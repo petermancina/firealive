@@ -8,6 +8,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { requireArrayBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 
 // ── Pseudonym System ────────────────────────────────────────────────────────
@@ -203,7 +204,7 @@ router.get('/backup-schedules', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load backup schedules' }); }
 });
 
-router.put('/backup-schedules', (req, res) => {
+router.put('/backup-schedules', requireArrayBody, (req, res) => {
   try {
     if (!Array.isArray(req.body)) {
       return res.status(400).json({ error: 'Request body must be an array of schedules' });
