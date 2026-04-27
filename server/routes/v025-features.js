@@ -205,13 +205,17 @@ router.get('/backup-schedules', (req, res) => {
 
 router.put('/backup-schedules', (req, res) => {
   try {
+    if (!Array.isArray(req.body)) {
+      return res.status(400).json({ error: 'Request body must be an array of schedules' });
+    }
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('backup_schedules', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'BACKUP_SCHEDULES_UPDATED', `${req.body.length} schedules configured`);
     db.close();
+    auditLog(req.user?.id || 'system', 'BACKUP_SCHEDULES_UPDATED', `${req.body.length} schedules configured`, req.ip);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save backup schedules' }); }
 });
+
 
 // ── Sync Interval Configuration ─────────────────────────────────────────────
 router.get('/sync-interval/config', (req, res) => {
