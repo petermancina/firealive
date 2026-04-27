@@ -1,7 +1,7 @@
 {
   "name": "firealive",
-  "version": "1.0.0",
-  "description": "**Version:** v1.0.0 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   **E-fuse counter:** 1 (anti-rollback)",
+  "version": "1.0.8",
+  "description": "**Version:** v1.0.8 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   **E-fuse counter:** 1 (anti-rollback)",
   "main": "index.js",
   "directories": {
     "doc": "docs"
