@@ -85,25 +85,8 @@ const detectSuspiciousInput = (req, res, next) => {
   }
   next();
 };
-
-// ── API Key Validation (no hardcoded keys) ──────────────────────────────────
-const validateApiKey = (req, res, next) => {
-  const key = req.headers['x-api-key'];
-  if (!key) return res.status(401).json({ error: 'API key required' });
-  // Keys are stored hashed in DB, never plaintext
-  // Comparison uses constant-time
-  const db = req.app.locals?.db;
-  if (!db) return next(); // Skip in test
-  const hashedKey = crypto.createHash('sha256').update(key).digest('hex');
-  const stored = db.prepare("SELECT * FROM api_keys WHERE key_hash = ? AND active = 1").get(hashedKey);
-  if (!stored) return res.status(403).json({ error: 'Invalid API key' });
-  // Check scope
-  req.apiKeyScopes = stored.scope?.split(',') || [];
-  next();
-};
-
 module.exports = {
   safeCompare, secureRandom, secureToken, secureUUID,
   checkLockout, recordFailure, clearFailures,
-  generateJwtKeyPair, detectSuspiciousInput, validateApiKey
+  generateJwtKeyPair, detectSuspiciousInput
 };
