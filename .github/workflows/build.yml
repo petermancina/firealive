@@ -1,0 +1,83 @@
+name: Build & Release FireAlive
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm install
+      - name: Build MC
+        run: cd frontend && npm install && npm run build:mac
+      - name: Build AC
+        run: cd packages/analyst-client && npm install && npm run build:mac
+      - name: Build GD
+        run: cd packages/global-dashboard && npm install && npm run build:mac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-installers
+          path: |
+            frontend/dist/*.dmg
+            packages/analyst-client/dist/*.dmg
+            packages/global-dashboard/dist/*.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm install
+      - name: Build MC
+        run: cd frontend && npm install && npm run build:win
+      - name: Build AC
+        run: cd packages/analyst-client && npm install && npm run build:win
+      - name: Build GD
+        run: cd packages/global-dashboard && npm install && npm run build:win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-installers
+          path: |
+            frontend/dist/*.exe
+            packages/analyst-client/dist/*.exe
+            packages/global-dashboard/dist/*.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm install
+      - name: Build MC
+        run: cd frontend && npm install && npm run build:linux
+      - name: Build AC
+        run: cd packages/analyst-client && npm install && npm run build:linux
+      - name: Build GD
+        run: cd packages/global-dashboard && npm install && npm run build:linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installers
+          path: |
+            frontend/dist/*.AppImage
+            packages/analyst-client/dist/*.AppImage
+            packages/global-dashboard/dist/*.AppImage
+
+  release:
+    needs: [build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mac-installers/**/*
+            win-installers/**/*
+            linux-installers/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
