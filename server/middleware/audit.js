@@ -58,7 +58,19 @@ function auditMiddleware(req, res, next) {
 /**
  * Write an explicit audit entry (for business events, not just HTTP requests)
  */
-function auditLog(userId, eventType, detail, ip) {
+function auditLog(...args) {
+  // Backward-compat: many callers historically passed (db, userId, eventType, detail)
+  // as 4 args, or (userId, eventType, detail, ip) as 4 args. Detect and normalize.
+  let userId, eventType, detail, ip;
+  if (args.length >= 4 && args[0] && typeof args[0] === 'object' && typeof args[0].prepare === 'function') {
+    // Legacy shape: (db, userId, eventType, detail)
+    [, userId, eventType, detail] = args;
+    ip = null;
+  } else {
+    // Correct shape: (userId, eventType, detail, ip)
+    [userId, eventType, detail, ip] = args;
+  }
+
   try {
     const db = getDb();
     const cef = formatCEF(eventType, userId, detail, ip);
@@ -74,6 +86,7 @@ function auditLog(userId, eventType, detail, ip) {
     logger.error('Audit log write failed', { error: err.message });
   }
 }
+
 
 /**
  * Stream CEF message to SIEM via syslog
