@@ -44,7 +44,7 @@
         }
       ],
       "hardenedRuntime": true,
-      "icon": "assets/icon.svg"
+      "icon": "assets/icon.png"
     },
     "win": {
       "target": [
@@ -55,7 +55,7 @@
           ]
         }
       ],
-      "icon": "assets/icon.svg"
+      "icon": "assets/icon.png"
     },
     "linux": {
       "target": [
@@ -66,8 +66,8 @@
           ]
         }
       ],
-      "icon": "assets/icon.svg"
+      "icon": "assets/icon.png"
     },
-    "icon": "assets/icon.svg"
+    "icon": "assets/icon.png"
   }
 }
