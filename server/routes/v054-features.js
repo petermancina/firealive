@@ -22,7 +22,7 @@ router.post('/soar/config', requireAuth, requireRole('manager'), async (req, res
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(
     'soar_config', JSON.stringify({ platform, endpoint, apiKeyHash: crypto.createHash('sha256').update(apiKey||'').digest('hex'), autoEscalate, updatedAt: new Date().toISOString() })
   );
-  auditLog(db, req.user?.id, 'SOAR_CONFIG', `SOAR ${platform} configured`);
+  auditLog(req.user?.id, 'SOAR_CONFIG', `SOAR ${platform} configured`);
   res.json({ saved: true });
 });
 
@@ -39,7 +39,7 @@ router.post('/ticketing/config', requireAuth, requireRole('manager'), async (req
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(
     'ticketing_config', JSON.stringify({ platform, endpoint, apiKeyHash: crypto.createHash('sha256').update(apiKey||'').digest('hex'), readOnly: true, updatedAt: new Date().toISOString() })
   );
-  auditLog(db, req.user?.id, 'TICKETING_CONFIG', `Ticketing ${platform} configured (READ-ONLY)`);
+  auditLog(req.user?.id, 'TICKETING_CONFIG', `Ticketing ${platform} configured (READ-ONLY)`);
   res.json({ saved: true });
 });
 
@@ -60,7 +60,7 @@ router.post('/routing/distribute', requireAuth, requireRole('manager'), async (r
   if (!analysts.length) return res.status(400).json({ error: 'No available analysts' });
   // Route to analyst with highest capacity (lowest burnout)
   const assigned = analysts[0];
-  auditLog(db, req.user?.id, 'TICKET_ROUTED', `Ticket ${ticketId} -> ${assigned.pseudonym} (capacity: ${assigned.capacity_score})`);
+  auditLog(req.user?.id, 'TICKET_ROUTED', `Ticket ${ticketId} -> ${assigned.pseudonym} (capacity: ${assigned.capacity_score})`);
   res.json({ assigned: assigned.pseudonym, capacity: assigned.capacity_score });
 });
 
@@ -80,7 +80,7 @@ router.post('/iam/check-absence', requireAuth, requireRole('manager'), async (re
   // In production: query IAM API for user list, compare against FireAlive users
   const users = db.prepare("SELECT id, uuid, pseudonym, last_iam_check FROM users WHERE role='analyst'").all();
   const absent = users.filter(u => !u.last_iam_check || Date.now() - new Date(u.last_iam_check).getTime() > iamCfg.intervalHours * 3600000);
-  auditLog(db, req.user?.id, 'IAM_CHECK', `Checked ${users.length} users, ${absent.length} need review`);
+  auditLog(req.user?.id, 'IAM_CHECK', `Checked ${users.length} users, ${absent.length} need review`);
   res.json({ checked: true, total: users.length, needsReview: absent.map(u => ({ uuid: u.uuid, pseudonym: u.pseudonym })) });
 });
 
@@ -89,10 +89,10 @@ router.post('/iam/confirm-status', requireAuth, requireRole('manager'), async (r
   const { uuid, action } = req.body; // action: 'active' or 'offboard'
   if (action === 'offboard') {
     db.prepare("UPDATE users SET active=0, offboarded_at=? WHERE uuid=?").run(new Date().toISOString(), uuid);
-    auditLog(db, req.user?.id, 'IAM_OFFBOARD', `Analyst ${uuid} offboarded`);
+    auditLog(req.user?.id, 'IAM_OFFBOARD', `Analyst ${uuid} offboarded`);
   } else {
     db.prepare("UPDATE users SET last_iam_check=? WHERE uuid=?").run(new Date().toISOString(), uuid);
-    auditLog(db, req.user?.id, 'IAM_CONFIRMED', `Analyst ${uuid} confirmed active`);
+    auditLog(req.user?.id, 'IAM_CONFIRMED', `Analyst ${uuid} confirmed active`);
   }
   res.json({ success: true, action });
 });
@@ -104,7 +104,7 @@ router.post('/upskilling/schedule', requireAuth, requireRole('manager'), async (
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(
     `upskilling_schedule_${analystUuid}`, JSON.stringify({ time: newTime, updatedAt: new Date().toISOString() })
   );
-  auditLog(db, req.user?.id, 'SCHED_EDIT', `Upskilling for ${analystUuid} -> ${newTime}`);
+  auditLog(req.user?.id, 'SCHED_EDIT', `Upskilling for ${analystUuid} -> ${newTime}`);
   res.json({ saved: true, analystUuid, newTime });
 });
 
@@ -122,7 +122,7 @@ router.post('/assessments/create-and-send', requireAuth, requireRole('manager'),
   db.prepare("INSERT INTO assessments (id, category, platform, target_analyst, status, created_at) VALUES (?, ?, ?, ?, 'sent', ?)").run(
     assessmentId, category, platform, targetAnalyst, new Date().toISOString()
   );
-  auditLog(db, req.user?.id, 'ASSESSMENT_CREATED', `${category} on ${platform} -> ${targetAnalyst}`);
+  auditLog(req.user?.id, 'ASSESSMENT_CREATED', `${category} on ${platform} -> ${targetAnalyst}`);
   // In production: push assessment link to analyst client via WebSocket/push notification
   res.json({ id: assessmentId, status: 'sent' });
 });
@@ -134,7 +134,7 @@ router.post('/assessments/submit-results', requireAuth, async (req, res) => {
     score, new Date().toISOString(), assessmentId
   );
   // Trigger AI gap analysis
-  auditLog(db, req.user?.id, 'ASSESSMENT_COMPLETED', `Assessment ${assessmentId}: ${score}%`);
+  auditLog(req.user?.id, 'ASSESSMENT_COMPLETED', `Assessment ${assessmentId}: ${score}%`);
   res.json({ success: true, gapAnalysisTriggered: true });
 });
 
@@ -166,7 +166,7 @@ router.post('/pseudonyms/rotate', requireAuth, requireRole('manager'), async (re
     const newPseudo = `Analyst-${shuffled[i % shuffled.length]}`;
     db.prepare("UPDATE users SET pseudonym=?, pseudonym_rotated_at=? WHERE id=?").run(newPseudo, new Date().toISOString(), a.id);
   });
-  auditLog(db, req.user?.id, 'PSEUDONYM_ROTATE', `Rotated ${analysts.length} pseudonyms (UUIDs unchanged)`);
+  auditLog(req.user?.id, 'PSEUDONYM_ROTATE', `Rotated ${analysts.length} pseudonyms (UUIDs unchanged)`);
   res.json({ rotated: analysts.length });
 });
 
@@ -182,7 +182,7 @@ router.post('/compliance/generate-report', requireAuth, requireRole('manager'), 
     { id: 'IR-1', name: 'Incident Response', status: 'pass', detail: 'OODA simulator + CISM retro' },
     { id: 'CM-1', name: 'Configuration Mgmt', status: 'pass', detail: 'Anti-rollback e-fuse' }
   ]};
-  auditLog(db, req.user?.id, 'COMPLIANCE_REPORT', `Generated ${framework} report`);
+  auditLog(req.user?.id, 'COMPLIANCE_REPORT', `Generated ${framework} report`);
   res.json(report);
 });
 
@@ -190,14 +190,14 @@ router.post('/compliance/generate-report', requireAuth, requireRole('manager'), 
 router.post('/clients/restore', requireAuth, requireRole('manager'), async (req, res) => {
   const db = getDb();
   const { clientId, source, path } = req.body;
-  auditLog(db, req.user?.id, 'CLIENT_RESTORE', `Client ${clientId} restored from ${source}:${path}`);
+  auditLog(req.user?.id, 'CLIENT_RESTORE', `Client ${clientId} restored from ${source}:${path}`);
   res.json({ success: true, clientId, restoredAt: new Date().toISOString() });
 });
 
 router.post('/clients/revert', requireAuth, requireRole('manager'), async (req, res) => {
   const db = getDb();
   const { clientId, version } = req.body;
-  auditLog(db, req.user?.id, 'CLIENT_REVERT', `Client ${clientId} reverted to ${version}`);
+  auditLog(req.user?.id, 'CLIENT_REVERT', `Client ${clientId} reverted to ${version}`);
   res.json({ success: true, clientId, revertedTo: version });
 });
 
@@ -208,7 +208,7 @@ router.post('/backup/schedule', requireAuth, requireRole('manager'), async (req,
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(
     'backup_schedule', JSON.stringify({ interval, type, retention, updatedAt: new Date().toISOString() })
   );
-  auditLog(db, req.user?.id, 'BACKUP_SCHEDULE', `Backup scheduled: ${interval} ${type}`);
+  auditLog(req.user?.id, 'BACKUP_SCHEDULE', `Backup scheduled: ${interval} ${type}`);
   res.json({ saved: true });
 });
 
@@ -222,7 +222,7 @@ router.post('/training/submit-completion', requireAuth, async (req, res) => {
   db.prepare("INSERT INTO training_completions (id, user_id, module, platform, url, completion_date, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')").run(
     id, req.user?.id, module, platform, sanitized, date
   );
-  auditLog(db, req.user?.id, 'TRAINING_SUBMITTED', `${module} on ${platform}`);
+  auditLog(req.user?.id, 'TRAINING_SUBMITTED', `${module} on ${platform}`);
   res.json({ id, status: 'pending_verification' });
 });
 
