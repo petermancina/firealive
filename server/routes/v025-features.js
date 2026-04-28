@@ -38,7 +38,7 @@ router.put('/pseudonyms/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('pseudonym_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'PSEUDONYM_CONFIG_UPDATED', 'Pseudonym system config updated');
+    auditLog(req.user?.id || 'system', 'PSEUDONYM_CONFIG_UPDATED', 'Pseudonym system config updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save pseudonym config' }); }
@@ -59,7 +59,7 @@ router.post('/pseudonyms/assign', (req, res) => {
     db.prepare("UPDATE analysts SET pseudonym = ? WHERE id = ?").run(pseudonym, analystId);
     // The real identity mapping is NOT stored in the DB — it's only in the
     // encrypted export that the Team Lead downloads and stores offline.
-    auditLog(db, 'system', 'PSEUDONYM_ASSIGNED', `Pseudonym assigned (identity not logged)`);
+    auditLog('system', 'PSEUDONYM_ASSIGNED', `Pseudonym assigned (identity not logged)`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to assign pseudonym' }); }
@@ -79,7 +79,7 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
       used.add(pseudonym);
       db.prepare("UPDATE analysts SET pseudonym = ? WHERE id = ?").run(pseudonym, a.id);
     });
-    auditLog(db, req.user?.id || 'system', 'PSEUDONYMS_ROTATED', `All ${analysts.length} pseudonyms rotated`);
+    auditLog(req.user?.id || 'system', 'PSEUDONYMS_ROTATED', `All ${analysts.length} pseudonyms rotated`);
     db.close();
     res.json({ success: true, rotated: analysts.length });
   } catch (e) { res.status(500).json({ error: 'Failed to rotate pseudonyms' }); }
@@ -99,7 +99,7 @@ router.put('/geo-fence/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('geo_fence_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'GEO_FENCE_CONFIG_UPDATED', `${req.body.clients?.length || 0} clients geo-assigned`);
+    auditLog(req.user?.id || 'system', 'GEO_FENCE_CONFIG_UPDATED', `${req.body.clients?.length || 0} clients geo-assigned`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save geo-fence config' }); }
@@ -145,7 +145,7 @@ router.put('/cluster/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cluster_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'CLUSTER_CONFIG_UPDATED', `Mode: ${req.body.mode}, nodes: ${req.body.nodeCount}`);
+    auditLog(req.user?.id || 'system', 'CLUSTER_CONFIG_UPDATED', `Mode: ${req.body.mode}, nodes: ${req.body.nodeCount}`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save cluster config' }); }
@@ -165,7 +165,7 @@ router.put('/global-dashboard/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('global_dashboard_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'GLOBAL_DASH_CONFIG_UPDATED', 'Global Dashboard export config updated');
+    auditLog(req.user?.id || 'system', 'GLOBAL_DASH_CONFIG_UPDATED', 'Global Dashboard export config updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save global dashboard config' }); }
@@ -232,7 +232,7 @@ router.put('/sync-interval/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('sync_interval_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'SYNC_INTERVAL_UPDATED', `Interval: ${req.body.intervalMin}min, adaptive: ${req.body.adaptiveSync}`);
+    auditLog(req.user?.id || 'system', 'SYNC_INTERVAL_UPDATED', `Interval: ${req.body.intervalMin}min, adaptive: ${req.body.adaptiveSync}`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save sync interval config' }); }
@@ -242,7 +242,7 @@ router.put('/sync-interval/config', (req, res) => {
 router.post('/ha/manual-failover', (req, res) => {
   try {
     const db = getDb();
-    auditLog(db, req.user?.id || 'system', 'HA_MANUAL_FAILOVER', 'Manual failover initiated by Team Lead');
+    auditLog(req.user?.id || 'system', 'HA_MANUAL_FAILOVER', 'Manual failover initiated by Team Lead');
     // In production: sends promote command to passive node, updates LB config
     db.close();
     res.json({ success: true, newActive: 'passive_promoted', previousActive: 'demoted_to_passive' });
@@ -252,7 +252,7 @@ router.post('/ha/manual-failover', (req, res) => {
 router.post('/ha/test-failover', (req, res) => {
   try {
     const db = getDb();
-    auditLog(db, req.user?.id || 'system', 'HA_FAILOVER_TEST_STARTED', 'Failover test initiated');
+    auditLog(req.user?.id || 'system', 'HA_FAILOVER_TEST_STARTED', 'Failover test initiated');
     // In production: promotes passive, validates, then rolls back
     db.close();
     // Simulated test result
