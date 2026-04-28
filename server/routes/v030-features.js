@@ -8,6 +8,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 
 // ── Push aggregate metrics to Global Dashboard Server ────────────────────────
@@ -80,7 +81,7 @@ router.get('/global-dashboard/push-config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to get push config' }); }
 });
 
-router.put('/global-dashboard/push-config', (req, res) => {
+router.put('/global-dashboard/push-config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('gd_push_schedule', ?)").run(JSON.stringify(req.body));
@@ -193,7 +194,7 @@ router.get('/ticketing/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to get ticketing config' }); }
 });
 
-router.put('/ticketing/config', (req, res) => {
+router.put('/ticketing/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ticketing_config', ?)").run(JSON.stringify(req.body));
