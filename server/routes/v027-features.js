@@ -25,7 +25,7 @@ router.put('/proactive/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('proactive_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'PROACTIVE_CONFIG_UPDATED', `High-sev threshold: ${req.body.highSevHours}hr`);
+    auditLog(req.user?.id || 'system', 'PROACTIVE_CONFIG_UPDATED', `High-sev threshold: ${req.body.highSevHours}hr`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save proactive config' }); }
@@ -59,7 +59,7 @@ router.post('/proactive/approve', (req, res) => {
   try {
     const { analystPseudonym, breakDurationMin } = req.body;
     const db = getDb();
-    auditLog(db, req.user?.id || 'system', 'PROACTIVE_BREAK_APPROVED', `Break approved for ${analystPseudonym} — ${breakDurationMin} min`);
+    auditLog(req.user?.id || 'system', 'PROACTIVE_BREAK_APPROVED', `Break approved for ${analystPseudonym} — ${breakDurationMin} min`);
     // In production: sends notification to analyst client via WebSocket/push
     db.close();
     res.json({ success: true, notification: 'sent' });
@@ -80,7 +80,7 @@ router.put('/upskilling-hour/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('upskilling_hour_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'UPSKILLING_HOUR_CONFIG_UPDATED', `Hour ${req.body.hourOfShift} of shift, ${req.body.durationMin}min`);
+    auditLog(req.user?.id || 'system', 'UPSKILLING_HOUR_CONFIG_UPDATED', `Hour ${req.body.hourOfShift} of shift, ${req.body.durationMin}min`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save upskilling config' }); }
@@ -100,7 +100,7 @@ router.put('/auto-disable-routing/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('auto_disable_routing_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'AUTO_DISABLE_ROUTING_CONFIG_UPDATED', 'Config updated');
+    auditLog(req.user?.id || 'system', 'AUTO_DISABLE_ROUTING_CONFIG_UPDATED', 'Config updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save auto-disable config' }); }
@@ -124,10 +124,10 @@ router.post('/auto-disable-routing/trigger', (req, res) => {
 
     if (shouldDisable) {
       db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('routing_paused', 'true')").run();
-      auditLog(db, 'SYSTEM', 'AUTO_ROUTING_DISABLED', `Trigger: ${triggerType} from ${source} (severity: ${severity})`);
+      auditLog('SYSTEM', 'AUTO_ROUTING_DISABLED', `Trigger: ${triggerType} from ${source} (severity: ${severity})`);
       // Schedule auto-restore
       const cooldownMin = cfg.cooldownMin || 30;
-      auditLog(db, 'SYSTEM', 'AUTO_RESTORE_SCHEDULED', `Routing will auto-restore in ${cooldownMin} minutes`);
+      auditLog('SYSTEM', 'AUTO_RESTORE_SCHEDULED', `Routing will auto-restore in ${cooldownMin} minutes`);
       db.close();
       return res.json({ disabled: true, cooldownMin, trigger: triggerType });
     }
@@ -167,7 +167,7 @@ router.post('/offboarding/execute', (req, res) => {
       db.prepare("DELETE FROM peer_messages WHERE sender_id = ? OR recipient_id = ?").run(analystId, analystId);
     }
 
-    auditLog(db, req.user?.id || 'system', 'ANALYST_OFFBOARDED', `Analyst ${analystId} offboarded — reason: ${reason}`);
+    auditLog(req.user?.id || 'system', 'ANALYST_OFFBOARDED', `Analyst ${analystId} offboarded — reason: ${reason}`);
     db.close();
 
     // 5. Notify SOAR (in production: webhook call)
@@ -194,7 +194,7 @@ router.post('/client/self-scan', (req, res) => {
   try {
     const { clientId, pseudonym } = req.body;
     const db = getDb();
-    auditLog(db, pseudonym || 'analyst', 'CLIENT_SELF_SCAN_INITIATED', `Client ${clientId} self-scan initiated by analyst`);
+    auditLog(pseudonym || 'analyst', 'CLIENT_SELF_SCAN_INITIATED', `Client ${clientId} self-scan initiated by analyst`);
 
     // In production: client runs local integrity checks and reports back
     const results = {
@@ -218,7 +218,7 @@ router.post('/client/self-scan', (req, res) => {
       signed: true,
     };
 
-    auditLog(db, pseudonym || 'analyst', 'CLIENT_SELF_SCAN_COMPLETE', `Result: ${results.overall}`);
+    auditLog(pseudonym || 'analyst', 'CLIENT_SELF_SCAN_COMPLETE', `Result: ${results.overall}`);
     db.close();
     res.json(results);
   } catch (e) { res.status(500).json({ error: 'Self-scan failed' }); }
@@ -252,7 +252,7 @@ router.post('/legal-hold/export', (req, res) => {
     const hash = crypto.createHash(hashAlgorithm === 'sha512' ? 'sha512' : 'sha256').update(dataStr).digest('hex');
     exportData.integrityHash = { algorithm: hashAlgorithm, value: hash };
 
-    auditLog(db, req.user?.id || 'system', 'LEGAL_HOLD_EXPORT', `Format: ${format}, hash: ${hashAlgorithm}, records: ${auditLogs.length}`);
+    auditLog(req.user?.id || 'system', 'LEGAL_HOLD_EXPORT', `Format: ${format}, hash: ${hashAlgorithm}, records: ${auditLogs.length}`);
     db.close();
 
     res.json(exportData);
@@ -307,7 +307,7 @@ router.post('/audit/collect-from-client', (req, res) => {
     const { clientId, pseudonym, events } = req.body;
     const db = getDb();
     events.forEach(event => {
-      auditLog(db, pseudonym || clientId, `CLIENT_${event.type}`, event.detail || '');
+      auditLog(pseudonym || clientId, `CLIENT_${event.type}`, event.detail || '');
     });
     db.close();
     res.json({ success: true, collected: events.length });
