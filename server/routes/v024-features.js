@@ -26,7 +26,7 @@ router.put('/mfa/config', (req, res) => {
     const db = getDb();
     const cfg = req.body;
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('mfa_config', ?)").run(JSON.stringify(cfg));
-    auditLog(db, req.user?.id || 'system', 'MFA_CONFIG_UPDATED', `Method: ${cfg.method}, enforce: ${cfg.enforceForAll}`);
+    auditLog(req.user?.id || 'system', 'MFA_CONFIG_UPDATED', `Method: ${cfg.method}, enforce: ${cfg.enforceForAll}`);
     db.close();
     res.json({ success: true, config: cfg });
   } catch (e) { logger.error('MFA config save failed', e); res.status(500).json({ error: 'Failed to save MFA config' }); }
@@ -59,7 +59,7 @@ router.put('/threat-hunting/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('threat_hunting_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'THREAT_HUNTING_CONFIG_UPDATED', 'Threat hunting integrations updated');
+    auditLog(req.user?.id || 'system', 'THREAT_HUNTING_CONFIG_UPDATED', 'Threat hunting integrations updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save threat hunting config' }); }
@@ -79,7 +79,7 @@ router.put('/tripwire/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('tripwire_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'TRIPWIRE_CONFIG_UPDATED', `Threshold: ${req.body.thresholdPct}%`);
+    auditLog(req.user?.id || 'system', 'TRIPWIRE_CONFIG_UPDATED', `Threshold: ${req.body.thresholdPct}%`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save tripwire config' }); }
@@ -98,7 +98,7 @@ router.post('/tripwire/check', (req, res) => {
     const pct = analysts.total > 0 ? (reducedRouting.count / analysts.total) * 100 : 0;
 
     if (pct >= cfg.thresholdPct) {
-      auditLog(db, 'SYSTEM', 'TRIPWIRE_TRIGGERED', `${pct.toFixed(1)}% analysts in reduced routing (threshold: ${cfg.thresholdPct}%)`);
+      auditLog('SYSTEM', 'TRIPWIRE_TRIGGERED', `${pct.toFixed(1)}% analysts in reduced routing (threshold: ${cfg.thresholdPct}%)`);
       // Auto-disable routing if configured
       if (cfg.autoDisableRouting) {
         db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('routing_paused', 'true')").run();
@@ -116,7 +116,7 @@ router.post('/compromise-scan/run', (req, res) => {
   try {
     const { targets } = req.body; // 'all' or array of client IDs
     const db = getDb();
-    auditLog(db, req.user?.id || 'system', 'COMPROMISE_SCAN_INITIATED', `Targets: ${targets === 'all' ? 'ALL clients' : targets.join(', ')}`);
+    auditLog(req.user?.id || 'system', 'COMPROMISE_SCAN_INITIATED', `Targets: ${targets === 'all' ? 'ALL clients' : targets.join(', ')}`);
 
     // In production: sends scan commands to each client via secure channel
     // Each client runs: binary integrity, memory analysis, DB query spike detection,
@@ -210,7 +210,7 @@ router.put('/posture/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('posture_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'POSTURE_CONFIG_UPDATED', 'Posture assessment configuration updated');
+    auditLog(req.user?.id || 'system', 'POSTURE_CONFIG_UPDATED', 'Posture assessment configuration updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save posture config' }); }
@@ -232,7 +232,7 @@ router.post('/posture/check', (req, res) => {
     }
 
     const passed = failures.length === 0;
-    auditLog(db, req.body.clientId || 'unknown', passed ? 'POSTURE_CHECK_PASSED' : 'POSTURE_CHECK_FAILED', `Failures: ${failures.join(', ') || 'none'}`);
+    auditLog(req.body.clientId || 'unknown', passed ? 'POSTURE_CHECK_PASSED' : 'POSTURE_CHECK_FAILED', `Failures: ${failures.join(', ') || 'none'}`);
     db.close();
 
     if (!passed && cfg.blockOnFail) {
@@ -267,7 +267,7 @@ router.put('/ha/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'HA_CONFIG_UPDATED', `Mode: ${req.body.mode}`);
+    auditLog(req.user?.id || 'system', 'HA_CONFIG_UPDATED', `Mode: ${req.body.mode}`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save HA config' }); }
@@ -292,7 +292,7 @@ router.put('/fail-open/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('fail_open_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'FAILOPEN_CONFIG_UPDATED', 'Fail-open routing config updated');
+    auditLog(req.user?.id || 'system', 'FAILOPEN_CONFIG_UPDATED', 'Fail-open routing config updated');
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save fail-open config' }); }
@@ -312,7 +312,7 @@ router.put('/utm/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('utm_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'UTM_CONFIG_UPDATED', `Provider: ${req.body.provider}`);
+    auditLog(req.user?.id || 'system', 'UTM_CONFIG_UPDATED', `Provider: ${req.body.provider}`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save UTM config' }); }
@@ -334,7 +334,7 @@ router.post('/certifications', (req, res) => {
     const { name, issuer, earnedDate, expiresDate, analystId, verificationUrl } = req.body;
     const id = crypto.randomUUID();
     db.prepare("INSERT INTO general_certifications (id, name, issuer, earned_date, expires_date, analyst_id, verification_url) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, name, issuer, earnedDate, expiresDate || null, analystId, verificationUrl || null);
-    auditLog(db, req.user?.id || 'system', 'CERT_ADDED', `${name} for analyst ${analystId}`);
+    auditLog(req.user?.id || 'system', 'CERT_ADDED', `${name} for analyst ${analystId}`);
     db.close();
     res.json({ success: true, id });
   } catch (e) { res.status(500).json({ error: 'Failed to add certification' }); }
@@ -344,7 +344,7 @@ router.delete('/certifications/:id', (req, res) => {
   try {
     const db = getDb();
     db.prepare("DELETE FROM general_certifications WHERE id = ?").run(req.params.id);
-    auditLog(db, req.user?.id || 'system', 'CERT_REMOVED', `Cert ${req.params.id} removed`);
+    auditLog(req.user?.id || 'system', 'CERT_REMOVED', `Cert ${req.params.id} removed`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to remove certification' }); }
