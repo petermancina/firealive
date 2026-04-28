@@ -57,20 +57,13 @@ function auditMiddleware(req, res, next) {
 
 /**
  * Write an explicit audit entry (for business events, not just HTTP requests)
+ *
+ * @param {string} userId - User ID, pseudonym, or 'system'/'SYSTEM' for non-user events
+ * @param {string} eventType - Event type identifier (e.g. 'CONFIG_UPDATED', 'BACKUP_CREATED')
+ * @param {string} detail - Human-readable detail string
+ * @param {string} [ip] - Optional IP address; pass req.ip from route handlers
  */
-function auditLog(...args) {
-  // Backward-compat: many callers historically passed (db, userId, eventType, detail)
-  // as 4 args, or (userId, eventType, detail, ip) as 4 args. Detect and normalize.
-  let userId, eventType, detail, ip;
-  if (args.length >= 4 && args[0] && typeof args[0] === 'object' && typeof args[0].prepare === 'function') {
-    // Legacy shape: (db, userId, eventType, detail)
-    [, userId, eventType, detail] = args;
-    ip = null;
-  } else {
-    // Correct shape: (userId, eventType, detail, ip)
-    [userId, eventType, detail, ip] = args;
-  }
-
+function auditLog(userId, eventType, detail, ip) {
   try {
     const db = getDb();
     const cef = formatCEF(eventType, userId, detail, ip);
