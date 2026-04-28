@@ -61,7 +61,7 @@ router.post('/global-dashboard/push', async (req, res) => {
       }
     }
 
-    auditLog(db, 'SYSTEM', 'GD_METRICS_PUSHED', `Pushed to ${results.filter(r => r.status === 'pushed').length}/${results.length} endpoints`);
+    auditLog('SYSTEM', 'GD_METRICS_PUSHED', `Pushed to ${results.filter(r => r.status === 'pushed').length}/${results.length} endpoints`);
     db.close();
     res.json({ pushed: true, results });
   } catch (e) {
@@ -84,7 +84,7 @@ router.put('/global-dashboard/push-config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('gd_push_schedule', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'GD_PUSH_SCHEDULE_UPDATED', `Interval: ${req.body.intervalMinutes}min`);
+    auditLog(req.user?.id || 'system', 'GD_PUSH_SCHEDULE_UPDATED', `Interval: ${req.body.intervalMinutes}min`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save push config' }); }
@@ -97,7 +97,7 @@ router.post('/clients/trigger-backup', (req, res) => {
     const { type = 'incremental', targets = 'all' } = req.body;
     const db = getDb();
     // In production: sends backup command to each client via WebSocket/push
-    auditLog(db, req.user?.id || 'system', 'CLIENT_BACKUP_TRIGGERED', `Type: ${type}, targets: ${targets}`);
+    auditLog(req.user?.id || 'system', 'CLIENT_BACKUP_TRIGGERED', `Type: ${type}, targets: ${targets}`);
     db.close();
     res.json({ success: true, message: `Backup trigger sent to ${targets === 'all' ? 'all clients' : targets}` });
   } catch (e) { res.status(500).json({ error: 'Client backup trigger failed' }); }
@@ -109,7 +109,7 @@ router.post('/clients/collect-logs', (req, res) => {
     const { targets = 'all', logTypes = ['audit', 'forensics', 'runtime'] } = req.body;
     const db = getDb();
     // In production: requests log transmission from each client
-    auditLog(db, req.user?.id || 'system', 'CLIENT_LOGS_COLLECTED', `Types: ${logTypes.join(', ')}, targets: ${targets}`);
+    auditLog(req.user?.id || 'system', 'CLIENT_LOGS_COLLECTED', `Types: ${logTypes.join(', ')}, targets: ${targets}`);
     db.close();
     res.json({ success: true, message: `Log collection requested from ${targets}` });
   } catch (e) { res.status(500).json({ error: 'Log collection failed' }); }
@@ -120,7 +120,7 @@ router.post('/clients/push-update', (req, res) => {
   try {
     const { version, staggerMinutes = 5, requireLabTest = true } = req.body;
     const db = getDb();
-    auditLog(db, req.user?.id || 'system', 'CLIENT_UPDATE_PUSHED', `Version: ${version}, stagger: ${staggerMinutes}min`);
+    auditLog(req.user?.id || 'system', 'CLIENT_UPDATE_PUSHED', `Version: ${version}, stagger: ${staggerMinutes}min`);
     db.close();
     res.json({ success: true, message: `Update ${version} push initiated (staggered ${staggerMinutes}min)` });
   } catch (e) { res.status(500).json({ error: 'Update push failed' }); }
@@ -142,7 +142,7 @@ router.post('/clients/propagate-config', (req, res) => {
     // - routing_config: burnout routing parameters
     // - upskilling_config: upskilling hour settings
     // - peer_schedule_config: peer chat scheduling windows
-    auditLog(db, req.user?.id || 'system', 'CONFIG_PROPAGATED', `${configType} → ${targets}`);
+    auditLog(req.user?.id || 'system', 'CONFIG_PROPAGATED', `${configType} → ${targets}`);
     db.close();
     res.json({ success: true, configType, targets });
   } catch (e) { res.status(500).json({ error: 'Config propagation failed' }); }
@@ -154,7 +154,7 @@ router.post('/proactive-break/send', (req, res) => {
     const { analystPseudonym, hours, duration } = req.body;
     const db = getDb();
     // In production: WebSocket push to the specific analyst's client
-    auditLog(db, req.user?.id || 'system', 'PROACTIVE_BREAK_SENT', `To ${analystPseudonym}: ${duration}min break after ${hours}hr`);
+    auditLog(req.user?.id || 'system', 'PROACTIVE_BREAK_SENT', `To ${analystPseudonym}: ${duration}min break after ${hours}hr`);
     db.close();
     res.json({ success: true, notification: 'sent', pseudonym: analystPseudonym });
   } catch (e) { res.status(500).json({ error: 'Failed to send break notification' }); }
@@ -170,7 +170,7 @@ router.post('/recovery-protocol/initiate', (req, res) => {
     // - Recovery resources pushed to their Wellness tab
     // - Peer support offer notification
     // - Follow-up schedule created
-    auditLog(db, req.user?.id || 'system', 'RECOVERY_PROTOCOL_INITIATED', `${incident} (${severity}) for ${analystPseudonyms.length} analysts`);
+    auditLog(req.user?.id || 'system', 'RECOVERY_PROTOCOL_INITIATED', `${incident} (${severity}) for ${analystPseudonyms.length} analysts`);
     db.close();
     res.json({ success: true, affectedAnalysts: analystPseudonyms.length, actions });
   } catch (e) { res.status(500).json({ error: 'Recovery protocol initiation failed' }); }
@@ -197,7 +197,7 @@ router.put('/ticketing/config', (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ticketing_config', ?)").run(JSON.stringify(req.body));
-    auditLog(db, req.user?.id || 'system', 'TICKETING_CONFIG_UPDATED', `Provider: ${req.body.provider}`);
+    auditLog(req.user?.id || 'system', 'TICKETING_CONFIG_UPDATED', `Provider: ${req.body.provider}`);
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save ticketing config' }); }
@@ -221,7 +221,7 @@ router.post('/routing/apply-burnout-filter', (req, res) => {
     // reduced-load overrides, upskilling hour pauses
     const filtered = tickets; // Pass-through in demo mode
     
-    auditLog(db, 'SYSTEM', 'ROUTING_APPLIED', `${tickets.length} tickets processed through burnout filter`);
+    auditLog('SYSTEM', 'ROUTING_APPLIED', `${tickets.length} tickets processed through burnout filter`);
     db.close();
     res.json({ filtered: true, tickets: filtered });
   } catch (e) { res.status(500).json({ error: 'Routing filter failed' }); }
