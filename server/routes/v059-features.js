@@ -13,7 +13,7 @@ router.post('/features/:feature/toggle', requireAuth, requireRole('manager'), (r
   const { FeatureToggleService } = require('../services/feature-toggles');
   const svc = new FeatureToggleService(req.app.locals.db);
   svc.setEnabled(req.params.feature, req.body.enabled, req.user.id);
-  auditLog(req.app.locals.db, req.user.id, 'FEATURE_TOGGLE', `${req.params.feature}: ${req.body.enabled ? 'ON' : 'OFF'}`);
+  auditLog(req.user.id, 'FEATURE_TOGGLE', `${req.params.feature}: ${req.body.enabled ? 'ON' : 'OFF'}`);
   res.json({ feature: req.params.feature, enabled: req.body.enabled });
 });
 
@@ -31,7 +31,7 @@ router.get('/metrics/cef', requireAuth, (req, res) => {
 router.get('/audit/integrity', requireAuth, requireRole('manager'), (req, res) => {
   const { verifyAuditChain } = require('../middleware/pentest-hardening');
   const result = verifyAuditChain(req.app.locals.db);
-  auditLog(req.app.locals.db, req.user.id, 'AUDIT_CHECK', `Integrity: ${result.intact}`);
+  auditLog(req.user.id, 'AUDIT_CHECK', `Integrity: ${result.intact}`);
   res.json(result);
 });
 
@@ -75,7 +75,7 @@ router.post('/runbook/generate', requireAuth, requireRole('manager'), (req, res)
     ]
   };
   const s = req.body.scenario || 'crash';
-  auditLog(req.app.locals.db, req.user.id, 'RUNBOOK', `Generated: ${s}`);
+  auditLog(req.user.id, 'RUNBOOK', `Generated: ${s}`);
   res.json({ id: crypto.randomUUID(), version:'v1.0.0', scenario:s, steps: scenarios[s] || scenarios.crash });
 });
 
@@ -88,14 +88,14 @@ router.post('/ttx/generate', requireAuth, requireRole('manager'), (req, res) => 
     burnout_crisis: {title:'Mass Burnout',injects:['Health < 40%','Multiple reduced load requests','Peer chat 300% spike','Tripwire triggered'],decisions:['All-hands disable?','Emergency upskilling?','Escalate CISO?']},
   };
   const t = req.body.type || 'ransomware';
-  auditLog(req.app.locals.db, req.user.id, 'TTX', `Generated: ${t}`);
+  auditLog(req.user.id, 'TTX', `Generated: ${t}`);
   res.json({ id: crypto.randomUUID(), ...types[t] });
 });
 
 // Cloud Migration (entire suite)
 router.post('/cloud/package', requireAuth, requireRole('manager'), (req, res) => {
   const p = req.body.provider || 'aws';
-  auditLog(req.app.locals.db, req.user.id, 'CLOUD_PKG', `Provider: ${p}`);
+  auditLog(req.user.id, 'CLOUD_PKG', `Provider: ${p}`);
   res.json({
     id: crypto.randomUUID(), provider:p, version:'v1.0.0',
     components: [
@@ -114,7 +114,7 @@ router.post('/cloud/package', requireAuth, requireRole('manager'), (req, res) =>
 
 // Backup (entire suite)
 router.post('/backup/full-suite', requireAuth, requireRole('manager'), (req, res) => {
-  auditLog(req.app.locals.db, req.user.id, 'BACKUP_FULL', 'Full suite backup initiated');
+  auditLog(req.user.id, 'BACKUP_FULL', 'Full suite backup initiated');
   res.json({
     id: crypto.randomUUID(),
     components: ['regional-server-db','gd-server-db','mc-configs','ac-configs','gd-configs','audit-logs','feature-toggles','encryption-keys-encrypted','integration-configs','upskilling-schedules','assessment-data','analyst-skills','analyst-baselines','signal-readings','analyst-impacts','training-completions','peer-session-metadata','compliance-reports','backup-schedules','backup-history','notifications','ir-policies','helper-ratings','api-keys','config-snapshots','integration-status'],
@@ -136,7 +136,7 @@ router.get('/cicd/full', requireAuth, (req, res) => {
 router.post('/regression/run', requireAuth, requireRole('manager'), (req, res) => {
   const { RegressionRunner } = require('../services/regression-runner');
   const result = new RegressionRunner(req.app.locals.db).run();
-  auditLog(req.app.locals.db, req.user.id, 'REGRESSION', `${result.passed}/${result.total} passed`);
+  auditLog(req.user.id, 'REGRESSION', `${result.passed}/${result.total} passed`);
   res.json(result);
 });
 
