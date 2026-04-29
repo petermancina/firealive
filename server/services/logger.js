@@ -5,6 +5,7 @@
 const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
+const pkgVersion = require(path.join(__dirname, '..', '..', 'package.json')).version;
 
 const logDir = process.env.LOG_PATH || path.join(__dirname, '../../data/logs');
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
@@ -16,7 +17,7 @@ const logger = winston.createLogger({
     winston.format.errors({ stack: true }),
     winston.format.json()
   ),
-  defaultMeta: { service: 'firealive', version: '0.0.18' },
+  defaultMeta: { service: 'firealive', version: pkgVersion },
   transports: [
     new winston.transports.File({
       filename: path.join(logDir, 'error.log'),
