@@ -6,11 +6,12 @@
 
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
+const { cefDeviceVersion } = require('../lib/version');
 
 function formatCEF(event, userId, detail, ip) {
   const ts = new Date().toISOString();
   // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
-  return `CEF:0|FireAlive|WellbeingPlatform|0.0.18|${event}|${event}|3|rt=${ts} suser=${userId || 'anonymous'} msg=${(detail || '').replace(/[|\\]/g, '_')} src=${ip || ''}`;
+  return `CEF:0|FireAlive|WellbeingPlatform|${cefDeviceVersion}|${event}|${event}|3|rt=${ts} suser=${userId || 'anonymous'} msg=${(detail || '').replace(/[|\\]/g, '_')} src=${ip || ''}`;
 }
 
 function auditMiddleware(req, res, next) {
