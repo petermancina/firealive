@@ -189,11 +189,22 @@ async function start() {
       detectMissingLogs();
     }, 3600000);
 
-    const server = const server = app.listen(PORT, HOST, () => {
-      logger.info(`FireAlive v0.0.21 running on http://${HOST}:${PORT}`);
-      logger.info(`Fuse counter: ${process.env.FUSE_COUNTER || 21}`);
+    const server = app.listen(PORT, HOST, () => {
+      const pkg = require('../package.json');
+      logger.info(`FireAlive v${pkg.version} running on http://${HOST}:${PORT}`);
       validatePortBinding(server, parseInt(PORT, 10));
     });
+
+    // Initialize WebSocket server for real-time features
+    try {
+      const wsServer = new FireAliveWebSocket(server, app.locals?.db);
+      wsServer.startHeartbeatCheck();
+      logger.info('WebSocket server started on /ws');
+      process.on('SIGTERM', () => { wsServer.shutdown(); server.close(); });
+      process.on('SIGINT', () => { wsServer.shutdown(); server.close(); });
+    } catch (e) {
+      logger.warn('WebSocket init skipped', { error: e.message });
+    }
   } catch (err) {
     logger.error('Failed to start:', err);
     process.exit(1);
@@ -203,12 +214,3 @@ async function start() {
 start();
 
 module.exports = app;  // for testing
-
-// Initialize WebSocket server for real-time features
-try {
-  const wsServer = new FireAliveWebSocket(server, app.locals?.db);
-  wsServer.startHeartbeatCheck();
-  console.log('[WS] WebSocket server started on /ws');
-  process.on('SIGTERM', () => { wsServer.shutdown(); server.close(); });
-  process.on('SIGINT', () => { wsServer.shutdown(); server.close(); });
-} catch (e) { console.warn('[WS] WebSocket init skipped:', e.message); }
