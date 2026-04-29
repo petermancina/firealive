@@ -420,6 +420,35 @@ CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ticket_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analyst_id TEXT,
+  ticket_id TEXT,
+  category TEXT,
+  action TEXT,
+  response_time_min REAL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS ticket_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analyst_id TEXT,
+  ticket_id TEXT,
+  priority TEXT,
+  status TEXT DEFAULT 'open',
+  assigned_at TEXT DEFAULT (datetime('now')),
+  closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS peer_sessions (
+  id TEXT PRIMARY KEY,
+  helper_id TEXT,
+  seeker_id TEXT,
+  duration_min INTEGER,
+  rating INTEGER,
+  created_at TEXT DEFAULT (datetime('now'))
+);
 `;
 
 function initDb() {
@@ -451,8 +480,3 @@ if (require.main === module) {
 }
 
 module.exports = { getDb, initDb, DB_PATH };
-
-db.prepare("CREATE TABLE IF NOT EXISTS ticket_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, analyst_id TEXT, ticket_id TEXT, category TEXT, action TEXT, response_time_min REAL, created_at TEXT DEFAULT (datetime('now')))").run();
-db.prepare("CREATE TABLE IF NOT EXISTS ticket_assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, analyst_id TEXT, ticket_id TEXT, priority TEXT, status TEXT DEFAULT 'open', assigned_at TEXT DEFAULT (datetime('now')), closed_at TEXT)").run();
-db.prepare("CREATE TABLE IF NOT EXISTS peer_sessions (id TEXT PRIMARY KEY, helper_id TEXT, seeker_id TEXT, duration_min INTEGER, rating INTEGER, created_at TEXT DEFAULT (datetime('now')))").run();
-db.prepare("CREATE TABLE IF NOT EXISTS helper_ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, helper_uuid TEXT, rating INTEGER, points INTEGER, created_at TEXT DEFAULT (datetime('now')))").run();
