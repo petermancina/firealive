@@ -7,7 +7,7 @@
 require('dotenv').config();
 
 const express = require('express');
-const { securityHeaders, sanitizeInput, rateLimit, antiReplay, maxBodySize, enforceMinTls } = require('./middleware/security-hardening');
+const { securityHeaders, sanitizeInput, antiReplay, maxBodySize, enforceMinTls } = require('./middleware/security-hardening');
 const { corsPolicy } = require('./middleware/cors-policy');
 const { detectSuspiciousInput } = require('./middleware/auth-hardening');
 const { aiSecurityMiddleware } = require('./middleware/ai-security');
