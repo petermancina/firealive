@@ -13,9 +13,11 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 
-const APP_VERSION = '0.0.21';
-const FUSE_COUNTER = 21;
-const BUILD_ID = `20260404.1`;
+const { version, fuseCounter, buildId } = require('../lib/version');
+
+const APP_VERSION = version;
+const FUSE_COUNTER = fuseCounter;
+const BUILD_ID = buildId;
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 router.get('/health', (req, res) => {
@@ -112,21 +114,22 @@ router.post('/fuse-check', (req, res) => {
   }
 });
 
-// ── Update Check (Simulated) ─────────────────────────────────────────────────
+// ── Update Check ─────────────────────────────────────────────────────────────
+// Returns the running version. In a real deployment this would also poll a
+// secure update server (Ed25519-signed release feed) for the latest available
+// version. Until that infrastructure exists, this endpoint simply reports the
+// current version and explicitly notes that no update server is configured.
 router.post('/update-check', (req, res) => {
-  // In production, this would call a secure update server
   const currentVersion = APP_VERSION;
-  const latestVersion = '0.0.20'; // simulated
 
-  const updateAvailable = latestVersion !== currentVersion;
-
-  auditLog(req.user?.id, 'UPDATE_CHECK', `current=${currentVersion} latest=${latestVersion}`, req.ip);
+  auditLog(req.user?.id, 'UPDATE_CHECK', `current=${currentVersion}`, req.ip);
 
   res.json({
     currentVersion,
-    latestVersion,
-    updateAvailable,
-    releaseNotes: updateAvailable ? 'Expand KB to 50+ sources, IAM/AD wizard improvements, report engine scheduling' : null,
+    latestVersion: null,
+    updateAvailable: false,
+    updateServerConfigured: false,
+    note: 'No update server configured. Configure FIREALIVE_UPDATE_SERVER_URL to enable update checks.',
     checkedAt: new Date().toISOString(),
   });
 });

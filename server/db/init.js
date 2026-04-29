@@ -452,6 +452,7 @@ CREATE TABLE IF NOT EXISTS peer_sessions (
 `;
 
 function initDb() {
+  const { version, fuseCounter } = require('../lib/version');
   const db = getDb();
 
   // Execute schema
@@ -459,8 +460,8 @@ function initDb() {
 
   // Set initial system metadata
   const setMeta = db.prepare('INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)');
-  setMeta.run('fuse_counter', '31');
-  setMeta.run('app_version', '0.0.31');
+  setMeta.run('fuse_counter', String(fuseCounter));
+  setMeta.run('app_version', version);
   setMeta.run('schema_version', '1');
   setMeta.run('installed_at', new Date().toISOString());
 
