@@ -7,6 +7,7 @@
 const cron = require('node-cron');
 const { logger } = require('./logger');
 const { versionLabel } = require('../lib/version');
+const notifications = require('./notifications');
 
 const schedulerService = {
   jobs: [],
@@ -80,6 +81,43 @@ const schedulerService = {
         }
       } catch (err) {
         logger.error('Scheduler: notifications email pipeline failed', { error: err.message });
+      }    
+    }));
+
+    // ── IAM recertification daily check ──────────────────────────────────
+    // Runs once daily at 09:00 local time. If recertification is due (per
+    // the configured interval, default 90 days), notifies every lead and
+    // admin so they can run the recert workflow.
+    this.jobs.push(cron.schedule('0 9 * * *', () => {
+      try {
+        const { checkRecertDue } = require('./recertification');
+        const status = checkRecertDue();
+        if (!status.due) return;
+
+        const eligible = notifications.getEligibleRecipients('iam_recert_due', {
+          roles: ['lead', 'admin'],
+          activeOnly: true,
+        });
+
+        let notifiedCount = 0;
+        for (const recipientId of eligible) {
+          try {
+            notifications.notify({
+              recipientId,
+              eventType: 'iam_recert_due',
+              title: 'IAM recertification is due',
+              body: `${status.daysSince} days have passed since the last recertification (interval: ${status.intervalDays} days). Open the Recertification tab to review user accounts, integrations, assessments, and configuration settings.`,
+              linkTab: 'recertification',
+              linkParams: { focus: 'review' },
+            });
+            notifiedCount++;
+          } catch (notifyErr) {
+            logger.warn('IAM recert: notify recipient failed (non-fatal)', { recipientId, error: notifyErr.message });
+          }
+        }
+        logger.info(`IAM recert daily job: notified ${notifiedCount} lead/admin recipient(s)`);
+      } catch (err) {
+        logger.error('Scheduler: IAM recert daily job failed', { error: err.message });
       }
     }));
 
