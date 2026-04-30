@@ -289,6 +289,65 @@ function setPreference(userId, eventType, { in_app, email }) {
   }
 }
 
+// Return all user IDs who have at least one channel enabled for `eventType`,
+// optionally filtered to specific roles. Used by broadcast events:
+// peer_request_posted, routing_panic_engaged, iam_recert_due.
+//
+// Resolution rules:
+//   - A user with a row in notification_preferences for this event type uses
+//     that row's in_app/email values.
+//   - A user with no row uses the EVENT_TYPES[eventType].default values.
+//   - "Eligible" = at least one of (in_app, email) is on.
+//
+// Filters:
+//   - opts.roles: array like ['lead', 'admin']. If omitted, all roles are eligible.
+//   - opts.activeOnly: defaults true. Restricts to users with active=1 (where
+//     the column exists; users.active was added in v0.0.25 — but in this
+//     codebase the column is on users.available rather than users.active.
+//     We use users.available which is the actual column name in db/init.js.)
+//   - opts.excludeUserIds: array of user IDs to exclude (e.g., the requester
+//     in a peer-share broadcast, or analysts on the requester's exclude list).
+function getEligibleRecipients(eventType, opts = {}) {
+  if (!isKnownEventType(eventType)) {
+    throw new Error(`getEligibleRecipients(): unknown event type "${eventType}"`);
+  }
+
+  const { roles, activeOnly = true, excludeUserIds = [] } = opts;
+  const eventDefaults = EVENT_TYPES[eventType].default;
+
+  const db = getDb();
+  try {
+    // Build user query
+    const conditions = [];
+    const params = [];
+    if (Array.isArray(roles) && roles.length > 0) {
+      conditions.push(`role IN (${roles.map(() => '?').join(',')})`);
+      params.push(...roles);
+    }
+    if (activeOnly) conditions.push('available = 1');
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const users = db.prepare(`SELECT id FROM users ${whereClause}`).all(...params);
+
+    // Pre-fetch all preferences for this event type in one query
+    const prefRows = db.prepare(`
+      SELECT user_id, in_app, email FROM notification_preferences WHERE event_type = ?
+    `).all(eventType);
+    const prefByUser = {};
+    for (const r of prefRows) prefByUser[r.user_id] = { in_app: r.in_app === 1, email: r.email === 1 };
+
+    const excludeSet = new Set(excludeUserIds);
+    const eligible = [];
+    for (const u of users) {
+      if (excludeSet.has(u.id)) continue;
+      const pref = prefByUser[u.id] || { in_app: eventDefaults.in_app === 1, email: eventDefaults.email === 1 };
+      if (pref.in_app || pref.email) eligible.push(u.id);
+    }
+    return eligible;
+  } finally {
+    db.close();
+  }
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -305,4 +364,5 @@ module.exports = {
   markAllRead,
   getPreferences,
   setPreference,
+  getEligibleRecipients,
 };
