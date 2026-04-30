@@ -241,8 +241,33 @@ router.post('/:id/results', (req, res) => {
       insert.run(crypto.randomBytes(16).toString('hex'), req.params.id, req.user.id, s.skillId, score);
     }
 
+    // Fetch assessment metadata + creator BEFORE close so we can notify the lead.
+    const meta = db.prepare(`
+      SELECT a.id, a.name, a.created_by, u.name AS analyst_name
+      FROM assessments a, users u
+      WHERE a.id = ? AND u.id = ?
+    `).get(req.params.id, req.user.id);
+
     db.close();
     auditLog(req.user.id, 'ASSESSMENT_COMPLETED', `assessment=${req.params.id} skills=${scores.length}`, req.ip);
+
+    // Notify the lead who created the assessment. Skip if the creator is the
+    // submitting user (lead-self-assessment edge case).
+    if (meta && meta.created_by && meta.created_by !== req.user.id) {
+      try {
+        notifications.notify({
+          recipientId: meta.created_by,
+          eventType: 'assessment_completed',
+          title: `Assessment completed: ${meta.name}`,
+          body: `${meta.analyst_name} submitted ${scores.length} skill score${scores.length === 1 ? '' : 's'} for the "${meta.name}" assessment. Open the Skills & Assessments tab to review their results and gap analysis.`,
+          linkTab: 'skills',
+          linkParams: { assessmentId: req.params.id, analystId: req.user.id },
+        });
+      } catch (notifyErr) {
+        logger.warn('Assessment complete: notify creator failed (non-fatal)', { assessmentId: req.params.id, creatorId: meta.created_by, error: notifyErr.message });
+      }
+    }
+
     res.json({ ok: true, recorded: scores.length });
   } catch (err) {
     logger.error('Record assessment results error', { error: err.message });

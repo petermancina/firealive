@@ -25,7 +25,7 @@
       "main.js",
       "preload.js",
       "index.html",
-      "socorra-v0031.jsx",
+      "firealive-mc.jsx",
       "assets/**/*"
     ],
     "extraResources": [

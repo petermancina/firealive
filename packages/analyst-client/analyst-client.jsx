@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SOCORRA ANALYST CLIENT v1.0.0 — Complete Standalone Desktop Application
+// FIREALIVE ANALYST CLIENT — Complete Standalone Desktop Application
 // FULL FEATURE SET: Login+MFA, Welcome Guide with Burnout Primer, Inactivity Lock,
 // Biometric Unlock, Burnout Signals with drill-down resources, Delegation with 
 // action buttons, FULL Peer Skill-Share (disclaimer, scheduling, exclusion lists,
@@ -15,7 +15,7 @@
 // Research Knowledge Base (42 entries) and AI synthesis engine included.
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect, useRef } from "react";
-// SOCORRA — SOC Analyst Wellbeing Platform v0.0.25
+// FIREALIVE — SOC Analyst Wellbeing Platform
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
@@ -321,8 +321,45 @@ export default function AnalystClientApp() {
   // ── Tab navigation ──
   const [tab, setTab] = useState("home");
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/v1/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
+
+  // ── Inbox state (Phase 1.4a) ──────────────────────────────────────────
+  const [inboxItems, setInboxItems] = useState([]);
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
+  const [inboxIncludeRead, setInboxIncludeRead] = useState(false);
+  const [inboxLoading, setInboxLoading] = useState(false);
+  const [inboxView, setInboxView] = useState("list"); // list | preferences
+  const [inboxPrefs, setInboxPrefs] = useState(null);
+  const [inboxPrefsLoading, setInboxPrefsLoading] = useState(false);
+
+  // Poll unread count every 60s; load list when entering inbox tab.
+  useEffect(()=>{
+    let cancelled = false;
+    const fetchCount = ()=>{
+      api.get("/api/inbox/unread-count").then(r=>{ if(!cancelled) setInboxUnreadCount(r?.unread||0); }).catch(()=>{});
+    };
+    fetchCount();
+    const handle = setInterval(fetchCount, 60000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, []);
+
+  // When inbox tab is opened, load items (or preferences depending on view).
+  useEffect(()=>{
+    if (tab !== "inbox") return;
+    if (inboxView === "list") {
+      setInboxLoading(true);
+      api.get(`/api/inbox?includeRead=${inboxIncludeRead?"true":"false"}`).then(r=>{
+        setInboxItems(r?.items||[]);
+      }).catch(()=>{}).finally(()=>setInboxLoading(false));
+    } else if (inboxView === "preferences") {
+      setInboxPrefsLoading(true);
+      api.get("/api/inbox/preferences").then(r=>{
+        setInboxPrefs(r?.preferences||null);
+      }).catch(()=>{}).finally(()=>setInboxPrefsLoading(false));
+    }
+  }, [tab, inboxView, inboxIncludeRead]);
+
   const tabs=[
-    {id:"home",label:"Home"},{id:"signals",label:"My Signals"},{id:"delegate",label:"Delegate"},
+    {id:"home",label:"Home"},{id:"signals",label:"My Signals"},{id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"delegate",label:"Delegate"},
     {id:"peers",label:"Peers"},{id:"board",label:"Board"},{id:"ooda",label:"IR Simulator"},
     {id:"skills",label:"Skills & Assessments"},{id:"training",label:"Training & Certs"},{id:"recovery",label:"Post-Incident Wellness"},
     {id:"scan",label:"Self-Scan"},{id:"audit_tab",label:"Audit"},{id:"privacy",label:"Privacy"},
@@ -1233,6 +1270,81 @@ export default function AnalystClientApp() {
             <M style={{color:C.td,display:"block",marginBottom:12}}>{selfScanResult.passed}/{selfScanResult.tests} tests passed · Results auto-sent to management console ✓</M>
             {selfScanResult.details.map((d,i)=><div key={i} style={{padding:"4px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.a}}>✓ </M><M style={{color:C.t}}>{d}</M></div>)}
           </Card>)}
+        </div>)}
+
+        {/* ══════════ INBOX ══════════ */}
+        {tab==="inbox"&&(<div>
+          <div style={{display:"flex",gap:6,marginBottom:12}}>
+            <button onClick={()=>setInboxView("list")} style={{padding:"6px 12px",background:inboxView==="list"?C.ad:"transparent",border:`1px solid ${inboxView==="list"?C.a+"50":C.b}`,borderRadius:6,color:inboxView==="list"?C.a:C.tm,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Notifications</button>
+            <button onClick={()=>setInboxView("preferences")} style={{padding:"6px 12px",background:inboxView==="preferences"?C.ad:"transparent",border:`1px solid ${inboxView==="preferences"?C.a+"50":C.b}`,borderRadius:6,color:inboxView==="preferences"?C.a:C.tm,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Preferences</button>
+          </div>
+          {inboxView==="list"&&(<div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <L style={{marginBottom:0}}>Inbox{inboxUnreadCount>0?` — ${inboxUnreadCount} unread`:""}</L>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:11,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>
+                <input type="checkbox" checked={inboxIncludeRead} onChange={e=>{const v=e.target.checked;setInboxIncludeRead(v);setInboxLoading(true);api.get(`/api/inbox?includeRead=${v?"true":"false"}`).then(r=>{setInboxItems(r?.items||[]);}).catch(()=>{}).finally(()=>setInboxLoading(false));}}/>
+                Show read
+              </label>
+              <Btn small onClick={()=>{setInboxLoading(true);api.get(`/api/inbox?includeRead=${inboxIncludeRead?"true":"false"}`).then(r=>setInboxItems(r?.items||[])).catch(()=>{}).finally(()=>setInboxLoading(false));api.get("/api/inbox/unread-count").then(r=>setInboxUnreadCount(r?.unread||0)).catch(()=>{});}}>Refresh</Btn>
+              <Btn small onClick={()=>{api.post("/api/inbox/read-all",{}).then(()=>{setInboxUnreadCount(0);api.get(`/api/inbox?includeRead=${inboxIncludeRead?"true":"false"}`).then(r=>setInboxItems(r?.items||[])).catch(()=>{});logC("INBOX_MARK_ALL_READ","All notifications marked read");}).catch(()=>{});}}>Mark all read</Btn>
+            </div>
+          </div>
+          {inboxLoading&&<M style={{color:C.td,display:"block",marginBottom:10}}>Loading…</M>}
+          {!inboxLoading&&inboxItems.length===0&&<Card><M style={{color:C.tm}}>No notifications. The Inbox shows assessments assigned to you, retro check-ins, peer requests, panic-mode broadcasts, and other workflow events from across FireAlive.</M></Card>}
+          {inboxItems.map(n=>(
+            <Card key={n.id} style={{marginBottom:8,borderLeft:`3px solid ${n.read_at?C.b:C.a}`,opacity:n.read_at?0.65:1}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{n.title}</div>
+                  {n.body&&<M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:6}}>{n.body}</M>}
+                  <div style={{display:"flex",gap:10,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>
+                    <span>{n.event_type}</span>
+                    <span>·</span>
+                    <span>{n.created_at}</span>
+                    {n.link_tab&&<><span>·</span><a href="#" onClick={e=>{e.preventDefault();setTab(n.link_tab);if(!n.read_at){api.post(`/api/inbox/${n.id}/read`,{}).then(()=>{setInboxItems(prev=>prev.map(it=>it.id===n.id?{...it,read_at:new Date().toISOString()}:it));setInboxUnreadCount(c=>Math.max(0,c-1));}).catch(()=>{});}}} style={{color:C.a,textDecoration:"none"}}>Open ↗</a></>}
+                  </div>
+                </div>
+                {!n.read_at&&<Btn small onClick={()=>{api.post(`/api/inbox/${n.id}/read`,{}).then(()=>{setInboxItems(prev=>prev.map(it=>it.id===n.id?{...it,read_at:new Date().toISOString()}:it));setInboxUnreadCount(c=>Math.max(0,c-1));}).catch(()=>{});}}>Mark read</Btn>}
+              </div>
+            </Card>          
+          ))}
+          </div>)}
+          {inboxView==="preferences"&&(<div>
+            <L>Notification preferences</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For each event type, choose whether you want to be notified in the inbox, by email, both, or neither. Some critical events (panic mode, tripwire) cannot be disabled in-app — you can still opt out of email for these.</M>
+            {inboxPrefsLoading&&<M style={{color:C.td}}>Loading preferences…</M>}
+            {!inboxPrefsLoading&&!inboxPrefs&&<Card><M style={{color:C.tm}}>Could not load preferences. The server may be unavailable.</M></Card>}
+            {inboxPrefs&&Object.entries(inboxPrefs).map(([eventType,p])=>(
+              <Card key={eventType} style={{marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{p.label}</div>
+                <M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:10}}>{p.description}</M>
+                <div style={{display:"flex",gap:16}}>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                    <input type="checkbox" checked={p.in_app} onChange={e=>{
+                      const newInApp = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:newInApp,email:p.email}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],in_app:newInApp,is_default:false}}));
+                      }).catch(err=>{
+                        logC("INBOX_PREF_REJECTED",`${eventType} in_app change rejected (likely mandatory in-app event)`);
+                      });
+                    }}/>
+                    <M style={{color:C.t}}>In-app</M>
+                  </label>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                    <input type="checkbox" checked={p.email} onChange={e=>{
+                      const newEmail = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:newEmail}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],email:newEmail,is_default:false}}));
+                      }).catch(()=>{});
+                    }}/>
+                    <M style={{color:C.t}}>Email</M>
+                  </label>
+                  {p.is_default&&<M style={{color:C.td,fontStyle:"italic"}}>(default)</M>}
+                </div>
+              </Card>
+            ))}
+          </div>)}
         </div>)}
 
         {/* ══════════ AUDIT & FORENSICS ══════════ */}

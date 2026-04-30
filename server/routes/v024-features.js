@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 // ── MFA Configuration ───────────────────────────────────────────────────────
 router.get('/mfa/config', (req, res) => {
@@ -93,7 +94,7 @@ router.post('/tripwire/check', (req, res) => {
     const cfg = cfgRow ? JSON.parse(cfgRow.value) : { enabled: false };
     if (!cfg.enabled) { db.close(); return res.json({ tripped: false, reason: 'tripwire disabled' }); }
 
-    const analysts = db.prepare("SELECT COUNT(*) as total FROM analysts").get();
+    const analysts = db.prepare("SELECT COUNT(*) as total FROM users WHERE role = 'analyst'").get();
     const reducedRouting = db.prepare("SELECT COUNT(*) as count FROM routing_overrides WHERE type = 'reduced_load' AND active = 1").get();
     const pct = analysts.total > 0 ? (reducedRouting.count / analysts.total) * 100 : 0;
 
@@ -104,7 +105,36 @@ router.post('/tripwire/check', (req, res) => {
         db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('routing_paused', 'true')").run();
       }
       db.close();
-      return res.json({ tripped: true, pct: pct.toFixed(1), threshold: cfg.thresholdPct, actions: { routingDisabled: cfg.autoDisableRouting, leadNotified: cfg.notifyLead, soarTriggered: cfg.triggerSoarScan, edrTriggered: cfg.triggerEdrScan } });
+
+      // Broadcast tripwire engagement to every active analyst. No requester
+      // to exclude — this is fired by the system. mandatoryInApp ensures
+      // every analyst sees this in-app regardless of preferences.
+      let notifiedCount = 0;
+      try {
+        const eligible = notifications.getEligibleRecipients('routing_panic_engaged_tripwire', {
+          roles: ['analyst'],
+          activeOnly: true,
+        });
+        for (const recipientId of eligible) {
+          try {
+            notifications.notify({
+              recipientId,
+              eventType: 'routing_panic_engaged_tripwire',
+              title: 'Tripwire engaged — wellness routing OFF',
+              body: `The tripwire fired automatically because ${pct.toFixed(1)}% of analysts are on reduced routing (threshold ${cfg.thresholdPct}%). All analysts are now at maximum complexity until a team lead reviews the situation.`,
+              linkTab: 'routing',
+              linkParams: { focus: 'tripwire' },
+            });
+            notifiedCount++;
+          } catch (notifyErr) {
+            logger.warn('Tripwire: notify analyst failed (non-fatal)', { recipientId, error: notifyErr.message });
+          }
+        }
+      } catch (broadcastErr) {
+        logger.error('Tripwire: broadcast failed (non-fatal)', { error: broadcastErr.message });
+      }
+
+      return res.json({ tripped: true, pct: pct.toFixed(1), threshold: cfg.thresholdPct, notified: notifiedCount, actions: { routingDisabled: cfg.autoDisableRouting, leadNotified: cfg.notifyLead, soarTriggered: cfg.triggerSoarScan, edrTriggered: cfg.triggerEdrScan } });
     }
     db.close();
     res.json({ tripped: false, pct: pct.toFixed(1), threshold: cfg.thresholdPct });

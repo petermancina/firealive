@@ -92,10 +92,22 @@ const EVENT_TYPES = {
     default: { in_app: 1, email: 0 },
     description: 'Your delegation request was accepted or rejected.',
   },
-  routing_panic_engaged: {
-    label: 'Panic-mode routing engaged',
+  routing_panic_engaged_manual: {
+    label: 'Panic-mode routing engaged (manual)',
     default: { in_app: 1, email: 1 },
-    description: '(Leads/admins) Panic mode has been engaged on the team.',
+    description: 'A team lead has manually engaged panic mode. Wellness routing is OFF and every analyst is at maximum complexity until panic mode is lifted. In-app delivery cannot be turned off for this event.',
+    mandatoryInApp: true,
+  },
+  routing_panic_engaged_tripwire: {
+    label: 'Panic-mode routing engaged (tripwire)',
+    default: { in_app: 1, email: 1 },
+    description: 'The tripwire fired automatically because too many analysts are on reduced routing. Wellness routing is OFF and every analyst is at maximum complexity until the situation is reviewed. In-app delivery cannot be turned off for this event.',
+    mandatoryInApp: true,
+  },
+  routing_panic_lifted: {
+    label: 'Panic-mode routing lifted',
+    default: { in_app: 1, email: 0 },
+    description: 'Panic mode has been lifted. Wellness routing is back on and analysts have returned to their previous complexity caps.',
   },
 };
 
@@ -276,6 +288,13 @@ function setPreference(userId, eventType, { in_app, email }) {
   if (!isKnownEventType(eventType)) {
     throw new Error(`setPreference(): unknown event type "${eventType}"`);
   }
+  // Refuse to disable in_app for events flagged mandatoryInApp.
+  // These are critical events (panic mode, tripwire) where every analyst
+  // MUST see the in-app notification regardless of preference. Email
+  // opt-out is still allowed — only in_app is enforced.
+  if (EVENT_TYPES[eventType].mandatoryInApp && !in_app) {
+    throw new Error(`setPreference(): in_app delivery cannot be disabled for "${eventType}" — this event is mandatory in-app for all users`);
+  }
   const db = getDb();
   try {
     db.prepare(`
@@ -336,9 +355,15 @@ function getEligibleRecipients(eventType, opts = {}) {
     for (const r of prefRows) prefByUser[r.user_id] = { in_app: r.in_app === 1, email: r.email === 1 };
 
     const excludeSet = new Set(excludeUserIds);
+    const isMandatoryInApp = !!EVENT_TYPES[eventType].mandatoryInApp;
     const eligible = [];
     for (const u of users) {
       if (excludeSet.has(u.id)) continue;
+      // For mandatoryInApp events, every matching user is eligible regardless
+      // of their stored preference — these events (panic, tripwire) cannot
+      // be silenced in-app. For all other events, the user must have at
+      // least one channel turned on.
+      if (isMandatoryInApp) { eligible.push(u.id); continue; }
       const pref = prefByUser[u.id] || { in_app: eventDefaults.in_app === 1, email: eventDefaults.email === 1 };
       if (pref.in_app || pref.email) eligible.push(u.id);
     }

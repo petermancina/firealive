@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SOCORRA GLOBAL DASHBOARD SERVER v0.0.31 — Database Initialization
+// FIREALIVE GLOBAL DASHBOARD SERVER — Database Initialization
 // Independent backend for the CISO Global Dashboard. 
 // Stores: regional MC data, users, sessions, audit logs, configs, backups,
 // notifications, compliance data, system health metrics.
