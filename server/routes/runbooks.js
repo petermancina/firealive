@@ -15,6 +15,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
+const { parsePolicyToSteps } = require('../services/runbook-parser');
 
 const VALID_SCENARIO_TYPES = [
   'ransomware',
@@ -30,81 +31,8 @@ const VALID_SCENARIO_TYPES = [
   'ir_team_handoff',
 ];
 
-function parsePolicyToSteps(policyContent, scenarioType) {
-  const lines = policyContent.split(/\r?\n/);
-  const steps = [];
-  let currentStep = null;
-  let inStepsSection = false;
-
-  const numberedRe = /^\s*(\d+)[\.\)]\s+(.+)/;
-  const headerStepRe = /^#{2,6}\s+(?:Step\s+)?(\d+)[:\.]?\s+(.+)/i;
-  const stepsHeaderRe = /^#{2,6}\s+(steps?|procedures?|actions?|response|recovery)\b/i;
-  const bulletRe = /^\s*[\*\-\+]\s+(.+)/;
-
-  function pushStep(s) {
-    if (!s) return;
-    const title = (s.title || '').slice(0, 200);
-    const instruction = (s.instructionLines || []).join('\n').trim() || title;
-    if (!title && !instruction) return;
-    let expectedOutcome = null;
-    const outcomeMatch = instruction.match(/(?:^|\n)\s*(?:Expected|Outcome|Result)[:\.]?\s*(.+?)(?=\n\s*\n|$)/is);
-    if (outcomeMatch) expectedOutcome = outcomeMatch[1].trim().slice(0, 1000);
-    const isCritical = /\b(CRITICAL|MANDATORY|MUST)\b/i.test(title) || /\b(CRITICAL|MANDATORY|MUST NOT FAIL)\b/i.test(instruction.slice(0, 500));
-    steps.push({
-      title,
-      instruction: instruction.slice(0, 5000),
-      expected_outcome: expectedOutcome,
-      is_critical: isCritical ? 1 : 0,
-    });
-  }
-
-  for (const line of lines) {
-    const headerStepMatch = line.match(headerStepRe);
-    if (headerStepMatch) {
-      pushStep(currentStep);
-      currentStep = { title: headerStepMatch[2].trim(), instructionLines: [] };
-      inStepsSection = true;
-      continue;
-    }
-    const numberedMatch = line.match(numberedRe);
-    if (numberedMatch) {
-      pushStep(currentStep);
-      currentStep = { title: numberedMatch[2].trim(), instructionLines: [] };
-      inStepsSection = true;
-      continue;
-    }
-    if (stepsHeaderRe.test(line)) {
-      inStepsSection = true;
-      continue;
-    }
-    if (inStepsSection) {
-      const bulletMatch = line.match(bulletRe);
-      if (bulletMatch && !currentStep) {
-        currentStep = { title: bulletMatch[1].trim(), instructionLines: [] };
-        continue;
-      }
-      if (bulletMatch && currentStep) {
-        currentStep.instructionLines.push('* ' + bulletMatch[1].trim());
-        continue;
-      }
-      if (line.trim() && currentStep) {
-        currentStep.instructionLines.push(line);
-      }
-    }
-  }
-  pushStep(currentStep);
-
-  if (steps.length === 0) {
-    steps.push({
-      title: 'Review the source policy and add steps manually',
-      instruction: 'The runbook generator could not extract structured steps from this policy. Open the source policy in the IR Simulator policies tab, identify the recovery procedure, and add steps to this runbook in draft state before activating.',
-      expected_outcome: null,
-      is_critical: 0,
-    });
-  }
-
-  return steps;
-}
+// Parser is in services/runbook-parser.js — extracted in commit 4a so it can
+// be tested in isolation and reused by future scenario generators.
 
 router.post('/generate', (req, res) => {
   if (!['lead', 'admin'].includes(req.user.role)) {
