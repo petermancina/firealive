@@ -1225,8 +1225,18 @@ function ManagementConsole() {
   const [backups, setBackups] = useState([{id:1,ts:"2026-03-27 02:00",type:"daily-auto",size:"2.4 GB",status:"verified",hash:"sha256:a3f8c…"},{id:2,ts:"2026-03-26 02:00",type:"daily-auto",size:"2.3 GB",status:"verified",hash:"sha256:b7e2d…"}]);
   const [snapshots, setSnapshots] = useState([]);
   const [forensicExports, setFE] = useState([]);
-  const [appVersion] = useState("0.0.24");
-  const [appBuild] = useState("20260411.1");
+  const [appVersion, setAppVersion] = useState("");
+  const [appBuild, setAppBuild] = useState("");
+  const [appFuse, setAppFuse] = useState("");
+  const [appFuseLastIncrement, setAppFuseLastIncrement] = useState("");
+  useEffect(()=>{
+    api.get("/api/system/version").then(r=>{
+      if (r?.version) setAppVersion(r.version);
+      if (r?.buildId) setAppBuild(r.buildId);
+      if (r?.fuseCounter !== undefined) setAppFuse(String(r.fuseCounter));
+      if (r?.fuseLastIncrement) setAppFuseLastIncrement(r.fuseLastIncrement);
+    }).catch(()=>{});
+  }, []);
   const [updateCheck, setUpdateCheck] = useState(null); // null | "checking" | {available,version} | "current"
   const [routingCaps, setRC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,a.tier===3?5:a.tier===2?3:2])));
   const [unsaved, setUnsaved] = useState(false);
@@ -2789,7 +2799,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <L>Updates & Versioning</L>
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-              <div><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>FireAlive — SOC Analyst Wellbeing Platform</div><M style={{color:C.tm}}>Version {appVersion} · Build {appBuild} · AGPL-3.0</M></div>
+              <div><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>FireAlive — SOC Analyst Wellbeing Platform</div><M style={{color:C.tm}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · AGPL-3.0</M></div>
               <Btn primary onClick={checkUpdate} disabled={updateCheck==="checking"}>{updateCheck==="checking"?"Checking...":"Check for Updates"}</Btn>
             </div>
             {updateCheck&&updateCheck!=="checking"&&(
@@ -2835,7 +2845,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Version & Anti-Rollback Status</div>
-            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion} · Build {appBuild} · Fuse counter: 1 · Last increment: 2026-04-25T00:00:00Z · Binary hash: sha256:f9c2…b134 · Signed: Ed25519 ✓</M>
+            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · Fuse counter: {appFuse||"…"} · Last increment: {appFuseLastIncrement||"…"} · Signed: Ed25519 ✓</M>
           </Card>
           <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/pmancina/firealive</M></Card>
         </div>)}
