@@ -22,6 +22,7 @@ const { logger } = require('../services/logger');
 const { generateComplianceReport, FRAMEWORKS, signLogBatch, toSyslog, getSeverity, SEVERITY_LABELS } = require('../services/compliance');
 const { runRetentionPurge, getRetentionConfig, DEFAULT_RETENTION } = require('../services/retention');
 const { runtimeMonitor } = require('../services/runtime-monitor');
+const { version } = require('../lib/version');
 
 // ── Compliance Reports ───────────────────────────────────────────────────────
 router.get('/compliance/report/:framework', (req, res) => {
@@ -66,7 +67,7 @@ router.get('/monitoring/health-detail', (req, res) => {
     res.json({
       runtime: runtimeMonitor.getMetrics(),
       app: {
-        version: '0.0.20',
+        version,
         fuse: parseInt(fuse?.value, 10),
         panicMode: panicMode?.value === '"active"',
         users: userCount.c,
@@ -180,7 +181,7 @@ router.get('/audit/export-forensics', (req, res) => {
     // Structured JSON for general forensics tools
     const forensicsData = {
       exportType: 'firealive_forensics',
-      version: '0.0.20',
+      version,
       exportedAt: new Date().toISOString(),
       eventCount: events.length,
       integrity: signLogBatch(events),
