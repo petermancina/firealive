@@ -28,24 +28,28 @@ const OODA_PHASES = ['observe', 'orient', 'decide', 'act'];
 router.post('/policies', (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can upload policies' });
 
-  const { title, content, type } = req.body;
+  const { title, content, type, scenarioTags } = req.body;
   if (!title || !content) return res.status(400).json({ error: 'title and content required' });
   if (content.length > MAX_POLICY_SIZE) return res.status(400).json({ error: `Content too large (max ${MAX_POLICY_SIZE / 1000}KB)` });
 
   const validTypes = ['incident_response', 'playbook', 'runbook', 'policy', 'procedure'];
   const safeType = validTypes.includes(type) ? type : 'policy';
+  const safeTitle = title.slice(0, 256);
+  const safeContent = content.slice(0, MAX_POLICY_SIZE);
+  const tags = Array.isArray(scenarioTags) ? scenarioTags.filter(t => typeof t === 'string').slice(0, 20) : [];
+  const contentHash = crypto.createHash('sha256').update(safeContent).digest('hex');
 
   try {
     const db = getDb();
     const id = crypto.randomBytes(16).toString('hex');
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(
-      `ooda_policy_${id}`,
-      JSON.stringify({ id, title: title.slice(0, 256), type: safeType, content: content.slice(0, MAX_POLICY_SIZE), uploadedAt: new Date().toISOString(), uploadedBy: req.user.id }),
-      req.user.id
-    );
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO ir_policies (id, title, policy_type, content, content_hash, scenario_tags, version, uploaded_by, uploaded_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(id, safeTitle, safeType, safeContent, contentHash, JSON.stringify(tags), req.user.id, now, now);
     db.close();
-    auditLog(req.user.id, 'OODA_POLICY_UPLOADED', `"${title}" (${safeType})`, req.ip);
-    res.status(201).json({ id, title, type: safeType });
+    auditLog(req.user.id, 'OODA_POLICY_UPLOADED', `"${safeTitle}" (${safeType})`, req.ip);
+    res.status(201).json({ id, title: safeTitle, type: safeType, scenarioTags: tags });
   } catch (err) {
     logger.error('Upload policy error', { error: err.message });
     res.status(500).json({ error: 'Failed to upload policy' });
@@ -55,9 +59,23 @@ router.post('/policies', (req, res) => {
 router.get('/policies', (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_policy_%'").all();
+    const rows = db.prepare(`
+      SELECT id, title, policy_type AS type, scenario_tags, version, uploaded_by, uploaded_at, updated_at
+      FROM ir_policies
+      WHERE deleted_at IS NULL
+      ORDER BY uploaded_at DESC
+    `).all();
     db.close();
-    const policies = rows.map(r => { try { const d = JSON.parse(r.value); return { id: d.id, title: d.title, type: d.type, uploadedAt: d.uploadedAt }; } catch { return null; } }).filter(Boolean);
+    const policies = rows.map(r => ({
+      id: r.id,
+      title: r.title,
+      type: r.type,
+      scenarioTags: (() => { try { return JSON.parse(r.scenario_tags); } catch { return []; } })(),
+      version: r.version,
+      uploadedBy: r.uploaded_by,
+      uploadedAt: r.uploaded_at,
+      updatedAt: r.updated_at,
+    }));
     res.json({ policies });
   } catch (err) {
     res.status(500).json({ error: 'Failed to list policies' });
@@ -68,8 +86,13 @@ router.delete('/policies/:id', (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can remove policies' });
   try {
     const db = getDb();
-    db.prepare("DELETE FROM team_config WHERE key = ?").run(`ooda_policy_${req.params.id}`);
+    // Soft delete: preserve the row so historical runbooks can still
+    // reference the policy version they were generated from.
+    const result = db.prepare("UPDATE ir_policies SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(req.params.id);
     db.close();
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Policy not found or already deleted' });
+    }
     auditLog(req.user.id, 'OODA_POLICY_REMOVED', req.params.id, req.ip);
     res.json({ ok: true });
   } catch (err) {
@@ -127,8 +150,8 @@ router.post('/generate', (req, res) => {
     const db = getDb();
 
     // Load policies and AARs for context
-    const policies = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_policy_%'").all()
-      .map(r => { try { return JSON.parse(r.value); } catch { return null; } }).filter(Boolean);
+    const policies = db.prepare("SELECT id, title, policy_type AS type, content, scenario_tags, version, uploaded_by, uploaded_at FROM ir_policies WHERE deleted_at IS NULL").all()
+      .map(p => ({ ...p, scenario_tags: (() => { try { return JSON.parse(p.scenario_tags); } catch { return []; } })() }));
     const aars = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_aar_%'").all()
       .map(r => { try { return JSON.parse(r.value); } catch { return null; } }).filter(Boolean);
 
