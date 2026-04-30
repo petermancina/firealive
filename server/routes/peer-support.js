@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 // ── Default Disclaimer ───────────────────────────────────────────────────────
 const DEFAULT_DISCLAIMER = `PEER SUPPORT CHAT — GUIDELINES & AGREEMENT
@@ -204,12 +205,14 @@ router.post('/sessions/:id/timeout', (req, res) => {
     db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(noShowKey, JSON.stringify(noShows), req.user.id);
 
     // Re-open the original request (minus the no-show accepter)
+    let requestReopened = false;
     const requestRow = db.prepare("SELECT value FROM team_config WHERE key = ?").get(`peer_request_${session.requestId}`);
     if (requestRow) {
       const request = JSON.parse(requestRow.value);
       request.status = 'open';
       if (!request.excludeIds.includes(session.accepterId)) request.excludeIds.push(session.accepterId);
       db.prepare("UPDATE team_config SET value = ? WHERE key = ?").run(JSON.stringify(request), `peer_request_${session.requestId}`);
+      requestReopened = true;
     }
 
     // Alert team lead if 3+ no-shows
@@ -219,6 +222,23 @@ router.post('/sessions/:id/timeout', (req, res) => {
 
     db.close();
     auditLog(req.user.id, 'PEER_TIMEOUT', `session=${req.params.id} — re-queued`, req.ip);
+
+    // Notify the seeker (session.requesterId) that their request was re-queued
+    try {
+      notifications.notify({
+        recipientId: session.requesterId,
+        eventType: 'peer_session_timed_out',
+        title: 'Peer support request re-queued',
+        body: requestReopened
+          ? `The peer who accepted your support request did not show up, so your request has been re-queued for a different helper. The previous helper has been excluded from seeing this request again. You don't need to do anything — just wait for someone else to accept, or re-post the request if you'd prefer.`
+          : `The peer support session you were in timed out. The original request could not be re-opened automatically. Please post a new request from the Peer Skill-Share tab if you still need support.`,
+        linkTab: 'peer-share',
+        linkParams: { focus: requestReopened ? 'requests' : 'create' },
+      });
+    } catch (notifyErr) {
+      logger.warn('Peer timeout: notify seeker failed (non-fatal)', { sessionId: req.params.id, requesterId: session.requesterId, error: notifyErr.message });
+    }
+
     res.json({ ok: true, message: 'Session timed out. Request re-queued.' });
   } catch (err) {
     logger.error('Timeout session error', { error: err.message });
