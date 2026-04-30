@@ -150,4 +150,167 @@ router.post('/flags', (req, res) => {
   });
 });
 
+// ── GET /api/peer/flags — list flags for review ─────────────────────────────
+//
+// Lead/admin only. Query parameters:
+//   ?status=open|resolved|all   (default: open)
+//   ?tier=1|2|3                 (optional filter)
+//
+// Response: { flags: [...] }
+//
+// Each flag includes decrypted content. Identity reveal follows tier rules:
+//   - Tier 1: flagger and flagged are both anonymized to "Analyst-XXX"
+//   - Tier 2: flagged peer's real name is shown; flagger remains anonymized
+//   - Tier 3: both real names are shown (reciprocal accountability)
+//
+// The reveal happens at read time so a lead who skims a tier-1 flag never
+// even sees encrypted-but-decryptable identity data — the response itself
+// omits the names.
+router.get('/flags', (req, res) => {
+  if (!['lead', 'admin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const status = ['open', 'resolved', 'all'].includes(req.query.status) ? req.query.status : 'open';
+  const tierFilter = ['1', '2', '3'].includes(req.query.tier) ? parseInt(req.query.tier, 10) : null;
+
+  let where = '';
+  const params = [];
+  if (status === 'open') where += ' WHERE f.resolved_at IS NULL';
+  else if (status === 'resolved') where += ' WHERE f.resolved_at IS NOT NULL';
+  if (tierFilter !== null) {
+    where += where ? ' AND' : ' WHERE';
+    where += ' f.tier = ?';
+    params.push(tierFilter);
+  }
+
+  let rows;
+  try {
+    const db = getDb();
+    rows = db.prepare(`
+      SELECT
+        f.id, f.session_id, f.flagger_user_id, f.flagged_user_id, f.tier,
+        f.content_encrypted, f.flagger_ip, f.created_at,
+        f.resolved_at, f.resolved_by, f.resolution_note,
+        flagger.name AS flagger_name,
+        flagged.name AS flagged_name,
+        resolver.name AS resolver_name
+      FROM peer_abuse_flags f
+      LEFT JOIN users flagger ON flagger.id = f.flagger_user_id
+      LEFT JOIN users flagged ON flagged.id = f.flagged_user_id
+      LEFT JOIN users resolver ON resolver.id = f.resolved_by
+      ${where}
+      ORDER BY f.tier DESC, f.created_at DESC
+    `).all(...params);
+    db.close();
+  } catch (err) {
+    logger.error('Failed to list peer abuse flags', { error: err.message });
+    return res.status(500).json({ error: 'failed to list flags' });
+  }
+
+  const { decryptTier3 } = require('../services/encryption');
+
+  const flags = rows.map((row) => {
+    let content;
+    try {
+      content = decryptTier3(row.content_encrypted);
+    } catch (err) {
+      logger.error('Failed to decrypt flag content', { flagId: row.id, error: err.message });
+      content = '[decryption failed — Tier-3 key may be misconfigured]';
+    }
+
+    // Identity reveal by tier. Anonymize names that this tier should not reveal.
+    // We use first 8 chars of the user ID as the anonymous suffix so the lead
+    // can still distinguish multiple anonymous flaggers/flagged in the same view.
+    const flaggerAnon = `Analyst-${row.flagger_user_id.slice(0, 8)}`;
+    const flaggedAnon = `Analyst-${row.flagged_user_id ? row.flagged_user_id.slice(0, 8) : 'unknown'}`;
+
+    let flaggerDisplay, flaggedDisplay;
+    if (row.tier === 1) {
+      flaggerDisplay = flaggerAnon;
+      flaggedDisplay = flaggedAnon;
+    } else if (row.tier === 2) {
+      flaggerDisplay = flaggerAnon;
+      flaggedDisplay = row.flagged_name || flaggedAnon;
+    } else {
+      // tier 3 — both revealed
+      flaggerDisplay = row.flagger_name || flaggerAnon;
+      flaggedDisplay = row.flagged_name || flaggedAnon;
+    }
+
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      tier: row.tier,
+      content,
+      flaggerDisplay,
+      flaggedDisplay,
+      flaggerIp: row.tier >= 2 ? row.flagger_ip : null, // tier-1 IPs not exposed
+      createdAt: row.created_at,
+      resolvedAt: row.resolved_at,
+      resolvedBy: row.resolver_name,
+      resolutionNote: row.resolution_note,
+    };
+  });
+
+  return res.json({ flags });
+});
+
+// ── POST /api/peer/flags/:id/resolve — resolve a flag ───────────────────────
+//
+// Lead/admin only. Marks a flag as resolved with an optional note.
+//
+// Request body:
+//   { note?: string (max 2000 chars) }
+//
+// Response: { id, resolvedAt, resolvedBy, note }
+router.post('/flags/:id/resolve', (req, res) => {
+  if (!['lead', 'admin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const flagId = req.params.id;
+  if (!flagId || typeof flagId !== 'string' || flagId.length > 64) {
+    return res.status(400).json({ error: 'invalid flag id' });
+  }
+
+  const note = (req.body && typeof req.body.note === 'string') ? req.body.note.slice(0, 2000) : null;
+  const now = new Date().toISOString();
+
+  let updated;
+  try {
+    const db = getDb();
+    const existing = db.prepare("SELECT id, resolved_at, tier FROM peer_abuse_flags WHERE id = ?").get(flagId);
+    if (!existing) {
+      db.close();
+      return res.status(404).json({ error: 'flag not found' });
+    }
+    if (existing.resolved_at) {
+      db.close();
+      return res.status(409).json({ error: 'flag already resolved' });
+    }
+
+    db.prepare(`
+      UPDATE peer_abuse_flags
+      SET resolved_at = ?, resolved_by = ?, resolution_note = ?
+      WHERE id = ?
+    `).run(now, req.user.id, note, flagId);
+
+    updated = { tier: existing.tier };
+    db.close();
+  } catch (err) {
+    logger.error('Failed to resolve peer abuse flag', { flagId, error: err.message });
+    return res.status(500).json({ error: 'failed to resolve flag' });
+  }
+
+  auditLog(req.user.id, 'PEER_ABUSE_FLAG_RESOLVED', `flag ${flagId}, tier ${updated.tier}`, req.ip);
+
+  return res.json({
+    id: flagId,
+    resolvedAt: now,
+    resolvedBy: req.user.id,
+    note,
+  });
+});
+
 module.exports = router;
