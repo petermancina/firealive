@@ -1244,6 +1244,66 @@ function ManagementConsole() {
     return ()=>{ cancelled = true; clearInterval(handle); };
   }, []);
 
+  // ── IR Recovery Runbook state (Phase 1.4c) ───────────────────────────────
+  const [runbooks, setRunbooks] = useState([]);
+  const [runbooksLoading, setRunbooksLoading] = useState(false);
+  const [runbookStatusFilter, setRunbookStatusFilter] = useState("all"); // all | draft | active | completed | cancelled
+  const [runbookScenarioFilter, setRunbookScenarioFilter] = useState(""); // "" | scenario type
+  const [activeRunbookCount, setActiveRunbookCount] = useState(0);
+  const [activeRunbookMostRecent, setActiveRunbookMostRecent] = useState(null); // id of most recent active runbook for banner click-through
+  const [runbookDetailId, setRunbookDetailId] = useState(null); // when set, detail view renders instead of list
+  const [runbookDetail, setRunbookDetail] = useState(null); // { runbook, steps }
+  const [runbookDetailLoading, setRunbookDetailLoading] = useState(false);
+  const [showGenerateRunbook, setShowGenerateRunbook] = useState(false);
+  const [genRunbookScenario, setGenRunbookScenario] = useState("ransomware");
+  const [genRunbookPolicies, setGenRunbookPolicies] = useState({ tagged: [], untagged: [] });
+  const [genRunbookPolicyId, setGenRunbookPolicyId] = useState("");
+  const [genRunbookTitle, setGenRunbookTitle] = useState("");
+  const [genRunbookIncidentId, setGenRunbookIncidentId] = useState("");
+
+  // Poll active runbook count every 60s for the dashboard banner.
+  // Same pattern as peerFlagOpenCount / peerFlagUrgentOpenCount above.
+  // We track the most recent active runbook id so the banner click
+  // navigates straight to its detail view.
+  useEffect(()=>{
+    let cancelled = false;
+    const fetchActive = ()=>{
+      api.get("/api/runbooks?status=active").then(r=>{
+        if (cancelled) return;
+        const list = r?.runbooks || [];
+        setActiveRunbookCount(list.length);
+        setActiveRunbookMostRecent(list.length > 0 ? list[0].id : null);
+      }).catch(()=>{});
+    };
+    fetchActive();
+    const handle = setInterval(fetchActive, 60000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, []);
+
+  // When the runbook tab is opened or filters change, load the list.
+  // Detail view (when runbookDetailId is set) is loaded by a separate
+  // effect below.
+  useEffect(()=>{
+    if (tab !== "runbook" || runbookDetailId) return;
+    setRunbooksLoading(true);
+    const params = new URLSearchParams();
+    if (runbookStatusFilter !== "all") params.set("status", runbookStatusFilter);
+    if (runbookScenarioFilter) params.set("scenario", runbookScenarioFilter);
+    const qs = params.toString();
+    api.get("/api/runbooks" + (qs ? "?" + qs : "")).then(r=>{
+      setRunbooks(r?.runbooks || []);
+    }).catch(()=>{}).finally(()=>setRunbooksLoading(false));
+  }, [tab, runbookStatusFilter, runbookScenarioFilter, runbookDetailId]);
+
+  // When a detail view is requested, fetch the full runbook + steps.
+  useEffect(()=>{
+    if (!runbookDetailId) { setRunbookDetail(null); return; }
+    setRunbookDetailLoading(true);
+    api.get("/api/runbooks/" + encodeURIComponent(runbookDetailId)).then(r=>{
+      setRunbookDetail(r || null);
+    }).catch(()=>setRunbookDetail(null)).finally(()=>setRunbookDetailLoading(false));
+  }, [runbookDetailId]);
+
   // When peer_conduct tab is opened or filters change, load flags.
   useEffect(()=>{
     if (tab !== "peer_conduct") return;
