@@ -516,8 +516,6 @@ CREATE TABLE IF NOT EXISTS peer_abuse_flags (
   flagged_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
   content_encrypted BLOB NOT NULL,
-  content_iv BLOB NOT NULL,
-  content_tag BLOB NOT NULL,
   flagger_ip TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at TEXT,
