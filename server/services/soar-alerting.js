@@ -8,6 +8,7 @@
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
+const { version } = require('../lib/version');
 
 const ALERT_TYPES = {
   FIM_FILE_MODIFIED: { severity: 'critical', action: 'investigate_app_compromise', containment: 'isolate_host' },
@@ -48,7 +49,7 @@ async function dispatchToSoar(alertType, details) {
     // Build SOAR alert payload
     const payload = {
       source: 'firealive',
-      version: '0.0.21',
+      version,
       alertType,
       severity: config.severity,
       suggestedAction: config.action,
