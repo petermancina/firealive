@@ -1225,8 +1225,18 @@ function ManagementConsole() {
   const [backups, setBackups] = useState([{id:1,ts:"2026-03-27 02:00",type:"daily-auto",size:"2.4 GB",status:"verified",hash:"sha256:a3f8c…"},{id:2,ts:"2026-03-26 02:00",type:"daily-auto",size:"2.3 GB",status:"verified",hash:"sha256:b7e2d…"}]);
   const [snapshots, setSnapshots] = useState([]);
   const [forensicExports, setFE] = useState([]);
-  const [appVersion] = useState("0.0.24");
-  const [appBuild] = useState("20260411.1");
+  const [appVersion, setAppVersion] = useState("");
+  const [appBuild, setAppBuild] = useState("");
+  const [appFuse, setAppFuse] = useState("");
+  const [appFuseLastIncrement, setAppFuseLastIncrement] = useState("");
+  useEffect(()=>{
+    api.get("/api/system/version").then(r=>{
+      if (r?.version) setAppVersion(r.version);
+      if (r?.buildId) setAppBuild(r.buildId);
+      if (r?.fuseCounter !== undefined) setAppFuse(String(r.fuseCounter));
+      if (r?.fuseLastIncrement) setAppFuseLastIncrement(r.fuseLastIncrement);
+    }).catch(()=>{});
+  }, []);
   const [updateCheck, setUpdateCheck] = useState(null); // null | "checking" | {available,version} | "current"
   const [routingCaps, setRC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,a.tier===3?5:a.tier===2?3:2])));
   const [unsaved, setUnsaved] = useState(false);
@@ -2789,7 +2799,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <L>Updates & Versioning</L>
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-              <div><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>FireAlive — SOC Analyst Wellbeing Platform</div><M style={{color:C.tm}}>Version {appVersion} · Build {appBuild} · AGPL-3.0</M></div>
+              <div><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>FireAlive — SOC Analyst Wellbeing Platform</div><M style={{color:C.tm}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · AGPL-3.0</M></div>
               <Btn primary onClick={checkUpdate} disabled={updateCheck==="checking"}>{updateCheck==="checking"?"Checking...":"Check for Updates"}</Btn>
             </div>
             {updateCheck&&updateCheck!=="checking"&&(
@@ -2835,7 +2845,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Version & Anti-Rollback Status</div>
-            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion} · Build {appBuild} · Fuse counter: 1 · Last increment: 2026-04-25T00:00:00Z · Binary hash: sha256:f9c2…b134 · Signed: Ed25519 ✓</M>
+            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · Fuse counter: {appFuse||"…"} · Last increment: {appFuseLastIncrement||"…"} · Signed: Ed25519 ✓</M>
           </Card>
           <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/pmancina/firealive</M></Card>
         </div>)}
@@ -3331,7 +3341,7 @@ regression:
             ))}
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>{const name=window.prompt("Snapshot name:");if(name){setConfigSnaps(prev=>[{id:"cs-"+Date.now(),name,createdAt:new Date().toISOString()},...prev]);addA("CONFIG_SNAPSHOT_SAVED",`"${name}"`);}}}>Save Current</Btn><Btn small onClick={()=>{const data=JSON.stringify({exportType:"firealive_config",version:"0.0.29",exportedAt:new Date().toISOString()},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-config-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);api.post("/api/v1/audit/log",{event:"CONFIG_EXPORTED",detail:"Configuration file downloaded"}).then(()=>addA("CONFIG_EXPORTED","Configuration file downloaded"));}}>Export Config</Btn><Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"CHANGE_REPORT",detail:"Configuration change report generated"}).then(()=>addA("CHANGE_REPORT","Configuration change report generated"))}>Change Report</Btn></div></div>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>{const name=window.prompt("Snapshot name:");if(name){setConfigSnaps(prev=>[{id:"cs-"+Date.now(),name,createdAt:new Date().toISOString()},...prev]);addA("CONFIG_SNAPSHOT_SAVED",`"${name}"`);}}}>Save Current</Btn><Btn small onClick={()=>{const data=JSON.stringify({exportType:"firealive_config",version:appVersion||"unknown",exportedAt:new Date().toISOString()},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-config-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);api.post("/api/v1/audit/log",{event:"CONFIG_EXPORTED",detail:"Configuration file downloaded"}).then(()=>addA("CONFIG_EXPORTED","Configuration file downloaded"));}}>Export Config</Btn><Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"CHANGE_REPORT",detail:"Configuration change report generated"}).then(()=>addA("CHANGE_REPORT","Configuration change report generated"))}>Change Report</Btn></div></div>
             {configSnapshots.map(s=>(
               <div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><M style={{color:C.t}}>{s.name}</M><br/><M style={{color:C.td}}>{s.createdAt}</M></div>
@@ -3899,7 +3909,7 @@ regression:
           </Card>
           <div style={{display:"flex",gap:8}}>
             <Btn primary onClick={()=>{api.post("/api/v1/audit/log",{event:"PSEUDONYM_CONFIG_SAVED",detail:"Pseudonym system config saved"}).then(()=>addA("PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
-            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:"0.0.29",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/v1/audit/log",{event:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
+            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/v1/audit/log",{event:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
             <Btn onClick={()=>{const birds=["Phoenix","Merlin","Peregrine","Kestrel","Harrier","Gyrfalcon","Sparrowhawk","Kite","Buzzard","Shrike"];setAnalystPseudonyms(prev=>prev.map((ap,i)=>({...ap,pseudonym:"Analyst-"+birds[i%birds.length]+"-"+Math.floor(Math.random()*99),assignedAt:new Date().toISOString().slice(0,10)})));api.post("/api/v1/audit/log",{event:"PSEUDONYMS_ROTATED",detail:"All analyst pseudonyms rotated"}).then(()=>addA("PSEUDONYMS_ROTATED","All analyst pseudonyms rotated"));}}>Rotate All Pseudonyms</Btn>
           </div>
         </div>)}
@@ -4381,9 +4391,9 @@ regression:
             <div style={{display:"flex",gap:6}}>
               <Btn small primary onClick={()=>{const esc=v=>{let s=String(v||"").replace(/"/g,'""');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return'"'+s+'"';};const csv="Timestamp,Type,Detail\n"+audit.map(e=>[esc(e.ts),esc(e.ty),esc(e.dt)].join(",")).join("\n");const blob=new Blob([csv],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="audit-log-"+new Date().toISOString().slice(0,10)+".csv";a.click();URL.revokeObjectURL(url);}}>CSV</Btn>
               <Btn small onClick={()=>{const data=JSON.stringify(audit.map(e=>({timestamp:e.ts,type:e.ty,detail:e.dt})),null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="audit-log-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);}}>JSON</Btn>
-              <Btn small onClick={()=>{const lines=audit.map(e=>"CEF:0|FireAlive|AuditLog|0.0.22|300|"+e.ty+"|3|rt="+e.ts+" msg="+(e.dt||"").replace(/[|\\]/g,"_"));const blob=new Blob([lines.join("\n")],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="audit-log-"+new Date().toISOString().slice(0,10)+".cef";a.click();URL.revokeObjectURL(url);}}>CEF</Btn>
+              <Btn small onClick={()=>{const cefVer=appVersion||"unknown";const lines=audit.map(e=>"CEF:0|FireAlive|AuditLog|"+cefVer+"|300|"+e.ty+"|3|rt="+e.ts+" msg="+(e.dt||"").replace(/[|\\]/g,"_"));const blob=new Blob([lines.join("\n")],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="audit-log-"+new Date().toISOString().slice(0,10)+".cef";a.click();URL.revokeObjectURL(url);}}>CEF</Btn>
               <Btn small onClick={()=>{const lines=audit.map(e=>{const sev=e.ty.includes("FAIL")||e.ty.includes("ERROR")?3:e.ty.includes("ALERT")||e.ty.includes("VIOLATION")?2:6;return`<${128+sev}>1 ${new Date().toISOString()} firealive firealive ${process?.pid||"-"} ${e.ty} - ${e.dt||""}`;});const blob=new Blob([lines.join("\n")],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="audit-log-"+new Date().toISOString().slice(0,10)+".syslog";a.click();URL.revokeObjectURL(url);}}>Syslog</Btn>
-              <Btn small onClick={()=>{const forensics={exportType:"firealive_forensics",version:"0.0.29",exportedAt:new Date().toISOString(),eventCount:audit.length,events:audit.map(e=>({timestamp:e.ts,epochMs:Date.now(),eventType:e.ty,detail:e.dt,severityLabel:e.ty.includes("FAIL")?"error":e.ty.includes("ALERT")?"critical":"info"}))};const blob=new Blob([JSON.stringify(forensics,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-forensics-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);}}>Forensics</Btn>
+              <Btn small onClick={()=>{const forensics={exportType:"firealive_forensics",version:appVersion||"unknown",exportedAt:new Date().toISOString(),eventCount:audit.length,events:audit.map(e=>({timestamp:e.ts,epochMs:Date.now(),eventType:e.ty,detail:e.dt,severityLabel:e.ty.includes("FAIL")?"error":e.ty.includes("ALERT")?"critical":"info"}))};const blob=new Blob([JSON.stringify(forensics,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-forensics-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);}}>Forensics</Btn>
             </div>
           </div>
           <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{pageItems.map((e,i)=>(

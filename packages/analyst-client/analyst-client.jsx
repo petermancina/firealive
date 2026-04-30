@@ -294,6 +294,16 @@ export default function AnalystClientApp() {
   // v1.0.0: Upskilling content filter active
   const [contentFilterActive, setContentFilterActive] = useState(false);
 
+  // ── Runtime version info from /api/system/version (Phase 1.4 release-v1.0.10) ──
+  const [appVersion, setAppVersion] = useState("");
+  const [appBuild, setAppBuild] = useState("");
+  useEffect(()=>{
+    api.get("/api/system/version").then(r=>{
+      if (r?.version) setAppVersion(r.version);
+      if (r?.buildId) setAppBuild(r.buildId);
+    }).catch(()=>{});
+  }, []);
+
   // ── Welcome guide ──
   const [welcomeStep, setWelcomeStep] = useState(0);
   const WELCOME_SLIDES = [
@@ -508,7 +518,7 @@ export default function AnalystClientApp() {
             <button onClick={function(){setMfaStep(false);setMfaCode("");}} style={{width:"100%",marginTop:8,padding:10,background:"transparent",border:"1px solid "+C.b,borderRadius:8,color:C.td,fontSize:11,cursor:"pointer"}}>Back</button>
           </div>
         )}
-        <M style={{color:C.td,display:"block",textAlign:"center",marginTop:24}}>FireAlive v1.0.0 AGPL-3.0</M>
+        <M style={{color:C.td,display:"block",textAlign:"center",marginTop:24}}>FireAlive{appVersion?` v${appVersion}`:""} AGPL-3.0</M>
       </div>
     </div>
   );
@@ -556,7 +566,7 @@ export default function AnalystClientApp() {
         <div>
           <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>
             <span style={{display:"inline-block",width:5,height:5,borderRadius:"50%",background:sc.c,marginRight:6,boxShadow:`0 0 6px ${sc.c}`}}/>
-            FireAlive Analyst · v1.0.0 {upskillingActive&&<Badge color={C.p}>UPSKILLING HOUR</Badge>}
+            FireAlive Analyst{appVersion?` · v${appVersion}`:""} {upskillingActive&&<Badge color={C.p}>UPSKILLING HOUR</Badge>}
           </M>
           <div style={{fontSize:18,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Your Wellbeing Dashboard</div>
         </div>
@@ -1371,15 +1381,15 @@ export default function AnalystClientApp() {
             ))}
           </Card>
           <div style={{display:"flex",gap:8,marginTop:12}}>
-            <Btn primary onClick={()=>{const data=JSON.stringify({exportType:"analyst_client_audit",version:"0.0.31",clientPseudonym:"Analyst-Falcon",exportedAt:new Date().toISOString(),logIntegrity,eventCount:auditLog.length,events:auditLog},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="analyst-audit-"+new Date().toISOString().slice(0,10)+".json";a.click();logC("AUDIT_EXPORTED","Audit log downloaded — also auto-sent to MC");}}>Download Audit Log</Btn>
-            <Btn onClick={()=>{const forensics={exportType:"analyst_client_forensics",version:"0.0.31",clientPseudonym:"Analyst-Falcon",exportedAt:new Date().toISOString(),events:auditLog.map(e=>({...e,epochMs:Date.now(),severity:e.a.includes("FAIL")?"error":e.a.includes("SCAN")?"info":"normal"}))};const blob=new Blob([JSON.stringify(forensics,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="analyst-forensics-"+new Date().toISOString().slice(0,10)+".json";a.click();logC("FORENSICS_EXPORTED","Forensics export downloaded — also auto-sent to MC");}}>Download Forensics</Btn>
+            <Btn primary onClick={()=>{const data=JSON.stringify({exportType:"analyst_client_audit",version:appVersion||"unknown",clientPseudonym:"Analyst-Falcon",exportedAt:new Date().toISOString(),logIntegrity,eventCount:auditLog.length,events:auditLog},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="analyst-audit-"+new Date().toISOString().slice(0,10)+".json";a.click();logC("AUDIT_EXPORTED","Audit log downloaded — also auto-sent to MC");}}>Download Audit Log</Btn>
+            <Btn onClick={()=>{const forensics={exportType:"analyst_client_forensics",version:appVersion||"unknown",clientPseudonym:"Analyst-Falcon",exportedAt:new Date().toISOString(),events:auditLog.map(e=>({...e,epochMs:Date.now(),severity:e.a.includes("FAIL")?"error":e.a.includes("SCAN")?"info":"normal"}))};const blob=new Blob([JSON.stringify(forensics,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="analyst-forensics-"+new Date().toISOString().slice(0,10)+".json";a.click();logC("FORENSICS_EXPORTED","Forensics export downloaded — also auto-sent to MC");}}>Download Forensics</Btn>
           </div>
         </div>)}
 
 
       </div></div>
       <div style={{padding:"14px 24px",borderTop:`1px solid ${C.b}`,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace",display:"flex",justifyContent:"space-between"}}>
-        <span>ANALYST CLIENT · PSEUDONYMIZED · E2EE PEER CHAT · PRIVATE · v1.0.0</span>
+        <span>ANALYST CLIENT · PSEUDONYMIZED · E2EE PEER CHAT · PRIVATE{appVersion?` · v${appVersion}`:""}</span>
         <span>{auditLog.length} events logged · Auto-sync to MC</span>
       </div>
     </div>
