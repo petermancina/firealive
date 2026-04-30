@@ -348,6 +348,33 @@ function getEligibleRecipients(eventType, opts = {}) {
   }
 }
 
+// Return the count of notifications of `eventType` delivered to `userId`
+// within the last `windowHours` (default 24). Used by event types with a
+// dailyCap to skip recipients who would exceed it.
+//
+// "Delivered" here means delivered_in_app=1 OR delivered_email=1. Rows
+// where neither flag is set don't count — they represent notifications
+// the user opted out of, which were created but never surfaced.
+function getDailySendCount(userId, eventType, windowHours = 24) {
+  if (!isKnownEventType(eventType)) {
+    throw new Error(`getDailySendCount(): unknown event type "${eventType}"`);
+  }
+  const db = getDb();
+  try {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM notifications
+      WHERE recipient_id = ?
+        AND event_type = ?
+        AND (delivered_in_app = 1 OR delivered_email = 1)
+        AND created_at > datetime('now', ?)
+    `).get(userId, eventType, `-${windowHours} hours`);
+    return row?.c || 0;
+  } finally {
+    db.close();
+  }
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -365,4 +392,5 @@ module.exports = {
   getPreferences,
   setPreference,
   getEligibleRecipients,
+  getDailySendCount,
 };
