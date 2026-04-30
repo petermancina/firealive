@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SOCORRA ANALYST CLIENT v1.0.0 — Complete Standalone Desktop Application
+// FIREALIVE ANALYST CLIENT — Complete Standalone Desktop Application
 // FULL FEATURE SET: Login+MFA, Welcome Guide with Burnout Primer, Inactivity Lock,
 // Biometric Unlock, Burnout Signals with drill-down resources, Delegation with 
 // action buttons, FULL Peer Skill-Share (disclaimer, scheduling, exclusion lists,
@@ -15,7 +15,7 @@
 // Research Knowledge Base (42 entries) and AI synthesis engine included.
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect, useRef } from "react";
-// SOCORRA — SOC Analyst Wellbeing Platform v0.0.25
+// FIREALIVE — SOC Analyst Wellbeing Platform
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
