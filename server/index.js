@@ -119,6 +119,8 @@ app.use('/api/query', authMiddleware(['lead', 'admin']), require('./routes/query
 app.use('/api/auth/password', require('./routes/password'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/ooda', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ooda'));
+app.use('/api/inbox', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/notifications-inapp'));
+app.use('/api/inbox/admin', authMiddleware(['admin']), require('./routes/notifications-admin'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/v021-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v022-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v023-features'));

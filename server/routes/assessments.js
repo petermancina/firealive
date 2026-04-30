@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 const GAP_THRESHOLD = 70; // below this = training recommended
 
@@ -183,14 +184,32 @@ router.post('/:id/assign', (req, res) => {
     if (!assessment) { db.close(); return res.status(404).json({ error: 'Assessment not found' }); }
 
     const insert = db.prepare('INSERT OR IGNORE INTO assessment_assignees (assessment_id, analyst_id) VALUES (?, ?)');
-    let assigned = 0;
+    const newlyAssigned = [];
     for (const aid of analystIds) {
       const result = insert.run(req.params.id, aid);
-      assigned += result.changes;
+      if (result.changes > 0) newlyAssigned.push(aid);
     }
+    const assigned = newlyAssigned.length;
 
     db.close();
     auditLog(req.user.id, 'ASSESSMENT_ASSIGNED', `assessment=${assessment.name} analysts=${assigned}`, req.ip);
+
+    // Notify each newly-assigned analyst (skip duplicates from re-assignment)
+    for (const aid of newlyAssigned) {
+      try {
+        notifications.notify({
+          recipientId: aid,
+          eventType: 'assessment_assigned',
+          title: `New assessment assigned: ${assessment.name}`,
+          body: `A team lead has assigned the "${assessment.name}" skills assessment to you. Open the Skills & Assessments tab to view and submit your scores.`,
+          linkTab: 'skills',
+          linkParams: { assessmentId: req.params.id },
+        });
+      } catch (notifyErr) {
+        logger.warn('Assessment assign: notify failed (non-fatal)', { analystId: aid, error: notifyErr.message });
+      }
+    }
+
     res.json({ ok: true, assigned });
   } catch (err) {
     logger.error('Assign assessment error', { error: err.message });
