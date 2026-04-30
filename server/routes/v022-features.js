@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { version, versionLabel } = require('../lib/version');
 
 // ── Client Notification Configuration ───────────────────────────────────────
 // Team leads configure how analysts receive notifications.
@@ -312,7 +313,7 @@ router.delete('/peer-board/:id', (req, res) => {
 router.post('/security/regression-test', (req, res) => {
   try {
     const db = getDb();
-    const results = { timestamp: new Date().toISOString(), version: '0.0.22', checks: [], passed: 0, failed: 0, warnings: 0 };
+    const results = { timestamp: new Date().toISOString(), version, checks: [], passed: 0, failed: 0, warnings: 0 };
 
     // Check 1: SIEM connectivity
     const siemConfig = db.prepare("SELECT value FROM team_config WHERE key = 'siem_config'").get();
@@ -335,7 +336,7 @@ router.post('/security/regression-test', (req, res) => {
         id: 'SOAR_COMPAT', name: 'SOAR Platform Compatibility',
         status: supported.includes(soar.platform) ? 'pass' : 'warning',
         detail: `Platform: ${soar.platform}`,
-        recommendation: supported.includes(soar.platform) ? null : `SOAR platform "${soar.platform}" may not be fully supported in v0.0.22. Verify webhook and API compatibility.`,
+        recommendation: supported.includes(soar.platform) ? null : `SOAR platform "${soar.platform}" may not be fully supported in ${versionLabel}. Verify webhook and API compatibility.`,
       });
     }
 
@@ -462,7 +463,7 @@ router.post('/soar/generate-playbook', (req, res) => {
 
   const playbook = {
     title: `FireAlive Incident Response Playbook: ${type.name}`,
-    version: '0.0.22',
+    version,
     generatedAt: new Date().toISOString(),
     incidentType,
     phases: ['detect', 'triage', 'contain', 'investigate', 'remediate', 'recover', 'review'],

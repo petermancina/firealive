@@ -12,6 +12,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { version } = require('../lib/version');
 
 const SERVER_ROOT = path.join(__dirname, '..');
 const MANIFEST_PATH = path.join(SERVER_ROOT, '..', 'config', 'integrity-manifest.json');
@@ -47,7 +48,7 @@ function collectFiles() {
 function generateManifest() {
   const files = collectFiles();
   const manifest = {
-    version: '0.0.19',
+    version,
     generatedAt: new Date().toISOString(),
     algorithm: 'sha256',
     fileCount: Object.keys(files).length,

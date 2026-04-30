@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { version } = require('../lib/version');
 
 // ── Human Impact Risk Report ────────────────────────────────────────────────
 // Generates a report linking incident types to analyst burnout metrics,
@@ -28,7 +29,7 @@ router.get('/reports/human-impact-risk', (req, res) => {
 
     const report = {
       reportType: 'human_impact_risk_assessment',
-      version: '0.0.23',
+      version,
       generatedAt: new Date().toISOString(),
       methodology: 'Links SOC incident types to analyst behavioral drift signals (investigation time, dismiss rate, documentation quality, escalation patterns) to estimate human capital impact. Designed for incorporation into enterprise risk registers alongside traditional financial and operational impact metrics.',
 

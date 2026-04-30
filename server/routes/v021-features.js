@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { version } = require('../lib/version');
 
 // ── Vulnerability Scanner Integration ────────────────────────────────────────
 // Allows approved scanners (Nessus, OpenVAS, Qualys) to scan the app.
@@ -139,7 +140,7 @@ router.get('/config/export', (req, res) => {
 
     const exportData = {
       exportType: 'firealive_config',
-      version: '0.0.21',
+      version,
       exportedAt: new Date().toISOString(),
       checksum: null,
       teamConfig, reportConfig, slaConfig, notifConfig,
@@ -171,7 +172,7 @@ router.get('/config/change-report', (req, res) => {
     res.json({
       reportType: 'configuration_change_management',
       generatedAt: new Date().toISOString(),
-      version: '0.0.21',
+      version,
       changeCount: configChanges.length,
       changes: configChanges,
     });

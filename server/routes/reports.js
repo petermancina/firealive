@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { version } = require('../lib/version');
 
 // ── List Reports ─────────────────────────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -63,7 +64,7 @@ router.post('/generate', (req, res) => {
     const format = req.body.format || configRow?.format || 'json';
 
     // ── Gather data ────────────────────────────────────────────────────────
-    const report = { generatedAt: new Date().toISOString(), version: '0.0.19', sections: {} };
+    const report = { generatedAt: new Date().toISOString(), version, sections: {} };
     let sectionCount = 0;
 
     // Team Health (depersonalized)

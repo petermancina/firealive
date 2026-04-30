@@ -9,6 +9,7 @@
 
 const dgram = require('dgram');
 const { logger } = require('../services/logger');
+const { cefDeviceVersion } = require('../lib/version');
 
 class SiemClient {
   constructor(config) {
@@ -91,7 +92,7 @@ class SiemClient {
     const version = 0;
     const vendor = 'FireAlive';
     const product = 'WellbeingPlatform';
-    const deviceVersion = '0.0.19';
+    const deviceVersion = cefDeviceVersion;
     const sigId = event.signatureId || 'UNKNOWN';
     const name = event.name || 'FireAlive Event';
     const severity = event.severity || 5;

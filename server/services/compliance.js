@@ -9,6 +9,7 @@
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
+const { version } = require('../lib/version');
 
 // ── Syslog Severity Mapping (RFC 5424) ───────────────────────────────────────
 const SEVERITY_MAP = {
@@ -224,7 +225,7 @@ function generateComplianceReport(framework) {
   return {
     framework: fw.name,
     generatedAt: new Date().toISOString(),
-    appVersion: '0.0.20',
+    appVersion: version,
     summary: { total: results.length, passed, warnings, failed },
     note: fw.note || null,
     controls: results,

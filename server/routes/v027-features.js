@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { version } = require('../lib/version');
 
 // ── Proactive Break Interventions ───────────────────────────────────────────
 router.get('/proactive/config', (req, res) => {
@@ -237,7 +238,7 @@ router.post('/legal-hold/export', (req, res) => {
 
     const exportData = {
       exportType: 'legal_hold',
-      version: '0.0.27',
+      version,
       exportedAt: new Date().toISOString(),
       chainOfCustody: {
         exportedBy: req.user?.id || 'system',
