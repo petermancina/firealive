@@ -259,7 +259,38 @@ router.post('/panic', (req, res) => {
 
       db.close();
       auditLog(req.user.id, 'PANIC_DEACTIVATED', 'Wellness routing restored', req.ip);
-      return res.json({ ok: true, mode: 'normal', message: 'Wellness routing restored.' });
+
+      // Broadcast to every active analyst that routing is back. Lead who
+      // pressed the button already knows. routing_panic_lifted is NOT
+      // mandatoryInApp — analysts can silence the lift notification if
+      // they only care about engagement events, not all-clear events.
+      let notifiedCount = 0;
+      try {
+        const eligible = notifications.getEligibleRecipients('routing_panic_lifted', {
+          roles: ['analyst'],
+          activeOnly: true,
+          excludeUserIds: [req.user.id],
+        });
+        for (const recipientId of eligible) {
+          try {
+            notifications.notify({
+              recipientId,
+              eventType: 'routing_panic_lifted',
+              title: 'Panic mode lifted — wellness routing restored',
+              body: 'Panic mode is over. Wellness routing is back on and your previous complexity cap has been restored.',
+              linkTab: 'routing',
+              linkParams: { focus: 'panic' },
+            });
+            notifiedCount++;
+          } catch (notifyErr) {
+            logger.warn('Panic deactivate: notify analyst failed (non-fatal)', { recipientId, error: notifyErr.message });
+          }
+        }
+      } catch (broadcastErr) {
+        logger.error('Panic deactivate: broadcast failed (non-fatal)', { error: broadcastErr.message });
+      }
+
+      return res.json({ ok: true, mode: 'normal', message: 'Wellness routing restored.', notified: notifiedCount });
     }
   } catch (err) {
     logger.error('Panic button error', { error: err.message });
