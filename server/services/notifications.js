@@ -46,15 +46,26 @@ const EVENT_TYPES = {
     default: { in_app: 1, email: 1 },
     description: 'A scheduled check-in (24hr, 72hr, or 2-week mark) for one of your active recovery protocols.',
   },
-  peer_request_received: {
-    label: 'A peer wants to share with you',
-    default: { in_app: 1, email: 0 },
-    description: 'Another analyst has requested a peer skill-share session.',
+  peer_request_posted: {
+    label: 'New peer support request available',
+    default: { in_app: 0, email: 0 },
+    description: 'An analyst posted a peer support request you are eligible to accept. Default off because volume can be high — opt in if you want to be a fast responder.',
+    dailyCap: 5,
   },
-  peer_session_rated: {
-    label: 'Your peer session was rated',
+  peer_request_accepted: {
+    label: 'A peer accepted your support request',
     default: { in_app: 1, email: 0 },
-    description: 'A seeker rated a peer-share session you helped with.',
+    description: 'Someone has accepted your peer support request. A session is now active.',
+  },
+  peer_consent_mutual: {
+    label: 'Identity revealed in peer session',
+    default: { in_app: 1, email: 0 },
+    description: 'Both parties consented to reveal identities in your active peer support session.',
+  },
+  peer_session_timed_out: {
+    label: 'Peer session timed out — request re-queued',
+    default: { in_app: 1, email: 0 },
+    description: 'Your peer support request was accepted but the helper did not show up. Your request has been re-queued for a different helper.',
   },
   iam_recert_due: {
     label: 'IAM recertification is due',
