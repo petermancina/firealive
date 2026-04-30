@@ -1180,6 +1180,11 @@ function ManagementConsole() {
   const [showAddAuto, setShowAddAuto] = useState(false);
   const [newAuto, setNewAuto] = useState({name:"",type:"EDR/XDR",l1:true,l2:false,l3:false,max:500,u:"alerts/hr"});
   const [notifCfg, setNotifCfg] = useState({thresh:"watch",email:true,sms:false,voip:false,lambda:false,addr:"",phone:"",arn:""});
+  // ── Inbox state (Phase 1.4a) ──────────────────────────────────────────
+  const [inboxItems, setInboxItems] = useState([]);
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
+  const [inboxIncludeRead, setInboxIncludeRead] = useState(false);
+  const [inboxLoading, setInboxLoading] = useState(false);
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
@@ -1451,7 +1456,7 @@ function ManagementConsole() {
   const toggleNav = (cat) => setNavExpanded(prev=>{const next={};next[cat]=!prev[cat];return next;});
   const navGroups = [
     {cat:"ops",label:"Operations",items:[
-      {id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
+      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
@@ -4262,6 +4267,40 @@ regression:
           <L style={{marginTop:24}}>Common Issues</L>
           <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Routing</div><M style={{color:C.tm,display:"block",lineHeight:1.6}}>Requires SOAR + ticketing. If panic, restore first.</M></Card>
           <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Config</div><M style={{color:C.tm,display:"block",lineHeight:1.6}}>Unlock config lock (sidebar, MFA).</M></Card>
+        </div>)}
+
+        {/* INBOX — in-app notifications from server */}
+        {tab==="inbox"&&(<div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <L style={{marginBottom:0}}>Inbox{inboxUnreadCount>0?` — ${inboxUnreadCount} unread`:""}</L>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:11,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>
+                <input type="checkbox" checked={inboxIncludeRead} onChange={e=>{const v=e.target.checked;setInboxIncludeRead(v);setInboxLoading(true);api.get(`/api/inbox?includeRead=${v?"true":"false"}`).then(r=>{setInboxItems(r?.items||[]);}).catch(()=>{}).finally(()=>setInboxLoading(false));}}/>
+                Show read
+              </label>
+              <Btn small onClick={()=>{setInboxLoading(true);api.get(`/api/inbox?includeRead=${inboxIncludeRead?"true":"false"}`).then(r=>setInboxItems(r?.items||[])).catch(()=>{}).finally(()=>setInboxLoading(false));api.get("/api/inbox/unread-count").then(r=>setInboxUnreadCount(r?.unread||0)).catch(()=>{});}}>Refresh</Btn>
+              <Btn small onClick={()=>{api.post("/api/inbox/read-all",{}).then(()=>{setInboxUnreadCount(0);api.get(`/api/inbox?includeRead=${inboxIncludeRead?"true":"false"}`).then(r=>setInboxItems(r?.items||[])).catch(()=>{});addA("INBOX_MARK_ALL_READ","All notifications marked read");}).catch(()=>{});}}>Mark all read</Btn>
+            </div>
+          </div>
+          {inboxLoading&&<M style={{color:C.td,display:"block",marginBottom:10}}>Loading…</M>}
+          {!inboxLoading&&inboxItems.length===0&&<Card><M style={{color:C.tm}}>No notifications. The Inbox shows assessments, retros, peer requests, panic-mode broadcasts, IAM recert reminders, and other workflow events from across FireAlive.</M></Card>}
+          {inboxItems.map(n=>(
+            <Card key={n.id} style={{marginBottom:8,borderLeft:`3px solid ${n.read_at?C.b:C.a}`,opacity:n.read_at?0.65:1}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{n.title}</div>
+                  {n.body&&<M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:6}}>{n.body}</M>}
+                  <div style={{display:"flex",gap:10,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>
+                    <span>{n.event_type}</span>
+                    <span>·</span>
+                    <span>{n.created_at}</span>
+                    {n.link_tab&&<><span>·</span><a href="#" onClick={e=>{e.preventDefault();setTab(n.link_tab);if(!n.read_at){api.post(`/api/inbox/${n.id}/read`,{}).then(()=>{setInboxItems(prev=>prev.map(it=>it.id===n.id?{...it,read_at:new Date().toISOString()}:it));setInboxUnreadCount(c=>Math.max(0,c-1));}).catch(()=>{});}}} style={{color:C.a,textDecoration:"none"}}>Open ↗</a></>}
+                  </div>
+                </div>
+                {!n.read_at&&<Btn small onClick={()=>{api.post(`/api/inbox/${n.id}/read`,{}).then(()=>{setInboxItems(prev=>prev.map(it=>it.id===n.id?{...it,read_at:new Date().toISOString()}:it));setInboxUnreadCount(c=>Math.max(0,c-1));}).catch(()=>{});}}>Mark read</Btn>}
+              </div>
+            </Card>
+          ))}
         </div>)}
 
         {/* AUDIT — aggregated across MC, server, and all clients */}
