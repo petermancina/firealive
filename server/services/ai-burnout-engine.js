@@ -7,26 +7,6 @@
 class AiBurnoutEngine {
   constructor(db) {
     this.db = db;
-    this._initTables();
-  }
-
-  _initTables() {
-    this.db.prepare(`CREATE TABLE IF NOT EXISTS analyst_baselines (
-      analyst_id TEXT PRIMARY KEY,
-      cognitive_load REAL, task_switching REAL, queue_pressure REAL,
-      response_latency REAL, break_compliance REAL, shift_overtime REAL,
-      established_at TEXT, sample_count INTEGER DEFAULT 0
-    )`).run();
-    this.db.prepare(`CREATE TABLE IF NOT EXISTS signal_readings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      analyst_id TEXT, signal TEXT, value REAL,
-      recorded_at TEXT DEFAULT (datetime('now'))
-    )`).run();
-    this.db.prepare(`CREATE TABLE IF NOT EXISTS analyst_impacts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      analyst_id TEXT, type TEXT, description TEXT,
-      recorded_at TEXT DEFAULT (datetime('now'))
-    )`).run();
   }
 
   // Record a signal reading from the AC
