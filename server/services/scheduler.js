@@ -66,7 +66,24 @@ const schedulerService = {
       }
     }));
 
-    logger.info(`Scheduler started with ${this.jobs.length} jobs`);
+    // ── Email notification pipeline ──────────────────────────────────────
+    const emailIntervalSec = parseInt(process.env.NOTIFICATIONS_EMAIL_INTERVAL_SEC || '60', 10);
+    const emailCronExpr = emailIntervalSec >= 60
+      ? `*/${Math.floor(emailIntervalSec / 60)} * * * *`
+      : '* * * * *';
+    this.jobs.push(cron.schedule(emailCronExpr, async () => {
+      try {
+        const { processQueue } = require('./notifications-email');
+        const stats = await processQueue();
+        if (stats.processed > 0 || stats.skipped > 0) {
+          logger.info('Notifications email pipeline cycle', stats);
+        }
+      } catch (err) {
+        logger.error('Scheduler: notifications email pipeline failed', { error: err.message });
+      }
+    }));
+
+    logger.info(`Scheduler started with ${this.jobs.length} jobs (email pipeline interval: ${emailIntervalSec}s)`);
   },
 
   stop() {
