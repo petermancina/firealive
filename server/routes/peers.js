@@ -167,6 +167,21 @@ router.post('/requests/:id/accept', (req, res) => {
 
     db.close();
     auditLog(req.user.id, 'PEER_SESSION_CREATED', 'Anonymous peer chat session started', req.ip);
+
+    // Notify the seeker (request.requesterId) that someone accepted
+    try {
+      notifications.notify({
+        recipientId: request.requesterId,
+        eventType: 'peer_request_accepted',
+        title: 'A peer accepted your support request',
+        body: `Someone has accepted your peer support request and a session is now active. Their identity remains hidden until both of you consent to reveal it. Open the Peer Skill-Share tab to start the conversation.`,
+        linkTab: 'peer-share',
+        linkParams: { sessionId, focus: 'session' },
+      });
+    } catch (notifyErr) {
+      logger.warn('Peer accept: notify seeker failed (non-fatal)', { sessionId, requesterId: request.requesterId, error: notifyErr.message });
+    }
+
     res.status(201).json({ sessionId, status: 'active' });
   } catch (err) {
     logger.error('Accept peer request error', { error: err.message });
