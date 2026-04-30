@@ -1654,9 +1654,7 @@ function ManagementConsole() {
   const [proactiveAlerts, setProactiveAlerts] = useState([
     {id:"pa1",analyst:"Analyst-Falcon",pseudonym:"Analyst-Falcon",trigger:"4hr continuous P1/P2 tickets",suggestedAt:new Date().toISOString(),status:"pending"},
   ]);
-  // Recovery runbook
-  const [runbookScenario, setRunbookScenario] = useState("server_crash");
-  const [generatedRunbook, setGeneratedRunbook] = useState(null);
+  // Recovery runbook (mocked state replaced by real state in Phase 1.4c Part 2 commit 1)
   // Upskilling hour
   const [upskillingCfg, setUpskillingCfg] = useState({enabled:false,hourOfShift:8,durationMin:60,stopRouting:true,statusLabel:"Upskilling",allowPeerChat:true,allowTraining:true});
   // Auto-routing disable on critical incidents
@@ -4237,39 +4235,68 @@ regression:
         </div>)}
 
         {/* ══════════ v1.0.0 — RECOVERY RUNBOOK ══════════ */}
-        {tab==="runbook"&&(<div>
-          <L>Recovery Runbook Generator</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Auto-generate step-by-step recovery instructions based on the specific failure scenario. Each runbook includes detection steps, immediate actions, recovery procedure, verification, and post-recovery tasks.</M>
-          <Card style={{marginBottom:16}}>
-            <Sel label="Failure scenario" value={runbookScenario} onChange={e=>setRunbookScenario(e.target.value)}>
-              <option value="server_crash">Server crash (backend down)</option>
-              <option value="db_corruption">Database corruption</option>
-              <option value="client_compromise">Analyst client compromised</option>
-              <option value="mc_compromise">Management console compromised</option>
-              <option value="network_partition">Network partition (clients can't reach server)</option>
-              <option value="encryption_key_loss">Encryption key loss</option>
-              <option value="ransomware">Ransomware attack on host</option>
-              <option value="insider_threat">Insider threat detected</option>
-              <option value="ha_failover_failed">HA failover failed</option>
-              <option value="mass_client_compromise">Mass client compromise (tripwire triggered)</option>
-            </Sel>
-            <Btn primary style={{marginTop:12}} onClick={()=>{
-              const books={
-                server_crash:{title:"Server Crash Recovery",steps:["1. DETECT: Monitor shows server unresponsive, clients report connection errors","2. VERIFY: Check server host — SSH/RDP to server machine, check process status","3. FAIL-OPEN: Confirm fail-open routing activated — tickets flowing without burnout filter","4. If HA enabled: Verify passive promoted to active automatically","5. If HA not enabled: Restart server process: systemctl restart firealive-server","6. CHECK DB: Run integrity check: node server/db/integrity-check.js","7. VERIFY CLIENTS: Confirm analyst clients reconnecting (check Integrations Health)","8. RESTORE ROUTING: If fail-open activated, verify burnout routing re-enabled","9. POST-RECOVERY: Review audit logs for cause, run regression test, notify team"]},
-                client_compromise:{title:"Analyst Client Compromise Recovery",steps:["1. ISOLATE: Disconnect compromised client from network immediately","2. PRESERVE: Export forensic data from the client before wiping","3. REVOKE: Revoke all API tokens and session tokens for that analyst's pseudonym","4. ROTATE: Rotate the analyst's pseudonym (Pseudonyms tab → rotate)","5. SCAN OTHERS: Run compromise scan on all other clients (Compromise Scan tab)","6. CHECK TRIPWIRE: Verify tripwire wasn't triggered by legitimate reduced routing","7. REPROVISION: Deploy fresh client from known-good image to the analyst's machine","8. RESTORE CONFIG: Push configuration from management console to new client","9. RE-AUTH: Analyst re-enrolls MFA on new client","10. POST: Review auth logs, update SIEM rules, conduct brief retro"]},
-                ransomware:{title:"Ransomware Recovery",steps:["1. ISOLATE: Disconnect affected host(s) from network IMMEDIATELY","2. DO NOT PAY: Do not engage with ransom demands","3. ASSESS SCOPE: Which components affected? Server? Clients? Management console?","4. ACTIVATE HA: If server affected and HA available, failover to clean standby","5. BACKUP CHECK: Verify backup integrity — are backups on a separate, unaffected system?","6. RESTORE: Restore from most recent verified clean backup","7. REPROVISION CLIENTS: Deploy fresh client images to all affected analyst machines","8. ROTATE ALL KEYS: API keys, encryption keys, JWT secrets, KMS keys","9. FORCE RE-AUTH: Invalidate all sessions, require full MFA re-enrollment","10. FORENSICS: Export all logs, run full compromise scan, engage IR team","11. REPORT: Generate forensic export for legal/compliance, update risk register"]},
-                insider_threat:{title:"Insider Threat Response",steps:["1. ACTIVATE PROTOCOL: Hit insider threat button — auto-rotates keys, locks configs","2. PRESERVE EVIDENCE: Do NOT alert the suspect — export audit logs immediately","3. REVIEW AUTH LOGS: Check for unauthorized access patterns, off-hours logins","4. CHECK PSEUDONYM MAP: Verify pseudonym mapping hasn't been exported without authorization","5. SCOPE: Determine what data the insider could have accessed (tier-1 only? tier-3?)","6. REVOKE: Disable the insider's account, revoke all their tokens","7. OFFBOARD: Use offboarding process — revoke keys, cancel peer sessions, archive data","8. SCAN: Run compromise scan on any systems the insider had access to","9. ROTATE: Rotate all shared secrets (API keys, KMS keys, SOAR tokens)","10. DEBRIEF: Conduct retro with remaining team — support their wellbeing after the event"]},
-              };
-              const book = books[runbookScenario] || {title:"Recovery Runbook",steps:["1. Assess the situation","2. Check HA status and failover","3. Verify backups are clean","4. Restore from known-good backup","5. Rotate all credentials","6. Run compromise scan","7. Verify all clients reconnected","8. Review audit logs","9. Run regression test","10. Conduct post-incident retro"]};
-              setGeneratedRunbook(book);
-              addA("RUNBOOK_GENERATED","Recovery runbook generated: "+book.title);
-            }}>Generate Runbook</Btn>
+          {tab==="runbook"&&!runbookDetailId&&(<div>
+          <L>IR Recovery Runbook</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate org-policy-driven runbooks for incident response. Each runbook is built from one of your team's uploaded IR policies. Steps are extracted from the policy text; the lead reviews in draft, activates during a real incident, and finalizes when the response is complete. The runbook records exactly which policy version was followed for the audit trail.</M>
+          <Card style={{marginBottom:16,display:"flex",gap:12,alignItems:"flex-end",flexWrap:"wrap"}}>
+            <div style={{flex:"1 1 180px"}}>
+              <Sel label="Status" value={runbookStatusFilter} onChange={e=>setRunbookStatusFilter(e.target.value)}>
+                <option value="all">All</option>
+                <option value="draft">Draft</option>
+                <option value="active">Active</option>
+                <option value="completed">Completed</option>
+                <option value="cancelled">Cancelled</option>
+              </Sel>
+            </div>
+            <div style={{flex:"1 1 220px"}}>
+              <Sel label="Scenario" value={runbookScenarioFilter} onChange={e=>setRunbookScenarioFilter(e.target.value)}>
+                <option value="">All scenarios</option>
+                <option value="ransomware">Ransomware</option>
+                <option value="data_exfiltration">Data exfiltration</option>
+                <option value="insider_threat">Insider threat</option>
+                <option value="credential_compromise">Credential compromise</option>
+                <option value="ddos">DDoS</option>
+                <option value="supply_chain">Supply chain</option>
+                <option value="cloud_account_compromise">Cloud account compromise</option>
+                <option value="database_corruption">Database corruption</option>
+                <option value="server_crash">Server crash</option>
+                <option value="backup_restoration">Backup restoration</option>
+                <option value="ir_team_handoff">IR team handoff</option>
+              </Sel>
+            </div>
+            <Btn primary onClick={()=>setShowGenerateRunbook(true)}>Generate runbook</Btn>
           </Card>
-          {generatedRunbook&&(<Card style={{marginBottom:16}}>
-            <div style={{fontSize:14,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>{generatedRunbook.title}</div>
-            {generatedRunbook.steps.map((s,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.t,lineHeight:1.6}}>{s}</M></div>)}
-            <Btn small style={{marginTop:12}} onClick={()=>{const data=JSON.stringify(generatedRunbook,null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="recovery-runbook-"+runbookScenario+".json";a.click();}}>Export Runbook</Btn>
-          </Card>)}
+          {runbooksLoading&&(<Card><M style={{color:C.tm}}>Loading runbooks...</M></Card>)}
+          {!runbooksLoading&&runbooks.length===0&&(<Card><M style={{color:C.tm}}>No runbooks match the current filters. Click Generate runbook to create one from an uploaded IR policy.</M></Card>)}
+          {!runbooksLoading&&runbooks.map(rb=>{
+            const statusColor = rb.status==="active"?"#EF4444":(rb.status==="draft"?"#F59E0B":(rb.status==="completed"?"#10B981":"#6B7280"));
+            const totalSteps = rb.stepCount || 0;
+            const done = rb.stepsCompleted || 0;
+            const skipped = rb.stepsSkipped || 0;
+            const remaining = totalSteps - done - skipped;
+            return (<Card key={rb.id} onClick={()=>setRunbookDetailId(rb.id)} style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:6}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:4,overflow:"hidden",textOverflow:"ellipsis"}}>{rb.title}</div>
+                  <M style={{color:C.tm,display:"block"}}>{(rb.scenarioType||"").replace(/_/g," ")} · from policy "{rb.sourcePolicyTitle||"(deleted)"}" v{rb.sourcePolicyVersion||"?"}</M>
+                </div>
+                <div style={{padding:"3px 8px",background:statusColor+"20",border:`1px solid ${statusColor}`,borderRadius:6,fontSize:9,fontWeight:600,color:statusColor,letterSpacing:0.5,textTransform:"uppercase",whiteSpace:"nowrap"}}>{rb.status}</div>
+              </div>
+              <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
+                <M style={{color:C.t}}>{done}/{totalSteps} complete{skipped>0?`, ${skipped} skipped`:""}{remaining>0&&rb.status==="active"?`, ${remaining} remaining`:""}</M>
+                <M style={{color:C.tm}}>generated by {rb.generatedBy} · {new Date(rb.generatedAt).toLocaleString()}</M>
+                {rb.incidentId&&<M style={{color:C.tm}}>incident: {rb.incidentId}</M>}
+              </div>
+            </Card>);
+          })}
+        </div>)}
+        {tab==="runbook"&&runbookDetailId&&(<div>
+          <div style={{marginBottom:16}}>
+            <Btn small onClick={()=>setRunbookDetailId(null)}>← Back to list</Btn>
+          </div>
+          {runbookDetailLoading&&(<Card><M style={{color:C.tm}}>Loading runbook...</M></Card>)}
+          {!runbookDetailLoading&&!runbookDetail&&(<Card><M style={{color:C.tm}}>Could not load runbook. It may have been deleted.</M></Card>)}
+          {!runbookDetailLoading&&runbookDetail&&(<Card><M style={{color:C.t}}>Detail view: {runbookDetail.runbook?.title}. Full step list and actions land in commits 4 and 5 of this PR.</M></Card>)}
         </div>)}
 
         {/* ══════════ v1.0.0 — ANALYST OFFBOARDING ══════════ */}
