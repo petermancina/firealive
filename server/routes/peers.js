@@ -201,11 +201,14 @@ router.post('/sessions/:id/consent', (req, res) => {
     const session = JSON.parse(row.value);
     if (session.status !== 'active') { db.close(); return res.status(400).json({ error: 'Session is not active' }); }
 
-    // Determine which party is consenting
+    // Determine which party is consenting (and which is the OTHER party)
+    let firstConsenterId = null;
     if (req.user.id === session.requesterId) {
       session.requesterConsent = true;
+      firstConsenterId = session.accepterId;
     } else if (req.user.id === session.accepterId) {
       session.accepterConsent = true;
+      firstConsenterId = session.requesterId;
     } else {
       db.close(); return res.status(403).json({ error: 'You are not a participant in this session' });
     }
@@ -216,12 +219,32 @@ router.post('/sessions/:id/consent', (req, res) => {
     const mutualConsent = session.requesterConsent && session.accepterConsent;
     auditLog(req.user.id, 'PEER_CONSENT', `Identity consent given. Mutual: ${mutualConsent}`, req.ip);
 
-    // If both consented, return both names
+    // If both consented, return both names AND notify the first consenter
     if (mutualConsent) {
       const db2 = getDb();
       const requester = db2.prepare('SELECT name FROM users WHERE id = ?').get(session.requesterId);
       const accepter = db2.prepare('SELECT name FROM users WHERE id = ?').get(session.accepterId);
       db2.close();
+
+      // Notify the OTHER party (the first consenter — they consented earlier and have been waiting)
+      const firstConsenterIsRequester = firstConsenterId === session.requesterId;
+      const peerName = firstConsenterIsRequester ? accepter?.name : requester?.name;
+
+      try {
+        notifications.notify({
+          recipientId: firstConsenterId,
+          eventType: 'peer_consent_mutual',
+          title: 'Identity revealed in your peer session',
+          body: peerName
+            ? `Your peer in the active support session has consented to reveal their identity. You can now see each other's names. Your peer is ${peerName}. Open the Peer Skill-Share tab to continue.`
+            : `Your peer in the active support session has consented to reveal their identity. You can now see each other's names. Open the Peer Skill-Share tab to continue.`,
+          linkTab: 'peer-share',
+          linkParams: { sessionId: req.params.id, focus: 'session' },
+        });
+      } catch (notifyErr) {
+        logger.warn('Peer consent: notify first consenter failed (non-fatal)', { sessionId: req.params.id, firstConsenterId, error: notifyErr.message });
+      }
+
       return res.json({
         mutualConsent: true,
         requesterName: requester?.name,
