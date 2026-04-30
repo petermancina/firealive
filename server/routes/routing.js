@@ -11,6 +11,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 const EQUITY_CAP = 0.35; // no analyst handles >35% of P0/P1 alerts
 
@@ -213,7 +214,37 @@ router.post('/panic', (req, res) => {
 
       db.close();
       auditLog(req.user.id, 'PANIC_ACTIVATED', 'All wellness routing disabled — all hands on deck', req.ip);
-      return res.json({ ok: true, mode: 'panic', message: 'Wellness routing disabled. All analysts at maximum capacity.' });
+
+      // Broadcast to every active analyst. Lead/admin who pressed the button
+      // already knows, so exclude them. mandatoryInApp ensures every analyst
+      // sees this in-app even if they have email-only preferences set.
+      let notifiedCount = 0;
+      try {
+        const eligible = notifications.getEligibleRecipients('routing_panic_engaged_manual', {
+          roles: ['analyst'],
+          activeOnly: true,
+          excludeUserIds: [req.user.id],
+        });
+        for (const recipientId of eligible) {
+          try {
+            notifications.notify({
+              recipientId,
+              eventType: 'routing_panic_engaged_manual',
+              title: 'Panic mode engaged — wellness routing OFF',
+              body: 'A team lead has manually engaged panic mode. All analysts are now at maximum complexity until panic mode is lifted. You will receive another notification when wellness routing is restored.',
+              linkTab: 'routing',
+              linkParams: { focus: 'panic' },
+            });
+            notifiedCount++;
+          } catch (notifyErr) {
+            logger.warn('Panic activate: notify analyst failed (non-fatal)', { recipientId, error: notifyErr.message });
+          }
+        }
+      } catch (broadcastErr) {
+        logger.error('Panic activate: broadcast failed (non-fatal)', { error: broadcastErr.message });
+      }
+
+      return res.json({ ok: true, mode: 'panic', message: 'Wellness routing disabled. All analysts at maximum capacity.', notified: notifiedCount });
     } else {
       // Restore saved caps
       const saved = db.prepare("SELECT value FROM team_config WHERE key = 'panic_saved_caps'").get();
