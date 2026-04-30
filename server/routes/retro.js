@@ -1,6 +1,8 @@
 const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 router.get('/', (req, res) => {
   const db = getDb();
@@ -21,9 +23,10 @@ router.post('/', (req, res) => {
   const crypto = require('crypto');
   const db = getDb();
   const retroId = crypto.randomBytes(16).toString('hex');
+  const duration = queueReductionDuration || '24hr';
 
   db.prepare('INSERT INTO retro_protocols (id, incident, severity, queue_reduction_duration, initiated_by) VALUES (?, ?, ?, ?, ?)')
-    .run(retroId, incident, severity, queueReductionDuration || '24hr', req.user.id);
+    .run(retroId, incident, severity, duration, req.user.id);
 
   const insertAnalyst = db.prepare('INSERT INTO retro_analysts (retro_id, analyst_id) VALUES (?, ?)');
   const insertAction = db.prepare('INSERT INTO retro_actions (retro_id, action_text) VALUES (?, ?)');
@@ -40,6 +43,23 @@ router.post('/', (req, res) => {
 
   db.close();
   auditLog(req.user.id, 'RETRO_ACTIVATED', `${incident} — ${analystIds.length} analysts`, req.ip);
+
+  // Notify each analyst added to the retro
+  for (const aid of analystIds) {
+    try {
+      notifications.notify({
+        recipientId: aid,
+        eventType: 'retro_scheduled',
+        title: `Post-incident recovery scheduled: ${incident}`,
+        body: `You've been added to a ${severity} post-incident recovery protocol for "${incident}". Lighter queues are active for ${duration}, peer support is available, and check-ins are scheduled at 24hr, 72hr, and 2 weeks. Open the Post-Incident Wellness tab for details.`,
+        linkTab: 'recovery',
+        linkParams: { retroId },
+      });
+    } catch (notifyErr) {
+      logger.warn('Retro create: notify analyst failed (non-fatal)', { analystId: aid, retroId, error: notifyErr.message });
+    }
+  }
+
   res.status(201).json({ id: retroId });
 });
 
