@@ -8,6 +8,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
+const { cefDeviceVersion } = require('../lib/version');
 
 // ── Query Audit Log ──────────────────────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -76,7 +77,7 @@ router.get('/export', (req, res) => {
     }
 
     if (format === 'cef') {
-      const cefLines = rows.map(r => r.cef_message || `CEF:0|FireAlive|WellbeingPlatform|0.0.19|${r.event_type}|${r.event_type}|5|src=${r.ip_address || ''} suser=${r.user_name || ''} msg=${r.detail || ''}`);
+      const cefLines = rows.map(r => r.cef_message || `CEF:0|FireAlive|WellbeingPlatform|${cefDeviceVersion}|${r.event_type}|${r.event_type}|5|src=${r.ip_address || ''} suser=${r.user_name || ''} msg=${r.detail || ''}`);
       res.setHeader('Content-Type', 'text/plain');
       res.setHeader('Content-Disposition', `attachment; filename=firealive-audit-${new Date().toISOString().slice(0, 10)}.cef`);
       return res.send(cefLines.join('\n'));
