@@ -92,10 +92,22 @@ const EVENT_TYPES = {
     default: { in_app: 1, email: 0 },
     description: 'Your delegation request was accepted or rejected.',
   },
-  routing_panic_engaged: {
-    label: 'Panic-mode routing engaged',
+  routing_panic_engaged_manual: {
+    label: 'Panic-mode routing engaged (manual)',
     default: { in_app: 1, email: 1 },
-    description: '(Leads/admins) Panic mode has been engaged on the team.',
+    description: 'A team lead has manually engaged panic mode. Wellness routing is OFF and every analyst is at maximum complexity until panic mode is lifted. In-app delivery cannot be turned off for this event.',
+    mandatoryInApp: true,
+  },
+  routing_panic_engaged_tripwire: {
+    label: 'Panic-mode routing engaged (tripwire)',
+    default: { in_app: 1, email: 1 },
+    description: 'The tripwire fired automatically because too many analysts are on reduced routing. Wellness routing is OFF and every analyst is at maximum complexity until the situation is reviewed. In-app delivery cannot be turned off for this event.',
+    mandatoryInApp: true,
+  },
+  routing_panic_lifted: {
+    label: 'Panic-mode routing lifted',
+    default: { in_app: 1, email: 0 },
+    description: 'Panic mode has been lifted. Wellness routing is back on and analysts have returned to their previous complexity caps.',
   },
 };
 
