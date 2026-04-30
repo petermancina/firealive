@@ -567,6 +567,116 @@ function initDb() {
   // Execute schema
   db.exec(SCHEMA);
 
+  // ── Migration: ir_policies phantom → canonical (Phase 1.4c precursor) ──
+  // The pre-1.4c-precursor codebase had two problems with IR policy storage:
+  //   1. assessment-service.js created a phantom ir_policies table with only
+  //      5 columns and no FKs. CREATE TABLE IF NOT EXISTS in the canonical
+  //      schema above will not modify an existing table, so on existing
+  //      deploys we may now have a phantom-shaped ir_policies sitting where
+  //      the canonical schema expects 13 columns.
+  //   2. The OODA route stored real policy data as JSON blobs in team_config
+  //      rows with the key prefix "ooda_policy_". Existing deploys may have
+  //      uploaded policies sitting in that key/value soup.
+  //
+  // This migration detects each case and remediates it. Idempotent — safe
+  // to run on every startup.
+  try {
+    // Detect phantom shape: canonical has 'policy_type' column, phantom has 'name' column.
+    const cols = db.prepare("PRAGMA table_info(ir_policies)").all();
+    const colNames = cols.map(c => c.name);
+    const isPhantom = colNames.includes('name') && !colNames.includes('policy_type');
+
+    if (isPhantom) {
+      console.log('ir_policies migration: phantom table detected, rebuilding to canonical');
+      // Read any existing rows (likely empty since the phantom was never written to,
+      // but we preserve anything just in case some deploy diverged).
+      const phantomRows = db.prepare("SELECT id, name, content, uploaded_by, uploaded_at FROM ir_policies").all();
+
+      // Drop the phantom and re-create from the canonical schema. We re-execute
+      // the canonical CREATE TABLE for ir_policies + its indexes by extracting
+      // them from SCHEMA. Cleaner: drop and rely on CREATE TABLE IF NOT EXISTS
+      // in the SCHEMA above to recreate. But db.exec already ran, so the
+      // canonical CREATE was a no-op. We need to drop then run the canonical
+      // CREATEs explicitly here.
+      db.exec('DROP TABLE ir_policies');
+      db.exec(`
+        CREATE TABLE ir_policies (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          policy_type TEXT NOT NULL CHECK (policy_type IN ('incident_response', 'playbook', 'runbook', 'policy', 'procedure')),
+          content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          scenario_tags TEXT NOT NULL DEFAULT '[]',
+          version INTEGER NOT NULL DEFAULT 1,
+          uploaded_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+          uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          deleted_at TEXT
+        );
+        CREATE INDEX idx_ir_policies_active ON ir_policies(uploaded_at DESC) WHERE deleted_at IS NULL;
+        CREATE INDEX idx_ir_policies_type ON ir_policies(policy_type, uploaded_at DESC) WHERE deleted_at IS NULL;
+        CREATE INDEX idx_ir_policies_hash ON ir_policies(content_hash);
+      `);
+
+      // Restore any phantom rows under the canonical schema. The phantom had
+      // 'name' where canonical has 'title'; everything else maps directly.
+      // policy_type defaults to 'policy' since the phantom didn't track it.
+      // content_hash is computed; uploaded_at falls back to now if missing.
+      const insertCanonical = db.prepare(`
+        INSERT INTO ir_policies (id, title, policy_type, content, content_hash, scenario_tags, version, uploaded_by, uploaded_at, updated_at)
+        VALUES (?, ?, 'policy', ?, ?, '[]', 1, ?, ?, ?)
+      `);
+      const crypto = require('crypto');
+      for (const row of phantomRows) {
+        const safeContent = row.content || '';
+        const hash = crypto.createHash('sha256').update(safeContent).digest('hex');
+        const ts = row.uploaded_at || new Date().toISOString();
+        insertCanonical.run(row.id, row.name || '(untitled)', safeContent, hash, row.uploaded_by, ts, ts);
+      }
+      console.log(`ir_policies migration: rebuilt to canonical, restored ${phantomRows.length} phantom row(s)`);
+    }
+
+    // Now copy team_config rows with key prefix 'ooda_policy_' into ir_policies.
+    // These are the real policy uploads from the pre-precursor OODA route.
+    const teamConfigPolicies = db.prepare("SELECT key, value FROM team_config WHERE key LIKE 'ooda_policy_%'").all();
+    if (teamConfigPolicies.length > 0) {
+      const cryptoLib = require('crypto');
+      const insertFromTeamConfig = db.prepare(`
+        INSERT OR IGNORE INTO ir_policies (id, title, policy_type, content, content_hash, scenario_tags, version, uploaded_by, uploaded_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, '[]', 1, ?, ?, ?)
+      `);
+      let copied = 0;
+      for (const row of teamConfigPolicies) {
+        try {
+          const d = JSON.parse(row.value);
+          if (!d.id || !d.title || !d.content) continue;
+          const validTypes = ['incident_response', 'playbook', 'runbook', 'policy', 'procedure'];
+          const safeType = validTypes.includes(d.type) ? d.type : 'policy';
+          const hash = cryptoLib.createHash('sha256').update(d.content).digest('hex');
+          const ts = d.uploadedAt || new Date().toISOString();
+          const result = insertFromTeamConfig.run(d.id, d.title, safeType, d.content, hash, d.uploadedBy || 'unknown', ts, ts);
+          if (result.changes > 0) copied++;
+        } catch (parseErr) {
+          // Skip rows with bad JSON — they were never readable anyway
+          continue;
+        }
+      }
+      if (copied > 0) {
+        console.log(`ir_policies migration: copied ${copied} policy/policies from team_config into ir_policies`);
+        // Delete the team_config rows we successfully copied. We do this in a
+        // second pass so a partial failure above doesn't lose data — anything
+        // not copied stays in team_config for a future migration attempt.
+        db.prepare("DELETE FROM team_config WHERE key LIKE 'ooda_policy_%'").run();
+      }
+    }
+  } catch (migrationErr) {
+    // Migration failures must not block server startup. Log loudly so the
+    // operator notices, but continue.
+    console.error('ir_policies migration FAILED:', migrationErr.message);
+    console.error('The server will start, but IR policies may be unavailable until the migration is investigated.');
+  }
+
+
   // Set initial system metadata
   const setMeta = db.prepare('INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)');
   setMeta.run('fuse_counter', String(fuseCounter));
