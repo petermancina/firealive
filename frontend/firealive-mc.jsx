@@ -1215,6 +1215,45 @@ function ManagementConsole() {
       }).catch(()=>{}).finally(()=>setInboxPrefsLoading(false));
     }
   }, [tab, inboxView, inboxIncludeRead]);
+
+  // ── Peer Conduct (Phase 1.4b) ──
+  const [peerFlags, setPeerFlags] = useState([]);
+  const [peerFlagsLoading, setPeerFlagsLoading] = useState(false);
+  const [peerFlagStatus, setPeerFlagStatus] = useState("open"); // open | resolved | all
+  const [peerFlagTierFilter, setPeerFlagTierFilter] = useState(""); // "" | "1" | "2" | "3"
+  const [peerFlagOpenCount, setPeerFlagOpenCount] = useState(0);
+  const [peerFlagUrgentOpenCount, setPeerFlagUrgentOpenCount] = useState(0);
+  const [peerFlagResolveTarget, setPeerFlagResolveTarget] = useState(null); // flag id
+  const [peerFlagResolveNote, setPeerFlagResolveNote] = useState("");
+
+  // Poll the open-flag count every 60s for the sidebar badge and the
+  // tier-3 dashboard banner. We track total open and urgent open in
+  // the same pass to avoid a second request.
+  useEffect(()=>{
+    let cancelled = false;
+    const fetchCounts = ()=>{
+      api.get("/api/peer/flags?status=open").then(r=>{
+        if (cancelled) return;
+        const flags = r?.flags || [];
+        setPeerFlagOpenCount(flags.length);
+        setPeerFlagUrgentOpenCount(flags.filter(f=>f.tier===3).length);
+      }).catch(()=>{});
+    };
+    fetchCounts();
+    const handle = setInterval(fetchCounts, 60000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, []);
+
+  // When peer_conduct tab is opened or filters change, load flags.
+  useEffect(()=>{
+    if (tab !== "peer_conduct") return;
+    setPeerFlagsLoading(true);
+    const params = new URLSearchParams({ status: peerFlagStatus });
+    if (peerFlagTierFilter) params.set("tier", peerFlagTierFilter);
+    api.get(`/api/peer/flags?${params.toString()}`).then(r=>{
+      setPeerFlags(r?.flags || []);
+    }).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));
+  }, [tab, peerFlagStatus, peerFlagTierFilter]);
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
@@ -1496,7 +1535,7 @@ function ManagementConsole() {
   const toggleNav = (cat) => setNavExpanded(prev=>{const next={};next[cat]=!prev[cat];return next;});
   const navGroups = [
     {cat:"ops",label:"Operations",items:[
-      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
+      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
@@ -1613,6 +1652,16 @@ function ManagementConsole() {
           </div>
         </div>
       </div>
+      {peerFlagUrgentOpenCount>0&&(<div onClick={()=>setTab("peer_conduct")} style={{padding:"10px 24px",background:"rgba(239,68,68,0.12)",borderBottom:`1px solid ${C.d}50`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:C.d,boxShadow:`0 0 8px ${C.d}`,animation:"pulse 1.5s infinite",flexShrink:0}}/>
+          <div>
+            <M style={{color:C.d,fontWeight:600,letterSpacing:1.5,textTransform:"uppercase",fontSize:10,display:"block"}}>Tier-3 Conduct Flag — Action Required</M>
+            <M style={{color:C.t,fontSize:11,display:"block",marginTop:2}}>{peerFlagUrgentOpenCount} unresolved urgent flag{peerFlagUrgentOpenCount>1?"s":""} (slurs / threats / harassment). HR intervention recommended.</M>
+          </div>
+        </div>
+        <M style={{color:C.d,fontWeight:500,fontSize:11}}>Review →</M>
+      </div>)}
       {/* v1.0.0: Grouped sidebar navigation replaces 57 flat tabs */}
       <div style={{display:"flex",minHeight:"calc(100vh - 120px)"}}>
         <div style={{width:220,flexShrink:0,borderRight:`1px solid ${C.b}`,background:C.s,overflowY:"auto",padding:"8px 0"}}>
@@ -4382,6 +4431,80 @@ regression:
               </Card>
             ))}
           </div>)}
+        </div>)}
+
+        {/* PEER CONDUCT — tiered abuse flag review */}
+        {tab==="peer_conduct"&&(<div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <L style={{marginBottom:0}}>Peer Conduct — {peerFlagStatus==="open"?"Open Flags":peerFlagStatus==="resolved"?"Resolved Flags":"All Flags"} ({peerFlags.length})</L>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <select value={peerFlagStatus} onChange={e=>setPeerFlagStatus(e.target.value)} style={{padding:"5px 10px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:6,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
+                <option value="open">Open</option>
+                <option value="resolved">Resolved</option>
+                <option value="all">All</option>
+              </select>
+              <select value={peerFlagTierFilter} onChange={e=>setPeerFlagTierFilter(e.target.value)} style={{padding:"5px 10px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:6,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
+                <option value="">All tiers</option>
+                <option value="3">Tier 3 (urgent)</option>
+                <option value="2">Tier 2 (attack)</option>
+                <option value="1">Tier 1 (minor)</option>
+              </select>
+              <Btn small onClick={()=>{setPeerFlagsLoading(true);const params=new URLSearchParams({status:peerFlagStatus});if(peerFlagTierFilter)params.set("tier",peerFlagTierFilter);api.get(`/api/peer/flags?${params.toString()}`).then(r=>setPeerFlags(r?.flags||[])).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));}}>Refresh</Btn>
+            </div>
+          </div>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Flags submitted by analysts after peer skill-share sessions. Tier 1 (minor) shows aggregate patterns only — both flagger and flagged stay anonymous. Tier 2 (personal attack) reveals the flagged peer's identity. Tier 3 (urgent — slurs, threats, harassment) reveals both identities and warrants HR involvement.</M>
+          {peerFlagsLoading&&<M style={{color:C.td,display:"block",marginBottom:10}}>Loading…</M>}
+          {!peerFlagsLoading&&peerFlags.length===0&&<Card><M style={{color:C.tm}}>No flags match the current filter. {peerFlagStatus==="open"?"That is good news — it means no peer skill-share sessions have been flagged for review.":""}</M></Card>}
+          {peerFlags.map(f=>{
+            const tierColor=f.tier===3?C.d:f.tier===2?C.w:C.i;
+            const tierLabel=f.tier===3?"URGENT":f.tier===2?"ATTACK":"MINOR";
+            return(
+              <Card key={f.id} style={{marginBottom:10,borderLeft:`4px solid ${tierColor}`,opacity:f.resolvedAt?0.65:1}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8,gap:10}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
+                      <Badge color={tierColor}>TIER {f.tier} · {tierLabel}</Badge>
+                      {f.resolvedAt&&<Badge color={C.a}>RESOLVED</Badge>}
+                      <M style={{color:C.td}}>{new Date(f.createdAt).toLocaleString()}</M>
+                    </div>
+                    <div style={{fontSize:11,color:C.tm,marginBottom:6}}>
+                      <span style={{color:C.t}}>Flagger:</span> {f.flaggerDisplay} · <span style={{color:C.t}}>Flagged:</span> {f.flaggedDisplay}
+                      {f.flaggerIp&&<span style={{color:C.td}}> · IP {f.flaggerIp}</span>}
+                    </div>
+                  </div>
+                </div>
+                <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,marginBottom:f.resolvedAt?0:10}}>
+                  <M style={{color:C.td,display:"block",marginBottom:4}}>Flagged content:</M>
+                  <div style={{fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap",fontFamily:"'IBM Plex Mono',monospace"}}>{f.content}</div>
+                </Card>
+                {f.resolvedAt&&(
+                  <div style={{marginTop:10,padding:"10px 12px",background:"rgba(110,231,183,0.04)",borderRadius:8,border:`1px solid ${C.a}30`}}>
+                    <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Resolved {new Date(f.resolvedAt).toLocaleString()} by {f.resolvedBy||"unknown"}</M>
+                    {f.resolutionNote&&<M style={{color:C.tm,lineHeight:1.6}}>{f.resolutionNote}</M>}
+                  </div>
+                )}
+                {!f.resolvedAt&&(
+                  <div>
+                    {f.tier===3&&(<Card style={{padding:"10px 12px",marginBottom:10,background:"rgba(239,68,68,0.06)",border:`1px solid ${C.d}40`}}>
+                      <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:4}}>HR intervention recommended</M>
+                      <M style={{color:C.tm,lineHeight:1.6}}>Tier 3 flags involve content (slurs, threats, harassment) that typically requires HR review and documentation per most workplace conduct policies. Resolve this flag only after the appropriate HR loop has been initiated.</M>
+                    </Card>)}
+                    {peerFlagResolveTarget===f.id?(
+                      <div>
+                        <textarea value={peerFlagResolveNote} onChange={e=>setPeerFlagResolveNote(e.target.value)} rows={3} maxLength={2000} placeholder="Resolution note — what action was taken? (max 2000 chars, optional but recommended)" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical",marginBottom:8}}/>
+                        <div style={{display:"flex",gap:6}}>
+                          <Btn small primary onClick={()=>{api.post(`/api/peer/flags/${f.id}/resolve`,{note:peerFlagResolveNote||null}).then(()=>{addA("PEER_FLAG_RESOLVED",`Tier ${f.tier} flag resolved`);setPeerFlagResolveTarget(null);setPeerFlagResolveNote("");setPeerFlagsLoading(true);const params=new URLSearchParams({status:peerFlagStatus});if(peerFlagTierFilter)params.set("tier",peerFlagTierFilter);api.get(`/api/peer/flags?${params.toString()}`).then(r=>setPeerFlags(r?.flags||[])).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));}).catch(()=>{addA("PEER_FLAG_RESOLVE_FAILED",`Tier ${f.tier} flag resolve attempt failed`);});}}>Submit Resolution</Btn>
+                          <Btn small onClick={()=>{setPeerFlagResolveTarget(null);setPeerFlagResolveNote("");}}>Cancel</Btn>
+                        </div>
+                      </div>
+                    ):(
+                      <Btn small primary onClick={()=>{setPeerFlagResolveTarget(f.id);setPeerFlagResolveNote("");}}>Mark Resolved</Btn>
+                    )}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
         </div>)}
 
         {/* AUDIT — aggregated across MC, server, and all clients */}

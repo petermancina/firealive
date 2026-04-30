@@ -445,6 +445,7 @@ export default function AnalystClientApp() {
   const [postRating, setPostRating] = useState(0);
   const [postFlagging, setPostFlagging] = useState(false);
   const [postFlagText, setPostFlagText] = useState("");
+  const [postFlagTier, setPostFlagTier] = useState(0); // 0=unselected, 1/2/3
   // (cleaned up in v1.0.0)
 
   // signals defined above
@@ -853,7 +854,8 @@ export default function AnalystClientApp() {
               </div>
 
               {postFlagging&&(<div>
-                <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:8}}>Review the chat and highlight abusive text below:</M>
+                <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:8}}>Review the chat and select the severity that matches what happened:</M>
+
                 <Card style={{marginBottom:8,maxHeight:200,overflow:"auto",background:"rgba(0,0,0,0.4)",fontFamily:"'Courier New',Courier,monospace"}}>
                   {postSession.messages.map(m=>(
                     <div key={m.id} style={{padding:"8px 12px",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
@@ -863,10 +865,55 @@ export default function AnalystClientApp() {
                     </div>
                   ))}
                 </Card>
-                <div style={{marginBottom:10}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Copy and paste the abusive text here, or describe what was said:</M><textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={10000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Paste abusive text or describe what happened..."/></div>
+
+                <div style={{marginBottom:14}}>
+                  <M style={{color:C.tm,marginBottom:8,display:"block"}}>Severity tier:</M>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===1?"rgba(96,165,250,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===1?C.i+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                      <input type="radio" name="flagtier" checked={postFlagTier===1} onChange={()=>setPostFlagTier(1)} style={{marginTop:3}}/>
+                      <div style={{flex:1}}>
+                        <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 — Minor</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness. Not a personal attack — just unprofessional. Identities stay anonymous. Aggregated for pattern detection only.</M>
+                      </div>
+                    </label>
+                    <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                      <input type="radio" name="flagtier" checked={postFlagTier===2} onChange={()=>setPostFlagTier(2)} style={{marginTop:3}}/>
+                      <div style={{flex:1}}>
+                        <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 — Personal attack</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language targeted at you. The peer's identity is revealed to your team lead. Your identity stays anonymous to the lead.</M>
+                      </div>
+                    </label>
+                    <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                      <input type="radio" name="flagtier" checked={postFlagTier===3} onChange={()=>setPostFlagTier(3)} style={{marginTop:3}}/>
+                      <div style={{flex:1}}>
+                        <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 — Urgent</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Slurs (racial, gender, orientation, religion, disability), explicit threats, sexual harassment, or content suggesting imminent harm. Both identities — yours and the peer's — are revealed to your lead. HR is brought in. Use this only when warranted; misuse undermines trust in the flagging system.</M>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                <div style={{marginBottom:10}}>
+                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Copy and paste the relevant text, or describe what was said:</M>
+                  <textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={10000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Paste the text in question or describe what happened..."/>
+                </div>
+
                 <div style={{display:"flex",gap:8}}>
-                  <Btn danger disabled={!postFlagText.trim()} onClick={()=>{logC("peer_abuse_flagged","Abusive text flagged and sent to secure vault");setPostFlagging(false);setPostSession(null);}}>Submit to Secure Vault</Btn>
-                  <Btn small onClick={()=>setPostFlagging(false)}>Cancel</Btn>
+                  <Btn danger disabled={!postFlagText.trim()||!postFlagTier} onClick={()=>{
+                    // TODO: when peer chat is backed by a real server session, replace
+                    // this with: api.post("/api/peer/flags", {sessionId, flaggedUserId,
+                    // tier: postFlagTier, content: postFlagText})
+                    // The endpoint exists (commit 3-5 of Phase 1.4b) but the AC peer
+                    // chat itself is still client-side only — there is no server
+                    // session to reference yet. This is recorded in the audit log so
+                    // the flag isn't lost.
+                    logC("peer_abuse_flagged",`Tier ${postFlagTier}: ${postFlagText.slice(0,80)}${postFlagText.length>80?"...":""}`);
+                    setPostFlagging(false);
+                    setPostFlagTier(0);
+                    setPostFlagText("");
+                    setPostSession(null);
+                  }}>Submit Flag</Btn>
+                  <Btn small onClick={()=>{setPostFlagging(false);setPostFlagTier(0);}}>Cancel</Btn>
                 </div>
               </div>)}
             </Card>

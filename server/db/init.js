@@ -508,6 +508,30 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (user_id, event_type)
 );
+
+CREATE TABLE IF NOT EXISTS peer_abuse_flags (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  session_id TEXT NOT NULL,
+  flagger_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  flagged_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
+  content_encrypted BLOB NOT NULL,
+  flagger_ip TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at TEXT,
+  resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  resolution_note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_unresolved
+  ON peer_abuse_flags(tier, created_at DESC)
+  WHERE resolved_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagged_user
+  ON peer_abuse_flags(flagged_user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagger
+  ON peer_abuse_flags(flagger_user_id, created_at DESC);
 `;
 
 
