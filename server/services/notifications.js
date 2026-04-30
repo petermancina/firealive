@@ -288,6 +288,13 @@ function setPreference(userId, eventType, { in_app, email }) {
   if (!isKnownEventType(eventType)) {
     throw new Error(`setPreference(): unknown event type "${eventType}"`);
   }
+  // Refuse to disable in_app for events flagged mandatoryInApp.
+  // These are critical events (panic mode, tripwire) where every analyst
+  // MUST see the in-app notification regardless of preference. Email
+  // opt-out is still allowed — only in_app is enforced.
+  if (EVENT_TYPES[eventType].mandatoryInApp && !in_app) {
+    throw new Error(`setPreference(): in_app delivery cannot be disabled for "${eventType}" — this event is mandatory in-app for all users`);
+  }
   const db = getDb();
   try {
     db.prepare(`
