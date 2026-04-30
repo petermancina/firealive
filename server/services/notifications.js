@@ -41,6 +41,11 @@ const EVENT_TYPES = {
     default: { in_app: 1, email: 1 },
     description: 'You have been added to a post-incident recovery protocol.',
   },
+  retro_followup_sent: {
+    label: 'Post-incident recovery check-in',
+    default: { in_app: 1, email: 1 },
+    description: 'A scheduled check-in (24hr, 72hr, or 2-week mark) for one of your active recovery protocols.',
+  },
   peer_request_received: {
     label: 'A peer wants to share with you',
     default: { in_app: 1, email: 0 },
