@@ -532,6 +532,31 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagged_user
 
 CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagger
   ON peer_abuse_flags(flagger_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ir_policies (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  policy_type TEXT NOT NULL CHECK (policy_type IN ('incident_response', 'playbook', 'runbook', 'policy', 'procedure')),
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  scenario_tags TEXT NOT NULL DEFAULT '[]',
+  version INTEGER NOT NULL DEFAULT 1,
+  uploaded_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ir_policies_active
+  ON ir_policies(uploaded_at DESC)
+  WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ir_policies_type
+  ON ir_policies(policy_type, uploaded_at DESC)
+  WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ir_policies_hash
+  ON ir_policies(content_hash);
 `;
 
 
