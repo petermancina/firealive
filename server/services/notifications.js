@@ -355,9 +355,15 @@ function getEligibleRecipients(eventType, opts = {}) {
     for (const r of prefRows) prefByUser[r.user_id] = { in_app: r.in_app === 1, email: r.email === 1 };
 
     const excludeSet = new Set(excludeUserIds);
+    const isMandatoryInApp = !!EVENT_TYPES[eventType].mandatoryInApp;
     const eligible = [];
     for (const u of users) {
       if (excludeSet.has(u.id)) continue;
+      // For mandatoryInApp events, every matching user is eligible regardless
+      // of their stored preference — these events (panic, tripwire) cannot
+      // be silenced in-app. For all other events, the user must have at
+      // least one channel turned on.
+      if (isMandatoryInApp) { eligible.push(u.id); continue; }
       const pref = prefByUser[u.id] || { in_app: eventDefaults.in_app === 1, email: eventDefaults.email === 1 };
       if (pref.in_app || pref.email) eligible.push(u.id);
     }
