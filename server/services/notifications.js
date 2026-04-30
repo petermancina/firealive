@@ -109,6 +109,22 @@ const EVENT_TYPES = {
     default: { in_app: 1, email: 0 },
     description: 'Panic mode has been lifted. Wellness routing is back on and analysts have returned to their previous complexity caps.',
   },
+  peer_abuse_flag_tier1: {
+    label: 'Peer chat — minor conduct flag (tier 1)',
+    default: { in_app: 1, email: 0 },
+    description: 'An analyst flagged a peer skill-share session for minor conduct issues — curt tone, dismissiveness, condescension, mild rudeness. No identity reveal. Aggregated for pattern detection. If a single peer accumulates many tier-1 flags from different reporters, consider a coaching conversation rather than disciplinary action.',
+  },
+  peer_abuse_flag_tier2: {
+    label: 'Peer chat — personal attack flag (tier 2)',
+    default: { in_app: 1, email: 1 },
+    description: 'An analyst flagged a peer skill-share session for direct insult, name-calling, mockery, or demeaning language. Per the peer-chat policy, the flagged peer\'s identity is revealed to you. Flagged content is retained in the secure vault for review. No automatic HR loop — your judgment on next steps.',
+  },
+  peer_abuse_flag_tier3: {
+    label: 'Peer chat — urgent conduct flag (tier 3)',
+    default: { in_app: 1, email: 1 },
+    description: 'An analyst flagged a peer skill-share session for urgent conduct: slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Both the flagged peer\'s identity and the flagger\'s identity are revealed to you. HR intervention is recommended. In-app delivery cannot be turned off for this event.',
+    mandatoryInApp: true,
+  },
 };
 
 function isKnownEventType(eventType) {
