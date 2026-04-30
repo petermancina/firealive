@@ -1222,19 +1222,25 @@ function ManagementConsole() {
   const [peerFlagStatus, setPeerFlagStatus] = useState("open"); // open | resolved | all
   const [peerFlagTierFilter, setPeerFlagTierFilter] = useState(""); // "" | "1" | "2" | "3"
   const [peerFlagOpenCount, setPeerFlagOpenCount] = useState(0);
+  const [peerFlagUrgentOpenCount, setPeerFlagUrgentOpenCount] = useState(0);
   const [peerFlagResolveTarget, setPeerFlagResolveTarget] = useState(null); // flag id
   const [peerFlagResolveNote, setPeerFlagResolveNote] = useState("");
 
-  // Poll the open-flag count every 60s for the sidebar badge.
+  // Poll the open-flag count every 60s for the sidebar badge and the
+  // tier-3 dashboard banner. We track total open and urgent open in
+  // the same pass to avoid a second request.
   useEffect(()=>{
     let cancelled = false;
-    const fetchCount = ()=>{
+    const fetchCounts = ()=>{
       api.get("/api/peer/flags?status=open").then(r=>{
-        if (!cancelled) setPeerFlagOpenCount((r?.flags||[]).length);
+        if (cancelled) return;
+        const flags = r?.flags || [];
+        setPeerFlagOpenCount(flags.length);
+        setPeerFlagUrgentOpenCount(flags.filter(f=>f.tier===3).length);
       }).catch(()=>{});
     };
-    fetchCount();
-    const handle = setInterval(fetchCount, 60000);
+    fetchCounts();
+    const handle = setInterval(fetchCounts, 60000);
     return ()=>{ cancelled = true; clearInterval(handle); };
   }, []);
 
@@ -1646,6 +1652,16 @@ function ManagementConsole() {
           </div>
         </div>
       </div>
+      {peerFlagUrgentOpenCount>0&&(<div onClick={()=>setTab("peer_conduct")} style={{padding:"10px 24px",background:"rgba(239,68,68,0.12)",borderBottom:`1px solid ${C.d}50`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:C.d,boxShadow:`0 0 8px ${C.d}`,animation:"pulse 1.5s infinite",flexShrink:0}}/>
+          <div>
+            <M style={{color:C.d,fontWeight:600,letterSpacing:1.5,textTransform:"uppercase",fontSize:10,display:"block"}}>Tier-3 Conduct Flag — Action Required</M>
+            <M style={{color:C.t,fontSize:11,display:"block",marginTop:2}}>{peerFlagUrgentOpenCount} unresolved urgent flag{peerFlagUrgentOpenCount>1?"s":""} (slurs / threats / harassment). HR intervention recommended.</M>
+          </div>
+        </div>
+        <M style={{color:C.d,fontWeight:500,fontSize:11}}>Review →</M>
+      </div>)}
       {/* v1.0.0: Grouped sidebar navigation replaces 57 flat tabs */}
       <div style={{display:"flex",minHeight:"calc(100vh - 120px)"}}>
         <div style={{width:220,flexShrink:0,borderRight:`1px solid ${C.b}`,background:C.s,overflowY:"auto",padding:"8px 0"}}>
