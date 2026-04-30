@@ -1304,6 +1304,19 @@ function ManagementConsole() {
     }).catch(()=>setRunbookDetail(null)).finally(()=>setRunbookDetailLoading(false));
   }, [runbookDetailId]);
 
+  // When the generate-runbook modal is opened or scenario changes,
+  // fetch policies tagged for that scenario plus untagged policies.
+  // Powers the policy picker in the modal.
+  useEffect(()=>{
+    if (!showGenerateRunbook) return;
+    api.get("/api/runbooks/scenarios/" + encodeURIComponent(genRunbookScenario) + "/policies").then(r=>{
+      setGenRunbookPolicies({ tagged: r?.tagged || [], untagged: r?.untagged || [] });
+      // Auto-pick the default policy if one exists for this scenario
+      const def = (r?.tagged || []).find(p => p.isDefault);
+      if (def) setGenRunbookPolicyId(def.id);
+    }).catch(()=>setGenRunbookPolicies({ tagged: [], untagged: [] }));
+  }, [showGenerateRunbook, genRunbookScenario]);
+
   // When peer_conduct tab is opened or filters change, load flags.
   useEffect(()=>{
     if (tab !== "peer_conduct") return;
@@ -4298,6 +4311,57 @@ regression:
           {!runbookDetailLoading&&!runbookDetail&&(<Card><M style={{color:C.tm}}>Could not load runbook. It may have been deleted.</M></Card>)}
           {!runbookDetailLoading&&runbookDetail&&(<Card><M style={{color:C.t}}>Detail view: {runbookDetail.runbook?.title}. Full step list and actions land in commits 4 and 5 of this PR.</M></Card>)}
         </div>)}
+        {showGenerateRunbook&&<Modal title="Generate IR Recovery Runbook" onClose={()=>{setShowGenerateRunbook(false);setGenRunbookPolicyId("");setGenRunbookTitle("");setGenRunbookIncidentId("");}} width={560}>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Pick a scenario type and one of your team's uploaded IR policies. The parser extracts ordered steps from the policy text. The runbook will be created in draft status — review and edit before activating during a real incident.</M>
+          <Sel label="Scenario type" value={genRunbookScenario} onChange={e=>{setGenRunbookScenario(e.target.value);setGenRunbookPolicyId("");}}>
+            <option value="ransomware">Ransomware</option>
+            <option value="data_exfiltration">Data exfiltration</option>
+            <option value="insider_threat">Insider threat</option>
+            <option value="credential_compromise">Credential compromise</option>
+            <option value="ddos">DDoS</option>
+            <option value="supply_chain">Supply chain</option>
+            <option value="cloud_account_compromise">Cloud account compromise</option>
+            <option value="database_corruption">Database corruption</option>
+            <option value="server_crash">Server crash</option>
+            <option value="backup_restoration">Backup restoration</option>
+            <option value="ir_team_handoff">IR team handoff</option>
+          </Sel>
+          <Sel label="Source policy" value={genRunbookPolicyId} onChange={e=>setGenRunbookPolicyId(e.target.value)}>
+            <option value="">— Select a policy —</option>
+            {genRunbookPolicies.tagged.length>0&&<optgroup label="Tagged for this scenario">
+              {genRunbookPolicies.tagged.map(p=><option key={p.id} value={p.id}>{p.isDefault?"★ ":""}{p.title} (v{p.version})</option>)}
+            </optgroup>}
+            {genRunbookPolicies.untagged.length>0&&<optgroup label="Other available policies">
+              {genRunbookPolicies.untagged.map(p=><option key={p.id} value={p.id}>{p.title} (v{p.version})</option>)}
+            </optgroup>}
+          </Sel>
+          {(genRunbookPolicies.tagged.length===0&&genRunbookPolicies.untagged.length===0)&&<Card style={{marginBottom:14,borderColor:"#F59E0B30"}}><M style={{color:"#F59E0B"}}>No IR policies uploaded yet. Upload a policy in the IR Simulator policies tab first, then return here to generate a runbook.</M></Card>}
+          <div style={{marginBottom:14}}>
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Title (optional — defaults to scenario + policy name)</M>
+            <input type="text" value={genRunbookTitle} onChange={e=>setGenRunbookTitle(e.target.value)} maxLength={256} placeholder="e.g. Q3 ransomware drill" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+          </div>
+          <div style={{marginBottom:14}}>
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Incident ID (optional — link to your tracker)</M>
+            <input type="text" value={genRunbookIncidentId} onChange={e=>setGenRunbookIncidentId(e.target.value)} maxLength={128} placeholder="e.g. INC-2026-0042" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+            <Btn onClick={()=>{setShowGenerateRunbook(false);setGenRunbookPolicyId("");setGenRunbookTitle("");setGenRunbookIncidentId("");}}>Cancel</Btn>
+            <Btn primary disabled={!genRunbookPolicyId} onClick={()=>{
+              const body = { scenarioType: genRunbookScenario, policyId: genRunbookPolicyId };
+              if (genRunbookTitle.trim()) body.title = genRunbookTitle.trim();
+              if (genRunbookIncidentId.trim()) body.incidentId = genRunbookIncidentId.trim();
+              api.post("/api/runbooks/generate", body).then(r=>{
+                if (r&&r.id) {
+                  setShowGenerateRunbook(false);
+                  setGenRunbookPolicyId("");
+                  setGenRunbookTitle("");
+                  setGenRunbookIncidentId("");
+                  setRunbookDetailId(r.id);
+                }
+              }).catch(()=>{});
+            }}>Generate</Btn>
+          </div>
+        </Modal>}
 
         {/* ══════════ v1.0.0 — ANALYST OFFBOARDING ══════════ */}
         {tab==="offboarding"&&(<div>
