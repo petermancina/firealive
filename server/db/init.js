@@ -557,8 +557,64 @@ CREATE INDEX IF NOT EXISTS idx_ir_policies_type
 
 CREATE INDEX IF NOT EXISTS idx_ir_policies_hash
   ON ir_policies(content_hash);
-`;
 
+CREATE TABLE IF NOT EXISTS runbooks (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  scenario_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  source_policy_id TEXT REFERENCES ir_policies(id) ON DELETE SET NULL,
+  source_policy_version INTEGER,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'completed', 'cancelled')),
+  generated_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  activated_at TEXT,
+  activated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  finalized_at TEXT,
+  finalized_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  incident_id TEXT,
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runbooks_status_generated
+  ON runbooks(status, generated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_runbooks_scenario
+  ON runbooks(scenario_type, generated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_runbooks_source_policy
+  ON runbooks(source_policy_id, source_policy_version);
+
+CREATE TABLE IF NOT EXISTS runbook_steps (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  runbook_id TEXT NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
+  step_number INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  instruction TEXT NOT NULL,
+  expected_outcome TEXT,
+  is_critical INTEGER NOT NULL DEFAULT 0,
+  completed_at TEXT,
+  completed_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  completion_note TEXT,
+  skipped INTEGER NOT NULL DEFAULT 0,
+  skip_reason TEXT,
+  UNIQUE(runbook_id, step_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runbook_steps_runbook
+  ON runbook_steps(runbook_id, step_number);
+
+CREATE TABLE IF NOT EXISTS runbook_scenario_policies (
+  scenario_type TEXT NOT NULL,
+  policy_id TEXT NOT NULL REFERENCES ir_policies(id) ON DELETE CASCADE,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  PRIMARY KEY (scenario_type, policy_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runbook_scenario_policies_scenario
+  ON runbook_scenario_policies(scenario_type, is_default DESC);
+`;
 
 function initDb() {
   const { version, fuseCounter } = require('../lib/version');
