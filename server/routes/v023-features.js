@@ -22,7 +22,7 @@ router.get('/reports/human-impact-risk', (req, res) => {
     // Gather incident-to-burnout correlation data
     // In production, this queries real ticket/incident data linked to analyst metrics.
     // For now, generates a structured report from available data.
-    const analysts = db.prepare("SELECT * FROM analysts").all();
+    const analysts = db.prepare("SELECT * FROM users WHERE role = 'analyst'").all();
     const incidents = db.prepare("SELECT * FROM audit_log WHERE event_type LIKE '%INCIDENT%' OR event_type LIKE '%RETRO%' OR event_type LIKE '%ROUTING%' ORDER BY timestamp DESC LIMIT 500").all();
 
     db.close();
