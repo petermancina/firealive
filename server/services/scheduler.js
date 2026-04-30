@@ -6,6 +6,7 @@
 
 const cron = require('node-cron');
 const { logger } = require('./logger');
+const { versionLabel } = require('../lib/version');
 
 const schedulerService = {
   jobs: [],
@@ -82,7 +83,7 @@ function generateReport(db, config, type) {
 
   const report = {
     generated: new Date().toISOString(),
-    platform: 'FireAlive v0.0.18',
+    platform: `FireAlive ${versionLabel}`,
     type,
     depersonalized: true,
     sections: {},
