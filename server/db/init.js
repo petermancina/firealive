@@ -477,6 +477,37 @@ CREATE TABLE IF NOT EXISTS analyst_impacts (
   description TEXT,
   recorded_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT,
+  link_tab TEXT,
+  link_params TEXT,
+  read_at TEXT,
+  delivered_in_app INTEGER NOT NULL DEFAULT 1,
+  delivered_email INTEGER NOT NULL DEFAULT 0,
+  email_delivery_status TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_unread
+  ON notifications(recipient_id, read_at)
+  WHERE read_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_created
+  ON notifications(recipient_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS notification_preferences (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  in_app INTEGER NOT NULL DEFAULT 1,
+  email INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, event_type)
+);
 `;
 
 
