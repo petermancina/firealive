@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const notifications = require('../services/notifications');
 
 // Anti-C2: max messages per user per hour
 const MAX_MESSAGES_PER_HOUR = 50;
@@ -35,6 +36,7 @@ router.post('/requests', (req, res) => {
   try {
     const db = getDb();
     const id = crypto.randomBytes(16).toString('hex');
+    const excludeIds = Array.isArray(excludeAnalystIds) ? excludeAnalystIds : [];
 
     // Store request — requester identity is encrypted (server knows for routing
     // but never exposes to other analysts)
@@ -46,7 +48,7 @@ router.post('/requests', (req, res) => {
       JSON.stringify({
         id,
         topic: topic.slice(0, 500),
-        excludeIds: Array.isArray(excludeAnalystIds) ? excludeAnalystIds : [],
+        excludeIds,
         willingToMeet: !!willingToMeetInPerson,
         requesterId: req.user.id, // stored but never exposed
         status: 'open',
@@ -57,7 +59,40 @@ router.post('/requests', (req, res) => {
 
     db.close();
     auditLog(req.user.id, 'PEER_REQUEST_CREATED', 'Anonymous peer support request', req.ip);
-    res.status(201).json({ id, status: 'open' });
+
+    // Broadcast notification to eligible helpers (opt-in event, daily cap 5)
+    let notifiedCount = 0;
+    let cappedCount = 0;
+    try {
+      const eligible = notifications.getEligibleRecipients('peer_request_posted', {
+        roles: ['analyst', 'lead'],
+        activeOnly: true,
+        excludeUserIds: [req.user.id, ...excludeIds],
+      });
+      const dailyCap = notifications.EVENT_TYPES.peer_request_posted.dailyCap || Infinity;
+
+      for (const recipientId of eligible) {
+        const todayCount = notifications.getDailySendCount(recipientId, 'peer_request_posted');
+        if (todayCount >= dailyCap) { cappedCount++; continue; }
+        try {
+          notifications.notify({
+            recipientId,
+            eventType: 'peer_request_posted',
+            title: 'New peer support request available',
+            body: `An analyst has posted a new peer support request you're eligible to accept. Topic: "${topic.slice(0, 120)}${topic.length > 120 ? '…' : ''}". Open the Peer Skill-Share tab to view available requests.`,
+            linkTab: 'peer-share',
+            linkParams: { focus: 'requests' },
+          });
+          notifiedCount++;
+        } catch (notifyErr) {
+          logger.warn('Peer request post: notify recipient failed (non-fatal)', { recipientId, error: notifyErr.message });
+        }
+      }
+    } catch (broadcastErr) {
+      logger.error('Peer request post: broadcast failed (non-fatal)', { error: broadcastErr.message });
+    }
+
+    res.status(201).json({ id, status: 'open', notified: notifiedCount, cappedFromBroadcast: cappedCount });
   } catch (err) {
     logger.error('Create peer request error', { error: err.message });
     res.status(500).json({ error: 'Failed to create peer request' });
