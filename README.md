@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.11 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 4 (anti-rollback)
+**Version:** v1.0.12 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 5 (anti-rollback)
 
 ---
 
@@ -60,7 +60,20 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **v054 API (18 endpoints):** SOAR/Ticketing config, routing engine, IAM offboarding, upskilling scheduling, helper pay, pseudonym rotation, compliance reports, training submissions.
 
-**v059 API (10 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, runbook generator, TTX generator, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+
+**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
+
+**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+
+**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
+
+**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+
+**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
+
+**TTX Generator API (Phase 1.4d, /api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
+
 
 ---
 
@@ -68,7 +81,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.11) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.12) under Tags.
 
 See **SETUP.md** for detailed setup instructions.
 
