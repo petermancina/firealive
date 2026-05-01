@@ -1333,6 +1333,23 @@ function ManagementConsole() {
     }).catch(()=>setTagPolicies({ tagged: [], untagged: [] }));
   }, [showTagPolicies, tagScenario, tagRefreshKey]);
 
+  // ── TTX Generator state (Phase 1.4d) ─────────────────────────────────────
+  const [ttxScenariosList, setTtxScenariosList] = useState([]);
+  const [ttxScenariosLoading, setTtxScenariosLoading] = useState(false);
+  const [ttxScenarioId, setTtxScenarioId] = useState("");
+  const [ttxDifficulty, setTtxDifficulty] = useState("intermediate");
+  const [ttxFormat, setTtxFormat] = useState("pdf");
+  const [ttxGenerating, setTtxGenerating] = useState(false);
+
+  // When the TTX tab is opened, fetch the curated scenario library.
+  useEffect(()=>{
+    if (tab !== "ttx") return;
+    setTtxScenariosLoading(true);
+    api.get("/api/ttx/scenarios").then(r=>{
+      setTtxScenariosList(r?.scenarios || []);
+    }).catch(()=>setTtxScenariosList([])).finally(()=>setTtxScenariosLoading(false));
+  }, [tab]);
+
   // When peer_conduct tab is opened or filters change, load flags.
   useEffect(()=>{
     if (tab !== "peer_conduct") return;
@@ -1692,7 +1709,7 @@ function ManagementConsole() {
   const [offboardingQueue, setOffboardingQueue] = useState([]);
   const [newOffboard, setNewOffboard] = useState({analystId:"",reason:"departure",archiveData:true,revokeKeys:true,cancelPeerSessions:true,notifySoar:true});
   // TTX generator
-  const [ttxScenario, setTtxScenario] = useState(null);
+  // (ttxScenario state removed in Phase 1.4d — TTX is now a download-only flow)
   // Legal hold backup
   const [legalHoldCfg, setLegalHoldCfg] = useState({enabled:false,repository:"",hashAlgorithm:"sha256",format:"eml_pst",indefiniteRetention:true});
   // Risk register asset
@@ -4608,28 +4625,75 @@ regression:
         {/* ══════════ v1.0.0 — TTX GENERATOR ══════════ */}
         {tab==="ttx"&&(<div>
           <L>Tabletop Exercise Generator</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate tabletop exercise scenarios for compromise of the FireAlive app itself. Each scenario includes background, inject timeline, discussion questions, and expected actions. Produces a downloadable document for team exercises.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Pick a scenario and difficulty, then download a Situation Manual (SitMan) for the lead to bring to the meeting and a blank After-Action Report (AAR) template for the team to fill in afterwards. Both formats are available in PDF (printable) and DOCX (editable). Each generation is logged to the audit trail as compliance evidence.</M>
           <Card style={{marginBottom:16}}>
-            <Btn primary onClick={()=>{
-              const scenarios=[
-                {title:"Scenario: Analyst Client Credential Theft",background:"A phishing email targeting SOC analysts contains a credential harvester mimicking the FireAlive login page. Three analysts enter their credentials before the phish is detected.",injects:["T+0: Security team reports phishing campaign targeting SOC staff","T+15: Two analyst clients show login from unfamiliar IP addresses","T+30: Attacker uses stolen credentials to access one analyst's burnout data","T+45: Tripwire triggers — 3 analysts simultaneously in reduced routing","T+60: SIEM alerts on unusual API call patterns from compromised clients"],questions:["How do you verify which analysts were compromised?","What is the impact of burnout data exposure given pseudonymization?","How do you communicate with affected analysts without exposing their identities?","What is the recovery procedure for compromised analyst clients?","How would dual-approval have prevented escalation?"]},
-                {title:"Scenario: Management Console Insider Threat",background:"A departing Team Lead, who has given 2-week notice, begins exporting pseudonym mappings and configuration files before their last day.",injects:["T+0: Audit log shows bulk export of pseudonym mapping file","T+15: Configuration export triggered outside normal hours","T+30: Auth logs show failed attempts to access other Team Lead's account","T+45: SOAR receives alert about unusual data egress from MC workstation"],questions:["How quickly can you detect unauthorized exports?","What data could the insider have accessed?","How do you protect analyst identities if the pseudonym mapping is leaked?","What offboarding steps should have been accelerated?","How does dual-approval mitigate this scenario?"]},
-                {title:"Scenario: Server-Side Ransomware",background:"The FireAlive backend server is hit by ransomware during a weekend maintenance window. The server is encrypted and a ransom note is displayed.",injects:["T+0: Server monitoring shows all services unresponsive","T+5: Fail-open routing activates — tickets flowing without burnout filters","T+10: Analysts report they cannot connect to FireAlive","T+20: Ransom note discovered on server console","T+45: Team must decide: restore from backup or attempt HA failover"],questions:["Are your backups on a separate, air-gapped system?","How long can the SOC operate without burnout routing?","What is the MTTR for a full server restore?","Should you pay the ransom? (No.)","How do you verify backup integrity before restoration?"]},
-              ];
-              const s=scenarios[Math.floor(Math.random()*scenarios.length)];
-              setTtxScenario(s);
-              addA("TTX_GENERATED","Tabletop exercise generated: "+s.title);
-            }}>Generate Random TTX Scenario</Btn>
+            {ttxScenariosLoading&&<M style={{color:C.tm}}>Loading scenarios...</M>}
+            {!ttxScenariosLoading&&ttxScenariosList.length===0&&<M style={{color:C.tm}}>No scenarios available. Check that the server is running and that you have lead/admin access.</M>}
+            {!ttxScenariosLoading&&ttxScenariosList.length>0&&(<>
+              <Sel label="Scenario" value={ttxScenarioId} onChange={e=>setTtxScenarioId(e.target.value)}>
+                <option value="">— Select a scenario —</option>
+                {ttxScenariosList.map(s=><option key={s.id} value={s.id}>{s.title}</option>)}
+              </Sel>
+              <Sel label="Difficulty" value={ttxDifficulty} onChange={e=>setTtxDifficulty(e.target.value)}>
+                <option value="easy">Easy — 3-4 injects, single attack vector</option>
+                <option value="intermediate">Intermediate — 5-7 injects, concurrent issues</option>
+                <option value="hard">Hard — 8-12 injects, cascading failures</option>
+              </Sel>
+              <Sel label="Format" value={ttxFormat} onChange={e=>setTtxFormat(e.target.value)}>
+                <option value="pdf">PDF — printable, archival</option>
+                <option value="docx">DOCX — editable in Word</option>
+              </Sel>
+              {ttxScenarioId&&(()=>{
+                const s = ttxScenariosList.find(x=>x.id===ttxScenarioId);
+                return s?(<div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`,marginTop:6}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>About this scenario</M>
+                  <M style={{color:C.t,display:"block",lineHeight:1.6}}>{s.description}</M>
+                </div>):null;
+              })()}
+              <div style={{display:"flex",gap:8,marginTop:14,flexWrap:"wrap"}}>
+                <Btn primary disabled={!ttxScenarioId||ttxGenerating} onClick={()=>{
+                  if (!ttxScenarioId) return;
+                  setTtxGenerating(true);
+                  fetch(API_BASE+"/api/ttx/sitman",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},body:JSON.stringify({scenarioId:ttxScenarioId,difficulty:ttxDifficulty,format:ttxFormat})}).then(r=>{
+                    if(!r.ok) throw new Error("status "+r.status);
+                    return r.blob();
+                  }).then(blob=>{
+                    const url=URL.createObjectURL(blob);
+                    const a=document.createElement("a");
+                    a.href=url;
+                    a.download="sitman-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }).catch(()=>{}).finally(()=>setTtxGenerating(false));
+                }}>{ttxGenerating?"Generating...":"Download SitMan"}</Btn>
+                <Btn disabled={!ttxScenarioId||ttxGenerating} onClick={()=>{
+                  if (!ttxScenarioId) return;
+                  setTtxGenerating(true);
+                  fetch(API_BASE+"/api/ttx/aar",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},body:JSON.stringify({scenarioId:ttxScenarioId,difficulty:ttxDifficulty,format:ttxFormat})}).then(r=>{
+                    if(!r.ok) throw new Error("status "+r.status);
+                    return r.blob();
+                  }).then(blob=>{
+                    const url=URL.createObjectURL(blob);
+                    const a=document.createElement("a");
+                    a.href=url;
+                    a.download="aar-template-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }).catch(()=>{}).finally(()=>setTtxGenerating(false));
+                }}>{ttxGenerating?"Generating...":"Download AAR Template"}</Btn>
+              </div>
+            </>)}
           </Card>
-          {ttxScenario&&(<Card style={{marginBottom:16}}>
-            <div style={{fontSize:14,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>{ttxScenario.title}</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}><strong style={{color:C.t}}>Background:</strong> {ttxScenario.background}</M>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Inject Timeline</div>
-            {ttxScenario.injects.map((inj,i)=><div key={i} style={{padding:"4px 0"}}><M style={{color:C.w}}>{inj}</M></div>)}
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:12,marginBottom:8}}>Discussion Questions</div>
-            {ttxScenario.questions.map((q,i)=><div key={i} style={{padding:"4px 0"}}><M style={{color:C.t}}>{i+1}. {q}</M></div>)}
-            <Btn small style={{marginTop:12}} onClick={()=>{const data=JSON.stringify(ttxScenario,null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="ttx-"+ttxScenario.title.replace(/\s/g,"-").toLowerCase()+".json";a.click();}}>Export TTX Document</Btn>
-          </Card>)}
+          <Card>
+            <L style={{marginBottom:10}}>How a tabletop exercise works</L>
+            <M style={{color:C.t,display:"block",lineHeight:1.6,marginBottom:8}}>A TTX is a discussion-based exercise. The team sits together. The facilitator (a lead) opens the SitMan, reads the scenario brief aloud, then drops injects one at a time. The team talks through how they would respond. Someone takes notes.</M>
+            <M style={{color:C.t,display:"block",lineHeight:1.6,marginBottom:8}}>After the meeting, the team fills in the AAR template — what went well, what gaps showed up, action items. The completed AAR is the artifact auditors look for as proof the tabletop wasn't just a checkbox.</M>
+            <M style={{color:C.tm,display:"block",lineHeight:1.6}}>Source: NIST SP 800-84, CISA CTEPs, HSEEP Volume IV.</M>
+          </Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — LEGAL HOLD ══════════ */}
