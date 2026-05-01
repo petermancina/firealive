@@ -1254,6 +1254,7 @@ function ManagementConsole() {
   const [runbookDetailId, setRunbookDetailId] = useState(null); // when set, detail view renders instead of list
   const [runbookDetail, setRunbookDetail] = useState(null); // { runbook, steps }
   const [runbookDetailLoading, setRunbookDetailLoading] = useState(false);
+  const [runbookDetailRefreshKey, setRunbookDetailRefreshKey] = useState(0);
   const [showGenerateRunbook, setShowGenerateRunbook] = useState(false);
   const [genRunbookScenario, setGenRunbookScenario] = useState("ransomware");
   const [genRunbookPolicies, setGenRunbookPolicies] = useState({ tagged: [], untagged: [] });
@@ -1302,7 +1303,7 @@ function ManagementConsole() {
     api.get("/api/runbooks/" + encodeURIComponent(runbookDetailId)).then(r=>{
       setRunbookDetail(r || null);
     }).catch(()=>setRunbookDetail(null)).finally(()=>setRunbookDetailLoading(false));
-  }, [runbookDetailId]);
+  }, [runbookDetailId, runbookDetailRefreshKey]);
 
   // When the generate-runbook modal is opened or scenario changes,
   // fetch policies tagged for that scenario plus untagged policies.
@@ -4349,7 +4350,39 @@ regression:
                   <M style={{color:C.t}}>{done}/{totalSteps} complete{skipped>0?`, ${skipped} skipped`:""}{remaining>0&&rb.status==="active"?`, ${remaining} remaining`:""}</M>
                 </div>
               </Card>
-                            <L>Steps</L>
+              {(rb.status==="draft"||rb.status==="active")&&<Card style={{marginBottom:16}}>
+                <L style={{marginBottom:10}}>Actions</L>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  {rb.status==="draft"&&<Btn primary onClick={()=>{
+                    const incidentId = window.prompt("Incident ID (optional):", rb.incidentId||"");
+                    if (incidentId === null) return;
+                    const body = {};
+                    if (incidentId.trim()) body.incidentId = incidentId.trim();
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/activate", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Activate</Btn>}
+                  {rb.status==="active"&&<Btn primary onClick={()=>{
+                    const notes = window.prompt("Final notes (optional, up to 5000 chars):", "");
+                    if (notes === null) return;
+                    const body = {};
+                    if (notes.trim()) body.notes = notes.trim().slice(0, 5000);
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/finalize", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Finalize</Btn>}
+                  <Btn danger onClick={()=>{
+                    const reason = window.prompt("Cancellation reason (optional, but recommended):", "");
+                    if (reason === null) return;
+                    const body = {};
+                    if (reason.trim()) body.reason = reason.trim().slice(0, 2000);
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/cancel", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Cancel runbook</Btn>
+                </div>
+              </Card>}
+              <L>Steps</L>
               {steps.length===0&&<Card><M style={{color:C.tm}}>This runbook has no steps. The parser could not find any structured steps in the source policy text.</M></Card>}
               {steps.map(step=>{
                 const stepStatusColor = step.completedAt?"#10B981":(step.skipped?"#6B7280":(step.isCritical?"#EF4444":C.tm));
@@ -4374,6 +4407,33 @@ regression:
                   {step.skipped&&<div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`}}>
                     <M style={{color:"#6B7280",display:"block"}}>⊘ Skipped</M>
                     {step.skipReason&&<M style={{color:C.t,display:"block",marginTop:4,whiteSpace:"pre-wrap",lineHeight:1.6}}>Reason: {step.skipReason}</M>}
+                  </div>}
+                  {rb.status==="active"&&!step.completedAt&&!step.skipped&&<div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.b}`,display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <Btn small primary onClick={()=>{
+                      const note = window.prompt("Completion note (optional):", "");
+                      if (note === null) return;
+                      const body = {};
+                      if (note.trim()) body.note = note.trim().slice(0, 2000);
+                      api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/steps/"+encodeURIComponent(step.id)+"/complete", body).then(()=>{
+                        setRunbookDetailRefreshKey(k=>k+1);
+                      }).catch(()=>{});
+                    }}>Mark complete</Btn>
+                    <Btn small onClick={()=>{
+                      const promptText = step.isCritical
+                        ? "This step is CRITICAL. A skip reason is required:"
+                        : "Skip reason (optional):";
+                      const reason = window.prompt(promptText, "");
+                      if (reason === null) return;
+                      if (step.isCritical && !reason.trim()) {
+                        window.alert("Critical steps require a skip reason.");
+                        return;
+                      }
+                      const body = {};
+                      if (reason.trim()) body.reason = reason.trim().slice(0, 2000);
+                      api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/steps/"+encodeURIComponent(step.id)+"/skip", body).then(()=>{
+                        setRunbookDetailRefreshKey(k=>k+1);
+                      }).catch(()=>{});
+                    }}>Skip</Btn>
                   </div>}
                 </Card>);
               })}
