@@ -37,6 +37,7 @@ const api = {
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
   async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   setToken(t) { this._token = t; },
 };
 
@@ -1261,6 +1262,10 @@ function ManagementConsole() {
   const [genRunbookPolicyId, setGenRunbookPolicyId] = useState("");
   const [genRunbookTitle, setGenRunbookTitle] = useState("");
   const [genRunbookIncidentId, setGenRunbookIncidentId] = useState("");
+  const [showTagPolicies, setShowTagPolicies] = useState(false);
+  const [tagScenario, setTagScenario] = useState("ransomware");
+  const [tagPolicies, setTagPolicies] = useState({ tagged: [], untagged: [] });
+  const [tagRefreshKey, setTagRefreshKey] = useState(0);
 
   // Poll active runbook count every 60s for the dashboard banner.
   // Same pattern as peerFlagOpenCount / peerFlagUrgentOpenCount above.
@@ -1317,6 +1322,16 @@ function ManagementConsole() {
       if (def) setGenRunbookPolicyId(def.id);
     }).catch(()=>setGenRunbookPolicies({ tagged: [], untagged: [] }));
   }, [showGenerateRunbook, genRunbookScenario]);
+
+  // Tagging modal: fetch policies for the chosen scenario when the
+  // modal opens, the scenario changes, or the refresh key bumps after
+  // a tag/untag/set-default action.
+  useEffect(()=>{
+    if (!showTagPolicies) return;
+    api.get("/api/runbooks/scenarios/" + encodeURIComponent(tagScenario) + "/policies").then(r=>{
+      setTagPolicies({ tagged: r?.tagged || [], untagged: r?.untagged || [] });
+    }).catch(()=>setTagPolicies({ tagged: [], untagged: [] }));
+  }, [showTagPolicies, tagScenario, tagRefreshKey]);
 
   // When peer_conduct tab is opened or filters change, load flags.
   useEffect(()=>{
@@ -4289,6 +4304,8 @@ regression:
               </Sel>
             </div>
             <Btn primary onClick={()=>setShowGenerateRunbook(true)}>Generate runbook</Btn>
+            <Btn onClick={()=>setShowTagPolicies(true)}>Tag policies</Btn>
+
           </Card>
           {runbooksLoading&&(<Card><M style={{color:C.tm}}>Loading runbooks...</M></Card>)}
           {!runbooksLoading&&runbooks.length===0&&(<Card><M style={{color:C.tm}}>No runbooks match the current filters. Click Generate runbook to create one from an uploaded IR policy.</M></Card>)}
@@ -4499,6 +4516,65 @@ regression:
                 }
               }).catch(()=>{});
             }}>Generate</Btn>
+          </div>
+        </Modal>}
+        {showTagPolicies&&<Modal title="Tag IR Policies for Scenarios" onClose={()=>setShowTagPolicies(false)} width={560}>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Tag uploaded IR policies for specific scenario types so they appear at the top of the policy picker when generating a runbook. Set one as default per scenario to auto-select it. Untagged policies remain available — tagging is just for surfacing.</M>
+          <Sel label="Scenario" value={tagScenario} onChange={e=>setTagScenario(e.target.value)}>
+            <option value="ransomware">Ransomware</option>
+            <option value="data_exfiltration">Data exfiltration</option>
+            <option value="insider_threat">Insider threat</option>
+            <option value="credential_compromise">Credential compromise</option>
+            <option value="ddos">DDoS</option>
+            <option value="supply_chain">Supply chain</option>
+            <option value="cloud_account_compromise">Cloud account compromise</option>
+            <option value="database_corruption">Database corruption</option>
+            <option value="server_crash">Server crash</option>
+            <option value="backup_restoration">Backup restoration</option>
+            <option value="ir_team_handoff">IR team handoff</option>
+          </Sel>
+          <L style={{marginTop:14,marginBottom:8}}>Tagged for {tagScenario.replace(/_/g," ")}</L>
+          {tagPolicies.tagged.length===0&&<Card style={{marginBottom:8}}><M style={{color:C.tm}}>No policies tagged for this scenario yet. Tag a policy from the list below.</M></Card>}
+          {tagPolicies.tagged.map(p=>(<Card key={p.id} style={{marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>{p.isDefault?"★ ":""}{p.title}</div>
+              <M style={{color:C.tm,display:"block",marginTop:2}}>v{p.version} · {p.policyType}</M>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {!p.isDefault&&<Btn small onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: true }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Set default</Btn>}
+              <Btn small danger onClick={()=>{
+                api.del("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies/"+encodeURIComponent(p.id)).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Untag</Btn>
+            </div>
+          </Card>))}
+                    <L style={{marginTop:14,marginBottom:8}}>Available untagged policies</L>
+          {tagPolicies.untagged.length===0&&<Card style={{marginBottom:8}}><M style={{color:C.tm}}>No untagged policies. Either everything's already tagged for this scenario, or no policies have been uploaded yet.</M></Card>}
+          {tagPolicies.untagged.map(p=>(<Card key={p.id} style={{marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>{p.title}</div>
+              <M style={{color:C.tm,display:"block",marginTop:2}}>v{p.version} · {p.policyType}</M>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <Btn small onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: false }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Tag</Btn>
+              <Btn small primary onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: true }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Tag as default</Btn>
+            </div>
+          </Card>))}
+          <div style={{display:"flex",justifyContent:"flex-end",marginTop:14}}>
+            <Btn onClick={()=>setShowTagPolicies(false)}>Done</Btn>
           </div>
         </Modal>}
 
