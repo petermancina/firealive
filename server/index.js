@@ -121,6 +121,7 @@ app.use('/api/auth/password', require('./routes/password'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/ooda', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ooda'));
 app.use('/api/runbooks', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/runbooks'));
+app.use('/api/ttx', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ttx'));
 app.use('/api/inbox', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/notifications-inapp'));
 app.use('/api/inbox/admin', authMiddleware(['admin']), require('./routes/notifications-admin'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/v021-features'));
