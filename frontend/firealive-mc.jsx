@@ -37,6 +37,7 @@ const api = {
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
   async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   setToken(t) { this._token = t; },
 };
 
@@ -1244,6 +1245,94 @@ function ManagementConsole() {
     return ()=>{ cancelled = true; clearInterval(handle); };
   }, []);
 
+  // ── IR Recovery Runbook state (Phase 1.4c) ───────────────────────────────
+  const [runbooks, setRunbooks] = useState([]);
+  const [runbooksLoading, setRunbooksLoading] = useState(false);
+  const [runbookStatusFilter, setRunbookStatusFilter] = useState("all"); // all | draft | active | completed | cancelled
+  const [runbookScenarioFilter, setRunbookScenarioFilter] = useState(""); // "" | scenario type
+  const [activeRunbookCount, setActiveRunbookCount] = useState(0);
+  const [activeRunbookMostRecent, setActiveRunbookMostRecent] = useState(null); // id of most recent active runbook for banner click-through
+  const [runbookDetailId, setRunbookDetailId] = useState(null); // when set, detail view renders instead of list
+  const [runbookDetail, setRunbookDetail] = useState(null); // { runbook, steps }
+  const [runbookDetailLoading, setRunbookDetailLoading] = useState(false);
+  const [runbookDetailRefreshKey, setRunbookDetailRefreshKey] = useState(0);
+  const [showGenerateRunbook, setShowGenerateRunbook] = useState(false);
+  const [genRunbookScenario, setGenRunbookScenario] = useState("ransomware");
+  const [genRunbookPolicies, setGenRunbookPolicies] = useState({ tagged: [], untagged: [] });
+  const [genRunbookPolicyId, setGenRunbookPolicyId] = useState("");
+  const [genRunbookTitle, setGenRunbookTitle] = useState("");
+  const [genRunbookIncidentId, setGenRunbookIncidentId] = useState("");
+  const [showTagPolicies, setShowTagPolicies] = useState(false);
+  const [tagScenario, setTagScenario] = useState("ransomware");
+  const [tagPolicies, setTagPolicies] = useState({ tagged: [], untagged: [] });
+  const [tagRefreshKey, setTagRefreshKey] = useState(0);
+
+  // Poll active runbook count every 60s for the dashboard banner.
+  // Same pattern as peerFlagOpenCount / peerFlagUrgentOpenCount above.
+  // We track the most recent active runbook id so the banner click
+  // navigates straight to its detail view.
+  useEffect(()=>{
+    let cancelled = false;
+    const fetchActive = ()=>{
+      api.get("/api/runbooks?status=active").then(r=>{
+        if (cancelled) return;
+        const list = r?.runbooks || [];
+        setActiveRunbookCount(list.length);
+        setActiveRunbookMostRecent(list.length > 0 ? list[0].id : null);
+      }).catch(()=>{});
+    };
+    fetchActive();
+    const handle = setInterval(fetchActive, 60000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, []);
+
+  // When the runbook tab is opened or filters change, load the list.
+  // Detail view (when runbookDetailId is set) is loaded by a separate
+  // effect below.
+  useEffect(()=>{
+    if (tab !== "runbook" || runbookDetailId) return;
+    setRunbooksLoading(true);
+    const params = new URLSearchParams();
+    if (runbookStatusFilter !== "all") params.set("status", runbookStatusFilter);
+    if (runbookScenarioFilter) params.set("scenario", runbookScenarioFilter);
+    const qs = params.toString();
+    api.get("/api/runbooks" + (qs ? "?" + qs : "")).then(r=>{
+      setRunbooks(r?.runbooks || []);
+    }).catch(()=>{}).finally(()=>setRunbooksLoading(false));
+  }, [tab, runbookStatusFilter, runbookScenarioFilter, runbookDetailId]);
+
+  // When a detail view is requested, fetch the full runbook + steps.
+  useEffect(()=>{
+    if (!runbookDetailId) { setRunbookDetail(null); return; }
+    setRunbookDetailLoading(true);
+    api.get("/api/runbooks/" + encodeURIComponent(runbookDetailId)).then(r=>{
+      setRunbookDetail(r || null);
+    }).catch(()=>setRunbookDetail(null)).finally(()=>setRunbookDetailLoading(false));
+  }, [runbookDetailId, runbookDetailRefreshKey]);
+
+  // When the generate-runbook modal is opened or scenario changes,
+  // fetch policies tagged for that scenario plus untagged policies.
+  // Powers the policy picker in the modal.
+  useEffect(()=>{
+    if (!showGenerateRunbook) return;
+    api.get("/api/runbooks/scenarios/" + encodeURIComponent(genRunbookScenario) + "/policies").then(r=>{
+      setGenRunbookPolicies({ tagged: r?.tagged || [], untagged: r?.untagged || [] });
+      // Auto-pick the default policy if one exists for this scenario
+      const def = (r?.tagged || []).find(p => p.isDefault);
+      if (def) setGenRunbookPolicyId(def.id);
+    }).catch(()=>setGenRunbookPolicies({ tagged: [], untagged: [] }));
+  }, [showGenerateRunbook, genRunbookScenario]);
+
+  // Tagging modal: fetch policies for the chosen scenario when the
+  // modal opens, the scenario changes, or the refresh key bumps after
+  // a tag/untag/set-default action.
+  useEffect(()=>{
+    if (!showTagPolicies) return;
+    api.get("/api/runbooks/scenarios/" + encodeURIComponent(tagScenario) + "/policies").then(r=>{
+      setTagPolicies({ tagged: r?.tagged || [], untagged: r?.untagged || [] });
+    }).catch(()=>setTagPolicies({ tagged: [], untagged: [] }));
+  }, [showTagPolicies, tagScenario, tagRefreshKey]);
+
   // When peer_conduct tab is opened or filters change, load flags.
   useEffect(()=>{
     if (tab !== "peer_conduct") return;
@@ -1594,9 +1683,7 @@ function ManagementConsole() {
   const [proactiveAlerts, setProactiveAlerts] = useState([
     {id:"pa1",analyst:"Analyst-Falcon",pseudonym:"Analyst-Falcon",trigger:"4hr continuous P1/P2 tickets",suggestedAt:new Date().toISOString(),status:"pending"},
   ]);
-  // Recovery runbook
-  const [runbookScenario, setRunbookScenario] = useState("server_crash");
-  const [generatedRunbook, setGeneratedRunbook] = useState(null);
+  // Recovery runbook (mocked state replaced by real state in Phase 1.4c Part 2 commit 1)
   // Upskilling hour
   const [upskillingCfg, setUpskillingCfg] = useState({enabled:false,hourOfShift:8,durationMin:60,stopRouting:true,statusLabel:"Upskilling",allowPeerChat:true,allowTraining:true});
   // Auto-routing disable on critical incidents
@@ -1661,6 +1748,16 @@ function ManagementConsole() {
           </div>
         </div>
         <M style={{color:C.d,fontWeight:500,fontSize:11}}>Review →</M>
+      </div>)}
+      {activeRunbookCount>0&&(<div onClick={()=>{if(activeRunbookMostRecent){setRunbookDetailId(activeRunbookMostRecent);}setTab("runbook");}} style={{padding:"10px 24px",background:"rgba(239,68,68,0.12)",borderBottom:`1px solid ${C.d}50`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:C.d,boxShadow:`0 0 8px ${C.d}`,animation:"pulse 1.5s infinite",flexShrink:0}}/>
+          <div>
+            <M style={{color:C.d,fontWeight:600,letterSpacing:1.5,textTransform:"uppercase",fontSize:10,display:"block"}}>IR Recovery Runbook — Active Incident</M>
+            <M style={{color:C.t,fontSize:11,display:"block",marginTop:2}}>{activeRunbookCount} runbook{activeRunbookCount>1?"s":""} currently active. Step-by-step incident response in progress.</M>
+          </div>
+        </div>
+        <M style={{color:C.d,fontWeight:500,fontSize:11}}>Open →</M>
       </div>)}
       {/* v1.0.0: Grouped sidebar navigation replaces 57 flat tabs */}
       <div style={{display:"flex",minHeight:"calc(100vh - 120px)"}}>
@@ -4177,40 +4274,309 @@ regression:
         </div>)}
 
         {/* ══════════ v1.0.0 — RECOVERY RUNBOOK ══════════ */}
-        {tab==="runbook"&&(<div>
-          <L>Recovery Runbook Generator</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Auto-generate step-by-step recovery instructions based on the specific failure scenario. Each runbook includes detection steps, immediate actions, recovery procedure, verification, and post-recovery tasks.</M>
-          <Card style={{marginBottom:16}}>
-            <Sel label="Failure scenario" value={runbookScenario} onChange={e=>setRunbookScenario(e.target.value)}>
-              <option value="server_crash">Server crash (backend down)</option>
-              <option value="db_corruption">Database corruption</option>
-              <option value="client_compromise">Analyst client compromised</option>
-              <option value="mc_compromise">Management console compromised</option>
-              <option value="network_partition">Network partition (clients can't reach server)</option>
-              <option value="encryption_key_loss">Encryption key loss</option>
-              <option value="ransomware">Ransomware attack on host</option>
-              <option value="insider_threat">Insider threat detected</option>
-              <option value="ha_failover_failed">HA failover failed</option>
-              <option value="mass_client_compromise">Mass client compromise (tripwire triggered)</option>
-            </Sel>
-            <Btn primary style={{marginTop:12}} onClick={()=>{
-              const books={
-                server_crash:{title:"Server Crash Recovery",steps:["1. DETECT: Monitor shows server unresponsive, clients report connection errors","2. VERIFY: Check server host — SSH/RDP to server machine, check process status","3. FAIL-OPEN: Confirm fail-open routing activated — tickets flowing without burnout filter","4. If HA enabled: Verify passive promoted to active automatically","5. If HA not enabled: Restart server process: systemctl restart firealive-server","6. CHECK DB: Run integrity check: node server/db/integrity-check.js","7. VERIFY CLIENTS: Confirm analyst clients reconnecting (check Integrations Health)","8. RESTORE ROUTING: If fail-open activated, verify burnout routing re-enabled","9. POST-RECOVERY: Review audit logs for cause, run regression test, notify team"]},
-                client_compromise:{title:"Analyst Client Compromise Recovery",steps:["1. ISOLATE: Disconnect compromised client from network immediately","2. PRESERVE: Export forensic data from the client before wiping","3. REVOKE: Revoke all API tokens and session tokens for that analyst's pseudonym","4. ROTATE: Rotate the analyst's pseudonym (Pseudonyms tab → rotate)","5. SCAN OTHERS: Run compromise scan on all other clients (Compromise Scan tab)","6. CHECK TRIPWIRE: Verify tripwire wasn't triggered by legitimate reduced routing","7. REPROVISION: Deploy fresh client from known-good image to the analyst's machine","8. RESTORE CONFIG: Push configuration from management console to new client","9. RE-AUTH: Analyst re-enrolls MFA on new client","10. POST: Review auth logs, update SIEM rules, conduct brief retro"]},
-                ransomware:{title:"Ransomware Recovery",steps:["1. ISOLATE: Disconnect affected host(s) from network IMMEDIATELY","2. DO NOT PAY: Do not engage with ransom demands","3. ASSESS SCOPE: Which components affected? Server? Clients? Management console?","4. ACTIVATE HA: If server affected and HA available, failover to clean standby","5. BACKUP CHECK: Verify backup integrity — are backups on a separate, unaffected system?","6. RESTORE: Restore from most recent verified clean backup","7. REPROVISION CLIENTS: Deploy fresh client images to all affected analyst machines","8. ROTATE ALL KEYS: API keys, encryption keys, JWT secrets, KMS keys","9. FORCE RE-AUTH: Invalidate all sessions, require full MFA re-enrollment","10. FORENSICS: Export all logs, run full compromise scan, engage IR team","11. REPORT: Generate forensic export for legal/compliance, update risk register"]},
-                insider_threat:{title:"Insider Threat Response",steps:["1. ACTIVATE PROTOCOL: Hit insider threat button — auto-rotates keys, locks configs","2. PRESERVE EVIDENCE: Do NOT alert the suspect — export audit logs immediately","3. REVIEW AUTH LOGS: Check for unauthorized access patterns, off-hours logins","4. CHECK PSEUDONYM MAP: Verify pseudonym mapping hasn't been exported without authorization","5. SCOPE: Determine what data the insider could have accessed (tier-1 only? tier-3?)","6. REVOKE: Disable the insider's account, revoke all their tokens","7. OFFBOARD: Use offboarding process — revoke keys, cancel peer sessions, archive data","8. SCAN: Run compromise scan on any systems the insider had access to","9. ROTATE: Rotate all shared secrets (API keys, KMS keys, SOAR tokens)","10. DEBRIEF: Conduct retro with remaining team — support their wellbeing after the event"]},
-              };
-              const book = books[runbookScenario] || {title:"Recovery Runbook",steps:["1. Assess the situation","2. Check HA status and failover","3. Verify backups are clean","4. Restore from known-good backup","5. Rotate all credentials","6. Run compromise scan","7. Verify all clients reconnected","8. Review audit logs","9. Run regression test","10. Conduct post-incident retro"]};
-              setGeneratedRunbook(book);
-              addA("RUNBOOK_GENERATED","Recovery runbook generated: "+book.title);
-            }}>Generate Runbook</Btn>
+          {tab==="runbook"&&!runbookDetailId&&(<div>
+          <L>IR Recovery Runbook</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate org-policy-driven runbooks for incident response. Each runbook is built from one of your team's uploaded IR policies. Steps are extracted from the policy text; the lead reviews in draft, activates during a real incident, and finalizes when the response is complete. The runbook records exactly which policy version was followed for the audit trail.</M>
+          <Card style={{marginBottom:16,display:"flex",gap:12,alignItems:"flex-end",flexWrap:"wrap"}}>
+            <div style={{flex:"1 1 180px"}}>
+              <Sel label="Status" value={runbookStatusFilter} onChange={e=>setRunbookStatusFilter(e.target.value)}>
+                <option value="all">All</option>
+                <option value="draft">Draft</option>
+                <option value="active">Active</option>
+                <option value="completed">Completed</option>
+                <option value="cancelled">Cancelled</option>
+              </Sel>
+            </div>
+            <div style={{flex:"1 1 220px"}}>
+              <Sel label="Scenario" value={runbookScenarioFilter} onChange={e=>setRunbookScenarioFilter(e.target.value)}>
+                <option value="">All scenarios</option>
+                <option value="ransomware">Ransomware</option>
+                <option value="data_exfiltration">Data exfiltration</option>
+                <option value="insider_threat">Insider threat</option>
+                <option value="credential_compromise">Credential compromise</option>
+                <option value="ddos">DDoS</option>
+                <option value="supply_chain">Supply chain</option>
+                <option value="cloud_account_compromise">Cloud account compromise</option>
+                <option value="database_corruption">Database corruption</option>
+                <option value="server_crash">Server crash</option>
+                <option value="backup_restoration">Backup restoration</option>
+                <option value="ir_team_handoff">IR team handoff</option>
+              </Sel>
+            </div>
+            <Btn primary onClick={()=>setShowGenerateRunbook(true)}>Generate runbook</Btn>
+            <Btn onClick={()=>setShowTagPolicies(true)}>Tag policies</Btn>
+
           </Card>
-          {generatedRunbook&&(<Card style={{marginBottom:16}}>
-            <div style={{fontSize:14,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>{generatedRunbook.title}</div>
-            {generatedRunbook.steps.map((s,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.t,lineHeight:1.6}}>{s}</M></div>)}
-            <Btn small style={{marginTop:12}} onClick={()=>{const data=JSON.stringify(generatedRunbook,null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="recovery-runbook-"+runbookScenario+".json";a.click();}}>Export Runbook</Btn>
-          </Card>)}
+          {runbooksLoading&&(<Card><M style={{color:C.tm}}>Loading runbooks...</M></Card>)}
+          {!runbooksLoading&&runbooks.length===0&&(<Card><M style={{color:C.tm}}>No runbooks match the current filters. Click Generate runbook to create one from an uploaded IR policy.</M></Card>)}
+          {!runbooksLoading&&runbooks.map(rb=>{
+            const statusColor = rb.status==="active"?"#EF4444":(rb.status==="draft"?"#F59E0B":(rb.status==="completed"?"#10B981":"#6B7280"));
+            const totalSteps = rb.stepCount || 0;
+            const done = rb.stepsCompleted || 0;
+            const skipped = rb.stepsSkipped || 0;
+            const remaining = totalSteps - done - skipped;
+            return (<Card key={rb.id} onClick={()=>setRunbookDetailId(rb.id)} style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:6}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:4,overflow:"hidden",textOverflow:"ellipsis"}}>{rb.title}</div>
+                  <M style={{color:C.tm,display:"block"}}>{(rb.scenarioType||"").replace(/_/g," ")} · from policy "{rb.sourcePolicyTitle||"(deleted)"}" v{rb.sourcePolicyVersion||"?"}</M>
+                </div>
+                <div style={{padding:"3px 8px",background:statusColor+"20",border:`1px solid ${statusColor}`,borderRadius:6,fontSize:9,fontWeight:600,color:statusColor,letterSpacing:0.5,textTransform:"uppercase",whiteSpace:"nowrap"}}>{rb.status}</div>
+              </div>
+              <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
+                <M style={{color:C.t}}>{done}/{totalSteps} complete{skipped>0?`, ${skipped} skipped`:""}{remaining>0&&rb.status==="active"?`, ${remaining} remaining`:""}</M>
+                <M style={{color:C.tm}}>generated by {rb.generatedBy} · {new Date(rb.generatedAt).toLocaleString()}</M>
+                {rb.incidentId&&<M style={{color:C.tm}}>incident: {rb.incidentId}</M>}
+              </div>
+            </Card>);
+          })}
         </div>)}
+        {tab==="runbook"&&runbookDetailId&&(<div>
+          <div style={{marginBottom:16}}>
+            <Btn small onClick={()=>setRunbookDetailId(null)}>← Back to list</Btn>
+          </div>
+          {runbookDetailLoading&&(<Card><M style={{color:C.tm}}>Loading runbook...</M></Card>)}
+          {!runbookDetailLoading&&!runbookDetail&&(<Card><M style={{color:C.tm}}>Could not load runbook. It may have been deleted.</M></Card>)}
+          {!runbookDetailLoading&&runbookDetail&&(()=>{
+            const rb = runbookDetail.runbook;
+            const steps = runbookDetail.steps || [];
+            const statusColor = rb.status==="active"?"#EF4444":(rb.status==="draft"?"#F59E0B":(rb.status==="completed"?"#10B981":"#6B7280"));
+            const totalSteps = steps.length;
+            const done = steps.filter(s=>s.completedAt).length;
+            const skipped = steps.filter(s=>s.skipped).length;
+            const remaining = totalSteps - done - skipped;
+            return (<>
+              <Card style={{marginBottom:16}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:10}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:15,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>{rb.title}</div>
+                    <M style={{color:C.tm,display:"block"}}>{(rb.scenarioType||"").replace(/_/g," ")}</M>
+                  </div>
+                  <div style={{padding:"4px 10px",background:statusColor+"20",border:`1px solid ${statusColor}`,borderRadius:6,fontSize:10,fontWeight:600,color:statusColor,letterSpacing:0.5,textTransform:"uppercase",whiteSpace:"nowrap"}}>{rb.status}</div>
+                </div>
+                <div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`,marginTop:6}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Source policy</M>
+                  <M style={{color:C.t,display:"block"}}>{rb.sourcePolicyTitle||"(deleted)"} · v{rb.sourcePolicyVersion||"?"}</M>
+                  <M style={{color:C.tm,display:"block",marginTop:4,fontSize:9}}>The runbook was generated from this version. Even if the policy is later edited, the runbook keeps the steps as parsed at generation time.</M>
+                </div>
+                <div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:6}}>Timeline</M>
+                  <M style={{color:C.t,display:"block",marginBottom:3}}>Generated by {rb.generatedBy} · {new Date(rb.generatedAt).toLocaleString()}</M>
+                  {rb.activatedAt&&<M style={{color:C.t,display:"block",marginBottom:3}}>Activated by {rb.activatedBy} · {new Date(rb.activatedAt).toLocaleString()}</M>}
+                  {rb.finalizedAt&&<M style={{color:C.t,display:"block",marginBottom:3}}>{rb.status==="cancelled"?"Cancelled":"Finalized"} by {rb.finalizedBy} · {new Date(rb.finalizedAt).toLocaleString()}</M>}
+                </div>
+                {rb.incidentId&&<div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Incident ID</M>
+                  <M style={{color:C.t}}>{rb.incidentId}</M>
+                </div>}
+                {rb.notes&&<div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Notes</M>
+                  <M style={{color:C.t,display:"block",whiteSpace:"pre-wrap",lineHeight:1.6}}>{rb.notes}</M>
+                </div>}
+                <div style={{padding:"10px 0",borderTop:`1px solid ${C.b}`}}>
+                  <M style={{color:C.t}}>{done}/{totalSteps} complete{skipped>0?`, ${skipped} skipped`:""}{remaining>0&&rb.status==="active"?`, ${remaining} remaining`:""}</M>
+                </div>
+              </Card>
+              {(rb.status==="draft"||rb.status==="active")&&<Card style={{marginBottom:16}}>
+                <L style={{marginBottom:10}}>Actions</L>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  {rb.status==="draft"&&<Btn primary onClick={()=>{
+                    const incidentId = window.prompt("Incident ID (optional):", rb.incidentId||"");
+                    if (incidentId === null) return;
+                    const body = {};
+                    if (incidentId.trim()) body.incidentId = incidentId.trim();
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/activate", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Activate</Btn>}
+                  {rb.status==="active"&&<Btn primary onClick={()=>{
+                    const notes = window.prompt("Final notes (optional, up to 5000 chars):", "");
+                    if (notes === null) return;
+                    const body = {};
+                    if (notes.trim()) body.notes = notes.trim().slice(0, 5000);
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/finalize", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Finalize</Btn>}
+                  <Btn danger onClick={()=>{
+                    const reason = window.prompt("Cancellation reason (optional, but recommended):", "");
+                    if (reason === null) return;
+                    const body = {};
+                    if (reason.trim()) body.reason = reason.trim().slice(0, 2000);
+                    api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/cancel", body).then(()=>{
+                      setRunbookDetailRefreshKey(k=>k+1);
+                    }).catch(()=>{});
+                  }}>Cancel runbook</Btn>
+                </div>
+              </Card>}
+              <L>Steps</L>
+              {steps.length===0&&<Card><M style={{color:C.tm}}>This runbook has no steps. The parser could not find any structured steps in the source policy text.</M></Card>}
+              {steps.map(step=>{
+                const stepStatusColor = step.completedAt?"#10B981":(step.skipped?"#6B7280":(step.isCritical?"#EF4444":C.tm));
+                const stepStatusLabel = step.completedAt?"complete":(step.skipped?"skipped":(step.isCritical?"critical · pending":"pending"));
+                return (<Card key={step.id} style={{marginBottom:8,borderLeft:`3px solid ${stepStatusColor}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <M style={{color:C.tm,display:"block",fontSize:9}}>Step {step.stepNumber}{step.isCritical?" · CRITICAL":""}</M>
+                      <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginTop:3}}>{step.title}</div>
+                    </div>
+                    <div style={{padding:"2px 7px",background:stepStatusColor+"20",border:`1px solid ${stepStatusColor}`,borderRadius:5,fontSize:9,fontWeight:600,color:stepStatusColor,letterSpacing:0.5,textTransform:"uppercase",whiteSpace:"nowrap"}}>{stepStatusLabel}</div>
+                  </div>
+                  {step.instruction&&step.instruction!==step.title&&<M style={{color:C.t,display:"block",whiteSpace:"pre-wrap",lineHeight:1.6,marginTop:8}}>{step.instruction}</M>}
+                  {step.expectedOutcome&&<div style={{marginTop:8,padding:"8px 10px",background:"rgba(255,255,255,0.02)",borderRadius:6,borderLeft:`2px solid ${C.tm}`}}>
+                    <M style={{color:C.tm,display:"block",marginBottom:3}}>Expected outcome</M>
+                    <M style={{color:C.t,whiteSpace:"pre-wrap",lineHeight:1.6}}>{step.expectedOutcome}</M>
+                  </div>}
+                  {step.completedAt&&<div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`}}>
+                    <M style={{color:"#10B981",display:"block"}}>✓ Completed by {step.completedBy} · {new Date(step.completedAt).toLocaleString()}</M>
+                    {step.completionNote&&<M style={{color:C.t,display:"block",marginTop:4,whiteSpace:"pre-wrap",lineHeight:1.6}}>{step.completionNote}</M>}
+                  </div>}
+                  {step.skipped&&<div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`}}>
+                    <M style={{color:"#6B7280",display:"block"}}>⊘ Skipped</M>
+                    {step.skipReason&&<M style={{color:C.t,display:"block",marginTop:4,whiteSpace:"pre-wrap",lineHeight:1.6}}>Reason: {step.skipReason}</M>}
+                  </div>}
+                  {rb.status==="active"&&!step.completedAt&&!step.skipped&&<div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.b}`,display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <Btn small primary onClick={()=>{
+                      const note = window.prompt("Completion note (optional):", "");
+                      if (note === null) return;
+                      const body = {};
+                      if (note.trim()) body.note = note.trim().slice(0, 2000);
+                      api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/steps/"+encodeURIComponent(step.id)+"/complete", body).then(()=>{
+                        setRunbookDetailRefreshKey(k=>k+1);
+                      }).catch(()=>{});
+                    }}>Mark complete</Btn>
+                    <Btn small onClick={()=>{
+                      const promptText = step.isCritical
+                        ? "This step is CRITICAL. A skip reason is required:"
+                        : "Skip reason (optional):";
+                      const reason = window.prompt(promptText, "");
+                      if (reason === null) return;
+                      if (step.isCritical && !reason.trim()) {
+                        window.alert("Critical steps require a skip reason.");
+                        return;
+                      }
+                      const body = {};
+                      if (reason.trim()) body.reason = reason.trim().slice(0, 2000);
+                      api.post("/api/runbooks/"+encodeURIComponent(rb.id)+"/steps/"+encodeURIComponent(step.id)+"/skip", body).then(()=>{
+                        setRunbookDetailRefreshKey(k=>k+1);
+                      }).catch(()=>{});
+                    }}>Skip</Btn>
+                  </div>}
+                </Card>);
+              })}
+            </>);
+          })()}
+        </div>)}
+        {showGenerateRunbook&&<Modal title="Generate IR Recovery Runbook" onClose={()=>{setShowGenerateRunbook(false);setGenRunbookPolicyId("");setGenRunbookTitle("");setGenRunbookIncidentId("");}} width={560}>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Pick a scenario type and one of your team's uploaded IR policies. The parser extracts ordered steps from the policy text. The runbook will be created in draft status — review and edit before activating during a real incident.</M>
+          <Sel label="Scenario type" value={genRunbookScenario} onChange={e=>{setGenRunbookScenario(e.target.value);setGenRunbookPolicyId("");}}>
+            <option value="ransomware">Ransomware</option>
+            <option value="data_exfiltration">Data exfiltration</option>
+            <option value="insider_threat">Insider threat</option>
+            <option value="credential_compromise">Credential compromise</option>
+            <option value="ddos">DDoS</option>
+            <option value="supply_chain">Supply chain</option>
+            <option value="cloud_account_compromise">Cloud account compromise</option>
+            <option value="database_corruption">Database corruption</option>
+            <option value="server_crash">Server crash</option>
+            <option value="backup_restoration">Backup restoration</option>
+            <option value="ir_team_handoff">IR team handoff</option>
+          </Sel>
+          <Sel label="Source policy" value={genRunbookPolicyId} onChange={e=>setGenRunbookPolicyId(e.target.value)}>
+            <option value="">— Select a policy —</option>
+            {genRunbookPolicies.tagged.length>0&&<optgroup label="Tagged for this scenario">
+              {genRunbookPolicies.tagged.map(p=><option key={p.id} value={p.id}>{p.isDefault?"★ ":""}{p.title} (v{p.version})</option>)}
+            </optgroup>}
+            {genRunbookPolicies.untagged.length>0&&<optgroup label="Other available policies">
+              {genRunbookPolicies.untagged.map(p=><option key={p.id} value={p.id}>{p.title} (v{p.version})</option>)}
+            </optgroup>}
+          </Sel>
+          {(genRunbookPolicies.tagged.length===0&&genRunbookPolicies.untagged.length===0)&&<Card style={{marginBottom:14,borderColor:"#F59E0B30"}}><M style={{color:"#F59E0B"}}>No IR policies uploaded yet. Upload a policy in the IR Simulator policies tab first, then return here to generate a runbook.</M></Card>}
+          <div style={{marginBottom:14}}>
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Title (optional — defaults to scenario + policy name)</M>
+            <input type="text" value={genRunbookTitle} onChange={e=>setGenRunbookTitle(e.target.value)} maxLength={256} placeholder="e.g. Q3 ransomware drill" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+          </div>
+          <div style={{marginBottom:14}}>
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Incident ID (optional — link to your tracker)</M>
+            <input type="text" value={genRunbookIncidentId} onChange={e=>setGenRunbookIncidentId(e.target.value)} maxLength={128} placeholder="e.g. INC-2026-0042" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+            <Btn onClick={()=>{setShowGenerateRunbook(false);setGenRunbookPolicyId("");setGenRunbookTitle("");setGenRunbookIncidentId("");}}>Cancel</Btn>
+            <Btn primary disabled={!genRunbookPolicyId} onClick={()=>{
+              const body = { scenarioType: genRunbookScenario, policyId: genRunbookPolicyId };
+              if (genRunbookTitle.trim()) body.title = genRunbookTitle.trim();
+              if (genRunbookIncidentId.trim()) body.incidentId = genRunbookIncidentId.trim();
+              api.post("/api/runbooks/generate", body).then(r=>{
+                if (r&&r.id) {
+                  setShowGenerateRunbook(false);
+                  setGenRunbookPolicyId("");
+                  setGenRunbookTitle("");
+                  setGenRunbookIncidentId("");
+                  setRunbookDetailId(r.id);
+                }
+              }).catch(()=>{});
+            }}>Generate</Btn>
+          </div>
+        </Modal>}
+        {showTagPolicies&&<Modal title="Tag IR Policies for Scenarios" onClose={()=>setShowTagPolicies(false)} width={560}>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Tag uploaded IR policies for specific scenario types so they appear at the top of the policy picker when generating a runbook. Set one as default per scenario to auto-select it. Untagged policies remain available — tagging is just for surfacing.</M>
+          <Sel label="Scenario" value={tagScenario} onChange={e=>setTagScenario(e.target.value)}>
+            <option value="ransomware">Ransomware</option>
+            <option value="data_exfiltration">Data exfiltration</option>
+            <option value="insider_threat">Insider threat</option>
+            <option value="credential_compromise">Credential compromise</option>
+            <option value="ddos">DDoS</option>
+            <option value="supply_chain">Supply chain</option>
+            <option value="cloud_account_compromise">Cloud account compromise</option>
+            <option value="database_corruption">Database corruption</option>
+            <option value="server_crash">Server crash</option>
+            <option value="backup_restoration">Backup restoration</option>
+            <option value="ir_team_handoff">IR team handoff</option>
+          </Sel>
+          <L style={{marginTop:14,marginBottom:8}}>Tagged for {tagScenario.replace(/_/g," ")}</L>
+          {tagPolicies.tagged.length===0&&<Card style={{marginBottom:8}}><M style={{color:C.tm}}>No policies tagged for this scenario yet. Tag a policy from the list below.</M></Card>}
+          {tagPolicies.tagged.map(p=>(<Card key={p.id} style={{marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>{p.isDefault?"★ ":""}{p.title}</div>
+              <M style={{color:C.tm,display:"block",marginTop:2}}>v{p.version} · {p.policyType}</M>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {!p.isDefault&&<Btn small onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: true }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Set default</Btn>}
+              <Btn small danger onClick={()=>{
+                api.del("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies/"+encodeURIComponent(p.id)).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Untag</Btn>
+            </div>
+          </Card>))}
+                    <L style={{marginTop:14,marginBottom:8}}>Available untagged policies</L>
+          {tagPolicies.untagged.length===0&&<Card style={{marginBottom:8}}><M style={{color:C.tm}}>No untagged policies. Either everything's already tagged for this scenario, or no policies have been uploaded yet.</M></Card>}
+          {tagPolicies.untagged.map(p=>(<Card key={p.id} style={{marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>{p.title}</div>
+              <M style={{color:C.tm,display:"block",marginTop:2}}>v{p.version} · {p.policyType}</M>
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              <Btn small onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: false }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Tag</Btn>
+              <Btn small primary onClick={()=>{
+                api.post("/api/runbooks/scenarios/"+encodeURIComponent(tagScenario)+"/policies", { policyId: p.id, isDefault: true }).then(()=>{
+                  setTagRefreshKey(k=>k+1);
+                }).catch(()=>{});
+              }}>Tag as default</Btn>
+            </div>
+          </Card>))}
+          <div style={{display:"flex",justifyContent:"flex-end",marginTop:14}}>
+            <Btn onClick={()=>setShowTagPolicies(false)}>Done</Btn>
+          </div>
+        </Modal>}
 
         {/* ══════════ v1.0.0 — ANALYST OFFBOARDING ══════════ */}
         {tab==="offboarding"&&(<div>
