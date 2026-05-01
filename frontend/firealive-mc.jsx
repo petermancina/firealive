@@ -1734,6 +1734,16 @@ function ManagementConsole() {
         </div>
         <M style={{color:C.d,fontWeight:500,fontSize:11}}>Review →</M>
       </div>)}
+      {activeRunbookCount>0&&(<div onClick={()=>{if(activeRunbookMostRecent){setRunbookDetailId(activeRunbookMostRecent);}setTab("runbook");}} style={{padding:"10px 24px",background:"rgba(239,68,68,0.12)",borderBottom:`1px solid ${C.d}50`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:C.d,boxShadow:`0 0 8px ${C.d}`,animation:"pulse 1.5s infinite",flexShrink:0}}/>
+          <div>
+            <M style={{color:C.d,fontWeight:600,letterSpacing:1.5,textTransform:"uppercase",fontSize:10,display:"block"}}>IR Recovery Runbook — Active Incident</M>
+            <M style={{color:C.t,fontSize:11,display:"block",marginTop:2}}>{activeRunbookCount} runbook{activeRunbookCount>1?"s":""} currently active. Step-by-step incident response in progress.</M>
+          </div>
+        </div>
+        <M style={{color:C.d,fontWeight:500,fontSize:11}}>Open →</M>
+      </div>)}
       {/* v1.0.0: Grouped sidebar navigation replaces 57 flat tabs */}
       <div style={{display:"flex",minHeight:"calc(100vh - 120px)"}}>
         <div style={{width:220,flexShrink:0,borderRight:`1px solid ${C.b}`,background:C.s,overflowY:"auto",padding:"8px 0"}}>
