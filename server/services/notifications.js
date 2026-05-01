@@ -125,27 +125,6 @@ const EVENT_TYPES = {
     description: 'An analyst flagged a peer skill-share session for urgent conduct: slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Both the flagged peer\'s identity and the flagger\'s identity are revealed to you. HR intervention is recommended. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
-  runbook_generated: {
-    label: 'IR Recovery Runbook generated',
-    default: { in_app: 1, email: 0 },
-    description: 'A new IR Recovery Runbook has been generated from one of your team\'s uploaded policies. Review the steps in draft state, edit if needed, then activate when the incident is in progress.',
-  },
-  runbook_activated: {
-    label: 'IR Recovery Runbook activated',
-    default: { in_app: 1, email: 1 },
-    description: 'A team lead activated an IR Recovery Runbook — an incident response is now in progress and the runbook is being followed step by step. The dashboard banner will track active progress until the runbook is finalized. In-app delivery cannot be turned off for this event.',
-    mandatoryInApp: true,
-  },
-  runbook_step_completed: {
-    label: 'IR Recovery Runbook step completed',
-    default: { in_app: 0, email: 0 },
-    description: 'A step in an active runbook was marked complete. This event is off by default to avoid noise during fast-moving incidents — opt in if you want a real-time stream of step completions.',
-  },
-  runbook_finalized: {
-    label: 'IR Recovery Runbook finalized',
-    default: { in_app: 1, email: 1 },
-    description: 'A runbook was marked complete and the incident response is closed. The runbook record is immutable from this point and forms part of the incident audit trail.',
-  },
 };
 
 function isKnownEventType(eventType) {
