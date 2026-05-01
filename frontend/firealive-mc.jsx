@@ -252,7 +252,7 @@ function RoleSelect({onSelect}) {
     <div style={{minHeight:"100vh",background:"#050810",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
       <div style={{maxWidth:520,width:"100%",padding:"0 24px",animation:"fadeIn 0.5s ease"}}>
-        <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:16,textAlign:"center"}}>FireAlive v1.0.0 · AGPL-3.0</M>
+        <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:16,textAlign:"center"}}>FireAlive v1.0.12 · AGPL-3.0</M>
         <h1 style={{fontSize:26,fontWeight:300,color:"#E8EDF5",textAlign:"center",marginBottom:8,fontFamily:"'Fraunces',serif"}}>FireAlive</h1>
         <M style={{color:C.tm,display:"block",textAlign:"center",marginBottom:36,lineHeight:1.6}}>Select your role to proceed to authentication.<br/>Each role loads a separate application with distinct data access.</M>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
@@ -339,7 +339,7 @@ function LoginScreen({role, onLogin, onBack}) {
             <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Password</M><input type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••" maxLength={128} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
             {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
             <Btn primary style={{width:"100%"}} onClick={handleCreds} disabled={loading}>{loading?"Authenticating...":"Sign In"}</Btn>
-            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v1.0.0 AGPL-3.0</M>
+            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v1.0.12 AGPL-3.0</M>
           </Card>
         )}
 
