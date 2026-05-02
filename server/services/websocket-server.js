@@ -36,11 +36,29 @@ class FireAliveWebSocket {
   _handleMessage(ws, msg) {
     switch (msg.type) {
       case 'auth':
-        // Validate JWT token
-        ws.userId = msg.userId;
-        this.clients.set(msg.userId, ws);
-        this._updateHeartbeat(msg.userId, true);
-        this._send(ws, { type: 'auth_ok' });
+        // JWT verification — reject connections that don't present a
+        // valid, non-expired token. The client-supplied msg.userId
+        // is intentionally ignored; ws.userId is set from the verified
+        // token payload so a spoofed userId cannot be substituted.
+        if (!msg.token || typeof msg.token !== 'string') {
+          this._send(ws, { type: 'auth_error', error: 'Token required' });
+          ws.close(1008, 'auth required');
+          return;
+        }
+        try {
+          const { verifyToken } = require('../middleware/auth');
+          const decoded = verifyToken(msg.token);
+          ws.userId = decoded.id;
+          ws.userRole = decoded.role;
+          this.clients.set(decoded.id, ws);
+          this._updateHeartbeat(decoded.id, true);
+          this._send(ws, { type: 'auth_ok', userId: decoded.id });
+        } catch (err) {
+          const code = err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
+          this._send(ws, { type: 'auth_error', error: err.message, code });
+          ws.close(1008, 'auth failed');
+          return;
+        }
         break;
       case 'heartbeat':
         ws.isAlive = true;
