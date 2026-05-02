@@ -1,0 +1,159 @@
+# FireAlive — SOC Analyst Wellbeing Platform
+
+**Version:** v1.0.13 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 6 (anti-rollback)
+
+---
+
+## What Is FireAlive?
+
+FireAlive is an open-source, privacy-first platform that prevents burnout in Security Operations Center (SOC) analysts. It uses AI-driven burnout signal detection, capacity-aware ticket routing, peer support, upskilling scheduling, and skills assessment to keep SOC teams healthy, productive, and retained.
+
+The name plays on the notion of burnout — FireAlive keeps the fire burning long.
+
+> **📘 New: See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It's also the reference behind the in-app Help articles in the MC, AC, and GD.
+
+## Architecture
+
+Five components:
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Analyst Client (AC)** | Electron + React | Desktop app for individual SOC analysts |
+| **Management Console (MC)** | Electron + React | Team Lead configuration and management |
+| **Regional Server** | Node.js + Express + SQLite | Backend API, routing engine, all services |
+| **Global Dashboard (GD)** | Electron + React | CISO cross-region oversight |
+| **GD Server** | Node.js + Express + SQLite | Aggregates data from regional servers |
+
+### Backend Services (23 files)
+
+| Service | Purpose |
+|---------|---------|
+| AI Burnout Engine | Baseline creation, signal drift detection, AI message generation, training recommendations |
+| Assessment Service | Create/assign/submit assessments, skill tracking, gap analysis |
+| Backup Service | Real filesystem backups, SHA-256 integrity verification, scheduling |
+| Compliance Scanner | Real checks against actual app state for 16+ frameworks |
+| Regression Runner | 35 real tests checking DB tables, crypto, integrations, middleware |
+| Integration Manager | SOAR/Ticketing/SIEM/IAM connection testing and config storage |
+| Notification Service | Proactive break alerts, shift handoff notifications, assessment assignments |
+| System Health Monitor | Real CPU/memory/heap/DB metrics via Node.js APIs |
+| Feature Toggle Service | Enable/disable 20 features without removing code |
+| Metrics Collector | Full-suite metrics for monitoring + CEF output for SIEM |
+
+### Security Middleware (9 modules, 877 lines)
+
+| Module | Protections |
+|--------|------------|
+| security-hardening | Headers, input sanitization, CSRF, anti-replay, rate limiting, SSRF, TLS |
+| auth-hardening | Constant-time comparison, CSPRNG, account lockout, JWT rotation, suspicious input detection |
+| ai-security | Prompt injection (12 patterns), context limits, output validation, data firewall |
+| network-security | DDoS/slowloris, DNS size limits, client heartbeat, mTLS, anti-pivot |
+| cors-policy | Zero-trust CORS, known origins only |
+| pentest-hardening | Token storage (memory only), safe errors, request correlation, content-type enforcement, idle timeout |
+| audit | Immutable SHA-256 hash chain |
+| auth | JWT + RBAC |
+| network-hardening | Additional network protections |
+
+### API Routes
+
+All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
+
+**v1 API (25 endpoints):** Signal recording, baseline retrieval, training recommendations, assessment CRUD, backup create/history/schedule/restore, compliance scan, regression test, integration save/test/status, system health, client heartbeat, notifications, config lock, SLA, shift handoff, config snapshots.
+
+**v054 API (18 endpoints):** SOAR/Ticketing config, routing engine, IAM offboarding, upskilling scheduling, helper pay, pseudonym rotation, compliance reports, training submissions.
+
+**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+
+**IAM API (/api/iam):** Periodic recertification of analyst accounts. Lists analysts whose IAM check is overdue, confirms active status or marks offboarded.
+
+**Upskilling API (/api/upskilling):** Per-analyst upskilling time slot management. Lists configured slots and saves/updates one-hour windows.
+
+**Recovery Runbook (frontend-only):** A scenario picker that generates printable failure-and-compromise runbooks specific to FireAlive (server crash, ransomware on FireAlive, MC compromise, mass client compromise via tripwire, etc.). Runs entirely in the MC frontend; produces a JSON download. See FEATURE-GUIDE.md for the intended scenarios and use cases.
+
+**TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
+
+---
+
+## Installation
+
+> **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
+
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.13) under Tags.
+
+See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
+
+### Quick Start (Development)
+```bash
+git clone https://github.com/pmancina/firealive.git
+cd firealive && npm install
+node server/index.js                    # Regional Server on :3000
+cd packages/global-dashboard-server && node index.js  # GD Server on :4001
+cd packages/analyst-client && npm start  # AC Electron app
+cd frontend && npm start                 # MC Electron app
+cd packages/global-dashboard && npm start # GD Electron app
+```
+
+### Building Installers
+```bash
+cd packages/analyst-client && npm run build:mac   # .dmg
+cd frontend && npm run build:win                   # .exe
+cd packages/global-dashboard && npm run build:linux # .AppImage
+```
+
+---
+
+## How It Works
+
+### First-Time Setup Flow
+1. Team Lead installs MC → MC starts Regional Server automatically
+2. Team Lead configures MFA, IAM, SOAR, Ticketing, SIEM, EDR
+3. Team Lead provisions Analyst Clients
+4. Analysts install AC, connect to server, authenticate via IAM + MFA
+5. First shift: AI Burnout Engine records 8 signal readings → baseline established
+6. After baseline: AI generates real-time drift detection + training recommendations
+7. CISO installs GD → registers regional MCs → sees cross-region health
+
+### Burnout Prevention Routing
+When active (requires SOAR + Ticketing configured):
+- FireAlive reads queue metadata via Ticketing (READ-ONLY)
+- AI assesses each analyst's capacity score from burnout signals
+- FireAlive writes ticket assignments via SOAR (WRITE) to the analyst with highest capacity
+- Analysts with elevated signals automatically receive lighter ticket loads
+- Anonymity is architecturally enforced — Team Lead never sees which analyst requested reduction
+
+### Privacy Architecture
+- **Tier-3 data** (individual burnout signals): encrypted on client, never visible to Team Lead
+- **Tier-1 data** (team aggregates): Team Lead sees averages, never individual data
+- **GD level**: CISO sees regional health only, no individual data
+- Pseudonyms protect analyst identity in all UIs. UUID stays constant across rotations.
+- Peer chat uses NaCl box E2EE — server cannot decrypt
+
+---
+
+## Compliance
+
+Real compliance scanning against actual app state for 16 frameworks: NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA.
+
+Checks include: access control (RBAC), encryption (AES-256-GCM), audit trail (SHA-256 chain), authentication (IAM/SSO), config management (e-fuse), incident response (IR policies), data protection (pseudonymization), network (SIEM/SOAR), backups, notifications, and AI engine status.
+
+---
+
+## Integrations
+
+| System | Access | Purpose |
+|--------|--------|---------|
+| SOAR | WRITE | Burnout-aware ticket distribution |
+| Ticketing | READ-ONLY | Queue metadata for routing |
+| SIEM | PUSH (CEF) | Health metrics, security events |
+| IAM | READ | Authentication, offboarding detection |
+| EDR | READ | Malware scanning of uploads/data |
+| Scheduling | READ | Shift data for upskilling |
+| Training Platforms | LINK | Assessment modules, training content |
+| KMS | READ/WRITE | Encryption key management |
+
+---
+
+## License
+
+GNU Affero General Public License v3.0 (AGPL-3.0-or-later)
+Copyright (C) 2026 Peter Mancina
