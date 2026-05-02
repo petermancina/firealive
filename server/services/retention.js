@@ -42,7 +42,23 @@ function runRetentionPurge() {
       if (days <= 0 && label !== 'peer_messages') return;
       const cutoff = new Date(Date.now() - (days || 1) * 86400000).toISOString();
       // SECURITY: Whitelist table/column names to prevent SQL injection
-      const SAFE_TABLES = {'signal_readings':'recorded_at','audit_log':'timestamp','notifications':'created_at','backup_history':'created_at','peer_sessions':'created_at'};
+      // Whitelist of (table, date_column) pairs that the retention
+      // purge is allowed to operate on. Every table targeted by a
+      // purge() call below MUST be in this map with its correct
+      // date column, or the purge will throw 'Invalid table' and
+      // abort the entire purge cycle.
+      const SAFE_TABLES = {
+        'analyst_signals': 'recorded_at',
+        'audit_log': 'timestamp',
+        'sla_measurements': 'measured_at',
+        'peer_messages': 'created_at',
+        'reports': 'generated_at',
+        'analyst_consent_log': 'created_at',
+        'sessions': 'expires_at',
+        'signal_readings': 'recorded_at',
+        'notifications': 'created_at',
+        'peer_sessions': 'created_at',
+      };
       if (!SAFE_TABLES[table] || SAFE_TABLES[table] !== dateCol) throw new Error('Invalid table');
       const r = db.prepare(`DELETE FROM ${table} WHERE ${dateCol} < ?`).run(cutoff);
       results[label] = r.changes;
