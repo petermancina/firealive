@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.14 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 7 (anti-rollback)
+**Version:** v1.0.15 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 8 (anti-rollback)
 
 ---
 
@@ -78,7 +78,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.14) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.15) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
