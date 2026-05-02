@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.12 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 5 (anti-rollback)
+**Version:** v1.0.13 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 6 (anti-rollback)
 
 ---
 
@@ -10,6 +10,8 @@
 FireAlive is an open-source, privacy-first platform that prevents burnout in Security Operations Center (SOC) analysts. It uses AI-driven burnout signal detection, capacity-aware ticket routing, peer support, upskilling scheduling, and skills assessment to keep SOC teams healthy, productive, and retained.
 
 The name plays on the notion of burnout — FireAlive keeps the fire burning long.
+
+> **📘 New: See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It's also the reference behind the in-app Help articles in the MC, AC, and GD.
 
 ## Architecture
 
@@ -52,7 +54,7 @@ Five components:
 | auth | JWT + RBAC |
 | network-hardening | Additional network protections |
 
-### API Routes (37 files, 7,848+ lines)
+### API Routes
 
 All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
@@ -62,18 +64,13 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
 
-**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
+**IAM API (/api/iam):** Periodic recertification of analyst accounts. Lists analysts whose IAM check is overdue, confirms active status or marks offboarded.
 
-**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
+**Upskilling API (/api/upskilling):** Per-analyst upskilling time slot management. Lists configured slots and saves/updates one-hour windows.
 
-**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
+**Recovery Runbook (frontend-only):** A scenario picker that generates printable failure-and-compromise runbooks specific to FireAlive (server crash, ransomware on FireAlive, MC compromise, mass client compromise via tripwire, etc.). Runs entirely in the MC frontend; produces a JSON download. See FEATURE-GUIDE.md for the intended scenarios and use cases.
 
-**v059 API (8 endpoints):** Feature toggles, full-suite metrics (JSON + CEF), audit integrity, cloud migration packages, CI/CD config, full-suite regression, full-suite backup.
-
-**IR Recovery Runbook API (Phase 1.4c, /api/runbooks, 11 endpoints):** Org-policy-driven runbooks generated from uploaded IR policies. Full lifecycle (draft → active → completed | cancelled) with per-step completion tracking, critical-step skip gating, source policy version capture for audit, and scenario-to-policy tagging. Active runbooks raise a mandatoryInApp notification and a persistent dashboard banner.
-
-**TTX Generator API (Phase 1.4d, /api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
-
+**TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
 
 ---
 
@@ -81,9 +78,9 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.12) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.13) under Tags.
 
-See **SETUP.md** for detailed setup instructions.
+See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
 ### Quick Start (Development)
 ```bash
