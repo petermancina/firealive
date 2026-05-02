@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
 **Version:** v1.0.13 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 6 (anti-rollback)
+**E-fuse counter:** 7 (anti-rollback)
 
 ---
 
@@ -68,7 +68,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **Upskilling API (/api/upskilling):** Per-analyst upskilling time slot management. Lists configured slots and saves/updates one-hour windows.
 
-**Recovery Runbook (frontend-only):** A scenario picker that generates printable failure-and-compromise runbooks specific to FireAlive (server crash, ransomware on FireAlive, MC compromise, mass client compromise via tripwire, etc.). Runs entirely in the MC frontend; produces a JSON download. See FEATURE-GUIDE.md for the intended scenarios and use cases.
+**Recovery Runbook API (/api/runbook, 3 endpoints):** Curated FireAlive-specific failure and compromise scenario library backing the Recovery Runbook generator. 38 scenarios across 8 categories (Identity & Authentication, Inter-Component Communication, Cryptography & Keys, Storage & Data, Integrations, Application Integrity, Burnout-Specific Abuse, Operational Failures). Each scenario produces two artifact types — a single-page Quick Reference card and a Full Runbook with full procedure (identification, containment, eradication, recovery, verification, post-incident review) — in three formats: PDF, DOCX, or JSON. The org's general IR runbooks are not in scope; this library specifically addresses the new attack surface and failure modes that FireAlive's adoption introduces.
 
 **TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
 
@@ -78,7 +78,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.13) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.14) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
