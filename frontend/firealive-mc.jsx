@@ -1245,9 +1245,30 @@ function ManagementConsole() {
     return ()=>{ cancelled = true; clearInterval(handle); };
   }, []);
 
-  // ── Recovery Runbook state ───────────────────────────────────────────────
-  const [runbookScenario, setRunbookScenario] = useState('server_crash');
-  const [generatedRunbook, setGeneratedRunbook] = useState(null);
+  // ── Recovery Runbook state (Phase F2) ────────────────────────────────────
+  const [runbookScenarios, setRunbookScenarios] = useState([]);
+  const [runbookCategories, setRunbookCategories] = useState([]);
+  const [runbookValidFormats, setRunbookValidFormats] = useState(['pdf', 'docx', 'json']);
+  const [runbookScenariosLoading, setRunbookScenariosLoading] = useState(false);
+  const [runbookSelectedId, setRunbookSelectedId] = useState('');
+  const [runbookArtifactType, setRunbookArtifactType] = useState('quickref');
+  const [runbookFormat, setRunbookFormat] = useState('pdf');
+  const [runbookGenerating, setRunbookGenerating] = useState(false);
+
+  // When the Runbook tab is opened, fetch the curated scenario library.
+  useEffect(()=>{
+    if (tab !== "runbook") return;
+    setRunbookScenariosLoading(true);
+    api.get("/api/runbook/scenarios").then(r=>{
+      setRunbookScenarios(r?.scenarios || []);
+      setRunbookCategories(r?.categories || []);
+      if (r?.validFormats) setRunbookValidFormats(r.validFormats);
+    }).catch(()=>{
+      setRunbookScenarios([]);
+      setRunbookCategories([]);
+    }).finally(()=>setRunbookScenariosLoading(false));
+  }, [tab]);
+
 
   // ── TTX Generator state (Phase 1.4d) ─────────────────────────────────────
   const [ttxScenariosList, setTtxScenariosList] = useState([]);
@@ -4196,42 +4217,68 @@ regression:
           <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"AUTO_DISABLE_ROUTING_SAVED",detail:"Auto-disable routing config saved"}).then(()=>addA("AUTO_DISABLE_ROUTING_SAVED","Auto-disable routing config saved"))}>Save Config</Btn>
         </div>)}
 
-        {/* ══════════ v1.0.0 — RECOVERY RUNBOOK ══════════ */}
+        {/* ══════════ Phase F2 — RECOVERY RUNBOOK (FireAlive-specific) ══════════ */}
         {tab==="runbook"&&(<div>
           <L>Recovery Runbook Generator</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Auto-generate step-by-step recovery instructions based on the specific failure scenario. Each runbook includes detection steps, immediate actions, recovery procedure, verification, and post-recovery tasks.</M>
-          <Card style={{marginBottom:16}}>
-            <Sel label="Failure scenario" value={runbookScenario} onChange={e=>setRunbookScenario(e.target.value)}>
-              <option value="server_crash">Server crash (backend down)</option>
-              <option value="db_corruption">Database corruption</option>
-              <option value="client_compromise">Analyst client compromised</option>
-              <option value="mc_compromise">Management console compromised</option>
-              <option value="network_partition">Network partition (clients can't reach server)</option>
-              <option value="encryption_key_loss">Encryption key loss</option>
-              <option value="ransomware">Ransomware attack on host</option>
-              <option value="insider_threat">Insider threat detected</option>
-              <option value="ha_failover_failed">HA failover failed</option>
-              <option value="mass_client_compromise">Mass client compromise (tripwire triggered)</option>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate runbooks for FireAlive-specific failure and compromise scenarios. The org already has runbooks for general incident response (ransomware on host, generic insider threat); FireAlive doesn't try to replace those. This generator addresses the new attack surface and failure modes that FireAlive's adoption introduces — compromise of FireAlive itself, MC↔AC channel attacks, false signal injection tripping the tripwire, etc.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6,fontStyle:"italic"}}>This runbook is preparation material. Generate scenarios in advance, print or save them, and execute from those copies during a real event when the platform itself may be unavailable.</M>
+          {runbookScenariosLoading&&(<Card style={{marginBottom:16}}><M style={{color:C.tm}}>Loading scenario library…</M></Card>)}
+          {!runbookScenariosLoading&&runbookScenarios.length===0&&(<Card style={{marginBottom:16}}><M style={{color:C.d}}>No scenarios available. Verify /api/runbook/scenarios is reachable.</M></Card>)}
+          {!runbookScenariosLoading&&runbookScenarios.length>0&&(<Card style={{marginBottom:16}}>
+            <Sel label={"Scenario ("+runbookScenarios.length+" available across "+runbookCategories.length+" categories)"} value={runbookSelectedId} onChange={e=>setRunbookSelectedId(e.target.value)}>
+              <option value="">— Select a scenario —</option>
+              {runbookCategories.map(cat=>(
+                <optgroup key={cat} label={cat}>
+                  {runbookScenarios.filter(s=>s.category===cat).map(s=>(
+                    <option key={s.id} value={s.id}>{s.title}</option>
+                  ))}
+                </optgroup>
+              ))}
             </Sel>
-            <Btn primary style={{marginTop:12}} onClick={()=>{
-              const books={
-                server_crash:{title:"Server Crash Recovery",steps:["1. DETECT: Monitor shows server unresponsive, clients report connection errors","2. VERIFY: Check server host — SSH/RDP to server machine, check process status","3. FAIL-OPEN: Confirm fail-open routing activated — tickets flowing without burnout filter","4. If HA enabled: Verify passive promoted to active automatically","5. If HA not enabled: Restart server process: systemctl restart firealive-server","6. CHECK DB: Run integrity check: node server/db/integrity-check.js","7. VERIFY CLIENTS: Confirm analyst clients reconnecting (check Integrations Health)","8. RESTORE ROUTING: If fail-open activated, verify burnout routing re-enabled","9. POST-RECOVERY: Review audit logs for cause, run regression test, notify team"]},
-                client_compromise:{title:"Analyst Client Compromise Recovery",steps:["1. ISOLATE: Disconnect compromised client from network immediately","2. PRESERVE: Export forensic data from the client before wiping","3. REVOKE: Revoke all API tokens and session tokens for that analyst's pseudonym","4. ROTATE: Rotate the analyst's pseudonym (Pseudonyms tab → rotate)","5. SCAN OTHERS: Run compromise scan on all other clients (Compromise Scan tab)","6. CHECK TRIPWIRE: Verify tripwire wasn't triggered by legitimate reduced routing","7. REPROVISION: Deploy fresh client from known-good image to the analyst's machine","8. RESTORE CONFIG: Push configuration from management console to new client","9. RE-AUTH: Analyst re-enrolls MFA on new client","10. POST: Review auth logs, update SIEM rules, conduct brief retro"]},
-                ransomware:{title:"Ransomware Recovery",steps:["1. ISOLATE: Disconnect affected host(s) from network IMMEDIATELY","2. DO NOT PAY: Do not engage with ransom demands","3. ASSESS SCOPE: Which components affected? Server? Clients? Management console?","4. ACTIVATE HA: If server affected and HA available, failover to clean standby","5. BACKUP CHECK: Verify backup integrity — are backups on a separate, unaffected system?","6. RESTORE: Restore from most recent verified clean backup","7. REPROVISION CLIENTS: Deploy fresh client images to all affected analyst machines","8. ROTATE ALL KEYS: API keys, encryption keys, JWT secrets, KMS keys","9. FORCE RE-AUTH: Invalidate all sessions, require full MFA re-enrollment","10. FORENSICS: Export all logs, run full compromise scan, engage IR team","11. REPORT: Generate forensic export for legal/compliance, update risk register"]},
-                insider_threat:{title:"Insider Threat Response",steps:["1. ACTIVATE PROTOCOL: Hit insider threat button — auto-rotates keys, locks configs","2. PRESERVE EVIDENCE: Do NOT alert the suspect — export audit logs immediately","3. REVIEW AUTH LOGS: Check for unauthorized access patterns, off-hours logins","4. CHECK PSEUDONYM MAP: Verify pseudonym mapping hasn't been exported without authorization","5. SCOPE: Determine what data the insider could have accessed (tier-1 only? tier-3?)","6. REVOKE: Disable the insider's account, revoke all their tokens","7. OFFBOARD: Use offboarding process — revoke keys, cancel peer sessions, archive data","8. SCAN: Run compromise scan on any systems the insider had access to","9. ROTATE: Rotate all shared secrets (API keys, KMS keys, SOAR tokens)","10. DEBRIEF: Conduct retro with remaining team — support their wellbeing after the event"]},
-              };
-              const book = books[runbookScenario] || {title:"Recovery Runbook",steps:["1. Assess the situation","2. Check HA status and failover","3. Verify backups are clean","4. Restore from known-good backup","5. Rotate all credentials","6. Run compromise scan","7. Verify all clients reconnected","8. Review audit logs","9. Run regression test","10. Conduct post-incident retro"]};
-              setGeneratedRunbook(book);
-              addA("RUNBOOK_GENERATED","Recovery runbook generated: "+book.title);
-            }}>Generate Runbook</Btn>
-          </Card>
-          {generatedRunbook&&(<Card style={{marginBottom:16}}>
-            <div style={{fontSize:14,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>{generatedRunbook.title}</div>
-            {generatedRunbook.steps.map((s,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.t,lineHeight:1.6}}>{s}</M></div>)}
-            <Btn small style={{marginTop:12}} onClick={()=>{const data=JSON.stringify(generatedRunbook,null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="recovery-runbook-"+runbookScenario+".json";a.click();}}>Export Runbook</Btn>
+            {runbookSelectedId&&(()=>{
+              const s = runbookScenarios.find(x=>x.id===runbookSelectedId);
+              if (!s) return null;
+              return (<div style={{marginTop:12,padding:12,background:C.s,borderRadius:6,border:`1px solid ${C.b}`}}>
+                <div style={{fontSize:11,color:C.tm,marginBottom:4}}>{s.category}</div>
+                <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:8}}>{s.title}</div>
+                <M style={{color:C.tm,lineHeight:1.6}}>{s.summary}</M>
+              </div>);
+            })()}
+            <div style={{display:"flex",gap:12,marginTop:12,flexWrap:"wrap"}}>
+              <Sel label="Artifact" value={runbookArtifactType} onChange={e=>setRunbookArtifactType(e.target.value)}>
+                <option value="quickref">Quick Reference (1-page card)</option>
+                <option value="full">Full Runbook (multi-section)</option>
+              </Sel>
+              <Sel label="Format" value={runbookFormat} onChange={e=>setRunbookFormat(e.target.value)}>
+                {runbookValidFormats.map(f=>(<option key={f} value={f}>{f.toUpperCase()}</option>))}
+              </Sel>
+            </div>
+            <Btn primary disabled={!runbookSelectedId||runbookGenerating} style={{marginTop:12}} onClick={()=>{
+              if (!runbookSelectedId) return;
+              setRunbookGenerating(true);
+              const endpoint = runbookArtifactType==="quickref" ? "/api/runbook/quickref" : "/api/runbook/full";
+              const filename = "runbook-"+runbookArtifactType+"-"+runbookSelectedId+"."+runbookFormat;
+              fetch(API_BASE+endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": "Bearer "+(api._token||"") },
+                body: JSON.stringify({ scenarioId: runbookSelectedId, format: runbookFormat })
+              }).then(r=>{
+                if (!r.ok) throw new Error("server returned "+r.status);
+                return r.blob();
+              }).then(blob=>{
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
+                addA("RUNBOOK_GENERATED", "Generated "+runbookArtifactType+" for scenario "+runbookSelectedId+" ("+runbookFormat+")");
+              }).catch(err=>{
+                addA("RUNBOOK_GENERATE_FAILED", "Failed to generate runbook: "+err.message);
+              }).finally(()=>setRunbookGenerating(false));
+            }}>{runbookGenerating?"Generating…":"Download "+(runbookArtifactType==="quickref"?"Quick Reference":"Full Runbook")}</Btn>
           </Card>)}
         </div>)}
-
 
         {/* ══════════ v1.0.0 — ANALYST OFFBOARDING ══════════ */}
         {tab==="offboarding"&&(<div>
