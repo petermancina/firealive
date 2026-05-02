@@ -2,7 +2,7 @@
 // FIREALIVE v0.0.22 — New Routes
 // Adds: client notifications, peer queue management (cancel/timeout/calendar),
 // peer message board, security regression testing, SOAR playbook generator,
-// CI/CD pipeline helpers, cloud vuln scanning, elasticity config
+// CI/CD pipeline helpers, cloud vuln scanning
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -605,58 +605,6 @@ router.put('/cloud/vuln-scan-config', (req, res) => {
     auditLog(req.user.id, 'CLOUD_VULNSCAN_CONFIG_UPDATED', `scanners=${config.scanners.join(',')}`, req.ip);
     res.json({ ok: true, config });
   } catch (err) { res.status(500).json({ error: 'Failed to update cloud vuln config' }); }
-});
-
-// ── Elasticity Configuration ────────────────────────────────────────────────
-router.get('/elasticity/config', (req, res) => {
-  try {
-    const db = getDb();
-    const config = db.prepare("SELECT value FROM team_config WHERE key = 'elasticity_config'").get();
-    db.close();
-    res.json(config ? JSON.parse(config.value) : {
-      enabled: false,
-      provider: null, // aws_ecs, azure_aci, gcp_cloudrun, k8s_hpa
-      minInstances: 1,
-      maxInstances: 10,
-      scaleUpThreshold: 80, // CPU % or analyst count per instance
-      scaleDownThreshold: 30,
-      cooldownSeconds: 300,
-      securityOnScale: {
-        rotateKeysOnScaleUp: true,
-        verifyIntegrityOnNewInstance: true,
-        enrollNewInstanceInSPIFFE: true,
-        auditScaleEvents: true,
-      },
-    });
-  } catch (err) { res.status(500).json({ error: 'Failed to get elasticity config' }); }
-});
-
-router.put('/elasticity/config', (req, res) => {
-  const { enabled, provider, minInstances, maxInstances, scaleUpThreshold, scaleDownThreshold, cooldownSeconds, securityOnScale } = req.body;
-  const VALID_PROVIDERS = ['aws_ecs', 'azure_aci', 'gcp_cloudrun', 'k8s_hpa'];
-  const config = {
-    enabled: !!enabled,
-    provider: VALID_PROVIDERS.includes(provider) ? provider : null,
-    minInstances: Math.max(1, Math.min(50, parseInt(minInstances, 10) || 1)),
-    maxInstances: Math.max(1, Math.min(100, parseInt(maxInstances, 10) || 10)),
-    scaleUpThreshold: Math.max(50, Math.min(95, parseInt(scaleUpThreshold, 10) || 80)),
-    scaleDownThreshold: Math.max(10, Math.min(50, parseInt(scaleDownThreshold, 10) || 30)),
-    cooldownSeconds: Math.max(60, Math.min(900, parseInt(cooldownSeconds, 10) || 300)),
-    securityOnScale: {
-      rotateKeysOnScaleUp: securityOnScale?.rotateKeysOnScaleUp !== false,
-      verifyIntegrityOnNewInstance: securityOnScale?.verifyIntegrityOnNewInstance !== false,
-      enrollNewInstanceInSPIFFE: securityOnScale?.enrollNewInstanceInSPIFFE !== false,
-      auditScaleEvents: securityOnScale?.auditScaleEvents !== false,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('elasticity_config', ?, ?)").run(JSON.stringify(config), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'ELASTICITY_CONFIG_UPDATED', `provider=${config.provider} min=${config.minInstances} max=${config.maxInstances}`, req.ip);
-    res.json({ ok: true, config });
-  } catch (err) { res.status(500).json({ error: 'Failed to update elasticity config' }); }
 });
 
 module.exports = router;
