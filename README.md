@@ -1,6 +1,6 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.13 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**Version:** v1.0.14 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
 **E-fuse counter:** 7 (anti-rollback)
 
 ---
