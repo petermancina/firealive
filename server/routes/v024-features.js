@@ -2,7 +2,7 @@
 // FIREALIVE v0.0.24 — New Routes
 // Adds: MFA wizard, threat hunting integrations, tripwire, compromise scan,
 // auth logs, posture assessment, HA config, fail-open routing, config
-// troubleshooter, UTM integration, general certs, auth log notifications
+// troubleshooter, general certs, auth log notifications
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -327,27 +327,6 @@ router.put('/fail-open/config', (req, res) => {
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save fail-open config' }); }
 });
-
-// ── UTM Integration ─────────────────────────────────────────────────────────
-router.get('/utm/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = db.prepare("SELECT value FROM config WHERE key = 'utm_config'").get();
-    db.close();
-    res.json(cfg ? JSON.parse(cfg.value) : { enabled: false, provider: null, endpoint: '', apiKey: '' });
-  } catch (e) { res.status(500).json({ error: 'Failed to load UTM config' }); }
-});
-
-router.put('/utm/config', (req, res) => {
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('utm_config', ?)").run(JSON.stringify(req.body));
-    auditLog(req.user?.id || 'system', 'UTM_CONFIG_UPDATED', `Provider: ${req.body.provider}`);
-    db.close();
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Failed to save UTM config' }); }
-});
-
 // ── General Certifications ──────────────────────────────────────────────────
 router.get('/certifications', (req, res) => {
   try {

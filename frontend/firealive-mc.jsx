@@ -1411,8 +1411,6 @@ function ManagementConsole() {
   const [troubleshooterOpen, setTroubleshooterOpen] = useState(false);
   const [troubleshooterMsgs, setTroubleshooterMsgs] = useState([]);
   const [troubleshooterInput, setTroubleshooterInput] = useState("");
-  // UTM integration
-  const [utmCfg, setUtmCfg] = useState({enabled:false,provider:null,endpoint:"",apiKey:""});
   // General cert uploads (beyond training-linked certs)
   const [generalCerts, setGeneralCerts] = useState([
     {id:"gc1",name:"CompTIA Security+",issuer:"CompTIA",earned:"2025-06-15",expires:"2028-06-15",analyst:"jordan-p"},
@@ -1444,7 +1442,7 @@ function ManagementConsole() {
   // Burnout stats sync interval
   const [syncIntervalCfg, setSyncIntervalCfg] = useState({intervalMin:15,adaptiveSync:true,urgentThresholdSec:30,batchMode:true});
   // Feature toggles
-  const [featureToggles, setFT] = useState({peer_chat:true,breathing_exercise:true,lighter_queue:true,lead_messaging:true,delegation:true,skill_assessments:true,training_certs:true,retro_protocol:true,burnout_routing:true,siem_feed:true,report_engine:true,soar_integration:true,ticket_integration:true,signals_display:true,impact_feed:true,network_map:false,query_tool:false,ooda_simulator:true,recertification:true,vuln_scanning:false,sase:false,peer_scheduling:true,lead_chat_identified:true,config_export:true,log_integrity:true,client_notifications:true,peer_board:true,peer_queue_mgmt:true,calendar_integration:true,security_regression:true,soar_playbooks:true,cicd_pipelines:false,cloud_vuln_scan:false,elasticity:false,queue_timeout:true,human_impact_risk:true,edr_inspection:true,enterprise_kms:false,wifi_policy:true,msp_multitenancy:false,post_session_rating:true,post_session_flagging:true,mfa_wizard:true,threat_hunting:true,tripwire:true,compromise_scan:true,auth_logs:true,posture_assessment:true,ha_config:false,fail_open_routing:true,config_troubleshooter:true,utm_integration:false,general_certs:true,auth_log_notifications:true,pseudonyms:true,geo_fencing:false,cluster_mode:false,global_dashboard:false,backup_schedules:true,sync_interval_config:true,inactivity_lock:true,biometrics:false,config_padlocks:true,concurrent_session_block:true,setup_wizard:true,welcome_guide:true,insider_threat_protocol:true,dual_approval:false,proactive_interventions:true,recovery_runbook:true,upskilling_hour:false,auto_routing_disable:false,analyst_offboarding:true,ttx_generator:true,legal_hold:false,risk_register:true});
+  const [featureToggles, setFT] = useState({peer_chat:true,breathing_exercise:true,lighter_queue:true,lead_messaging:true,delegation:true,skill_assessments:true,training_certs:true,retro_protocol:true,burnout_routing:true,siem_feed:true,report_engine:true,soar_integration:true,ticket_integration:true,signals_display:true,impact_feed:true,network_map:false,query_tool:false,ooda_simulator:true,recertification:true,vuln_scanning:false,sase:false,peer_scheduling:true,lead_chat_identified:true,config_export:true,log_integrity:true,client_notifications:true,peer_board:true,peer_queue_mgmt:true,calendar_integration:true,security_regression:true,soar_playbooks:true,cicd_pipelines:false,cloud_vuln_scan:false,queue_timeout:true,human_impact_risk:true,edr_inspection:true,enterprise_kms:false,wifi_policy:true,msp_multitenancy:false,post_session_rating:true,post_session_flagging:true,mfa_wizard:true,threat_hunting:true,tripwire:true,compromise_scan:true,auth_logs:true,posture_assessment:true,ha_config:false,fail_open_routing:true,config_troubleshooter:true,general_certs:true,auth_log_notifications:true,pseudonyms:true,geo_fencing:false,cluster_mode:false,global_dashboard:false,backup_schedules:true,sync_interval_config:true,inactivity_lock:true,biometrics:false,config_padlocks:true,concurrent_session_block:true,setup_wizard:true,welcome_guide:true,insider_threat_protocol:true,dual_approval:false,proactive_interventions:true,recovery_runbook:true,upskilling_hour:false,auto_routing_disable:false,analyst_offboarding:true,ttx_generator:true,legal_hold:false,risk_register:true});
   // Compliance
   const [complianceFw, setCompFw] = useState("nist_csf");
   const [complianceReport, setCompReport] = useState(null);
@@ -1468,7 +1466,6 @@ function ManagementConsole() {
   const [playbookType, setPlaybookType] = useState("app_compromise");
   const [generatedPlaybook, setGenPlaybook] = useState(null);
   const [clientNotifCfg, setClientNotifCfg] = useState({enabled:true,channels:{desktop:true,slack:false,teams:false,email:false},slackWebhook:"",teamsWebhook:"",rules:{peerChatRequest:{enabled:true,realtime:true,channel:"desktop"},weeklyMetricsReminder:{enabled:true,day:"friday",time:"16:00",channel:"desktop"},burnoutSpike:{enabled:false,channel:"desktop"},shiftHandoff:{enabled:true,channel:"desktop"},scheduledChatReminder:{enabled:true,minutesBefore:15,channel:"desktop"}}});
-  const [elasticityCfg, setElasticityCfg] = useState({enabled:false,provider:null,minInstances:1,maxInstances:10,scaleUpThreshold:80,scaleDownThreshold:30,cooldownSeconds:300,securityOnScale:{rotateKeysOnScaleUp:true,verifyIntegrityOnNewInstance:true,enrollNewInstanceInSPIFFE:true,auditScaleEvents:true}});
   const [cloudVulnCfg, setCloudVulnCfg] = useState({enabled:false,scanners:[],schedule:"weekly",targetEnvironment:null});
   // Query tool
   const [querySource, setQuerySource] = useState("audit_log");
@@ -1619,7 +1616,7 @@ function ManagementConsole() {
   // v1.0.0: setup wizard
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   const [setupStep, setSetupStep] = useState(0);
-  const [setupSelections, setSetupSelections] = useState({siem:false,soar:false,edr:false,xdr:false,atp:false,ticketing:"none",iam:"none",cloud:"none",vpn:false,utm:false});
+  const [setupSelections, setSetupSelections] = useState({siem:false,soar:false,edr:false,xdr:false,atp:false,ticketing:"none",iam:"none",cloud:"none",vpn:false});
   // v1.0.0: welcome guide — first launch only
   const [showWelcome, setShowWelcome] = useState(false); // disabled by default; set true for first-time users via server flag
   const [welcomeStep, setWelcomeStep] = useState(0);
@@ -1732,7 +1729,7 @@ function ManagementConsole() {
           {setupStep===0&&(<div>
             <L>Welcome to FireAlive Setup</L>
             <M style={{color:C.tm,display:"block",marginBottom:20,lineHeight:1.6}}>This wizard will guide you through first-time configuration. What systems does your SOC use?</M>
-            {[{k:"siem",l:"SIEM (Splunk, Elastic, QRadar, Sentinel)"},{k:"soar",l:"SOAR (Splunk SOAR, Cortex XSOAR, Swimlane)"},{k:"edr",l:"EDR (CrowdStrike, SentinelOne, Defender)"},{k:"xdr",l:"XDR (Cortex XDR, 365 Defender, Vision One)"},{k:"atp",l:"ATP (Defender ATP, FireEye, Proofpoint)"},{k:"vpn",l:"VPN Concentrator"},{k:"utm",l:"UTM (FortiGate, Sophos, Check Point)"}].map(s=>(
+            {[{k:"siem",l:"SIEM (Splunk, Elastic, QRadar, Sentinel)"},{k:"soar",l:"SOAR (Splunk SOAR, Cortex XSOAR, Swimlane)"},{k:"edr",l:"EDR (CrowdStrike, SentinelOne, Defender)"},{k:"xdr",l:"XDR (Cortex XDR, 365 Defender, Vision One)"},{k:"atp",l:"ATP (Defender ATP, FireEye, Proofpoint)"},{k:"vpn",l:"VPN Concentrator"}].map(s=>(
               <label key={s.k} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",cursor:"pointer"}}><input type="checkbox" checked={setupSelections[s.k]} onChange={e=>setSetupSelections(prev=>({...prev,[s.k]:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>{s.l}</M></label>
             ))}
             <Sel label="Ticketing System" value={setupSelections.ticketing} onChange={e=>setSetupSelections(prev=>({...prev,ticketing:e.target.value}))}>
@@ -2966,7 +2963,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"Testing Lab",s:"configured",d:"cyber-lab.corp.local · REST API"},
               ...(provisionedClients.length>0?[{n:"Provisioned Clients",s:provisionedClients.length+" deployed",d:provisionedClients.map(c=>c.hostname).join(", ")}]:[]),
               {n:"CI/CD Pipeline",s:"pending",d:"See CI/CD tab for pipeline configs"},
-              {n:"Elasticity / Auto-Scaling",s:"pending",d:"See Elasticity tab"},
               {n:"EDR File Inspection",s:edrCfg.enabled?"configured":"pending",d:edrCfg.enabled?`${edrCfg.provider} · Scan on upload/restore/import`:"Not configured — see EDR tab"},
               {n:"Enterprise KMS",s:kmsCfg.enabled?"configured":"pending",d:kmsCfg.enabled?`${kmsCfg.provider} · ${kmsCfg.hsmBacked?"HSM-backed":"Software keys"} · Rotation: ${kmsCfg.rotationPolicy}`:"Not configured — see KMS tab"},
               {n:"WiFi Security Policy",s:"configured",d:`Min: ${wifiPolicy.minimumProtocol.replace(/_/g," ")} · WPA3 preferred: ${wifiPolicy.wpa3Preferred?"yes":"no"} · Block PSK: ${wifiPolicy.blockWpa2Personal?"yes":"no"}`},
@@ -2977,7 +2973,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"Posture Assessment",s:postureCfg.enabled?"enabled":"disabled",d:postureCfg.enabled?`${Object.values(postureCfg.checks).filter(v=>v===true).length} checks active · ${postureCfg.blockOnFail?"strict":"warn"} mode`:"Not enabled — see Posture tab"},
               {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?`${haCfg.mode} · Sync every ${haCfg.syncIntervalSec}s`:"Not configured — see HA tab"},
               {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure · Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled — see Fail-Open tab"},
-              {n:"UTM",s:utmCfg.enabled?"configured":"disabled",d:utmCfg.enabled?`${utmCfg.provider}`:"Not configured — see UTM tab"},
               {n:"Pseudonym System",s:pseudonymCfg.enabled?"active":"disabled",d:pseudonymCfg.enabled?`${analystPseudonyms.length} analysts pseudonymized`:"Not enabled — see Pseudonyms tab"},
               {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?`${geoFenceCfg.clients.length} clients geo-assigned`:"Not configured — see Data Sovereignty tab"},
               {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?`${clusterCfg.nodeCount} nodes · ${clusterCfg.sessionStore}`:"Single instance"},
@@ -3169,37 +3164,6 @@ regression:
           <Card style={{padding:12,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>DevSecOps Pipeline Stages</M><M style={{color:C.tm,lineHeight:1.8}}>Test (unit + lint) → Security audit (npm audit + Snyk) → Build (Docker image) → Regression test (all integrations + security controls) → Deploy (with fuse increment)</M></Card>
         </div>)}
 
-        {/* ══════════ ELASTICITY ══════════ */}
-        {tab==="elasticity"&&(<div>
-          <L>Elasticity & Auto-Scaling</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure auto-scaling for cloud-deployed FireAlive instances. As your SOC grows or shrinks (e.g., multinational office openings/closings), the platform scales while maintaining security guarantees — new instances are integrity-verified, enrolled in SPIFFE, and have keys rotated before accepting traffic.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={elasticityCfg.enabled} onChange={e=>setElasticityCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable auto-scaling</label>
-            <Sel label="Scaling Provider" value={elasticityCfg.provider||""} onChange={e=>setElasticityCfg(prev=>({...prev,provider:e.target.value}))}>
-              <option value="">Select...</option><option value="aws_ecs">AWS ECS / Fargate</option><option value="azure_aci">Azure Container Instances</option><option value="gcp_cloudrun">GCP Cloud Run</option><option value="k8s_hpa">Kubernetes HPA</option>
-            </Sel>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
-              <Input label="Min instances" type="number" value={elasticityCfg.minInstances} onChange={e=>setElasticityCfg(prev=>({...prev,minInstances:parseInt(e.target.value)||1}))}/>
-              <Input label="Max instances" type="number" value={elasticityCfg.maxInstances} onChange={e=>setElasticityCfg(prev=>({...prev,maxInstances:parseInt(e.target.value)||10}))}/>
-              <Input label="Cooldown (seconds)" type="number" value={elasticityCfg.cooldownSeconds} onChange={e=>setElasticityCfg(prev=>({...prev,cooldownSeconds:parseInt(e.target.value)||300}))}/>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
-              <Input label="Scale up at CPU %" type="number" value={elasticityCfg.scaleUpThreshold} onChange={e=>setElasticityCfg(prev=>({...prev,scaleUpThreshold:parseInt(e.target.value)||80}))}/>
-              <Input label="Scale down at CPU %" type="number" value={elasticityCfg.scaleDownThreshold} onChange={e=>setElasticityCfg(prev=>({...prev,scaleDownThreshold:parseInt(e.target.value)||30}))}/>
-            </div>
-          </Card>
-          <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
-            <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Security on Scale Events</div>
-            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Each new instance must pass these security checks before joining the cluster and accepting analyst connections.</M>
-            {[{k:"verifyIntegrityOnNewInstance",l:"Verify binary integrity on new instance (Ed25519 + SHA-256)"},{k:"enrollNewInstanceInSPIFFE",l:"Enroll new instance in SPIFFE/SPIRE for mTLS identity"},{k:"rotateKeysOnScaleUp",l:"Rotate encryption keys on scale-up event"},{k:"auditScaleEvents",l:"Audit log all scale events with instance metadata"}].map(s=>(
-              <label key={s.k} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",cursor:"pointer"}}><input type="checkbox" checked={elasticityCfg.securityOnScale[s.k]} onChange={e=>setElasticityCfg(prev=>({...prev,securityOnScale:{...prev.securityOnScale,[s.k]:e.target.checked}}))}/><M style={{color:C.t}}>{s.l}</M></label>
-            ))}
-          </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"ELASTICITY_CONFIG",detail:"Elasticity configuration saved"}).then(()=>addA("ELASTICITY_CONFIG","Elasticity configuration saved"))}>Save Elasticity Config</Btn>
-        </div>)}
-
-
-        {/* AUDIT */}
         {/* ══════════ IR SIMULATOR (OODA) — MANAGEMENT ══════════ */}
         {tab==="ooda_mgmt"&&(<div>
           <L>Incident Response Simulator — Policy Management</L>
@@ -3272,7 +3236,7 @@ regression:
           <L>Feature Toggles</L>
           {configLocked&&<Card style={{borderColor:C.d+"40",marginBottom:16,padding:12}}><M style={{color:C.d,fontWeight:500}}>🔒 Configurations are locked. Unlock with MFA using the button in the sidebar to make changes.</M></Card>}
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Enable or disable features for your deployment. Disabled features disappear from both the Management Console and all Analyst Clients. Changes propagate to all connected clients automatically.</M>
-          {[{cat:"Wellbeing",ids:["peer_chat","peer_scheduling","breathing_exercise","lighter_queue","lead_messaging","lead_chat_identified","signals_display","impact_feed","proactive_interventions","upskilling_hour"]},{cat:"Operations",ids:["delegation","burnout_routing","ooda_simulator","auto_routing_disable","fail_open_routing","tripwire"]},{cat:"Development",ids:["skill_assessments","training_certs","general_certs"]},{cat:"Integrations",ids:["soar_integration","ticket_integration","siem_feed","sase","vuln_scanning","edr_inspection","threat_hunting","utm_integration"]},{cat:"Security",ids:["mfa_wizard","posture_assessment","config_padlocks","concurrent_session_block","insider_threat_protocol","pseudonyms","auth_logs","auth_log_notifications"]},{cat:"Management",ids:["report_engine","query_tool","recertification","config_export","log_integrity","ha_config","cluster_mode","global_dashboard","backup_schedules","setup_wizard","welcome_guide","analyst_offboarding","recovery_runbook","ttx_generator","risk_register"]}].map(g=>(
+          {[{cat:"Wellbeing",ids:["peer_chat","peer_scheduling","breathing_exercise","lighter_queue","lead_messaging","lead_chat_identified","signals_display","impact_feed","proactive_interventions","upskilling_hour"]},{cat:"Operations",ids:["delegation","burnout_routing","ooda_simulator","auto_routing_disable","fail_open_routing","tripwire"]},{cat:"Development",ids:["skill_assessments","training_certs","general_certs"]},{cat:"Integrations",ids:["soar_integration","ticket_integration","siem_feed","sase","vuln_scanning","edr_inspection","threat_hunting"]},{cat:"Security",ids:["mfa_wizard","posture_assessment","config_padlocks","concurrent_session_block","insider_threat_protocol","pseudonyms","auth_logs","auth_log_notifications"]},{cat:"Management",ids:["report_engine","query_tool","recertification","config_export","log_integrity","ha_config","cluster_mode","global_dashboard","backup_schedules","setup_wizard","welcome_guide","analyst_offboarding","recovery_runbook","ttx_generator","risk_register"]}].map(g=>(
             <Card key={g.cat} style={{marginBottom:12}}>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{g.cat}</div>
               {g.ids.map(id=>(
@@ -3918,21 +3882,6 @@ regression:
           </div>
         </div>)}
 
-        {/* ══════════ v1.0.0 — UTM INTEGRATION ══════════ */}
-        {tab==="utm"&&(<div>
-          <L>UTM Integration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Unified Threat Management devices are largely superseded by SIEM/XDR/NGFW in modern SOCs, but some environments — especially smaller operations and legacy infrastructure — still run UTMs (Fortinet FortiGate, Sophos UTM, Check Point). This integration lets those devices feed alerts into FireAlive's routing engine and receive burnout-aware triage data.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={utmCfg.enabled} onChange={e=>setUtmCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable UTM integration</label>
-            <Sel label="UTM Provider" value={utmCfg.provider||""} onChange={e=>setUtmCfg(prev=>({...prev,provider:e.target.value}))}>
-              <option value="">Select...</option><option value="fortigate">Fortinet FortiGate</option><option value="sophos_utm">Sophos UTM</option><option value="checkpoint">Check Point</option><option value="watchguard">WatchGuard</option><option value="sonicwall">SonicWall</option><option value="other">Other (generic syslog)</option>
-            </Sel>
-            <Input label="UTM management endpoint" value={utmCfg.endpoint} onChange={e=>setUtmCfg(prev=>({...prev,endpoint:e.target.value}))} placeholder="https://utm.corp.local:8443/api" maxLength={512}/>
-            <Input label="API key" value={utmCfg.apiKey} onChange={e=>setUtmCfg(prev=>({...prev,apiKey:e.target.value}))} placeholder="utm-api-key..." maxLength={256}/>
-          </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"UTM_CONFIG_SAVED",detail:"UTM integration config saved"}).then(()=>addA("UTM_CONFIG_SAVED","UTM integration config saved"))}>Save UTM Config</Btn>
-        </div>)}
-
         {/* ══════════ v1.0.0 — GENERAL CERTS ══════════ */}
         {tab==="general_certs"&&(<div>
           <L>Certification Management</L>
@@ -4452,7 +4401,7 @@ regression:
           {[
             {cat:"Operations",items:[{n:"Actions",d:"Priority prompts generated from team health signals. Each prompt has severity, recommendation, and supporting research. Use depth controls to adjust detail level."},{n:"Team Overview",d:"Aggregate team health metrics — score, utilization, capacity. No individual burnout data. Shows shift roster with tier, utilization, and complexity caps."},{n:"Routing",d:"Configure burnout-aware ticket distribution. Set per-analyst complexity caps. Routing adjusts automatically based on team health signals."},{n:"Shift Handoff",d:"Structured shift transition notes. Maintains context continuity between shifts."},{n:"SLA",d:"Service Level Agreement targets for MTTA (mean time to acknowledge) and MTTR (mean time to resolve) by priority level."},{n:"Automation",d:"Track automated systems (EDR, SOAR, SIEM) and their alert volumes. Add new automation integrations."},{n:"Fail-Open Routing",d:"Like IPS fail-open: if burnout routing fails, tickets flow unfiltered so the SOC keeps running."},{n:"Auto-Disable Routing",d:"Automatically turn off burnout routing when critical incidents require all hands. Triggers: P1 tickets, SIEM alerts, SOAR escalations."},{n:"Recovery Runbook",d:"Generate step-by-step recovery instructions for 10+ failure scenarios (server crash, ransomware, insider threat, etc.)."}]},
             {cat:"Analysts & Wellbeing",items:[{n:"Skills Matrix",d:"Team skill coverage across 16 categories. Identifies gaps for training planning."},{n:"Assessments",d:"Create and assign skills assessments. Track results with progress bars."},{n:"Certifications",d:"Upload and track industry certs (CompTIA, ISACA, ISC², GIAC, etc.)."},{n:"CISM Retro",d:"Post-incident retrospective protocol following Mitchell's CISM model. 24hr/48-72hr/7-day check-ins."},{n:"Peer Config",d:"Configure peer skill-share scheduling windows, session limits, and helper leaderboard."},{n:"Pseudonyms",d:"Decouple analyst identity from burnout data. All data stored under pseudonyms. Mapping exportable for offline storage."},{n:"Proactive Breaks",d:"Sonnentag research-based: suggest breaks after prolonged high-severity work. Requires your approval before notification sent to analyst."},{n:"Upskilling Hour",d:"Dedicate one hour per shift to professional development. Routing pauses automatically. Research shows this reduces turnover by 20-30%."},{n:"Offboarding",d:"Securely deprovision analysts. Revokes keys, archives data, cancels peer sessions, notifies SOAR."}]},
-            {cat:"Integrations",items:[{n:"Health Dashboard",d:"Status of all system integrations — SIEM, SOAR, EDR, ticketing, cloud, etc."},{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."},{n:"UTM",d:"Legacy UTM device integration (FortiGate, Sophos, Check Point)."}]},
+            {cat:"Integrations",items:[{n:"Health Dashboard",d:"Status of all system integrations — SIEM, SOAR, EDR, ticketing, cloud, etc."},{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
             {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
             {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."},{n:"Legal Hold",d:"Export data for e-discovery with hashing and chain of custody."}]},
