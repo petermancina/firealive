@@ -1278,6 +1278,72 @@ function ManagementConsole() {
   const [ttxFormat, setTtxFormat] = useState("pdf");
   const [ttxGenerating, setTtxGenerating] = useState(false);
 
+  // ── AI Provider state (Phase F4a) ────────────────────────────────────────
+  const [aiStatus, setAiStatus] = useState(null);  // /api/ai-provider/status
+  const [aiConfigs, setAiConfigs] = useState([]);  // /api/ai-provider/config
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiDownloadPolling, setAiDownloadPolling] = useState(false);
+  const [aiSelectedFeature, setAiSelectedFeature] = useState('ir_simulator');
+  const [aiEditProvider, setAiEditProvider] = useState('internal');
+  const [aiEditModelName, setAiEditModelName] = useState('');
+  const [aiEditApiKey, setAiEditApiKey] = useState('');
+  const [aiEditEndpoint, setAiEditEndpoint] = useState('');
+  const [aiEditMaxTokens, setAiEditMaxTokens] = useState(1024);
+  const [aiEditTemperature, setAiEditTemperature] = useState(0.7);
+  const [aiInferences, setAiInferences] = useState([]);
+
+  // Fetch AI provider status + configs when tab is opened
+  useEffect(()=>{
+    if (tab !== 'ai_integrations') return;
+    setAiLoading(true);
+    Promise.all([
+      api.get('/api/ai-provider/status').catch(()=>null),
+      api.get('/api/ai-provider/config').catch(()=>null),
+    ]).then(([statusR, configR])=>{
+      setAiStatus(statusR);
+      setAiConfigs(configR?.configs || []);
+    }).finally(()=>setAiLoading(false));
+  }, [tab]);
+
+  // Poll download progress when a download is active
+  useEffect(()=>{
+    if (!aiDownloadPolling) return;
+    const tick = setInterval(()=>{
+      api.get('/api/ai-provider/model/download/status').then(r=>{
+        if (!r?.active) {
+          setAiDownloadPolling(false);
+          api.get('/api/ai-provider/status').then(s=>setAiStatus(s)).catch(()=>{});
+          return;
+        }
+        setAiStatus(prev=>prev ? {...prev, activeDownload: r.job} : prev);
+      }).catch(()=>{});
+    }, 2000);
+    return ()=>clearInterval(tick);
+  }, [aiDownloadPolling]);
+
+  // Load existing config into edit form when feature selection changes
+  useEffect(()=>{
+    if (tab !== 'ai_integrations') return;
+    const cfg = aiConfigs.find(c=>c.featureId===aiSelectedFeature);
+    if (cfg) {
+      setAiEditProvider(cfg.provider);
+      setAiEditModelName(cfg.modelName || '');
+      setAiEditMaxTokens(cfg.maxTokens || 1024);
+      setAiEditTemperature(cfg.temperature !== null && cfg.temperature !== undefined ? cfg.temperature : 0.7);
+    } else {
+      setAiEditProvider('internal');
+      setAiEditModelName('');
+      setAiEditMaxTokens(1024);
+      setAiEditTemperature(0.7);
+    }
+    setAiEditApiKey('');
+    setAiEditEndpoint('');
+    api.get('/api/ai-provider/inferences/'+aiSelectedFeature+'?limit=20').then(r=>{
+      setAiInferences(r?.inferences || []);
+    }).catch(()=>setAiInferences([]));
+  }, [aiSelectedFeature, aiConfigs, tab]);
+
+
   // When the TTX tab is opened, fetch the curated scenario library.
   useEffect(()=>{
     if (tab !== "ttx") return;
@@ -4390,9 +4456,98 @@ regression:
         {/* ══════════ v1.0.0 — HELP ══════════ */}
         {tab==="ai_integrations"&&(<div>
           <L>AI/ML Integrations</L>
-          <Card style={{marginBottom:16,borderColor:C.a+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:10}}>FireAlive Internal AI</div>{["Burnout detection","Routing","Abuse detection","Wellness","Privacy"].map((t,idx)=><div key={idx} style={{padding:"4px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t}}>INTERNAL: {t}</M></div>)}</Card>
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Outsourceable</div>{["IR scenarios","TTX","Playbooks","AI Tutor","Reports","Training"].map((t,idx)=><div key={idx} style={{padding:"4px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t}}>OPTIONAL: {t}</M></div>)}</Card>
-          <Card><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Provider for Outsourceable AI/ML Functions</div><Sel label="Provider"><option>FireAlive Internal AI</option><option>Anthropic Claude</option><option>OpenAI</option><option>Google Gemini</option><option>Azure OpenAI</option><option>AWS Bedrock</option><option>Custom</option></Sel><Input label="Endpoint" placeholder="https://api.anthropic.com/v1/messages"/><Input label="Key" type="password"/><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><M style={{color:C.a,fontWeight:600}}>Data firewall: ALWAYS ON (required)</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/integrations/save",{type:"ai",platform:"",endpoint:"",apiKey:""}).then(()=>addA("AI","Saved"))}>Save</Btn></Card>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>FireAlive ships internal AI by default. Some features use statistical/rule-based logic (deterministic, fast, no model needed); others use a local large language model bundled with FireAlive (private, no data leaves the host). Externally-hosted providers (Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom endpoints) can be configured per feature for orgs that prefer them.</M>
+
+          <Card style={{marginBottom:12,borderColor:C.a+"30"}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:10}}>Always Internal (statistical / rule-based — not configurable)</div>
+            {[{n:"Burnout signal detection",d:"Time-series statistical analysis on signal_readings."},{n:"Burnout-aware routing",d:"Capacity scoring + weighted ticket distribution."},{n:"Training gap recommendations",d:"Skill assessment scores → training module lookup."},{n:"Peer abuse detection",d:"Statistical pattern detection across flag history."},{n:"Compliance / regression scanning",d:"Deterministic rule checks against actual app state."}].map(f=>(
+              <div key={f.n} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
+                <M style={{color:C.t,fontWeight:500}}>{f.n}</M>
+                <M style={{color:C.tm,display:"block"}}>{f.d}</M>
+              </div>
+            ))}
+          </Card>
+
+          <Card style={{marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>Local LLM (FireAlive Internal AI for generative features)</div>
+              <Btn small onClick={()=>{setAiLoading(true);Promise.all([api.get("/api/ai-provider/status"),api.get("/api/ai-provider/config")]).then(([s,c])=>{setAiStatus(s);setAiConfigs(c?.configs||[]);}).catch(()=>{}).finally(()=>setAiLoading(false));}}>Refresh</Btn>
+            </div>
+            {aiLoading&&<M style={{color:C.td}}>Loading…</M>}
+            {!aiLoading&&aiStatus&&(<div>
+              <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model file present:</M> <M style={{color:aiStatus.modelPresent?C.a:C.d,fontWeight:600}}>{aiStatus.modelPresent?"yes":"no"}</M></div>
+              <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model loaded in memory:</M> <M style={{color:aiStatus.internalLlm?.ready?C.a:C.tm,fontWeight:600}}>{aiStatus.internalLlm?.ready?"yes":"no"}</M></div>
+              {aiStatus.internalLlm?.modelName&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model name:</M> <M style={{color:C.t}}>{aiStatus.internalLlm.modelName}</M></div>}
+              {aiStatus.internalLlm?.modelSizeBytes&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Size:</M> <M style={{color:C.t}}>{(aiStatus.internalLlm.modelSizeBytes/1024/1024).toFixed(1)} MB</M></div>}
+              {aiStatus.internalLlm?.lastInferenceAt&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Last inference:</M> <M style={{color:C.t}}>{aiStatus.internalLlm.lastInferenceAt}</M></div>}
+              {aiStatus.activeDownload&&(<div style={{marginTop:10,padding:10,background:C.s,borderRadius:6,border:`1px solid ${C.a}40`}}>
+                <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Download in progress: {aiStatus.activeDownload.variant}</M>
+                <M style={{color:C.tm,display:"block",fontSize:11}}>Status: {aiStatus.activeDownload.status} — {aiStatus.activeDownload.progress?.pct||0}%{aiStatus.activeDownload.progress?.totalBytes?(" — "+(aiStatus.activeDownload.progress.downloadedBytes/1024/1024).toFixed(1)+" / "+(aiStatus.activeDownload.progress.totalBytes/1024/1024).toFixed(1)+" MB"):""}</M>
+              </div>)}
+              <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
+                {!aiStatus.modelPresent&&!aiStatus.activeDownload&&<Btn primary onClick={()=>{api.post("/api/ai-provider/model/download",{variant:"phi3"}).then(()=>{setAiDownloadPolling(true);addA("AI_MODEL_DOWNLOAD_STARTED","Local LLM download started (Phi-3-mini, ~2.4GB)");}).catch(e=>addA("AI_MODEL_DOWNLOAD_FAILED","Failed to start download: "+(e?.message||"unknown")));}}>Download Local AI Model (~2.4GB)</Btn>}
+                {aiStatus.modelPresent&&!aiStatus.internalLlm?.ready&&<Btn small onClick={()=>{api.post("/api/ai-provider/model/load",{}).then(r=>{setAiStatus(s=>({...s,internalLlm:r.status}));addA("AI_MODEL_LOADED","Local LLM loaded into memory");}).catch(e=>addA("AI_MODEL_LOAD_FAILED","Load failed: "+(e?.message||"unknown")));}}>Load Model</Btn>}
+                {aiStatus.internalLlm?.ready&&<Btn small onClick={()=>{api.post("/api/ai-provider/model/unload",{}).then(()=>{api.get("/api/ai-provider/status").then(s=>setAiStatus(s));addA("AI_MODEL_UNLOADED","Local LLM unloaded from memory");}).catch(()=>{});}}>Unload Model</Btn>}
+              </div>
+            </div>)}
+          </Card>
+
+          <Card style={{marginBottom:12}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Feature Provider Routing</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>For features that use generative AI, choose where the inference runs. Internal uses the local LLM (private; no data leaves the host). External providers send the prompt over the network and require credentials.</M>
+            <Sel label="Feature" value={aiSelectedFeature} onChange={e=>setAiSelectedFeature(e.target.value)}>
+              <option value="ir_simulator">IR Simulator scenario generation</option>
+              <option value="burnout_messages">Burnout intervention messages</option>
+              <option value="kb_synthesis">Knowledge Base synthesis</option>
+              <option value="ttx_enhancement">TTX scenario enhancement (optional)</option>
+              <option value="troubleshooter">Troubleshooter AI diagnosis</option>
+            </Sel>
+            <Sel label="Provider" value={aiEditProvider} onChange={e=>setAiEditProvider(e.target.value)}>
+              <option value="internal">FireAlive Internal AI (local LLM)</option>
+              <option value="anthropic">Anthropic (Claude)</option>
+              <option value="openai">OpenAI (GPT)</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="azure_openai">Azure OpenAI Service</option>
+              <option value="aws_bedrock">AWS Bedrock</option>
+              <option value="custom">Custom (OpenAI-compatible endpoint)</option>
+            </Sel>
+            <Input label="Model name (optional; provider default used if blank)" value={aiEditModelName} onChange={e=>setAiEditModelName(e.target.value)} placeholder="e.g. claude-opus-4-7"/>
+            {aiEditProvider!=="internal"&&(<>
+              <Input label="API key" type="password" value={aiEditApiKey} onChange={e=>setAiEditApiKey(e.target.value)} placeholder="Required for external providers"/>
+              <Input label="Endpoint URL (optional for most; required for Azure OpenAI, AWS Bedrock proxy, custom)" value={aiEditEndpoint} onChange={e=>setAiEditEndpoint(e.target.value)} placeholder="Leave blank to use provider default"/>
+            </>)}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
+              <Input label="Max tokens" type="number" value={aiEditMaxTokens} onChange={e=>setAiEditMaxTokens(parseInt(e.target.value)||1024)}/>
+              <Input label="Temperature (0-2)" type="number" value={aiEditTemperature} onChange={e=>setAiEditTemperature(Math.max(0,Math.min(2,Number(e.target.value)||0.7)))}/>
+            </div>
+            <Btn primary style={{marginTop:12}} onClick={()=>{
+              const body = {provider:aiEditProvider,modelName:aiEditModelName||null,maxTokens:aiEditMaxTokens,temperature:aiEditTemperature};
+              if (aiEditProvider!=="internal") {
+                body.providerConfig = {apiKey:aiEditApiKey,endpointUrl:aiEditEndpoint||undefined};
+              }
+              api.put("/api/ai-provider/config/"+aiSelectedFeature,body).then(()=>{
+                addA("AI_PROVIDER_CONFIGURED","Provider for "+aiSelectedFeature+" set to "+aiEditProvider);
+                api.get("/api/ai-provider/config").then(r=>setAiConfigs(r?.configs||[]));
+              }).catch(e=>addA("AI_PROVIDER_CONFIG_FAILED","Save failed: "+(e?.message||"unknown")));
+            }}>Save Routing for {aiSelectedFeature}</Btn>
+          </Card>
+
+          <Card style={{marginBottom:12}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Recent inferences for {aiSelectedFeature}</div>
+            {aiInferences.length===0&&<M style={{color:C.tm}}>No inference activity yet. Once features start using their configured provider, calls will be logged here (token counts and metadata only — prompt and response content are not stored to protect Tier-3 data).</M>}
+            {aiInferences.length>0&&(<div style={{maxHeight:300,overflowY:"auto"}}>
+              {aiInferences.map(inf=>(
+                <div key={inf.id} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,fontSize:11}}>
+                  <div style={{display:"flex",justifyContent:"space-between",gap:10}}>
+                    <span style={{color:inf.status==="success"?C.a:C.d,fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>{inf.status}</span>
+                    <span style={{color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>{inf.created_at}</span>
+                  </div>
+                  <div style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>provider: {inf.provider} {inf.model_name?"· "+inf.model_name:""} · {inf.latency_ms}ms · in: {inf.input_token_count||0}t · out: {inf.output_token_count||0}t</div>
+                  {inf.error_message&&<div style={{color:C.d,fontStyle:"italic"}}>{inf.error_message}</div>}
+                </div>
+              ))}
+            </div>)}
+          </Card>
         </div>)}
 
         {tab==="help_mc"&&(<div>

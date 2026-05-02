@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.15 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 8 (anti-rollback)
+**Version:** v1.0.16 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 9 (anti-rollback)
 
 ---
 
@@ -72,13 +72,15 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
 
+**AI Provider API (/api/ai-provider, 8 endpoints):** Unified AI dispatcher and local LLM management. Per-feature routing config (internal local LLM vs. external provider — Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom OpenAI-compatible endpoint). Status, config CRUD, model download/load/unload, recent inference log. Backed by `server/services/ai-provider.js` (dispatcher), `server/services/internal-llm.js` (node-llama-cpp wrapper, default model: Phi-3-mini-4k-instruct, ~2.4GB, MIT licensed), `server/services/external-llm.js` (HTTP calls to external providers), and `scripts/download-model.js` (first-run model bootstrap). Inference audit log records token counts and metadata only — prompt and response content are NOT stored, to protect Tier-3 burnout data. Two features will use this in upcoming phases: IR Simulator scenario generation (F4b) and burnout intervention message generation (N1). Statistical features like burnout signal detection and burnout-aware routing remain rule-based for determinism, speed, and audit clarity.
+
 ---
 
 ## Installation
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.15) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.16) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 

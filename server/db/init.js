@@ -558,6 +558,58 @@ CREATE INDEX IF NOT EXISTS idx_ir_policies_type
 CREATE INDEX IF NOT EXISTS idx_ir_policies_hash
   ON ir_policies(content_hash);
 
+-- ── AI Provider Configuration ────────────────────────────────────────────
+-- Per-feature routing for AI calls. One row per AI-using feature.
+-- The dispatcher reads this to decide internal vs external for each call.
+
+CREATE TABLE IF NOT EXISTS ai_provider_config (
+  feature_id TEXT PRIMARY KEY CHECK (feature_id IN (
+    'ir_simulator',
+    'burnout_messages',
+    'kb_synthesis',
+    'ttx_enhancement',
+    'troubleshooter'
+  )),
+  provider TEXT NOT NULL DEFAULT 'internal' CHECK (provider IN (
+    'internal',
+    'anthropic', 'openai', 'gemini', 'azure_openai', 'aws_bedrock', 'custom'
+  )),
+  model_name TEXT,
+  config_encrypted BLOB,
+  max_tokens INTEGER NOT NULL DEFAULT 1024,
+  temperature REAL NOT NULL DEFAULT 0.7,
+  updated_by TEXT REFERENCES users(id),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ── AI Inference Log ─────────────────────────────────────────────────────
+-- Audit trail of every model call. Compliance requirement (GDPR + DORA).
+-- Records token counts and metadata only; prompt/response content is NOT
+-- stored here to avoid leaking Tier-3 burnout data into plain audit logs.
+
+CREATE TABLE IF NOT EXISTS ai_inference_log (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  feature_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model_name TEXT,
+  user_id TEXT REFERENCES users(id),
+  input_token_count INTEGER,
+  output_token_count INTEGER,
+  latency_ms INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('success', 'error', 'timeout', 'rate_limited')),
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_inference_feature
+  ON ai_inference_log(feature_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ai_inference_user
+  ON ai_inference_log(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ai_inference_status
+  ON ai_inference_log(status, created_at DESC);
+
 `;
 
 function initDb() {
