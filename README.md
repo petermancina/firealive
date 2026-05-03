@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.16 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 9 (anti-rollback)
+**Version:** v1.0.17 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 10 (anti-rollback)
 
 ---
 
@@ -72,7 +72,11 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
 
-**AI Provider API (/api/ai-provider, 8 endpoints):** Unified AI dispatcher and local LLM management. Per-feature routing config (internal local LLM vs. external provider — Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom OpenAI-compatible endpoint). Status, config CRUD, model download/load/unload, recent inference log. Backed by `server/services/ai-provider.js` (dispatcher), `server/services/internal-llm.js` (node-llama-cpp wrapper, default model: Phi-3-mini-4k-instruct, ~2.4GB, MIT licensed), `server/services/external-llm.js` (HTTP calls to external providers), and `scripts/download-model.js` (first-run model bootstrap). Inference audit log records token counts and metadata only — prompt and response content are NOT stored, to protect Tier-3 burnout data. Two features will use this in upcoming phases: IR Simulator scenario generation (F4b) and burnout intervention message generation (N1). Statistical features like burnout signal detection and burnout-aware routing remain rule-based for determinism, speed, and audit clarity.
+**AI Provider API (/api/ai-provider, 8 endpoints):** Unified AI dispatcher and local LLM management. Per-feature routing config (internal local LLM vs. external provider — Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom OpenAI-compatible endpoint). Status, config CRUD, model download/load/unload, recent inference log. Backed by `server/services/ai-provider.js` (dispatcher), `server/services/internal-llm.js` (node-llama-cpp wrapper, default model: Phi-3-mini-4k-instruct, ~2.4GB, MIT licensed), `server/services/external-llm.js` (HTTP calls to external providers), and `scripts/download-model.js` (first-run model bootstrap). Inference audit log records token counts and metadata only — prompt and response content are NOT stored, to protect Tier-3 burnout data. The IR Simulator scenario generator (F4b) and burnout intervention message generator (N1, upcoming) route through this dispatcher. Statistical features like burnout signal detection and burnout-aware routing remain rule-based for determinism, speed, and audit clarity.
+
+**IR Simulator API (/api/ooda, 11 endpoints):** OODA-loop incident response training generator. Team leads upload IR policies, playbooks, and after-action reports; the system generates choose-your-own-adventure decision-tree training scenarios calibrated to a chosen scenario type (8 categories: ransomware, phishing, data exfil, insider threat, APT, DDoS, supply chain, credential compromise) and difficulty (beginner / intermediate / advanced). Analysts work through the scenarios node-by-node, getting explanations on each correct or incorrect choice. Backed by `server/services/ooda-scenario-generator.js` (orchestration), `server/services/ir-policy-parser.js` (rule-based extraction of detection signals, decision points, escalation paths, roles, containment actions, and communications obligations from uploaded policy text), and the AI Provider dispatcher (the LLM call). The scenario generator validates every model output structurally — node count bounds, OODA-phase progression, exactly-one-correct-choice per decision node, all `nextNodeId` references resolve to real nodes, exactly one resolution node — and rejects malformed responses rather than persisting a broken scenario. Per-analyst progress tracked in the canonical `ooda_progress` table; aggregated training metrics (completion rate by scenario type, by difficulty, recent activity feed) available via `GET /api/ooda/mastery`.
+
+**Upload security (defense in depth, applies to /api/ooda/policies and /api/ooda/aar):** Two scan layers run on every uploaded policy and after-action report before any database write. Layer 1 (`server/services/content-sanitizer.js`) is a deterministic FireAlive-specific scanner — it catches threats that originate from how FireAlive uses the uploaded content, particularly LLM prompt injection (instruction-override patterns, role-switching jailbreaks, chat-template token injection, output-shape hijacking), embedded executables (shell shebangs, PowerShell IEX, VBA macros, reverse-shell signatures, pipe-to-shell installers, suspicious base64 blobs), and encoding attacks (null bytes, RTL override, zero-width invisibles, Unicode tag-character smuggling). Layer 2 (`server/services/integration-manager.js inspectFile()`) calls the deploying organization's EDR if configured, catching novel malware signatures and threat-intel matches that the internal sanitizer cannot stay current on. Both layers fail-closed: either layer's rejection blocks the upload. If EDR is not configured, layer 2 returns "skipped" — but layer 1 must still pass.
 
 ---
 
@@ -80,7 +84,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.16) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.17) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 

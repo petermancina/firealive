@@ -558,6 +558,89 @@ CREATE INDEX IF NOT EXISTS idx_ir_policies_type
 CREATE INDEX IF NOT EXISTS idx_ir_policies_hash
   ON ir_policies(content_hash);
 
+-- ── OODA After-Action Reports ────────────────────────────────────────────
+-- Real incident reports uploaded by leads/admins. Used as context for
+-- LLM-driven scenario generation in F4b. Phase F4b precursor: was stored
+-- as JSON blobs in team_config rows with key prefix 'ooda_aar_'.
+
+CREATE TABLE IF NOT EXISTS ooda_aars (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  incident_date TEXT,
+  lessons_learned TEXT,
+  uploaded_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ooda_aars_active
+  ON ooda_aars(uploaded_at DESC)
+  WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ooda_aars_uploader
+  ON ooda_aars(uploaded_by, uploaded_at DESC)
+  WHERE deleted_at IS NULL;
+
+-- ── OODA Generated Scenarios ─────────────────────────────────────────────
+-- Decision-tree training scenarios. F4a generated these from hardcoded
+-- templates; F4b generates them by calling aiProvider.generate() with
+-- policy + AAR context. Phase F4b precursor: stored as JSON blobs in
+-- team_config rows with key prefix 'ooda_scenario_'.
+--
+-- The full scenario JSON (nodes, choices, explanations) lives in 'tree'.
+-- Scalar fields are denormalized for indexed listing/filtering.
+
+CREATE TABLE IF NOT EXISTS ooda_scenarios (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  scenario_type TEXT NOT NULL CHECK (scenario_type IN (
+    'ransomware', 'phishing', 'data_exfil', 'insider_threat',
+    'apt', 'ddos', 'supply_chain', 'credential_compromise'
+  )),
+  difficulty TEXT NOT NULL CHECK (difficulty IN ('beginner', 'intermediate', 'advanced')),
+  tree TEXT NOT NULL,
+  node_count INTEGER NOT NULL DEFAULT 0,
+  generated_by_provider TEXT,
+  source_policy_ids TEXT NOT NULL DEFAULT '[]',
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  archived_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ooda_scenarios_active
+  ON ooda_scenarios(created_at DESC)
+  WHERE archived_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ooda_scenarios_type
+  ON ooda_scenarios(scenario_type, difficulty, created_at DESC)
+  WHERE archived_at IS NULL;
+
+-- ── OODA Analyst Progress ────────────────────────────────────────────────
+-- Per-analyst progress through individual scenarios. One row per
+-- (user, scenario) pair. Phase F4b precursor: stored as JSON blobs in
+-- team_config rows with key prefix 'ooda_progress_<userId>_<scenarioId>'.
+--
+-- nodes_completed is a JSON array of node IDs the analyst correctly
+-- advanced through. Length gives completion percentage when divided by
+-- the parent scenario's node_count.
+
+CREATE TABLE IF NOT EXISTS ooda_progress (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  scenario_id TEXT NOT NULL REFERENCES ooda_scenarios(id) ON DELETE CASCADE,
+  nodes_completed TEXT NOT NULL DEFAULT '[]',
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT,
+  PRIMARY KEY (user_id, scenario_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ooda_progress_user
+  ON ooda_progress(user_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ooda_progress_completed
+  ON ooda_progress(user_id, completed_at DESC)
+  WHERE completed_at IS NOT NULL;
+
 -- ── AI Provider Configuration ────────────────────────────────────────────
 -- Per-feature routing for AI calls. One row per AI-using feature.
 -- The dispatcher reads this to decide internal vs external for each call.
@@ -719,6 +802,151 @@ function initDb() {
         // second pass so a partial failure above doesn't lose data — anything
         // not copied stays in team_config for a future migration attempt.
         db.prepare("DELETE FROM team_config WHERE key LIKE 'ooda_policy_%'").run();
+      }
+    }
+
+    // ── Migration: ooda_aar_* team_config rows → ooda_aars table ──
+    // Phase F4a stored AARs as JSON blobs in team_config with key prefix
+    // 'ooda_aar_<id>'. Phase F4b moves them to a canonical table.
+    // Idempotent: each row is copied with INSERT OR IGNORE on the AAR id,
+    // and only rows that copy successfully are deleted from team_config.
+    {
+      const aarRows = db.prepare("SELECT key, value, updated_by FROM team_config WHERE key LIKE 'ooda_aar_%'").all();
+      if (aarRows.length > 0) {
+        const insertAar = db.prepare(`
+          INSERT OR IGNORE INTO ooda_aars (id, title, content, incident_date, lessons_learned, uploaded_by, uploaded_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+        const copiedAarKeys = [];
+        for (const row of aarRows) {
+          try {
+            const d = JSON.parse(row.value);
+            if (!d.id || !d.title || !d.content) continue;
+            const ts = d.uploadedAt || new Date().toISOString();
+            const result = insertAar.run(
+              d.id,
+              d.title,
+              d.content,
+              d.incidentDate || null,
+              d.lessonsLearned || null,
+              row.updated_by || 'unknown',
+              ts
+            );
+            if (result.changes > 0) copiedAarKeys.push(row.key);
+          } catch (parseErr) {
+            continue;
+          }
+        }
+        if (copiedAarKeys.length > 0) {
+          console.log(`ooda_aars migration: copied ${copiedAarKeys.length} AAR(s) from team_config`);
+          const deleteAar = db.prepare("DELETE FROM team_config WHERE key = ?");
+          for (const k of copiedAarKeys) deleteAar.run(k);
+        }
+      }
+    }
+
+    // ── Migration: ooda_scenario_* team_config rows → ooda_scenarios table ──
+    // Phase F4a stored generated scenarios as JSON blobs in team_config with
+    // key prefix 'ooda_scenario_<id>'. The full decision tree (nodes/choices)
+    // is preserved in the `tree` column verbatim; scalar fields (title,
+    // scenario_type, difficulty, node_count) are denormalized for indexed
+    // queries. The legacy F4a scenarios were generated from hardcoded
+    // templates, so generated_by_provider is recorded as 'legacy_template'.
+    {
+      const scenarioRows = db.prepare("SELECT key, value, updated_by FROM team_config WHERE key LIKE 'ooda_scenario_%'").all();
+      if (scenarioRows.length > 0) {
+        const validTypes = ['ransomware', 'phishing', 'data_exfil', 'insider_threat', 'apt', 'ddos', 'supply_chain', 'credential_compromise'];
+        const validDiffs = ['beginner', 'intermediate', 'advanced'];
+        const insertScenario = db.prepare(`
+          INSERT OR IGNORE INTO ooda_scenarios (id, title, scenario_type, difficulty, tree, node_count, generated_by_provider, source_policy_ids, created_by, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, 'legacy_template', '[]', ?, ?)
+        `);
+        const copiedScenarioKeys = [];
+        for (const row of scenarioRows) {
+          try {
+            const d = JSON.parse(row.value);
+            if (!d.id || !d.title || !Array.isArray(d.nodes)) continue;
+            const safeType = validTypes.includes(d.type) ? d.type : 'ransomware';
+            const safeDiff = validDiffs.includes(d.difficulty) ? d.difficulty : 'intermediate';
+            const ts = d.createdAt || new Date().toISOString();
+            const createdBy = d.createdBy || row.updated_by || 'unknown';
+            const result = insertScenario.run(
+              d.id,
+              d.title,
+              safeType,
+              safeDiff,
+              row.value,
+              d.nodes.length,
+              createdBy,
+              ts
+            );
+            if (result.changes > 0) copiedScenarioKeys.push(row.key);
+          } catch (parseErr) {
+            continue;
+          }
+        }
+        if (copiedScenarioKeys.length > 0) {
+          console.log(`ooda_scenarios migration: copied ${copiedScenarioKeys.length} scenario(s) from team_config`);
+          const deleteScenario = db.prepare("DELETE FROM team_config WHERE key = ?");
+          for (const k of copiedScenarioKeys) deleteScenario.run(k);
+        }
+      }
+    }
+
+    // ── Migration: ooda_progress_* team_config rows → ooda_progress table ──
+    // Phase F4a stored per-analyst progress as JSON blobs in team_config
+    // with key prefix 'ooda_progress_<userId>_<scenarioId>'. The composite
+    // PRIMARY KEY (user_id, scenario_id) on the canonical table requires
+    // both pieces, which we extract from the legacy key by splitting on
+    // the second underscore.
+    //
+    // Critical ordering: this migration runs AFTER ooda_scenarios is
+    // populated, because ooda_progress.scenario_id has a foreign-key
+    // constraint into ooda_scenarios. A progress row whose scenario was
+    // never migrated (because the scenario JSON was malformed, or the
+    // scenario was deleted before migration) is silently skipped — the
+    // FK enforcement returns SQLITE_CONSTRAINT and INSERT OR IGNORE
+    // converts that into a no-op.
+    {
+      const progressRows = db.prepare("SELECT key, value, updated_by FROM team_config WHERE key LIKE 'ooda_progress_%'").all();
+      if (progressRows.length > 0) {
+        const insertProgress = db.prepare(`
+          INSERT OR IGNORE INTO ooda_progress (user_id, scenario_id, nodes_completed, started_at, completed_at)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        const copiedProgressKeys = [];
+        for (const row of progressRows) {
+          try {
+            // Key shape: 'ooda_progress_<userId>_<scenarioId>'.
+            // userId and scenarioId are both hex strings from
+            // crypto.randomBytes(16).toString('hex'), so they have no
+            // underscores — split on the first underscore after the prefix.
+            const stripped = row.key.replace(/^ooda_progress_/, '');
+            const firstUnderscore = stripped.indexOf('_');
+            if (firstUnderscore === -1) continue;
+            const userId = stripped.slice(0, firstUnderscore);
+            const scenarioId = stripped.slice(firstUnderscore + 1);
+            if (!userId || !scenarioId) continue;
+            const d = JSON.parse(row.value);
+            const nodesCompleted = JSON.stringify(Array.isArray(d.nodesCompleted) ? d.nodesCompleted : []);
+            const startedAt = d.startedAt || new Date().toISOString();
+            const result = insertProgress.run(
+              userId,
+              scenarioId,
+              nodesCompleted,
+              startedAt,
+              d.completedAt || null
+            );
+            if (result.changes > 0) copiedProgressKeys.push(row.key);
+          } catch (parseErr) {
+            continue;
+          }
+        }
+        if (copiedProgressKeys.length > 0) {
+          console.log(`ooda_progress migration: copied ${copiedProgressKeys.length} progress row(s) from team_config`);
+          const deleteProgress = db.prepare("DELETE FROM team_config WHERE key = ?");
+          for (const k of copiedProgressKeys) deleteProgress.run(k);
+        }
       }
     }
   } catch (migrationErr) {

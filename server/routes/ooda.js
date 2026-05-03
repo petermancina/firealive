@@ -20,25 +20,153 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { generateScenario } = require('../services/ooda-scenario-generator');
+const { sanitize, SANITIZER_VERSION } = require('../services/content-sanitizer');
+const { IntegrationManager, INSPECTOR_VERSION } = require('../services/integration-manager');
 
 const MAX_POLICY_SIZE = 500000; // 500KB text max
+const MAX_AAR_LESSONS_SIZE = 5000;
 const OODA_PHASES = ['observe', 'orient', 'decide', 'act'];
 
+// Map error codes from the scenario generator + dispatcher to HTTP status
+// codes. Defined once so commit 5's play/history endpoints can reuse it
+// when they also start surfacing generator-side errors (e.g. on regenerate).
+function statusForGeneratorError(err) {
+  if (!err || !err.code) return 500;
+  switch (err.code) {
+    case 'SCENARIO_INVALID_PARAMS': return 400;
+    case 'SCENARIO_NO_POLICIES': return 400;
+    case 'SCENARIO_INVALID_OUTPUT': return 502;
+    case 'AI_NOT_CONFIGURED': return 503;
+    case 'AI_TIMEOUT': return 504;
+    case 'AI_RATE_LIMITED': return 429;
+    case 'AI_INTERNAL_UNAVAILABLE': return 503;
+    case 'AI_INTERNAL_INVALID_MODEL_PATH': return 500;
+    default: return 500;
+  }
+}
+
+// ── Two-layer upload scan ────────────────────────────────────────────────────
+//
+// Runs the layer-1 content sanitizer first (catches FireAlive-domain threats:
+// prompt injection, embedded executables, encoding attacks). If clean, runs
+// the layer-2 EDR inspector (catches malware signatures and threat-intel
+// matches via the deploying organization's EDR integration). Either layer's
+// rejection blocks the upload — fail-closed.
+//
+// If layer 2 (EDR) is not configured, it returns {skipped: true, clean: true}.
+// That is NOT a green light by itself — it means "this layer has nothing to
+// add." The layer-1 sanitizer must still have passed. Per the security model
+// established in commits 6a and 6b, an unscanned upload is never allowed to
+// land: layer 1 runs always, layer 2 runs when configured, and the deploying
+// organization is encouraged (in docs and in the MC) to configure EDR for
+// defense in depth.
+//
+// Returns: {
+//   ok: bool,                  true only if both layers cleared
+//   layer1: {clean, threats, scanId, sanitizerVersion},
+//   layer2: {clean, skipped, threats, scanId, provider, latencyMs,
+//            error?, inspectorVersion},
+//   rejectedBy: 'layer1' | 'layer2' | null,
+// }
+async function runUploadScans(content, fileName, fileType) {
+  // Layer 1 — sanitizer (sync, deterministic, network-free)
+  const layer1 = sanitize(content, { fileName, fileType });
+  if (!layer1.clean) {
+    return { ok: false, layer1, layer2: null, rejectedBy: 'layer1' };
+  }
+
+  // Layer 2 — EDR (async; only runs if layer 1 cleared). The IntegrationManager
+  // is instantiated per upload because it caches a db handle in this.db; we
+  // open one, run the inspection, close it.
+  const db = getDb();
+  let layer2;
+  try {
+    const mgr = new IntegrationManager(db);
+    layer2 = await mgr.inspectFile(content, fileName, fileType);
+  } finally {
+    db.close();
+  }
+  if (!layer2.clean) {
+    return { ok: false, layer1, layer2, rejectedBy: 'layer2' };
+  }
+  return { ok: true, layer1, layer2, rejectedBy: null };
+}
+
+// Build the per-upload audit-log fragment that records both scan layers.
+// Used in the OODA_POLICY_UPLOADED and OODA_AAR_UPLOADED detail strings.
+function scanAuditFragment(scans) {
+  const parts = [
+    `sanitizer=${scans.layer1.sanitizerVersion}/${scans.layer1.scanId}`,
+  ];
+  if (scans.layer2 && scans.layer2.skipped) {
+    parts.push('edr=skipped');
+  } else if (scans.layer2) {
+    parts.push(
+      `edr=${scans.layer2.provider}/${scans.layer2.scanId || 'no-id'}`
+        + ` (${scans.layer2.latencyMs}ms)`
+    );
+  }
+  return parts.join(' ');
+}
+
 // ── Upload Policy/Playbook ───────────────────────────────────────────────────
-router.post('/policies', (req, res) => {
+// Two-layer scan gate: content-sanitizer (layer 1, FireAlive-domain threats)
+// and EDR inspector (layer 2, malware signatures via configured EDR). Either
+// layer's rejection blocks the upload. Both scans are logged to the audit
+// trail regardless of outcome.
+router.post('/policies', async (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can upload policies' });
 
-  const { title, content, type, scenarioTags } = req.body;
+  const { title, content, type, scenarioTags } = req.body || {};
   if (!title || !content) return res.status(400).json({ error: 'title and content required' });
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content must be a string' });
   if (content.length > MAX_POLICY_SIZE) return res.status(400).json({ error: `Content too large (max ${MAX_POLICY_SIZE / 1000}KB)` });
 
   const validTypes = ['incident_response', 'playbook', 'runbook', 'policy', 'procedure'];
   const safeType = validTypes.includes(type) ? type : 'policy';
-  const safeTitle = title.slice(0, 256);
+  const safeTitle = String(title).slice(0, 256);
   const safeContent = content.slice(0, MAX_POLICY_SIZE);
   const tags = Array.isArray(scenarioTags) ? scenarioTags.filter(t => typeof t === 'string').slice(0, 20) : [];
   const contentHash = crypto.createHash('sha256').update(safeContent).digest('hex');
 
+  // Two-layer scan. Both layers run before any database write.
+  let scans;
+  try {
+    scans = await runUploadScans(safeContent, safeTitle + '.policy', 'text/plain');
+  } catch (scanErr) {
+    logger.error('Policy upload scan error', { error: scanErr.message });
+    return res.status(500).json({ error: 'Upload scan failed', code: 'SCAN_INFRASTRUCTURE_ERROR' });
+  }
+
+  if (!scans.ok) {
+    auditLog(
+      req.user.id,
+      'OODA_POLICY_UPLOAD_REJECTED',
+      `"${safeTitle}" rejected_by=${scans.rejectedBy} ${scanAuditFragment(scans)}`,
+      req.ip
+    );
+    if (scans.rejectedBy === 'layer1') {
+      return res.status(422).json({
+        error: 'Content rejected by safety scan',
+        code: 'CONTENT_REJECTED_SANITIZER',
+        threats: scans.layer1.threats,
+        scanId: scans.layer1.scanId,
+      });
+    }
+    // layer 2
+    return res.status(422).json({
+      error: scans.layer2.error
+        ? 'EDR scan failed (configured but unreachable or returned an error)'
+        : 'Content rejected by EDR scan',
+      code: scans.layer2.error ? 'EDR_SCAN_UNAVAILABLE' : 'CONTENT_REJECTED_EDR',
+      threats: scans.layer2.threats,
+      scanId: scans.layer2.scanId,
+      provider: scans.layer2.provider,
+    });
+  }
+
+  // Both layers passed — persist and audit.
   try {
     const db = getDb();
     const id = crypto.randomBytes(16).toString('hex');
@@ -48,8 +176,13 @@ router.post('/policies', (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
     `).run(id, safeTitle, safeType, safeContent, contentHash, JSON.stringify(tags), req.user.id, now, now);
     db.close();
-    auditLog(req.user.id, 'OODA_POLICY_UPLOADED', `"${safeTitle}" (${safeType})`, req.ip);
-    res.status(201).json({ id, title: safeTitle, type: safeType, scenarioTags: tags });
+    auditLog(
+      req.user.id,
+      'OODA_POLICY_UPLOADED',
+      `"${safeTitle}" (${safeType}) ${scanAuditFragment(scans)}`,
+      req.ip
+    );
+    res.status(201).json({ id, title: safeTitle, type: safeType, scanId: scans.layer1.scanId, scenarioTags: tags });
   } catch (err) {
     logger.error('Upload policy error', { error: err.message });
     res.status(500).json({ error: 'Failed to upload policy' });
@@ -101,24 +234,80 @@ router.delete('/policies/:id', (req, res) => {
 });
 
 // ── Upload After-Action Report ───────────────────────────────────────────────
-router.post('/aar', (req, res) => {
+// Same two-layer scan gate as POST /policies. AAR content is also LLM-prompt
+// input (commit 3's ooda-scenario-generator includes recent AARs in its
+// scenario-generation prompt) so the prompt-injection defense applies here
+// equally.
+router.post('/aar', async (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can upload AARs' });
 
-  const { title, content, incidentDate, lessonsLearned } = req.body;
+  const { title, content, incidentDate, lessonsLearned } = req.body || {};
   if (!title || !content) return res.status(400).json({ error: 'title and content required' });
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content must be a string' });
+  if (content.length > MAX_POLICY_SIZE) return res.status(400).json({ error: `Content too large (max ${MAX_POLICY_SIZE / 1000}KB)` });
+
+  const safeTitle = String(title).slice(0, 256);
+  const safeContent = content.slice(0, MAX_POLICY_SIZE);
+  const safeLessons = typeof lessonsLearned === 'string' ? lessonsLearned.slice(0, MAX_AAR_LESSONS_SIZE) : null;
+  const safeIncidentDate = typeof incidentDate === 'string' ? incidentDate.slice(0, 32) : null;
+
+  // The lessons_learned field is also LLM input, so scan it too if present.
+  // We scan content + lessons together as one combined blob — they're
+  // serialized into the same prompt anyway, and a separate scan for lessons
+  // would duplicate audit log entries unnecessarily.
+  const combinedForScan = safeLessons ? `${safeContent}\n\n--- LESSONS LEARNED ---\n${safeLessons}` : safeContent;
+
+  let scans;
+  try {
+    scans = await runUploadScans(combinedForScan, safeTitle + '.aar', 'text/plain');
+  } catch (scanErr) {
+    logger.error('AAR upload scan error', { error: scanErr.message });
+    return res.status(500).json({ error: 'Upload scan failed', code: 'SCAN_INFRASTRUCTURE_ERROR' });
+  }
+
+  if (!scans.ok) {
+    auditLog(
+      req.user.id,
+      'OODA_AAR_UPLOAD_REJECTED',
+      `"${safeTitle}" rejected_by=${scans.rejectedBy} ${scanAuditFragment(scans)}`,
+      req.ip
+    );
+    if (scans.rejectedBy === 'layer1') {
+      return res.status(422).json({
+        error: 'Content rejected by safety scan',
+        code: 'CONTENT_REJECTED_SANITIZER',
+        threats: scans.layer1.threats,
+        scanId: scans.layer1.scanId,
+      });
+    }
+    return res.status(422).json({
+      error: scans.layer2.error
+        ? 'EDR scan failed (configured but unreachable or returned an error)'
+        : 'Content rejected by EDR scan',
+      code: scans.layer2.error ? 'EDR_SCAN_UNAVAILABLE' : 'CONTENT_REJECTED_EDR',
+      threats: scans.layer2.threats,
+      scanId: scans.layer2.scanId,
+      provider: scans.layer2.provider,
+    });
+  }
 
   try {
     const db = getDb();
     const id = crypto.randomBytes(16).toString('hex');
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(
-      `ooda_aar_${id}`,
-      JSON.stringify({ id, title: title.slice(0, 256), content: content.slice(0, MAX_POLICY_SIZE), incidentDate, lessonsLearned: lessonsLearned?.slice(0, 5000), uploadedAt: new Date().toISOString() }),
-      req.user.id
-    );
+    db.prepare(`
+      INSERT INTO ooda_aars (id, title, content, incident_date, lessons_learned, uploaded_by, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(id, safeTitle, safeContent, safeIncidentDate, safeLessons, req.user.id);
     db.close();
-    auditLog(req.user.id, 'OODA_AAR_UPLOADED', `"${title}"`, req.ip);
-    res.status(201).json({ id, title });
+    auditLog(
+      req.user.id,
+      'OODA_AAR_UPLOADED',
+      `"${safeTitle}" ${scanAuditFragment(scans)}`,
+      req.ip
+    );
+    res.status(201).json({ id, title: safeTitle, scanId: scans.layer1.scanId });
   } catch (err) {
+    logger.error('Upload AAR error', { error: err.message });
     res.status(500).json({ error: 'Failed to upload AAR' });
   }
 });
@@ -126,103 +315,214 @@ router.post('/aar', (req, res) => {
 router.get('/aar', (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_aar_%'").all();
+    const rows = db.prepare(`
+      SELECT id, title, incident_date, uploaded_at
+      FROM ooda_aars
+      WHERE deleted_at IS NULL
+      ORDER BY uploaded_at DESC
+    `).all();
     db.close();
-    const aars = rows.map(r => { try { const d = JSON.parse(r.value); return { id: d.id, title: d.title, incidentDate: d.incidentDate, uploadedAt: d.uploadedAt }; } catch { return null; } }).filter(Boolean);
+    const aars = rows.map(r => ({
+      id: r.id,
+      title: r.title,
+      incidentDate: r.incident_date,
+      uploadedAt: r.uploaded_at,
+    }));
     res.json({ aars });
   } catch (err) {
+    logger.error('List AAR error', { error: err.message });
     res.status(500).json({ error: 'Failed to list AARs' });
   }
 });
 
 // ── Generate Scenario ────────────────────────────────────────────────────────
-// In production, this calls the AI engine with policy+AAR context.
-// For now, generates structured scenarios from templates informed by uploaded content.
-router.post('/generate', (req, res) => {
+// Calls the OODA scenario generator service, which loads ir_policies + ooda_aars,
+// builds a structured prompt, dispatches through the AI provider (internal local
+// LLM by default; per-feature override configurable via the MC AI/ML
+// Integrations tab), validates the model output, and returns a tree.
+// We persist the validated tree to the ooda_scenarios canonical table.
+router.post('/generate', async (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can generate scenarios' });
 
-  const { scenarioType, difficulty } = req.body;
-  const validTypes = ['ransomware', 'phishing', 'data_exfil', 'insider_threat', 'apt', 'ddos', 'supply_chain', 'credential_compromise'];
-  const type = validTypes.includes(scenarioType) ? scenarioType : validTypes[Math.floor(Math.random() * validTypes.length)];
-  const diff = ['beginner', 'intermediate', 'advanced'].includes(difficulty) ? difficulty : 'intermediate';
+  const { scenarioType, difficulty, policyIds } = req.body || {};
+
+  let result;
+  try {
+    result = await generateScenario({
+      scenarioType,
+      difficulty,
+      policyIds: Array.isArray(policyIds) ? policyIds : null,
+      userId: req.user.id,
+    });
+  } catch (err) {
+    const status = statusForGeneratorError(err);
+    logger.warn('Generate scenario error', {
+      scenarioType, difficulty,
+      code: err && err.code,
+      message: err && err.message,
+      status,
+    });
+    return res.status(status).json({
+      error: err && err.message ? err.message : 'Failed to generate scenario',
+      code: err && err.code ? err.code : 'UNKNOWN',
+    });
+  }
+
+  // Persist the validated tree to ooda_scenarios. The full tree (nodes,
+  // choices, explanations) is stored in the `tree` column verbatim;
+  // scalar fields are denormalized for indexed listing.
+  const id = crypto.randomBytes(16).toString('hex');
+  const treeJson = JSON.stringify(result.tree);
+  const sourcePolicyIdsJson = JSON.stringify(result.sourcePolicyIds || []);
+  const generatedByProvider = result.modelName ? `${result.provider}/${result.modelName}` : result.provider;
 
   try {
     const db = getDb();
-
-    // Load policies and AARs for context
-    const policies = db.prepare("SELECT id, title, policy_type AS type, content, scenario_tags, version, uploaded_by, uploaded_at FROM ir_policies WHERE deleted_at IS NULL").all()
-      .map(p => ({ ...p, scenario_tags: (() => { try { return JSON.parse(p.scenario_tags); } catch { return []; } })() }));
-    const aars = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_aar_%'").all()
-      .map(r => { try { return JSON.parse(r.value); } catch { return null; } }).filter(Boolean);
-
-    // Generate scenario decision tree
-    const scenario = generateScenarioTree(type, diff, policies, aars);
-    const id = crypto.randomBytes(16).toString('hex');
-
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(
-      `ooda_scenario_${id}`,
-      JSON.stringify({ ...scenario, id, createdAt: new Date().toISOString(), createdBy: req.user.id }),
+    db.prepare(`
+      INSERT INTO ooda_scenarios (id, title, scenario_type, difficulty, tree, node_count, generated_by_provider, source_policy_ids, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(
+      id,
+      result.tree.title,
+      result.tree.scenarioType,
+      result.tree.difficulty,
+      treeJson,
+      result.tree.nodeCount,
+      generatedByProvider,
+      sourcePolicyIdsJson,
       req.user.id
     );
-
     db.close();
-    auditLog(req.user.id, 'OODA_SCENARIO_GENERATED', `type=${type} difficulty=${diff} nodes=${scenario.nodes.length}`, req.ip);
-    res.status(201).json({ id, title: scenario.title, type, difficulty: diff, nodeCount: scenario.nodes.length });
-  } catch (err) {
-    logger.error('Generate scenario error', { error: err.message });
-    res.status(500).json({ error: 'Failed to generate scenario' });
+  } catch (dbErr) {
+    logger.error('Persist scenario error', { error: dbErr.message });
+    return res.status(500).json({ error: 'Generated scenario but failed to persist it' });
   }
+
+  auditLog(
+    req.user.id,
+    'OODA_SCENARIO_GENERATED',
+    `type=${result.tree.scenarioType} difficulty=${result.tree.difficulty} nodes=${result.tree.nodeCount} provider=${generatedByProvider} latency_ms=${result.latencyMs}`,
+    req.ip
+  );
+
+  res.status(201).json({
+    id,
+    title: result.tree.title,
+    type: result.tree.scenarioType,
+    difficulty: result.tree.difficulty,
+    nodeCount: result.tree.nodeCount,
+    sourcePolicyIds: result.sourcePolicyIds,
+    provider: result.provider,
+    modelName: result.modelName,
+    latencyMs: result.latencyMs,
+  });
 });
 
 // ── List Scenarios ───────────────────────────────────────────────────────────
 router.get('/scenarios', (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare("SELECT value FROM team_config WHERE key LIKE 'ooda_scenario_%'").all();
+    const rows = db.prepare(`
+      SELECT id, title, scenario_type, difficulty, node_count, generated_by_provider, created_at
+      FROM ooda_scenarios
+      WHERE archived_at IS NULL
+      ORDER BY created_at DESC
+    `).all();
     db.close();
-    const scenarios = rows.map(r => {
-      try { const d = JSON.parse(r.value); return { id: d.id, title: d.title, type: d.type, difficulty: d.difficulty, nodeCount: d.nodes?.length, createdAt: d.createdAt }; } catch { return null; }
-    }).filter(Boolean);
+    const scenarios = rows.map(r => ({
+      id: r.id,
+      title: r.title,
+      type: r.scenario_type,
+      difficulty: r.difficulty,
+      nodeCount: r.node_count,
+      generatedByProvider: r.generated_by_provider,
+      createdAt: r.created_at,
+    }));
     res.json({ scenarios });
   } catch (err) {
+    logger.error('List scenarios error', { error: err.message });
     res.status(500).json({ error: 'Failed to list scenarios' });
   }
 });
 
-// ── Get Scenario (full decision tree) ────────────────────────────────────────
+// ── Get Scenario (start node only) ────────────────────────────────────────────
+// The analyst progresses node-by-node via POST /scenarios/:id/play; we never
+// return the entire tree (with answer keys) to a client.
 router.get('/scenarios/:id', (req, res) => {
   try {
     const db = getDb();
-    const row = db.prepare("SELECT value FROM team_config WHERE key = ?").get(`ooda_scenario_${req.params.id}`);
+    const row = db.prepare(`
+      SELECT id, title, scenario_type, difficulty, tree, node_count
+      FROM ooda_scenarios
+      WHERE id = ? AND archived_at IS NULL
+    `).get(req.params.id);
     db.close();
     if (!row) return res.status(404).json({ error: 'Scenario not found' });
-    const scenario = JSON.parse(row.value);
-    // Only return the first node — analyst progresses by making choices
+
+    let tree;
+    try {
+      tree = JSON.parse(row.tree);
+    } catch (parseErr) {
+      logger.error('Scenario tree parse error', { id: req.params.id, error: parseErr.message });
+      return res.status(500).json({ error: 'Scenario data is corrupted' });
+    }
+    if (!Array.isArray(tree.nodes) || tree.nodes.length === 0) {
+      return res.status(500).json({ error: 'Scenario has no nodes' });
+    }
+
     res.json({
-      id: scenario.id, title: scenario.title, type: scenario.type, difficulty: scenario.difficulty,
-      startNode: scenario.nodes[0],
-      totalNodes: scenario.nodes.length,
+      id: row.id,
+      title: row.title,
+      type: row.scenario_type,
+      difficulty: row.difficulty,
+      briefing: tree.briefing,
+      startNode: tree.nodes[0],
+      totalNodes: row.node_count,
     });
   } catch (err) {
+    logger.error('Get scenario error', { error: err.message });
     res.status(500).json({ error: 'Failed to get scenario' });
   }
 });
 
 // ── Play — Submit Choice ─────────────────────────────────────────────────────
+// Reads the scenario tree from ooda_scenarios.tree (the canonical table from
+// commit 1's schema) and writes per-analyst progress into ooda_progress
+// (composite PK on user_id + scenario_id, INSERT OR REPLACE on each correct
+// step). Wrong choices keep the analyst on the same node and don't write
+// progress — the explanation is the teaching moment.
 router.post('/scenarios/:id/play', (req, res) => {
-  const { currentNodeId, choiceIndex } = req.body;
-  if (currentNodeId === undefined || choiceIndex === undefined) return res.status(400).json({ error: 'currentNodeId and choiceIndex required' });
+  const { currentNodeId, choiceIndex } = req.body || {};
+  if (currentNodeId === undefined || choiceIndex === undefined) {
+    return res.status(400).json({ error: 'currentNodeId and choiceIndex required' });
+  }
 
   try {
     const db = getDb();
-    const row = db.prepare("SELECT value FROM team_config WHERE key = ?").get(`ooda_scenario_${req.params.id}`);
+    const row = db.prepare(`
+      SELECT id, tree, node_count
+      FROM ooda_scenarios
+      WHERE id = ? AND archived_at IS NULL
+    `).get(req.params.id);
     if (!row) { db.close(); return res.status(404).json({ error: 'Scenario not found' }); }
 
-    const scenario = JSON.parse(row.value);
-    const node = scenario.nodes.find(n => n.id === currentNodeId);
+    let tree;
+    try {
+      tree = JSON.parse(row.tree);
+    } catch (parseErr) {
+      db.close();
+      logger.error('Scenario tree parse error', { id: req.params.id, error: parseErr.message });
+      return res.status(500).json({ error: 'Scenario data is corrupted' });
+    }
+    if (!Array.isArray(tree.nodes)) {
+      db.close();
+      return res.status(500).json({ error: 'Scenario has no nodes' });
+    }
+
+    const node = tree.nodes.find(n => n.id === currentNodeId);
     if (!node) { db.close(); return res.status(404).json({ error: 'Node not found' }); }
 
-    const choice = node.choices?.[choiceIndex];
+    const choice = Array.isArray(node.choices) ? node.choices[choiceIndex] : null;
     if (!choice) { db.close(); return res.status(400).json({ error: 'Invalid choice index' }); }
 
     if (!choice.correct) {
@@ -236,22 +536,48 @@ router.post('/scenarios/:id/play', (req, res) => {
     }
 
     // Correct choice — advance to next node
-    const nextNode = scenario.nodes.find(n => n.id === choice.nextNodeId);
+    const nextNode = choice.nextNodeId ? tree.nodes.find(n => n.id === choice.nextNodeId) : null;
 
-    // Track progress
-    const progressKey = `ooda_progress_${req.user.id}_${req.params.id}`;
-    const existing = db.prepare("SELECT value FROM team_config WHERE key = ?").get(progressKey);
-    const progress = existing ? JSON.parse(existing.value) : { nodesCompleted: [], startedAt: new Date().toISOString() };
-    if (!progress.nodesCompleted.includes(currentNodeId)) progress.nodesCompleted.push(currentNodeId);
+    // Track progress in ooda_progress.
+    // Composite PK is (user_id, scenario_id), so INSERT OR REPLACE updates
+    // the existing row in place when the analyst progresses to a new node.
+    const existing = db.prepare(`
+      SELECT nodes_completed, started_at, completed_at
+      FROM ooda_progress
+      WHERE user_id = ? AND scenario_id = ?
+    `).get(req.user.id, req.params.id);
 
-    const isComplete = !nextNode || nextNode.type === 'resolution';
-    if (isComplete) progress.completedAt = new Date().toISOString();
+    let nodesCompleted;
+    let startedAt;
+    if (existing) {
+      try {
+        nodesCompleted = JSON.parse(existing.nodes_completed);
+        if (!Array.isArray(nodesCompleted)) nodesCompleted = [];
+      } catch { nodesCompleted = []; }
+      startedAt = existing.started_at;
+    } else {
+      nodesCompleted = [];
+      startedAt = new Date().toISOString();
+    }
+    if (!nodesCompleted.includes(currentNodeId)) nodesCompleted.push(currentNodeId);
 
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(progressKey, JSON.stringify(progress), req.user.id);
+    const isComplete = !nextNode || nextNode.type === 'resolution' || nextNode.phase === 'resolution';
+    const completedAt = isComplete ? new Date().toISOString() : null;
+
+    db.prepare(`
+      INSERT OR REPLACE INTO ooda_progress (user_id, scenario_id, nodes_completed, started_at, completed_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(req.user.id, req.params.id, JSON.stringify(nodesCompleted), startedAt, completedAt);
+
     db.close();
 
     if (isComplete) {
-      auditLog(req.user.id, 'OODA_SCENARIO_COMPLETED', `scenario=${req.params.id} nodes=${progress.nodesCompleted.length}`, req.ip);
+      auditLog(
+        req.user.id,
+        'OODA_SCENARIO_COMPLETED',
+        `scenario=${req.params.id} nodes=${nodesCompleted.length} duration_ms=${new Date(completedAt) - new Date(startedAt)}`,
+        req.ip
+      );
     }
 
     res.json({
@@ -259,7 +585,7 @@ router.post('/scenarios/:id/play', (req, res) => {
       explanation: choice.explanation,
       nextNode: nextNode || null,
       complete: isComplete,
-      progress: { completed: progress.nodesCompleted.length, total: scenario.nodes.length },
+      progress: { completed: nodesCompleted.length, total: row.node_count },
     });
   } catch (err) {
     logger.error('Play scenario error', { error: err.message });
@@ -268,84 +594,165 @@ router.post('/scenarios/:id/play', (req, res) => {
 });
 
 // ── Exercise History ─────────────────────────────────────────────────────────
+// Returns the calling analyst's run history across all scenarios. Joins
+// ooda_progress (the analyst-keyed progress rows) with ooda_scenarios to
+// get titles/types/totals, so the response is a single ready-to-render list.
 router.get('/history', (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare("SELECT key, value FROM team_config WHERE key LIKE ?").all(`ooda_progress_${req.user.id}_%`);
+    const rows = db.prepare(`
+      SELECT
+        p.scenario_id    AS scenarioId,
+        p.nodes_completed AS nodesCompletedJson,
+        p.started_at     AS startedAt,
+        p.completed_at   AS completedAt,
+        s.title          AS title,
+        s.scenario_type  AS type,
+        s.difficulty     AS difficulty,
+        s.node_count     AS totalNodes
+      FROM ooda_progress p
+      LEFT JOIN ooda_scenarios s ON s.id = p.scenario_id AND s.archived_at IS NULL
+      WHERE p.user_id = ?
+      ORDER BY COALESCE(p.completed_at, p.started_at) DESC
+    `).all(req.user.id);
     db.close();
+
     const history = rows.map(r => {
+      let nodesCompletedCount = 0;
       try {
-        const d = JSON.parse(r.value);
-        const scenarioId = r.key.replace(`ooda_progress_${req.user.id}_`, '');
-        return { scenarioId, nodesCompleted: d.nodesCompleted.length, startedAt: d.startedAt, completedAt: d.completedAt || null };
-      } catch { return null; }
-    }).filter(Boolean);
+        const arr = JSON.parse(r.nodesCompletedJson);
+        if (Array.isArray(arr)) nodesCompletedCount = arr.length;
+      } catch { /* malformed JSON — count as 0 */ }
+      return {
+        scenarioId: r.scenarioId,
+        title: r.title,             // null if scenario was archived/deleted
+        type: r.type,
+        difficulty: r.difficulty,
+        nodesCompleted: nodesCompletedCount,
+        totalNodes: r.totalNodes,
+        startedAt: r.startedAt,
+        completedAt: r.completedAt,
+      };
+    });
     res.json({ history });
   } catch (err) {
+    logger.error('History error', { error: err.message });
     res.status(500).json({ error: 'Failed to get history' });
   }
 });
 
-// ── Scenario Generation Engine ───────────────────────────────────────────────
-// Builds a decision tree with OODA phases as stages.
-// In production, this would call an AI model with policy context.
-// For now, uses structured templates.
+// ── Mastery (per-analyst aggregation) ─────────────────────────────────────────
+// Returns aggregated training metrics for the calling analyst, broken down
+// by scenario type and difficulty. Used by the IR Simulator dashboard's
+// progress view to show which areas the analyst is strong in vs. needs more
+// practice. Read-only; never writes to the DB.
+//
+// Response shape:
+//   {
+//     overall: { startedCount, completedCount, completionRate, avgDurationMs },
+//     byType: [ { type, started, completed, completionRate }, ... ],
+//     byDifficulty: [ { difficulty, started, completed, completionRate }, ... ],
+//     recentCompletions: [ { scenarioId, title, type, difficulty, completedAt }, ... ],
+//   }
+router.get('/mastery', (req, res) => {
+  try {
+    const db = getDb();
+    // Overall counts. Single round-trip for both started and completed
+    // and the average duration (only across completed scenarios).
+    const overallRow = db.prepare(`
+      SELECT
+        COUNT(*) AS started,
+        SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed,
+        AVG(CASE
+          WHEN completed_at IS NOT NULL
+            THEN (strftime('%s', completed_at) - strftime('%s', started_at)) * 1000
+          ELSE NULL
+        END) AS avg_duration_ms
+      FROM ooda_progress
+      WHERE user_id = ?
+    `).get(req.user.id);
 
-function generateScenarioTree(type, difficulty, policies, aars) {
-  const templates = {
-    ransomware: {
-      title: 'Ransomware Containment Exercise',
-      briefing: 'Multiple endpoints are showing encrypted file extensions and a ransom note has appeared on 3 workstations in the finance department. The SIEM has flagged anomalous SMB traffic.',
-      nodes: [
-        { id: 'observe_1', phase: 'observe', type: 'decision', prompt: 'You receive a P1 alert about encrypted files. What do you look at first?',
-          choices: [
-            { text: 'Check the SIEM for correlated alerts across the network', correct: true, nextNodeId: 'observe_2', explanation: 'Correct — establishing the scope of the incident is the first priority in the Observe phase. The SIEM will show if this is isolated or spreading.' },
-            { text: 'Immediately disconnect all affected machines from the network', correct: false, explanation: 'While containment is important, it belongs in the Act phase. First you need to Observe — understand what you\'re dealing with before taking action that could destroy forensic evidence.' },
-            { text: 'Open the ransom note to see what group is responsible', correct: false, explanation: 'Never interact with ransomware artifacts directly from your workstation. This could trigger additional payloads or C2 callbacks.' },
-          ]},
-        { id: 'observe_2', phase: 'observe', type: 'decision', prompt: 'SIEM shows SMB lateral movement from a single source IP to 47 endpoints over the last 2 hours. EDR shows a known ransomware binary hash. What else do you check?',
-          choices: [
-            { text: 'Check if the source IP maps to a compromised user account and verify their access scope', correct: true, nextNodeId: 'orient_1', explanation: 'Correct — identifying the compromised account tells you the blast radius (what they can access) and helps you move to the Orient phase with a clear picture.' },
-            { text: 'Start reimaging the affected machines', correct: false, explanation: 'Reimaging destroys forensic evidence and doesn\'t address the root cause. The attacker still has access through the compromised account.' },
-          ]},
-        { id: 'orient_1', phase: 'orient', type: 'decision', prompt: 'The source is a service account used by the finance automation tool. It has admin rights across the finance OU. You\'ve identified the attack vector. How do you Orient?',
-          choices: [
-            { text: 'Map the service account\'s permissions, identify all systems it can reach, check if domain admin was escalated', correct: true, nextNodeId: 'decide_1', explanation: 'Correct — in the Orient phase, you\'re building a complete picture. The service account\'s reach defines your containment boundary.' },
-            { text: 'Disable the service account immediately', correct: false, explanation: 'This is an Act step, and doing it without a full picture could alert the attacker to pivot to a backup access method before you\'ve identified all their footholds.' },
-          ]},
-        { id: 'decide_1', phase: 'decide', type: 'decision', prompt: 'Orientation complete: 47 endpoints affected, no domain admin escalation, attacker used a known vulnerability (CVE patched 3 months ago but not applied to this OU). What\'s your decision?',
-          choices: [
-            { text: 'Coordinate simultaneous containment: disable the service account, isolate affected OU at the network level, preserve forensic images of 3 representative machines', correct: true, nextNodeId: 'act_1', explanation: 'Correct — the Decide phase means choosing a coordinated action plan. Simultaneous containment prevents the attacker from reacting to piecemeal responses.' },
-            { text: 'Focus on patching the vulnerability first to prevent reinfection', correct: false, explanation: 'Patching is important but it\'s a recovery step. The attacker is active now — containment must happen before remediation.' },
-          ]},
-        { id: 'act_1', phase: 'act', type: 'decision', prompt: 'You\'ve decided on coordinated containment. What\'s the execution order?',
-          choices: [
-            { text: '1) Network isolate the finance OU, 2) Disable the service account, 3) Begin forensic imaging, 4) Notify management and legal', correct: true, nextNodeId: 'resolution', explanation: 'Correct — network isolation first prevents further spread, then credential kill, then evidence preservation, then notifications. This is the standard IR execution order.' },
-            { text: '1) Notify management, 2) Disable the account, 3) Start cleanup', correct: false, explanation: 'Notifications should not delay containment actions. Every minute the attacker has network access, more data is at risk.' },
-          ]},
-        { id: 'resolution', phase: 'resolution', type: 'resolution', prompt: 'Incident contained. The ransomware spread was limited to the finance OU. Forensic images captured. Service account disabled. Network segment isolated. Management and legal notified.',
-          summary: 'You successfully navigated all four OODA phases: Observed the scope via SIEM, Oriented by mapping the attack surface, Decided on coordinated containment, and Acted with proper execution order. Key lesson: simultaneous containment prevents attacker pivot.',
-          choices: []
-        },
-      ],
-    },
-  };
+    // Per-scenario-type completion rate. Inner join — a progress row whose
+    // scenario was archived is excluded from the type breakdown (still
+    // counted in the overall numbers above).
+    const byTypeRows = db.prepare(`
+      SELECT
+        s.scenario_type AS type,
+        COUNT(*) AS started,
+        SUM(CASE WHEN p.completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed
+      FROM ooda_progress p
+      JOIN ooda_scenarios s ON s.id = p.scenario_id AND s.archived_at IS NULL
+      WHERE p.user_id = ?
+      GROUP BY s.scenario_type
+      ORDER BY s.scenario_type
+    `).all(req.user.id);
 
-  // Use template for known types, generate variations for others
-  const base = templates[type] || templates.ransomware;
+    // Per-difficulty completion rate.
+    const byDifficultyRows = db.prepare(`
+      SELECT
+        s.difficulty AS difficulty,
+        COUNT(*) AS started,
+        SUM(CASE WHEN p.completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed
+      FROM ooda_progress p
+      JOIN ooda_scenarios s ON s.id = p.scenario_id AND s.archived_at IS NULL
+      WHERE p.user_id = ?
+      GROUP BY s.difficulty
+      ORDER BY CASE s.difficulty
+        WHEN 'beginner' THEN 1
+        WHEN 'intermediate' THEN 2
+        WHEN 'advanced' THEN 3
+        ELSE 4 END
+    `).all(req.user.id);
 
-  // Customize with policy references if available
-  if (policies.length > 0) {
-    base.policyContext = `This exercise references ${policies.length} uploaded policy/playbook document(s): ${policies.map(p => p.title).join(', ')}.`;
+    // 5 most recent completions for the dashboard activity feed.
+    const recentRows = db.prepare(`
+      SELECT
+        p.scenario_id    AS scenarioId,
+        p.completed_at   AS completedAt,
+        s.title          AS title,
+        s.scenario_type  AS type,
+        s.difficulty     AS difficulty
+      FROM ooda_progress p
+      LEFT JOIN ooda_scenarios s ON s.id = p.scenario_id AND s.archived_at IS NULL
+      WHERE p.user_id = ? AND p.completed_at IS NOT NULL
+      ORDER BY p.completed_at DESC
+      LIMIT 5
+    `).all(req.user.id);
+    db.close();
+
+    const started = overallRow.started || 0;
+    const completed = overallRow.completed || 0;
+    res.json({
+      overall: {
+        startedCount: started,
+        completedCount: completed,
+        completionRate: started > 0 ? completed / started : 0,
+        avgDurationMs: overallRow.avg_duration_ms ? Math.round(overallRow.avg_duration_ms) : null,
+      },
+      byType: byTypeRows.map(r => ({
+        type: r.type,
+        started: r.started,
+        completed: r.completed,
+        completionRate: r.started > 0 ? r.completed / r.started : 0,
+      })),
+      byDifficulty: byDifficultyRows.map(r => ({
+        difficulty: r.difficulty,
+        started: r.started,
+        completed: r.completed,
+        completionRate: r.started > 0 ? r.completed / r.started : 0,
+      })),
+      recentCompletions: recentRows.map(r => ({
+        scenarioId: r.scenarioId,
+        title: r.title,
+        type: r.type,
+        difficulty: r.difficulty,
+        completedAt: r.completedAt,
+      })),
+    });
+  } catch (err) {
+    logger.error('Mastery error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get mastery aggregation' });
   }
-  if (aars.length > 0) {
-    base.aarContext = `Informed by ${aars.length} after-action report(s): ${aars.map(a => a.title).join(', ')}.`;
-  }
-
-  base.type = type;
-  base.difficulty = difficulty;
-
-  return base;
-}
+});
 
 module.exports = router;
