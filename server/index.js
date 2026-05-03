@@ -17,7 +17,7 @@ const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
-const { initDb } = require('./db/init');
+const { initDb, getDb } = require('./db/init');
 const { logger } = require('./services/logger');
 const { auditMiddleware } = require('./middleware/audit');
 const { authMiddleware } = require('./middleware/auth');
@@ -205,7 +205,7 @@ async function start() {
 
     // Initialize WebSocket server for real-time features
     try {
-      const wsServer = new FireAliveWebSocket(server, app.locals?.db);
+      const wsServer = new FireAliveWebSocket(server, getDb());
       wsServer.startHeartbeatCheck();
       logger.info('WebSocket server started on /ws');
       process.on('SIGTERM', () => { wsServer.shutdown(); server.close(); });
