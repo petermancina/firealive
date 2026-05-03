@@ -25,7 +25,7 @@ Five components:
 | **Global Dashboard (GD)** | Electron + React | CISO cross-region oversight |
 | **GD Server** | Node.js + Express + SQLite | Aggregates data from regional servers |
 
-### Backend Services (23 files)
+### Backend Services (37 files)
 
 | Service | Purpose |
 |---------|---------|
