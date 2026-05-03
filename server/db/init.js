@@ -641,6 +641,65 @@ CREATE INDEX IF NOT EXISTS idx_ooda_progress_completed
   ON ooda_progress(user_id, completed_at DESC)
   WHERE completed_at IS NOT NULL;
 
+-- ── OODA Scenario Generation Jobs (Phase F4c) ────────────────────────────
+-- Background scenario-generation jobs for the IR Simulator. The lead's
+-- policy upload triggers a multi-scenario generation (5 per difficulty by
+-- default, configurable up to 20). Each LLM call takes 30-90s on the
+-- internal Phi-3 model, so a 15-scenario job runs ~15 minutes — too long
+-- for a foreground HTTP request. Jobs are persisted here so:
+--   - The MC can poll job status to render a progress meter.
+--   - A server restart mid-job recovers the job state and resumes
+--     from where the worker left off (lead never has to manually
+--     re-trigger).
+--   - The audit trail records who enqueued each job, when, and via
+--     which mode (initial_upload / manual / threshold / scheduled).
+--
+-- progress_json holds an array of per-difficulty progress entries:
+--   [{"difficulty": "beginner", "completed": 4, "target": 5},
+--    {"difficulty": "intermediate", "completed": 3, "target": 5},
+--    {"difficulty": "advanced", "completed": 1, "target": 5}]
+-- Updated incrementally as each scenario completes. completed counts
+-- only successfully-generated-and-validated scenarios; if the LLM
+-- produces malformed output for one slot, the worker retries up to
+-- 3 times before marking the slot abandoned and moving on.
+--
+-- The mode column captures provenance:
+--   initial_upload — auto-fired when a policy is uploaded
+--   manual         — lead pressed "Generate more" on the policy
+--   threshold      — analyst dipped below the configured threshold
+--   scheduled      — daily scheduler tick fired this job
+
+CREATE TABLE IF NOT EXISTS ooda_generation_jobs (
+  id TEXT PRIMARY KEY,
+  policy_id TEXT NOT NULL REFERENCES ir_policies(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'cancelled')),
+  mode TEXT NOT NULL CHECK (mode IN ('initial_upload', 'manual', 'threshold', 'scheduled')),
+  target_count_per_difficulty INTEGER NOT NULL CHECK (target_count_per_difficulty BETWEEN 1 AND 20),
+  progress_json TEXT NOT NULL DEFAULT '[]',
+  enqueued_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+  started_at TEXT,
+  completed_at TEXT,
+  error_message TEXT,
+  provider TEXT
+);
+
+-- Worker reads this index to find next job to pick up: oldest queued first.
+CREATE INDEX IF NOT EXISTS idx_ooda_generation_jobs_queued
+  ON ooda_generation_jobs(enqueued_at ASC)
+  WHERE status = 'queued';
+
+-- MC's per-policy progress meter reads recent jobs by policy.
+CREATE INDEX IF NOT EXISTS idx_ooda_generation_jobs_policy
+  ON ooda_generation_jobs(policy_id, enqueued_at DESC);
+
+-- Restart resumption: server start-up reads any rows still in 'running'
+-- status (these were running when the server crashed/restarted) and
+-- transitions them back to 'queued' so the worker picks them up again.
+CREATE INDEX IF NOT EXISTS idx_ooda_generation_jobs_running
+  ON ooda_generation_jobs(started_at)
+  WHERE status = 'running';
+
 -- ── AI Provider Configuration ────────────────────────────────────────────
 -- Per-feature routing for AI calls. One row per AI-using feature.
 -- The dispatcher reads this to decide internal vs external for each call.
