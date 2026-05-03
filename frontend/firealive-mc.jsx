@@ -282,6 +282,7 @@ function LoginScreen({role, onLogin, onBack}) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [apiMode, setApiMode] = useState(null); // null=unknown, true=backend available, false=demo mode
+  const [loginVersion, setLoginVersion] = useState("");
 
   const roleLabel = "FireAlive";
   const roleGroup = role==="analyst"?"soc_analyst_group":"soc_teamlead_group";
@@ -293,6 +294,12 @@ function LoginScreen({role, onLogin, onBack}) {
         .then(d=>{ if(d.status==='healthy') setApiMode(true); else setApiMode(false); })
         .catch(()=>setApiMode(false));
     } else { setApiMode(false); }
+  },[]);
+  // Fetch version for the login footer (no auth required)
+  useEffect(()=>{
+    api.get("/api/system/version").then(r=>{
+      if (r?.version) setLoginVersion(r.version);
+    }).catch(()=>{});
   },[]);
 
   const handleCreds = async () => {
@@ -339,7 +346,7 @@ function LoginScreen({role, onLogin, onBack}) {
             <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Password</M><input type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••" maxLength={128} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
             {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
             <Btn primary style={{width:"100%"}} onClick={handleCreds} disabled={loading}>{loading?"Authenticating...":"Sign In"}</Btn>
-            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v1.0.12 AGPL-3.0</M>
+            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v{loginVersion||"…"} · AGPL-3.0</M>
           </Card>
         )}
 
@@ -1741,7 +1748,7 @@ function ManagementConsole() {
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
             <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>
-              <span style={{display:"inline-block",width:5,height:5,borderRadius:"50%",background:C.a,marginRight:6,boxShadow:`0 0 6px ${C.a}`}}/>FireAlive · Team Capacity · Day Shift · v1.0.0</M>
+              <span style={{display:"inline-block",width:5,height:5,borderRadius:"50%",background:C.a,marginRight:6,boxShadow:`0 0 6px ${C.a}`}}/>FireAlive · Team Capacity · Day Shift · v{appVersion||"…"}</M>
             <div style={{fontSize:18,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Team Capacity Dashboard</div>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -2404,7 +2411,7 @@ function ManagementConsole() {
               const secs=reportCfg.sections;
               let content="";
               if(reportCfg.format==="json"){
-                const data={generated:now.toISOString(),platform:"FireAlive v1.0.0",type:"team_capacity_report",depersonalized:true,
+                const data={generated:now.toISOString(),platform:"FireAlive v"+(appVersion||"unknown"),type:"team_capacity_report",depersonalized:true,
                   ...(secs.teamHealth?{teamHealth:{score:th.score,status:th.status,utilization:th.avgUtil,overCapacity:th.oc,dayStaff:dayAnalysts.length}}:{}),
                   ...(secs.tierBreakdown?{tierBreakdown:{day:{l1:analysts.filter(a=>a.shift==="day"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="day"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="day"&&a.tier===3).length},swing:{l1:analysts.filter(a=>a.shift==="swing"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="swing"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="swing"&&a.tier===3).length},night:{l1:analysts.filter(a=>a.shift==="night"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="night"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="night"&&a.tier===3).length}}}:{}),
                   ...(secs.automationRate?{automation:{systemCount:autoSys.length,resolved24h:autoSys.reduce((s,a)=>s+a.resolved,0),avgFpRate:+(autoSys.reduce((s,a)=>s+a.fp,0)/autoSys.length*100).toFixed(1)}}:{}),
@@ -2420,7 +2427,7 @@ function ManagementConsole() {
                 if(secs.kbInsights) lines.push("KB INSIGHT","  "+th.avgUtil+"% utilization "+(th.avgUtil>80?"exceeds":"within")+" 70-80% threshold (R012).","");
                 if(secs.skillProgress) lines.push("SKILL PROGRESSION","  L1 cohort: Avg triage 78%, documentation 76%, SIEM 52%","  L2 cohort: Avg investigation 74%, network 69%, malware 48%","  L3 cohort: Avg hunting 82%, IR coordination 77%","");
                 if(secs.upskillingGaps) lines.push("UPSKILLING GAPS","  4/6 L1 below 70% in SIEM Queries (avg 52%)","  3/6 L1 below 70% in Escalation Judgment (avg 58%)","  4/5 L2 below 70% in Malware Analysis (avg 48%)","  12 lab completions, 3 re-takes, 2 level-up signals (30d)","");
-                lines.push("═".repeat(60),"AGPL-3.0 | FireAlive v1.0.0 | github.com/pmancina/firealive");
+                lines.push("═".repeat(60),"AGPL-3.0 | FireAlive v"+(appVersion||"unknown")+" | github.com/pmancina/firealive");
                 content=lines.join("\n");
                 const blob=new Blob([content],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-report-${dateStr}.txt`;a.click();URL.revokeObjectURL(url);
               }
@@ -2735,7 +2742,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <Card key={t.n} style={{textAlign:"center",cursor:"pointer"}} onClick={()=>{
                   let content="";const D="$";const ts=new Date().toISOString();
                   if(t.n==="Terraform"){content=[
-                    "# FireAlive v1.0.0 — Terraform Deployment","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
+                    "# FireAlive v"+(appVersion||"unknown")+" — Terraform Deployment","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
                     "terraform {","  required_version = \">= 1.5.0\"","  required_providers {","    aws = { source = \"hashicorp/aws\", version = \"~> 5.0\" }","  }","}","",
                     "variable \"environment\" {","  type    = string","  default = \"production\"","}","",
                     "variable \"vpc_cidr\" {","  type    = string","  default = \"10.0.0.0/16\"","}","",
@@ -2769,7 +2776,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     "output \"tier1_table\"  { value = aws_dynamodb_table.tier1_aggregates.name }",
                   ].join("\n");}
                   else if(t.n==="CloudFormation"){content=[
-                    "# FireAlive v1.0.0 — CloudFormation Template","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
+                    "# FireAlive v"+(appVersion||"unknown")+" — CloudFormation Template","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
                     "AWSTemplateFormatVersion: '2010-09-09'","Description: FireAlive SOC Analyst Wellbeing Platform","",
                     "Parameters:","  Environment:","    Type: String","    Default: production","    AllowedValues: [production, staging, development]",
                     "  VpcCidr:","    Type: String","    Default: '10.0.0.0/16'","",
@@ -2795,7 +2802,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     "Outputs:","  ClusterName:","    Value: !Ref ECSCluster","  Tier3Table:","    Value: !Ref Tier3Table",
                   ].join("\n");}
                   else{content=[
-                    "// FireAlive v1.0.0 — Pulumi Deployment","// Generated: "+ts,"// AGPL-3.0 | github.com/pmancina/firealive","",
+                    "// FireAlive v"+(appVersion||"unknown")+" — Pulumi Deployment","// Generated: "+ts,"// AGPL-3.0 | github.com/pmancina/firealive","",
                     "import * as pulumi from \"@pulumi/pulumi\";","import * as aws from \"@pulumi/aws\";","",
                     "const config = new pulumi.Config();","const env = config.get(\"environment\") || \"production\";","",
                     "// VPC with tier-isolated subnets","const vpc = new aws.ec2.Vpc(\"firealive-vpc\", {",
