@@ -26,6 +26,7 @@ const { networkHardening, antiEnumerationErrors, validatePortBinding } = require
 const { bandwidthMonitor } = require('./services/bandwidth-monitor');
 const { verifyIntegrity } = require('./services/integrity');
 const { runtimeMonitor } = require('./services/runtime-monitor');
+const oodaJobs = require('./services/ooda-generation-jobs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -167,6 +168,13 @@ async function start() {
     schedulerService.start();
     logger.info('Scheduler started');
 
+    // Start OODA scenario generation jobs worker (Phase F4c).
+    // Idempotent: safe to call multiple times. Crash-recovery transitions
+    // any orphaned 'running' jobs back to 'queued' so they get picked up.
+    // The worker logs its own startup info including configured concurrency,
+    // tick interval, and per-job timeout.
+    oodaJobs.start();
+
     // Start bandwidth monitor
     bandwidthMonitor.start();
     bandwidthMonitor.onAlert((alert) => {
@@ -204,16 +212,32 @@ async function start() {
       validatePortBinding(server, parseInt(PORT, 10));
     });
 
-    // Initialize WebSocket server for real-time features
+    // Initialize WebSocket server for real-time features. WebSocket failure
+    // is non-fatal — the rest of the server runs without it.
+    let wsServer = null;
     try {
-      const wsServer = new FireAliveWebSocket(server, getDb());
+      wsServer = new FireAliveWebSocket(server, getDb());
       wsServer.startHeartbeatCheck();
       logger.info('WebSocket server started on /ws');
-      process.on('SIGTERM', () => { wsServer.shutdown(); server.close(); });
-      process.on('SIGINT', () => { wsServer.shutdown(); server.close(); });
     } catch (e) {
       logger.warn('WebSocket init skipped', { error: e.message });
     }
+
+    // Graceful shutdown handlers. Registered OUTSIDE the WebSocket try
+    // block so they fire even if WebSocket init failed — the OODA worker's
+    // tick timer would otherwise keep the process alive indefinitely on
+    // SIGTERM/SIGINT. Subsystems shut down in dependency-safe order:
+    // worker first (stops new jobs from being claimed), WebSocket if it
+    // came up (drops live connections), then HTTP server (stops accepting
+    // new requests and closes idle keep-alives).
+    const gracefulShutdown = (signal) => {
+      logger.info(`Received ${signal}, beginning graceful shutdown`);
+      try { oodaJobs.shutdown(); } catch (e) { logger.warn('OODA worker shutdown error', { error: e.message }); }
+      if (wsServer) { try { wsServer.shutdown(); } catch (e) { logger.warn('WebSocket shutdown error', { error: e.message }); } }
+      server.close();
+    };
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   } catch (err) {
     logger.error('Failed to start:', err);
     process.exit(1);

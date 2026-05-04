@@ -23,6 +23,7 @@ const { logger } = require('../services/logger');
 const { generateScenario } = require('../services/ooda-scenario-generator');
 const { sanitize, SANITIZER_VERSION } = require('../services/content-sanitizer');
 const { IntegrationManager, INSPECTOR_VERSION } = require('../services/integration-manager');
+const oodaJobs = require('../services/ooda-generation-jobs');
 
 const MAX_POLICY_SIZE = 500000; // 500KB text max
 const MAX_AAR_LESSONS_SIZE = 5000;
@@ -110,6 +111,145 @@ function scanAuditFragment(scans) {
   return parts.join(' ');
 }
 
+// ── Phase F4c: Threshold-mode replenishment check ───────────────────────────
+//
+// Called from POST /scenarios/:id/play when an analyst completes a scenario.
+// For each policy the scenario was generated from, checks the policy's
+// replenishment_config:
+//
+//   1. mode === 'threshold'?              if not, skip
+//   2. unplayed-pool count for THIS user  if >= threshold_x, skip
+//      below threshold_x?
+//   3. is a job already queued/running    if so, skip (anti-pile-up)
+//      for this policy?
+//   4. enqueue a generation job with the policy's configured batch_size
+//
+// The "unplayed pool" for a (user, policy) pair is: the count of active
+// scenarios linked to this policy (via source_policy_ids JSON containing
+// the policy id) that the user hasn't COMPLETED. Partial progress doesn't
+// count — only scenarios with completed_at set in ooda_progress are
+// considered "played" for pool-floor purposes.
+//
+// Defense in depth: the entire helper is wrapped in try/catch and any
+// failure is non-fatal. If the threshold check throws or times out, the
+// analyst's /play response is unaffected. The check is async-friendly
+// but kept synchronous here because better-sqlite3 doesn't return
+// promises and the queries are local/fast.
+//
+// Audit attribution: the analyst whose play triggered the check is
+// recorded as enqueued_by on the resulting generation job. This lets
+// admins reconstruct "scenario X completed by user Y triggered job Z".
+function checkThresholdReplenishment(sourcePolicyIdsJson, userId) {
+  let policyIds;
+  try {
+    policyIds = JSON.parse(sourcePolicyIdsJson || '[]');
+    if (!Array.isArray(policyIds)) policyIds = [];
+  } catch {
+    return;
+  }
+  if (policyIds.length === 0) return;
+
+  const db = getDb();
+  try {
+    for (const policyId of policyIds) {
+      try {
+        // Read the policy's replenishment config. Skip silently if the
+        // policy was deleted between scenario creation and now.
+        const policy = db.prepare(`
+          SELECT id, replenishment_config FROM ir_policies
+          WHERE id = ? AND deleted_at IS NULL
+        `).get(policyId);
+        if (!policy) continue;
+
+        let cfg;
+        try {
+          cfg = JSON.parse(policy.replenishment_config || '{}');
+        } catch {
+          // Malformed config — analyst's play succeeds; admin can fix
+          // the config when they notice the missing replenishment.
+          continue;
+        }
+
+        if (cfg.mode !== 'threshold') continue;
+
+        const thresholdX = parseInt(cfg.threshold_x, 10);
+        if (!Number.isInteger(thresholdX) || thresholdX < 1 || thresholdX > 50) {
+          continue;
+        }
+
+        // Count unplayed scenarios for this (user, policy) pair. Uses
+        // SQLite's json_each() to query inside the source_policy_ids
+        // JSON array — supported natively in better-sqlite3.
+        const countRow = db.prepare(`
+          SELECT COUNT(*) AS unplayed_count
+          FROM ooda_scenarios s
+          WHERE s.archived_at IS NULL
+            AND EXISTS (
+              SELECT 1 FROM json_each(s.source_policy_ids)
+              WHERE json_each.value = ?
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM ooda_progress p
+              WHERE p.scenario_id = s.id
+                AND p.user_id = ?
+                AND p.completed_at IS NOT NULL
+            )
+        `).get(policyId, userId);
+
+        const unplayedCount = countRow ? countRow.unplayed_count : 0;
+        if (unplayedCount >= thresholdX) continue;
+
+        // Anti-pile-up: skip if a job is already queued or running for
+        // this policy. Without this guard, every play below threshold
+        // would enqueue another job, accumulating queue pressure.
+        const existingJob = db.prepare(`
+          SELECT id FROM ooda_generation_jobs
+          WHERE policy_id = ? AND status IN ('queued', 'running')
+          LIMIT 1
+        `).get(policyId);
+        if (existingJob) continue;
+
+        // Resolve batch_size with fallback to 5 (matches the canonical
+        // default in db/init.js)
+        const rawBatch = parseInt(cfg.batch_size, 10);
+        const batchSize = (Number.isInteger(rawBatch) && rawBatch >= 1 && rawBatch <= 20)
+          ? rawBatch : 5;
+
+        try {
+          const jobId = oodaJobs.enqueueJob({
+            policy_id: policyId,
+            mode: 'threshold',
+            target_count_per_difficulty: batchSize,
+            enqueued_by: userId,
+          });
+          logger.info('Threshold replenishment enqueued', {
+            policy_id: policyId,
+            job_id: jobId,
+            unplayed_count: unplayedCount,
+            threshold_x: thresholdX,
+            batch_size: batchSize,
+            triggered_by: userId,
+          });
+        } catch (enqueueErr) {
+          logger.error('Threshold replenishment: enqueue failed', {
+            policy_id: policyId,
+            error: enqueueErr.message,
+          });
+        }
+      } catch (perPolicyErr) {
+        // Per-policy errors are logged but don't stop other policies in
+        // the same scenario from being checked.
+        logger.warn('Threshold replenishment: per-policy check failed', {
+          policy_id: policyId,
+          error: perPolicyErr.message,
+        });
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
 // ── Upload Policy/Playbook ───────────────────────────────────────────────────
 // Two-layer scan gate: content-sanitizer (layer 1, FireAlive-domain threats)
 // and EDR inspector (layer 2, malware signatures via configured EDR). Either
@@ -137,6 +277,31 @@ router.post('/policies', async (req, res) => {
   } catch (scanErr) {
     logger.error('Policy upload scan error', { error: scanErr.message });
     return res.status(500).json({ error: 'Upload scan failed', code: 'SCAN_INFRASTRUCTURE_ERROR' });
+  }
+
+  // Phase F4c: IR Simulator uploads require an active malware scanner.
+  // runUploadScans returns layer2.skipped=true when no scanner is
+  // configured (the org hasn't set up any of the 15 supported vendors via
+  // MC > Malware Scanners). For the IR Simulator paths specifically, this
+  // is treated as a hard gate — the LLM context that scenarios get
+  // generated from MUST have been malware-scanned end-to-end. Other
+  // upload paths in the codebase may still tolerate skipped EDR (their
+  // risk profile is different); this gate is local to /policies and /aar.
+  //
+  // Rejection happens BEFORE the !scans.ok check below because skipped
+  // produces ok=true (layer2.clean is true when it didn't run). Without
+  // this explicit gate, the upload would proceed.
+  if (scans.layer2 && scans.layer2.skipped === true) {
+    auditLog(
+      req.user.id,
+      'OODA_POLICY_UPLOAD_REJECTED',
+      `"${safeTitle}" rejected_by=malware_scanner_required (no scanner configured)`,
+      req.ip
+    );
+    return res.status(422).json({
+      error: 'IR policy uploads require a configured malware scanner. Configure at least one scanner under MC > Malware Scanners and try again.',
+      code: 'MALWARE_SCANNER_REQUIRED',
+    });
   }
 
   if (!scans.ok) {
@@ -263,6 +428,25 @@ router.post('/aar', async (req, res) => {
   } catch (scanErr) {
     logger.error('AAR upload scan error', { error: scanErr.message });
     return res.status(500).json({ error: 'Upload scan failed', code: 'SCAN_INFRASTRUCTURE_ERROR' });
+  }
+
+  // Phase F4c: same hard gate as POST /policies — IR Simulator AAR uploads
+  // require an active malware scanner. See the comment block at the
+  // matching location in POST /policies for full rationale. Identical
+  // behavior applies here: layer2.skipped=true means no scanner is
+  // configured; reject with 422 MALWARE_SCANNER_REQUIRED before the
+  // !scans.ok check (since skipped produces ok=true).
+  if (scans.layer2 && scans.layer2.skipped === true) {
+    auditLog(
+      req.user.id,
+      'OODA_AAR_UPLOAD_REJECTED',
+      `"${safeTitle}" rejected_by=malware_scanner_required (no scanner configured)`,
+      req.ip
+    );
+    return res.status(422).json({
+      error: 'AAR uploads require a configured malware scanner. Configure at least one scanner under MC > Malware Scanners and try again.',
+      code: 'MALWARE_SCANNER_REQUIRED',
+    });
   }
 
   if (!scans.ok) {
@@ -500,7 +684,7 @@ router.post('/scenarios/:id/play', (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare(`
-      SELECT id, tree, node_count
+      SELECT id, tree, node_count, source_policy_ids
       FROM ooda_scenarios
       WHERE id = ? AND archived_at IS NULL
     `).get(req.params.id);
@@ -578,6 +762,21 @@ router.post('/scenarios/:id/play', (req, res) => {
         `scenario=${req.params.id} nodes=${nodesCompleted.length} duration_ms=${new Date(completedAt) - new Date(startedAt)}`,
         req.ip
       );
+
+      // Phase F4c: threshold-mode replenishment check. After the
+      // analyst's pool of unplayed scenarios drops below a policy's
+      // threshold_x, enqueue a generation job to refill. Best-effort
+      // and non-fatal — any failure inside the helper is logged but
+      // doesn't affect the analyst's response.
+      try {
+        checkThresholdReplenishment(row.source_policy_ids, req.user.id);
+      } catch (replErr) {
+        logger.warn('Threshold replenishment check threw (non-fatal)', {
+          scenario_id: req.params.id,
+          user_id: req.user.id,
+          error: replErr.message,
+        });
+      }
     }
 
     res.json({
@@ -753,6 +952,208 @@ router.get('/mastery', (req, res) => {
     logger.error('Mastery error', { error: err.message });
     res.status(500).json({ error: 'Failed to get mastery aggregation' });
   }
+});
+
+// ── Scenario Generation Jobs (Phase F4c) ─────────────────────────────────────
+//
+// Async generation of OODA scenarios. The IR Simulator's generate-on-upload,
+// scheduled-replenishment, and threshold-replenishment flows all enqueue
+// jobs through this surface. The worker module (services/ooda-generation-
+// jobs.js) processes them in the background; these routes are the
+// HTTP-facing wrappers around the worker's exported API.
+//
+// Permissions: enqueue and cancel are lead/admin only (mirrors the
+// /policies and /aar upload pattern). Status and list reads are also
+// lead/admin only — analysts see scenarios served to them via /scenarios,
+// not queue introspection. Cancellation is best-effort: the worker stops
+// at the next scenario boundary; the in-flight LLM call (if any) runs to
+// completion.
+//
+// Wire-level errors map cleanly:
+//   400  invalid args (mode, target_count_per_difficulty, policy_id missing)
+//   403  analyst role attempted enqueue/cancel
+//   404  job id or policy id not found
+//   409  cancel requested on a job already in a terminal state
+//   500  unexpected worker or DB error
+
+// POST /api/ooda/generation-jobs — enqueue a new generation job.
+router.post('/generation-jobs', (req, res) => {
+  if (req.user.role === 'analyst') {
+    return res.status(403).json({ error: 'Only leads/admins can enqueue generation jobs' });
+  }
+
+  const body = req.body || {};
+  // Accept both target_count_per_difficulty (canonical) and batch_size (alias
+  // used by the MC wizard and replenishment_config). Either works.
+  const target = body.target_count_per_difficulty != null
+    ? body.target_count_per_difficulty
+    : body.batch_size;
+  const mode = body.mode || 'manual';
+
+  let jobId;
+  try {
+    jobId = oodaJobs.enqueueJob({
+      policy_id: body.policy_id,
+      mode,
+      target_count_per_difficulty: target,
+      enqueued_by: req.user.id,
+    });
+  } catch (err) {
+    // The worker's enqueueJob throws plain Error for validation failures.
+    // Map common cases to 400/404; other failures bubble as 500.
+    const msg = err.message || 'unknown';
+    if (msg.includes('policy not found')) {
+      return res.status(404).json({ error: msg, code: 'POLICY_NOT_FOUND' });
+    }
+    if (msg.includes('policy_id is required')
+        || msg.includes('mode must be one of')
+        || msg.includes('target_count_per_difficulty')) {
+      return res.status(400).json({ error: msg, code: 'INVALID_JOB_ARGS' });
+    }
+    logger.error('Generation job enqueue failed', {
+      error: msg, body: { policy_id: body.policy_id, mode, target },
+    });
+    return res.status(500).json({ error: 'Failed to enqueue generation job' });
+  }
+
+  auditLog(
+    req.user.id,
+    'OODA_GEN_JOB_ENQUEUED',
+    `id=${jobId} policy=${body.policy_id} mode=${mode} batch_size=${target}`,
+    req.ip
+  );
+
+  return res.status(202).json({
+    job_id: jobId,
+    status_url: `/api/ooda/generation-jobs/${jobId}`,
+    message: 'Job enqueued; poll status_url for progress',
+  });
+});
+
+// GET /api/ooda/generation-jobs/:id — fetch a single job's status.
+router.get('/generation-jobs/:id', (req, res) => {
+  if (req.user.role === 'analyst') {
+    return res.status(403).json({ error: 'Only leads/admins can view generation job status' });
+  }
+
+  let job;
+  try {
+    job = oodaJobs.getJobStatus(req.params.id);
+  } catch (err) {
+    logger.error('Generation job status fetch failed', { id: req.params.id, error: err.message });
+    return res.status(500).json({ error: 'Failed to fetch job status' });
+  }
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+  }
+  return res.json(job);
+});
+
+// GET /api/ooda/generation-jobs — list jobs with optional filters. Most
+// recent first, default limit 50, max 200.
+router.get('/generation-jobs', (req, res) => {
+  if (req.user.role === 'analyst') {
+    return res.status(403).json({ error: 'Only leads/admins can list generation jobs' });
+  }
+
+  const filter = {};
+  if (req.query.policy_id) filter.policy_id = String(req.query.policy_id);
+  if (req.query.status) {
+    const status = String(req.query.status);
+    if (!['queued', 'running', 'done', 'failed', 'cancelled'].includes(status)) {
+      return res.status(400).json({
+        error: `status filter must be one of: queued, running, done, failed, cancelled`,
+        code: 'INVALID_STATUS_FILTER',
+      });
+    }
+    filter.status = status;
+  }
+  if (req.query.limit) {
+    const lim = parseInt(req.query.limit, 10);
+    if (!Number.isInteger(lim) || lim < 1) {
+      return res.status(400).json({
+        error: 'limit must be a positive integer',
+        code: 'INVALID_LIMIT',
+      });
+    }
+    filter.limit = lim;
+  }
+
+  let jobs;
+  try {
+    jobs = oodaJobs.listJobs(filter);
+  } catch (err) {
+    logger.error('Generation job list failed', { filter, error: err.message });
+    return res.status(500).json({ error: 'Failed to list generation jobs' });
+  }
+  return res.json({ jobs, count: jobs.length });
+});
+
+// POST /api/ooda/generation-jobs/:id/cancel — cancel a queued or running
+// job. Best-effort: stops at next scenario boundary; in-flight LLM call
+// is allowed to complete.
+router.post('/generation-jobs/:id/cancel', (req, res) => {
+  if (req.user.role === 'analyst') {
+    return res.status(403).json({ error: 'Only leads/admins can cancel generation jobs' });
+  }
+
+  // Fetch first so we can distinguish "not found" (404) from "already
+  // terminal" (409). The worker's cancelJob returns false for both cases
+  // and the route layer's job is to provide more helpful HTTP semantics.
+  let job;
+  try {
+    job = oodaJobs.getJobStatus(req.params.id);
+  } catch (err) {
+    logger.error('Generation job cancel: status fetch failed', {
+      id: req.params.id, error: err.message,
+    });
+    return res.status(500).json({ error: 'Failed to access job for cancellation' });
+  }
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+  }
+  if (job.status !== 'queued' && job.status !== 'running') {
+    return res.status(409).json({
+      error: `Job is already in terminal state '${job.status}'`,
+      code: 'JOB_ALREADY_TERMINAL',
+      status: job.status,
+    });
+  }
+
+  // Snapshot the pre-cancel status for the audit log. Capturing here
+  // rather than reading job.status after cancelJob() means the audit
+  // log accurately records what the job was BEFORE the cancel,
+  // regardless of whether getJobStatus returns shared or fresh state.
+  const previousStatus = job.status;
+
+  let applied;
+  try {
+    applied = oodaJobs.cancelJob(req.params.id, req.user.id);
+  } catch (err) {
+    logger.error('Generation job cancel failed', { id: req.params.id, error: err.message });
+    return res.status(500).json({ error: 'Failed to cancel generation job' });
+  }
+  // Race condition: between the getJobStatus and cancelJob calls, the
+  // worker may have completed/failed the job. Surface this as 409.
+  if (!applied) {
+    return res.status(409).json({
+      error: 'Job transitioned to terminal state during cancellation request',
+      code: 'JOB_ALREADY_TERMINAL',
+    });
+  }
+
+  auditLog(
+    req.user.id,
+    'OODA_GEN_JOB_CANCEL_REQUESTED',
+    `id=${req.params.id} previous_status=${previousStatus}`,
+    req.ip
+  );
+
+  return res.json({
+    job_id: req.params.id,
+    status: 'cancelled',
+    note: 'Best-effort cancel: worker stops at next scenario boundary. In-flight LLM call (if any) completes.',
+  });
 });
 
 module.exports = router;

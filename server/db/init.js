@@ -544,7 +544,24 @@ CREATE TABLE IF NOT EXISTS ir_policies (
   uploaded_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
   uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  deleted_at TEXT
+  deleted_at TEXT,
+  -- Phase F4c: per-policy scenario replenishment configuration. JSON blob:
+  --   { "mode": "threshold" | "scheduled" | "manual" | "disabled",
+  --     "threshold_x": 1-50,             unplayed-pool floor that fires
+  --                                       a replenishment job when crossed
+  --                                       (only for mode=threshold)
+  --     "batch_size": 1-20,              target_count_per_difficulty for
+  --                                       replenishment jobs
+  --     "scheduled_cron": "<cron expr>", optional, only for mode=scheduled
+  --     "auto_initial_upload": bool      whether to auto-enqueue an
+  --                                       initial-batch generation job at
+  --                                       policy upload time
+  --   }
+  -- Application layer validates the JSON shape; SQLite stores the blob
+  -- verbatim. Defaults represent "threshold mode, refill when <2 unplayed
+  -- remain, batch size 5 per difficulty, auto-generate on upload" — the
+  -- recommended setup that matches the F4c product brief.
+  replenishment_config TEXT NOT NULL DEFAULT '{"mode":"threshold","threshold_x":2,"batch_size":5,"auto_initial_upload":true}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_ir_policies_active
@@ -894,7 +911,8 @@ function initDb() {
           uploaded_by TEXT NOT NULL REFERENCES users(id) ON DELETE SET NULL,
           uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          deleted_at TEXT
+          deleted_at TEXT,
+          replenishment_config TEXT NOT NULL DEFAULT '{"mode":"threshold","threshold_x":2,"batch_size":5,"auto_initial_upload":true}'
         );
         CREATE INDEX idx_ir_policies_active ON ir_policies(uploaded_at DESC) WHERE deleted_at IS NULL;
         CREATE INDEX idx_ir_policies_type ON ir_policies(policy_type, uploaded_at DESC) WHERE deleted_at IS NULL;
@@ -1102,6 +1120,32 @@ function initDb() {
     // operator notices, but continue.
     console.error('ir_policies migration FAILED:', migrationErr.message);
     console.error('The server will start, but IR policies may be unavailable until the migration is investigated.');
+  }
+
+
+  // ── Migration: Phase F4c — replenishment_config column on ir_policies ──
+  //
+  // Existing deploys (v1.0.17 and earlier) have ir_policies without the
+  // replenishment_config column added in this PR. ALTER TABLE ADD COLUMN
+  // is idempotent here: we only run it when the column is missing. The
+  // SQL adds the column with the same default JSON as the canonical
+  // CREATE TABLE so existing rows immediately get sensible defaults
+  // without needing application-side fallbacks.
+  //
+  // This migration is independent of the phantom remediation above —
+  // separate try/catch so a failure here doesn't mask one there and
+  // vice versa.
+  try {
+    const irPolCols = db.prepare("PRAGMA table_info(ir_policies)").all().map(c => c.name);
+    if (!irPolCols.includes('replenishment_config')) {
+      db.exec(
+        `ALTER TABLE ir_policies ADD COLUMN replenishment_config TEXT NOT NULL DEFAULT '{"mode":"threshold","threshold_x":2,"batch_size":5,"auto_initial_upload":true}'`
+      );
+      console.log('ir_policies migration (F4c): added replenishment_config column');
+    }
+  } catch (replenishMigrationErr) {
+    console.error('ir_policies F4c migration FAILED:', replenishMigrationErr.message);
+    console.error('The server will start, but per-policy replenishment configuration may use defaults until the migration is investigated.');
   }
 
 
