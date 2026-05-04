@@ -1451,6 +1451,43 @@ function ManagementConsole() {
   const [humanImpactReport, setHIR] = useState(null);
   const [hirLoading, setHirLoading] = useState(false);
   const [edrCfg, setEdrCfg] = useState({enabled:false,provider:null,scanOnUpload:true,scanOnRestore:true,scanOnPolicyImport:true,blockOnThreat:true,quarantineOnSuspicious:true});
+  // ── Phase F4c: Multi-provider malware scanner integration ──
+  const [scannerList, setScannerList] = useState([]);
+  const [scanMode, setScanMode] = useState("single_with_fallback");
+  const [scannerForm, setScannerForm] = useState(null); // {mode:'add'|'edit', id?, provider_type, display_name, priority, enabled, credentials:{}}
+  const [scannerTestResult, setScannerTestResult] = useState({}); // id -> {ok, error, latencyMs}
+  const [scannerListLoading, setScannerListLoading] = useState(false);
+  const [scannerError, setScannerError] = useState(null);
+  const SCANNER_PROVIDERS = [
+    {id:"clamav",label:"ClamAV (on-prem signature)",fields:[{k:"socketPath",l:"Socket path",ph:"/var/run/clamav/clamd.sock"},{k:"host",l:"Host (alt to socket)",ph:"clamd.internal"},{k:"port",l:"Port",ph:"3310"}]},
+    {id:"virustotal",label:"VirusTotal",fields:[{k:"apiKey",l:"API key",secret:true}]},
+    {id:"crowdstrike_falcon",label:"CrowdStrike Falcon Sandbox",fields:[{k:"clientId",l:"Client ID"},{k:"clientSecret",l:"Client secret",secret:true},{k:"region",l:"Region",sel:[{v:"us-1",l:"US-1"},{v:"us-2",l:"US-2"},{v:"eu-1",l:"EU-1"},{v:"us-gov-1",l:"US-GOV-1"}]},{k:"environmentId",l:"Sandbox environment",sel:[{v:"100",l:"Win10 64-bit (default)"},{v:"110",l:"Win7"},{v:"200",l:"Linux Ubuntu"}]}]},
+    {id:"microsoft_defender",label:"Microsoft Defender for Endpoint",fields:[{k:"tenantId",l:"Tenant ID"},{k:"clientId",l:"Client ID"},{k:"clientSecret",l:"Client secret",secret:true},{k:"cloud",l:"Cloud",sel:[{v:"commercial",l:"Commercial"},{v:"gcc",l:"GCC"},{v:"gcc-high",l:"GCC High"},{v:"dod",l:"DOD"}]}]},
+    {id:"sentinelone",label:"SentinelOne Singularity",fields:[{k:"siteUrl",l:"Site URL",ph:"https://<tenant>.sentinelone.net"},{k:"apiToken",l:"API token",secret:true}]},
+    {id:"cisco_amp",label:"Cisco Secure Endpoint (AMP)",fields:[{k:"clientId",l:"Client ID"},{k:"apiKey",l:"API key",secret:true},{k:"region",l:"Region",sel:[{v:"na",l:"North America"},{v:"eu",l:"Europe"},{v:"apjc",l:"Asia Pacific"}]}]},
+    {id:"fortinet_fortisandbox",label:"Fortinet FortiSandbox",fields:[{k:"baseUrl",l:"Base URL",ph:"https://fortisandbox.example.com"},{k:"user",l:"Username"},{k:"password",l:"Password",secret:true},{k:"verifyTls",l:"Verify TLS cert (recommended)",bool:true}]},
+    {id:"trellix_atd",label:"Trellix ATD (formerly McAfee ATD)",fields:[{k:"baseUrl",l:"Base URL",ph:"https://atd.example.com"},{k:"user",l:"Username"},{k:"password",l:"Password",secret:true},{k:"verifyTls",l:"Verify TLS cert (recommended)",bool:true}]},
+    {id:"sophos_intelix",label:"Sophos Intelix",fields:[{k:"clientId",l:"Client ID"},{k:"clientSecret",l:"Client secret",secret:true},{k:"region",l:"Region",sel:[{v:"de",l:"Germany (default)"},{v:"us",l:"United States"},{v:"eu",l:"Europe"},{v:"au",l:"Australia"}]},{k:"scoreThreshold",l:"Score threshold (1=strict, 30=permissive)",ph:"1"}]},
+    {id:"joe_sandbox",label:"Joe Sandbox",fields:[{k:"apiKey",l:"API key",secret:true},{k:"baseUrl",l:"Base URL (default Cloud Pro)",ph:"https://jbxcloud.joesecurity.org"},{k:"verifyTls",l:"Verify TLS cert (recommended)",bool:true}]},
+    {id:"hybrid_analysis",label:"Hybrid Analysis (free tier of Falcon Sandbox)",fields:[{k:"apiKey",l:"API key",secret:true},{k:"environmentId",l:"Sandbox environment",sel:[{v:"120",l:"Win7 64-bit (default)"},{v:"100",l:"Win7 32-bit"},{v:"200",l:"Linux Ubuntu"},{v:"300",l:"Android"},{v:"400",l:"Mac OS X"}]}]},
+    {id:"palo_alto_wildfire",label:"Palo Alto WildFire",fields:[{k:"apiKey",l:"API key",secret:true},{k:"region",l:"Region",sel:[{v:"us",l:"United States"},{v:"eu",l:"Europe"},{v:"jp",l:"Japan"},{v:"sg",l:"Singapore"},{v:"ca",l:"Canada"},{v:"uk",l:"United Kingdom"},{v:"au",l:"Australia"}]}]},
+    {id:"blackberry_cylance",label:"BlackBerry Cylance Infinity",fields:[{k:"tenantId",l:"Tenant ID (UUID)"},{k:"appId",l:"Application ID (UUID)"},{k:"appSecret",l:"Application secret",secret:true},{k:"region",l:"Region",sel:[{v:"na",l:"North America"},{v:"euc1",l:"Europe Central"},{v:"au",l:"Australia"},{v:"apne1",l:"Asia Pacific North"},{v:"sae1",l:"South America"}]}]},
+    {id:"trend_micro_ddan",label:"Trend Micro Deep Discovery Analyzer",fields:[{k:"baseUrl",l:"Base URL",ph:"https://ddan.example.com"},{k:"apiKey",l:"API key",secret:true},{k:"verifyTls",l:"Verify TLS cert (recommended)",bool:true}]},
+    {id:"kaspersky_sandbox",label:"Kaspersky Sandbox",fields:[{k:"baseUrl",l:"Base URL",ph:"https://kaspersky.example.com"},{k:"user",l:"Username"},{k:"password",l:"Password",secret:true},{k:"vmId",l:"VM ID (optional)"},{k:"verifyTls",l:"Verify TLS cert (recommended)",bool:true}]},
+  ];
+  const reloadScanners = async () => {
+    setScannerListLoading(true);
+    setScannerError(null);
+    try {
+      const r = await api.get("/api/v1/malware-scanners");
+      if (r && Array.isArray(r.scanners)) setScannerList(r.scanners);
+      else if (r && r.error) setScannerError(r.error);
+      const m = await api.get("/api/v1/malware-scanners/scan-mode");
+      if (m && m.mode) setScanMode(m.mode);
+    } catch (e) { setScannerError(e.message); }
+    setScannerListLoading(false);
+  };
+  useEffect(() => { reloadScanners(); }, []);
   const [kmsCfg, setKmsCfg] = useState({enabled:false,provider:null,endpoint:"",keyId:"",rotationPolicy:"annual",envelopeEncryption:true,hsmBacked:false,keyUsage:{tier3Encryption:true,tier1Encryption:true,e2eeKeyWrapping:true,backupEncryption:true,auditLogSigning:true}});
   const [wifiPolicy, setWifiPolicy] = useState({minimumProtocol:"wpa2_enterprise",wpa3Preferred:true,blockWpa2Personal:true,requireDot1x:true,warnOnInsecure:true,disconnectOnInsecure:false});
   const [mspCfg, setMspCfg] = useState({enabled:false,tenants:[],isolation:{separateEncryptionKeys:true,separateAuditTrails:true,crossTenantAccessBlocked:true,tenantScopedApiKeys:true,perTenantBackups:true},managementOverlay:{centralDashboard:true,aggregateReporting:false,tenantAdminDelegation:true}});
@@ -1654,7 +1691,7 @@ function ManagementConsole() {
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
     ]},
     {cat:"integrations",label:"Integrations",items:[
-      {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"ai_integrations",label:"AI/ML Integrations"},
+      {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"ai_integrations",label:"AI/ML Integrations"},
     ]},
     {cat:"security",label:"Security",items:[
       {id:"iam",label:"IAM"},{id:"mfa",label:"MFA"},{id:"apikeys",label:"API Keys"},{id:"access_ctrl",label:"Access Control"},{id:"auth_logs",label:"Auth Logs"},{id:"kms",label:"KMS"},{id:"wifi",label:"WiFi Policy"},{id:"posture",label:"Posture Assessment"},{id:"tripwire",label:"Tripwire"},{id:"compromise_scan",label:"Compromise Scan"},{id:"log_integrity",label:"Log Integrity"},{id:"regression",label:"Regression Test"},{id:"ttx",label:"TTX Generator"},
@@ -3624,6 +3661,169 @@ regression:
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={edrCfg.quarantineOnSuspicious} onChange={e=>setEdrCfg(prev=>({...prev,quarantineOnSuspicious:e.target.checked}))}/><M style={{color:C.w}}>Quarantine suspicious files for manual review</M></label>
           </Card>
           <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"EDR_CONFIG_SAVED",detail:"EDR file inspection configuration saved"}).then(()=>addA("EDR_CONFIG_SAVED","EDR file inspection configuration saved"))}>Save EDR Config</Btn>
+        </div>)}
+
+        {/* ══════════ MALWARE SCANNER INTEGRATION (Phase F4c) ══════════ */}
+        {tab==="malware_scanners"&&(<div>
+          <L>Malware Scanner Integration</L>
+          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Multi-provider malware scanning for IR Simulator policy and AAR uploads. Configure one or more vendor scanners; the dispatcher routes uploads through them based on the selected scan mode. Credentials are encrypted at rest (AES-256-GCM) and decrypted only at scan time.</M>
+          <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
+            <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>IR Simulator requires at least one enabled scanner</M>
+            <M style={{color:C.t,lineHeight:1.6}}>Policy and AAR uploads are gated by malware scanning. If no enabled scanner is configured, IR Simulator uploads will be rejected with MALWARE_SCANNER_REQUIRED. Other parts of the platform are not affected.</M>
+          </Card>
+
+          {scannerError&&<Card style={{marginBottom:16,borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Error loading scanners: {scannerError}</M></Card>}
+
+          {/* ── SCAN MODE ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Scan mode</div>
+            <label style={{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 0",cursor:"pointer"}}>
+              <input type="radio" name="scanmode" checked={scanMode==="single_with_fallback"} onChange={()=>setScanMode("single_with_fallback")} style={{accentColor:C.a,marginTop:3}}/>
+              <div>
+                <M style={{color:C.t,fontWeight:500,display:"block"}}>Single with priority fallback (recommended)</M>
+                <M style={{color:C.tm,display:"block",marginTop:2,lineHeight:1.5}}>Try scanners in priority order. The first scanner that returns an authoritative result wins. Scanner errors fall through to the next scanner. If every scanner errors, the upload is rejected.</M>
+              </div>
+            </label>
+            <label style={{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 0",cursor:"pointer"}}>
+              <input type="radio" name="scanmode" checked={scanMode==="all_configured"} onChange={()=>setScanMode("all_configured")} style={{accentColor:C.a,marginTop:3}}/>
+              <div>
+                <M style={{color:C.t,fontWeight:500,display:"block"}}>All configured (defense in depth)</M>
+                <M style={{color:C.tm,display:"block",marginTop:2,lineHeight:1.5}}>Run all enabled scanners in parallel. The upload passes only if every scanner returns clean. Any flagged verdict, any scanner error, fails the upload. Slower but catches threats one engine might miss.</M>
+              </div>
+            </label>
+            <Btn primary small style={{marginTop:10}} onClick={async()=>{
+              const r=await api.post("/api/v1/malware-scanners/scan-mode",{mode:scanMode});
+              if(r&&!r.error){addA("MALWARE_SCAN_MODE_SAVED","Scan mode set to "+scanMode);}
+              else{setScannerError((r&&r.error)||"failed to save scan mode");}
+            }}>Save scan mode</Btn>
+          </Card>
+
+          {/* ── CONFIGURED SCANNERS LIST ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Configured scanners ({scannerList.length})</div>
+              <Btn primary small onClick={()=>setScannerForm({mode:"add",provider_type:"",display_name:"",priority:100,enabled:true,credentials:{}})}>+ Add Scanner</Btn>
+            </div>
+            {scannerListLoading&&<M style={{color:C.tm}}>Loading...</M>}
+            {!scannerListLoading&&scannerList.length===0&&(
+              <div style={{padding:"24px 0",textAlign:"center"}}>
+                <M style={{color:C.tm,display:"block",marginBottom:8}}>No scanners configured.</M>
+                <M style={{color:C.tm,display:"block"}}>IR Simulator uploads will be rejected until at least one scanner is added and enabled.</M>
+              </div>
+            )}
+            {scannerList.map(s=>{
+              const provider=SCANNER_PROVIDERS.find(p=>p.id===s.provider_type);
+              const tr=scannerTestResult[s.id];
+              const lastTest=s.last_test_status;
+              const testColor=lastTest==="success"?C.a:lastTest==="failed"?C.d:C.tm;
+              return(<div key={s.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:s.enabled?1:0.55}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <M style={{color:C.t,fontWeight:600}}>{s.display_name}</M>
+                    <span style={{fontSize:9,padding:"1px 6px",borderRadius:8,background:C.id,color:C.i,fontFamily:"'IBM Plex Mono',monospace"}}>P{s.priority}</span>
+                    {!s.enabled&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:8,background:C.b,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>DISABLED</span>}
+                  </div>
+                  <M style={{color:C.tm,display:"block"}}>{provider?provider.label:s.provider_type}</M>
+                  <div style={{display:"flex",gap:12,marginTop:6,flexWrap:"wrap"}}>
+                    <M style={{color:testColor}}>Test: {lastTest||"never"}</M>
+                    <M style={{color:C.tm}}>Scans: {s.total_scans||0}</M>
+                    <M style={{color:C.tm}}>Threats: {s.total_threats_detected||0}</M>
+                    <M style={{color:C.tm}}>Failures: {s.total_failures||0}</M>
+                  </div>
+                  {s.last_test_error&&<M style={{color:C.d,display:"block",marginTop:4,fontSize:9}}>Last error: {s.last_test_error}</M>}
+                  {tr&&(<M style={{color:tr.ok?C.a:C.d,display:"block",marginTop:4,fontSize:9}}>{tr.ok?`✓ Connection OK (${tr.latencyMs||0}ms)`:`✗ ${tr.error||"failed"}`}</M>)}
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn small onClick={async()=>{
+                    setScannerTestResult(prev=>({...prev,[s.id]:{ok:null,testing:true}}));
+                    const r=await api.post(`/api/v1/malware-scanners/${s.id}/test`,{});
+                    setScannerTestResult(prev=>({...prev,[s.id]:r||{ok:false,error:"no response"}}));
+                    reloadScanners();
+                  }}>Test</Btn>
+                  <Btn small onClick={async()=>{
+                    const r=await api.post(`/api/v1/malware-scanners/${s.id}`,{enabled:!s.enabled});
+                    if(r&&!r.error)reloadScanners();
+                  }}>{s.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={()=>setScannerForm({mode:"edit",id:s.id,provider_type:s.provider_type,display_name:s.display_name,priority:s.priority,enabled:s.enabled,credentials:{}})}>Edit</Btn>
+                  <Btn small danger onClick={async()=>{
+                    if(!window.confirm(`Delete scanner "${s.display_name}"? This cannot be undone.`))return;
+                    const r=await api.del(`/api/v1/malware-scanners/${s.id}`);
+                    if(r&&!r.error){addA("MALWARE_SCANNER_DELETED",s.display_name+" ("+s.provider_type+")");reloadScanners();}
+                    else{setScannerError((r&&r.error)||"delete failed");}
+                  }}>Del</Btn>
+                </div>
+              </div>);
+            })}
+          </Card>
+
+          <M style={{color:C.tm,display:"block",lineHeight:1.6}}>Note: vendor integrations are not validated against live API endpoints in CI. Verify each scanner with the Test button after configuration. See README for per-vendor setup details.</M>
+
+          {/* ── ADD/EDIT MODAL ── */}
+          {scannerForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setScannerForm(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:16,padding:32,maxWidth:600,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+              <L>{scannerForm.mode==="add"?"Add Scanner":"Edit Scanner"}</L>
+              <Sel label="Provider" value={scannerForm.provider_type} onChange={e=>setScannerForm(prev=>({...prev,provider_type:e.target.value,credentials:{}}))} disabled={scannerForm.mode==="edit"}>
+                <option value="">Select a provider...</option>
+                {SCANNER_PROVIDERS.map(p=>(<option key={p.id} value={p.id}>{p.label}</option>))}
+              </Sel>
+              <Input label="Display name" value={scannerForm.display_name} onChange={e=>setScannerForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Production CrowdStrike" maxLength={256}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                <Input label="Priority (1-1000, lower runs first)" type="number" min="1" max="1000" value={scannerForm.priority} onChange={e=>setScannerForm(prev=>({...prev,priority:Number(e.target.value)||100}))}/>
+                <div style={{display:"flex",alignItems:"center",paddingTop:18}}>
+                  <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+                    <input type="checkbox" checked={scannerForm.enabled} onChange={e=>setScannerForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>
+                    <M style={{color:C.t}}>Enabled</M>
+                  </label>
+                </div>
+              </div>
+              {scannerForm.provider_type&&(()=>{
+                const p=SCANNER_PROVIDERS.find(x=>x.id===scannerForm.provider_type);
+                if(!p)return null;
+                return(<div style={{marginTop:8,padding:12,background:C.sh,border:`1px solid ${C.b}`,borderRadius:8}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:10,fontSize:9,letterSpacing:1.2,textTransform:"uppercase"}}>Credentials</M>
+                  {scannerForm.mode==="edit"&&<M style={{color:C.w,display:"block",marginBottom:10,lineHeight:1.5}}>Leave fields empty to keep existing credentials. Filling any field replaces the entire credential set.</M>}
+                  {p.fields.map(f=>{
+                    const v=scannerForm.credentials[f.k]||"";
+                    if(f.bool){
+                      return(<label key={f.k} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",cursor:"pointer"}}>
+                        <input type="checkbox" checked={v!==false&&v!==""} onChange={e=>setScannerForm(prev=>({...prev,credentials:{...prev.credentials,[f.k]:e.target.checked}}))} style={{accentColor:C.a}}/>
+                        <M style={{color:C.t}}>{f.l}</M>
+                      </label>);
+                    }
+                    if(f.sel){
+                      return(<Sel key={f.k} label={f.l} value={v} onChange={e=>setScannerForm(prev=>({...prev,credentials:{...prev.credentials,[f.k]:e.target.value}}))}>
+                        <option value="">Select...</option>
+                        {f.sel.map(o=>(<option key={o.v} value={o.v}>{o.l}</option>))}
+                      </Sel>);
+                    }
+                    return(<Input key={f.k} label={f.l} type={f.secret?"password":"text"} value={v} placeholder={f.ph||""} onChange={e=>setScannerForm(prev=>({...prev,credentials:{...prev.credentials,[f.k]:e.target.value}}))}/>);
+                  })}
+                </div>);
+              })()}
+              <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                <Btn onClick={()=>setScannerForm(null)}>Cancel</Btn>
+                <Btn primary onClick={async()=>{
+                  if(!scannerForm.provider_type){setScannerError("Provider is required");return;}
+                  if(!scannerForm.display_name||!scannerForm.display_name.trim()){setScannerError("Display name is required");return;}
+                  const hasAnyCred=Object.keys(scannerForm.credentials).length>0&&Object.values(scannerForm.credentials).some(v=>v!==""&&v!==null&&v!==undefined);
+                  if(scannerForm.mode==="add"&&!hasAnyCred){setScannerError("Credentials are required for new scanners");return;}
+                  const body={display_name:scannerForm.display_name.trim(),priority:scannerForm.priority,enabled:scannerForm.enabled};
+                  if(scannerForm.mode==="add")body.provider_type=scannerForm.provider_type;
+                  if(hasAnyCred)body.credentials=scannerForm.credentials;
+                  const path=scannerForm.mode==="add"?"/api/v1/malware-scanners":`/api/v1/malware-scanners/${scannerForm.id}`;
+                  const r=await api.post(path,body);
+                  if(r&&!r.error){
+                    addA(scannerForm.mode==="add"?"MALWARE_SCANNER_ADDED":"MALWARE_SCANNER_UPDATED",scannerForm.display_name+" ("+scannerForm.provider_type+")");
+                    setScannerForm(null);
+                    setScannerError(null);
+                    reloadScanners();
+                  }else{
+                    setScannerError((r&&r.error)||"save failed");
+                  }
+                }}>{scannerForm.mode==="add"?"Add Scanner":"Save Changes"}</Btn>
+              </div>
+            </div>
+          </div>)}
         </div>)}
 
         {/* ══════════ ENTERPRISE KMS ══════════ */}

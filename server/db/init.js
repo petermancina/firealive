@@ -700,6 +700,95 @@ CREATE INDEX IF NOT EXISTS idx_ooda_generation_jobs_running
   ON ooda_generation_jobs(started_at)
   WHERE status = 'running';
 
+-- ── Malware Scanner Integrations (Phase F4c) ─────────────────────────────
+-- Multi-provider malware scanner integration table. Each row represents one
+-- configured scanner. Multiple scanners can be configured simultaneously;
+-- the dispatcher (services/integration-manager.js) selects which to call
+-- based on the global scan_mode setting in team_config.
+--
+-- Phase F4c gates the IR Simulator (and any future LLM-input upload feature)
+-- behind at least one configured-and-enabled scanner. Without a scanner the
+-- upload routes return 503 MALWARE_SCANNER_REQUIRED.
+--
+-- Provider catalog (15 vendors):
+--   On-prem signature:     clamav
+--   Cloud reputation:      virustotal
+--   Standalone analysis:   joe_sandbox, hybrid_analysis
+--   Network sandbox:       fortinet_fortisandbox, palo_alto_wildfire
+--   Vendor sandbox:        trellix_atd, trend_micro_ddan, kaspersky_sandbox
+--   Cloud reputation/AI:   sophos_intelix, blackberry_cylance
+--   Enterprise EDR:        crowdstrike_falcon, microsoft_defender, sentinelone,
+--                          cisco_amp
+--
+-- Credentials are stored ENCRYPTED. The credentials_encrypted column holds a
+-- JSON blob encrypted via services/encryption.js (AES-256-GCM with the same
+-- master key the rest of the platform uses). The shape of the decrypted JSON
+-- is provider-specific:
+--   clamav:           {"host":"localhost","port":3310}
+--   virustotal:       {"apiKey":"...","tier":"public"|"premium"}
+--   crowdstrike:      {"clientId":"...","clientSecret":"...","baseUrl":"..."}
+--   microsoft_defender:{"tenantId":"...","clientId":"...","clientSecret":"..."}
+--   sentinelone:      {"siteUrl":"...","apiToken":"..."}
+--   cisco_amp:        {"clientId":"...","apiKey":"...","region":"..."}
+--   trellix_atd:      {"baseUrl":"...","apiKey":"..."}
+--   sophos_intelix:   {"clientId":"...","clientSecret":"..."}
+--   trend_micro_ddan: {"baseUrl":"...","apiKey":"..."}
+--   kaspersky_sandbox:{"baseUrl":"...","apiKey":"..."}
+--   ...
+-- Provider modules in services/malware-scanners/<provider>.js are responsible
+-- for parsing their own credential shape after decryption.
+--
+-- last_test_*  fields are touched by the MC's "Test Connection" button and
+-- by each successful or failed inspection call. Lets the operations
+-- dashboard show "last successful test: 3 minutes ago" without polling
+-- the live integration.
+
+CREATE TABLE IF NOT EXISTS malware_scanner_integrations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  provider_type TEXT NOT NULL CHECK (provider_type IN (
+    'clamav',
+    'virustotal',
+    'crowdstrike_falcon',
+    'microsoft_defender',
+    'sentinelone',
+    'cisco_amp',
+    'fortinet_fortisandbox',
+    'trellix_atd',
+    'sophos_intelix',
+    'joe_sandbox',
+    'hybrid_analysis',
+    'palo_alto_wildfire',
+    'blackberry_cylance',
+    'trend_micro_ddan',
+    'kaspersky_sandbox'
+  )),
+  display_name TEXT NOT NULL,
+  credentials_encrypted TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 1000),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  configured_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  configured_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_test_at TEXT,
+  last_test_status TEXT CHECK (last_test_status IS NULL OR last_test_status IN ('success', 'failed')),
+  last_test_error TEXT,
+  last_scan_at TEXT,
+  total_scans INTEGER NOT NULL DEFAULT 0,
+  total_threats_detected INTEGER NOT NULL DEFAULT 0,
+  total_failures INTEGER NOT NULL DEFAULT 0
+);
+
+-- Dispatcher reads this index to find the next scanner to try (lowest
+-- priority value first; ties broken by configured_at). Partial index
+-- excludes disabled rows so we never even consider them.
+CREATE INDEX IF NOT EXISTS idx_malware_scanner_active
+  ON malware_scanner_integrations(priority ASC, configured_at ASC)
+  WHERE enabled = 1;
+
+-- MC's status panel reads scanners by provider_type for "is CrowdStrike
+-- configured?" checks.
+CREATE INDEX IF NOT EXISTS idx_malware_scanner_provider
+  ON malware_scanner_integrations(provider_type, enabled);
+
 -- ── AI Provider Configuration ────────────────────────────────────────────
 -- Per-feature routing for AI calls. One row per AI-using feature.
 -- The dispatcher reads this to decide internal vs external for each call.
