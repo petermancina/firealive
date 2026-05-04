@@ -1562,6 +1562,97 @@ function ManagementConsole() {
   const [oodaPolicies, setOodaPolicies] = useState([]);
   const [oodaNewPolicy, setOodaNewPolicy] = useState({title:"",type:"incident_response",content:""});
   const [oodaScenarios, setOodaScenarios] = useState([]);
+  // Phase F4c: backend-wired state for policies, scenarios, jobs
+  const [oodaLoading, setOodaLoading] = useState(false);
+  const [oodaUploading, setOodaUploading] = useState(false);
+  const [oodaUploadError, setOodaUploadError] = useState(null);
+  const [oodaRefreshTick, setOodaRefreshTick] = useState(0);
+  // Phase F4c commit 4: AAR state — uploads, listing, remove
+  const [oodaAars, setOodaAars] = useState([]);
+  const [oodaNewAar, setOodaNewAar] = useState({title:"",incidentDate:"",content:"",lessonsLearned:""});
+  const [oodaUploadingAar, setOodaUploadingAar] = useState(false);
+  const [oodaAarError, setOodaAarError] = useState(null);
+  // Phase F4c commit 7: replenishment-config wizard state
+  // wizardPolicy is the policy whose config is being edited (null = closed).
+  // wizardConfig holds the in-flight form values; wizardError holds any
+  // server-returned validation error; wizardSaving suppresses the Save
+  // button while the PATCH is in flight.
+  const [wizardPolicy, setWizardPolicy] = useState(null);
+  const [wizardConfig, setWizardConfig] = useState(null);
+  const [wizardError, setWizardError] = useState(null);
+  const [wizardSaving, setWizardSaving] = useState(false);
+  // Phase F4c commit 8: generation-jobs monitoring dashboard
+  const [oodaJobs, setOodaJobs] = useState([]);
+  const [oodaJobsError, setOodaJobsError] = useState(null);
+  // Ref tracks the latest jobs list for the polling closure — without
+  // this, the setInterval callback would close over the initial empty
+  // array and never see updates, so it could never stop polling once
+  // jobs are added.
+  const oodaJobsRef = React.useRef([]);
+  oodaJobsRef.current = oodaJobs;
+  // Polling effect: while any job is queued or running, refetch every 5
+  // seconds so the user sees progress updates. When all jobs are in
+  // terminal states (done/failed/cancelled), the interval still ticks
+  // but skips the fetch — much cheaper than tearing down and rebuilding
+  // the interval on every state change.
+  useEffect(()=>{
+    if (tab !== "ooda_mgmt") return;
+    let cancelled = false;
+    const fetchJobs = async () => {
+      const r = await api.get("/api/ooda/generation-jobs?limit=50");
+      if (cancelled) return;
+      if (r?.error) {
+        setOodaJobsError(r.error);
+        return;
+      }
+      setOodaJobsError(null);
+      setOodaJobs(r?.jobs || []);
+    };
+    fetchJobs();
+    const tickHandle = setInterval(()=>{
+      const hasActive = oodaJobsRef.current.some(j=>j.status==="queued"||j.status==="running");
+      if (hasActive) fetchJobs();
+    }, 5000);
+    return ()=>{ cancelled = true; clearInterval(tickHandle); };
+  }, [tab, oodaRefreshTick]);
+  // When the IR Simulator MC tab is opened, fetch the live list of
+  // policies, scenarios, and AARs from the backend. The mock state from
+  // earlier builds is replaced with API data; setOodaPolicies on tab
+  // activation overwrites whatever stale entries were there.
+  useEffect(()=>{
+    if (tab !== "ooda_mgmt") return;
+    let cancelled = false;
+    setOodaLoading(true);
+    Promise.all([
+      api.get("/api/ooda/policies"),
+      api.get("/api/ooda/scenarios"),
+      api.get("/api/ooda/aar"),
+    ]).then(([polRes, scRes, aarRes])=>{
+      if (cancelled) return;
+      // The /policies route returns {policies: [...]} with each row
+      // including replenishment_config (JSON string from the DB) and the
+      // standard ir_policies columns. Normalize the JSON into an object
+      // for the UI's wizard (commit 6) — the rest of this commit just
+      // displays title, type, uploadedAt, id.
+      const polList = (polRes?.policies || []).map(p => ({
+        ...p,
+        replenishment_config: (() => {
+          try { return p.replenishment_config ? JSON.parse(p.replenishment_config) : null; }
+          catch { return null; }
+        })(),
+      }));
+      setOodaPolicies(polList);
+      setOodaScenarios(scRes?.scenarios || []);
+      setOodaAars(aarRes?.aars || []);
+    }).catch(()=>{
+      // Network or auth error — leave existing state alone, surface in
+      // the upload-error slot so the user sees something actionable
+      if (!cancelled) setOodaUploadError("Failed to load IR Simulator data. Refresh the tab to retry.");
+    }).finally(()=>{
+      if (!cancelled) setOodaLoading(false);
+    });
+    return ()=>{ cancelled = true; };
+  }, [tab, oodaRefreshTick]);
   // Peer support config
   const [peerScheduleCfg, setPeerSchedCfg] = useState({allowDuringShift:true,blockedDays:[],blockedHoursStart:null,blockedHoursEnd:null,maxSessionMinutes:30,inactivityTimeoutMinutes:5});
   // Helper leaderboard populated from real peer sessions.
@@ -3278,29 +3369,369 @@ regression:
         {tab==="ooda_mgmt"&&(<div>
           <L>Incident Response Simulator — Policy Management</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Upload IR policies, playbooks, and after-action reports. The simulator generates OODA-loop exercises for analysts based on your org's actual procedures.</M>
+          {/* ── Scanner-required banner (Phase F4c commit 6) ── */}
+          {/* Reads from scannerList already loaded by reloadScanners() on mount.
+              Surfaces an amber banner when no scanner is enabled, BEFORE the
+              user attempts an upload — saves them from a 422 dead-end and
+              points them at the right config tab. The inline upload-error
+              path (commit 3 / commit 5) remains as a fallback for scanner
+              state that changes between page load and upload. */}
+          {scannerList.filter(s=>s.enabled).length===0&&(
+            <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
+              <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Malware scanner required</M>
+              <M style={{color:C.t,lineHeight:1.6,display:"block",marginBottom:8}}>IR Simulator policy and AAR uploads are gated by malware scanning. No enabled scanner is configured, so any upload attempt will be rejected with code MALWARE_SCANNER_REQUIRED.</M>
+              <Btn small onClick={()=>setTab("malware_scanners")}>Open Malware Scanners config</Btn>
+            </Card>
+          )}
+          {oodaLoading&&<Card style={{marginBottom:12,padding:10,borderColor:C.i+"30"}}><M style={{color:C.i}}>Loading…</M></Card>}
+          {oodaUploadError&&<Card style={{marginBottom:12,padding:10,borderColor:C.d+"30"}}><M style={{color:C.d}}>{oodaUploadError}</M></Card>}
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Upload Policy / Playbook</div>
             <Input label="Title" value={oodaNewPolicy.title} onChange={e=>setOodaNewPolicy(p=>({...p,title:e.target.value}))} placeholder="e.g., Ransomware Response Playbook" maxLength={256}/>
             <Sel label="Type" value={oodaNewPolicy.type} onChange={e=>setOodaNewPolicy(p=>({...p,type:e.target.value}))}>
               <option value="incident_response">Incident Response Plan</option><option value="playbook">Playbook</option><option value="runbook">Runbook</option><option value="policy">Policy</option><option value="procedure">Procedure</option>
             </Sel>
-            <Card style={{padding:14,borderColor:C.i+"30",marginBottom:14}}><Sel label="Source"><option>Local</option><option>Network</option><option>NAS</option><option>SharePoint</option><option>S3</option></Sel><div style={{padding:16,background:"rgba(0,0,0,0.2)",borderRadius:8,border:"2px dashed "+C.b,textAlign:"center",marginTop:8,cursor:"pointer"}} onClick={()=>api.post("/api/v054/clients/restore",{action:"edr_scan"}).then(()=>addA("IR","EDR scan initiated"))}><M style={{color:C.tm}}>Browse</M></div></Card>
-            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Upload or paste</M><textarea value={oodaNewPolicy.content} onChange={e=>setOodaNewPolicy(p=>({...p,content:e.target.value}))} rows={6} maxLength={500000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,resize:"vertical"}}/></div>
-            <Btn primary disabled={!oodaNewPolicy.title.trim()||!oodaNewPolicy.content.trim()} onClick={()=>{setOodaPolicies(prev=>[...prev,{id:Date.now(),title:oodaNewPolicy.title,type:oodaNewPolicy.type,uploadedAt:new Date().toISOString()}]);addA("OODA_POLICY_UPLOADED",`"${oodaNewPolicy.title}" (${oodaNewPolicy.type})`);setOodaNewPolicy({title:"",type:"incident_response",content:""});}}>Upload Policy</Btn>
+            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Paste policy content</M><textarea value={oodaNewPolicy.content} onChange={e=>setOodaNewPolicy(p=>({...p,content:e.target.value}))} rows={6} maxLength={500000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,resize:"vertical"}}/><M style={{color:C.td,fontSize:10,display:"block",marginTop:4,lineHeight:1.5}}>Uploaded content is sanitized and scanned by the configured malware scanner (MC &gt; Malware Scanners). Uploads are rejected if no scanner is configured.</M></div>
+            <Btn primary disabled={!oodaNewPolicy.title.trim()||!oodaNewPolicy.content.trim()||oodaUploading} onClick={async ()=>{
+              setOodaUploading(true);
+              setOodaUploadError(null);
+              const r = await api.post("/api/ooda/policies", {
+                title: oodaNewPolicy.title,
+                type: oodaNewPolicy.type,
+                content: oodaNewPolicy.content,
+              });
+              setOodaUploading(false);
+              if (r?.error || r?.code) {
+                // Surface backend error codes — particularly
+                // MALWARE_SCANNER_REQUIRED (PR #3 commit 5) and the
+                // sanitizer/EDR rejection codes — to the user. The
+                // dedicated banner from commit 5 of THIS PR will catch
+                // MALWARE_SCANNER_REQUIRED specifically; for now,
+                // display whatever the server says.
+                const msg = r.code === "MALWARE_SCANNER_REQUIRED"
+                  ? "Upload requires a configured malware scanner. Configure one under MC > Malware Scanners."
+                  : (r.error || "Upload failed");
+                setOodaUploadError(msg);
+                addA("OODA_POLICY_UPLOAD_FAILED", `"${oodaNewPolicy.title}" code=${r.code||"unknown"}`);
+                return;
+              }
+              addA("OODA_POLICY_UPLOADED", `"${oodaNewPolicy.title}" (${oodaNewPolicy.type})`);
+              setOodaNewPolicy({title:"",type:"incident_response",content:""});
+              setOodaRefreshTick(n=>n+1);  // trigger refetch
+            }}>{oodaUploading?"Uploading…":"Upload Policy"}</Btn>
           </Card>
           <L>Uploaded Policies ({oodaPolicies.length})</L>
           {oodaPolicies.length===0?<M style={{color:C.td}}>No policies uploaded yet. Upload IR policies to enable scenario generation.</M>:
-          oodaPolicies.map(p=><Card key={p.id} style={{marginBottom:8,padding:"12px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><M style={{color:C.t}}>{p.title}</M><br/><M style={{color:C.td}}>{p.type} · {new Date(p.uploadedAt).toLocaleDateString()}</M></div><Badge color={C.a}>active</Badge></Card>)}
-          <div style={{marginTop:16}}><L>Generate Scenario</L>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {["ransomware","phishing","data_exfil","insider_threat","apt","ddos","supply_chain","credential_compromise"].map(t=>(
-                <Btn key={t} small onClick={()=>{const id="sc-"+Date.now();setOodaScenarios(prev=>[...prev,{id,title:`${t.replace(/_/g," ")} Exercise`,type:t,nodeCount:6,createdAt:new Date().toISOString()}]);addA("OODA_SCENARIO_GENERATED",`${t} scenario generated`);}}>Generate: {t.replace(/_/g," ")}</Btn>
+          oodaPolicies.map(p=><Card key={p.id} style={{marginBottom:8,padding:"12px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <M style={{color:C.t}}>{p.title}</M><br/>
+              <M style={{color:C.td}}>{p.policy_type||p.type} · {new Date(p.uploaded_at||p.uploadedAt).toLocaleDateString()}
+                {p.replenishment_config&&p.replenishment_config.mode&&<span> · refill: {p.replenishment_config.mode}</span>}
+              </M>
+            </div>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <Badge color={C.a}>active</Badge>
+              <Btn small onClick={async ()=>{
+                // Phase F4c commit 9: manual generation button.
+                // Enqueues a single generation job using the policy's
+                // configured batch_size (falling back to 5 to match the
+                // canonical default in db/init.js). The job appears in
+                // the Generation Jobs dashboard below within ~5s as the
+                // polling effect picks it up. mode='manual' is preserved
+                // through the worker so the audit log clearly
+                // distinguishes hand-triggered runs from auto-triggered
+                // ones (threshold, scheduled, initial_upload).
+                const cfg = p.replenishment_config || {};
+                const batchSize = (Number.isInteger(cfg.batch_size) && cfg.batch_size>=1 && cfg.batch_size<=20) ? cfg.batch_size : 5;
+                const r = await api.post("/api/ooda/generation-jobs", {
+                  policy_id: p.id,
+                  mode: "manual",
+                  target_count_per_difficulty: batchSize,
+                });
+                if (r?.error || r?.code) {
+                  // Common error codes from POST /generation-jobs:
+                  //   POLICY_NOT_FOUND  — policy was soft-deleted between
+                  //                       page load and the click
+                  //   INVALID_JOB_ARGS  — mode/target validation, shouldn't
+                  //                       happen with our constructed body
+                  //                       but caught defensively
+                  // The MALWARE_SCANNER_REQUIRED gate only fires on the
+                  // upload paths (/policies, /aar), not here — the worker
+                  // generates scenarios from the LLM, not from new file
+                  // uploads, so the scanner gate doesn't apply.
+                  setOodaUploadError(r.code==="POLICY_NOT_FOUND"
+                    ? "Policy not found — refresh the page to reload the list."
+                    : (r.error || `Failed to enqueue (${r.code||"unknown"})`));
+                  addA("OODA_GEN_JOB_ENQUEUE_FAILED", `"${p.title}" code=${r.code||"unknown"}`);
+                  return;
+                }
+                addA("OODA_GEN_JOB_ENQUEUED", `"${p.title}" mode=manual batch_size=${batchSize} job=${r.job_id||"unknown"}`);
+                setOodaRefreshTick(n=>n+1);
+              }}>Generate</Btn>
+              <Btn small onClick={()=>{
+                // Open the replenishment-config wizard for this policy.
+                // Seed wizardConfig from the policy's current config so the
+                // form starts with the existing values; defaults match
+                // db/init.js if no config is set.
+                const cur = p.replenishment_config || {};
+                setWizardPolicy(p);
+                setWizardConfig({
+                  mode: cur.mode || "threshold",
+                  threshold_x: cur.threshold_x != null ? cur.threshold_x : 2,
+                  batch_size: cur.batch_size != null ? cur.batch_size : 5,
+                  scheduled_hour: cur.scheduled_hour != null ? cur.scheduled_hour : 3,
+                  scheduled_days: Array.isArray(cur.scheduled_days) ? cur.scheduled_days : [],
+                  auto_initial_upload: cur.auto_initial_upload != null ? cur.auto_initial_upload : true,
+                });
+                setWizardError(null);
+              }}>Configure</Btn>
+              <Btn small onClick={async ()=>{
+                if (!window.confirm(`Remove "${p.title}"? Existing scenarios will remain available but no new ones will be generated from this policy.`)) return;
+                const r = await api.del(`/api/ooda/policies/${p.id}`);
+                if (r?.error) { setOodaUploadError(r.error); return; }
+                addA("OODA_POLICY_REMOVED", `"${p.title}"`);
+                setOodaRefreshTick(n=>n+1);
+              }}>Remove</Btn>
+            </div>
+          </Card>)}
+
+          {/* ── After-Action Reports (Phase F4c commit 4) ── */}
+          <div style={{marginTop:24}}>
+            <L>After-Action Reports</L>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Upload completed AARs from past incidents. The scenario generator pulls recent AARs as context to make exercises realistic. AAR content is sanitized and malware-scanned identically to policies.</M>
+            {oodaAarError&&<Card style={{marginBottom:12,padding:10,borderColor:C.d+"30"}}><M style={{color:C.d}}>{oodaAarError}</M></Card>}
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Upload AAR</div>
+              <Input label="Title" value={oodaNewAar.title} onChange={e=>setOodaNewAar(p=>({...p,title:e.target.value}))} placeholder="e.g., Q1 Phishing Incident — March 2026" maxLength={256}/>
+              <Input label="Incident date (YYYY-MM-DD, optional)" value={oodaNewAar.incidentDate} onChange={e=>setOodaNewAar(p=>({...p,incidentDate:e.target.value}))} placeholder="2026-03-15"/>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block"}}>AAR content</M>
+                <textarea value={oodaNewAar.content} onChange={e=>setOodaNewAar(p=>({...p,content:e.target.value}))} rows={6} maxLength={500000} placeholder="Paste the AAR narrative — incident summary, response timeline, root cause." style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,resize:"vertical"}}/>
+              </div>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block"}}>Lessons learned (optional)</M>
+                <textarea value={oodaNewAar.lessonsLearned} onChange={e=>setOodaNewAar(p=>({...p,lessonsLearned:e.target.value}))} rows={4} maxLength={50000} placeholder="What worked, what didn't, what changes are recommended." style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,resize:"vertical"}}/>
+                <M style={{color:C.td,fontSize:10,display:"block",marginTop:4,lineHeight:1.5}}>Both fields are scanned together as one combined blob. Uploads are rejected if no malware scanner is configured (MC &gt; Malware Scanners).</M>
+              </div>
+              <Btn primary disabled={!oodaNewAar.title.trim()||!oodaNewAar.content.trim()||oodaUploadingAar} onClick={async ()=>{
+                setOodaUploadingAar(true);
+                setOodaAarError(null);
+                const r = await api.post("/api/ooda/aar", {
+                  title: oodaNewAar.title,
+                  content: oodaNewAar.content,
+                  incidentDate: oodaNewAar.incidentDate || null,
+                  lessonsLearned: oodaNewAar.lessonsLearned || null,
+                });
+                setOodaUploadingAar(false);
+                if (r?.error || r?.code) {
+                  // Same error mapping as policy uploads — the
+                  // MALWARE_SCANNER_REQUIRED gate from PR #3 commit 5
+                  // applies to /api/ooda/aar identically.
+                  const msg = r.code === "MALWARE_SCANNER_REQUIRED"
+                    ? "Upload requires a configured malware scanner. Configure one under MC > Malware Scanners."
+                    : (r.error || "Upload failed");
+                  setOodaAarError(msg);
+                  addA("OODA_AAR_UPLOAD_FAILED", `"${oodaNewAar.title}" code=${r.code||"unknown"}`);
+                  return;
+                }
+                addA("OODA_AAR_UPLOADED", `"${oodaNewAar.title}"`);
+                setOodaNewAar({title:"",incidentDate:"",content:"",lessonsLearned:""});
+                setOodaRefreshTick(n=>n+1);
+              }}>{oodaUploadingAar?"Uploading…":"Upload AAR"}</Btn>
+            </Card>
+            {oodaAars.length===0?<M style={{color:C.td}}>No AARs uploaded yet. Upload past incident AARs to give the scenario generator more context.</M>:
+            oodaAars.map(a=><Card key={a.id} style={{marginBottom:8,padding:"12px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <M style={{color:C.t}}>{a.title}</M><br/>
+                <M style={{color:C.td}}>
+                  {a.incidentDate?`Incident: ${a.incidentDate} · `:""}
+                  Uploaded: {new Date(a.uploadedAt).toLocaleDateString()}
+                </M>
+              </div>
+              <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                <Badge color={C.i}>aar</Badge>
+                <Btn small onClick={async ()=>{
+                  if (!window.confirm(`Remove "${a.title}"? Existing scenarios that referenced this AAR retain their provenance trail.`)) return;
+                  const r = await api.del(`/api/ooda/aar/${a.id}`);
+                  if (r?.error) { setOodaAarError(r.error); return; }
+                  addA("OODA_AAR_REMOVED", `"${a.title}"`);
+                  setOodaRefreshTick(n=>n+1);
+                }}>Remove</Btn>
+              </div>
+            </Card>)}
+          </div>
+
+          {oodaScenarios.length>0&&<div style={{marginTop:16}}><L>Available Scenarios ({oodaScenarios.length})</L>
+            {oodaScenarios.map(s=><Card key={s.id} style={{marginBottom:8,padding:"12px 14px"}}><div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{s.title}</M><Badge color={C.p}>{s.node_count||s.nodeCount} nodes</Badge></div><M style={{color:C.td}}>Type: {s.scenario_type||s.type} · Difficulty: {s.difficulty||"—"} · Created: {new Date(s.created_at||s.createdAt).toLocaleDateString()}</M></Card>)}
+          </div>}
+
+          {/* ── Generation Jobs Dashboard (Phase F4c commit 8) ── */}
+          <div style={{marginTop:24}}>
+            <L>Generation Jobs ({oodaJobs.length})</L>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Background scenario-generation jobs. Threshold-mode and scheduled-mode runs appear here automatically; manual jobs (commit 9) will too. Active jobs refresh every 5 seconds.</M>
+            {oodaJobsError&&<Card style={{marginBottom:12,padding:10,borderColor:C.d+"30"}}><M style={{color:C.d}}>Error loading jobs: {oodaJobsError}</M></Card>}
+            {oodaJobs.length===0?<M style={{color:C.td}}>No generation jobs yet. Configure a policy's replenishment mode (Configure button above) to set up auto-generation.</M>:
+            oodaJobs.map(j=>{
+              // Resolve policy title from oodaPolicies. If the policy was
+              // soft-deleted after the job was enqueued, fall back to the
+              // policy_id so the job still displays meaningfully.
+              const pol = oodaPolicies.find(p=>p.id===j.policy_id);
+              const polTitle = pol ? pol.title : `(policy ${j.policy_id.slice(0,8)}…)`;
+              const statusColor = {
+                queued: C.i, running: C.w, done: C.a,
+                failed: C.d, cancelled: C.tm,
+              }[j.status] || C.tm;
+              const isActive = j.status==="queued" || j.status==="running";
+              const pctText = `${j.scenarios_completed||0}/${j.total_scenarios||0}`
+                + (j.scenarios_failed>0 ? ` (${j.scenarios_failed} failed)` : "");
+              return (<Card key={j.id} style={{marginBottom:8,padding:"12px 14px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
+                      <Badge color={statusColor}>{j.status}</Badge>
+                      <Badge color={C.p}>{j.mode}</Badge>
+                      <M style={{color:C.t,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{polTitle}</M>
+                    </div>
+                    <M style={{color:C.td,display:"block",lineHeight:1.5}}>
+                      Progress: {pctText}
+                      {j.provider&&<span> · {j.provider}</span>}
+                      <br/>
+                      Enqueued: {new Date(j.enqueued_at).toLocaleString()}
+                      {j.completed_at&&<span> · Completed: {new Date(j.completed_at).toLocaleString()}</span>}
+                    </M>
+                    {j.error_message&&<M style={{color:C.d,display:"block",marginTop:4,lineHeight:1.5,fontSize:10}}>Error: {j.error_message}</M>}
+                  </div>
+                  {isActive&&<Btn small onClick={async ()=>{
+                    if (!window.confirm(`Cancel this ${j.mode} job? Best-effort: the worker stops at the next scenario boundary; any scenario currently being generated will complete.`)) return;
+                    const r = await fetch(API_BASE+`/api/ooda/generation-jobs/${j.id}/cancel`,{
+                      method:"POST",
+                      headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},
+                    }).then(res=>res.json()).catch(e=>({error:e.message}));
+                    if (r?.error) {
+                      setOodaJobsError(r.error);
+                      return;
+                    }
+                    addA("OODA_GEN_JOB_CANCEL_REQUESTED", `id=${j.id} previous_status=${j.status}`);
+                    setOodaRefreshTick(n=>n+1);
+                  }}>Cancel</Btn>}
+                </div>
+              </Card>);
+            })}
+          </div>
+
+          {/* ── Replenishment-config wizard (Phase F4c commit 7) ── */}
+          {wizardPolicy&&wizardConfig&&<Modal title={`Replenishment config — ${wizardPolicy.title}`} onClose={()=>{setWizardPolicy(null);setWizardConfig(null);setWizardError(null);}} width={520}>
+            <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Controls how new scenarios get generated for this policy. Threshold mode auto-refills when an analyst's unplayed pool drops too low; scheduled mode generates batches at fixed times; manual disables auto-generation entirely (you can still trigger jobs by hand).</M>
+
+            {/* Mode selector */}
+            <div style={{marginBottom:14}}>
+              <M style={{color:C.tm,marginBottom:6,display:"block",fontSize:11,fontWeight:500}}>Mode</M>
+              {[
+                {v:"threshold",lbl:"Threshold — refill when unplayed pool drops below threshold (recommended)"},
+                {v:"scheduled",lbl:"Scheduled — generate batches at a fixed hour and days"},
+                {v:"manual",lbl:"Manual — no automatic generation; trigger by hand"},
+                {v:"disabled",lbl:"Disabled — no generation at all"},
+              ].map(opt=>(
+                <label key={opt.v} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"6px 0",cursor:"pointer"}}>
+                  <input type="radio" name="repl-mode" checked={wizardConfig.mode===opt.v} onChange={()=>setWizardConfig(c=>({...c,mode:opt.v}))} style={{accentColor:C.a,marginTop:3}}/>
+                  <M style={{color:wizardConfig.mode===opt.v?C.t:C.tm,lineHeight:1.5}}>{opt.lbl}</M>
+                </label>
               ))}
             </div>
-          </div>
-          {oodaScenarios.length>0&&<div style={{marginTop:16}}><L>Available Scenarios ({oodaScenarios.length})</L>
-            {oodaScenarios.map(s=><Card key={s.id} style={{marginBottom:8,padding:"12px 14px"}}><div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{s.title}</M><Badge color={C.p}>{s.nodeCount} nodes</Badge></div><M style={{color:C.td}}>Type: {s.type} · Created: {new Date(s.createdAt).toLocaleDateString()}</M></Card>)}
-          </div>}
+
+            {/* Threshold-only field */}
+            {wizardConfig.mode==="threshold"&&<div style={{marginBottom:14}}>
+              <Input label={`Threshold (refill when unplayed scenarios drop below this number) — currently ${wizardConfig.threshold_x}`} type="number" min="1" max="50" value={wizardConfig.threshold_x} onChange={e=>setWizardConfig(c=>({...c,threshold_x:parseInt(e.target.value,10)||c.threshold_x}))}/>
+              <M style={{color:C.td,fontSize:10,display:"block",marginTop:-4,lineHeight:1.5}}>Range 1–50. Default 2. Most SOCs find 2–3 keeps the pool fresh without over-generating.</M>
+            </div>}
+
+            {/* Scheduled-only fields */}
+            {wizardConfig.mode==="scheduled"&&<>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block",fontSize:11,fontWeight:500}}>Hour of day (24h)</M>
+                <Sel value={wizardConfig.scheduled_hour} onChange={e=>setWizardConfig(c=>({...c,scheduled_hour:parseInt(e.target.value,10)}))}>
+                  {Array.from({length:24},(_,i)=>i).map(h=>(
+                    <option key={h} value={h}>{h.toString().padStart(2,"0")}:00</option>
+                  ))}
+                </Sel>
+              </div>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:6,display:"block",fontSize:11,fontWeight:500}}>Days of week (leave all unchecked for every day)</M>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {[{v:"sun",l:"Sun"},{v:"mon",l:"Mon"},{v:"tue",l:"Tue"},{v:"wed",l:"Wed"},{v:"thu",l:"Thu"},{v:"fri",l:"Fri"},{v:"sat",l:"Sat"}].map(d=>(
+                    <label key={d.v} style={{display:"flex",alignItems:"center",gap:4,padding:"6px 10px",border:`1px solid ${wizardConfig.scheduled_days.includes(d.v)?C.a:C.b}`,borderRadius:8,cursor:"pointer",background:wizardConfig.scheduled_days.includes(d.v)?C.ad:"transparent"}}>
+                      <input type="checkbox" checked={wizardConfig.scheduled_days.includes(d.v)} onChange={e=>{
+                        setWizardConfig(c=>({
+                          ...c,
+                          scheduled_days: e.target.checked
+                            ? [...c.scheduled_days,d.v]
+                            : c.scheduled_days.filter(x=>x!==d.v),
+                        }));
+                      }} style={{accentColor:C.a}}/>
+                      <M style={{color:wizardConfig.scheduled_days.includes(d.v)?C.a:C.tm}}>{d.l}</M>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </>}
+
+            {/* batch_size — required for threshold/scheduled/manual */}
+            {wizardConfig.mode!=="disabled"&&<div style={{marginBottom:14}}>
+              <Input label={`Batch size per difficulty (3 difficulties × this number = scenarios per refill) — currently ${wizardConfig.batch_size}`} type="number" min="1" max="20" value={wizardConfig.batch_size} onChange={e=>setWizardConfig(c=>({...c,batch_size:parseInt(e.target.value,10)||c.batch_size}))}/>
+              <M style={{color:C.td,fontSize:10,display:"block",marginTop:-4,lineHeight:1.5}}>Range 1–20. Default 5 (15 scenarios per refill). Larger batches mean fewer LLM calls but longer to first availability.</M>
+            </div>}
+
+            {/* auto_initial_upload — applies to all modes */}
+            <label style={{display:"flex",alignItems:"flex-start",gap:8,padding:"8px 0",cursor:"pointer",marginBottom:14}}>
+              <input type="checkbox" checked={wizardConfig.auto_initial_upload} onChange={e=>setWizardConfig(c=>({...c,auto_initial_upload:e.target.checked}))} style={{accentColor:C.a,marginTop:3}}/>
+              <div>
+                <M style={{color:C.t,fontWeight:500,display:"block"}}>Auto-generate initial batch on policy upload</M>
+                <M style={{color:C.tm,display:"block",marginTop:2,lineHeight:1.5}}>When a policy is first uploaded, automatically enqueue a generation job to populate the initial scenario pool.</M>
+              </div>
+            </label>
+
+            {wizardError&&<Card style={{marginBottom:14,padding:10,borderColor:C.d+"30"}}><M style={{color:C.d}}>{wizardError}</M></Card>}
+
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <Btn onClick={()=>{setWizardPolicy(null);setWizardConfig(null);setWizardError(null);}}>Cancel</Btn>
+              <Btn primary disabled={wizardSaving} onClick={async ()=>{
+                setWizardSaving(true);
+                setWizardError(null);
+                // Build the body: only send fields that apply to the
+                // chosen mode. The PATCH route normalizes anyway, but
+                // sending exactly what's relevant keeps the audit log
+                // clean and reduces the chance of a stale-field warning.
+                const body = {
+                  mode: wizardConfig.mode,
+                  auto_initial_upload: wizardConfig.auto_initial_upload,
+                };
+                if (wizardConfig.mode==="threshold") body.threshold_x = wizardConfig.threshold_x;
+                if (wizardConfig.mode==="scheduled") {
+                  body.scheduled_hour = wizardConfig.scheduled_hour;
+                  if (wizardConfig.scheduled_days.length>0) body.scheduled_days = wizardConfig.scheduled_days;
+                }
+                if (wizardConfig.mode!=="disabled") body.batch_size = wizardConfig.batch_size;
+                const r = await fetch(API_BASE+`/api/ooda/policies/${wizardPolicy.id}/replenishment-config`,{
+                  method:"PATCH",
+                  headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},
+                  body:JSON.stringify(body),
+                }).then(res=>res.json()).catch(e=>({error:e.message}));
+                setWizardSaving(false);
+                if (r?.error || r?.code) {
+                  // Map server error codes to friendlier messages.
+                  // INVALID_THRESHOLD_X / INVALID_BATCH_SIZE etc. all
+                  // come back with the field-specific code from the
+                  // PATCH route's validation block.
+                  setWizardError(r.error || `Validation failed: ${r.code}`);
+                  return;
+                }
+                addA("OODA_POLICY_REPL_CONFIG_UPDATED", `"${wizardPolicy.title}" mode=${wizardConfig.mode}`);
+                setWizardPolicy(null);
+                setWizardConfig(null);
+                setOodaRefreshTick(n=>n+1);
+              }}>{wizardSaving?"Saving…":"Save"}</Btn>
+            </div>
+          </Modal>}
         </div>)}
 
         {/* ══════════ PEER SUPPORT CONFIG ══════════ */}

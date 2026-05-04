@@ -398,6 +398,208 @@ router.delete('/policies/:id', (req, res) => {
   }
 });
 
+// ── Update per-policy replenishment config (Phase F4c) ──────────────────────
+//
+// PATCH /api/ooda/policies/:id/replenishment-config
+//
+// Updates a single policy's replenishment_config JSON column. Read by:
+//   - The threshold-replenishment hook in POST /scenarios/:id/play
+//     (commit 7 of PR #3)
+//   - The scheduled-mode cron in services/scheduler.js (commit 4 of PR #3)
+//   - The auto_initial_upload check in POST /policies (future enhancement)
+//
+// Validates the entire incoming config object server-side. Each field has a
+// known type, range, and conditional applicability:
+//
+//   mode           required; one of 'threshold', 'scheduled', 'manual',
+//                  'disabled'. The other fields' applicability depends on
+//                  this — e.g. threshold_x is only meaningful when
+//                  mode='threshold'. Unrelated fields are tolerated (stored)
+//                  but ignored at runtime so the UI can preserve user input
+//                  across mode toggles.
+//
+//   threshold_x    integer 1-50, only meaningful when mode='threshold'
+//   batch_size     integer 1-20, all auto modes use it
+//   scheduled_hour integer 0-23, only meaningful when mode='scheduled'
+//   scheduled_days optional array of 'sun'|'mon'|...|'sat' strings, only
+//                  meaningful when mode='scheduled'. Empty/missing means
+//                  every day.
+//   auto_initial_upload  boolean. Whether to auto-enqueue an
+//                        initial-batch generation job at policy upload
+//                        time. PR #3 commit 5 did NOT wire this hook
+//                        yet — the column is set, but no upload-time
+//                        generation fires. Wiring the auto-enqueue hook
+//                        is a separate F4c task.
+//
+// Audit: OODA_POLICY_REPL_CONFIG_UPDATED with the policy id, the incoming
+// mode, and a compact summary of changed fields. The full prior config is
+// not logged (would be noisy for what is functionally a settings-write).
+//
+// Permission: lead/admin only. Same role pattern as the rest of /policies.
+router.patch('/policies/:id/replenishment-config', (req, res) => {
+  if (req.user.role === 'analyst') {
+    return res.status(403).json({ error: 'Only leads/admins can change replenishment config' });
+  }
+
+  const body = req.body || {};
+
+  // Validate mode (required)
+  const VALID_MODES = ['threshold', 'scheduled', 'manual', 'disabled'];
+  if (!VALID_MODES.includes(body.mode)) {
+    return res.status(400).json({
+      error: `mode must be one of: ${VALID_MODES.join(', ')}`,
+      code: 'INVALID_MODE',
+    });
+  }
+
+  // Validate threshold_x if mode='threshold' (other modes can supply or
+  // omit; we tolerate but normalize)
+  let thresholdX = null;
+  if (body.threshold_x != null) {
+    const n = parseInt(body.threshold_x, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 50) {
+      return res.status(400).json({
+        error: 'threshold_x must be an integer between 1 and 50',
+        code: 'INVALID_THRESHOLD_X',
+      });
+    }
+    thresholdX = n;
+  } else if (body.mode === 'threshold') {
+    return res.status(400).json({
+      error: 'threshold_x is required when mode is threshold',
+      code: 'INVALID_THRESHOLD_X',
+    });
+  }
+
+  // Validate batch_size (required for all auto modes; tolerated/ignored
+  // for mode='disabled'; we still validate if supplied)
+  let batchSize = null;
+  if (body.batch_size != null) {
+    const n = parseInt(body.batch_size, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 20) {
+      return res.status(400).json({
+        error: 'batch_size must be an integer between 1 and 20',
+        code: 'INVALID_BATCH_SIZE',
+      });
+    }
+    batchSize = n;
+  } else if (body.mode === 'threshold' || body.mode === 'scheduled' || body.mode === 'manual') {
+    return res.status(400).json({
+      error: 'batch_size is required when mode is threshold, scheduled, or manual',
+      code: 'INVALID_BATCH_SIZE',
+    });
+  }
+
+  // Validate scheduled_hour if mode='scheduled'
+  let scheduledHour = null;
+  if (body.scheduled_hour != null) {
+    const n = parseInt(body.scheduled_hour, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 23) {
+      return res.status(400).json({
+        error: 'scheduled_hour must be an integer between 0 and 23',
+        code: 'INVALID_SCHEDULED_HOUR',
+      });
+    }
+    scheduledHour = n;
+  } else if (body.mode === 'scheduled') {
+    return res.status(400).json({
+      error: 'scheduled_hour is required when mode is scheduled',
+      code: 'INVALID_SCHEDULED_HOUR',
+    });
+  }
+
+  // Validate scheduled_days if supplied (always optional; empty/missing =
+  // every day)
+  const VALID_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+  let scheduledDays = null;
+  if (body.scheduled_days != null) {
+    if (!Array.isArray(body.scheduled_days)) {
+      return res.status(400).json({
+        error: 'scheduled_days must be an array',
+        code: 'INVALID_SCHEDULED_DAYS',
+      });
+    }
+    for (const d of body.scheduled_days) {
+      if (typeof d !== 'string' || !VALID_DAYS.includes(d)) {
+        return res.status(400).json({
+          error: `scheduled_days entries must be one of: ${VALID_DAYS.join(', ')}`,
+          code: 'INVALID_SCHEDULED_DAYS',
+        });
+      }
+    }
+    // Deduplicate while preserving canonical order
+    scheduledDays = VALID_DAYS.filter(d => body.scheduled_days.includes(d));
+  }
+
+  // Validate auto_initial_upload (boolean; default true if absent)
+  let autoInitialUpload;
+  if (body.auto_initial_upload === undefined || body.auto_initial_upload === null) {
+    autoInitialUpload = true;
+  } else if (typeof body.auto_initial_upload === 'boolean') {
+    autoInitialUpload = body.auto_initial_upload;
+  } else {
+    return res.status(400).json({
+      error: 'auto_initial_upload must be a boolean',
+      code: 'INVALID_AUTO_INITIAL_UPLOAD',
+    });
+  }
+
+  // Build the canonical config object. Only include fields that apply to
+  // the current mode plus the always-applicable batch_size and
+  // auto_initial_upload. This way runtime readers can rely on a clean
+  // contract and the UI doesn't have to filter stale fields when the
+  // mode changes.
+  const config = { mode: body.mode };
+  if (body.mode === 'threshold') config.threshold_x = thresholdX;
+  if (body.mode === 'scheduled') {
+    config.scheduled_hour = scheduledHour;
+    if (scheduledDays && scheduledDays.length > 0) config.scheduled_days = scheduledDays;
+  }
+  if (body.mode !== 'disabled') config.batch_size = batchSize;
+  config.auto_initial_upload = autoInitialUpload;
+
+  // Persist
+  let updateResult;
+  try {
+    const db = getDb();
+    updateResult = db.prepare(`
+      UPDATE ir_policies
+      SET replenishment_config = ?, updated_at = datetime('now')
+      WHERE id = ? AND deleted_at IS NULL
+    `).run(JSON.stringify(config), req.params.id);
+    db.close();
+  } catch (err) {
+    logger.error('Replenishment config update failed', {
+      policy_id: req.params.id, error: err.message,
+    });
+    return res.status(500).json({ error: 'Failed to update replenishment config' });
+  }
+
+  if (updateResult.changes === 0) {
+    return res.status(404).json({
+      error: 'Policy not found or has been deleted',
+      code: 'POLICY_NOT_FOUND',
+    });
+  }
+
+  auditLog(
+    req.user.id,
+    'OODA_POLICY_REPL_CONFIG_UPDATED',
+    `policy=${req.params.id} mode=${config.mode}`
+      + (config.threshold_x != null ? ` threshold_x=${config.threshold_x}` : '')
+      + (config.batch_size != null ? ` batch_size=${config.batch_size}` : '')
+      + (config.scheduled_hour != null ? ` hour=${config.scheduled_hour}` : '')
+      + (config.scheduled_days ? ` days=${config.scheduled_days.join(',')}` : '')
+      + ` auto_init=${config.auto_initial_upload}`,
+    req.ip
+  );
+
+  return res.json({
+    policy_id: req.params.id,
+    replenishment_config: config,
+  });
+});
+
 // ── Upload After-Action Report ───────────────────────────────────────────────
 // Same two-layer scan gate as POST /policies. AAR content is also LLM-prompt
 // input (commit 3's ooda-scenario-generator includes recent AARs in its
@@ -516,6 +718,27 @@ router.get('/aar', (req, res) => {
   } catch (err) {
     logger.error('List AAR error', { error: err.message });
     res.status(500).json({ error: 'Failed to list AARs' });
+  }
+});
+
+// ── Remove AAR ───────────────────────────────────────────────────────────────
+// Soft delete (matches the policy delete pattern). Preserves the row so any
+// historically-generated scenarios that referenced this AAR retain their
+// provenance trail. Lead/admin only.
+router.delete('/aar/:id', (req, res) => {
+  if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can remove AARs' });
+  try {
+    const db = getDb();
+    const result = db.prepare("UPDATE ooda_aars SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(req.params.id);
+    db.close();
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'AAR not found or already deleted' });
+    }
+    auditLog(req.user.id, 'OODA_AAR_REMOVED', req.params.id, req.ip);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('Remove AAR error', { error: err.message });
+    res.status(500).json({ error: 'Failed to remove AAR' });
   }
 });
 
@@ -846,6 +1069,14 @@ router.get('/history', (req, res) => {
 // progress view to show which areas the analyst is strong in vs. needs more
 // practice. Read-only; never writes to the DB.
 //
+// Access is analyst-only. Leads and admins are explicitly rejected here
+// even though the parent /api/ooda mount allows them — they don't take
+// trainings, so they don't have meaningful mastery data of their own.
+// A defense against future frontend changes that might accidentally
+// surface lead-mastery data: even if the UI were to call /mastery from
+// a lead session, the backend refuses. A separate route would be needed
+// to surface aggregate analyst-mastery data to leads (not built here).
+//
 // Response shape:
 //   {
 //     overall: { startedCount, completedCount, completionRate, avgDurationMs },
@@ -854,6 +1085,12 @@ router.get('/history', (req, res) => {
 //     recentCompletions: [ { scenarioId, title, type, difficulty, completedAt }, ... ],
 //   }
 router.get('/mastery', (req, res) => {
+  if (req.user.role !== 'analyst') {
+    return res.status(403).json({
+      error: 'Mastery tracking is for analysts only',
+      code: 'MASTERY_ANALYST_ONLY',
+    });
+  }
   try {
     const db = getDb();
     // Overall counts. Single round-trip for both started and completed

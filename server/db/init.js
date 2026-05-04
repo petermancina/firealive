@@ -552,14 +552,30 @@ CREATE TABLE IF NOT EXISTS ir_policies (
   --                                       (only for mode=threshold)
   --     "batch_size": 1-20,              target_count_per_difficulty for
   --                                       replenishment jobs
-  --     "scheduled_cron": "<cron expr>", optional, only for mode=scheduled
+  --     "scheduled_hour": 0-23,          required for mode=scheduled; the
+  --                                       hour-of-day at which the cron
+  --                                       fires the policy's batch
+  --     "scheduled_days": ["sun"..."sat"], optional for mode=scheduled;
+  --                                       array of 3-letter lowercase day
+  --                                       codes. Empty/missing means every
+  --                                       day. Server canonicalizes to
+  --                                       sun-through-sat sequence and
+  --                                       deduplicates.
   --     "auto_initial_upload": bool      whether to auto-enqueue an
   --                                       initial-batch generation job at
-  --                                       policy upload time
+  --                                       policy upload time (storage in
+  --                                       place; upload-time hook is a
+  --                                       future F4c task)
   --   }
-  -- Application layer validates the JSON shape; SQLite stores the blob
-  -- verbatim. Defaults represent "threshold mode, refill when <2 unplayed
-  -- remain, batch size 5 per difficulty, auto-generate on upload" — the
+  -- Application layer validates the JSON shape (PATCH /api/ooda/policies/
+  -- :id/replenishment-config in routes/ooda.js does the canonical
+  -- validation); SQLite stores the blob verbatim. The hour+days schedule
+  -- format was chosen over full cron expressions because SOC leads
+  -- typically don't write cron and the daily/weekly schedules they
+  -- actually want all map cleanly to (hour, optional days) — avoiding a
+  -- cron-parser dependency and keeping the wizard UI a checkbox grid.
+  -- Defaults represent "threshold mode, refill when <2 unplayed remain,
+  -- batch size 5 per difficulty, auto-generate on upload" — the
   -- recommended setup that matches the F4c product brief.
   replenishment_config TEXT NOT NULL DEFAULT '{"mode":"threshold","threshold_x":2,"batch_size":5,"auto_initial_upload":true}'
 );
