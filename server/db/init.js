@@ -825,6 +825,23 @@ CREATE INDEX IF NOT EXISTS idx_malware_scanner_provider
 -- ── AI Provider Configuration ────────────────────────────────────────────
 -- Per-feature routing for AI calls. One row per AI-using feature.
 -- The dispatcher reads this to decide internal vs external for each call.
+--
+-- Adding a new AI feature requires updating the feature_id CHECK list
+-- below BEFORE any code calls aiProvider.generate('new_feature', ...).
+-- Order of operations:
+--
+--   1. Add the new feature_id literal to the CHECK list below. SQLite
+--      cannot drop or amend a CHECK constraint in place, so for a live
+--      database the change ships as an idempotent migration block (see
+--      the migration helper later in this file for the pattern: a
+--      transactional rename-rebuild of ai_provider_config that copies
+--      existing rows into a new table with the expanded CHECK).
+--   2. Then add the code path that calls aiProvider.generate with the
+--      new feature_id.
+--
+-- Reversing the order produces a hard error at the first generate()
+-- call, because the dispatcher will try to upsert a row whose
+-- feature_id violates the constraint and SQLite will reject it.
 
 CREATE TABLE IF NOT EXISTS ai_provider_config (
   feature_id TEXT PRIMARY KEY CHECK (feature_id IN (

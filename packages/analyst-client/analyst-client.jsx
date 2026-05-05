@@ -62,7 +62,7 @@ const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;paddin
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:3px}`;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// RESEARCH KNOWLEDGE BASE v2026.03.2 — 42 peer-reviewed entries
+// RESEARCH KNOWLEDGE BASE v2026.03.3 — 42 peer-reviewed entries
 // ══════════════════════════════════════════════════════════════════════════════
 const RESEARCH_KB = [
   {id:"R001",topic:"intervention",tags:["organizational","meta-analysis","exhaustion"],finding:"Organizational interventions produce effect size d=−0.30 on exhaustion (CI: −0.42 to −0.18), with participatory interventions strongest.",implication:"Structural changes (workload, scheduling, participatory redesign) are evidence-based first response.",strength:"strong",cite:"Shoman et al. (2023), Int Arch Occup Environ Health, 96(7), 1009–1025",year:2023},

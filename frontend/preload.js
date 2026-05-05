@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const pkg = require('./package.json');
 
 // Expose only whitelisted IPC channels
 const ALLOWED_CHANNELS = [
@@ -23,6 +24,6 @@ contextBridge.exposeInMainWorld('firealive', {
       ipcRenderer.on(channel, (event, ...args) => callback(...args));
     }
   },
-  version: '1.0.19',
+  version: pkg.version,
   component: 'analyst-client',
 });

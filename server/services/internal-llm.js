@@ -23,10 +23,9 @@
 // or defaults to ~/.firealive/models/. The bootstrap script
 // (scripts/download-model.js, commit 5) downloads the model on first run.
 //
-// Inference runs in the main Node process by default. For deployments
-// where MC responsiveness during long generation is critical, the
-// FIREALIVE_LLM_USE_WORKER env var enables worker-thread inference
-// (transparent to callers; same generate() interface).
+// Idle-unload behavior is configurable via FIREALIVE_LLM_IDLE_UNLOAD_MS.
+// Set to a positive integer (milliseconds) to override the default of
+// 5 minutes. Invalid values fall back to the default with a warning log.
 //
 // ── Path-injection defense ──────────────────────────────────────────────────
 // Any caller-supplied model path (e.g. from POST /api/ai-provider/model/load
@@ -78,7 +77,21 @@ const { logger } = require('./logger');
 
 // Configuration
 const DEFAULT_MODEL_FILENAME = 'phi-3-mini-4k-instruct-q4.gguf';
-const DEFAULT_IDLE_UNLOAD_MS = 5 * 60 * 1000;  // unload after 5 minutes of no use
+
+// Idle-unload timeout. Read once at module load from the
+// FIREALIVE_LLM_IDLE_UNLOAD_MS env var (positive integer milliseconds);
+// invalid or missing falls back to 5 minutes. The header documents this.
+function resolveIdleUnloadMs() {
+  const raw = process.env.FIREALIVE_LLM_IDLE_UNLOAD_MS;
+  if (raw === undefined || raw === '') return 5 * 60 * 1000;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn('FIREALIVE_LLM_IDLE_UNLOAD_MS is not a positive integer; using default', { value: raw });
+    return 5 * 60 * 1000;
+  }
+  return parsed;
+}
+const IDLE_UNLOAD_MS = resolveIdleUnloadMs();
 
 // Module-level state
 let llamaModule = null;       // lazily-required node-llama-cpp module
@@ -103,7 +116,7 @@ function getStatus() {
     modelSizeBytes: modelInfo ? modelInfo.sizeBytes : null,
     loadedAt: modelInfo ? modelInfo.loadedAt : null,
     lastInferenceAt,
-    idleUnloadMs: DEFAULT_IDLE_UNLOAD_MS,
+    idleUnloadMs: IDLE_UNLOAD_MS,
     available: modelFileExists(),
   };
 }
@@ -251,7 +264,7 @@ function resetIdleTimer() {
   idleTimer = setTimeout(() => {
     logger.info('Internal LLM idle timeout — unloading');
     unloadModel().catch(err => logger.error('Idle unload failed', { error: err.message }));
-  }, DEFAULT_IDLE_UNLOAD_MS);
+  }, IDLE_UNLOAD_MS);
 }
 
 // ── Path resolution + validation ────────────────────────────────────────────
