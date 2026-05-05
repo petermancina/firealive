@@ -23,6 +23,6 @@ contextBridge.exposeInMainWorld('firealive', {
       ipcRenderer.on(channel, (event, ...args) => callback(...args));
     }
   },
-  version: '1.0.0',
+  version: '1.0.19',
   component: 'analyst-client',
 });

@@ -281,10 +281,6 @@ export default function AnalystClientApp() {
     return () => { ev.forEach(e => window.removeEventListener(e, resetLock)); clearTimeout(lockRef.current); };
   }, [stage]);
   const [biometricEnabled, setBiometricEnabled] = useState(false);
-  // v1.0.0: IR Simulator tracking
-  const [irLevel, setIrLevel] = useState(1);
-  const [irPoints, setIrPoints] = useState(0);
-  const [irCompletedScenarios, setIrCompleted] = useState([]);
   // v1.0.0: Cert upload state
   const [certUploadName, setCertUploadName] = useState("");
   const [certUploadIssuer, setCertUploadIssuer] = useState("");
@@ -293,6 +289,43 @@ export default function AnalystClientApp() {
   const [uploadedCerts, setUploadedCerts] = useState([]);
   // v1.0.0: Upskilling content filter active
   const [contentFilterActive, setContentFilterActive] = useState(false);
+
+  // F4d: OODA scenario state — server-driven, replaces hardcoded phases array.
+  // Populated by GET /api/ooda/scenarios on mount and GET /api/ooda/scenarios/:id
+  // when an analyst selects a scenario to run. The full node tree never reaches
+  // the client; we walk node-by-node via POST /api/ooda/scenarios/:id/play.
+  const [oodaScenarioList, setOodaScenarioList] = useState([]);
+  const [oodaScenarioId, setOodaScenarioId] = useState(null);
+  const [oodaScenarioData, setOodaScenarioData] = useState(null);
+  const [oodaCurrentNode, setOodaCurrentNode] = useState(null);
+  const [oodaPhasesVisited, setOodaPhasesVisited] = useState([]);
+  const [oodaLoading, setOodaLoading] = useState(false);
+  const [oodaError, setOodaError] = useState(null);
+  // F4d: per-analyst exercise history from GET /api/ooda/history.
+  // Each entry: {scenarioId, title, type, difficulty, nodesCompleted,
+  // totalNodes, startedAt, completedAt}. completedAt is null for runs in
+  // progress. Joined against oodaScenarioList in the policies-practiced
+  // Card to render practiced/in-progress/not-yet rows.
+  const [oodaHistory, setOodaHistory] = useState([]);
+  // F4d: per-analyst mastery aggregation from GET /api/ooda/mastery.
+  // Shape: {overall:{startedCount, completedCount, completionRate,
+  // avgDurationMs}, byType:[{type, started, completed, completionRate}],
+  // byDifficulty:[{difficulty, started, completed, completionRate}],
+  // recentCompletions:[{scenarioId, title, type, difficulty, completedAt}]}.
+  // Endpoint is analyst-only on the server (returns 403 for leads/admins);
+  // AC is an analyst-only client so this should always succeed, but null
+  // is the graceful-degradation fallback if the fetch errors.
+  const [oodaMastery, setOodaMastery] = useState(null);
+  // F4d: choice feedback from POST /api/ooda/scenarios/:id/play.
+  // Shape: {ci: <choiceIndex>, correct: <bool>, explanation: <string>}.
+  // Cleared after the post-correct delay before advancing to the next
+  // node, or when the analyst picks a different scenario.
+  const [oodaPlayFb, setOodaPlayFb] = useState(null);
+  // F4d: scenario completion flag. Set true when the server's
+  // /play response returns {complete: true} after a correct choice.
+  // The render layer uses this to swap from the active player into
+  // the completion summary card.
+  const [oodaComplete, setOodaComplete] = useState(false);
 
   // ── Runtime version info from /api/system/version (Phase 1.4 release-v1.0.10) ──
   const [appVersion, setAppVersion] = useState("");
@@ -303,6 +336,105 @@ export default function AnalystClientApp() {
       if (r?.buildId) setAppBuild(r.buildId);
     }).catch(()=>{});
   }, []);
+
+  // F4d: load OODA scenario list on mount.
+  // The picker UI added in a later commit lets the analyst choose which
+  // scenario to run; this fetch populates the choices. Best-effort — if the
+  // server is unavailable, the list stays empty and the IR Simulator tab
+  // shows an empty-state message.
+  useEffect(()=>{
+    api.get("/api/ooda/scenarios").then(r=>{
+      if (r?.scenarios) setOodaScenarioList(r.scenarios);
+    }).catch(()=>{});
+  }, []);
+
+  // F4d: load this analyst's OODA exercise history on mount.
+  // Used by the policies-practiced Card to render practiced vs not-yet
+  // rows joined against oodaScenarioList. Best-effort — empty history
+  // simply means every scenario shows "not yet" until the analyst
+  // starts one.
+  useEffect(()=>{
+    api.get("/api/ooda/history").then(r=>{
+      if (Array.isArray(r?.history)) setOodaHistory(r.history);
+    }).catch(()=>{});
+  }, []);
+
+  // F4d: load this analyst's OODA mastery aggregation on mount.
+  // Drives the IR Policy Mastery Card. Best-effort — null on failure
+  // and the card renders zeroed placeholders so the layout doesn't shift.
+  useEffect(()=>{
+    api.get("/api/ooda/mastery").then(r=>{
+      if (r && r.overall) setOodaMastery(r);
+    }).catch(()=>{});
+  }, []);
+
+  // F4d: select a scenario by id. Fetches GET /api/ooda/scenarios/:id
+  // (returns briefing, startNode, totalNodes — never the full tree)
+  // and primes oodaScenarioData / oodaCurrentNode / oodaPhasesVisited
+  // so the IR Simulator player can render the briefing and the first
+  // node. Wrong-choice walks and node advancement happen in a later
+  // commit via POST /api/ooda/scenarios/:id/play.
+  const selectScenario = (scenarioId) => {
+    setOodaLoading(true);
+    setOodaError(null);
+    setOodaScenarioId(scenarioId);
+    setOodaPlayFb(null);
+    setOodaComplete(false);
+    api.get("/api/ooda/scenarios/" + encodeURIComponent(scenarioId)).then(r => {
+      if (r && r.startNode) {
+        setOodaScenarioData(r);
+        setOodaCurrentNode(r.startNode);
+        setOodaPhasesVisited(r.startNode.phase ? [r.startNode.phase] : []);
+        logC("OS", "Selected scenario: " + (r.title || scenarioId));
+      } else {
+        setOodaError("Failed to load scenario data.");
+      }
+    }).catch(() => {
+      setOodaError("Could not load scenario. Please try again.");
+    }).then(() => {
+      setOodaLoading(false);
+    });
+  };
+
+  // F4d: submit a choice for the current node. Calls
+  // POST /api/ooda/scenarios/:id/play with {currentNodeId, choiceIndex}.
+  // Server-side, wrong choices keep the analyst on the same node (the
+  // explanation is the teaching moment); correct choices advance to
+  // nextNode and write progress. The render layer shows transient
+  // feedback, then either advances to the next node or flips the
+  // completion flag when {complete: true} returns.
+  const submitChoice = (choiceIndex) => {
+    if (!oodaScenarioId || !oodaCurrentNode) return;
+    setOodaLoading(true);
+    setOodaError(null);
+    api.post("/api/ooda/scenarios/" + encodeURIComponent(oodaScenarioId) + "/play", {
+      currentNodeId: oodaCurrentNode.id,
+      choiceIndex: choiceIndex,
+    }).then(r => {
+      if (!r) { setOodaError("No response from server."); return; }
+      setOodaPlayFb({ ci: choiceIndex, correct: !!r.correct, explanation: r.explanation || "" });
+      if (r.correct) {
+        logC("ooda_correct", oodaCurrentNode.phase || "");
+        setTimeout(() => {
+          setOodaPlayFb(null);
+          if (r.complete) {
+            setOodaComplete(true);
+          } else if (r.nextNode) {
+            setOodaCurrentNode(r.nextNode);
+            if (r.nextNode.phase) {
+              setOodaPhasesVisited(prev => [...prev, r.nextNode.phase]);
+            }
+          }
+        }, 2200);
+      } else {
+        logC("ooda_wrong", oodaCurrentNode.phase || "");
+      }
+    }).catch(() => {
+      setOodaError("Could not submit choice. Please try again.");
+    }).then(() => {
+      setOodaLoading(false);
+    });
+  };
 
   // ── Welcome guide ──
   const [welcomeStep, setWelcomeStep] = useState(0);
@@ -414,8 +546,6 @@ export default function AnalystClientApp() {
     {id:2,topic:"Threat intel feed dedup — how do you handle overlapping IOCs from multiple sources?",time:"after_shift",burnout:false,ts:"18 min ago"},
     {id:3,topic:"Alert fatigue from noisy WAF rules — looking for tuning advice",time:"tomorrow",burnout:true,ts:"1 hr ago"},
   ]);
-  const [oodaStage, setOodaStage] = useState(0);
-  const [oodaFb, setOodaFb] = useState(null);
   const [showLeadMsg, setShowLeadMsg] = useState(false);
   const [leadMsgs, setLM] = useState([]);
   const [newLM, setNewLM] = useState("");
@@ -961,95 +1091,176 @@ export default function AnalystClientApp() {
           <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Practice incident response using your organization's specific IR policies — not generic textbook procedures. This simulator trains you on how YOUR team responds in YOUR SOC, using the policies your Team Lead has uploaded. General certifications teach you frameworks; this teaches you how to execute them here.</M>
           <M style={{color:C.tm,display:"block",marginBottom:16}}><span style={{color:C.a}}>Observe</span> → <span style={{color:C.i}}>Orient</span> → <span style={{color:C.p}}>Decide</span> → <span style={{color:C.w}}>Act</span> → Resolution</M>
 
-          {/* IR Policy Mastery Tracker */}
+          {/* F4d: IR Policy Mastery Tracker — server-driven from /api/ooda/mastery + /api/ooda/scenarios */}
           <Card style={{marginBottom:16,borderColor:C.p+"30"}}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Your IR Policy Mastery</div>
-              <Badge color={C.p}>Level 4 / 10</Badge>
+              <Badge color={C.p}>Level {oodaMastery ? oodaMastery.overall.completedCount : 0} / {oodaScenarioList.length || 0}</Badge>
             </div>
             <div style={{width:"100%",height:8,background:C.b,borderRadius:4,marginBottom:10}}>
-              <div style={{width:"40%",height:"100%",background:C.p,borderRadius:4}}/>
+              <div style={{width: (oodaMastery && oodaScenarioList.length > 0) ? (Math.min(100, Math.round((oodaMastery.overall.completedCount / oodaScenarioList.length) * 100)) + "%") : "0%", height:"100%",background:C.p,borderRadius:4}}/>
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
-              <div style={{textAlign:"center"}}><M style={{color:C.a,fontWeight:600}}>7</M><br/><M style={{color:C.td}}>Simulations completed</M></div>
-              <div style={{textAlign:"center"}}><M style={{color:C.i,fontWeight:600}}>3 / 8</M><br/><M style={{color:C.td}}>Org policies practiced</M></div>
-              <div style={{textAlign:"center"}}><M style={{color:C.w,fontWeight:600}}>78%</M><br/><M style={{color:C.td}}>Avg correct decisions</M></div>
+              <div style={{textAlign:"center"}}><M style={{color:C.a,fontWeight:600}}>{oodaMastery ? oodaMastery.overall.completedCount : 0}</M><br/><M style={{color:C.td}}>Simulations completed</M></div>
+              <div style={{textAlign:"center"}}><M style={{color:C.i,fontWeight:600}}>{oodaMastery ? oodaMastery.byType.length : 0} / {oodaScenarioList.length ? new Set(oodaScenarioList.map(s => s.type)).size : 0}</M><br/><M style={{color:C.td}}>Policy types practiced</M></div>
+              <div style={{textAlign:"center"}}><M style={{color:C.w,fontWeight:600}}>{oodaMastery ? Math.round((oodaMastery.overall.completionRate || 0) * 100) : 0}%</M><br/><M style={{color:C.td}}>Completion rate</M></div>
             </div>
-            <M style={{color:C.td,display:"block",fontStyle:"italic"}}>Each simulation trains you on a different org policy. As you complete more, your level increases and reflects practical knowledge of your SOC's specific procedures — something no external certification can provide.</M>
+            <M style={{color:C.td,display:"block",fontStyle:"italic"}}>Each simulation trains you on a different org policy. As you complete more, your mastery score increases and reflects practical knowledge of your SOC's specific procedures — something no external certification can provide.</M>
           </Card>
 
-          {/* Policies practiced vs not yet */}
+          {/* F4d: Org policies practiced — server-driven from /api/ooda/scenarios + /api/ooda/history */}
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Org Policies Practiced</div>
-            {[{name:"Ransomware Response Protocol",practiced:true,score:85},{name:"Data Exfiltration Playbook",practiced:true,score:72},{name:"Insider Threat Protocol",practiced:true,score:90},{name:"Phishing Campaign Response",practiced:false},{name:"DDoS Mitigation Procedure",practiced:false},{name:"APT Investigation Protocol",practiced:false},{name:"Supply Chain Compromise",practiced:false},{name:"Cloud Security Incident",practiced:false}].map((p,i)=>(
-              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
-                <M style={{color:p.practiced?C.t:C.td}}>{p.name}</M>
-                {p.practiced?<div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={C.a}>{p.score}%</Badge><Btn small onClick={()=>logC("OR","Retry: "+p.name)}>Retry</Btn></div>:<div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={C.td}>not yet</Badge><Btn small primary onClick={()=>logC("OS","Start: "+p.name)}>Start</Btn></div>}
+            {oodaScenarioList.length === 0 ? (
+              <M style={{color:C.td,display:"block",padding:"12px 0",fontStyle:"italic"}}>Your team lead has not yet generated any scenarios. Once an org policy is uploaded and a scenario is generated, it will appear here for practice.</M>
+            ) : (
+              oodaScenarioList.map((s) => {
+                const h = oodaHistory.find(x => x.scenarioId === s.id);
+                const completed = !!(h && h.completedAt);
+                const inProgress = !!(h && !h.completedAt);
+                const progressPct = (h && h.totalNodes) ? Math.round((h.nodesCompleted / h.totalNodes) * 100) : 0;
+                return (
+                  <div key={s.id} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
+                    <M style={{color: (completed || inProgress) ? C.t : C.td}}>{s.title}</M>
+                    {completed ? (
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={C.a}>completed</Badge><Btn small onClick={()=>logC("OR","Retry: "+s.title)}>Retry</Btn></div>
+                    ) : inProgress ? (
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={C.i}>{progressPct}%</Badge><Btn small primary onClick={()=>logC("OC","Continue: "+s.title)}>Continue</Btn></div>
+                    ) : (
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={C.td}>not yet</Badge><Btn small primary onClick={()=>logC("OS","Start: "+s.title)}>Start</Btn></div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </Card>
+
+          {/* F4d: Scenario picker — selects which scenario to run via GET /api/ooda/scenarios/:id */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Choose a Scenario to Run</div>
+            {oodaScenarioList.length === 0 ? (
+              <M style={{color:C.td,fontStyle:"italic"}}>No scenarios available yet. Your team lead will generate them from your org's IR policies.</M>
+            ) : (
+              <div>
+                <select
+                  value={oodaScenarioId || ""}
+                  onChange={(e)=>{ const id = e.target.value; if (id) selectScenario(id); }}
+                  disabled={oodaLoading}
+                  style={{width:"100%",padding:"8px 10px",background:C.b,color:C.t,border:`1px solid ${C.b}`,borderRadius:4,fontSize:13,marginBottom:6}}
+                >
+                  <option value="">— Select a scenario —</option>
+                  {oodaScenarioList.map(s => (
+                    <option key={s.id} value={s.id}>{s.title} ({s.difficulty})</option>
+                  ))}
+                </select>
+                {oodaLoading && <M style={{color:C.i,display:"block",marginTop:4}}>Loading scenario...</M>}
+                {oodaError && <M style={{color:C.d,display:"block",marginTop:4}}>{oodaError}</M>}
+                {oodaScenarioData && !oodaLoading && !oodaError && (
+                  <M style={{color:C.a,display:"block",marginTop:4,fontSize:11}}>Selected: {oodaScenarioData.title || "scenario"} — {oodaScenarioData.totalNodes} step{oodaScenarioData.totalNodes === 1 ? "" : "s"}</M>
+                )}
               </div>
-            ))}
+            )}
           </Card>
           {(()=>{
-            const phases=[
-              {phase:"OBSERVE",color:C.a,prompt:"You receive a P1 alert about encrypted files on 3 finance workstations. The SIEM flags anomalous SMB traffic. What do you look at first?",choices:[
-                {text:"Check the SIEM for correlated alerts across the network",correct:true,explain:"Correct — establishing the scope is the first priority."},
-                {text:"Immediately disconnect all affected machines",correct:false,explain:"Containment belongs in the Act phase. First Observe."},
-                {text:"Open the ransom note to identify the group",correct:false,explain:"Never interact with ransomware artifacts from your workstation."},
-              ]},
-              {phase:"ORIENT",color:C.i,prompt:"SIEM shows SMB lateral movement to 47 endpoints. EDR confirms ransomware. Source is a finance service account with admin rights. How do you Orient?",choices:[
-                {text:"Map the service account permissions, identify all reachable systems, check for domain admin escalation",correct:true,explain:"Correct — build a complete picture. The service account reach defines your containment boundary."},
-                {text:"Disable the service account immediately",correct:false,explain:"This is an Act step. Acting without full orientation could alert the attacker to pivot."},
-              ]},
-              {phase:"DECIDE",color:C.p,prompt:"47 endpoints affected, no domain admin escalation, attacker used an unpatched CVE. What is your decision?",choices:[
-                {text:"Coordinate simultaneous containment: disable account, isolate OU, preserve forensic images",correct:true,explain:"Correct — simultaneous containment prevents the attacker from reacting."},
-                {text:"Patch the vulnerability first to prevent reinfection",correct:false,explain:"Patching is recovery. The attacker is active — contain first."},
-              ]},
-              {phase:"ACT",color:C.w,prompt:"You decided on coordinated containment. What execution order?",choices:[
-                {text:"Network isolate OU, then disable account, then forensic imaging, then notify management",correct:true,explain:"Correct — isolation prevents spread, then credential kill, evidence preservation, then notifications."},
-                {text:"Notify management, then disable account, then cleanup",correct:false,explain:"Notifications should not delay containment."},
-              ]},
-            ];
-            if(oodaStage>=phases.length) return(
-              <Card style={{borderColor:C.a+"40",padding:24}}>
-                <div style={{fontSize:18,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:8,textAlign:"center"}}>Exercise Complete — +10 Points</div>
-                <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6,textAlign:"center"}}>You navigated all four OODA phases successfully. Your IR Simulator level: {irLevel}.</M>
-                <Card style={{borderColor:C.i+"30",padding:14,marginBottom:16}}>
-                  <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:6}}>Organization Policy Used for This Exercise</M>
-                  <M style={{color:C.tm,lineHeight:1.8}}>Policy: Ransomware Incident Response Procedure (IRP-2024-003){"\n"}Source: Uploaded by Team Lead on 2026-04-01{"\n"}Version: 2.1{"\n"}Key requirements: Coordinate simultaneous containment, preserve forensic evidence before cleanup, network isolation before credential revocation, management notification after containment.{"\n"}{"\n"}This is YOUR organization's actual policy document — not AI-generated content. Review the full policy in your org's policy repository for complete procedures.</M>
+            // F4d: Server-driven scenario player. Replaces the hardcoded
+            // ransomware IIFE. Reads from oodaScenarioData (populated by
+            // selectScenario via GET /api/ooda/scenarios/:id) and walks
+            // node-by-node via POST /api/ooda/scenarios/:id/play. The
+            // full node tree never reaches the client; only the current
+            // node is visible.
+
+            // Empty state when no scenario is selected
+            if (!oodaScenarioData || !oodaCurrentNode) {
+              return (
+                <Card style={{marginBottom:16,padding:"16px 14px",textAlign:"center"}}>
+                  <M style={{color:C.tm,fontStyle:"italic",lineHeight:1.6}}>Select a scenario above to begin a new exercise. Each scenario walks you through your organization's actual IR policy step by step.</M>
                 </Card>
-                <Btn primary onClick={()=>{setOodaStage(0);setOodaFb(null);const newPts=irPoints+10;setIrPoints(newPts);if(newPts>=50&&irLevel<5)setIrLevel(Math.min(5,Math.floor(newPts/10)));setIrCompleted(prev=>[...prev,{scenario:"ransomware",completedAt:new Date().toISOString(),points:10}]);logC("IR_SIM_COMPLETE","Ransomware exercise completed — +10 points, level "+irLevel);}}>Continue (+10 pts)</Btn>
-              </Card>
-            );
-            const stg=phases[oodaStage];
-            return(
-              <Card style={{marginBottom:16,borderLeft:`3px solid ${stg.color}`}}>
-                <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>Ransomware Containment Exercise</div>
-                <div style={{display:"flex",gap:6,marginBottom:12}}>{phases.map((s,i)=><Badge key={i} color={i<oodaStage?C.a:i===oodaStage?s.color:C.td}>{s.phase}{i<oodaStage?" ✓":""}</Badge>)}</div>
-                <div style={{padding:12,background:`${stg.color}08`,borderRadius:8,border:`1px solid ${stg.color}30`,marginBottom:12}}><M style={{color:"#E8EDF5",lineHeight:1.6}}>{stg.prompt}</M></div>
-                {stg.choices.map((ch,ci)=>(
-                  <Card key={ci} style={{marginBottom:6,padding:"10px 14px",cursor:"pointer",borderColor:(oodaFb||{}).ci===ci?(ch.correct?C.a+"60":C.d+"60"):C.b,background:(oodaFb||{}).ci===ci?(ch.correct?"rgba(110,231,183,0.06)":"rgba(239,68,68,0.06)"):"transparent",transition:"all 0.2s"}} onClick={()=>{
-                    setOodaFb({ci,correct:ch.correct,explain:ch.explain});
-                    if(ch.correct){logC("ooda_correct",stg.phase);setTimeout(()=>{setOodaStage(prev=>prev+1);setOodaFb(null);},2200);}else{logC("ooda_wrong",stg.phase);}
-                  }}>
-                    <div style={{display:"flex",gap:10,alignItems:"flex-start"}}><M style={{color:stg.color,fontWeight:600,minWidth:16}}>{String.fromCharCode(65+ci)}</M><M style={{color:C.t,lineHeight:1.5}}>{ch.text}</M></div>
+              );
+            }
+
+            // Completion state
+            if (oodaComplete) {
+              return (
+                <Card style={{borderColor:C.a+"40",padding:24,marginBottom:16}}>
+                  <div style={{fontSize:18,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:8,textAlign:"center"}}>Exercise Complete</div>
+                  <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6,textAlign:"center"}}>You completed all {oodaScenarioData.totalNodes} step{oodaScenarioData.totalNodes === 1 ? "" : "s"} of "{oodaScenarioData.title}".</M>
+                  <Card style={{borderColor:C.i+"30",padding:14,marginBottom:16}}>
+                    <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:6}}>Scenario Reference</M>
+                    <M style={{color:C.tm,lineHeight:1.8}}>Title: {oodaScenarioData.title}{"\n"}Type: {oodaScenarioData.type}{"\n"}Difficulty: {oodaScenarioData.difficulty}{"\n\n"}This scenario was generated from one of your organization's IR policies. Review the source policy in your org's policy repository for the complete procedure.</M>
                   </Card>
-                ))}
-                {oodaFb&&(<div style={{padding:12,marginTop:8,background:oodaFb.correct?"rgba(110,231,183,0.08)":"rgba(239,68,68,0.08)",borderRadius:8,border:`1px solid ${oodaFb.correct?C.a:C.d}30`}}>
-                  <M style={{color:oodaFb.correct?C.a:C.d,fontWeight:500}}>{oodaFb.correct?"✓ Correct":"✗ Try again"}</M><br/><M style={{color:C.tm,lineHeight:1.6}}>{oodaFb.explain}</M>
-                  {oodaFb.correct&&<M style={{color:C.a,display:"block",marginTop:4}}>Advancing...</M>}
-                </div>)}
+                  <Btn primary onClick={()=>{
+                    setOodaScenarioId(null);
+                    setOodaScenarioData(null);
+                    setOodaCurrentNode(null);
+                    setOodaPhasesVisited([]);
+                    setOodaPlayFb(null);
+                    setOodaComplete(false);
+                    setOodaError(null);
+                    api.get("/api/ooda/history").then(r=>{ if (Array.isArray(r?.history)) setOodaHistory(r.history); }).catch(()=>{});
+                    api.get("/api/ooda/mastery").then(r=>{ if (r && r.overall) setOodaMastery(r); }).catch(()=>{});
+                    logC("IR_SIM_COMPLETE", "Completed: " + oodaScenarioData.title);
+                  }}>Choose Another Scenario</Btn>
+                </Card>
+              );
+            }
+
+            // Active player state
+            const node = oodaCurrentNode;
+            const phaseColor = node.phase === "OBSERVE" ? C.a : node.phase === "ORIENT" ? C.i : node.phase === "DECIDE" ? C.p : node.phase === "ACT" ? C.w : C.t;
+            return (
+              <Card style={{marginBottom:16,borderLeft:`3px solid ${phaseColor}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>{oodaScenarioData.title}</div>
+                  <M style={{color:C.tm,fontSize:11}}>Step {oodaPhasesVisited.length} of {oodaScenarioData.totalNodes}</M>
+                </div>
+                <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+                  {oodaPhasesVisited.map((p,i)=>(
+                    <Badge key={i} color={i < oodaPhasesVisited.length - 1 ? C.a : phaseColor}>{p}{i < oodaPhasesVisited.length - 1 ? " ✓" : ""}</Badge>
+                  ))}
+                </div>
+                {oodaScenarioData.briefing && oodaPhasesVisited.length === 1 && (
+                  <Card style={{borderColor:C.b,padding:10,marginBottom:10}}>
+                    <M style={{color:C.tm,lineHeight:1.6,fontSize:11}}>{oodaScenarioData.briefing}</M>
+                  </Card>
+                )}
+                <div style={{padding:12,background:`${phaseColor}08`,borderRadius:8,border:`1px solid ${phaseColor}30`,marginBottom:12}}>
+                  <M style={{color:"#E8EDF5",lineHeight:1.6}}>{node.prompt}</M>
+                </div>
+                {Array.isArray(node.choices) && node.choices.map((ch, ci) => {
+                  const fbForThis = oodaPlayFb && oodaPlayFb.ci === ci;
+                  return (
+                    <Card key={ci} style={{
+                      marginBottom:6,padding:"10px 14px",
+                      cursor: oodaLoading ? "wait" : "pointer",
+                      borderColor: fbForThis ? (oodaPlayFb.correct ? C.a+"60" : C.d+"60") : C.b,
+                      background: fbForThis ? (oodaPlayFb.correct ? "rgba(110,231,183,0.06)" : "rgba(239,68,68,0.06)") : "transparent",
+                      transition:"all 0.2s",
+                      opacity: oodaLoading && !fbForThis ? 0.5 : 1
+                    }} onClick={()=>{ if (!oodaLoading && !oodaPlayFb) submitChoice(ci); }}>
+                      <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+                        <M style={{color:phaseColor,fontWeight:600,minWidth:16}}>{String.fromCharCode(65+ci)}</M>
+                        <M style={{color:C.t,lineHeight:1.5}}>{ch.text}</M>
+                      </div>
+                    </Card>
+                  );
+                })}
+                {oodaPlayFb && (
+                  <div style={{padding:12,marginTop:8,background:oodaPlayFb.correct?"rgba(110,231,183,0.08)":"rgba(239,68,68,0.08)",borderRadius:8,border:`1px solid ${oodaPlayFb.correct?C.a:C.d}30`}}>
+                    <M style={{color:oodaPlayFb.correct?C.a:C.d,fontWeight:500}}>{oodaPlayFb.correct?"✓ Correct":"✗ Try again"}</M>
+                    <br/>
+                    <M style={{color:C.tm,lineHeight:1.6}}>{oodaPlayFb.explanation}</M>
+                    {oodaPlayFb.correct && <M style={{color:C.a,display:"block",marginTop:4}}>Advancing...</M>}
+                  </div>
+                )}
+                {oodaError && (
+                  <div style={{padding:10,marginTop:8,borderRadius:8,border:`1px solid ${C.d}30`}}>
+                    <M style={{color:C.d}}>{oodaError}</M>
+                  </div>
+                )}
               </Card>
             );
           })()}
-          <Card style={{marginBottom:12}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-              <div><M style={{color:C.i,fontWeight:500}}>Your IR Simulator Progress</M></div>
-              <Badge color={irLevel>=5?C.a:irLevel>=3?C.i:C.p}>Level {irLevel}{irLevel>=5?" — IR Policy Expert":irLevel>=3?" — Proficient":""}</Badge>
-            </div>
-            <M style={{color:C.tm,display:"block",marginBottom:8}}>Points: {irPoints} · Scenarios completed: {irCompletedScenarios.length} · Level {irLevel} of 5</M>
-            <div style={{width:"100%",height:6,background:C.b,borderRadius:3}}><div style={{width:Math.min(100,irPoints/10)+"%",height:"100%",background:C.i,borderRadius:3}}/></div>
-            <M style={{color:C.td,display:"block",marginTop:8,fontStyle:"italic"}}>This simulator trains you on YOUR organization's IR policies — not generic textbook responses. Each scenario is generated from policies your Team Lead uploaded. The policy used for each exercise is shown after completion so you can verify the training matches your org's actual protocols.</M>
-          </Card>
-          <Card style={{padding:"12px 14px"}}><M style={{color:C.td}}>More exercises generated when your lead uploads IR policies from the Management Console. After each simulation, the specific policy document used will be presented to you.</M></Card>
+          <Card style={{padding:"12px 14px"}}><M style={{color:C.td}}>More exercises generated when your lead uploads IR policies from the Management Console. After each simulation, the specific scenario reference is presented to you.</M></Card>
         </div>)}
 
         {/* ══════════ TRAINING CERTIFICATES ══════════ */}
