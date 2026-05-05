@@ -29,6 +29,21 @@ const { logger } = require('../services/logger');
 const { listScenarios, listCategories, getScenarioById } = require('../services/runbook-scenarios');
 const { generateQuickRef, generateFullRunbook, VALID_FORMATS } = require('../services/runbook-generator');
 
+// ── Active features for scenario gating ────────────────────────────────────
+// Scenarios in services/runbook-scenarios.js may declare a feature_required
+// field that gates their visibility behind a feature flag. Pass this set
+// into the listScenarios, listCategories, and getScenarioById helpers so
+// gated scenarios become reachable once the feature ships.
+//
+// Adding a feature here is the second of three steps for un-gating a
+// scenario: (1) ship the schema and service; (2) add the feature here;
+// (3) ship the AC or MC UI. Without step (2), the scenario stays hidden
+// from these routes even after its schema lands.
+const ACTIVE_FEATURES = new Set([
+  'helper_pay',  // F5: peer_session_ratings, helper_points_ledger,
+                 // helper_redemption_options, helper_redemptions
+]);
+
 // ── Content-type for each output format ────────────────────────────────────
 const CONTENT_TYPES = {
   pdf: 'application/pdf',
@@ -39,8 +54,8 @@ const CONTENT_TYPES = {
 // ── GET /api/runbook/scenarios ─────────────────────────────────────────────
 router.get('/scenarios', (req, res) => {
   try {
-    const scenarios = listScenarios();
-    const categories = listCategories();
+    const scenarios = listScenarios(ACTIVE_FEATURES);
+    const categories = listCategories(ACTIVE_FEATURES);
     return res.json({
       scenarios,
       categories,
@@ -66,7 +81,7 @@ router.post('/quickref', async (req, res) => {
   if (!VALID_FORMATS.includes(format)) {
     return res.status(400).json({ error: 'format must be one of: ' + VALID_FORMATS.join(', ') });
   }
-  if (!getScenarioById(scenarioId)) {
+  if (!getScenarioById(scenarioId, ACTIVE_FEATURES)) {
     return res.status(404).json({ error: 'scenario not found' });
   }
 
@@ -104,7 +119,7 @@ router.post('/full', async (req, res) => {
   if (!VALID_FORMATS.includes(format)) {
     return res.status(400).json({ error: 'format must be one of: ' + VALID_FORMATS.join(', ') });
   }
-  if (!getScenarioById(scenarioId)) {
+  if (!getScenarioById(scenarioId, ACTIVE_FEATURES)) {
     return res.status(404).json({ error: 'scenario not found' });
   }
 

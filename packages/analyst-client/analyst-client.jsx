@@ -327,6 +327,19 @@ export default function AnalystClientApp() {
   // the completion summary card.
   const [oodaComplete, setOodaComplete] = useState(false);
 
+  // F5 part 2a: Helper Pay state. Populated by GET /api/helper-pay/balance,
+  // /ledger, /options, and /redemptions when the analyst opens the tab.
+  // Cards render from these arrays; the redemption flow uses redeemConfirm
+  // for the confirmation dialog and redeemFb for inline success/error.
+  const [helperBalance, setHelperBalance] = useState(0);
+  const [helperLedger, setHelperLedger] = useState([]);
+  const [helperOptions, setHelperOptions] = useState([]);
+  const [helperMyRedemptions, setHelperMyRedemptions] = useState([]);
+  const [helperLoading, setHelperLoading] = useState(false);
+  const [helperError, setHelperError] = useState(null);
+  const [redeemConfirm, setRedeemConfirm] = useState(null);
+  const [redeemFb, setRedeemFb] = useState(null);
+
   // ── Runtime version info from /api/system/version (Phase 1.4 release-v1.0.10) ──
   const [appVersion, setAppVersion] = useState("");
   const [appBuild, setAppBuild] = useState("");
@@ -436,6 +449,67 @@ export default function AnalystClientApp() {
     });
   };
 
+  // F5 part 2a: load Helper Pay data when the analyst opens the tab.
+  // Best-effort — failures land in helperError and the tab shows a
+  // retry-friendly inline message rather than crashing the AC.
+  useEffect(() => {
+    if (tab !== "helper-pay") return;
+    let cancelled = false;
+    setHelperLoading(true);
+    setHelperError(null);
+    Promise.all([
+      api.get("/api/helper-pay/balance"),
+      api.get("/api/helper-pay/ledger?limit=20"),
+      api.get("/api/helper-pay/options"),
+      api.get("/api/helper-pay/redemptions"),
+    ]).then(([b, l, o, m]) => {
+      if (cancelled) return;
+      if (b?.error || l?.error || o?.error || m?.error) {
+        setHelperError("Could not load Helper Pay data.");
+        return;
+      }
+      setHelperBalance(typeof b?.balance === "number" ? b.balance : 0);
+      setHelperLedger(Array.isArray(l?.entries) ? l.entries : []);
+      setHelperOptions(Array.isArray(o?.options) ? o.options : []);
+      setHelperMyRedemptions(Array.isArray(m?.redemptions) ? m.redemptions : []);
+    }).finally(() => {
+      if (!cancelled) setHelperLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [tab]);
+
+  // F5 part 2a: submit a redemption request. On approval (auto-approve
+  // options) the balance is debited server-side; we re-fetch balance,
+  // ledger, and redemptions to reflect the new state. On request (approval-
+  // required options) we re-fetch redemptions only — balance is unchanged
+  // until a lead approves.
+  const submitRedeem = (option) => {
+    setRedeemFb(null);
+    api.post("/api/helper-pay/redeem", { optionId: option.id }).then((r) => {
+      if (r?.error) {
+        setRedeemFb({ kind: "error", message: r.message || r.error || "Could not complete redemption." });
+        return;
+      }
+      const message = r?.status === "approved"
+        ? "Redemption approved. Points debited from your balance."
+        : "Redemption requested. Pending team lead approval.";
+      setRedeemFb({ kind: "success", message });
+      setRedeemConfirm(null);
+      // Refresh affected views.
+      api.get("/api/helper-pay/balance").then(b => {
+        if (typeof b?.balance === "number") setHelperBalance(b.balance);
+      });
+      api.get("/api/helper-pay/redemptions").then(m => {
+        if (Array.isArray(m?.redemptions)) setHelperMyRedemptions(m.redemptions);
+      });
+      api.get("/api/helper-pay/ledger?limit=20").then(l => {
+        if (Array.isArray(l?.entries)) setHelperLedger(l.entries);
+      });
+      logC("helper_pay_redeem_" + (r?.status || "unknown"),
+        option.name + " (" + option.cost_points + " pts)");
+    });
+  };
+
   // ── Welcome guide ──
   const [welcomeStep, setWelcomeStep] = useState(0);
   const WELCOME_SLIDES = [
@@ -502,7 +576,7 @@ export default function AnalystClientApp() {
 
   const tabs=[
     {id:"home",label:"Home"},{id:"signals",label:"My Signals"},{id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"delegate",label:"Delegate"},
-    {id:"peers",label:"Peers"},{id:"board",label:"Board"},{id:"ooda",label:"IR Simulator"},
+    {id:"peers",label:"Peers"},{id:"helper-pay",label:"Helper Pay"},{id:"board",label:"Board"},{id:"ooda",label:"IR Simulator"},
     {id:"skills",label:"Skills & Assessments"},{id:"training",label:"Training & Certs"},{id:"recovery",label:"Post-Incident Wellness"},
     {id:"scan",label:"Self-Scan"},{id:"audit_tab",label:"Audit"},{id:"privacy",label:"Privacy"},
   ];
@@ -1048,6 +1122,128 @@ export default function AnalystClientApp() {
               </div>)}
             </Card>
           </div>)}
+        </div>)}
+
+        {tab==="helper-pay"&&(<div>
+          <L>Helper Pay</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Earn points by helping peers in skill-share sessions. Points accrue when an analyst you helped rates the session at 3 stars or higher. Redeem points for rewards from your team's catalog. Anti-gaming protections (minimum session length, daily caps, lazy debit on lead approval) live in the helper-pay service.</M>
+
+          {helperLoading && (<Card style={{marginBottom:16}}><M style={{color:C.tm}}>Loading Helper Pay data...</M></Card>)}
+
+          {helperError && (<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>{helperError}</M></Card>)}
+
+          {redeemFb && (<Card style={{marginBottom:16,borderColor:(redeemFb.kind==="success"?C.a:C.d)+"60"}}>
+            <M style={{color:redeemFb.kind==="success"?C.a:C.d}}>{redeemFb.message}</M>
+          </Card>)}
+
+          {!helperLoading && !helperError && (<>
+            <Card style={{marginBottom:16,padding:24,textAlign:"center"}}>
+              <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:8,letterSpacing:1.5,textTransform:"uppercase"}}>Your Balance</div>
+              <div style={{fontSize:48,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace",lineHeight:1}}>{helperBalance}</div>
+              <div style={{fontSize:11,color:C.tm,marginTop:6}}>points</div>
+            </Card>
+
+            <L style={{marginBottom:8}}>Available Rewards</L>
+            {helperOptions.length === 0 ? (
+              <Card style={{marginBottom:16}}><M style={{color:C.tm}}>Your team has not added any rewards to the catalog yet. Ask your team lead to set up redemption options in the management console.</M></Card>
+            ) : (
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12,marginBottom:16}}>
+                {helperOptions.map(opt => {
+                  const canAfford = helperBalance >= opt.cost_points;
+                  const typeLabel = {time_off:"Time off",gift_card:"Gift card",donation:"Donation",other:"Other"}[opt.redemption_type] || opt.redemption_type;
+                  return (
+                    <Card key={opt.id} style={{display:"flex",flexDirection:"column",justifyContent:"space-between",opacity:canAfford?1:0.6}}>
+                      <div>
+                        <div style={{fontSize:9,fontWeight:600,color:C.a,marginBottom:6,letterSpacing:1.2,textTransform:"uppercase"}}>{typeLabel}</div>
+                        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>{opt.name}</div>
+                        {opt.description && <M style={{color:C.tm,marginBottom:10,lineHeight:1.5,display:"block"}}>{opt.description}</M>}
+                      </div>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10,paddingTop:10,borderTop:`1px solid ${C.b}`}}>
+                        <div style={{fontSize:13,fontWeight:600,color:canAfford?C.a:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{opt.cost_points} pts</div>
+                        <Btn primary={canAfford} small disabled={!canAfford} onClick={()=>setRedeemConfirm(opt)}>
+                          {opt.approval_required ? "Request" : "Redeem"}
+                        </Btn>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+
+            <L style={{marginBottom:8}}>Recent Activity</L>
+            {helperLedger.length === 0 ? (
+              <Card style={{marginBottom:16}}><M style={{color:C.tm}}>No Helper Pay activity yet. Help peers in skill-share sessions to earn your first points.</M></Card>
+            ) : (
+              <Card style={{marginBottom:16,padding:0,overflow:"hidden"}}>
+                {helperLedger.map((entry, i) => {
+                  const reasonLabel = {
+                    rating_received:"Rating received",
+                    mentor_session:"Mentor session",
+                    kb_contribution:"Knowledge base contribution",
+                    redemption:"Redemption",
+                    reversal_fraud:"Reversed (fraud)",
+                    reversal_admin:"Reversed (admin)",
+                    admin_adjustment:"Admin adjustment",
+                  }[entry.reason] || entry.reason;
+                  const isPositive = entry.delta > 0;
+                  const isZero = entry.delta === 0;
+                  return (
+                    <div key={entry.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:i<helperLedger.length-1?`1px solid ${C.b}`:"none"}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:12,color:"#E8EDF5",marginBottom:2}}>{reasonLabel}</div>
+                        {entry.notes && <div style={{fontSize:10,color:C.tm}}>{entry.notes}</div>}
+                        <div style={{fontSize:10,color:C.tm}}>{entry.created_at}</div>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:14,flexShrink:0}}>
+                        <div style={{fontSize:13,fontWeight:600,color:isZero?C.tm:(isPositive?C.a:C.d),fontFamily:"'IBM Plex Mono',monospace"}}>{isPositive?"+":""}{entry.delta}</div>
+                        <div style={{fontSize:11,color:C.tm,fontFamily:"'IBM Plex Mono',monospace",minWidth:48,textAlign:"right"}}>bal {entry.balance_after}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </Card>
+            )}
+
+            <L style={{marginBottom:8}}>My Redemptions</L>
+            {helperMyRedemptions.length === 0 ? (
+              <Card style={{marginBottom:16}}><M style={{color:C.tm}}>You have not redeemed any rewards yet.</M></Card>
+            ) : (
+              <Card style={{marginBottom:16,padding:0,overflow:"hidden"}}>
+                {helperMyRedemptions.map((r, i) => {
+                  const statusColor = {requested:C.w,approved:C.a,denied:C.d,fulfilled:C.a,cancelled:C.tm}[r.status] || C.tm;
+                  return (
+                    <div key={r.id} style={{padding:"10px 14px",borderBottom:i<helperMyRedemptions.length-1?`1px solid ${C.b}`:"none"}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                        <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{r.option_name}</div>
+                        <div style={{fontSize:9,fontWeight:600,color:statusColor,textTransform:"uppercase",letterSpacing:1.2}}>{r.status}</div>
+                      </div>
+                      <div style={{fontSize:10,color:C.tm}}>{r.cost_points} pts · requested {r.requested_at}</div>
+                      {r.decision_note && (<div style={{marginTop:6,fontSize:10,color:C.tm,fontStyle:"italic"}}>Lead note: {r.decision_note}</div>)}
+                    </div>
+                  );
+                })}
+              </Card>
+            )}
+          </>)}
+
+          {redeemConfirm && (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+              <Card style={{maxWidth:420,width:"100%"}}>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Confirm redemption</div>
+                <M style={{color:C.tm,marginBottom:14,lineHeight:1.6,display:"block"}}>
+                  {redeemConfirm.approval_required
+                    ? `Submit a redemption request for "${redeemConfirm.name}" (${redeemConfirm.cost_points} pts)? Your team lead must approve before points are debited.`
+                    : `Redeem "${redeemConfirm.name}" for ${redeemConfirm.cost_points} pts? Points will be debited immediately.`}
+                </M>
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                  <Btn onClick={()=>setRedeemConfirm(null)}>Cancel</Btn>
+                  <Btn primary onClick={()=>submitRedeem(redeemConfirm)}>
+                    {redeemConfirm.approval_required ? "Submit Request" : "Redeem"}
+                  </Btn>
+                </div>
+              </Card>
+            </div>
+          )}
         </div>)}
 
         {tab==="board"&&(<div>
