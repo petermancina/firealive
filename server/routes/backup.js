@@ -13,7 +13,6 @@ const path = require('path');
 const fs = require('fs');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
-const { backupService } = require('../services/backup');
 const { logger } = require('../services/logger');
 
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, '../../data/backups');
