@@ -55,8 +55,8 @@ router.post('/pseudonyms/assign', (req, res) => {
   try {
     const { analystId, pseudonym } = req.body;
     const db = getDb();
-    // Store only the pseudonym in the analysts table
-    db.prepare("UPDATE analysts SET pseudonym = ? WHERE id = ?").run(pseudonym, analystId);
+    // Store only the pseudonym on the users row
+    db.prepare("UPDATE users SET pseudonym = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, analystId);
     // The real identity mapping is NOT stored in the DB — it's only in the
     // encrypted export that the Team Lead downloads and stores offline.
     auditLog('system', 'PSEUDONYM_ASSIGNED', `Pseudonym assigned (identity not logged)`);
@@ -68,7 +68,7 @@ router.post('/pseudonyms/assign', (req, res) => {
 router.post('/pseudonyms/rotate-all', (req, res) => {
   try {
     const db = getDb();
-    const analysts = db.prepare("SELECT id FROM analysts").all();
+    const analysts = db.prepare("SELECT id FROM users WHERE role = 'analyst'").all();
     const used = new Set();
     analysts.forEach(a => {
       let pseudonym;
@@ -77,7 +77,7 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
         pseudonym = `Analyst-${bird}-${Math.floor(Math.random() * 99)}`;
       } while (used.has(pseudonym));
       used.add(pseudonym);
-      db.prepare("UPDATE analysts SET pseudonym = ? WHERE id = ?").run(pseudonym, a.id);
+      db.prepare("UPDATE users SET pseudonym = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, a.id);
     });
     auditLog(req.user?.id || 'system', 'PSEUDONYMS_ROTATED', `All ${analysts.length} pseudonyms rotated`);
     db.close();
@@ -175,7 +175,7 @@ router.put('/global-dashboard/config', (req, res) => {
 router.get('/global-dashboard/aggregate', (req, res) => {
   try {
     const db = getDb();
-    const analysts = db.prepare("SELECT COUNT(*) as count FROM analysts").get();
+    const analysts = db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'analyst'").get();
     // Only aggregate data — no individual analyst info
     const aggregate = {
       region: 'configured_region',

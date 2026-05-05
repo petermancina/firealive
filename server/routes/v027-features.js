@@ -160,12 +160,24 @@ router.post('/offboarding/execute', (req, res) => {
       db.prepare("DELETE FROM api_keys WHERE user_id = ?").run(analystId);
     }
 
-    // 3. Disable account
-    db.prepare("UPDATE users SET available = 0, updated_at = datetime('now') WHERE id = ?").run(analystId);
+    // 3. Mark account inactive (canonical offboarding flag per FEATURE-GUIDE
+    //    Offboarding step 4: "account marked inactive"). The available flag
+    //    is also cleared so any leftover routing logic that checks it sees
+    //    the account as not eligible for new tickets.
+    db.prepare("UPDATE users SET active = 0, available = 0, offboarded_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(analystId);
 
-    // 4. Cancel peer sessions
+    // 4. Peer messages and peer sessions
+    //    peer_messages are end-to-end encrypted. The server stores only
+    //    ciphertext plus encrypted sender/recipient blobs; it cannot
+    //    identify which messages involve this analyst. Once their session
+    //    keys are revoked in step 2, the encrypted blobs are permanently
+    //    unreadable to anyone, which is the privacy guarantee. peer_sessions
+    //    records (helper_id, seeker_id) are preserved for the
+    //    helper_points_ledger audit trail and aggregate team metrics under
+    //    the stable user id. The cancelPeerSessions request flag is kept in
+    //    the response below for API compatibility but is now a no-op.
     if (cancelPeerSessions) {
-      db.prepare("DELETE FROM peer_messages WHERE sender_id = ? OR recipient_id = ?").run(analystId, analystId);
+      // No server-side action possible without compromising E2EE.
     }
 
     auditLog(req.user?.id || 'system', 'ANALYST_OFFBOARDED', `Analyst ${analystId} offboarded — reason: ${reason}`);

@@ -40,9 +40,15 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'developer')),
   name TEXT NOT NULL,
   pseudonym TEXT,  -- v0.0.25: burnout data keyed to this, not name
+  pseudonym_rotated_at TEXT,  -- R0: timestamp of last pseudonym rotation
   tier INTEGER CHECK (tier IN (1, 2, 3)),
   shift TEXT CHECK (shift IN ('day', 'swing', 'night')),
   available INTEGER DEFAULT 1,
+  active INTEGER DEFAULT 1,  -- R0: account active flag (distinct from the available shift status); offboarding sets to 0
+  capacity_score INTEGER DEFAULT 50,  -- R0: 0-100, higher = more capacity for new tickets; consumed by routing/SOAR feature
+  last_heartbeat TEXT,  -- R0: last AC heartbeat ping timestamp; consumed by system-health monitor
+  last_iam_check TEXT,  -- R0: last time IAM offboarding detector saw this user in the IdP
+  offboarded_at TEXT,  -- R0: timestamp of offboarding; pairs with active=0
   auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
   external_id TEXT,  -- SSO subject identifier
   geo_country TEXT,  -- v0.0.25: assigned country for geo-fencing
@@ -1010,6 +1016,74 @@ CREATE INDEX IF NOT EXISTS idx_redemptions_user
 CREATE INDEX IF NOT EXISTS idx_redemptions_status
   ON helper_redemptions(status, requested_at DESC);
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R0: ROUTING / SOAR / SOC TICKET FLOW
+-- Tables consumed by signal-collector (behavioral metrics) and the
+-- Routing & SOAR feature (per-analyst capacity-aware ticket distribution).
+-- Populated by the SOAR/ticketing platform integrations described in
+-- FEATURE-GUIDE.md "Routing & SOAR" — write path lands when those
+-- integrations connect.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS ticket_actions (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ticket_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,  -- triage, comment, close, escalate, etc.
+  category TEXT,              -- malware, phishing, intrusion, etc. (used by signal-collector for task-switching metric)
+  response_time_min REAL,     -- minutes from ticket arrival to first action
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_actions_analyst
+  ON ticket_actions(analyst_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_actions_ticket
+  ON ticket_actions(ticket_id);
+
+CREATE TABLE IF NOT EXISTS ticket_assignments (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  ticket_id TEXT NOT NULL,
+  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'closed', 'reassigned')),
+  priority TEXT,
+  category TEXT,
+  capacity_score_at_assign INTEGER,  -- Snapshot of analyst's capacity_score at assignment time (audit trail for routing decisions)
+  assigned_at TEXT DEFAULT (datetime('now')),
+  closed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_assignments_analyst
+  ON ticket_assignments(analyst_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_assignments_ticket
+  ON ticket_assignments(ticket_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R0: COMPLIANCE CONTROLS CATALOG
+-- Framework-keyed catalog of compliance controls referenced by the
+-- Compliance Report feature (FEATURE-GUIDE.md "Compliance"). Populated
+-- by framework metadata loaders or the org's compliance team. Empty by
+-- default — the report endpoint falls back to hardcoded defaults when
+-- the table is empty for a queried framework.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS compliance_controls (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  framework TEXT NOT NULL,    -- 'NIST_CSF', 'ISO_27001', 'SOC_2', 'HIPAA', etc.
+  control_id TEXT NOT NULL,   -- e.g. 'AC-1', 'A.5.1.1'; unique within framework
+  name TEXT NOT NULL,
+  description TEXT,
+  category TEXT,              -- 'access_control', 'audit', 'incident_response', etc.
+  required INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(framework, control_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_compliance_controls_framework
+  ON compliance_controls(framework);
+
 `;
 
 function initDb() {
@@ -1298,6 +1372,52 @@ function initDb() {
   } catch (replenishMigrationErr) {
     console.error('ir_policies F4c migration FAILED:', replenishMigrationErr.message);
     console.error('The server will start, but per-policy replenishment configuration may use defaults until the migration is investigated.');
+  }
+
+
+  // ── Migration: Phase R0 — six new columns on users ─────────────────────────
+  //
+  // Existing deploys (v1.0.23 and earlier) have a users table that predates
+  // the phantom-reference resolution in R0. Each of the six new columns is
+  // referenced by code paths that fired against missing columns and now have
+  // canonical schema homes:
+  //
+  //   active                 — soft-delete flag for offboarding workflow
+  //                            (FEATURE-GUIDE Offboarding step 4); referenced
+  //                            by signal-collector, metrics-collector,
+  //                            system-health, iam.js
+  //   capacity_score         — 0-100 capacity rating consumed by
+  //                            Routing & SOAR; referenced by metrics-
+  //                            collector and the routing distribute endpoint
+  //   last_heartbeat         — last AC heartbeat ping; referenced by
+  //                            system-health for connected-clients view
+  //   last_iam_check         — IAM offboarding detector watermark;
+  //                            referenced by iam.js
+  //   offboarded_at          — timestamp of offboarding; pairs with active=0
+  //   pseudonym_rotated_at   — last pseudonym rotation timestamp;
+  //                            referenced by the pseudonym-rotate endpoint
+  //
+  // Each ALTER is guarded by a PRAGMA table_info check so the migration is
+  // idempotent and re-running initDb on an already-migrated DB is a no-op.
+  // The block runs in its own try/catch so a failure here does not mask
+  // the F4c migration above and vice versa.
+  try {
+    const usersCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+    const addCol = (col, ddl) => {
+      if (!usersCols.includes(col)) {
+        db.exec(`ALTER TABLE users ADD COLUMN ${ddl}`);
+        console.log(`users migration (R0): added ${col} column`);
+      }
+    };
+    addCol('active', 'active INTEGER DEFAULT 1');
+    addCol('capacity_score', 'capacity_score INTEGER DEFAULT 50');
+    addCol('last_heartbeat', 'last_heartbeat TEXT');
+    addCol('last_iam_check', 'last_iam_check TEXT');
+    addCol('offboarded_at', 'offboarded_at TEXT');
+    addCol('pseudonym_rotated_at', 'pseudonym_rotated_at TEXT');
+  } catch (r0MigrationErr) {
+    console.error('users R0 migration FAILED:', r0MigrationErr.message);
+    console.error('The server will start, but routing, IAM offboarding detection, system-health, and pseudonym rotation may misbehave until the migration is investigated.');
   }
 
 

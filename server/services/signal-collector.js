@@ -8,7 +8,7 @@ class SignalCollector {
 
   // Called periodically (every 15 min) to collect signals for active analysts
   async collectAll() {
-    const analysts = this.db.prepare("SELECT id, uuid FROM users WHERE role='analyst' AND active=1").all();
+    const analysts = this.db.prepare("SELECT id FROM users WHERE role='analyst' AND active=1").all();
     const results = [];
     for (const analyst of analysts) {
       const signals = this._generateSignals(analyst);
@@ -17,7 +17,7 @@ class SignalCollector {
       for (const sig of signals) {
         engine.recordSignal(analyst.id, sig.signal, sig.value);
       }
-      results.push({ analyst: analyst.uuid, signals: signals.length });
+      results.push({ analyst: analyst.id, signals: signals.length });
     }
     return { collected: results.length, timestamp: new Date().toISOString() };
   }

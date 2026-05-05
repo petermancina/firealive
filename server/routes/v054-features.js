@@ -78,21 +78,21 @@ router.post('/iam/check-absence', requireAuth, requireRole('manager'), async (re
   if (!cfg) return res.json({ checked: false, reason: 'IAM not configured' });
   const iamCfg = JSON.parse(cfg.value);
   // In production: query IAM API for user list, compare against FireAlive users
-  const users = db.prepare("SELECT id, uuid, pseudonym, last_iam_check FROM users WHERE role='analyst'").all();
+  const users = db.prepare("SELECT id, pseudonym, last_iam_check FROM users WHERE role='analyst'").all();
   const absent = users.filter(u => !u.last_iam_check || Date.now() - new Date(u.last_iam_check).getTime() > iamCfg.intervalHours * 3600000);
   auditLog(req.user?.id, 'IAM_CHECK', `Checked ${users.length} users, ${absent.length} need review`);
-  res.json({ checked: true, total: users.length, needsReview: absent.map(u => ({ uuid: u.uuid, pseudonym: u.pseudonym })) });
+  res.json({ checked: true, total: users.length, needsReview: absent.map(u => ({ id: u.id, pseudonym: u.pseudonym })) });
 });
 
 router.post('/iam/confirm-status', requireAuth, requireRole('manager'), async (req, res) => {
   const db = getDb();
-  const { uuid, action } = req.body; // action: 'active' or 'offboard'
+  const { id, action } = req.body; // action: 'active' or 'offboard'
   if (action === 'offboard') {
-    db.prepare("UPDATE users SET active=0, offboarded_at=? WHERE uuid=?").run(new Date().toISOString(), uuid);
-    auditLog(req.user?.id, 'IAM_OFFBOARD', `Analyst ${uuid} offboarded`);
+    db.prepare("UPDATE users SET active=0, offboarded_at=? WHERE id=?").run(new Date().toISOString(), id);
+    auditLog(req.user?.id, 'IAM_OFFBOARD', `Analyst ${id} offboarded`);
   } else {
-    db.prepare("UPDATE users SET last_iam_check=? WHERE uuid=?").run(new Date().toISOString(), uuid);
-    auditLog(req.user?.id, 'IAM_CONFIRMED', `Analyst ${uuid} confirmed active`);
+    db.prepare("UPDATE users SET last_iam_check=? WHERE id=?").run(new Date().toISOString(), id);
+    auditLog(req.user?.id, 'IAM_CONFIRMED', `Analyst ${id} confirmed active`);
   }
   res.json({ success: true, action });
 });
@@ -139,34 +139,51 @@ router.post('/assessments/submit-results', requireAuth, async (req, res) => {
 });
 
 // ── Helper Pay (Quality-Based) ───────────────────────────────────────────────
+// The pre-F5 design of these endpoints inserted into a phantom `helper_ratings`
+// table. The F5 phase (v1.0.21) introduced canonical Helper Pay storage in
+// peer_session_ratings + helper_points_ledger, with the full anti-gaming
+// logic (session-participant validation, minimum-duration gate, daily caps,
+// lazy debit on lead approval) housed in server/services/helper-pay.js and
+// exposed at POST /api/helper-pay/sessions/:sessionId/rate. The endpoint
+// below redirects callers there rather than offering a parallel rating path
+// that would bypass the anti-gaming protections.
 router.post('/helper-pay/rate', requireAuth, async (req, res) => {
-  const db = getDb();
-  const { helperUuid, sessionId, rating } = req.body; // 1-5 stars
-  const points = rating >= 4 ? rating : 0; // Only 4-5 stars earn points
-  db.prepare("INSERT INTO helper_ratings (session_id, helper_uuid, rating, points, created_at) VALUES (?, ?, ?, ?, ?)").run(
-    sessionId, helperUuid, rating, points, new Date().toISOString()
-  );
-  res.json({ recorded: true, pointsAwarded: points });
+  res.status(410).json({
+    error: 'Endpoint removed in favor of F5 canonical helper-pay service',
+    redirectTo: 'POST /api/helper-pay/sessions/:sessionId/rate',
+    note: 'The F5 endpoint enforces session-participant validation, minimum session duration, daily caps, and writes to peer_session_ratings + helper_points_ledger atomically.',
+  });
 });
 
 router.get('/helper-pay/leaderboard', requireAuth, async (req, res) => {
   const db = getDb();
-  const leaders = db.prepare("SELECT u.pseudonym, SUM(hr.points) as total_points FROM helper_ratings hr JOIN users u ON u.uuid = hr.helper_uuid GROUP BY hr.helper_uuid ORDER BY total_points DESC LIMIT 10").all();
+  // Query the F5 canonical ledger for positive-delta rows, grouped by user.
+  // Negative deltas (redemptions, fraud reversals) are excluded so the
+  // leaderboard reflects gross helpfulness earnings rather than net balance.
+  const leaders = db.prepare(`
+    SELECT u.pseudonym, SUM(l.delta) AS total_points
+    FROM helper_points_ledger l
+    JOIN users u ON u.id = l.user_id
+    WHERE l.delta > 0
+    GROUP BY l.user_id
+    ORDER BY total_points DESC
+    LIMIT 10
+  `).all();
   res.json(leaders);
 });
 
 // ── Pseudonym Rotation ───────────────────────────────────────────────────────
 router.post('/pseudonyms/rotate', requireAuth, requireRole('manager'), async (req, res) => {
   const db = getDb();
-  const analysts = db.prepare("SELECT id, uuid, pseudonym FROM users WHERE role='analyst'").all();
-  // Generate new pseudonyms — UUID stays constant
+  const analysts = db.prepare("SELECT id, pseudonym FROM users WHERE role='analyst'").all();
+  // Generate new pseudonyms — id (the canonical 32-hex GUID) stays constant
   const animals = ['Falcon','Kestrel','Hawk','Eagle','Osprey','Merlin','Peregrine','Harrier','Sparrow','Wren','Robin','Swift','Heron','Crane','Raven','Owl','Phoenix','Condor','Albatross','Pelican'];
   const shuffled = animals.sort(() => Math.random() - 0.5);
   analysts.forEach((a, i) => {
     const newPseudo = `Analyst-${shuffled[i % shuffled.length]}`;
     db.prepare("UPDATE users SET pseudonym=?, pseudonym_rotated_at=? WHERE id=?").run(newPseudo, new Date().toISOString(), a.id);
   });
-  auditLog(req.user?.id, 'PSEUDONYM_ROTATE', `Rotated ${analysts.length} pseudonyms (UUIDs unchanged)`);
+  auditLog(req.user?.id, 'PSEUDONYM_ROTATE', `Rotated ${analysts.length} pseudonyms (ids unchanged)`);
   res.json({ rotated: analysts.length });
 });
 
