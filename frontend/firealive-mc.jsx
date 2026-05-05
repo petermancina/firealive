@@ -37,7 +37,39 @@ const api = {
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
   async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  // download(path, filename, opts?) — fetches a binary response (CSV, PDF,
+  // DOCX, etc.) and triggers a browser download via an anchor click. Use
+  // for endpoints that return a blob rather than JSON; the get/post/put
+  // methods above all assume a JSON response and would break on binary.
+  // opts.method defaults to 'GET'; pass 'POST' for endpoints that take a
+  // request body (runbook generator, TTX sitman/aar). opts.body, if
+  // provided, is JSON-stringified and sent with Content-Type set.
+  // Returns a Promise that resolves to true on success, false on error.
+  async download(path, filename, opts) {
+    const method = (opts && opts.method) || 'GET';
+    const init = { method, headers: this._headers() };
+    if (opts && opts.body !== undefined) init.body = JSON.stringify(opts.body);
+    try {
+      const r = await fetch(API_BASE + path, init);
+      if (!r.ok) throw new Error('status ' + r.status);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      return true;
+    } catch (e) {
+      console.warn('[API download]', path, e.message);
+      return false;
+    }
+  },
   setToken(t) { this._token = t; },
 };
 
@@ -248,11 +280,20 @@ function generateCEF(th, type) {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function RoleSelect({onSelect}) {
+  const [roleSelectVersion, setRoleSelectVersion] = useState("");
+  // Fetch the running server version for the pre-auth header. /api/system/version
+  // is auth-free (LoginScreen uses the same endpoint just below). Falls back to
+  // an empty string on failure so the header still renders cleanly.
+  useEffect(()=>{
+    api.get("/api/system/version").then(r=>{
+      if (r?.version) setRoleSelectVersion(r.version);
+    }).catch(()=>{});
+  },[]);
   return (
     <div style={{minHeight:"100vh",background:"#050810",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
       <div style={{maxWidth:520,width:"100%",padding:"0 24px",animation:"fadeIn 0.5s ease"}}>
-        <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:16,textAlign:"center"}}>FireAlive v1.0.12 · AGPL-3.0</M>
+        <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:16,textAlign:"center"}}>FireAlive{roleSelectVersion ? " v"+roleSelectVersion : ""} · AGPL-3.0</M>
         <h1 style={{fontSize:26,fontWeight:300,color:"#E8EDF5",textAlign:"center",marginBottom:8,fontFamily:"'Fraunces',serif"}}>FireAlive</h1>
         <M style={{color:C.tm,display:"block",textAlign:"center",marginBottom:36,lineHeight:1.6}}>Select your role to proceed to authentication.<br/>Each role loads a separate application with distinct data access.</M>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
@@ -1945,11 +1986,7 @@ function ManagementConsole() {
     if (isEdit) {
       // PUT — also include the active flag so admins can re-activate a soft-deleted option.
       body.active = !!optionForm.active;
-      fetch(API_BASE + "/api/helper-pay/admin/options/" + optionForm.id, {
-        method: "PUT",
-        headers: api._headers(),
-        body: JSON.stringify(body),
-      }).then(r => r.ok ? r.json() : { error: r.statusText }).then(r => {
+      api.put("/api/helper-pay/admin/options/" + optionForm.id, body).then(r => {
         if (r?.error) {
           setHelperFb({ kind: "error", message: r.message || r.error });
           return;
@@ -2005,27 +2042,15 @@ function ManagementConsole() {
     });
   };
 
-  // F5 part 2b: CSV export. The api helper assumes JSON, so we do a raw
-  // fetch and trigger a browser download.
+  // F5 part 2b: CSV export. Uses api.download because the response is
+  // text/csv rather than JSON.
   const downloadCsv = (type) => {
-    fetch(API_BASE + "/api/helper-pay/admin/export.csv?type=" + encodeURIComponent(type), {
-      headers: api._headers(),
-    }).then(r => {
-      if (!r.ok) {
-        setHelperFb({ kind: "error", message: "Export failed: " + r.statusText });
-        return null;
+    const filename = "helper-pay-" + type + "-" + new Date().toISOString().slice(0, 10) + ".csv";
+    api.download("/api/helper-pay/admin/export.csv?type=" + encodeURIComponent(type), filename).then(ok => {
+      if (!ok) {
+        setHelperFb({ kind: "error", message: "Export failed." });
+        return;
       }
-      return r.blob();
-    }).then(blob => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "helper-pay-" + type + "-" + new Date().toISOString().slice(0, 10) + ".csv";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
       addA("HELPER_PAY_EXPORT", type);
     });
   };
@@ -3819,10 +3844,7 @@ regression:
                   </div>
                   {isActive&&<Btn small onClick={async ()=>{
                     if (!window.confirm(`Cancel this ${j.mode} job? Best-effort: the worker stops at the next scenario boundary; any scenario currently being generated will complete.`)) return;
-                    const r = await fetch(API_BASE+`/api/ooda/generation-jobs/${j.id}/cancel`,{
-                      method:"POST",
-                      headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},
-                    }).then(res=>res.json()).catch(e=>({error:e.message}));
+                    const r = await api.post(`/api/ooda/generation-jobs/${j.id}/cancel`, {});
                     if (r?.error) {
                       setOodaJobsError(r.error);
                       return;
@@ -3927,11 +3949,7 @@ regression:
                   if (wizardConfig.scheduled_days.length>0) body.scheduled_days = wizardConfig.scheduled_days;
                 }
                 if (wizardConfig.mode!=="disabled") body.batch_size = wizardConfig.batch_size;
-                const r = await fetch(API_BASE+`/api/ooda/policies/${wizardPolicy.id}/replenishment-config`,{
-                  method:"PATCH",
-                  headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},
-                  body:JSON.stringify(body),
-                }).then(res=>res.json()).catch(e=>({error:e.message}));
+                const r = await api.patch(`/api/ooda/policies/${wizardPolicy.id}/replenishment-config`, body);
                 setWizardSaving(false);
                 if (r?.error || r?.code) {
                   // Map server error codes to friendlier messages.
@@ -5425,23 +5443,15 @@ regression:
               setRunbookGenerating(true);
               const endpoint = runbookArtifactType==="quickref" ? "/api/runbook/quickref" : "/api/runbook/full";
               const filename = "runbook-"+runbookArtifactType+"-"+runbookSelectedId+"."+runbookFormat;
-              fetch(API_BASE+endpoint, {
+              api.download(endpoint, filename, {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": "Bearer "+(api._token||"") },
-                body: JSON.stringify({ scenarioId: runbookSelectedId, format: runbookFormat })
-              }).then(r=>{
-                if (!r.ok) throw new Error("server returned "+r.status);
-                return r.blob();
-              }).then(blob=>{
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = filename;
-                a.click();
-                URL.revokeObjectURL(url);
-                addA("RUNBOOK_GENERATED", "Generated "+runbookArtifactType+" for scenario "+runbookSelectedId+" ("+runbookFormat+")");
-              }).catch(err=>{
-                addA("RUNBOOK_GENERATE_FAILED", "Failed to generate runbook: "+err.message);
+                body: { scenarioId: runbookSelectedId, format: runbookFormat },
+              }).then(ok=>{
+                if (ok) {
+                  addA("RUNBOOK_GENERATED", "Generated "+runbookArtifactType+" for scenario "+runbookSelectedId+" ("+runbookFormat+")");
+                } else {
+                  addA("RUNBOOK_GENERATE_FAILED", "Failed to generate runbook");
+                }
               }).finally(()=>setRunbookGenerating(false));
             }}>{runbookGenerating?"Generating…":"Download "+(runbookArtifactType==="quickref"?"Quick Reference":"Full Runbook")}</Btn>
           </Card>)}
@@ -5451,7 +5461,7 @@ regression:
         {tab==="offboarding"&&(<div>
           <L>Analyst Offboarding</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Securely deprovision analysts who leave the org or change roles. Their historical data is archived for aggregate reporting but personally identifiable links are severed. All keys, sessions, and peer chat schedules are revoked. Integrates with SOAR/IAM offboarding orchestration.</M>
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>IAM Offboarding</div><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Enable</M></label><Sel label="Frequency"><option>Every 4hr</option><option>Every 8hr</option><option>Daily</option><option>Weekly</option></Sel><Card style={{padding:12,borderColor:C.w+"30",marginTop:12}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0"}}><M style={{color:C.t}}>{analysts.length>0?analysts[0].name:"No pending reviews"}</M><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>api.post("/api/v054/iam/confirm-status",{uuid:"",action:"active"}).then(()=>addA("IA","Confirmed active"))}>Active</Btn><Btn small danger onClick={()=>api.post("/api/v054/iam/confirm-status",{uuid:"",action:"offboard"}).then(()=>addA("IO","Offboarded"))}>Offboard</Btn></div></div></Card></Card>
+          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>IAM Offboarding</div><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Enable</M></label><Sel label="Frequency"><option>Every 4hr</option><option>Every 8hr</option><option>Daily</option><option>Weekly</option></Sel><Card style={{padding:12,borderColor:C.w+"30",marginTop:12}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0"}}><M style={{color:C.t}}>{analysts.length>0?analysts[0].name:"No pending reviews"}</M><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>api.post("/api/v054/iam/confirm-status",{id:"",action:"active"}).then(()=>addA("IA","Confirmed active"))}>Active</Btn><Btn small danger onClick={()=>api.post("/api/v054/iam/confirm-status",{id:"",action:"offboard"}).then(()=>addA("IO","Offboarded"))}>Offboard</Btn></div></div></Card></Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Offboard an Analyst</div>
             <Sel label="Analyst" value={newOffboard.analystId} onChange={e=>setNewOffboard(prev=>({...prev,analystId:e.target.value}))}>
@@ -5506,36 +5516,20 @@ regression:
                 <Btn primary disabled={!ttxScenarioId||ttxGenerating} onClick={()=>{
                   if (!ttxScenarioId) return;
                   setTtxGenerating(true);
-                  fetch(API_BASE+"/api/ttx/sitman",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},body:JSON.stringify({scenarioId:ttxScenarioId,difficulty:ttxDifficulty,format:ttxFormat})}).then(r=>{
-                    if(!r.ok) throw new Error("status "+r.status);
-                    return r.blob();
-                  }).then(blob=>{
-                    const url=URL.createObjectURL(blob);
-                    const a=document.createElement("a");
-                    a.href=url;
-                    a.download="sitman-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                  }).catch(()=>{}).finally(()=>setTtxGenerating(false));
+                  const filename = "sitman-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
+                  api.download("/api/ttx/sitman", filename, {
+                    method: "POST",
+                    body: { scenarioId: ttxScenarioId, difficulty: ttxDifficulty, format: ttxFormat },
+                  }).finally(()=>setTtxGenerating(false));
                 }}>{ttxGenerating?"Generating...":"Download SitMan"}</Btn>
                 <Btn disabled={!ttxScenarioId||ttxGenerating} onClick={()=>{
                   if (!ttxScenarioId) return;
                   setTtxGenerating(true);
-                  fetch(API_BASE+"/api/ttx/aar",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+(api._token||"")},body:JSON.stringify({scenarioId:ttxScenarioId,difficulty:ttxDifficulty,format:ttxFormat})}).then(r=>{
-                    if(!r.ok) throw new Error("status "+r.status);
-                    return r.blob();
-                  }).then(blob=>{
-                    const url=URL.createObjectURL(blob);
-                    const a=document.createElement("a");
-                    a.href=url;
-                    a.download="aar-template-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                  }).catch(()=>{}).finally(()=>setTtxGenerating(false));
+                  const filename = "aar-template-"+ttxScenarioId+"-"+ttxDifficulty+"."+ttxFormat;
+                  api.download("/api/ttx/aar", filename, {
+                    method: "POST",
+                    body: { scenarioId: ttxScenarioId, difficulty: ttxDifficulty, format: ttxFormat },
+                  }).finally(()=>setTtxGenerating(false));
                 }}>{ttxGenerating?"Generating...":"Download AAR Template"}</Btn>
               </div>
             </>)}

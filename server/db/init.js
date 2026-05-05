@@ -427,25 +427,9 @@ CREATE TABLE IF NOT EXISTS config (
   value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS ticket_actions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  analyst_id TEXT,
-  ticket_id TEXT,
-  category TEXT,
-  action TEXT,
-  response_time_min REAL,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS ticket_assignments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  analyst_id TEXT,
-  ticket_id TEXT,
-  priority TEXT,
-  status TEXT DEFAULT 'open',
-  assigned_at TEXT DEFAULT (datetime('now')),
-  closed_at TEXT
-);
+-- ticket_actions and ticket_assignments are defined further down with the
+-- canonical richer shape (FK CASCADE, status CHECK constraint, indexes).
+-- See the "R0: ROUTING / SOAR / SOC TICKET FLOW" section.
 
 CREATE TABLE IF NOT EXISTS peer_sessions (
   id TEXT PRIMARY KEY,
@@ -1418,6 +1402,124 @@ function initDb() {
   } catch (r0MigrationErr) {
     console.error('users R0 migration FAILED:', r0MigrationErr.message);
     console.error('The server will start, but routing, IAM offboarding detection, system-health, and pseudonym rotation may misbehave until the migration is investigated.');
+  }
+
+
+  // ── Migration: Phase R1 — rebuild ticket_actions and ticket_assignments ───
+  //
+  // v1.0.24 and earlier shipped two definitions of ticket_actions and
+  // ticket_assignments in init.js: the original simple shape near line 430
+  // (INTEGER AUTOINCREMENT id, plain TEXT analyst_id, "action" column on
+  // ticket_actions, plain TEXT status on ticket_assignments with no CHECK)
+  // and the richer R0 shape near line 1020 (TEXT GUID id, FK CASCADE to
+  // users(id), "action_type" column, status CHECK constraint, capacity
+  // snapshot column, indexes). Because both used IF NOT EXISTS, the
+  // simpler original shape won on every install — the richer shape
+  // declared in init.js never actually landed in the database.
+  //
+  // R1 removes the original definitions from the SCHEMA constant above
+  // (so fresh installs land directly on the canonical richer shape) and
+  // this migration block rebuilds existing v1.0.24 deploys by:
+  //
+  //   1. Detecting the simple-shape signature (column "action" present,
+  //      column "action_type" absent on ticket_actions).
+  //   2. Building a *_new table with the canonical shape.
+  //   3. Copying rows over, mapping old `action` -> new `action_type`
+  //      (defaulting NULL or empty values to 'unknown' since action_type
+  //      is NOT NULL in the canonical shape) and casting INTEGER ids to
+  //      TEXT.
+  //   4. Dropping the simple-shape table and renaming *_new in its place.
+  //   5. Creating the canonical indexes.
+  //
+  // Foreign keys are toggled off for the swap (SQLite requirement) then
+  // back on. Wrapped in a transaction so a partial failure doesn't leave
+  // a half-rebuilt schema. Idempotent — re-running initDb on an already-
+  // migrated database is a no-op because the action_type column is
+  // already present.
+  try {
+    const taCols = db.prepare("PRAGMA table_info(ticket_actions)").all().map(c => c.name);
+    if (taCols.length && !taCols.includes('action_type')) {
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE ticket_actions_new (
+          id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+          analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          ticket_id TEXT NOT NULL,
+          action_type TEXT NOT NULL,
+          category TEXT,
+          response_time_min REAL,
+          notes TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        );
+        INSERT INTO ticket_actions_new (id, analyst_id, ticket_id, action_type, category, response_time_min, created_at)
+          SELECT
+            CAST(id AS TEXT),
+            COALESCE(analyst_id, ''),
+            COALESCE(ticket_id, ''),
+            COALESCE(NULLIF(action, ''), 'unknown'),
+            category,
+            response_time_min,
+            COALESCE(created_at, datetime('now'))
+          FROM ticket_actions
+          WHERE analyst_id IS NOT NULL AND ticket_id IS NOT NULL;
+        DROP TABLE ticket_actions;
+        ALTER TABLE ticket_actions_new RENAME TO ticket_actions;
+        CREATE INDEX IF NOT EXISTS idx_ticket_actions_analyst ON ticket_actions(analyst_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ticket_actions_ticket ON ticket_actions(ticket_id);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+      console.log('ticket_actions migration (R1): rebuilt with canonical shape');
+    }
+  } catch (r1TaMigrationErr) {
+    console.error('ticket_actions R1 migration FAILED:', r1TaMigrationErr.message);
+    console.error('The server will start, but ticket_actions may retain the legacy shape (action column instead of action_type) until the migration is investigated.');
+  }
+
+  try {
+    const tasCols = db.prepare("PRAGMA table_info(ticket_assignments)").all().map(c => c.name);
+    if (tasCols.length && !tasCols.includes('capacity_score_at_assign')) {
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE ticket_assignments_new (
+          id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+          ticket_id TEXT NOT NULL,
+          analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'closed', 'reassigned')),
+          priority TEXT,
+          category TEXT,
+          capacity_score_at_assign INTEGER,
+          assigned_at TEXT DEFAULT (datetime('now')),
+          closed_at TEXT
+        );
+        INSERT INTO ticket_assignments_new (id, ticket_id, analyst_id, status, priority, assigned_at, closed_at)
+          SELECT
+            CAST(id AS TEXT),
+            COALESCE(ticket_id, ''),
+            COALESCE(analyst_id, ''),
+            CASE
+              WHEN status IN ('open', 'in_progress', 'closed', 'reassigned') THEN status
+              ELSE 'open'
+            END,
+            priority,
+            COALESCE(assigned_at, datetime('now')),
+            closed_at
+          FROM ticket_assignments
+          WHERE analyst_id IS NOT NULL AND ticket_id IS NOT NULL;
+        DROP TABLE ticket_assignments;
+        ALTER TABLE ticket_assignments_new RENAME TO ticket_assignments;
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_analyst ON ticket_assignments(analyst_id, status);
+        CREATE INDEX IF NOT EXISTS idx_ticket_assignments_ticket ON ticket_assignments(ticket_id);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+      console.log('ticket_assignments migration (R1): rebuilt with canonical shape');
+    }
+  } catch (r1TasMigrationErr) {
+    console.error('ticket_assignments R1 migration FAILED:', r1TasMigrationErr.message);
+    console.error('The server will start, but ticket_assignments may retain the legacy shape (no FK, no status CHECK, no capacity_score_at_assign) until the migration is investigated.');
   }
 
 
