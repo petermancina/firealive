@@ -109,6 +109,8 @@ app.use('/api/v1/malware-scanners', authMiddleware(['admin']), require('./routes
 app.use('/api/apikeys', authMiddleware(['admin']), require('./routes/apikeys'));
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), require('./routes/audit'));
+app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
+app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
 app.use('/api/sla', authMiddleware(['lead', 'admin']), require('./routes/sla'));
 app.use('/api/notifications', authMiddleware(['admin']), require('./routes/notifications'));
