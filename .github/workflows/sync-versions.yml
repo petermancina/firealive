@@ -1,0 +1,64 @@
+# Sync sub-package package.json versions with the root package.json on every
+# branch push (except main and tag pushes) where the root package.json is
+# touched. If scripts/sync-versions.js updates any sub-package.json files,
+# this workflow auto-commits the changes back to the same branch.
+#
+# The root package.json is the source of truth for the project version;
+# electron-builder reads each sub-package's package.json at build time to
+# stamp the installer, so the version fields must match. This workflow keeps
+# them in sync without requiring the contributor to manually edit four files
+# on every version bump.
+#
+# Trigger filter: only fires when root package.json changes. Code commits,
+# README edits, and other file changes do not trigger a run, so most
+# branch pushes never invoke the workflow.
+#
+# Concurrency: a new push on the same branch cancels any in-progress run,
+# so we never pile up multiple queued attempts during a rapid commit
+# sequence.
+#
+# Pushes made with the default GITHUB_TOKEN do not trigger downstream
+# workflow runs, so the auto-commit does not re-trigger this workflow.
+
+name: Sync sub-package versions
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!main'
+    paths:
+      - 'package.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-versions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Run sync script
+        run: node scripts/sync-versions.js
+
+      - name: Commit changes if any
+        run: |
+          if git diff --quiet; then
+            echo "No changes; nothing to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add frontend/package.json packages/analyst-client/package.json packages/global-dashboard/package.json
+            git commit -m "chore: auto-sync sub-package versions to match root"
+            git push
+          fi
