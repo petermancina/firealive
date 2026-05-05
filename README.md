@@ -1,13 +1,15 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.20 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 13 (anti-rollback)
+**Version:** v1.0.21 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 14 (anti-rollback)
 
 ---
 
 ## What Is FireAlive?
 
 FireAlive is an open-source, privacy-first platform that prevents burnout in Security Operations Center (SOC) analysts. It uses AI-driven burnout signal detection, capacity-aware ticket routing, peer support, upskilling scheduling, and skills assessment to keep SOC teams healthy, productive, and retained.
+
+FireAlive is grounded in peer-reviewed research on burnout — both SOC-analyst-specific findings and the broader cross-industry literature on burnout prevention. AI-generated suggestions for Team Lead interventions are drawn from a knowledge base of that peer-reviewed research, so the recommendations a lead sees are traceable to evidence rather than ungrounded model output.
 
 The name plays on the notion of burnout — FireAlive keeps the fire burning long.
 
@@ -84,7 +86,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.20) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.21) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 

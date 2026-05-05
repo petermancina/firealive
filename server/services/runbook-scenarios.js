@@ -1825,6 +1825,7 @@ const SCENARIOS = [
   {
     id: 'helper_pay_fraud',
     category: 'Burnout-Specific Abuse',
+    feature_required: 'helper_pay',
     title: 'Helper Pay Manipulation / Fake Skill-Share Sessions',
     summary: 'Once Helper Pay ships, an adversary or insider creates fake peer sessions or fake ratings to drain the org\'s PTO/bonus budget through fraudulent Helper Pay redemptions.',
     indicators: [
@@ -2291,17 +2292,37 @@ const SCENARIOS = [
 
 module.exports = {
   SCENARIOS,
-  getScenarioById: (id) => SCENARIOS.find(s => s.id === id && !s.deprecated),
-  listScenarios: () => SCENARIOS.filter(s => !s.deprecated).map(s => ({
-    id: s.id,
-    category: s.category,
-    title: s.title,
-    summary: s.summary,
-  })),
-  listCategories: () => {
+  // getScenarioById, listScenarios, and listCategories accept an optional
+  // enabledFeatures Set. Scenarios carrying a feature_required field are
+  // filtered out when the named feature is not in the set. Used to gate
+  // scenarios that reference tables shipped by later phases (e.g. the
+  // helper_pay_fraud scenario references helper_points_ledger and
+  // peer_session_ratings, which are added in F5). Default empty set
+  // preserves the pre-F5 behavior of hiding any feature-gated scenario.
+  getScenarioById: (id, enabledFeatures = new Set()) =>
+    SCENARIOS.find(s =>
+      s.id === id &&
+      !s.deprecated &&
+      (!s.feature_required || enabledFeatures.has(s.feature_required))
+    ),
+  listScenarios: (enabledFeatures = new Set()) =>
+    SCENARIOS
+      .filter(s =>
+        !s.deprecated &&
+        (!s.feature_required || enabledFeatures.has(s.feature_required))
+      )
+      .map(s => ({
+        id: s.id,
+        category: s.category,
+        title: s.title,
+        summary: s.summary,
+      })),
+  listCategories: (enabledFeatures = new Set()) => {
     const cats = new Set();
     for (const s of SCENARIOS) {
-      if (!s.deprecated) cats.add(s.category);
+      if (s.deprecated) continue;
+      if (s.feature_required && !enabledFeatures.has(s.feature_required)) continue;
+      cats.add(s.category);
     }
     return Array.from(cats);
   },

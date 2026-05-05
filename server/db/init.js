@@ -891,6 +891,125 @@ CREATE INDEX IF NOT EXISTS idx_ai_inference_user
 CREATE INDEX IF NOT EXISTS idx_ai_inference_status
   ON ai_inference_log(status, created_at DESC);
 
+-- ── Helper Pay (Phase F5) ────────────────────────────────────────────────
+-- Recognition system for analysts who help peers via skill-share, mentoring,
+-- or knowledge-base contributions. Points accrue from peer ratings on real
+-- sessions and can be redeemed for org-configured rewards (time off, gift
+-- cards, donations). The ledger is append-only — reversals are negative
+-- entries, never DELETEs — so the audit trail is preserved end to end.
+--
+-- Anti-gaming protections live in the helper-pay service (validation that
+-- the rated session has real message activity, daily accrual caps, the
+-- max_per_user_per_year cap on redemption_options below) rather than in
+-- pure schema constraints, because they require cross-table queries that
+-- CHECK clauses cannot express.
+
+-- Append-only points ledger. Every accrual, redemption, reversal, and
+-- admin adjustment lands here as a new row. balance_after is cached at
+-- insert time so a per-user balance read is O(1) on the latest row.
+CREATE TABLE IF NOT EXISTS helper_points_ledger (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  delta INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN (
+    'rating_received',
+    'mentor_session',
+    'kb_contribution',
+    'redemption',
+    'reversal_fraud',
+    'reversal_admin',
+    'admin_adjustment'
+  )),
+  ref_type TEXT,                          -- 'peer_session_rating', 'redemption', etc.
+  ref_id TEXT,                            -- id of the referenced entity
+  balance_after INTEGER NOT NULL,
+  notes TEXT,
+  created_by TEXT REFERENCES users(id),   -- NULL for automatic accruals
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_helper_ledger_user
+  ON helper_points_ledger(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_helper_ledger_reason
+  ON helper_points_ledger(reason, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_helper_ledger_ref
+  ON helper_points_ledger(ref_type, ref_id);
+
+-- Peer-session ratings. The recipient of help rates the helper after a
+-- session ends. UNIQUE on (session_id, rated_by_id) prevents double-rating.
+-- Ratings drive Helper Pay accruals via the helper-pay service's
+-- recordRating() handler, which writes a corresponding ledger entry.
+CREATE TABLE IF NOT EXISTS peer_session_ratings (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  session_id TEXT NOT NULL REFERENCES peer_sessions(id) ON DELETE RESTRICT,
+  rated_by_id TEXT NOT NULL REFERENCES users(id),
+  rated_user_id TEXT NOT NULL REFERENCES users(id),
+  stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+  comment TEXT,
+  helpfulness_tags TEXT NOT NULL DEFAULT '[]',  -- JSON array, e.g. ["clear","patient"]
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (session_id, rated_by_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_ratings_helper
+  ON peer_session_ratings(rated_user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_ratings_session
+  ON peer_session_ratings(session_id);
+
+-- Per-org redemption catalog. Lead/admin configures what points can be
+-- redeemed for and at what cost. max_per_user_per_year is an anti-gaming
+-- cap so a single analyst cannot drain the budget by redeeming the same
+-- option dozens of times.
+CREATE TABLE IF NOT EXISTS helper_redemption_options (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  name TEXT NOT NULL,
+  description TEXT,
+  cost_points INTEGER NOT NULL CHECK (cost_points > 0),
+  redemption_type TEXT NOT NULL CHECK (redemption_type IN (
+    'time_off', 'gift_card', 'donation', 'other'
+  )),
+  approval_required INTEGER NOT NULL DEFAULT 1,
+  active INTEGER NOT NULL DEFAULT 1,
+  max_per_user_per_year INTEGER,                 -- NULL = unlimited
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_by TEXT REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_redemption_options_active
+  ON helper_redemption_options(active, redemption_type);
+
+-- Redemption requests. cost_points is copied from the option at request
+-- time so a later catalog price change does not retroactively alter the
+-- redemption cost. ledger_id points at the ledger entry that debited the
+-- points; NULL until approval (lazy debit — points stay liquid in the
+-- analyst's balance until a lead approves the redemption, at which point
+-- the service writes the ledger entry and stamps ledger_id here).
+CREATE TABLE IF NOT EXISTS helper_redemptions (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  option_id TEXT NOT NULL REFERENCES helper_redemption_options(id) ON DELETE RESTRICT,
+  cost_points INTEGER NOT NULL CHECK (cost_points > 0),
+  ledger_id TEXT REFERENCES helper_points_ledger(id),
+  status TEXT NOT NULL CHECK (status IN (
+    'requested', 'approved', 'denied', 'fulfilled', 'cancelled'
+  )),
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at TEXT,
+  decided_by TEXT REFERENCES users(id),
+  decision_note TEXT,
+  fulfilled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_redemptions_user
+  ON helper_redemptions(user_id, requested_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_redemptions_status
+  ON helper_redemptions(status, requested_at DESC);
+
 `;
 
 function initDb() {
