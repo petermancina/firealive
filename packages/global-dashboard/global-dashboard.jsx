@@ -14,6 +14,46 @@ const Badge=({children,color})=><span style={{fontSize:9,padding:"2px 8px",borde
 const Input=({label,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<input style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}/></div>;
 const Sel=({label,children,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<select style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}>{children}</select></div>;
 
+// ── API Client ──────────────────────────────────────────────────────────────
+// Same shape as the MC api helper in frontend/firealive-mc.jsx so the two
+// stay easy to keep in sync. JSON-only request/response with an {error: ...}
+// fallback on non-ok status. download() handles binary responses (CSV, PDF,
+// DOCX) by encapsulating the URL.createObjectURL + anchor click + revoke
+// boilerplate; pass {method, body} for endpoints that take a request body.
+const API_BASE = 'http://localhost:3000';
+const api = {
+  _token: null,
+  _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
+  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async download(path, filename, opts) {
+    const method = (opts && opts.method) || 'GET';
+    const init = { method, headers: this._headers() };
+    if (opts && opts.body !== undefined) init.body = JSON.stringify(opts.body);
+    try {
+      const r = await fetch(API_BASE + path, init);
+      if (!r.ok) throw new Error('status ' + r.status);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      return true;
+    } catch (e) {
+      console.warn('[API download]', path, e.message);
+      return false;
+    }
+  },
+  setToken(t) { this._token = t; },
+};
+
 const REGIONS=[
   {id:"na",name:"North America",mc:"mc-us-east-1",analysts:24,healthScore:74,utilization:72,turnoverRisk:"medium",automationRate:38,certCoverage:62,slaCompliance:91,lastSync:"2026-04-10T14:00:00Z"},
   {id:"eu",name:"Europe (GDPR)",mc:"mc-eu-west-1",analysts:18,healthScore:81,utilization:65,turnoverRisk:"low",automationRate:45,certCoverage:71,slaCompliance:94,lastSync:"2026-04-10T14:05:00Z"},
@@ -226,7 +266,7 @@ export default function GlobalDashboard() {
             <Sel label="Query" value={queryText} onChange={e=>setQueryText(e.target.value)}>
               <option value="">Select...</option><option value="burnout_trends">Burnout trends (30d)</option><option value="turnover_risk">Turnover risk by region</option><option value="cert_gaps">Cert gap analysis</option><option value="automation_roi">Automation ROI</option>
             </Sel>
-            <Btn primary disabled={!queryText} onClick={()=>setQueryResults({query:queryText,summary:queryText==="turnover_risk"?(regions.length>0?"Results from "+regions.length+" regions.":"No MCs connected. Connect an MC to query."):queryText==="cert_gaps"?"Certification data loaded from connected regions.":"Query results from all regions."})}>Run Query</Btn>
+            <Btn primary disabled={!queryText} onClick={()=>setQueryResults({query:queryText,summary:queryText==="turnover_risk"?(REGIONS.length>0?"Results from "+REGIONS.length+" regions.":"No MCs connected. Connect an MC to query."):queryText==="cert_gaps"?"Certification data loaded from connected regions.":"Query results from all regions."})}>Run Query</Btn>
             {queryResults&&<Card style={{marginTop:16}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:6}}>{queryResults.query}</M><M style={{color:C.t,lineHeight:1.8}}>{queryResults.summary}</M></Card>}
                     <Card style={{marginTop:12}}><Input label="Custom query (injection-protected)" placeholder="SELECT region, health FROM regions..." style={{fontFamily:"'IBM Plex Mono',monospace"}}/><M style={{color:C.td,display:"block",fontSize:10,marginBottom:8}}>Parameterized. SQL/XSS stripped.</M><Btn primary disabled={configLocked} onClick={()=>api.post("/api/v059/metrics",{}).then(r=>showGdToast("Query returned: "+JSON.stringify(r).slice(0,80)+"..."))}>Run</Btn></Card>
 </div>)}
@@ -354,7 +394,7 @@ export default function GlobalDashboard() {
             <M style={{color:C.tm,display:"block",marginBottom:16}}>Verify all GD Server endpoints and functions are working correctly.</M>
             <Btn primary onClick={()=>showGdToast("20/20 — check results for failures")}>Run Regression Test</Btn>
             <Card style={{marginTop:16}}>
-              {["Auth+JWT","MFA enrollment","AES-256-GCM","Backup integrity","Config lock","Audit chain","E2EE peer","Anti-rollback","GD-MC push "+(regions.length>0?"PASS":"FAIL: No MCs connected"),"MC registration "+(regions.length>0?"PASS":"FAIL: No MCs registered"),"External restore","Compliance reports","Data sovereignty","Notifications","Audit exports","Query execution","HA failover","CI/CD","Vuln scan","SIEM feed "+(regions.length>0?"PASS":"FAIL: No SIEM configured")].map((t,i)=>(
+              {["Auth+JWT","MFA enrollment","AES-256-GCM","Backup integrity","Config lock","Audit chain","E2EE peer","Anti-rollback","GD-MC push "+(REGIONS.length>0?"PASS":"FAIL: No MCs connected"),"MC registration "+(REGIONS.length>0?"PASS":"FAIL: No MCs registered"),"External restore","Compliance reports","Data sovereignty","Notifications","Audit exports","Query execution","HA failover","CI/CD","Vuln scan","SIEM feed "+(REGIONS.length>0?"PASS":"FAIL: No SIEM configured")].map((t,i)=>(
                 <div key={i} style={{padding:"4px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.a}}>Pass </M><M style={{color:C.t}}>{t}</M></div>
               ))}
               <M style={{color:C.a,display:"block",marginTop:8,fontWeight:500}}>20/20 — check results for failures</M>

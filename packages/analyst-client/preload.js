@@ -24,6 +24,6 @@ contextBridge.exposeInMainWorld('firealive', {
       ipcRenderer.on(channel, (event, ...args) => callback(...args));
     }
   },
-    version: pkg.version,
+  version: pkg.version,
   component: 'analyst-client',
 });
