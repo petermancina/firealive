@@ -1779,7 +1779,7 @@ function ManagementConsole() {
       {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
-      {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
+      {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
     ]},
     {cat:"integrations",label:"Integrations",items:[
       {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"ai_integrations",label:"AI/ML Integrations"},
@@ -1813,7 +1813,223 @@ function ManagementConsole() {
   const [configLocked, setConfigLocked] = useState(false);
   const [padlocks, setPadlocks] = useState({});
   const isPadlocked = (section) => configLocked && (padlocks[section] !== false);
+
+  // F5 part 2b: Helper Pay management state. Populated when the Helper Pay
+  // tab opens. Pending-queue and catalog operations land via the lead and
+  // admin endpoints. The MC user is a manager (lead or admin) — admin-only
+  // operations (catalog mutate, fraud reverse, CSV export) will 403 server-
+  // side for leads, surfacing as inline error feedback.
+  const [helperPending, setHelperPending] = useState([]);
+  const [helperOptionsAdmin, setHelperOptionsAdmin] = useState([]);
+  const [helperLoading, setHelperLoading] = useState(false);
+  const [helperError, setHelperError] = useState(null);
+  const [helperFb, setHelperFb] = useState(null);
+  const [helperSection, setHelperSection] = useState("pending");
+  // Decide modal: { redemption, approve, note }
+  const [decideModal, setDecideModal] = useState(null);
+  // Catalog form: editing existing (with id) or creating new (id=null)
+  const [optionForm, setOptionForm] = useState(null);
+  // Reversal form fields
+  const [reverseLedgerId, setReverseLedgerId] = useState("");
+  const [reverseNote, setReverseNote] = useState("");
   const togglePadlock = (section) => {if(window.confirm("Authenticate with MFA to "+(isPadlocked(section)?"unlock":"lock")+" this section.")){setPadlocks(prev=>({...prev,[section]:isPadlocked(section)?false:true}));addA(isPadlocked(section)?"CONFIG_UNLOCKED":"CONFIG_LOCKED","Section: "+section);}};
+
+  // F5 part 2b: Helper Pay tab loader. When the manager opens the tab, we
+  // fetch the pending-redemption queue (lead, admin) and the full catalog
+  // including inactive options (admin only). A leads request to /admin/options
+  // returns 403 — we surface that inline rather than crashing the tab.
+  React.useEffect(() => {
+    if (tab !== "helper_pay") return;
+    let cancelled = false;
+    setHelperLoading(true);
+    setHelperError(null);
+    setHelperFb(null);
+    Promise.all([
+      api.get("/api/helper-pay/redemptions/pending"),
+      api.get("/api/helper-pay/admin/options"),
+    ]).then(([p, o]) => {
+      if (cancelled) return;
+      if (p?.error) {
+        setHelperError("Could not load pending redemptions: " + (p.error || "unknown error"));
+      } else {
+        setHelperPending(Array.isArray(p?.pending) ? p.pending : []);
+      }
+      if (o?.error) {
+        // Lead users get 403 here; that's expected, not a hard error.
+        setHelperOptionsAdmin([]);
+      } else {
+        setHelperOptionsAdmin(Array.isArray(o?.options) ? o.options : []);
+      }
+    }).finally(() => {
+      if (!cancelled) setHelperLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [tab]);
+
+  // F5 part 2b: pending-queue actions.
+  const reloadPending = () => {
+    api.get("/api/helper-pay/redemptions/pending").then(p => {
+      if (Array.isArray(p?.pending)) setHelperPending(p.pending);
+    });
+  };
+  const submitDecide = (redemption, approve, note) => {
+    api.post("/api/helper-pay/redemptions/" + redemption.id + "/decide", { approve, note }).then(r => {
+      if (r?.error) {
+        setHelperFb({ kind: "error", message: r.message || r.error || "Could not record decision." });
+        return;
+      }
+      const verb = r.status === "approved" ? "approved" : "denied";
+      setHelperFb({ kind: "success", message: "Redemption " + verb + " for " + redemption.user_name + "." });
+      setDecideModal(null);
+      reloadPending();
+      addA("HELPER_PAY_DECIDE", verb + " " + redemption.option_name + " for " + redemption.username);
+    });
+  };
+  const submitFulfill = (redemption) => {
+    api.post("/api/helper-pay/redemptions/" + redemption.id + "/fulfill", {}).then(r => {
+      if (r?.error) {
+        setHelperFb({ kind: "error", message: r.message || r.error || "Could not mark fulfilled." });
+        return;
+      }
+      setHelperFb({ kind: "success", message: "Redemption marked fulfilled for " + redemption.user_name + "." });
+      reloadPending();
+      addA("HELPER_PAY_FULFILL", redemption.option_name + " for " + redemption.username);
+    });
+  };
+
+  // F5 part 2b: catalog actions.
+  const reloadOptions = () => {
+    api.get("/api/helper-pay/admin/options").then(o => {
+      if (Array.isArray(o?.options)) setHelperOptionsAdmin(o.options);
+    });
+  };
+  const startNewOption = () => setOptionForm({
+    id: null,
+    name: "",
+    description: "",
+    costPoints: 100,
+    redemptionType: "time_off",
+    approvalRequired: true,
+    maxPerUserPerYear: "",
+    active: true,
+  });
+  const startEditOption = (opt) => setOptionForm({
+    id: opt.id,
+    name: opt.name || "",
+    description: opt.description || "",
+    costPoints: opt.cost_points,
+    redemptionType: opt.redemption_type,
+    approvalRequired: !!opt.approval_required,
+    maxPerUserPerYear: opt.max_per_user_per_year == null ? "" : String(opt.max_per_user_per_year),
+    active: !!opt.active,
+  });
+  const submitOptionForm = () => {
+    if (!optionForm) return;
+    const body = {
+      name: optionForm.name.trim(),
+      description: optionForm.description.trim() || null,
+      costPoints: parseInt(optionForm.costPoints, 10),
+      redemptionType: optionForm.redemptionType,
+      approvalRequired: !!optionForm.approvalRequired,
+      maxPerUserPerYear: optionForm.maxPerUserPerYear === "" ? null : parseInt(optionForm.maxPerUserPerYear, 10),
+    };
+    if (!body.name) {
+      setHelperFb({ kind: "error", message: "Name is required." });
+      return;
+    }
+    if (!Number.isInteger(body.costPoints) || body.costPoints <= 0) {
+      setHelperFb({ kind: "error", message: "Cost (points) must be a positive integer." });
+      return;
+    }
+    const isEdit = !!optionForm.id;
+    if (isEdit) {
+      // PUT — also include the active flag so admins can re-activate a soft-deleted option.
+      body.active = !!optionForm.active;
+      fetch(API_BASE + "/api/helper-pay/admin/options/" + optionForm.id, {
+        method: "PUT",
+        headers: api._headers(),
+        body: JSON.stringify(body),
+      }).then(r => r.ok ? r.json() : { error: r.statusText }).then(r => {
+        if (r?.error) {
+          setHelperFb({ kind: "error", message: r.message || r.error });
+          return;
+        }
+        setHelperFb({ kind: "success", message: "Option updated." });
+        setOptionForm(null);
+        reloadOptions();
+        addA("HELPER_PAY_OPTION_UPDATED", body.name);
+      });
+    } else {
+      api.post("/api/helper-pay/admin/options", body).then(r => {
+        if (r?.error) {
+          setHelperFb({ kind: "error", message: r.message || r.error });
+          return;
+        }
+        setHelperFb({ kind: "success", message: "Option created." });
+        setOptionForm(null);
+        reloadOptions();
+        addA("HELPER_PAY_OPTION_CREATED", body.name);
+      });
+    }
+  };
+  const deactivateOption = (opt) => {
+    if (!window.confirm("Deactivate \"" + opt.name + "\"? It will hide from the analyst catalog. Historic redemptions will continue to resolve.")) return;
+    api.del("/api/helper-pay/admin/options/" + opt.id).then(r => {
+      if (r?.error) {
+        setHelperFb({ kind: "error", message: r.message || r.error });
+        return;
+      }
+      setHelperFb({ kind: "success", message: "Option deactivated." });
+      reloadOptions();
+      addA("HELPER_PAY_OPTION_DEACTIVATED", opt.name);
+    });
+  };
+
+  // F5 part 2b: fraud reversal.
+  const submitReversal = () => {
+    const id = reverseLedgerId.trim();
+    if (!id) {
+      setHelperFb({ kind: "error", message: "Ledger ID is required." });
+      return;
+    }
+    if (!window.confirm("Reverse this ledger entry? This writes a new negative-delta row to the append-only ledger; the original is preserved.")) return;
+    api.post("/api/helper-pay/admin/reverse", { ledgerId: id, note: reverseNote.trim() || null }).then(r => {
+      if (r?.error) {
+        setHelperFb({ kind: "error", message: r.message || r.error });
+        return;
+      }
+      setHelperFb({ kind: "success", message: "Reversal posted. Reversal ledger ID: " + r.ledgerId });
+      setReverseLedgerId("");
+      setReverseNote("");
+      addA("HELPER_PAY_REVERSAL", "Reversed " + id);
+    });
+  };
+
+  // F5 part 2b: CSV export. The api helper assumes JSON, so we do a raw
+  // fetch and trigger a browser download.
+  const downloadCsv = (type) => {
+    fetch(API_BASE + "/api/helper-pay/admin/export.csv?type=" + encodeURIComponent(type), {
+      headers: api._headers(),
+    }).then(r => {
+      if (!r.ok) {
+        setHelperFb({ kind: "error", message: "Export failed: " + r.statusText });
+        return null;
+      }
+      return r.blob();
+    }).then(blob => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "helper-pay-" + type + "-" + new Date().toISOString().slice(0, 10) + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      addA("HELPER_PAY_EXPORT", type);
+    });
+  };
+
   // v1.0.0: setup wizard
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   const [setupStep, setSetupStep] = useState(0);
@@ -3735,6 +3951,146 @@ regression:
         </div>)}
 
         {/* ══════════ PEER SUPPORT CONFIG ══════════ */}
+        {tab==="helper_pay"&&(<div>
+          <L>Helper Pay — Lead and Admin Management</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Review pending redemption requests, manage the redemption catalog, reverse fraudulent ledger entries, and export the ledger or redemption history. Approval queue and fulfillment are available to leads. Catalog management, fraud reversal, and CSV export are admin-only — leads will see those sections grey out or 403 server-side.</M>
+
+          {helperLoading && (<Card style={{marginBottom:16}}><M style={{color:C.tm}}>Loading Helper Pay data...</M></Card>)}
+          {helperError && (<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>{helperError}</M></Card>)}
+          {helperFb && (<Card style={{marginBottom:16,borderColor:(helperFb.kind==="success"?C.a:C.d)+"60"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+              <M style={{color:helperFb.kind==="success"?C.a:C.d}}>{helperFb.message}</M>
+              <button onClick={()=>setHelperFb(null)} style={{background:"transparent",border:"none",color:C.tm,cursor:"pointer",fontSize:14,padding:4}}>×</button>
+            </div>
+          </Card>)}
+
+          <L style={{marginBottom:8}}>Pending Redemption Requests ({helperPending.length})</L>
+          {helperPending.length === 0 ? (
+            <Card style={{marginBottom:24}}><M style={{color:C.tm}}>No redemption requests are awaiting decision.</M></Card>
+          ) : (
+            <Card style={{marginBottom:24,padding:0,overflow:"hidden"}}>
+              {helperPending.map((r,i)=>(
+                <div key={r.id} style={{padding:"12px 14px",borderBottom:i<helperPending.length-1?`1px solid ${C.b}`:"none"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:8}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{r.user_name} <span style={{color:C.tm,fontSize:10}}>({r.username})</span></div>
+                      <div style={{fontSize:11,color:C.tm,marginTop:2}}>{r.option_name} · <span style={{color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{r.cost_points} pts</span></div>
+                      <div style={{fontSize:10,color:C.td,marginTop:2}}>requested {r.requested_at}</div>
+                    </div>
+                    <div style={{display:"flex",gap:6,flexShrink:0}}>
+                      <Btn small onClick={()=>setDecideModal({redemption:r,approve:false,note:""})}>Deny</Btn>
+                      <Btn small primary onClick={()=>setDecideModal({redemption:r,approve:true,note:""})}>Approve</Btn>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </Card>
+          )}
+
+          <L style={{marginBottom:8}}>Redemption Catalog ({helperOptionsAdmin.length})</L>
+          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Catalog operations require the admin role. Leads will see an empty list here even when redemption options exist for analysts.</M>
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            <Btn primary small onClick={startNewOption}>+ New Option</Btn>
+          </div>
+          {helperOptionsAdmin.length === 0 ? (
+            <Card style={{marginBottom:24}}><M style={{color:C.tm}}>No redemption options yet, or you do not have admin access to view the full catalog.</M></Card>
+          ) : (
+            <Card style={{marginBottom:24,padding:0,overflow:"hidden"}}>
+              {helperOptionsAdmin.map((opt,i)=>{
+                const typeLabel = {time_off:"Time off",gift_card:"Gift card",donation:"Donation",other:"Other"}[opt.redemption_type] || opt.redemption_type;
+                return (
+                  <div key={opt.id} style={{padding:"12px 14px",borderBottom:i<helperOptionsAdmin.length-1?`1px solid ${C.b}`:"none",opacity:opt.active?1:0.5}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:6}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+                          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{opt.name}</div>
+                          {!opt.active && <div style={{fontSize:9,color:C.tm,letterSpacing:1.2,textTransform:"uppercase"}}>inactive</div>}
+                        </div>
+                        <div style={{fontSize:10,color:C.tm,marginTop:2}}>{typeLabel} · <span style={{color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{opt.cost_points} pts</span> · {opt.approval_required ? "approval required" : "auto-approve"}{opt.max_per_user_per_year != null ? " · cap " + opt.max_per_user_per_year + "/yr" : ""}</div>
+                        {opt.description && <div style={{fontSize:11,color:C.tm,marginTop:4,lineHeight:1.5}}>{opt.description}</div>}
+                      </div>
+                      <div style={{display:"flex",gap:6,flexShrink:0}}>
+                        <Btn small onClick={()=>startEditOption(opt)}>Edit</Btn>
+                        {opt.active && <Btn small danger onClick={()=>deactivateOption(opt)}>Deactivate</Btn>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </Card>
+          )}
+
+          <L style={{marginBottom:8}}>Fraud Reversal</L>
+          <Card style={{marginBottom:24}}>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Reverse a Helper Pay ledger entry by ID. Used during the helper_pay_fraud runbook scenario when a rating is determined to be fraudulent. Writes a new negative-delta entry tagged reversal_fraud; the original entry is preserved for audit.</M>
+            <Input label="Original ledger entry ID" value={reverseLedgerId} onChange={e=>setReverseLedgerId(e.target.value)} placeholder="hex string from /api/helper-pay/ledger"/>
+            <Input label="Reason / note (optional)" value={reverseNote} onChange={e=>setReverseNote(e.target.value)} placeholder="Investigation reference"/>
+            <Btn danger onClick={submitReversal}>Post Reversal</Btn>
+          </Card>
+
+          <L style={{marginBottom:8}}>CSV Export</L>
+          <Card style={{marginBottom:24}}>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Download the full points ledger or redemption history as CSV. Useful for compliance review, payroll reconciliation, and offline analysis.</M>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <Btn onClick={()=>downloadCsv("ledger")}>Export Ledger</Btn>
+              <Btn onClick={()=>downloadCsv("redemptions")}>Export Redemptions</Btn>
+            </div>
+          </Card>
+
+          {decideModal && (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+              <Card style={{maxWidth:480,width:"100%"}}>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{decideModal.approve ? "Approve" : "Deny"} redemption</div>
+                <M style={{color:C.tm,marginBottom:14,lineHeight:1.6,display:"block"}}>
+                  {decideModal.approve
+                    ? `Approve "${decideModal.redemption.option_name}" for ${decideModal.redemption.user_name} (${decideModal.redemption.cost_points} pts)? Points will be debited from their balance immediately.`
+                    : `Deny "${decideModal.redemption.option_name}" for ${decideModal.redemption.user_name}? The analyst keeps their points; an optional note will be visible to them.`}
+                </M>
+                <Input label="Note for the analyst (optional)" value={decideModal.note} onChange={e=>setDecideModal(p=>({...p,note:e.target.value}))} placeholder={decideModal.approve ? "Approved — see you Friday!" : "Reason for denial"}/>
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+                  <Btn onClick={()=>setDecideModal(null)}>Cancel</Btn>
+                  <Btn primary={decideModal.approve} danger={!decideModal.approve} onClick={()=>submitDecide(decideModal.redemption,decideModal.approve,decideModal.note)}>{decideModal.approve ? "Approve" : "Deny"}</Btn>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {optionForm && (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20,overflowY:"auto"}}>
+              <Card style={{maxWidth:520,width:"100%",maxHeight:"90vh",overflowY:"auto"}}>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>{optionForm.id ? "Edit" : "New"} redemption option</div>
+                <Input label="Name" value={optionForm.name} onChange={e=>setOptionForm(p=>({...p,name:e.target.value}))} placeholder="Half-day off"/>
+                <Input label="Description (optional)" value={optionForm.description} onChange={e=>setOptionForm(p=>({...p,description:e.target.value}))} placeholder="Take a paid half-day during your next shift block"/>
+                <Input label="Cost (points)" type="number" value={optionForm.costPoints} onChange={e=>setOptionForm(p=>({...p,costPoints:e.target.value}))}/>
+                <div style={{marginBottom:14}}>
+                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Type</M>
+                  <select value={optionForm.redemptionType} onChange={e=>setOptionForm(p=>({...p,redemptionType:e.target.value}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}>
+                    <option value="time_off">Time off</option>
+                    <option value="gift_card">Gift card</option>
+                    <option value="donation">Donation</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+                <Input label="Max per user per year (blank = unlimited)" value={optionForm.maxPerUserPerYear} onChange={e=>setOptionForm(p=>({...p,maxPerUserPerYear:e.target.value}))} placeholder=""/>
+                <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,cursor:"pointer"}}>
+                  <input type="checkbox" checked={optionForm.approvalRequired} onChange={e=>setOptionForm(p=>({...p,approvalRequired:e.target.checked}))}/>
+                  <M style={{color:C.t}}>Approval required (lead must approve before debit)</M>
+                </label>
+                {optionForm.id && (
+                  <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,cursor:"pointer"}}>
+                    <input type="checkbox" checked={optionForm.active} onChange={e=>setOptionForm(p=>({...p,active:e.target.checked}))}/>
+                    <M style={{color:C.t}}>Active (analysts see this option in their catalog)</M>
+                  </label>
+                )}
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                  <Btn onClick={()=>setOptionForm(null)}>Cancel</Btn>
+                  <Btn primary onClick={submitOptionForm}>{optionForm.id ? "Save changes" : "Create option"}</Btn>
+                </div>
+              </Card>
+            </div>
+          )}
+        </div>)}
+
         {tab==="peersupport"&&(<div>
           <L>Peer Skill-Share Configuration</L>
           <Card style={{marginBottom:16}}>
@@ -3770,6 +4126,164 @@ regression:
           <Card><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Chat Disclaimer</div>
             <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>The peer skill-share disclaimer is persistent and applies uniformly to all participants. It covers purpose, anonymity, conduct rules, abuse policy (including flag misuse warning), the not-counseling notice, and the 5-minute post-session retention window for rating and abuse review. Management cannot edit this text — this is the analysts' space. If you do not want analysts using peer skill-share, disable it in Feature Toggles.</M>
           </Card>
+        </div>)}
+
+        {/* ══════════ HELPER PAY MANAGEMENT (F5 part 2b) ══════════ */}
+        {tab==="helper_pay"&&(<div>
+          <L>Helper Pay Management</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Approve redemption requests, configure the rewards catalog, and run audit operations on the points ledger. Catalog mutations, fraud reversals, and CSV exports require admin role; if you are a lead, those actions will surface a 403 from the server.</M>
+
+          {helperLoading && (<Card style={{marginBottom:16}}><M style={{color:C.tm}}>Loading Helper Pay management data...</M></Card>)}
+          {helperError && (<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>{helperError}</M></Card>)}
+          {helperFb && (<Card style={{marginBottom:16,borderColor:(helperFb.kind==="success"?C.a:C.d)+"60"}}>
+            <M style={{color:helperFb.kind==="success"?C.a:C.d}}>{helperFb.message}</M>
+          </Card>)}
+
+          <div style={{display:"flex",gap:6,marginBottom:16}}>
+            {[
+              {id:"pending",label:"Pending Queue",badge:helperPending.length},
+              {id:"catalog",label:"Catalog"},
+              {id:"tools",label:"Audit Tools"},
+            ].map(s=>(
+              <button key={s.id} onClick={()=>setHelperSection(s.id)} style={{padding:"8px 14px",background:helperSection===s.id?C.ad:"transparent",border:`1px solid ${helperSection===s.id?C.a+"50":C.b}`,borderRadius:8,color:helperSection===s.id?C.a:C.tm,fontSize:11,fontWeight:500,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
+                {s.label}
+                {s.badge>0&&<span style={{fontSize:9,background:C.dd,color:C.d,padding:"1px 6px",borderRadius:8,fontWeight:600}}>{s.badge}</span>}
+              </button>
+            ))}
+          </div>
+
+          {helperSection==="pending"&&(<div>
+            {helperPending.length===0?(
+              <Card><M style={{color:C.tm}}>No pending redemption requests.</M></Card>
+            ):(
+              helperPending.map(r=>{
+                const typeLabel = {time_off:"Time off",gift_card:"Gift card",donation:"Donation",other:"Other"}[r.redemption_type] || r.redemption_type;
+                return (
+                  <Card key={r.id} style={{marginBottom:12}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+                      <div>
+                        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{r.user_name} <span style={{color:C.td,fontWeight:400}}>· @{r.username}</span></div>
+                        <M style={{color:C.tm,display:"block",marginBottom:2}}>{r.option_name} <span style={{color:C.a}}>({typeLabel})</span></M>
+                        <M style={{color:C.td}}>requested {r.requested_at}</M>
+                      </div>
+                      <div style={{fontSize:14,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{r.cost_points} pts</div>
+                    </div>
+                    <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                      <Btn small onClick={()=>setDecideModal({redemption:r,approve:false,note:""})}>Deny</Btn>
+                      <Btn small primary onClick={()=>setDecideModal({redemption:r,approve:true,note:""})}>Approve</Btn>
+                    </div>
+                  </Card>
+                );
+              })
+            )}
+          </div>)}
+
+          {helperSection==="catalog"&&(<div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <M style={{color:C.tm}}>{helperOptionsAdmin.length} option{helperOptionsAdmin.length===1?"":"s"} in catalog (active and inactive)</M>
+              <Btn small primary onClick={startNewOption}>+ New Option</Btn>
+            </div>
+            {helperOptionsAdmin.length===0?(
+              <Card><M style={{color:C.tm}}>No options in catalog yet, or you do not have admin permission to view the full catalog. Click "+ New Option" to create one (admin role required).</M></Card>
+            ):(
+              helperOptionsAdmin.map(o=>{
+                const typeLabel = {time_off:"Time off",gift_card:"Gift card",donation:"Donation",other:"Other"}[o.redemption_type] || o.redemption_type;
+                return (
+                  <Card key={o.id} style={{marginBottom:10,opacity:o.active?1:0.55}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                          <span style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>{o.name}</span>
+                          <Badge color={o.active?C.a:C.tm}>{o.active?"Active":"Inactive"}</Badge>
+                          <Badge color={C.i}>{typeLabel}</Badge>
+                          {o.approval_required?<Badge color={C.w}>Approval required</Badge>:<Badge color={C.a}>Auto-approve</Badge>}
+                        </div>
+                        {o.description&&<M style={{color:C.tm,display:"block",marginBottom:6,lineHeight:1.5}}>{o.description}</M>}
+                        <M style={{color:C.td}}>{o.cost_points} pts{o.max_per_user_per_year?" · max "+o.max_per_user_per_year+"/yr per user":" · unlimited per user"}</M>
+                      </div>
+                      <div style={{display:"flex",gap:6,flexShrink:0,marginLeft:12}}>
+                        <Btn small onClick={()=>startEditOption(o)}>Edit</Btn>
+                        {o.active&&<Btn small danger onClick={()=>deactivateOption(o)}>Deactivate</Btn>}
+                      </div>
+                    </div>
+                  </Card>
+                );
+              })
+            )}
+          </div>)}
+
+          {helperSection==="tools"&&(<div>
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Fraud Reversal</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Reverse a points ledger entry by writing a new negative-delta row. The original entry is preserved (the ledger is append-only) and the user's balance is corrected by the reversal row's negative delta. Admin role required.</M>
+              <Input label="Ledger entry ID" value={reverseLedgerId} onChange={e=>setReverseLedgerId(e.target.value)} placeholder="lower-hex 32-char id"/>
+              <Input label="Reason / note (optional)" value={reverseNote} onChange={e=>setReverseNote(e.target.value)} placeholder="e.g. fake-session abuse — runbook helper_pay_fraud"/>
+              <Btn danger onClick={submitReversal}>Reverse Entry</Btn>
+            </Card>
+            <Card>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>CSV Export</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Download the full ledger or redemption history as CSV for offline analysis or external audit. Admin role required.</M>
+              <div style={{display:"flex",gap:8}}>
+                <Btn onClick={()=>downloadCsv("ledger")}>Download Ledger CSV</Btn>
+                <Btn onClick={()=>downloadCsv("redemptions")}>Download Redemptions CSV</Btn>
+              </div>
+            </Card>
+          </div>)}
+
+          {decideModal&&(
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+              <Card style={{maxWidth:480,width:"100%"}}>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{decideModal.approve?"Approve":"Deny"} redemption</div>
+                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>
+                  {decideModal.approve
+                    ?`Approve "${decideModal.redemption.option_name}" (${decideModal.redemption.cost_points} pts) for ${decideModal.redemption.user_name}? Approval debits the points immediately and notifies the analyst.`
+                    :`Deny "${decideModal.redemption.option_name}" (${decideModal.redemption.cost_points} pts) for ${decideModal.redemption.user_name}? Their balance is unchanged.`}
+                </M>
+                <Input label="Note to analyst (optional)" value={decideModal.note} onChange={e=>setDecideModal(m=>({...m,note:e.target.value}))} placeholder={decideModal.approve?"e.g. enjoy the time off":"e.g. budget exhausted this quarter"}/>
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:6}}>
+                  <Btn onClick={()=>setDecideModal(null)}>Cancel</Btn>
+                  <Btn primary={decideModal.approve} danger={!decideModal.approve} onClick={()=>submitDecide(decideModal.redemption,decideModal.approve,decideModal.note)}>
+                    {decideModal.approve?"Approve":"Deny"}
+                  </Btn>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {optionForm&&(
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20,overflowY:"auto"}}>
+              <Card style={{maxWidth:520,width:"100%",maxHeight:"90vh",overflowY:"auto"}}>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>{optionForm.id?"Edit redemption option":"New redemption option"}</div>
+                <Input label="Name" value={optionForm.name} onChange={e=>setOptionForm(f=>({...f,name:e.target.value}))} placeholder="e.g. 2-hour PTO chunk"/>
+                <Input label="Description (optional)" value={optionForm.description} onChange={e=>setOptionForm(f=>({...f,description:e.target.value}))} placeholder="What the analyst gets for redeeming"/>
+                <Input label="Cost (points)" type="number" value={optionForm.costPoints} onChange={e=>setOptionForm(f=>({...f,costPoints:e.target.value}))}/>
+                <div style={{marginBottom:14}}>
+                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Type</M>
+                  <select value={optionForm.redemptionType} onChange={e=>setOptionForm(f=>({...f,redemptionType:e.target.value}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}>
+                    <option value="time_off">Time off</option>
+                    <option value="gift_card">Gift card</option>
+                    <option value="donation">Donation</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+                <Input label="Max per user per year (optional)" type="number" value={optionForm.maxPerUserPerYear} onChange={e=>setOptionForm(f=>({...f,maxPerUserPerYear:e.target.value}))} placeholder="leave blank for unlimited"/>
+                <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",cursor:"pointer"}}>
+                  <input type="checkbox" checked={optionForm.approvalRequired} onChange={e=>setOptionForm(f=>({...f,approvalRequired:e.target.checked}))}/>
+                  <M style={{color:C.t}}>Requires lead approval before debit</M>
+                </label>
+                {optionForm.id&&(
+                  <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",cursor:"pointer"}}>
+                    <input type="checkbox" checked={optionForm.active} onChange={e=>setOptionForm(f=>({...f,active:e.target.checked}))}/>
+                    <M style={{color:C.t}}>Active (visible to analysts in their catalog)</M>
+                  </label>
+                )}
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+                  <Btn onClick={()=>setOptionForm(null)}>Cancel</Btn>
+                  <Btn primary onClick={submitOptionForm}>{optionForm.id?"Save Changes":"Create"}</Btn>
+                </div>
+              </Card>
+            </div>
+          )}
         </div>)}
 
         {/* ══════════ FEATURE TOGGLES ══════════ */}
