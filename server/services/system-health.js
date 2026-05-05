@@ -27,7 +27,7 @@ class SystemHealthMonitor {
   }
   getConnectedClients() {
     try {
-      return this.db.prepare("SELECT id, uuid, pseudonym, last_heartbeat, active FROM users WHERE role='analyst'").all().map(u => ({
+      return this.db.prepare("SELECT id, pseudonym, last_heartbeat, active FROM users WHERE role='analyst'").all().map(u => ({
         ...u, connected: u.last_heartbeat && (Date.now() - new Date(u.last_heartbeat).getTime() < 90000)
       }));
     } catch { return []; }
