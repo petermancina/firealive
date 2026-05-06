@@ -27,6 +27,7 @@ const { bandwidthMonitor } = require('./services/bandwidth-monitor');
 const { verifyIntegrity } = require('./services/integrity');
 const { runtimeMonitor } = require('./services/runtime-monitor');
 const oodaJobs = require('./services/ooda-generation-jobs');
+const { gdPushService } = require('./services/gd-push');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -196,6 +197,9 @@ async function start() {
       dispatchToSoar(alert.type, alert);
     });
 
+    // Start GD push service (pushes aggregate metrics to configured GD-Server)
+    gdPushService.start();
+
     // Scheduled jobs: account review (03:00), retention purge (04:00),
     // recert check (09:00), log integrity (hourly)
     const { runAccountReview } = require('./services/account-review');
@@ -237,6 +241,7 @@ async function start() {
     const gracefulShutdown = (signal) => {
       logger.info(`Received ${signal}, beginning graceful shutdown`);
       try { oodaJobs.shutdown(); } catch (e) { logger.warn('OODA worker shutdown error', { error: e.message }); }
+      try { gdPushService.stop(); } catch (e) { logger.warn('GD push service shutdown error', { error: e.message }); }
       if (wsServer) { try { wsServer.shutdown(); } catch (e) { logger.warn('WebSocket shutdown error', { error: e.message }); } }
       server.close();
     };
