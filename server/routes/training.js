@@ -234,22 +234,26 @@ router.post('/submit-completion', (req, res) => {
     return res.status(400).json({ error: 'platform name too long (max 64)' });
   }
 
-  // ── URL: optional, sanitized to strip XSS vectors ──
+  // ── URL: optional, strictly validated as http(s) URL ──
   let sanitizedUrl = null;
   if (url !== undefined && url !== null && url !== '') {
     if (typeof url !== 'string' || url.length > 2048) {
       return res.status(400).json({ error: 'url must be a string up to 2048 chars' });
     }
-    sanitizedUrl = url
-      .replace(/<[^>]*>/g, '')
-      .replace(/javascript:/gi, '')
-      .replace(/data:/gi, '')
-      .replace(/vbscript:/gi, '')
-      .replace(/%3C/gi, '')
-      .trim();
-    if (sanitizedUrl && !/^https?:\/\//i.test(sanitizedUrl)) {
+
+    const trimmedUrl = url.trim();
+    let parsed;
+    try {
+      parsed = new URL(trimmedUrl);
+    } catch {
+      return res.status(400).json({ error: 'url must be a valid absolute URL' });
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
       return res.status(400).json({ error: 'url must use http:// or https://' });
     }
+
+    sanitizedUrl = parsed.toString();
   }
 
   // ── Score: optional, 0-100 ──
