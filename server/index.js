@@ -108,6 +108,7 @@ app.use('/api/integrations', authMiddleware(['admin']), require('./routes/integr
 app.use('/api/v1/malware-scanners', authMiddleware(['admin']), require('./routes/malware-scanners'));
 app.use('/api/apikeys', authMiddleware(['admin']), require('./routes/apikeys'));
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
+app.use('/api/gd-config', authMiddleware(['admin']), require('./routes/gd-config'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), require('./routes/audit'));
 app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
