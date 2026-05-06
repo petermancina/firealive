@@ -56,7 +56,7 @@ router.post('/pseudonyms/assign', (req, res) => {
     const { analystId, pseudonym } = req.body;
     const db = getDb();
     // Store only the pseudonym on the users row
-    db.prepare("UPDATE users SET pseudonym = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, analystId);
+    db.prepare("UPDATE users SET pseudonym = ?, pseudonym_rotated_at = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, new Date().toISOString(), analystId);
     // The real identity mapping is NOT stored in the DB — it's only in the
     // encrypted export that the Team Lead downloads and stores offline.
     auditLog('system', 'PSEUDONYM_ASSIGNED', `Pseudonym assigned (identity not logged)`);
@@ -77,7 +77,7 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
         pseudonym = `Analyst-${bird}-${Math.floor(Math.random() * 99)}`;
       } while (used.has(pseudonym));
       used.add(pseudonym);
-      db.prepare("UPDATE users SET pseudonym = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, a.id);
+      db.prepare("UPDATE users SET pseudonym = ?, pseudonym_rotated_at = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, new Date().toISOString(), a.id);
     });
     auditLog(req.user?.id || 'system', 'PSEUDONYMS_ROTATED', `All ${analysts.length} pseudonyms rotated`);
     db.close();

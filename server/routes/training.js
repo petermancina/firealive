@@ -8,7 +8,8 @@
 // POST /api/training/certificates       — upload/submit certificate proof
 // GET  /api/training/certificates       — list submitted certificates
 // PUT  /api/training/certificates/:id/verify — lead verifies a certificate
-// GET  /api/training/completions        — lead views team completions
+// POST /api/training/submit-completion  — analyst submits external module completion
+// GET  /api/training/completions        — lead views team certificate summary
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -202,6 +203,104 @@ router.put('/certificates/:id/verify', (req, res) => {
   } catch (err) {
     logger.error('Verify certificate error', { error: err.message });
     res.status(500).json({ error: 'Failed to verify certificate' });
+  }
+});
+
+// ── Submit Training Completion ──────────────────────────────────────────────
+// Analyst-side submission of an external training-module completion (per
+// FEATURE-GUIDE training section: "submits a completion report (link, score,
+// date) back into the AC"). Distinct from certificate uploads at POST
+// /certificates — completions track module-level external training progress
+// while certificates track formal credentials per skill. Both feed the
+// analyst's gap display and contribute to team-aggregate training metrics.
+//
+// Stored in the training_completions table (added to canonical schema in
+// the previous commit). The metrics-collector.js service reads verified
+// completion counts from this table.
+router.post('/submit-completion', (req, res) => {
+  const { module, platform, url, completionDate, score } = req.body || {};
+
+  // ── Required fields ──
+  if (!module || typeof module !== 'string' || !module.trim()) {
+    return res.status(400).json({ error: 'module is required' });
+  }
+  if (module.length > 256) {
+    return res.status(400).json({ error: 'module name too long (max 256)' });
+  }
+  if (!platform || typeof platform !== 'string' || !platform.trim()) {
+    return res.status(400).json({ error: 'platform is required' });
+  }
+  if (platform.length > 64) {
+    return res.status(400).json({ error: 'platform name too long (max 64)' });
+  }
+
+  // ── URL: optional, strictly validated as http(s) URL ──
+  let sanitizedUrl = null;
+  if (url !== undefined && url !== null && url !== '') {
+    if (typeof url !== 'string' || url.length > 2048) {
+      return res.status(400).json({ error: 'url must be a string up to 2048 chars' });
+    }
+
+    const trimmedUrl = url.trim();
+    let parsed;
+    try {
+      parsed = new URL(trimmedUrl);
+    } catch {
+      return res.status(400).json({ error: 'url must be a valid absolute URL' });
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return res.status(400).json({ error: 'url must use http:// or https://' });
+    }
+
+    sanitizedUrl = parsed.toString();
+  }
+
+  // ── Score: optional, 0-100 ──
+  let validatedScore = null;
+  if (score !== undefined && score !== null && score !== '') {
+    const n = parseInt(score, 10);
+    if (!Number.isFinite(n) || n < 0 || n > 100) {
+      return res.status(400).json({ error: 'score must be 0-100' });
+    }
+    validatedScore = n;
+  }
+
+  // ── Completion date: optional ISO 8601 (defaults to today) ──
+  let validatedDate = null;
+  if (completionDate) {
+    if (typeof completionDate !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(completionDate)) {
+      return res.status(400).json({ error: 'completionDate must be ISO format (YYYY-MM-DD or full ISO 8601)' });
+    }
+    validatedDate = completionDate;
+  } else {
+    validatedDate = new Date().toISOString().slice(0, 10);
+  }
+
+  try {
+    const db = getDb();
+    const id = crypto.randomBytes(16).toString('hex');
+    db.prepare(`
+      INSERT INTO training_completions
+        (id, user_id, module, platform, url, completion_date, score, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+    `).run(
+      id,
+      req.user.id,
+      module.slice(0, 256),
+      platform.slice(0, 64),
+      sanitizedUrl,
+      validatedDate,
+      validatedScore
+    );
+    db.close();
+
+    auditLog(req.user.id, 'TRAINING_COMPLETION_SUBMITTED',
+      `module=${module} platform=${platform}`, req.ip);
+    res.status(201).json({ id, status: 'pending' });
+  } catch (err) {
+    logger.error('Submit training completion error', { error: err.message });
+    res.status(500).json({ error: 'Failed to submit training completion' });
   }
 });
 

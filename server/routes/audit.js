@@ -3,12 +3,15 @@
 // GET  /api/audit            — query audit log with filters
 // GET  /api/audit/export     — export audit log (CSV, JSON, or CEF)
 // GET  /api/audit/stats      — aggregated event counts
+// GET  /api/audit/integrity  — verify the SHA-256 chain across the audit log
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
+const { auditLog } = require('../middleware/audit');
 const { cefDeviceVersion } = require('../lib/version');
+const { verifyAuditChain } = require('../middleware/pentest-hardening');
 
 // ── Query Audit Log ──────────────────────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -115,6 +118,34 @@ router.get('/stats', (req, res) => {
   } catch (err) {
     logger.error('Audit stats error', { error: err.message });
     res.status(500).json({ error: 'Failed to compute audit stats' });
+  }
+});
+
+// ── Audit Chain Integrity Verification ───────────────────────────────────────
+// Walks the audit_log table in id-order, confirming each row's prev_hash
+// matches the previous row's hash. A mismatch indicates someone tampered with
+// the audit log between two entries — either an INSERT, UPDATE, or DELETE that
+// did not preserve the SHA-256 hash chain. The chain is the primary integrity
+// guarantee for the immutable audit trail referenced in compliance reports
+// (NIST AU-9, SOC2 CC7.3, ISO 27001 A.12.4.2).
+//
+// On success: { intact: true, entries: N }
+// On tamper detection: { intact: false, brokenAt: <id>, expected: <hash>, found: <hash> }
+//
+// The check itself is logged to the audit chain so that a Team Lead running
+// integrity checks creates an additional auditable trail of monitoring activity.
+router.get('/integrity', (req, res) => {
+  try {
+    const db = getDb();
+    const result = verifyAuditChain(db);
+    db.close();
+    auditLog(req.user?.id, 'AUDIT_INTEGRITY_CHECK',
+      result.intact ? `intact entries=${result.entries}` : `BROKEN at id=${result.brokenAt}`,
+      req.ip);
+    res.json(result);
+  } catch (err) {
+    logger.error('Audit integrity check error', { error: err.message });
+    res.status(500).json({ error: 'Failed to verify audit chain integrity' });
   }
 });
 

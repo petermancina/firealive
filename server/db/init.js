@@ -1068,6 +1068,41 @@ CREATE TABLE IF NOT EXISTS compliance_controls (
 CREATE INDEX IF NOT EXISTS idx_compliance_controls_framework
   ON compliance_controls(framework);
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R3a: TRAINING COMPLETIONS
+-- Analyst-side submission of external training-module completions, per
+-- FEATURE-GUIDE.md training section: "submits a completion report (link,
+-- score, date) back into the AC". Distinct from the certificate workflow
+-- (POST /api/training/certificates) — certificates are formal credential
+-- documents (PDF uploads with verification codes) tracked per skill, while
+-- completions are module-completion reports for external training platforms
+-- (LetsDefend, HackTheBox, TryHackMe, CyberDefenders, SANS, Immersive Labs,
+-- internal training). Both feed the analyst's gap display and contribute
+-- to team-aggregate training metrics surfaced via the metrics collector.
+-- Lead verification updates status from 'pending' to 'verified' or
+-- 'rejected' the same way certificate verification works.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS training_completions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  module TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  url TEXT,
+  completion_date TEXT,
+  score INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'verified', 'rejected')),
+  submitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+  verified_at TEXT,
+  verified_by TEXT REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_completions_user
+  ON training_completions(user_id);
+CREATE INDEX IF NOT EXISTS idx_training_completions_status
+  ON training_completions(status);
+
 `;
 
 function initDb() {
