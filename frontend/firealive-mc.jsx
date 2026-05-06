@@ -747,7 +747,16 @@ function ManagementConsole() {
   // Cluster config
   const [clusterCfg, setClusterCfg] = useState({enabled:false,mode:"active_active",nodeCount:2,nodes:[],sessionStore:"redis",parallelProcessing:true,workerThreads:4});
   // Global dashboard (read-only VP view)
-  const [globalDashCfg, setGlobalDashCfg] = useState({enabled:false,ingestEndpoints:[],readOnlyApiKey:"",allowedRegions:[]});
+  const [globalDashCfg, setGlobalDashCfg] = useState({enabled:false,endpoint_url:"",api_key_set:false,api_key_input:"",push_interval_minutes:15,retry_max:3,retry_backoff_seconds:30,last_push_at:null,last_push_status:null,last_push_error:null,consecutive_failures:0,_loaded:false,_saving:false,_testing:false,_testResult:null,_savedEndpointUrl:"",_savedApiKeySet:false});
+  useEffect(()=>{
+    if (tab !== "global_dash") return;
+    if (globalDashCfg._loaded) return;
+    api.get("/api/gd-config").then(r=>{
+      if (r && !r.error) {
+        setGlobalDashCfg(prev=>({...prev, ...r, api_key_input:"", _loaded:true, _savedEndpointUrl:r.endpoint_url||"", _savedApiKeySet:!!r.api_key_set}));
+      }
+    }).catch(()=>{});
+  }, [tab, globalDashCfg._loaded]);
   // Backup enhancements
   const [backupSchedules, setBackupSchedules] = useState([
     {id:"bs1",type:"incremental",frequency:"daily",time:"02:00",destination:"local",retentionDays:30,encrypted:true,regulatoryPreset:"none"},
@@ -4422,22 +4431,45 @@ regression:
 
         {/* ══════════ v1.0.0 — GLOBAL DASHBOARD ══════════ */}
         {tab==="global_dash"&&(<div>
-          <L>Global Dashboard (Executive Read-Only)</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>A separate read-only view for Cyber VPs and CISOs that aggregates burnout metrics, training progress, and team health data from multiple regional Management Consoles. Each MC pushes anonymized aggregate data to the Global Dashboard — no individual analyst data is transmitted. This is a companion app, not a controller.</M>
+          <L>Global Dashboard Push</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure this Regional MC to push aggregate metrics to a Global Dashboard Server (GD-Server) — a separate read-only backend operated by your CISO/VP that aggregates region-level data across multiple MCs. The CISO obtains an API key by registering this MC on the GD-Server, then provides it here. Pushes are one-way (this MC pushes; GD-Server never writes back) and contain only team-level aggregate data — no individual analyst data is transmitted.</M>
+          <Card style={{marginBottom:16,borderColor:globalDashCfg.last_push_status==="failure"?C.d+"40":(globalDashCfg.last_push_status==="success"?C.a+"40":C.b)}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Connection Status</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:11}}>
+              <M style={{color:C.tm}}>State: <span style={{color:globalDashCfg.enabled?C.a:C.tm}}>{globalDashCfg.enabled?"enabled":"disabled"}</span></M>
+              <M style={{color:C.tm}}>API key: <span style={{color:globalDashCfg.api_key_set?C.a:C.w}}>{globalDashCfg.api_key_set?"configured":"not set"}</span></M>
+              <M style={{color:C.tm}}>Last push: {globalDashCfg.last_push_at||"never"}</M>
+              <M style={{color:C.tm}}>Status: <span style={{color:globalDashCfg.last_push_status==="success"?C.a:(globalDashCfg.last_push_status==="failure"?C.d:C.tm)}}>{globalDashCfg.last_push_status||"\u2014"}</span></M>
+              {globalDashCfg.consecutive_failures>0&&<M style={{color:C.d}}>Consecutive failures: {globalDashCfg.consecutive_failures}{globalDashCfg.consecutive_failures>=20?" (CIRCUIT BREAKER TRIPPED \u2014 auto-disabled)":""}</M>}
+              {globalDashCfg.last_push_error&&<M style={{color:C.d,gridColumn:"1 / -1",fontFamily:"'IBM Plex Mono',monospace",fontSize:10}}>Last error: {globalDashCfg.last_push_error}</M>}
+            </div>
+            {globalDashCfg.consecutive_failures>0&&<Btn small onClick={()=>{api.put("/api/gd-config",{reset_failure_counter:true}).then(r=>{if(r&&!r.error){setGlobalDashCfg(prev=>({...prev,...r,_loaded:true}));addA("GD","Failure counter reset");}else{addA("GD","Reset failed: "+(r?.error||"unknown"));}});}} style={{marginTop:10}}>Reset Failure Counter</Btn>}
+          </Card>
           <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={globalDashCfg.enabled} onChange={e=>setGlobalDashCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable Global Dashboard data export from this MC</label>
-            <Input label="Global Dashboard ingest endpoint" value={globalDashCfg.ingestEndpoints[0]||""} onChange={e=>setGlobalDashCfg(prev=>({...prev,ingestEndpoints:[e.target.value]}))} placeholder="https://global-dash.corp.com/api/ingest" maxLength={512}/>
-            <Input label="Read-only API key for this MC" value={globalDashCfg.readOnlyApiKey} onChange={e=>setGlobalDashCfg(prev=>({...prev,readOnlyApiKey:e.target.value}))} placeholder="Auto-generated on save" maxLength={256}/>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={globalDashCfg.enabled} onChange={e=>setGlobalDashCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable Global Dashboard push from this MC</label>
+            <Input label="GD-Server endpoint URL" value={globalDashCfg.endpoint_url} onChange={e=>setGlobalDashCfg(prev=>({...prev,endpoint_url:e.target.value}))} placeholder="https://gd.corp.com:4001" maxLength={2048}/>
+            <Input label={globalDashCfg.api_key_set?"Replace API key (leave blank to keep existing)":"API key from GD-Server"} type="password" value={globalDashCfg.api_key_input} onChange={e=>setGlobalDashCfg(prev=>({...prev,api_key_input:e.target.value}))} placeholder={globalDashCfg.api_key_set?"\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022":"gdash-ro-..."} maxLength={512}/>
+            {globalDashCfg.api_key_set&&<Btn small onClick={()=>{if(window.confirm("Clear stored API key? Push will be disabled until a new key is set.")){api.put("/api/gd-config",{clear_api_key:true,enabled:false}).then(r=>{if(r&&!r.error){setGlobalDashCfg(prev=>({...prev,...r,api_key_input:"",_loaded:true}));addA("GD","API key cleared");}});}}} style={{marginTop:6}}>Clear Stored API Key</Btn>}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:12}}>
+              <Input label="Push interval (min)" type="number" value={globalDashCfg.push_interval_minutes} onChange={e=>setGlobalDashCfg(prev=>({...prev,push_interval_minutes:parseInt(e.target.value)||15}))} min={1} max={1440}/>
+              <Input label="Retry max" type="number" value={globalDashCfg.retry_max} onChange={e=>setGlobalDashCfg(prev=>({...prev,retry_max:parseInt(e.target.value)||0}))} min={0} max={10}/>
+              <Input label="Retry backoff (sec)" type="number" value={globalDashCfg.retry_backoff_seconds} onChange={e=>setGlobalDashCfg(prev=>({...prev,retry_backoff_seconds:parseInt(e.target.value)||30}))} min={1} max={3600}/>
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:14}}>
+              <Btn primary disabled={globalDashCfg._saving} onClick={()=>{const payload={enabled:globalDashCfg.enabled,endpoint_url:globalDashCfg.endpoint_url,push_interval_minutes:globalDashCfg.push_interval_minutes,retry_max:globalDashCfg.retry_max,retry_backoff_seconds:globalDashCfg.retry_backoff_seconds};if(globalDashCfg.api_key_input)payload.api_key=globalDashCfg.api_key_input;setGlobalDashCfg(prev=>({...prev,_saving:true}));api.put("/api/gd-config",payload).then(r=>{if(r&&!r.error){setGlobalDashCfg(prev=>({...prev,...r,api_key_input:"",_saving:false,_loaded:true,_savedEndpointUrl:r.endpoint_url||"",_savedApiKeySet:!!r.api_key_set}));addA("GD","Configuration saved");}else{setGlobalDashCfg(prev=>({...prev,_saving:false}));addA("GD","Save failed: "+(r?.error||"unknown"));}});}}>{globalDashCfg._saving?"Saving...":"Save Configuration"}</Btn>
+              <Btn disabled={globalDashCfg._testing||!globalDashCfg._savedEndpointUrl||!globalDashCfg._savedApiKeySet} onClick={()=>{setGlobalDashCfg(prev=>({...prev,_testing:true,_testResult:null}));api.post("/api/gd-config/test",{}).then(r=>{setGlobalDashCfg(prev=>({...prev,_testing:false,_testResult:r}));if(r?.ok)addA("GD","Test connection succeeded ("+r.durationMs+"ms)");else addA("GD","Test connection failed: "+(r?.error||"unknown"));});}}>{globalDashCfg._testing?"Testing...":"Test Connection"}</Btn>
+            </div>
+            <M style={{color:C.tm,fontSize:10,fontStyle:"italic",marginTop:6,display:"block",lineHeight:1.5}}>Test runs against the saved configuration. If you've edited the form fields above, click Save first. Note: the GD endpoint hostname must be in the <code>GD_ALLOWED_HOSTS</code> environment variable on this MC server (set at deployment time) — see deployment docs.</M>
+            {globalDashCfg._testResult&&<Card style={{padding:10,marginTop:10,borderColor:(globalDashCfg._testResult.ok?C.a:C.d)+"40"}}><M style={{color:globalDashCfg._testResult.ok?C.a:C.d,fontWeight:500,fontSize:11}}>{globalDashCfg._testResult.ok?"\u2713 Connection successful":"\u2717 Connection failed"} ({globalDashCfg._testResult.durationMs||"?"}ms)</M>{globalDashCfg._testResult.error&&<M style={{color:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",marginTop:4}}>{globalDashCfg._testResult.error}</M>}</Card>}
           </Card>
           <Card style={{padding:12,borderColor:C.p+"30",marginBottom:16}}>
-            <M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Data Sent to Global Dashboard</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>Team-level aggregate burnout score (no individual data) · Team size and capacity utilization · Training completion rates · Certification coverage · SLA performance · Incident-to-burnout correlation trends · Automation rate · All data uses pseudonyms at minimum — individual analyst identities are never transmitted</M>
+            <M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Data Sent to GD-Server</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>Aggregate team health (capacity score) \u00b7 Analyst count \u00b7 Active incident count \u00b7 Burnout routing state \u00b7 Proactive breaks given (24h) \u00b7 Upskilling hours used \u00b7 Turnover risk (derived) \u00b7 SLA compliance (where measured) \u00b7 Cert coverage (where configured) \u00b7 Automation rate (where configured). All values are team-level aggregates with no individual analyst identifiers.</M>
           </Card>
-          <Card style={{padding:12,borderColor:C.w+"30",marginBottom:16}}>
+          <Card style={{padding:12,borderColor:C.w+"30"}}>
             <M style={{color:C.w,fontWeight:500,display:"block",marginBottom:4}}>Architecture Note</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>The Global Dashboard is a separate application with its own deployment. It has read-only permissions — it cannot modify any regional MC's configuration or data. Each regional MC pushes data on a schedule (configurable, default: hourly). MCs are not connected to each other and don't know about each other. The Global Dashboard is the only system that aggregates across regions.</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>The GD-Server is a separate application with its own deployment (typically on port 4001). It has read-only ingest from this MC's perspective and never writes back. The push is fire-and-forget \u2014 if the GD-Server is unreachable, this MC retries with exponential backoff and auto-disables after 20 consecutive failures (circuit breaker). Failures are logged in the audit trail under GD_PUSH_FAILURE.</M>
           </Card>
-          <Btn primary onClick={()=>{if(!globalDashCfg.readOnlyApiKey){setGlobalDashCfg(prev=>({...prev,readOnlyApiKey:"gdash-ro-"+Math.random().toString(36).slice(2,18)}));}api.post("/api/v1/audit/log",{event:"GLOBAL_DASH_CONFIG_SAVED",detail:"Global Dashboard export config saved"}).then(()=>addA("GLOBAL_DASH_CONFIG_SAVED","Global Dashboard export config saved"));}}>Save & Generate API Key</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — BACKUP SCHEDULES ══════════ */}

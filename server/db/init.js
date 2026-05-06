@@ -1103,6 +1103,54 @@ CREATE INDEX IF NOT EXISTS idx_training_completions_user
 CREATE INDEX IF NOT EXISTS idx_training_completions_status
   ON training_completions(status);
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R3b: GLOBAL DASHBOARD PUSH CONFIGURATION
+-- Stores the configuration this Regional MC uses to push aggregate metrics
+-- to a Global Dashboard Server (GD-Server). The GD-Server runs as a separate
+-- backend (typically on port 4001) operated by the customer's CISO/VP, and
+-- it receives aggregate region-level data from one or more MCs across the
+-- enterprise. The MC-side data flow is push-only — the GD-Server NEVER
+-- writes back to the MC.
+--
+-- Single-row table by convention (id=1), since each MC pushes to at most
+-- one GD-Server. The CISO obtains the API key by calling POST /api/mc/register
+-- on the GD-Server, then provides the key plus the GD endpoint URL to the
+-- MC admin who fills it into the MC's Global Dashboard Push settings.
+--
+-- Push behavior: an MC-side service (services/gd-push.js, added in a later
+-- commit) wakes on the configured interval, calls the canonical metrics
+-- collector to get a fresh snapshot, transforms it into the shape the
+-- GD-Server's /api/ingest/metrics endpoint expects, and posts it with the
+-- API key. Result of each push is recorded in last_push_at, last_push_status,
+-- and last_push_error so the admin can see whether pushes are succeeding.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS gd_push_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  endpoint_url TEXT,
+  api_key_encrypted TEXT,
+  push_interval_minutes INTEGER NOT NULL DEFAULT 15
+    CHECK (push_interval_minutes >= 1 AND push_interval_minutes <= 1440),
+  retry_max INTEGER NOT NULL DEFAULT 3 CHECK (retry_max >= 0 AND retry_max <= 10),
+  retry_backoff_seconds INTEGER NOT NULL DEFAULT 30
+    CHECK (retry_backoff_seconds >= 1 AND retry_backoff_seconds <= 3600),
+  last_push_at TEXT,
+  last_push_status TEXT
+    CHECK (last_push_status IS NULL OR last_push_status IN ('success', 'failure', 'pending')),
+  last_push_error TEXT,
+  last_push_duration_ms INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Seed the singleton row in disabled state on first init. The singleton
+-- pattern is enforced by the CHECK (id = 1) constraint above. PUTs to
+-- /api/gd-config update this row in place.
+INSERT OR IGNORE INTO gd_push_config (id, enabled, push_interval_minutes)
+  VALUES (1, 0, 15);
+
 `;
 
 function initDb() {

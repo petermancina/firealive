@@ -8,6 +8,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
@@ -25,6 +26,23 @@ app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting on /api/. Mirrors the pattern in MC server/index.js to keep
+// both servers' DoS protection consistent. 1000 req per 15-minute window per
+// IP is generous enough for normal CISO dashboard use (tab switches reload
+// data, the regions tab refreshes on activation, the query feature retries
+// on error) while still blocking the kind of tight-loop hammering that could
+// exhaust the SQLite connection pool. Public /api/health is exempt so
+// health-check probes from a load balancer never burn limit budget.
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/api/health',
+});
+app.use('/api/', apiLimiter);
 
 // Request logging
 app.use((req, res, next) => {
@@ -512,8 +530,306 @@ app.post('/api/troubleshoot', authMiddleware(['ciso', 'vp']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Troubleshoot failed' }); }
 });
 
-// ── Initialize and Start ─────────────────────────────────────────────────────
-initDb();
+// ── CISO Custom Regional Query ───────────────────────────────────────────────
+// Hybrid template + bounded regex query feature for the CISO. The CISO selects
+// from a registry of pre-defined templates (each implemented as a parameterized
+// SQL query against the regional_metrics table), optionally chooses a column
+// to apply a regex filter on, and the GD-Server returns shaped results suitable
+// for both table view and line-graph rendering.
+//
+// Security model:
+//   - SQL is fully template-defined and parameterized — no user input ever
+//     enters the SQL string. The CISO cannot type SQL.
+//   - Regex filter is compiled by the GD-Server (try/catch on RegExp constructor)
+//     and applied to query results in JavaScript, never injected into SQL.
+//     Regex is bounded to a single safelisted column the CISO selects from a
+//     dropdown.
+//   - daysBack parameter is integer-coerced and clamped to [1, 365] before
+//     reaching SQL.
+//   - Every query is audit-logged with templateId, parameters, and result
+//     count. Result content is NOT logged (just metadata).
+//   - Authorization restricted to ciso/vp roles. Readonly users cannot query.
+
+const QUERY_TEMPLATES = {
+  burnout_trends: {
+    name: 'Burnout Trends',
+    description: 'Daily team health (capacity score) per region over the chosen window. Lower scores indicate higher burnout risk.',
+    resultShape: 'time_series',
+    valueColumn: 'health_score',
+    valueLabel: 'Health Score',
+    defaultDaysBack: 30,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.health_score as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.timestamp > datetime('now', ?)
+      ORDER BY mc.name, rm.timestamp ASC
+    `,
+  },
+  turnover_risk: {
+    name: 'Turnover Risk by Region',
+    description: 'Most recent turnover risk classification per region (low / medium / high / critical).',
+    resultShape: 'snapshot',
+    valueColumn: 'turnover_risk',
+    valueLabel: 'Turnover Risk',
+    defaultDaysBack: 7,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.turnover_risk as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.id IN (
+        SELECT MAX(id) FROM regional_metrics
+        WHERE timestamp > datetime('now', ?)
+        GROUP BY mc_id
+      )
+      ORDER BY
+        CASE rm.turnover_risk WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+        mc.name
+    `,
+  },
+  cert_gaps: {
+    name: 'Certification Coverage Gaps',
+    description: 'Most recent certification coverage percentage per region. Lower means more analysts lack required certifications.',
+    resultShape: 'snapshot',
+    valueColumn: 'cert_coverage_pct',
+    valueLabel: 'Cert Coverage (%)',
+    defaultDaysBack: 7,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.cert_coverage_pct as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.id IN (
+        SELECT MAX(id) FROM regional_metrics
+        WHERE timestamp > datetime('now', ?)
+        GROUP BY mc_id
+      )
+      ORDER BY rm.cert_coverage_pct ASC, mc.name
+    `,
+  },
+  automation_roi: {
+    name: 'Automation Rate Trend',
+    description: 'Automation rate per region over the chosen window. Higher rates correlate with reduced analyst toil.',
+    resultShape: 'time_series',
+    valueColumn: 'automation_rate',
+    valueLabel: 'Automation Rate (%)',
+    defaultDaysBack: 30,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.automation_rate as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.timestamp > datetime('now', ?)
+      ORDER BY mc.name, rm.timestamp ASC
+    `,
+  },
+  sla_compliance_trend: {
+    name: 'SLA Compliance Trend',
+    description: 'SLA compliance percentage per region over the chosen window.',
+    resultShape: 'time_series',
+    valueColumn: 'sla_compliance_pct',
+    valueLabel: 'SLA Compliance (%)',
+    defaultDaysBack: 30,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.sla_compliance_pct as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.timestamp > datetime('now', ?)
+      ORDER BY mc.name, rm.timestamp ASC
+    `,
+  },
+  proactive_breaks_trend: {
+    name: 'Proactive Breaks Given',
+    description: 'Number of proactive breaks given per region per day. A direct burnout-prevention intervention metric.',
+    resultShape: 'time_series',
+    valueColumn: 'proactive_breaks_given',
+    valueLabel: 'Breaks Given',
+    defaultDaysBack: 30,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.proactive_breaks_given as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.timestamp > datetime('now', ?)
+      ORDER BY mc.name, rm.timestamp ASC
+    `,
+  },
+  upskilling_uptake: {
+    name: 'Upskilling Hours Used',
+    description: 'Upskilling hours used per region over the chosen window. Tracks how much of the budgeted upskilling time is actually being spent.',
+    resultShape: 'time_series',
+    valueColumn: 'upskilling_hours_used',
+    valueLabel: 'Upskilling Hours',
+    defaultDaysBack: 30,
+    sql: `
+      SELECT mc.id as mc_id, mc.name as region_name, rm.timestamp, rm.upskilling_hours_used as value
+      FROM regional_metrics rm
+      JOIN management_consoles mc ON mc.id = rm.mc_id
+      WHERE rm.timestamp > datetime('now', ?)
+      ORDER BY mc.name, rm.timestamp ASC
+    `,
+  },
+};
+
+// Columns the CISO is allowed to apply a regex filter against. Anything else
+// is rejected. region_name is the friendly label; mc_id is the raw identifier.
+// We deliberately do NOT include the raw value column — filtering numbers by
+// regex doesn't make sense and would imply we're supporting comparison
+// operators we don't actually parse.
+const FILTERABLE_COLUMNS = ['region_name', 'mc_id'];
+
+// Pure-string glob matcher. Replaces an earlier `new RegExp(filterRegex)` call
+// to eliminate the regex injection / ReDoS attack surface flagged by CodeQL
+// js/regex-injection. The CISO's actual need is "filter to rows where this
+// column contains/matches X" — substring + wildcard semantics, not full regex.
+//
+// Syntax:
+//   "east"           — case-insensitive substring match
+//   "mc-us-*"        — starts with "mc-us-"
+//   "*-prod"         — ends with "-prod"
+//   "mc-*-east-*"    — segments must appear in order
+//
+// Implementation is pure string ops (indexOf / startsWith / endsWith / split)
+// — no RegExp constructor, no backtracking, no ReDoS surface. Worst-case
+// complexity is O(N * M) where N is text length and M is segment count.
+// With pattern bounded to 256 chars and rows bounded by SQL window, runtime
+// is trivially bounded.
+function matchesGlob(text, pattern) {
+  if (!pattern) return true;
+  const t = String(text).toLowerCase();
+  const p = pattern.toLowerCase();
+  if (!p.includes('*')) return t.includes(p);
+  const segments = p.split('*');
+  let pos = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (i === 0) {
+      if (seg === '') continue;
+      if (!t.startsWith(seg)) return false;
+      pos = seg.length;
+    } else if (i === segments.length - 1) {
+      if (seg === '') return true;
+      if (!t.endsWith(seg)) return false;
+      const endPos = t.length - seg.length;
+      if (endPos < pos) return false;
+    } else {
+      if (seg === '') continue;
+      const idx = t.indexOf(seg, pos);
+      if (idx === -1) return false;
+      pos = idx + seg.length;
+    }
+  }
+  return true;
+}
+
+app.get('/api/gd/query/templates', authMiddleware(['ciso', 'vp', 'readonly']), (req, res) => {
+  const list = Object.entries(QUERY_TEMPLATES).map(([id, t]) => ({
+    id,
+    name: t.name,
+    description: t.description,
+    resultShape: t.resultShape,
+    valueLabel: t.valueLabel,
+    defaultDaysBack: t.defaultDaysBack,
+  }));
+  res.json({ templates: list, filterableColumns: FILTERABLE_COLUMNS });
+});
+
+app.post('/api/gd/query', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const { templateId, filterColumn, filterPattern, daysBack } = req.body || {};
+
+    // Template safelist
+    const template = QUERY_TEMPLATES[templateId];
+    if (!template) {
+      return res.status(400).json({ error: `Unknown templateId. Valid: ${Object.keys(QUERY_TEMPLATES).join(', ')}` });
+    }
+
+    // daysBack: integer in [1, 365], default per-template
+    let days = parseInt(daysBack, 10);
+    if (!Number.isFinite(days)) days = template.defaultDaysBack;
+    days = Math.max(1, Math.min(365, days));
+
+    // Glob filter: optional. If present, both column and pattern required.
+    // Pattern uses pure-string glob matching (see matchesGlob helper above)
+    // — no RegExp involved, so no regex-injection / ReDoS surface.
+    let normalizedFilterColumn = null;
+    let normalizedFilterPattern = null;
+    if (filterColumn || filterPattern) {
+      if (!filterColumn || !filterPattern) {
+        return res.status(400).json({ error: 'filterColumn and filterPattern must both be provided together' });
+      }
+      if (!FILTERABLE_COLUMNS.includes(filterColumn)) {
+        return res.status(400).json({ error: `filterColumn must be one of: ${FILTERABLE_COLUMNS.join(', ')}` });
+      }
+      if (typeof filterPattern !== 'string' || filterPattern.length > 256) {
+        return res.status(400).json({ error: 'filterPattern must be a string up to 256 chars' });
+      }
+      normalizedFilterColumn = filterColumn;
+      normalizedFilterPattern = filterPattern;
+    }
+
+    // Run the parameterized template SQL
+    const db = getDb();
+    let rows;
+    try {
+      rows = db.prepare(template.sql).all(`-${days} days`);
+    } finally {
+      db.close();
+    }
+
+    // Apply glob post-filter if present
+    if (normalizedFilterPattern && normalizedFilterColumn) {
+      rows = rows.filter(row => {
+        const cell = row[normalizedFilterColumn];
+        if (cell == null) return false;
+        return matchesGlob(cell, normalizedFilterPattern);
+      });
+    }
+
+    // Shape series for line graph if applicable
+    let series = null;
+    if (template.resultShape === 'time_series') {
+      const byRegion = {};
+      for (const row of rows) {
+        const key = row.region_name || row.mc_id;
+        if (!byRegion[key]) byRegion[key] = { name: key, points: [] };
+        byRegion[key].points.push({
+          x: row.timestamp,
+          y: typeof row.value === 'number' ? row.value : Number(row.value) || 0,
+        });
+      }
+      series = Object.values(byRegion);
+    }
+
+    // Audit log — metadata only, never row content
+    const db2 = getDb();
+    try {
+      db2.prepare("INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, 'GD_QUERY', ?, ?, 'info')")
+        .run(
+          req.user?.id || 'unknown',
+          `template=${templateId} days=${days} filter=${normalizedFilterColumn || 'none'} pattern_len=${filterPattern?.length || 0} rows=${rows.length}`,
+          req.ip
+        );
+    } finally {
+      db2.close();
+    }
+
+    res.json({
+      templateId,
+      templateName: template.name,
+      description: template.description,
+      resultShape: template.resultShape,
+      valueLabel: template.valueLabel,
+      daysBack: days,
+      filterColumn: normalizedFilterColumn,
+      filterPattern: normalizedFilterPattern,
+      rows,
+      series,
+      regionCount: new Set(rows.map(r => r.mc_id)).size,
+      resultCount: rows.length,
+    });
+  } catch (err) {
+    console.error('GD query error:', err);
+    res.status(500).json({ error: 'Query execution failed' });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`FireAlive Global Dashboard Server v0.0.31 running on port ${PORT}`);
