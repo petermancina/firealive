@@ -101,6 +101,29 @@ cd frontend && npm start                 # MC Electron app
 cd packages/global-dashboard && npm start # GD Electron app
 ```
 
+### Environment Variables (Optional Features)
+
+Some FireAlive features require a deployment-time environment variable to enable. These are intentionally **not set by default** — opt in only when you're ready and have considered the security implications.
+
+| Env Var | Purpose | Required For |
+|---------|---------|--------------|
+| `GD_ALLOWED_HOSTS` | Comma-separated allow-list of GD-Server hostnames the MC may push to. Hostname-only (no port). Case-insensitive exact match — no wildcards, no subdomain semantics. | Global Dashboard push pipeline |
+
+Example:
+```bash
+GD_ALLOWED_HOSTS=gd-prod.corp.local,gd-staging.corp.local
+```
+
+The **Global Dashboard push feature is disabled by default.** If `GD_ALLOWED_HOSTS` is unset or empty, the MC will reject any URL passed to `PUT /api/gd-config` and the recurring push service will refuse to send. This is the primary SSRF defense — the URL the MC sends to is restricted to a pre-approved set chosen at deployment time, not freely entered by an admin in the UI. See **Security.md** for the full threat model.
+
+To enable GD push:
+
+1. Set `GD_ALLOWED_HOSTS` on the MC server (env var, systemd unit, container env, etc.) and restart the MC process.
+2. In the MC UI, open the Global Dashboard tab and configure the URL + API key. The URL's hostname must be in the allow-list.
+3. Click Save (with Enabled left off).
+4. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
+5. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
+
 ### Building Installers
 ```bash
 cd packages/analyst-client && npm run build:mac   # .dmg
