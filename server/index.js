@@ -111,7 +111,6 @@ app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), require('./routes/audit'));
 app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
-app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
 app.use('/api/sla', authMiddleware(['lead', 'admin']), require('./routes/sla'));
 app.use('/api/notifications', authMiddleware(['admin']), require('./routes/notifications'));
 app.use('/api/messages', authMiddleware(['analyst']), require('./routes/messages'));
@@ -132,6 +131,7 @@ app.use('/api/ttx', authMiddleware(['analyst', 'lead', 'admin']), require('./rou
 app.use('/api/inbox', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/notifications-inapp'));
 app.use('/api/inbox/admin', authMiddleware(['admin']), require('./routes/notifications-admin'));
 app.use('/api/helper-pay', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/helper-pay'));
+app.use('/api/heartbeat', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/heartbeat'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/v021-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v022-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v023-features'));
