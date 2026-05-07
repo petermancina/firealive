@@ -1290,6 +1290,68 @@ CREATE INDEX IF NOT EXISTS idx_analyst_availability_week_start
 CREATE INDEX IF NOT EXISTS idx_analyst_availability_user
   ON analyst_availability(user_id);
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R3d: EXTERNAL RESTORE SOURCES (compromise-recovery backup sources)
+-- One row per configured external backup source. The lead/admin sets up
+-- sources at deployment time (e.g. "Production NAS", "DR S3 bucket",
+-- "SFTP failover") and picks one per restore operation. Each row holds
+-- two distinct encrypted blobs:
+--
+--   credentials_encrypted     — Tier-1 AES-256-GCM JSON object holding
+--                               per-source-type AUTHENTICATION credentials
+--                               (how to reach the source). Per-type shape:
+--
+--     network_share (SMB):    {host, share, username, password, domain?}
+--     nas (NFS):              {host, export_path, mount_options?}
+--                              (NFS commonly has no auth; can be empty {})
+--     s3:                     {region, bucket, accessKeyId, secretAccessKey,
+--                              sessionToken?}
+--     azure_blob:             {accountName, accountKey OR sasToken,
+--                              containerName}
+--     sftp:                   {host, port?, username, password OR privateKey}
+--
+--   backup_decryption_key_encrypted
+--                             — Tier-1 AES-256-GCM blob holding the
+--                               BACKUP-PAYLOAD decryption key. Distinct
+--                               from credentials_encrypted because the
+--                               source's auth credentials are unrelated
+--                               to the encryption key on the backup
+--                               archive itself. Nullable for environments
+--                               that store unencrypted backups (dev/test
+--                               only — production deployments should set
+--                               this); a NULL key means the orchestrator
+--                               attempts to decompress without decryption.
+--
+-- Multi-row by design (multi-source). UNIQUE(name) so leads pick
+-- distinct names. enabled flag allows soft-disable without deletion.
+-- last_used_at lets the UI sort sources by recency.
+--
+-- The credentials decrypt only at adapter-call time inside the route
+-- handler; the per-tick service path used for HR sync does not apply
+-- to External Restore (restores are interactive, lead-triggered, never
+-- recurring).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS external_restore_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  source_type TEXT NOT NULL
+    CHECK (source_type IN ('network_share', 'nas', 's3', 'azure_blob', 'sftp')),
+  path TEXT NOT NULL,
+  credentials_encrypted TEXT NOT NULL,
+  backup_decryption_key_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_restore_sources_enabled
+  ON external_restore_sources(enabled);
+CREATE INDEX IF NOT EXISTS idx_external_restore_sources_type
+  ON external_restore_sources(source_type);
+
 `;
 
 function initDb() {
