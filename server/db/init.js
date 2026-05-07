@@ -356,16 +356,70 @@ CREATE TABLE IF NOT EXISTS notification_config (
 );
 
 -- ── Backups ──────────────────────────────────────────────────────────────
+-- Two backup format versions are supported:
+--   format_version = 1 — legacy raw SQLite .db file copy (v1.0.29 and
+--     earlier). Stored at file_path; verified by sha256_hash. Internal
+--     restore reads this directly via fs.copyFileSync.
+--   format_version = 2 — encrypted, signed directory layout (v1.0.30+).
+--     Each backup is a folder containing four files:
+--       archive.tar.zst.enc   — tar archive, zstd-compressed, AES-256-GCM
+--       manifest.json         — cleartext manifest with per-file SHA-256
+--       manifest.sig          — Ed25519 signature of manifest.json
+--       wrapped-key.bin       — per-backup data key wrapped with KEK
+--     Each file has its own *_path column. file_path is NULL for v2 rows.
+--
+-- file_path is nullable to accommodate v2 rows. For v1 rows it remains
+-- the canonical pointer to the .db copy. Old installs that started on
+-- v1.0.29's NOT NULL constraint get rebuilt by the migration block below.
 
 CREATE TABLE IF NOT EXISTS backups (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
   size_bytes INTEGER,
-  file_path TEXT NOT NULL,
-  sha256_hash TEXT,
+  file_path TEXT,                                   -- v1 only; NULL for v2
+  sha256_hash TEXT,                                 -- v1: hash of the .db file; v2: hash of manifest.json
   status TEXT DEFAULT 'running' CHECK (status IN ('running', 'verified', 'failed')),
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TEXT DEFAULT (datetime('now')),
+  -- ── R3d-1: v2 encrypted-format columns ────────────────────────────────
+  format_version INTEGER NOT NULL DEFAULT 1
+    CHECK (format_version IN (1, 2)),
+  manifest_path TEXT,                               -- v2 only
+  archive_path TEXT,                                -- v2 only
+  manifest_sig_path TEXT,                           -- v2 only
+  wrapped_key_path TEXT,                            -- v2 only
+  signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT
 );
+
+-- ── R3d-1: BACKUP SIGNING KEYS ───────────────────────────────────────────
+-- Ed25519 keypair per install. Public key plaintext (used by verifiers,
+-- no confidentiality concern). Private key Tier-1 AES-256-GCM encrypted
+-- (used by the backup engine when signing manifests).
+--
+-- ROTATION MODEL: One active keypair at a time (is_active = 1); old
+-- keypairs are retained with is_active = 0 so manifests signed under
+-- them stay verifiable. Rotation creates a new active keypair and demotes
+-- the previous one. Never delete a row — backups signed under that key
+-- become unverifiable. The backups.signing_key_id FK uses ON DELETE
+-- RESTRICT to enforce this at the DB level.
+--
+-- KEY GENERATION: at server startup, if no rows exist OR no row has
+-- is_active = 1, the backup-keys service generates a new keypair and
+-- inserts a row with is_active = 1. This bootstraps fresh installs and
+-- recovers from accidental deactivation.
+CREATE TABLE IF NOT EXISTS backup_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- base64 Ed25519 public key (32 bytes)
+  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  is_active INTEGER NOT NULL DEFAULT 0
+    CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active
+  ON backup_signing_keys(is_active) WHERE is_active = 1;
+
 
 -- ── Audit Trail (immutable) ──────────────────────────────────────────────
 
@@ -1852,6 +1906,130 @@ function initDb() {
   }
 
 
+  // ── Migration: Phase R3d-1 — backups table v2-format columns ──────────────
+  //
+  // v1.0.29 and earlier shipped a backups table with file_path NOT NULL and
+  // no v2-format columns. v1.0.30 introduces the encrypted-signed backup
+  // format which lives in a directory of four files (manifest.json,
+  // archive.tar.zst.enc, manifest.sig, wrapped-key.bin) rather than a single
+  // .db file copy. v2 rows carry NULL in file_path and populate the new
+  // *_path columns instead.
+  //
+  // Two distinct migrations run here:
+  //
+  //   1. Add the v2 columns to the existing backups table via idempotent
+  //      ALTER TABLE ADD COLUMN. SQLite supports this in-place for nullable
+  //      columns and for NOT NULL columns that have a non-NULL DEFAULT
+  //      (format_version qualifies; defaults to 1 = legacy).
+  //
+  //   2. Relax the file_path NOT NULL constraint so v2 INSERTs that omit
+  //      file_path can succeed. SQLite has no ALTER COLUMN; the only path
+  //      is a table rebuild — CREATE backups_new with the canonical shape,
+  //      copy data, DROP old, RENAME. Foreign keys are toggled OFF for
+  //      the rebuild and back ON afterward (audit_log has no FK to backups
+  //      so this is straightforward; the only FK from backups is OUTGOING
+  //      to backup_signing_keys which itself was just created above and
+  //      is empty in old installs).
+  //
+  // Idempotent — safe to re-run on every startup. The check for a NOT NULL
+  // file_path column gates the rebuild; the column-presence check gates
+  // the ALTERs. Both are no-ops on already-migrated databases.
+  try {
+    const backupsCols = db.prepare("PRAGMA table_info(backups)").all();
+    const hasFormatVersion = backupsCols.some(c => c.name === 'format_version');
+    const filePathCol = backupsCols.find(c => c.name === 'file_path');
+    const filePathStillNotNull = filePathCol && filePathCol.notnull === 1;
+
+    // Step 1: rebuild if file_path is still NOT NULL.
+    if (filePathStillNotNull) {
+      console.log('backups migration (R3d-1): rebuilding to relax file_path NOT NULL constraint');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        // Build the column list dynamically — old installs may or may not
+        // already have the v2 columns from a prior partial migration.
+        const colNames = backupsCols.map(c => c.name);
+        const hasV2 = (n) => colNames.includes(n);
+
+        // CREATE the new table with the canonical R3d-1 schema.
+        db.exec(`
+          CREATE TABLE backups_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
+            size_bytes INTEGER,
+            file_path TEXT,
+            sha256_hash TEXT,
+            status TEXT DEFAULT 'running' CHECK (status IN ('running', 'verified', 'failed')),
+            created_at TEXT DEFAULT (datetime('now')),
+            format_version INTEGER NOT NULL DEFAULT 1
+              CHECK (format_version IN (1, 2)),
+            manifest_path TEXT,
+            archive_path TEXT,
+            manifest_sig_path TEXT,
+            wrapped_key_path TEXT,
+            signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT
+          )
+        `);
+
+        // Copy data. For columns that exist in the old table, copy directly;
+        // for v2 columns missing on the old table, NULL them in the new one
+        // (they get format_version = 1 from the DEFAULT, which is correct
+        // since these are legacy v1 rows).
+        const selectCols = [
+          'id', 'type', 'size_bytes', 'file_path', 'sha256_hash', 'status', 'created_at',
+          hasV2('format_version') ? 'format_version' : '1 AS format_version',
+          hasV2('manifest_path') ? 'manifest_path' : 'NULL AS manifest_path',
+          hasV2('archive_path') ? 'archive_path' : 'NULL AS archive_path',
+          hasV2('manifest_sig_path') ? 'manifest_sig_path' : 'NULL AS manifest_sig_path',
+          hasV2('wrapped_key_path') ? 'wrapped_key_path' : 'NULL AS wrapped_key_path',
+          hasV2('signing_key_id') ? 'signing_key_id' : 'NULL AS signing_key_id',
+        ].join(', ');
+
+        const copied = db.prepare(`SELECT COUNT(*) AS n FROM backups`).get().n;
+        db.exec(`
+          INSERT INTO backups_new
+            (id, type, size_bytes, file_path, sha256_hash, status, created_at,
+             format_version, manifest_path, archive_path, manifest_sig_path,
+             wrapped_key_path, signing_key_id)
+          SELECT ${selectCols} FROM backups
+        `);
+
+        db.exec('DROP TABLE backups');
+        db.exec('ALTER TABLE backups_new RENAME TO backups');
+        db.exec('COMMIT');
+        console.log(`backups migration (R3d-1): rebuilt to canonical, preserved ${copied} legacy v1 row(s)`);
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    } else if (!hasFormatVersion) {
+      // Step 2: file_path was already nullable (fresh install on a partial
+      // schema, or some unusual migration history) but the v2 columns are
+      // missing. Add them via ALTER. Idempotent column-presence checks.
+      const recheckCols = db.prepare("PRAGMA table_info(backups)").all().map(c => c.name);
+      const addCol = (name, ddl) => {
+        if (!recheckCols.includes(name)) {
+          db.exec(`ALTER TABLE backups ADD COLUMN ${ddl}`);
+          console.log(`backups migration (R3d-1): added column ${name}`);
+        }
+      };
+      addCol('format_version',
+        `format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2))`);
+      addCol('manifest_path',     'manifest_path TEXT');
+      addCol('archive_path',      'archive_path TEXT');
+      addCol('manifest_sig_path', 'manifest_sig_path TEXT');
+      addCol('wrapped_key_path',  'wrapped_key_path TEXT');
+      addCol('signing_key_id',
+        `signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT`);
+    }
+  } catch (r3d1MigrationErr) {
+    console.error('backups R3d-1 migration FAILED:', r3d1MigrationErr.message);
+    console.error('The server will start, but the backups table may retain the v1 shape (file_path NOT NULL, no v2 columns) until the migration is investigated.');
+  }
+
+
   // Set initial system metadata
   const setMeta = db.prepare('INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)');
   setMeta.run('fuse_counter', String(fuseCounter));
@@ -1863,6 +2041,32 @@ function initDb() {
   db.prepare('INSERT OR IGNORE INTO report_config (id) VALUES (?)').run('default');
   db.prepare('INSERT OR IGNORE INTO sla_config (id) VALUES (?)').run('default');
   db.prepare('INSERT OR IGNORE INTO notification_config (id) VALUES (?)').run('default');
+
+  // ── Phase R3d-1: ensure an active backup-manifest signing keypair ──────
+  //
+  // Generates a fresh Ed25519 keypair on first boot of any install (fresh
+  // or upgrade from v1.0.29). Idempotent on subsequent starts -- only
+  // creates a row when no row has is_active = 1.
+  //
+  // Wrapped in try/catch so a key-gen failure (e.g. missing
+  // TIER1_ENCRYPTION_KEY env var) loudly surfaces in logs without
+  // bricking server startup. v2 backups will fail with a clear error
+  // message at backup-creation time until the underlying issue is
+  // resolved; existing v1 .db backups via internal restore are
+  // unaffected.
+  //
+  // Lazy-required so init.js does not pull the encryption service at
+  // module-load time; only at initDb() call time.
+  try {
+    const { ensureActiveKeypair } = require('../services/backup-signing-keys');
+    const keyResult = ensureActiveKeypair(db);
+    if (keyResult.isNewlyCreated) {
+      console.log(`backup-signing-keys: generated new active Ed25519 keypair (id=${keyResult.id})`);
+    }
+  } catch (signingKeyErr) {
+    console.error('backup-signing-keys initialization FAILED:', signingKeyErr.message);
+    console.error('The server will start, but v2 backups cannot be created until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
+  }
 
   console.log('Database initialized at', DB_PATH);
   db.close();
