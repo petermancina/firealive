@@ -43,6 +43,7 @@ const archiveSvc = require('../services/backup-archive');
 const keyWrapSvc = require('../services/backup-key-wrapping');
 const manifestSvc = require('../services/backup-manifest');
 const signingKeysSvc = require('../services/backup-signing-keys');
+const chainSvc = require('../services/backup-chain');
 
 // ── List Restore Points ──────────────────────────────────────────────────────
 router.get('/points', (req, res) => {
@@ -263,6 +264,53 @@ router.post('/execute/:id', async (req, res) => {
         }
       }
 
+      // 1b. R3d-2 PRECONDITION: chain integrity verified up to this
+      //     backup's CREATE entry. Refuses the restore if the chain
+      //     is broken anywhere from genesis to the backup's CREATE
+      //     entry (inclusive). Partial-chain semantics: a chain
+      //     break AFTER the backup's CREATE entry does NOT block
+      //     this restore (the backup's provenance was committed
+      //     before the break and is still attestable).
+      //
+      //     Failure here is FATAL. Unlike chain append at backup
+      //     creation time (where degraded mode is OK because the
+      //     alternative is no backups), here the alternative is
+      //     simply declining the restore until chain integrity is
+      //     restored. SOC operators must investigate before
+      //     destructively replacing the live DB. There is
+      //     deliberately no `?force=true` override -- forcing is
+      //     a future feature when a real recovery scenario
+      //     justifies it.
+      //
+      //     If the backup has no CREATE entry at all (e.g. it was
+      //     created during a chain-keypair outage in degraded
+      //     mode), the chain check returns no_create_entry and
+      //     the restore is refused with a precise error so the
+      //     operator can decide whether to investigate.
+      const chainCheck = chainSvc.verifyChainUpToBackup(db, backup.id);
+      if (!chainCheck.ok) {
+        db.close();
+        auditLog(
+          req.user?.id,
+          'RESTORE_REFUSED_CHAIN_BROKEN',
+          `backup=${backup.id} reason=${chainCheck.reason} brokenAtId=${chainCheck.brokenAtId || 'none'}`,
+          req.ip,
+        );
+        return res.status(409).json({
+          error: 'v2 chain integrity precondition failed -- restore refused',
+          chain: {
+            ok: false,
+            reason: chainCheck.reason,
+            brokenAtId: chainCheck.brokenAtId,
+            entriesVerified: chainCheck.entriesVerified,
+            detail: chainCheck.detail,
+          },
+          remediation: chainCheck.reason === 'no_create_entry'
+            ? 'This backup has no CREATE entry in the chain. It may have been created during a chain-keypair outage (degraded mode). Investigate the chain history before restoring.'
+            : 'The chain has been tampered or has become inconsistent before/at this backup. Investigate the chain (admin: GET /api/backup-chain/verify) before restoring.',
+        });
+      }
+
       // 2. Read all four
       const manifestBytes   = fs.readFileSync(filePaths.manifest);
       const signature       = fs.readFileSync(filePaths.signature);
@@ -327,6 +375,47 @@ router.post('/execute/:id', async (req, res) => {
         });
       }
 
+      // 7b. R3d-2: append RESTORE_REQUEST entry to the chain BEFORE
+      //     destructive work begins. Records intent in the audit
+      //     trail so a REQUEST with no following COMPLETE is
+      //     forensically detectable as a failed/aborted restore.
+      //
+      //     Failure to append RESTORE_REQUEST is FATAL -- unlike at
+      //     backup creation time, the restore has not yet started
+      //     destructive work, so there is no "preserve recoverability"
+      //     argument for degraded mode. If we cannot record intent,
+      //     we should not proceed with destructive operation.
+      let restoreRequestEntry = null;
+      try {
+        const result = chainSvc.appendChainEntry(db, {
+          eventType: 'RESTORE_REQUEST',
+          backupId: backup.id,
+          actorUserId: req.user?.id || null,
+          payload: {
+            restore_initiated_at: new Date().toISOString(),
+            backup_signing_key_id: backup.signing_key_id,
+            backup_created_at: backup.created_at,
+            backup_chain_create_entry_id: chainCheck.chainEntryId,
+          },
+        });
+        restoreRequestEntry = {
+          id: result.id,
+          this_hash: result.thisHash,
+          created_at: result.createdAt,
+        };
+      } catch (chainErr) {
+        db.close();
+        logger.error('chain RESTORE_REQUEST append failed; refusing restore', {
+          backupId: backup.id,
+          error: chainErr.message,
+        });
+        return res.status(500).json({
+          error: 'v2 chain RESTORE_REQUEST append failed; restore refused',
+          detail: chainErr.message,
+          hint: 'Cannot record restore intent in the chain. Restoring without recording intent would create an unauditable destructive operation. Investigate the chain-signing-keys configuration and retry.',
+        });
+      }
+
       db.close();
 
       // 7. Unwrap the ephemeral key
@@ -385,6 +474,66 @@ router.post('/execute/:id', async (req, res) => {
         });
       }
 
+      // 11. R3d-2: append RESTORE_COMPLETE entry to the RESTORED
+      //     chain. Note this opens a NEW DB connection -- the live
+      //     DB at DB_PATH is now the restored database (atomic
+      //     rename happened in step 10). The chain in the restored
+      //     DB has whatever entries existed at backup-creation time.
+      //     This COMPLETE entry chains forward from that historical
+      //     head, signed by the restored DB's chain-signing key
+      //     (which is also the key that was active at backup-
+      //     creation time).
+      //
+      //     Forensic semantics: a future operator inspecting the
+      //     restored DB's chain sees a RESTORE_COMPLETE entry at
+      //     the head documenting that this database was restored
+      //     from the named backup at the recorded time. The OLD
+      //     chain (which had the RESTORE_REQUEST) has been
+      //     overwritten -- but the audit log (separate table)
+      //     preserves the REQUEST record.
+      //
+      //     Failure to append RESTORE_COMPLETE is DEGRADED-MODE.
+      //     The restore has succeeded; the live DB is the restored
+      //     state. Refusing to surface that to the user because
+      //     we couldn't write a chain entry would be perverse.
+      //     Loud log + chain_complete_error in the response.
+      let restoreCompleteEntry = null;
+      let restoreCompleteError = null;
+      try {
+        const newDb = getDb();
+        try {
+          const result = chainSvc.appendChainEntry(newDb, {
+            eventType: 'RESTORE_COMPLETE',
+            backupId: backup.id,
+            actorUserId: req.user?.id || null,
+            payload: {
+              restore_completed_at: new Date().toISOString(),
+              restored_db_size_bytes: extracted.payload.length,
+              pre_restore_filename: path.basename(preRestorePath),
+              backup_signing_key_id: backup.signing_key_id,
+              backup_created_at: backup.created_at,
+              source_chain_request_entry_id: restoreRequestEntry ? restoreRequestEntry.id : null,
+              source_chain_request_this_hash: restoreRequestEntry ? restoreRequestEntry.this_hash : null,
+            },
+          });
+          restoreCompleteEntry = {
+            id: result.id,
+            this_hash: result.thisHash,
+            created_at: result.createdAt,
+          };
+        } finally {
+          newDb.close();
+        }
+      } catch (chainErr) {
+        restoreCompleteError = chainErr.message;
+        logger.error(
+          'chain RESTORE_COMPLETE append failed (restore itself succeeded). ' +
+          'The restored database lacks a chain entry recording the restoration. ' +
+          'Audit log preserves the event but the restored chain is missing the head annotation.',
+          { backupId: backup.id, error: chainErr.message },
+        );
+      }
+
       auditLog(
         req.user.id,
         'DATABASE_RESTORED',
@@ -406,6 +555,11 @@ router.post('/execute/:id', async (req, res) => {
         restoredFrom: backup.created_at,
         manifestFuseCounter: manifest.source_db.fuse_counter_at_creation,
         sizeBytes: extracted.payload.length,
+        chain: {
+          request_entry: restoreRequestEntry,        // in old (overwritten) chain
+          complete_entry: restoreCompleteEntry,      // in new (restored) chain
+          complete_error: restoreCompleteError,
+        },
         note: 'The server should be restarted to ensure all in-memory state reflects the restored database.',
       });
     }

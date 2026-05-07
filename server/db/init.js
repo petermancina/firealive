@@ -421,6 +421,115 @@ CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active
   ON backup_signing_keys(is_active) WHERE is_active = 1;
 
 
+-- ── R3d-2: CHAIN SIGNING KEYS ────────────────────────────────────────────
+-- Ed25519 keypair per install used to sign backup_chain entries. Public
+-- key plaintext (used by chain verifiers, no confidentiality concern).
+-- Private key Tier-1 AES-256-GCM encrypted (used by the chain service
+-- when appending entries).
+--
+-- DELIBERATELY SEPARATE FROM backup_signing_keys. Chain integrity is a
+-- distinct cryptographic concern from backup integrity -- a compromise
+-- of the backup-signing key MUST NOT compromise the chain audit trail.
+-- The keys never share storage, never share the same in-memory KeyObject
+-- instance, never share a service module. Cost is ~150 lines of
+-- duplicated keypair-management boilerplate; the security separation
+-- justifies it.
+--
+-- ROTATION MODEL: same as backup_signing_keys -- one active keypair at
+-- a time (is_active = 1), old keypairs retained with is_active = 0 +
+-- rotated_out_at so historical chain entries stay verifiable.
+CREATE TABLE IF NOT EXISTS chain_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- base64 Ed25519 public key
+  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  is_active INTEGER NOT NULL DEFAULT 0
+    CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_signing_keys_active
+  ON chain_signing_keys(is_active) WHERE is_active = 1;
+
+
+-- ── R3d-2: BACKUP CHAIN (cryptographic chain of custody) ─────────────────
+-- Append-only hash-chained audit log of backup operations. Detects
+-- backup deletion, modification, substitution, and replay against the
+-- audit trail itself.
+--
+-- HASH CHAIN FORMAT
+--
+--   prev_hash    SHA-256 hex of the previous entry's this_hash
+--                NULL for the genesis entry (the first one ever)
+--
+--   this_hash    SHA-256 hex of:
+--                  prev_hash || canonicalized_payload || created_at
+--                where || is byte concatenation. canonicalized_payload
+--                is the canonical-JSON serialization of the payload
+--                column (same canonicalization rules as
+--                backup-manifest.js).
+--
+--   signature    base64 of Ed25519 signature over this_hash bytes
+--                Signed by the active chain_signing_keys keypair at
+--                append time. signing_key_id records which keypair
+--                signed this entry so historical entries stay
+--                verifiable across rotations.
+--
+-- EVENT TYPES
+--
+--   CREATE              backup created (manifest_sha256 in payload)
+--   VERIFY              backup integrity check ran (result in payload)
+--   RESTORE_REQUEST     restore initiated for a backup
+--   RESTORE_COMPLETE    restore applied
+--   DELETE_DENIED       attempted backup deletion that was refused
+--                       (e.g. retention attempting to delete a
+--                       backup currently held by a legal hold; the
+--                       attempt itself is logged for auditability)
+--
+-- backup_id is nullable for events not tied to a specific backup
+-- (e.g. periodic chain self-verifications). It is NOT a foreign key
+-- because the chain must persist even if a backup row is later
+-- deleted -- the audit trail is the source of truth, not the
+-- backups table.
+--
+-- APPEND-ONLY ENFORCEMENT
+--
+-- Two SQLite triggers reject UPDATE and DELETE on this table. Defeats
+-- in-app tampering paths. OS-level protection (filesystem permissions,
+-- immutable storage, OS-level audit) is a separate higher layer
+-- outside the scope of these triggers but matters for true
+-- append-only guarantees -- triggers are the first line of defense,
+-- not the last.
+CREATE TABLE IF NOT EXISTS backup_chain (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  signing_key_id INTEGER NOT NULL REFERENCES chain_signing_keys(id) ON DELETE RESTRICT,
+  event_type TEXT NOT NULL
+    CHECK (event_type IN ('CREATE', 'VERIFY', 'RESTORE_REQUEST', 'RESTORE_COMPLETE', 'DELETE_DENIED')),
+  backup_id TEXT,                                   -- soft reference; chain persists even if backup row is deleted
+  payload TEXT NOT NULL,                            -- canonicalized JSON
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_chain_id
+  ON backup_chain(id DESC);
+CREATE INDEX IF NOT EXISTS idx_backup_chain_backup
+  ON backup_chain(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_chain_event
+  ON backup_chain(event_type);
+
+CREATE TRIGGER IF NOT EXISTS backup_chain_no_update
+  BEFORE UPDATE ON backup_chain
+  BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete
+  BEFORE DELETE ON backup_chain
+  BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
+
+
 -- ── Audit Trail (immutable) ──────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -2066,6 +2175,30 @@ function initDb() {
   } catch (signingKeyErr) {
     console.error('backup-signing-keys initialization FAILED:', signingKeyErr.message);
     console.error('The server will start, but v2 backups cannot be created until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
+  }
+
+  // ── R3d-2: Ensure an active chain signing keypair exists ────────────────
+  //
+  // Same lifecycle pattern as backup-signing-keys above. Distinct keypair
+  // for chain integrity (separate concern from backup integrity -- a
+  // compromise of the backup-signing key MUST NOT compromise the chain
+  // audit trail).
+  //
+  // Failure here is logged but non-fatal: the server still starts. If the
+  // chain keypair is missing when a backup is attempted, the chain entry
+  // append will throw with a clear message; the backup itself can still
+  // be created without a chain entry as a degraded mode (the operator
+  // sees the chain-keypair failure in logs and addresses it). This
+  // matches the v1.0.29 -> v1.0.30 upgrade tolerance pattern.
+  try {
+    const { ensureActiveChainKeypair } = require('../services/chain-signing-keys');
+    const chainKeyResult = ensureActiveChainKeypair(db);
+    if (chainKeyResult.isNewlyCreated) {
+      console.log(`chain-signing-keys: generated new active Ed25519 keypair (id=${chainKeyResult.id})`);
+    }
+  } catch (chainKeyErr) {
+    console.error('chain-signing-keys initialization FAILED:', chainKeyErr.message);
+    console.error('The server will start, but backup_chain entries cannot be appended until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
   }
 
   console.log('Database initialized at', DB_PATH);

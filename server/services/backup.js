@@ -15,6 +15,8 @@
 //   backup-manifest.js       — canonical-JSON manifest with per-file
 //                              SHA-256
 //   backup-signing-keys.js   — Ed25519 signs the manifest
+//   backup-chain.js          — appends the CREATE entry to the
+//                              cryptographic chain of custody (R3d-2)
 //
 // PUBLIC API
 //
@@ -22,10 +24,18 @@
 //     async; returns {
 //       id, format_version, backup_dir, manifest_path, archive_path,
 //       manifest_sig_path, wrapped_key_path, size_bytes,
-//       manifest_sha256, status
+//       manifest_sha256, status,
+//       chain_entry,            // R3d-2: { id, prev_hash, this_hash,
+//                                  chain_signing_key_id, created_at }
+//                                  or null if append failed
+//       chain_error,            // R3d-2: error message if append failed,
+//                                  null if succeeded
 //     }
-//     throws on any failure (with a 'failed' status row already inserted
-//     by the engine for audit)
+//     throws on any failure of the BACKUP itself (with 'failed' status
+//     row already inserted by the engine for audit). Chain append
+//     failure does NOT throw -- backup succeeds in degraded mode with
+//     chain_error populated and a loud log line so operators address
+//     the chain-keypair issue without losing recoverability.
 //
 // CALLERS
 //
@@ -76,6 +86,7 @@ const archiveSvc = require('./backup-archive');
 const keyWrapSvc = require('./backup-key-wrapping');
 const manifestSvc = require('./backup-manifest');
 const signingKeysSvc = require('./backup-signing-keys');
+const chainSvc = require('./backup-chain');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -355,7 +366,69 @@ async function performBackup(type = 'on-demand', options = {}) {
       manifestSha: manifestSha256.slice(0, 16),
     });
 
-    // 9. Retention cleanup (uniform across v1 + v2)
+    // 9. Append CREATE entry to the cryptographic chain of custody.
+    //
+    // This commits the manifest hash + backup metadata to the
+    // append-only chain so any subsequent attempt to delete or
+    // substitute this backup leaves a detectable gap in the audit
+    // trail. The chain entry is appended AFTER the backups row is
+    // updated to 'verified' so the chain attestation reflects
+    // verified state, not running state.
+    //
+    // DEGRADED-MODE on chain failure. If the chain append throws
+    // (e.g., chain keypair missing, transient KEK issue), the
+    // backup is still considered successful: it exists on disk,
+    // is verified, and the row is 'verified'. What's missing is
+    // the chain attestation. The failure is logged loudly and
+    // surfaced in the result + audit trail; operators address the
+    // chain issue separately and subsequent backups get full
+    // attestation. The alternative (refusing all backups when
+    // chain is unavailable) creates a worse failure mode where a
+    // chain-keypair config issue blocks all recoverability.
+    let chainEntry = null;
+    let chainError = null;
+    try {
+      const archiveEntry  = manifestSvc.getFileEntry(manifestObj, manifestSvc.ARCHIVE_FILENAME);
+      const wrappedEntry  = manifestSvc.getFileEntry(manifestObj, manifestSvc.WRAPPED_KEY_FILENAME);
+      const result = chainSvc.appendChainEntry(db, {
+        eventType: 'CREATE',
+        backupId,
+        payload: {
+          backup_type: type,
+          format_version: 2,
+          manifest_sha256: manifestSha256,
+          archive_sha256:    archiveEntry ? archiveEntry.sha256 : null,
+          archive_size_bytes: archiveEntry ? archiveEntry.sizeBytes : null,
+          wrapped_key_sha256: wrappedEntry ? wrappedEntry.sha256 : null,
+          backup_signing_key_id: signingKey.id,
+          source_fuse_counter:   sourceFuseCounter,
+          source_schema_version: sourceSchemaVersion,
+          total_size_bytes: totalSize,
+          backup_dir_name: path.basename(finalDir),
+        },
+      });
+      chainEntry = {
+        id: result.id,
+        prev_hash: result.prevHash,
+        this_hash: result.thisHash,
+        chain_signing_key_id: result.signingKeyId,
+        created_at: result.createdAt,
+      };
+      logger.info('backup: chain CREATE entry appended', {
+        id: backupId,
+        chain_entry_id: result.id,
+        this_hash: result.thisHash.slice(0, 16),
+      });
+    } catch (chainErr) {
+      chainError = chainErr.message;
+      logger.error(
+        'backup: CHAIN ENTRY APPEND FAILED -- backup created without chain attestation. ' +
+        'Address chain-signing-keys configuration; subsequent backups will retry chain append.',
+        { id: backupId, error: chainErr.message },
+      );
+    }
+
+    // 10. Retention cleanup (uniform across v1 + v2)
     cleanOldBackups(backupDir);
 
     return {
@@ -369,6 +442,8 @@ async function performBackup(type = 'on-demand', options = {}) {
       size_bytes: totalSize,
       manifest_sha256: manifestSha256,
       status: 'verified',
+      chain_entry: chainEntry,
+      chain_error: chainError,
     };
   } catch (err) {
     // Mark row failed + clean up partial output

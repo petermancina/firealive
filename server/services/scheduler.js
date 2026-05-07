@@ -67,6 +67,45 @@ const schedulerService = {
       }
     }));
 
+    // ── R3d-2: scheduled chain integrity verification ──────────────────────
+    //
+    // Walks the entire backup_chain checking linkage + per-entry hash
+    // recomputation + Ed25519 signature verification. Appends a VERIFY
+    // entry to the chain recording the result. Emits a
+    // CHAIN_INTEGRITY_FAILURE audit event on detected tampering --
+    // distinct from informational CHAIN_INTEGRITY_VERIFIED so SIEM
+    // feeds can alert on integrity failures independently.
+    //
+    // Default schedule is one hour after the default backup time
+    // (03:00 UTC vs 02:00 UTC) so they don't pile up on the same
+    // minute. Operators can override via CHAIN_VERIFY_SCHEDULE env
+    // var; chain-verifier.js getSchedule() handles the fallback.
+    //
+    // Empty-chain skip: on fresh installs with no backups taken yet,
+    // the verifier returns immediately without writing a VERIFY entry
+    // or audit log. Reason: nothing to verify; entries here would be
+    // noise.
+    //
+    // Broken-chain appends still succeed: appendChainEntry depends on
+    // the CURRENT head only, not historical integrity, so even on a
+    // tampered chain the VERIFY entry recording the discovery lands
+    // correctly at the head.
+    const chainVerifierSchedule = (() => {
+      try {
+        return require('./chain-verifier').getSchedule();
+      } catch {
+        return '0 3 * * *';
+      }
+    })();
+    this.jobs.push(cron.schedule(chainVerifierSchedule, () => {
+      try {
+        const { runScheduledVerification } = require('./chain-verifier');
+        runScheduledVerification({ verifier: 'scheduled' });
+      } catch (err) {
+        logger.error('Scheduler: chain verification failed', { error: err.message });
+      }
+    }));
+
     // ── Email notification pipeline ──────────────────────────────────────
     const emailIntervalSec = parseInt(process.env.NOTIFICATIONS_EMAIL_INTERVAL_SEC || '60', 10);
     const emailCronExpr = emailIntervalSec >= 60
