@@ -36,6 +36,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   username TEXT UNIQUE NOT NULL,
+  email TEXT,  -- R3c: SILENT join key for HR scheduling sync ONLY. Populated by SSO claim at login; never typed by leads, never displayed in MC/AC/GD, never written to burnout/metrics/audit tables. See ANONYMITY MODEL note in migration block below.
   password_hash TEXT,  -- NULL when using SSO (SAML/OIDC/LDAP)
   role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'developer')),
   name TEXT NOT NULL,
@@ -1151,6 +1152,144 @@ CREATE TABLE IF NOT EXISTS gd_push_config (
 INSERT OR IGNORE INTO gd_push_config (id, enabled, push_interval_minutes)
   VALUES (1, 0, 15);
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R3c: HR SCHEDULING PLATFORM CONFIGURATION
+-- Stores the configuration this MC uses to sync analyst work-schedule data
+-- with an external HR scheduling platform — UKG/Kronos, Workday, ADP,
+-- BambooHR, or Manual mode where FireAlive itself is the system of record.
+--
+-- The MC is the master controller of upskilling hour scheduling. The HR
+-- platform supplies each analyst's weekly work hours; the MC then schedules
+-- upskilling time into the gaps and pushes the upskilling assignments
+-- back to the HR platform as calendar events. Analysts have NO surface
+-- on which to manipulate this — credentials are admin/lead-only and
+-- this table never appears on the AC side.
+--
+-- Single-row table by convention (id=1) following the gd_push_config
+-- pattern. One platform credential set serves the whole tenant; each
+-- adapter under server/services/scheduling-platforms/ uses these
+-- credentials as a service account that can read every analyst's schedule
+-- and write upskilling events back. Per-analyst tokens were considered
+-- and rejected — analysts could revoke or alter their own tokens to
+-- dodge upskilling assignments, which would defeat the lead's authority
+-- over the schedule.
+--
+-- Sync behavior: an MC-side service (services/scheduling-platforms/*,
+-- added in later commits) wakes on the configured interval, calls the
+-- selected adapter's pullAvailability() to refresh per-analyst hours,
+-- and calls pushSchedule() to send back any newly-assigned upskilling
+-- events. Result of each sync recorded in last_sync_at, last_sync_status,
+-- and last_sync_error so the lead can see whether syncs are succeeding.
+-- consecutive_failures backs a circuit breaker that auto-disables the
+-- sync after sustained failure (matching the gd-push.js pattern).
+--
+-- credentials_encrypted is a Tier-1 encrypted blob (AES-256-GCM, key
+-- from FIREALIVE_DB_KEY env var). Its plaintext shape varies per
+-- platform — for Workday it is JSON {tenantUrl, clientId, clientSecret,
+-- refreshToken}; for BambooHR it is {subdomain, apiKey}; for UKG it is
+-- {tenantUrl, username, password}; for ADP it is {clientId, clientSecret,
+-- certPem, certKeyPem}; for Manual it is null. The adapter modules
+-- understand their own credential shape; the table treats it opaquely.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS scheduling_platform_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  platform TEXT
+    CHECK (platform IS NULL OR platform IN ('ukg_kronos', 'workday', 'adp', 'bamboohr', 'manual')),
+  endpoint_url TEXT,
+  credentials_encrypted TEXT,
+  sync_interval_minutes INTEGER NOT NULL DEFAULT 60
+    CHECK (sync_interval_minutes >= 5 AND sync_interval_minutes <= 1440),
+  retry_max INTEGER NOT NULL DEFAULT 3 CHECK (retry_max >= 0 AND retry_max <= 10),
+  retry_backoff_seconds INTEGER NOT NULL DEFAULT 30
+    CHECK (retry_backoff_seconds >= 1 AND retry_backoff_seconds <= 3600),
+  last_sync_at TEXT,
+  last_sync_status TEXT
+    CHECK (last_sync_status IS NULL OR last_sync_status IN ('success', 'failure', 'pending')),
+  last_sync_error TEXT,
+  last_sync_duration_ms INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Seed the singleton row in disabled state on first init. The singleton
+-- pattern is enforced by the CHECK (id = 1) constraint above. PUTs to
+-- /api/scheduling/config update this row in place.
+INSERT OR IGNORE INTO scheduling_platform_config (id, enabled, sync_interval_minutes)
+  VALUES (1, 0, 60);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- R3c: ANALYST AVAILABILITY (per-week, per-user)
+-- The output of HR scheduling sync. Each row records one analyst's
+-- availability for one week, expressed as a JSON slots map keyed by
+-- day-of-week. The auto-assigner reads these rows to find gaps where
+-- it can schedule upskilling blocks for that analyst that week.
+--
+-- slots_json shape:
+--   {
+--     "monday":    [{"start":"09:00","end":"17:00"}],
+--     "tuesday":   [{"start":"09:00","end":"12:00"},{"start":"13:00","end":"17:00"}],
+--     "wednesday": [{"start":"09:00","end":"17:00"}],
+--     "thursday":  [{"start":"09:00","end":"17:00"}],
+--     "friday":    []
+--   }
+--
+-- An empty array for a day means the analyst is unavailable that day.
+-- A missing day key means the same as an empty array. Times are local
+-- to the analyst's working timezone (the auto-assigner stays in that
+-- timezone — no UTC conversion).
+--
+-- UNIQUE (user_id, week_start) lets the sync service upsert via
+-- ON CONFLICT DO UPDATE. One availability row per user per week,
+-- replaced wholesale on each successful sync rather than incrementally
+-- merged. Wholesale replacement is the right semantics: the HR
+-- platform is the source of truth, so if an analyst's schedule
+-- changes there, the next sync reflects it fully.
+--
+-- source_platform records which adapter wrote the row, so the lead
+-- can audit "where did this availability data come from" via the
+-- per-row metadata. Manual mode rows have source_platform='manual'
+-- and are written by the route layer's PUT /api/scheduling/availability
+-- handler rather than by an adapter pull.
+--
+-- last_synced_at is the wall-clock timestamp of the most recent
+-- write to this row, distinct from updated_at (SQLite trigger-managed)
+-- so the lead's status panel can show "last synced 23 minutes ago"
+-- without confusion if a manual edit also touched the row.
+--
+-- ANONYMITY MODEL: This table is keyed by user_id (the UUID FK to
+-- users.id). It does NOT carry email, real name, or any direct-identity
+-- field. Email is used only at sync time as a silent join key by the HR
+-- adapters to translate a Workday/UKG/ADP/BambooHR employee record into
+-- a users.id; once that translation happens, every downstream flow
+-- (auto-assigner, lead's status panel, GD aggregate views) operates on
+-- user_id and pseudonym only. Availability data thus lives behind the
+-- same pseudonym wall as burnout metrics — an attacker who somehow
+-- exfiltrated this table would learn schedules-by-UUID, not
+-- schedules-by-person. See the email column ANONYMITY MODEL note in
+-- the initDb() migration block for the full contract on email handling.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS analyst_availability (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  week_start TEXT NOT NULL,
+  slots_json TEXT NOT NULL,
+  source_platform TEXT
+    CHECK (source_platform IS NULL OR source_platform IN ('ukg_kronos', 'workday', 'adp', 'bamboohr', 'manual')),
+  last_synced_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (user_id, week_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analyst_availability_week_start
+  ON analyst_availability(week_start);
+CREATE INDEX IF NOT EXISTS idx_analyst_availability_user
+  ON analyst_availability(user_id);
+
 `;
 
 function initDb() {
@@ -1482,6 +1621,51 @@ function initDb() {
     addCol('last_iam_check', 'last_iam_check TEXT');
     addCol('offboarded_at', 'offboarded_at TEXT');
     addCol('pseudonym_rotated_at', 'pseudonym_rotated_at TEXT');
+
+    // ─────────────────────────────────────────────────────────────────────
+    // R3c — ANONYMITY MODEL note for the email column added below
+    //
+    // The four real-platform HR scheduling adapters (BambooHR, Workday,
+    // ADP, UKG/Kronos) need to translate "Workday says employee
+    // jane.doe@acme.com works Mon-Thu 9-5" into "schedule upskilling
+    // for users.id UUID xyz...". Email is the only stable identifier
+    // shared between an external HR record and our user record, so it
+    // serves as the join key.
+    //
+    // Email is treated as a SILENT join key. The contract:
+    //
+    //   - Populated automatically by SSO (SAML/OIDC/LDAP) attribute
+    //     claim at login. B5b (IAM real IdP integration) handles this
+    //     in a later phase; for v1.0.29 most users will have NULL
+    //     email and HR sync silently skips them.
+    //
+    //   - NEVER typed by a lead, admin, or analyst. The MC has no UI
+    //     surface that captures or displays email.
+    //
+    //   - NEVER displayed in MC/AC/GD. The lead sees the pseudonym
+    //     (users.pseudonym) for burnout-related surfaces, and the
+    //     username for IAM/admin surfaces, never the email.
+    //
+    //   - NEVER written to burnout, metrics, audit, GD aggregate, or
+    //     any other downstream table. Email lives only on users.email.
+    //
+    //   - NEVER logged. Audit middleware does not include email in
+    //     event detail. Adapter log lines reference users.id, not
+    //     email (see scheduling-platforms/*.js).
+    //
+    // The HR adapter reads users.email to find the matching users.id,
+    // and after that translation everything downstream (auto-assigner,
+    // analyst_availability rows, lead's status panel, GD aggregates)
+    // operates on UUID + pseudonym only. Availability data thus lives
+    // behind the same pseudonym wall as burnout metrics. An attacker
+    // who exfiltrated the analyst_availability table would learn
+    // schedules-by-UUID, not schedules-by-person.
+    //
+    // Nullable on purpose: legacy local accounts predating SSO carry
+    // NULL email; HR sync's WHERE email IS NOT NULL guard handles
+    // those rows by skipping them.
+    // ─────────────────────────────────────────────────────────────────────
+    addCol('email', 'email TEXT');  // R3c: HR scheduling sync silent join key (see note above)
   } catch (r0MigrationErr) {
     console.error('users R0 migration FAILED:', r0MigrationErr.message);
     console.error('The server will start, but routing, IAM offboarding detection, system-health, and pseudonym rotation may misbehave until the migration is investigated.');

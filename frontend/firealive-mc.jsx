@@ -757,6 +757,47 @@ function ManagementConsole() {
       }
     }).catch(()=>{});
   }, [tab, globalDashCfg._loaded]);
+  // R3c — HR scheduling platform configuration (loads when upskilling_hr tab opens)
+  const [schedCfg, setSchedCfg] = useState({
+    enabled: false,
+    platform: null,
+    endpoint_url: "",
+    credentials_set: false,
+    sync_interval_minutes: 60,
+    retry_max: 3,
+    retry_backoff_seconds: 30,
+    last_sync_at: null,
+    last_sync_status: null,
+    last_sync_error: null,
+    last_sync_duration_ms: null,
+    consecutive_failures: 0,
+    updated_at: null,
+    _loaded: false,
+    _saving: false,
+    _testing: false,
+    _testResult: null,
+    _savedPlatform: null,
+    _savedEndpointUrl: "",
+    _savedCredsSet: false,
+    credentials_input: {},
+  });
+  useEffect(() => {
+    if (tab !== "upskilling_hr") return;
+    if (schedCfg._loaded) return;
+    api.get("/api/scheduling/config").then(r => {
+      if (r && !r.error) {
+        setSchedCfg(prev => ({
+          ...prev, ...r,
+          credentials_input: {},
+          _loaded: true,
+          _savedPlatform: r.platform || null,
+          _savedEndpointUrl: r.endpoint_url || "",
+          _savedCredsSet: !!r.credentials_set,
+        }));
+      }
+    }).catch(() => {});
+  }, [tab, schedCfg._loaded]);
+
   // Backup enhancements
   const [backupSchedules, setBackupSchedules] = useState([
     {id:"bs1",type:"incremental",frequency:"daily",time:"02:00",destination:"local",retentionDays:30,encrypted:true,regulatoryPreset:"none"},
@@ -4579,7 +4620,159 @@ regression:
             <M style={{color:C.tm,lineHeight:1.8}}>Average SOC analyst replacement cost: $85,000 (recruiting, onboarding, ramp-up). Annual turnover rate: 35%. For a 6-person team: ~$178,500/year in churn costs. One hour per day per analyst for upskilling costs ~$31,200/year in productive time. Net savings: $147,300/year — plus reduced insider threat risk from disgruntled departing analysts, plus compounding skill improvement.</M>
           </Card>
           <Btn primary onClick={()=>addA("UPSKILLING_HR_SAVED","Upskilling hour config saved — hour "+upskillingCfg.hourOfShift+" of shift")}>Save Upskilling Config</Btn>
-          <Card style={{marginTop:16,marginBottom:16}}><div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Analyst Scheduling</div><Card style={{padding:14,borderColor:C.i+"30",marginBottom:12}}><Sel label="Platform"><option value="">Select...</option><option>UKG/Kronos</option><option>Workday</option><option>ADP</option><option>BambooHR</option><option>Manual</option></Sel><Input label="API" placeholder="https://scheduling.corp.com/api"/><Btn small primary onClick={()=>addA("SY","HR scheduling platform integration: planned (see BUILD-PLAN-v6)")}>Sync</Btn></Card><Card style={{padding:14,marginBottom:12}}><Input label="Min coverage (%)" type="number" defaultValue="75"/><Sel label="Frequency"><option>Every shift</option><option>Alternate</option><option>3/week</option><option>Weekly</option></Sel></Card><Card style={{padding:14,marginBottom:12}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Schedule (select hour per analyst)</div><div style={{background:C.s,border:"1px solid "+C.b,borderRadius:10,overflow:"hidden"}}>{(analysts.length?analysts:[]).filter(a=>a.shift==="day").slice(0,6).map(a=>({id:a.id,n:a.name,t:"L"+a.tier,h:a.tier===3?"14-15":a.tier===2?"10-11":"16-17"})).map((a,idx)=>(<div key={idx} style={{display:"flex",justifyContent:"space-between",padding:"6px 14px",borderBottom:"1px solid "+C.b,alignItems:"center",gap:8}}><M style={{color:C.t,minWidth:70}}>{a.n}</M><Badge color={a.t==="L3"?C.p:C.i}>{a.t}</Badge><select defaultValue={a.h} style={{flex:1,padding:4,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:6,color:C.t,fontSize:11}} onChange={e=>api.post("/api/upskilling/schedule",{analystId:a.id,slot:e.target.value}).then(()=>addA("SCHED",a.n+" -> "+e.target.value))}><option value="06-07">06-07</option><option value="07-08">07-08</option><option value="08-09">08-09</option><option value="09-10">09-10</option><option value="10-11">10-11</option><option value="11-12">11-12</option><option value="12-13">12-13</option><option value="13-14">13-14</option><option value="14-15">14-15</option><option value="15-16">15-16</option><option value="16-17">16-17</option><option value="17-18">17-18</option></select></div>))}</div></Card><Btn primary onClick={()=>addA("SC","All schedules saved (per-analyst changes save on selection)")}>Save All</Btn></Card>
+          {/* R3c: HR Scheduling Platform Integration */}
+          <Card style={{marginTop:16,marginBottom:16,borderColor:schedCfg.last_sync_status==="failure"?C.d+"40":(schedCfg.last_sync_status==="success"?C.a+"40":C.b)}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Analyst Scheduling</div>
+
+            {/* Status panel */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))",gap:8,marginBottom:14,padding:12,background:C.s,border:"1px solid "+C.b,borderRadius:8}}>
+              <M style={{color:C.tm}}>State: <span style={{color:schedCfg.enabled?C.a:C.tm}}>{schedCfg.enabled?"enabled":"disabled"}</span></M>
+              <M style={{color:C.tm}}>Platform: <span style={{color:schedCfg.platform?C.t:C.tm}}>{schedCfg.platform||"not set"}</span></M>
+              <M style={{color:C.tm}}>Credentials: <span style={{color:schedCfg.credentials_set?C.a:C.w}}>{schedCfg.credentials_set?"configured":"not set"}</span></M>
+              <M style={{color:C.tm}}>Last sync: {schedCfg.last_sync_at||"never"}</M>
+              <M style={{color:C.tm}}>Status: <span style={{color:schedCfg.last_sync_status==="success"?C.a:(schedCfg.last_sync_status==="failure"?C.d:C.tm)}}>{schedCfg.last_sync_status||"\u2014"}</span></M>
+              <M style={{color:C.tm}}>Failures: <span style={{color:schedCfg.consecutive_failures>0?C.d:C.tm}}>{schedCfg.consecutive_failures||0}</span></M>
+            </div>
+            {schedCfg.last_sync_error && <Card style={{padding:8,marginBottom:10,borderColor:C.d+"40"}}><M style={{color:C.d,fontSize:11}}>Last error: {schedCfg.last_sync_error}</M></Card>}
+
+            {/* Platform configuration */}
+            <Card style={{padding:14,marginBottom:12}}>
+              <Sel label="Platform" value={schedCfg.platform||""} onChange={e=>setSchedCfg(prev=>({...prev,platform:e.target.value||null,credentials_input:{}}))}>
+                <option value="">Select...</option>
+                <option value="ukg_kronos">UKG / Kronos</option>
+                <option value="workday">Workday</option>
+                <option value="adp">ADP</option>
+                <option value="bamboohr">BambooHR</option>
+                <option value="manual">Manual (FireAlive is system of record)</option>
+              </Sel>
+              {schedCfg.platform && schedCfg.platform!=="manual" && (
+                <Input label="Endpoint URL" placeholder="https://hr.corp.local/api" value={schedCfg.endpoint_url||""} onChange={e=>setSchedCfg(prev=>({...prev,endpoint_url:e.target.value}))}/>
+              )}
+
+              {schedCfg.platform==="bamboohr" && (
+                <div style={{marginTop:8}}>
+                  <M style={{color:C.tm,fontSize:11,marginBottom:6,display:"block"}}>BambooHR credentials {schedCfg.credentials_set?"(configured — fill in to update, or leave blank to keep)":""}</M>
+                  <Input label="Subdomain" placeholder="acme" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,subdomain:e.target.value}}))} value={schedCfg.credentials_input?.subdomain||""}/>
+                  <Input label="API Key" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,apiKey:e.target.value}}))} value={schedCfg.credentials_input?.apiKey||""}/>
+                </div>
+              )}
+              {schedCfg.platform==="workday" && (
+                <div style={{marginTop:8}}>
+                  <M style={{color:C.tm,fontSize:11,marginBottom:6,display:"block"}}>Workday credentials {schedCfg.credentials_set?"(configured — fill in to update, or leave blank to keep)":""}</M>
+                  <Input label="Tenant URL" placeholder="https://acme.workday.com" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,tenantUrl:e.target.value}}))} value={schedCfg.credentials_input?.tenantUrl||""}/>
+                  <Input label="Client ID" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientId:e.target.value}}))} value={schedCfg.credentials_input?.clientId||""}/>
+                  <Input label="Client Secret" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientSecret:e.target.value}}))} value={schedCfg.credentials_input?.clientSecret||""}/>
+                  <Input label="Refresh Token" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,refreshToken:e.target.value}}))} value={schedCfg.credentials_input?.refreshToken||""}/>
+                </div>
+              )}
+              {schedCfg.platform==="adp" && (
+                <div style={{marginTop:8}}>
+                  <M style={{color:C.tm,fontSize:11,marginBottom:6,display:"block"}}>ADP credentials {schedCfg.credentials_set?"(configured — fill in to update, or leave blank to keep)":""}</M>
+                  <Input label="Client ID" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientId:e.target.value}}))} value={schedCfg.credentials_input?.clientId||""}/>
+                  <Input label="Client Secret (optional)" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientSecret:e.target.value}}))} value={schedCfg.credentials_input?.clientSecret||""}/>
+                  <div style={{marginTop:8}}>
+                    <M style={{color:C.tm,fontSize:11,display:"block",marginBottom:4}}>Client Certificate (PEM)</M>
+                    <textarea placeholder="-----BEGIN CERTIFICATE-----" value={schedCfg.credentials_input?.certPem||""} onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,certPem:e.target.value}}))} style={{width:"100%",minHeight:80,padding:8,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:6,color:C.t,fontSize:10,fontFamily:"monospace"}}/>
+                  </div>
+                  <div style={{marginTop:8}}>
+                    <M style={{color:C.tm,fontSize:11,display:"block",marginBottom:4}}>Private Key (PEM)</M>
+                    <textarea placeholder="-----BEGIN PRIVATE KEY-----" value={schedCfg.credentials_input?.certKeyPem||""} onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,certKeyPem:e.target.value}}))} style={{width:"100%",minHeight:80,padding:8,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:6,color:C.t,fontSize:10,fontFamily:"monospace"}}/>
+                  </div>
+                </div>
+              )}
+              {schedCfg.platform==="ukg_kronos" && (
+                <div style={{marginTop:8}}>
+                  <M style={{color:C.tm,fontSize:11,marginBottom:6,display:"block"}}>UKG / Kronos credentials {schedCfg.credentials_set?"(configured — fill in to update, or leave blank to keep)":""}</M>
+                  <Input label="Tenant URL" placeholder="https://acme.us.workforce.ukg.com" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,tenantUrl:e.target.value}}))} value={schedCfg.credentials_input?.tenantUrl||""}/>
+                  <Input label="Client ID" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientId:e.target.value}}))} value={schedCfg.credentials_input?.clientId||""}/>
+                  <Input label="Client Secret" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,clientSecret:e.target.value}}))} value={schedCfg.credentials_input?.clientSecret||""}/>
+                  <Input label="Username (service account)" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,username:e.target.value}}))} value={schedCfg.credentials_input?.username||""}/>
+                  <Input label="Password" type="password" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,password:e.target.value}}))} value={schedCfg.credentials_input?.password||""}/>
+                  <Input label="API Key (optional)" onChange={e=>setSchedCfg(prev=>({...prev,credentials_input:{...prev.credentials_input,apiKey:e.target.value}}))} value={schedCfg.credentials_input?.apiKey||""}/>
+                </div>
+              )}
+
+              <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}>
+                <input type="checkbox" checked={schedCfg.enabled} onChange={e=>setSchedCfg(prev=>({...prev,enabled:e.target.checked}))}/>
+                <M style={{color:C.t}}>Enabled</M>
+              </label>
+
+              <div style={{display:"flex",gap:8,marginTop:14,flexWrap:"wrap"}}>
+                <Btn primary disabled={schedCfg._saving} onClick={()=>{
+                  const payload = {enabled: schedCfg.enabled, platform: schedCfg.platform, endpoint_url: schedCfg.endpoint_url || null};
+                  if (schedCfg.credentials_input && Object.values(schedCfg.credentials_input).some(v=>v)) {
+                    payload.credentials = schedCfg.credentials_input;
+                  }
+                  setSchedCfg(prev=>({...prev,_saving:true}));
+                  api.put("/api/scheduling/config", payload).then(r=>{
+                    if (r && !r.error) {
+                      setSchedCfg(prev=>({...prev,...r,credentials_input:{},_saving:false,_loaded:true,_savedPlatform:r.platform,_savedEndpointUrl:r.endpoint_url||"",_savedCredsSet:!!r.credentials_set}));
+                      addA("SCHEDULING","Configuration saved");
+                    } else {
+                      setSchedCfg(prev=>({...prev,_saving:false}));
+                      addA("SCHEDULING","Save failed: "+(r?.error||"unknown"));
+                    }
+                  });
+                }}>{schedCfg._saving?"Saving...":"Save Configuration"}</Btn>
+
+                <Btn disabled={schedCfg._testing||!schedCfg._savedPlatform||(schedCfg._savedPlatform!=="manual"&&(!schedCfg._savedEndpointUrl||!schedCfg._savedCredsSet))} onClick={()=>{
+                  setSchedCfg(prev=>({...prev,_testing:true,_testResult:null}));
+                  api.post("/api/scheduling/test", {}).then(r=>{
+                    setSchedCfg(prev=>({...prev,_testing:false,_testResult:r}));
+                    if (r?.ok) addA("SCHEDULING","Test connection succeeded ("+(r.durationMs||0)+"ms, "+(r.analystsReturned||0)+" analysts)");
+                    else addA("SCHEDULING","Test failed: "+(r?.error||"unknown"));
+                  });
+                }}>{schedCfg._testing?"Testing...":"Test Connection"}</Btn>
+
+                <Btn disabled={!schedCfg.enabled} onClick={()=>{
+                  api.post("/api/scheduling/sync", {}).then(r=>{
+                    if (r?.ok) addA("SCHEDULING", r.alreadyRunning ? "Sync already in progress" : "Sync queued — check status panel for completion");
+                    else addA("SCHEDULING", "Sync trigger failed: "+(r?.error||"unknown"));
+                  });
+                }}>Sync Now</Btn>
+
+                {schedCfg.consecutive_failures>0 && (
+                  <Btn small onClick={()=>{
+                    api.put("/api/scheduling/config",{reset_failure_counter:true}).then(r=>{
+                      if (r && !r.error) {
+                        setSchedCfg(prev=>({...prev,...r,_loaded:true}));
+                        addA("SCHEDULING","Failure counter reset");
+                      }
+                    });
+                  }}>Reset Failure Counter</Btn>
+                )}
+
+                {schedCfg.credentials_set && (
+                  <Btn small onClick={()=>{
+                    if (window.confirm("Clear stored credentials? Sync will be disabled until new credentials are set.")) {
+                      api.put("/api/scheduling/config",{clear_credentials:true,enabled:false}).then(r=>{
+                        if (r && !r.error) {
+                          setSchedCfg(prev=>({...prev,...r,credentials_input:{},_loaded:true,_savedCredsSet:false}));
+                          addA("SCHEDULING","Credentials cleared");
+                        }
+                      });
+                    }
+                  }}>Clear Stored Credentials</Btn>
+                )}
+              </div>
+
+              {schedCfg._testResult && (
+                <Card style={{padding:8,marginTop:10,borderColor:schedCfg._testResult.ok?C.a+"40":C.d+"40"}}>
+                  <M style={{color:schedCfg._testResult.ok?C.a:C.d,fontSize:11}}>
+                    {schedCfg._testResult.ok
+                      ? "Test passed: "+schedCfg._testResult.platform+" returned "+(schedCfg._testResult.analystsReturned||0)+" analysts in "+(schedCfg._testResult.durationMs||0)+"ms"
+                      : "Test failed: "+(schedCfg._testResult.error||"unknown error")}
+                  </M>
+                </Card>
+              )}
+            </Card>
+
+            {/* Coverage / frequency settings (kept from prior version, unchanged) */}
+            <Card style={{padding:14,marginBottom:12}}><Input label="Min coverage (%)" type="number" defaultValue="75"/><Sel label="Frequency"><option>Every shift</option><option>Alternate</option><option>3/week</option><option>Weekly</option></Sel></Card>
+
+            {/* Per-analyst upskilling-slot grid (unchanged — already wired to /api/upskilling/schedule per-row) */}
+            <Card style={{padding:14,marginBottom:12}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Schedule (select hour per analyst)</div><div style={{background:C.s,border:"1px solid "+C.b,borderRadius:10,overflow:"hidden"}}>{(analysts.length?analysts:[]).filter(a=>a.shift==="day").slice(0,6).map(a=>({id:a.id,n:a.name,t:"L"+a.tier,h:a.tier===3?"14-15":a.tier===2?"10-11":"16-17"})).map((a,idx)=>(<div key={idx} style={{display:"flex",justifyContent:"space-between",padding:"6px 14px",borderBottom:"1px solid "+C.b,alignItems:"center",gap:8}}><M style={{color:C.t,minWidth:70}}>{a.n}</M><Badge color={a.t==="L3"?C.p:C.i}>{a.t}</Badge><select defaultValue={a.h} style={{flex:1,padding:4,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:6,color:C.t,fontSize:11}} onChange={e=>api.post("/api/upskilling/schedule",{analystId:a.id,slot:e.target.value}).then(()=>addA("SCHED",a.n+" -> "+e.target.value))}><option value="06-07">06-07</option><option value="07-08">07-08</option><option value="08-09">08-09</option><option value="09-10">09-10</option><option value="10-11">10-11</option><option value="11-12">11-12</option><option value="12-13">12-13</option><option value="13-14">13-14</option><option value="14-15">14-15</option><option value="15-16">15-16</option><option value="16-17">16-17</option><option value="17-18">17-18</option></select></div>))}</div></Card>
+          </Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — AUTO-DISABLE ROUTING ON CRITICAL INCIDENTS ══════════ */}
