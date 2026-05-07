@@ -106,6 +106,54 @@ const schedulerService = {
       }
     }));
 
+    // ── R3d-3: scheduled retry of due push failures ──────────────────────
+    //
+    // Picks up failed pushes whose next_retry_at has passed and runs
+    // them via backupPush.retryAllDuePushes. Operates on the schedule
+    // from BACKUP_PUSH_RETRY_SCHEDULE env var; defaults to hourly at
+    // minute 15 ('15 * * * *') -- offset from the chain verifier
+    // (03:00) and the other top-of-hour jobs (IAM recert at 09:00,
+    // OODA replenishment at :00) to avoid contention.
+    //
+    // The exponential backoff schedule in backup-push.js spaces
+    // retries at 5min, 30min, 2hr, 12hr after each failure. Hourly
+    // scheduler ticks mean a 5min-due retry waits at most 60min
+    // before being picked up. Operators wanting faster retries can
+    // manually trigger via POST /api/backup-push/retry-all-due
+    // (commit 11 of this phase) without waiting for the next tick.
+    //
+    // Per-tick error handling matches the rest of the scheduler:
+    // exceptions logged at error level, scheduler keeps running.
+    // Pushes that throw inside the orchestrator are caught and
+    // surfaced via backup_pushes.error_message; this layer only
+    // sees catastrophic failures (DB unreachable, etc.).
+    const pushRetrySchedule = process.env.BACKUP_PUSH_RETRY_SCHEDULE || '15 * * * *';
+    this.jobs.push(cron.schedule(pushRetrySchedule, async () => {
+      try {
+        const { getDb } = require('../db/init');
+        const backupPush = require('./backup-push');
+        const db = getDb();
+        try {
+          const result = await backupPush.retryAllDuePushes(db, { logger });
+          if (result.retried > 0) {
+            const succeeded = result.results.filter(r => r.ok && !r.skipped).length;
+            const failed = result.results.filter(r => !r.ok && !r.skipped).length;
+            const skipped = result.results.filter(r => r.skipped).length;
+            logger.info('Scheduler: backup push retry sweep complete', {
+              retried: result.retried,
+              succeeded,
+              failed,
+              skipped,
+            });
+          }
+        } finally {
+          try { db.close(); } catch { /* swallow */ }
+        }
+      } catch (err) {
+        logger.error('Scheduler: backup push retry sweep failed', { error: err.message });
+      }
+    }));
+
     // ── Email notification pipeline ──────────────────────────────────────
     const emailIntervalSec = parseInt(process.env.NOTIFICATIONS_EMAIL_INTERVAL_SEC || '60', 10);
     const emailCronExpr = emailIntervalSec >= 60

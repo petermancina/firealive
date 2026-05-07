@@ -530,6 +530,113 @@ CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete
   BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
 
 
+-- ── R3d-3: BACKUP DESTINATIONS (off-host push targets) ───────────────────
+-- Each row defines a configured destination where backups are pushed
+-- after creation. The push happens automatically per services/backup-push.js
+-- (the push orchestrator) -- backups created with no enabled destinations
+-- stay on-host only (BACKUP_DIR), which is the v1.0.30 R3d-1/R3d-2
+-- baseline behavior.
+--
+-- ADAPTER COLUMN
+--
+-- 'local'        push to a separate local mount path (NAS, off-host
+--                filesystem mount). Configured via config.path.
+--                Immutability is the OS's responsibility.
+-- 'sftp'         push to an SFTP server using the existing ssh2 dep.
+--                Configured via config.host/port/username/path; auth
+--                via credentials_encrypted (key OR password).
+-- 's3'           cloud object storage. NOT IMPLEMENTED in R3d-3 --
+--                rejected by the destination service with a clear
+--                'lands in R3d-4' message. The CHECK constraint
+--                accepts the value so future adapters add without
+--                schema migration.
+-- 'azure-blob'   Azure Blob Storage. NOT IMPLEMENTED in R3d-3 -- R3d-4.
+-- 'gcs'          GCP Cloud Storage. NOT IMPLEMENTED in R3d-3 -- R3d-4.
+--
+-- IMMUTABILITY_MODE COLUMN
+--
+-- 'none'           operator declares no immutability protection
+-- 'append-only'    SFTP append-only directory or local-mount
+--                  with chattr +i applied by the operator outside
+--                  FireAlive's control
+-- 'object-lock'    S3 Object Lock (probed by adapter when
+--                  implemented in R3d-4). Refused by the local
+--                  and SFTP adapters in R3d-3.
+-- 'unknown'        operator hasn't declared; FireAlive does not
+--                  attempt to probe and does not refuse pushes
+--
+-- FireAlive does NOT enforce immutability itself (R3d-3); it
+-- trusts the operator's declaration. R3d-4 will add probes for
+-- destinations where they are programmatically verifiable
+-- (S3 GetObjectLockConfiguration).
+CREATE TABLE IF NOT EXISTS backup_destinations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  adapter TEXT NOT NULL
+    CHECK (adapter IN ('local', 'sftp', 's3', 'azure-blob', 'gcs')),
+  config TEXT NOT NULL,
+  credentials_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1
+    CHECK (enabled IN (0, 1)),
+  immutability_mode TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (immutability_mode IN ('none', 'append-only', 'object-lock', 'unknown')),
+  retention_days INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_destinations_enabled
+  ON backup_destinations(enabled) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_backup_destinations_adapter
+  ON backup_destinations(adapter);
+
+
+-- ── R3d-3: BACKUP PUSHES (per-backup-per-destination push status) ────────
+-- Tracks the status of every push attempt. One row per (backup,
+-- destination) pair, updated as the push progresses through:
+--
+--   queued    → just created; orchestrator will pick it up
+--   running   → adapter is currently uploading
+--   succeeded → upload completed; pushed_at and size set
+--   failed    → upload failed; error_message set; next_retry_at
+--               populated for the scheduler to retry with
+--               exponential backoff
+--
+-- backup_id is a SOFT reference (no FK) so push-audit records
+-- persist even if backups rows are later removed by retention or
+-- admin operations. The push history itself is part of the audit
+-- trail, not the backups table.
+--
+-- destination_id IS a foreign key with ON DELETE RESTRICT --
+-- destinations cannot be deleted while push records reference
+-- them. Operators wanting to retire a destination should mark
+-- it disabled (enabled=0); the destination row stays for audit
+-- continuity.
+CREATE TABLE IF NOT EXISTS backup_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  backup_id TEXT NOT NULL,
+  destination_id TEXT NOT NULL
+    REFERENCES backup_destinations(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_backup
+  ON backup_pushes(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_destination
+  ON backup_pushes(destination_id);
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_retry_scan
+  ON backup_pushes(status, next_retry_at);
+
+
 -- ── Audit Trail (immutable) ──────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS audit_log (

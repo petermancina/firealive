@@ -87,6 +87,7 @@ const keyWrapSvc = require('./backup-key-wrapping');
 const manifestSvc = require('./backup-manifest');
 const signingKeysSvc = require('./backup-signing-keys');
 const chainSvc = require('./backup-chain');
+const backupPushSvc = require('./backup-push');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -428,7 +429,61 @@ async function performBackup(type = 'on-demand', options = {}) {
       );
     }
 
-    // 10. Retention cleanup (uniform across v1 + v2)
+    // 10. R3d-3: push backup to enabled destinations.
+    //
+    // FIRE-AND-FORGET BY DEFAULT. The push runs in the background
+    // with its own DB connection so performBackup can return
+    // quickly even when pushes are slow (multi-GB archives over
+    // slow SFTP, etc.). Push status lands in the backup_pushes
+    // table; admins and the scheduler can query separately.
+    //
+    // OPT-IN SYNCHRONOUS via options.awaitPush=true. Tests and
+    // CLI workflows that want synchronous push results should
+    // pass this flag. The function awaits push completion and
+    // includes push_result in the return value. The caller
+    // accepts that the response time is bounded by the slowest
+    // destination's push completion.
+    //
+    // DEGRADED-MODE on push failure (matches chain-append posture):
+    // a backup with chain attestation but failed pushes is still
+    // considered successful. The on-host backup files exist and
+    // are verified. Push failures are logged and tracked in
+    // backup_pushes; the scheduler retries transient failures
+    // with exponential backoff (commits 13-14 of this phase).
+    // Refusing to acknowledge backup creation when pushes fail
+    // would create a worse failure mode where a destination
+    // outage blocks all backup operations.
+    let pushResult = null;
+    let pushScheduled = false;
+    if (options.awaitPush) {
+      try {
+        pushResult = await backupPushSvc.pushBackup(db, backupId, { logger });
+      } catch (pushErr) {
+        logger.error('backup: synchronous push orchestration crashed', { id: backupId, error: pushErr.message });
+        pushResult = { ok: false, error: pushErr.message, crashed: true };
+      }
+    } else {
+      void (async () => {
+        let pushDb;
+        try {
+          pushDb = getDb();
+          const r = await backupPushSvc.pushBackup(pushDb, backupId, { logger });
+          logger.info('backup: background push completed', {
+            id: backupId,
+            destinations: r.destinations ? r.destinations.length : 0,
+            succeeded: r.destinations ? r.destinations.filter(d => d.ok).length : 0,
+            failed: r.destinations ? r.destinations.filter(d => !d.ok).length : 0,
+          });
+        } catch (err) {
+          logger.error('backup: background push orchestration crashed', { id: backupId, error: err.message });
+        } finally {
+          if (pushDb) { try { pushDb.close(); } catch { /* swallow */ } }
+        }
+      })();
+      pushScheduled = true;
+    }
+
+    // 11. Retention cleanup (uniform across v1 + v2)
     cleanOldBackups(backupDir);
 
     return {
@@ -444,6 +499,8 @@ async function performBackup(type = 'on-demand', options = {}) {
       status: 'verified',
       chain_entry: chainEntry,
       chain_error: chainError,
+      push_result: pushResult,        // populated when awaitPush=true; null otherwise
+      push_scheduled: pushScheduled,  // true when fire-and-forget; false when awaitPush=true
     };
   } catch (err) {
     // Mark row failed + clean up partial output
