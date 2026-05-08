@@ -53,6 +53,9 @@ CREATE TABLE IF NOT EXISTS users (
   auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
   external_id TEXT,  -- SSO subject identifier
   geo_country TEXT,  -- v0.0.25: assigned country for geo-fencing
+  totp_secret TEXT,  -- v1.0.30: TOTP shared secret (Tier-3 encrypted base32). NULL = not enrolled.
+  totp_enrolled_at TEXT,  -- v1.0.30: timestamp of TOTP enrollment confirmation
+  totp_last_used_step INTEGER,  -- v1.0.30: replay protection -- last accepted TOTP time-step counter
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
   last_login TEXT
@@ -2133,6 +2136,9 @@ function initDb() {
     addCol('last_iam_check', 'last_iam_check TEXT');
     addCol('offboarded_at', 'offboarded_at TEXT');
     addCol('pseudonym_rotated_at', 'pseudonym_rotated_at TEXT');
+    addCol('totp_secret', 'totp_secret TEXT');
+    addCol('totp_enrolled_at', 'totp_enrolled_at TEXT');
+    addCol('totp_last_used_step', 'totp_last_used_step INTEGER');
 
     // ─────────────────────────────────────────────────────────────────────
     // R3c — ANONYMITY MODEL note for the email column added below
