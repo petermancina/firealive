@@ -637,6 +637,186 @@ CREATE INDEX IF NOT EXISTS idx_backup_pushes_retry_scan
   ON backup_pushes(status, next_retry_at);
 
 
+-- ── R3d-4: KMS PROVIDERS (key encryption key sources) ────────────────────
+-- Each row defines a configured KEK source. The DEFAULT row (is_default=1)
+-- is used for new backups; old backups remember their original provider
+-- via the manifest's key_wrapping.scheme + kek_reference fields, so old
+-- providers stay reachable for restore as long as their row is enabled.
+--
+-- PROVIDER TYPES
+--
+-- 'env-var'         TIER1_ENCRYPTION_KEY env var (existing R3d-1 behavior).
+--                   Always available. Auto-seeded as the initial default
+--                   on first boot if no rows exist (boot path in init.js).
+--                   Tier 3 security (KEK in process memory).
+--
+-- 'aws-kms'         AWS KMS via @aws-sdk/client-kms. Tier 2 security
+--                   (KEK in AWS HSM, FIPS 140-2 Level 3 in eligible
+--                   regions). config: {region, key_id|key_arn,
+--                   encryption_context?}. credentials: {access_key_id,
+--                   secret_access_key, session_token?} OR rely on
+--                   instance profile / env-var-based AWS auth (no
+--                   credentials_encrypted needed).
+--
+-- 'azure-keyvault'  Azure Key Vault via @azure/keyvault-keys. Tier 2.
+--                   config: {vault_url, key_name, key_version?}.
+--                   credentials: {tenant_id, client_id, client_secret}
+--                   OR rely on managed identity.
+--
+-- 'gcp-kms'         GCP Cloud KMS via @google-cloud/kms. Tier 2.
+--                   config: {project_id, location, key_ring, key_name,
+--                   key_version?}. credentials: {service_account_json}
+--                   OR rely on GCE metadata service.
+--
+-- 'hashicorp-vault' Vault transit engine via HTTPS API (no SDK; raw
+--                   HTTP client). Tier 2. config: {vault_addr,
+--                   transit_path, key_name, namespace?}. credentials:
+--                   {token, token_renewable?} -- typically AppRole-
+--                   issued. Critical for on-prem and EU privacy-first
+--                   deployments (Hetzner / OVHcloud / Scaleway hosts).
+--
+-- PKCS#11 HSM (YubiHSM, Thales, Entrust) is intentionally NOT in this
+-- list for R3d-4. The provider interface (services/key-wrapping-providers/
+-- base.js, commit 4 of this phase) is designed so PKCS#11 plugs in
+-- cleanly later. Adding it requires native bindings and hardware
+-- verification not feasible in this phase's scope.
+--
+-- IS_DEFAULT
+--
+-- Exactly one row at a time can have is_default = 1, enforced by the
+-- partial UNIQUE index below. New backups use the default. Operators
+-- rotating the default to a new provider should mark the new row
+-- is_default=1 and clear the old row's flag in the same transaction;
+-- the existing row stays in the table (enabled=1 typically) so old
+-- backups can still unwrap their DEKs.
+--
+-- ENABLED
+--
+-- Disabling a provider (enabled=0) prevents it from being used for
+-- new wrapping operations. Old backups whose key_wrapping.kek_reference
+-- points at a disabled provider can still be UNWRAPPED for restore --
+-- the provider row stays in the table; only new wraps are gated.
+--
+-- CREDENTIALS_ENCRYPTED
+--
+-- Same on-disk format as backup_destinations.credentials_encrypted:
+-- AES-256-GCM (iv + tag + ciphertext) base64-encoded for TEXT column.
+-- TIER1_ENCRYPTION_KEY is the wrapping key for THIS table too --
+-- which creates a chicken-and-egg: env-var rows don't need credentials
+-- (they ARE the env var), so they store NULL. Cloud rows store the
+-- cloud auth credentials encrypted under TIER1_ENCRYPTION_KEY.
+--
+-- For air-gapped operators who want to eliminate TIER1_ENCRYPTION_KEY
+-- entirely, the migration path is: cloud-KMS-encrypted DEKs only,
+-- and cloud SDK auth via instance metadata (no credentials in DB).
+-- That removes TIER1_ENCRYPTION_KEY from the security boundary
+-- entirely. Documented in the R3d-4 PR description.
+CREATE TABLE IF NOT EXISTS kms_providers (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  name TEXT NOT NULL UNIQUE,
+  provider_type TEXT NOT NULL CHECK (provider_type IN
+    ('env-var', 'aws-kms', 'azure-keyvault', 'gcp-kms', 'hashicorp-vault')),
+  config TEXT NOT NULL,
+  credentials_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1
+    CHECK (enabled IN (0, 1)),
+  is_default INTEGER NOT NULL DEFAULT 0
+    CHECK (is_default IN (0, 1)),
+  last_probe_at TEXT,
+  last_probe_status TEXT
+    CHECK (last_probe_status IS NULL OR last_probe_status IN ('ok', 'failed')),
+  last_probe_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kms_providers_default
+  ON kms_providers(is_default) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS idx_kms_providers_enabled
+  ON kms_providers(enabled) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_kms_providers_type
+  ON kms_providers(provider_type);
+
+
+-- ── R3d-4: RESTORE APPROVALS (two-person approval workflow) ──────────────
+-- Implements operator-configurable two-person approval for v2 restore
+-- operations. Three modes (configured in system_meta):
+--
+--   strict (default)            second admin must POST approval w/ TOTP
+--                                before the restore can execute
+--
+--   delayed-self-approval       second admin POST approval, OR the same
+--                                admin can approve their own request
+--                                after a configured window has elapsed
+--                                (system_meta.restore_approval_window_hours,
+--                                default 24)
+--
+--   disabled                    no two-person approval; first admin
+--                                proceeds directly. R3d-2 chain integrity
+--                                precondition still enforced. Intended
+--                                for SOCs with single-admin operations
+--                                where two-person would block all recovery.
+--
+-- LIFECYCLE
+--
+--   pending     just created; awaiting approval or expiration
+--   approved    second admin (or self in delayed mode) approved
+--   denied      explicitly denied by an admin
+--   expired     pending past expires_at; never approved
+--   consumed    restore actually executed using this approval
+--
+-- One approval record per restore request. After consumption, the same
+-- approval record cannot be used again -- a re-restore requires a fresh
+-- request. The chain_request_entry_id column links to the backup_chain
+-- RESTORE_REQUEST entry once the restore consumes the approval, providing
+-- a forensic chain anchor.
+--
+-- AUDIT NOTES
+--
+-- Soft references to user IDs (no FK to users table) -- consistent
+-- with audit-trail tables that should persist even if user accounts
+-- are later removed. Reason: SOC compliance reviews must reconstruct
+-- "who approved what" even years later, regardless of personnel turnover.
+--
+-- client_ip_at_request and client_ip_at_approval are recorded for
+-- forensic value (correlate against VPN logs, etc.); not used for
+-- authorization.
+CREATE TABLE IF NOT EXISTS restore_approvals (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  backup_id TEXT NOT NULL,
+  requested_by_user_id TEXT NOT NULL,
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  request_reason TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+  approval_mode_at_creation TEXT NOT NULL
+    CHECK (approval_mode_at_creation IN ('strict', 'delayed-self-approval', 'disabled')),
+  approval_window_hours INTEGER NOT NULL,
+  approved_by_user_id TEXT,
+  approved_at TEXT,
+  approval_method TEXT
+    CHECK (approval_method IS NULL OR approval_method IN
+      ('second-person-totp', 'delayed-self-totp', 'disabled-mode-bypass')),
+  denied_by_user_id TEXT,
+  denied_at TEXT,
+  denial_reason TEXT,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  chain_request_entry_id INTEGER,
+  client_ip_at_request TEXT,
+  client_ip_at_approval TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_backup
+  ON restore_approvals(backup_id);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_status
+  ON restore_approvals(status);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
+  ON restore_approvals(expires_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
+  ON restore_approvals(requested_by_user_id);
+
+
 -- ── Audit Trail (immutable) ──────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -2306,6 +2486,49 @@ function initDb() {
   } catch (chainKeyErr) {
     console.error('chain-signing-keys initialization FAILED:', chainKeyErr.message);
     console.error('The server will start, but backup_chain entries cannot be appended until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
+  }
+
+  // ── R3d-4: KMS providers + restore approval defaults ────────────────────
+  //
+  // Seed the env-var KMS provider as the initial default if no providers
+  // exist. This preserves backward compatibility with R3d-1/R3d-2/R3d-3
+  // installs (which used TIER1_ENCRYPTION_KEY directly without a row).
+  // Operators upgrading to R3d-4 keep the env-var path; they can add
+  // cloud KMS providers later via /api/kms-providers (commit 24+ of this
+  // phase) and rotate the default to the new provider.
+  //
+  // If kms_providers already has rows (mid-upgrade re-init or similar),
+  // do NOT seed -- the operator's configured providers stay authoritative.
+  try {
+    const existingProvidersCount = db.prepare('SELECT COUNT(*) AS c FROM kms_providers').get().c;
+    if (existingProvidersCount === 0) {
+      db.prepare(`
+        INSERT INTO kms_providers (name, provider_type, config, credentials_encrypted, enabled, is_default)
+        VALUES (?, 'env-var', ?, NULL, 1, 1)
+      `).run(
+        'env-var-default',
+        JSON.stringify({ env_var_name: 'TIER1_ENCRYPTION_KEY' }),
+      );
+      console.log("kms-providers: seeded env-var-default provider as the initial default (uses TIER1_ENCRYPTION_KEY)");
+    }
+  } catch (kmsErr) {
+    console.error('kms-providers initialization FAILED:', kmsErr.message);
+    console.error('The server will start, but backup creation may fail until kms_providers has at least one default-enabled row.');
+  }
+
+  // Seed restore approval policy defaults if not already set.
+  try {
+    const ensureMeta = (key, defaultValue) => {
+      const existing = db.prepare("SELECT value FROM system_meta WHERE key = ?").get(key);
+      if (!existing) {
+        db.prepare("INSERT INTO system_meta (key, value) VALUES (?, ?)").run(key, defaultValue);
+        console.log(`system_meta: seeded ${key} = ${defaultValue}`);
+      }
+    };
+    ensureMeta('restore_approval_mode', 'strict');
+    ensureMeta('restore_approval_window_hours', '24');
+  } catch (metaErr) {
+    console.error('restore approval defaults initialization FAILED:', metaErr.message);
   }
 
   console.log('Database initialized at', DB_PATH);
