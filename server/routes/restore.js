@@ -119,6 +119,7 @@ const signingKeysSvc = require('../services/backup-signing-keys');
 const chainSvc = require('../services/backup-chain');
 const approvalsSvc = require('../services/restore-approvals');
 const approvalPolicy = require('../services/restore-approval-policy');
+const { IntegrationManager } = require('../services/integration-manager');
 
 // ── Approval-gate helpers ────────────────────────────────────────────────────
 //
@@ -995,6 +996,89 @@ router.post('/execute/:id', async (req, res) => {
         });
       }
 
+      // 8b. Layer-2 EDR scan of the extracted SQLite bytes. Mandatory:
+      //     defense-in-depth even though the local backup is signed by
+      //     this deployment's chain-signing key. Catches the case
+      //     where an attacker with local code-exec replaced or
+      //     modified backup files between creation and restore, and
+      //     prevents the restore path from being used as a malware-
+      //     delivery channel into a host that's otherwise been
+      //     hardened against direct uploads. Three FATAL refusal
+      //     conditions, all enforced before the destructive pre-
+      //     restore snapshot:
+      //
+      //       skipped:true             -> SCANNER_NOT_CONFIGURED
+      //       clean:false + threats[]  -> MALWARE_DETECTED
+      //       clean:false + no threats -> SCAN_FAILED (fail-safe)
+      //
+      //     Uses a temp db handle because the restore-handler db was
+      //     closed at the consume step to release the file lock for
+      //     atomic-rename, and IntegrationManager queries the
+      //     malware_scanner_integrations registry.
+      let scanResult;
+      {
+        const scanDb = getDb();
+        try {
+          const mgr = new IntegrationManager(scanDb);
+          try {
+            scanResult = await mgr.inspectFile(
+              extracted.payload,
+              'firealive.db',
+              'application/x-sqlite3',
+            );
+          } catch (scanErr) {
+            return res.status(500).json({
+              error: 'v2 malware scan threw',
+              detail: scanErr.message,
+              code: 'SCAN_FAILED',
+            });
+          }
+        } finally {
+          try { scanDb.close(); } catch { /* best effort */ }
+        }
+      }
+      if (scanResult.skipped === true) {
+        auditLog(
+          userId,
+          'RESTORE_REJECTED_NO_SCANNER',
+          `backup=${backup.id} format=v2 reason=no_scanner_configured`,
+          req.ip,
+        );
+        return res.status(422).json({
+          error: 'restore requires at least one configured malware scanner. Configure one under MC > Malware Scanners and retry.',
+          code: 'SCANNER_NOT_CONFIGURED',
+        });
+      }
+      if (scanResult.clean !== true) {
+        const threats = Array.isArray(scanResult.threats) ? scanResult.threats : [];
+        if (threats.length > 0) {
+          auditLog(
+            userId,
+            'RESTORE_REJECTED_MALWARE',
+            `backup=${backup.id} format=v2 scan_id=${scanResult.scanId || 'null'} provider=${scanResult.provider || 'null'} threats=${threats.join(',')}`,
+            req.ip,
+          );
+          return res.status(422).json({
+            error: 'malware detected in extracted backup bytes',
+            code: 'MALWARE_DETECTED',
+            threats,
+            scan_id: scanResult.scanId || null,
+            provider: scanResult.provider || null,
+          });
+        }
+        auditLog(
+          userId,
+          'RESTORE_REJECTED_SCAN_FAILED',
+          `backup=${backup.id} format=v2 scan_id=${scanResult.scanId || 'null'} no_authoritative_result`,
+          req.ip,
+        );
+        return res.status(500).json({
+          error: 'malware scan did not produce an authoritative clean result (all configured scanners errored)',
+          code: 'SCAN_FAILED',
+          scan_id: scanResult.scanId || null,
+        });
+      }
+
       // 9. Pre-restore raw copy of CURRENT live DB state
       const { DB_PATH } = require('../db/init');
       const preRestoreDir = path.dirname(DB_PATH);
@@ -1063,6 +1147,25 @@ router.post('/execute/:id', async (req, res) => {
               source_chain_request_this_hash: restoreRequestEntry ? restoreRequestEntry.this_hash : null,
               approval_id: approvalRowFinal.id,
               approval_method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || 'unknown',
+              malware_scan: {
+                clean: scanResult.clean === true,
+                scan_id: scanResult.scanId || null,
+                provider: scanResult.provider || null,
+                mode: scanResult.mode || null,
+                latency_ms: scanResult.latencyMs || 0,
+                inspector_version: scanResult.inspectorVersion || null,
+                scanners: Array.isArray(scanResult.scanners)
+                  ? scanResult.scanners.map(s => ({
+                      id: s.id || null,
+                      provider_type: s.provider_type || null,
+                      clean: s.clean === true,
+                      scan_id: s.scanId || null,
+                      latency_ms: s.latencyMs || 0,
+                      attempted: s.attempted === true,
+                      error: s.error || null,
+                    }))
+                  : [],
+              },
             },
           });
           restoreCompleteEntry = {

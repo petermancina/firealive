@@ -1,19 +1,31 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — External Restore: Azure Blob Storage Source Adapter
+// FIREALIVE — External Restore: Azure Blob Source Adapter (v2 directory layout)
 //
-// Fourth of five source adapters for the External Restore feature.
-// Operates on the listBackups / fetchBackup / verifyIntegrity contract
-// shared with the other adapters in this directory; see network-share.js
-// (commit 4) for the full adapter API documentation.
+// Source adapter for the External Restore feature. Operates on the v2
+// directory-layout contract (see nas.js for the canonical contract
+// documentation; identical for all 5 source adapters): each backup is
+// a "folder" (Azure blob name prefix) firealive-backup-<iso-ts>/
+// containing 4 blobs (archive.tar.zst.enc, wrapped-key.bin,
+// manifest.json, manifest.sig).
 //
-// ═══════════════════════════════════════════════════════════════════════════════
+// CONTRACT (shared across all 5 source adapters)
+//
+//   listBackups(ctx)                  -> { backups: [{ id, modifiedAt,
+//                                                       sizeBytes }] }
+//   fetchFile(ctx, backupId, name)    -> Buffer
+//   verifyStructure(ctx, backupId)    -> { ok, missing[], present[],
+//                                           totalSizeBytes }
+//
+//   Crypto verification (Ed25519 sig + file SHA-256s) happens in the
+//   orchestrator (services/external-restore.js, commit 8), not the
+//   adapter -- adapters are pure I/O.
 //
 // IMPLEMENTATION NOTES
 //
 // Speaks raw Azure Blob Storage REST API over HTTPS using the built-in
-// node:https client and either Shared Key signing or SAS-token URLs —
+// node:https client and either Shared Key signing or SAS-token URLs --
 // no @azure/* SDK dependency. Same rationale as the S3 adapter
-// (commit 6): the malware-scanner integrations all use built-in https,
+// (commit 6): malware-scanner integrations all use built-in https,
 // and the surface needed here is small (List Blobs + Get Blob).
 //
 // Azure Shared Key signing reference:
@@ -22,7 +34,7 @@
 // Azure SAS reference:
 //   https://learn.microsoft.com/en-us/rest/api/storageservices/delegate-access-with-shared-access-signature
 //
-// CREDENTIALS SHAPE on a source row (decrypted by the orchestrator):
+// CREDENTIALS SHAPE on a source row (after Tier-1 decryption):
 //
 //   Shared Key auth:
 //     {
@@ -39,31 +51,46 @@
 //     }
 //
 // Either accountKey OR sasToken is required, not both. Shared Key gives
-// full account-level access; SAS tokens are scoped (preferred for least-
-// privilege deployments). Per-source choice — leads can configure
+// full account-level access; SAS tokens are scoped (preferred for
+// least-privilege deployments). Per-source choice -- leads can configure
 // separate sources with different auth modes side-by-side.
 //
 // PATH on a source row is the prefix WITHIN the container where backups
-// live (e.g. "mc-prod/backups/" or "" for container root).
+// live -- e.g. "mc-prod/backups/" or "" for container root. Trailing
+// slash is added if missing. Backup IDs are FOLDER names matching
+// BACKUP_FOLDER_RE; full blob name for a file is
+// `${prefix}${backupId}/${filename}`.
+//
+// AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const https = require('https');
 const crypto = require('crypto');
 const { validateAllowedHost } = require('../external-restore-allow-list');
 
+// ── Shared adapter constants ─────────────────────────────────────────────────
+
+const BACKUP_FOLDER_RE = /^firealive-backup-\d{8}T\d{6}Z$/;
+
+const BACKUP_FILE_NAMES = Object.freeze([
+  'archive.tar.zst.enc',
+  'wrapped-key.bin',
+  'manifest.json',
+  'manifest.sig',
+]);
+const BACKUP_FILE_NAMES_SET = new Set(BACKUP_FILE_NAMES);
+
+const MAX_BACKUP_SIZE_BYTES = 8 * 1024 * 1024 * 1024;  // 8 GB
+const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;            // 1 MB
+
 const REQUEST_TIMEOUT_MS = 60000;
 const FETCH_TIMEOUT_MS   = 600000;
-const MAX_BACKUP_SIZE_BYTES = 8 * 1024 * 1024 * 1024;  // 8 GB
-const BACKUP_FILENAME_RE = /^[A-Za-z0-9_\-]{1,80}-\d{8}T\d{6}Z\.tar\.gz(?:\.enc)?$/;
 const X_MS_VERSION = '2023-11-03';  // pinned for stability
 
-// ── Shared Key signing ────────────────────────────────────────────────────
+// ── Shared Key signing (UNCHANGED from v1) ───────────────────────────────
 
 /**
  * Sign an Azure Blob request using Shared Key.
- *
- * The canonical request format is documented at
- * https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key
  *
  * String to sign (literal newlines between every field):
  *   VERB \n
@@ -88,10 +115,6 @@ function signSharedKey({ method, accountName, accountKey, urlPath, queryParams, 
     `x-ms-date:${xmsDate}\n` +
     `x-ms-version:${X_MS_VERSION}`;
 
-  // CanonicalizedResource format:
-  //   /<accountname><urlpath>\n
-  //   <param-name>:<value-1>,<value-2>,...
-  //   (sorted lex by param name; values comma-joined if duplicated)
   const sortedParams = Object.keys(queryParams || {}).sort();
   const paramLines = sortedParams.map(k => {
     const v = queryParams[k];
@@ -133,8 +156,19 @@ function buildBlobHost(accountName) {
  * Make a signed Azure Blob request. Returns { statusCode, body, headers }
  * or { statusCode, headers, stream } when stream=true. Throws on
  * transport errors or non-2xx.
+ *
+ * Optional maxBytes parameter caps the buffered response size on a
+ * per-call basis (List Blobs vs file fetch have different bounds).
  */
-function azureRequest({ method, host, urlPath, queryParams, accountName, accountKey, sasToken, timeoutMs }, stream) {
+function azureRequest(opts, stream) {
+  const {
+    method, host, urlPath, queryParams,
+    accountName, accountKey, sasToken,
+    timeoutMs, maxBytes,
+  } = opts;
+  const sizeCap = typeof maxBytes === 'number' && maxBytes > 0
+    ? maxBytes : MAX_BACKUP_SIZE_BYTES;
+
   const allowed = validateAllowedHost(host);
   if (!allowed.ok) {
     return Promise.reject(new Error(`outbound host ${host} rejected: ${allowed.error}`));
@@ -142,8 +176,6 @@ function azureRequest({ method, host, urlPath, queryParams, accountName, account
 
   const xmsDate = new Date().toUTCString();
 
-  // Build the request URL. SAS-token auth appends the token to the
-  // query string; Shared Key auth uses the Authorization header.
   let qsParts = [];
   for (const [k, v] of Object.entries(queryParams || {})) {
     if (Array.isArray(v)) {
@@ -164,8 +196,6 @@ function azureRequest({ method, host, urlPath, queryParams, accountName, account
       method, accountName, accountKey, urlPath, queryParams, xmsDate,
     });
   } else if (sasToken) {
-    // SAS tokens already contain `?sv=...&sig=...`. Strip leading '?' if
-    // present so we can compose with our own query string.
     const sasClean = sasToken.startsWith('?') ? sasToken.slice(1) : sasToken;
     urlSuffix = urlSuffix ? urlSuffix + '&' + sasClean : '?' + sasClean;
   } else {
@@ -188,15 +218,19 @@ function azureRequest({ method, host, urlPath, queryParams, accountName, account
       }
       const chunks = [];
       let totalBytes = 0;
+      let aborted = false;
       res.on('data', (c) => {
+        if (aborted) return;
         totalBytes += c.length;
-        if (totalBytes > MAX_BACKUP_SIZE_BYTES) {
-          req.destroy(new Error('response body exceeded MAX_BACKUP_SIZE_BYTES'));
+        if (totalBytes > sizeCap) {
+          aborted = true;
+          req.destroy(new Error(`response body exceeded ${sizeCap} bytes`));
           return;
         }
         chunks.push(c);
       });
       res.on('end', () => {
+        if (aborted) return;
         const body = Buffer.concat(chunks);
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ statusCode: res.statusCode, headers: res.headers, body });
@@ -235,10 +269,24 @@ function validateCredentials(creds) {
     throw new Error(`credentials.containerName '${creds.containerName}' is not a valid Azure container name`);
   }
   if (creds.accountKey) {
-    // Account keys are base64-encoded 64-byte secrets — 88 base64 chars.
     if (!/^[A-Za-z0-9+/=]{40,200}$/.test(creds.accountKey)) {
       throw new Error('credentials.accountKey does not look like a base64-encoded Azure storage account key');
     }
+  }
+}
+
+function validateBackupId(backupId) {
+  if (typeof backupId !== 'string' || !BACKUP_FOLDER_RE.test(backupId)) {
+    throw new Error(`backupId '${backupId}' is not a valid v2 backup folder name`);
+  }
+}
+
+function validateFilename(filename) {
+  if (typeof filename !== 'string' || !BACKUP_FILE_NAMES_SET.has(filename)) {
+    throw new Error(
+      `filename '${filename}' is not one of the expected v2 backup files: ` +
+      BACKUP_FILE_NAMES.join(', '),
+    );
   }
 }
 
@@ -258,10 +306,6 @@ function uriEncodePath(p) {
 
 /**
  * Minimal XML parser for Azure's List Blobs response.
- * Handles only the fields we need:
- *   <Blob><Name>...</Name><Properties><Content-Length>...</Content-Length>
- *     <Last-Modified>...</Last-Modified><Etag>...</Etag></Properties></Blob>
- *   <NextMarker>...</NextMarker>
  */
 function parseListBlobsXml(xml) {
   const blobs = [];
@@ -287,24 +331,20 @@ function parseListBlobsXml(xml) {
   };
 }
 
-// ── Adapter API ───────────────────────────────────────────────────────────
-
-async function listBackups(ctx) {
-  const creds = ctx.config.credentials;
-  validateCredentials(creds);
-  const prefix = normalizePrefix(ctx.config.path);
-  const host = buildBlobHost(creds.accountName);
+/**
+ * Run a paginated List Blobs call and return all blobs under a given
+ * blob-name prefix. Caps at 50 pages to bound a runaway container.
+ * Each paginated call is a separate signed request.
+ */
+async function listAllBlobs(creds, host, blobPrefix) {
   const containerPath = `/${creds.containerName}`;
-
   const collected = [];
   let marker = null;
-  // Cap continuations like the S3 adapter — Azure default page size is
-  // 5000 max; 50 pages = 250000 max enumerated.
   for (let page = 0; page < 50; page++) {
     const queryParams = {
       'restype': 'container',
       'comp': 'list',
-      'prefix': prefix,
+      'prefix': blobPrefix,
       'maxresults': '5000',
     };
     if (marker) queryParams['marker'] = marker;
@@ -318,40 +358,117 @@ async function listBackups(ctx) {
       accountKey: creds.accountKey,
       sasToken: creds.sasToken,
       timeoutMs: REQUEST_TIMEOUT_MS,
+      maxBytes: 16 * 1024 * 1024,  // List Blobs XML capped at 16 MB
     });
 
     const xml = result.body.toString('utf8');
     const parsed = parseListBlobsXml(xml);
-    for (const b of parsed.blobs) {
-      const rel = prefix && b.name.startsWith(prefix) ? b.name.slice(prefix.length) : b.name;
-      if (!rel || rel.includes('/')) continue;  // skip nested
-      if (!BACKUP_FILENAME_RE.test(rel)) continue;
-      collected.push({
-        id: rel,
-        filename: rel,
-        sizeBytes: b.contentLength,
-        modifiedAt: b.lastModified ? new Date(b.lastModified).toISOString() : null,
-        etag: b.etag,
-      });
-    }
+    for (const b of parsed.blobs) collected.push(b);
     if (!parsed.nextMarker) break;
     marker = parsed.nextMarker;
   }
-
-  collected.sort((a, b) => (b.modifiedAt || '').localeCompare(a.modifiedAt || ''));
-  ctx.log('info', 'listBackups completed', { account: creds.accountName, container: creds.containerName, prefix, count: collected.length });
-  return { backups: collected };
+  return collected;
 }
 
-async function fetchBackup(ctx, backupId) {
-  if (!BACKUP_FILENAME_RE.test(backupId)) {
-    throw new Error(`backupId '${backupId}' is not a valid FireAlive backup filename`);
+/**
+ * Group flat blob list by folder. Given a blob name like
+ * `<prefix><folderName>/<filename>`, extract folderName + filename and
+ * group. Blobs whose name shape doesn't match the v2 folder/file
+ * convention are silently skipped. Returns Map<folderName, {
+ * present[], totalSize, manifestLastModified }>.
+ */
+function groupBlobsByFolder(blobs, blobPrefix) {
+  const folders = new Map();
+  for (const b of blobs) {
+    const name = b.name || '';
+    if (blobPrefix && !name.startsWith(blobPrefix)) continue;
+    const rel = name.slice(blobPrefix.length);
+    const slashIdx = rel.indexOf('/');
+    if (slashIdx <= 0) continue;
+    const folderName = rel.slice(0, slashIdx);
+    const filename = rel.slice(slashIdx + 1);
+    if (!BACKUP_FOLDER_RE.test(folderName)) continue;
+    if (!BACKUP_FILE_NAMES_SET.has(filename)) continue;
+    if (filename.includes('/')) continue;
+
+    let entry = folders.get(folderName);
+    if (!entry) {
+      entry = { present: [], totalSize: 0, manifestLastModified: null };
+      folders.set(folderName, entry);
+    }
+    entry.present.push(filename);
+    entry.totalSize += b.contentLength || 0;
+    if (filename === 'manifest.json') {
+      entry.manifestLastModified = b.lastModified
+        ? new Date(b.lastModified).toISOString()
+        : null;
+    }
   }
+  return folders;
+}
+
+// ── Adapter API ───────────────────────────────────────────────────────────
+
+/**
+ * List all v2 backup folders in the source's container+prefix. Strategy:
+ * one paginated List Blobs over the prefix; group resulting blobs by
+ * folder; emit only folders that have all 4 expected files. Round
+ * trips: ceil(total_blobs / 5000), typically 1 at SOC-shop scale.
+ */
+async function listBackups(ctx) {
   const creds = ctx.config.credentials;
   validateCredentials(creds);
   const prefix = normalizePrefix(ctx.config.path);
   const host = buildBlobHost(creds.accountName);
-  const blobPath = `/${creds.containerName}/${uriEncodePath(prefix + backupId)}`;
+
+  const allBlobs = await listAllBlobs(creds, host, prefix);
+  const folders = groupBlobsByFolder(allBlobs, prefix);
+
+  const backups = [];
+  let skippedPartial = 0;
+  for (const [folderName, info] of folders.entries()) {
+    const presentSet = new Set(info.present);
+    const missing = BACKUP_FILE_NAMES.filter(n => !presentSet.has(n));
+    if (missing.length > 0) {
+      skippedPartial += 1;
+      ctx.log('warn', 'listBackups: skipping partial backup folder', {
+        backupId: folderName, missing,
+      });
+      continue;
+    }
+    backups.push({
+      id: folderName,
+      modifiedAt: info.manifestLastModified,
+      sizeBytes: info.totalSize,
+    });
+  }
+
+  backups.sort((a, b) => (b.modifiedAt || '').localeCompare(a.modifiedAt || ''));
+  ctx.log('info', 'listBackups completed', {
+    account: creds.accountName, container: creds.containerName,
+    prefix, count: backups.length, skippedPartial,
+  });
+  return { backups };
+}
+
+/**
+ * Fetch one named blob from a v2 backup folder. Constructs the full
+ * blob name as `${prefix}${backupId}/${filename}` and issues a GET.
+ * Manifest-vs-archive size limit selection.
+ */
+async function fetchFile(ctx, backupId, filename) {
+  validateBackupId(backupId);
+  validateFilename(filename);
+  const creds = ctx.config.credentials;
+  validateCredentials(creds);
+  const prefix = normalizePrefix(ctx.config.path);
+  const host = buildBlobHost(creds.accountName);
+  const blobName = `${prefix}${backupId}/${filename}`;
+  const blobPath = `/${creds.containerName}/${uriEncodePath(blobName)}`;
+
+  const isManifestFile = filename === 'manifest.json' || filename === 'manifest.sig';
+  const sizeLimit = isManifestFile ? MAX_MANIFEST_BYTES : MAX_BACKUP_SIZE_BYTES;
+  const timeoutMs = isManifestFile ? REQUEST_TIMEOUT_MS : FETCH_TIMEOUT_MS;
 
   const result = await azureRequest({
     method: 'GET',
@@ -361,57 +478,76 @@ async function fetchBackup(ctx, backupId) {
     accountName: creds.accountName,
     accountKey: creds.accountKey,
     sasToken: creds.sasToken,
-    timeoutMs: FETCH_TIMEOUT_MS,
+    timeoutMs,
+    maxBytes: sizeLimit,
   });
 
-  ctx.log('info', 'fetchBackup completed', { backupId, sizeBytes: result.body.length });
+  ctx.log('info', 'fetchFile completed', {
+    backupId, filename, sizeBytes: result.body.length,
+  });
   return result.body;
 }
 
-async function verifyIntegrity(ctx, backupId, opts = {}) {
-  if (!BACKUP_FILENAME_RE.test(backupId)) {
-    throw new Error(`backupId '${backupId}' is not a valid FireAlive backup filename`);
-  }
+/**
+ * Lightweight structural check: List Blobs with prefix
+ * `${prefix}${backupId}/` enumerates the (up to 4) blobs in the
+ * folder. Returns presence + size summary. NO crypto -- the
+ * orchestrator handles Ed25519 sig + file SHA-256 verification.
+ */
+async function verifyStructure(ctx, backupId) {
+  validateBackupId(backupId);
   const creds = ctx.config.credentials;
   validateCredentials(creds);
   const prefix = normalizePrefix(ctx.config.path);
   const host = buildBlobHost(creds.accountName);
-  const blobPath = `/${creds.containerName}/${uriEncodePath(prefix + backupId)}`;
+  const folderPrefix = `${prefix}${backupId}/`;
 
-  const result = await azureRequest({
-    method: 'GET',
-    host,
-    urlPath: blobPath,
-    queryParams: {},
-    accountName: creds.accountName,
-    accountKey: creds.accountKey,
-    sasToken: creds.sasToken,
-    timeoutMs: FETCH_TIMEOUT_MS,
-  }, /* stream */ true);
+  const allBlobs = await listAllBlobs(creds, host, folderPrefix);
+  const folders = groupBlobsByFolder(allBlobs, prefix);
+  const info = folders.get(backupId);
 
-  const hash = crypto.createHash('sha256');
-  let sizeBytes = 0;
-  await new Promise((resolve, reject) => {
-    result.stream.on('data', (chunk) => {
-      hash.update(chunk);
-      sizeBytes += chunk.length;
-      if (sizeBytes > MAX_BACKUP_SIZE_BYTES) {
-        result.stream.destroy(new Error('blob exceeds MAX_BACKUP_SIZE_BYTES'));
-      }
-    });
-    result.stream.on('end', resolve);
-    result.stream.on('error', reject);
-  });
-  const sha256 = hash.digest('hex');
+  if (!info) {
+    ctx.log('warn', 'verifyStructure: folder has no recognized files', { backupId });
+    return {
+      ok: false,
+      present: [],
+      missing: [...BACKUP_FILE_NAMES],
+      totalSizeBytes: 0,
+    };
+  }
 
-  const out = {
-    ok: !opts.expectedSha256 || (sha256 === opts.expectedSha256),
-    sha256,
-    sizeBytes,
+  const presentSet = new Set(info.present);
+  const missing = BACKUP_FILE_NAMES.filter(n => !presentSet.has(n));
+  const result = {
+    ok: missing.length === 0,
+    present: info.present,
+    missing,
+    totalSizeBytes: info.totalSize,
   };
-  if (opts.expectedSha256) out.expectedSha256 = opts.expectedSha256;
-  ctx.log('info', 'verifyIntegrity completed', { backupId, sha256: sha256.slice(0, 12) + '...', ok: out.ok });
-  return out;
+  ctx.log('info', 'verifyStructure completed', {
+    backupId, ok: result.ok, missingCount: missing.length,
+  });
+  return result;
 }
 
-module.exports = { listBackups, fetchBackup, verifyIntegrity };
+// ── Module exports ────────────────────────────────────────────────────────
+
+module.exports = {
+  listBackups,
+  fetchFile,
+  verifyStructure,
+
+  // Constants exposed for orchestrator + tests
+  BACKUP_FOLDER_RE,
+  BACKUP_FILE_NAMES,
+  MAX_BACKUP_SIZE_BYTES,
+  MAX_MANIFEST_BYTES,
+
+  // Internal helpers exposed for tests only
+  _internal: {
+    signSharedKey, buildBlobHost, validateCredentials,
+    validateBackupId, validateFilename, normalizePrefix,
+    uriEncodePath, parseListBlobsXml, listAllBlobs,
+    groupBlobsByFolder, azureRequest,
+  },
+};

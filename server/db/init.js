@@ -784,9 +784,17 @@ CREATE INDEX IF NOT EXISTS idx_kms_providers_type
 -- client_ip_at_request and client_ip_at_approval are recorded for
 -- forensic value (correlate against VPN logs, etc.); not used for
 -- authorization.
+-- R3d-5: backup_id is now nullable; an approval row targets EITHER a
+-- local backup_id (the R3d-4-pt2 case) OR an external (source_id,
+-- external_backup_id) pair (the R3d-5 external-restore case). The
+-- table-level CHECK constraint enforces local-XOR-external at the
+-- database layer so neither column combination can ever be in an
+-- ambiguous or null/null state.
 CREATE TABLE IF NOT EXISTS restore_approvals (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  backup_id TEXT NOT NULL,
+  backup_id TEXT,
+  source_id TEXT,
+  external_backup_id TEXT,
   requested_by_user_id TEXT NOT NULL,
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   request_reason TEXT,
@@ -807,11 +815,18 @@ CREATE TABLE IF NOT EXISTS restore_approvals (
   consumed_at TEXT,
   chain_request_entry_id INTEGER,
   client_ip_at_request TEXT,
-  client_ip_at_approval TEXT
+  client_ip_at_approval TEXT,
+  CHECK (
+    (backup_id IS NOT NULL AND source_id IS NULL AND external_backup_id IS NULL)
+    OR
+    (backup_id IS NULL AND source_id IS NOT NULL AND external_backup_id IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_backup
   ON restore_approvals(backup_id);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_source
+  ON restore_approvals(source_id, external_backup_id);
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_status
   ON restore_approvals(status);
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
@@ -2535,6 +2550,107 @@ function initDb() {
     ensureMeta('restore_approval_window_hours', '24');
   } catch (metaErr) {
     console.error('restore approval defaults initialization FAILED:', metaErr.message);
+  }
+
+  // ── R3d-5 migration: extend restore_approvals for external restore ───────
+  //
+  // Adds source_id and external_backup_id columns to the existing
+  // restore_approvals table and relaxes backup_id NOT NULL so an
+  // approval row can target either:
+  //   (1) a local backup_id (the R3d-4 part 2 case), or
+  //   (2) an external (source_id, external_backup_id) pair (new in R3d-5
+  //       — approvals for restoring from a remote backup source).
+  //
+  // The new table-level CHECK constraint enforces local-XOR-external at
+  // the database layer; neither both-null nor both-populated rows are
+  // accepted.
+  //
+  // SQLite does not support ALTER TABLE ... DROP NOT NULL, so we rebuild
+  // per the standard pattern used elsewhere in this file (CREATE *_new,
+  // INSERT ... SELECT, DROP, RENAME, recreate indexes). Wrapped in a
+  // transaction with foreign keys briefly disabled. Idempotent — re-
+  // running on an already-migrated database is a no-op because the
+  // source_id column is already present.
+  //
+  // Existing R3d-4-pt2 rows (all of which have backup_id populated and
+  // source_id / external_backup_id NULL) satisfy the new CHECK and are
+  // copied verbatim. No data loss.
+  try {
+    const raCols = db.prepare("PRAGMA table_info(restore_approvals)").all().map(c => c.name);
+    if (raCols.length && !raCols.includes('source_id')) {
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE restore_approvals_new (
+          id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+          backup_id TEXT,
+          source_id TEXT,
+          external_backup_id TEXT,
+          requested_by_user_id TEXT NOT NULL,
+          requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+          request_reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+          approval_mode_at_creation TEXT NOT NULL
+            CHECK (approval_mode_at_creation IN ('strict', 'delayed-self-approval', 'disabled')),
+          approval_window_hours INTEGER NOT NULL,
+          approved_by_user_id TEXT,
+          approved_at TEXT,
+          approval_method TEXT
+            CHECK (approval_method IS NULL OR approval_method IN
+              ('second-person-totp', 'delayed-self-totp', 'disabled-mode-bypass')),
+          denied_by_user_id TEXT,
+          denied_at TEXT,
+          denial_reason TEXT,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          chain_request_entry_id INTEGER,
+          client_ip_at_request TEXT,
+          client_ip_at_approval TEXT,
+          CHECK (
+            (backup_id IS NOT NULL AND source_id IS NULL AND external_backup_id IS NULL)
+            OR
+            (backup_id IS NULL AND source_id IS NOT NULL AND external_backup_id IS NOT NULL)
+          )
+        );
+        INSERT INTO restore_approvals_new (
+          id, backup_id, source_id, external_backup_id,
+          requested_by_user_id, requested_at, request_reason, status,
+          approval_mode_at_creation, approval_window_hours,
+          approved_by_user_id, approved_at, approval_method,
+          denied_by_user_id, denied_at, denial_reason,
+          expires_at, consumed_at, chain_request_entry_id,
+          client_ip_at_request, client_ip_at_approval
+        )
+          SELECT
+            id, backup_id, NULL, NULL,
+            requested_by_user_id, requested_at, request_reason, status,
+            approval_mode_at_creation, approval_window_hours,
+            approved_by_user_id, approved_at, approval_method,
+            denied_by_user_id, denied_at, denial_reason,
+            expires_at, consumed_at, chain_request_entry_id,
+            client_ip_at_request, client_ip_at_approval
+          FROM restore_approvals;
+        DROP TABLE restore_approvals;
+        ALTER TABLE restore_approvals_new RENAME TO restore_approvals;
+        CREATE INDEX IF NOT EXISTS idx_restore_approvals_backup
+          ON restore_approvals(backup_id);
+        CREATE INDEX IF NOT EXISTS idx_restore_approvals_source
+          ON restore_approvals(source_id, external_backup_id);
+        CREATE INDEX IF NOT EXISTS idx_restore_approvals_status
+          ON restore_approvals(status);
+        CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
+          ON restore_approvals(expires_at) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
+          ON restore_approvals(requested_by_user_id);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+      console.log('restore_approvals R3d-5 migration: rebuilt with source_id + external_backup_id columns and XOR check');
+    }
+  } catch (r3d5MigrationErr) {
+    console.error('restore_approvals R3d-5 migration FAILED:', r3d5MigrationErr.message);
+    console.error('The server will start, but external-restore approvals may fail until the migration is investigated.');
   }
 
   console.log('Database initialized at', DB_PATH);

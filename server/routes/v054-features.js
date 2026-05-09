@@ -203,14 +203,7 @@ router.post('/compliance/generate-report', requireAuth, requireRole('manager'), 
   res.json(report);
 });
 
-// ── Client Provisioning Restore/Revert ───────────────────────────────────────
-router.post('/clients/restore', requireAuth, requireRole('manager'), async (req, res) => {
-  const db = getDb();
-  const { clientId, source, path } = req.body;
-  auditLog(req.user?.id, 'CLIENT_RESTORE', `Client ${clientId} restored from ${source}:${path}`);
-  res.json({ success: true, clientId, restoredAt: new Date().toISOString() });
-});
-
+// ── Client Provisioning Revert ───────────────────────────────────────────────
 router.post('/clients/revert', requireAuth, requireRole('manager'), async (req, res) => {
   const db = getDb();
   const { clientId, version } = req.body;

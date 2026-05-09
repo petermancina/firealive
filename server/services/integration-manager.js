@@ -425,13 +425,17 @@ class IntegrationManager {
   async inspectFile(content, fileName, fileType) {
     const startedAt = Date.now();
 
-    // Validate input. inspectFile takes a string (per v1.0.17 contract);
-    // we convert to Buffer at the scanner-call boundary.
-    if (typeof content !== 'string' || content.length === 0) {
+    // Validate input. inspectFile accepts a non-empty string OR Buffer
+    // (R3d-5: Buffer support added for restore scans of binary SQLite
+    // bytes). The 15 scanner modules each preserve Buffer input
+    // unchanged at the scanner-call boundary; string input is
+    // converted to Buffer there.
+    const isBufferContent = Buffer.isBuffer(content);
+    if ((typeof content !== 'string' && !isBufferContent) || content.length === 0) {
       return {
         clean: false,
         skipped: false,
-        threats: ['empty or non-string content rejected before scanner call'],
+        threats: ['empty or invalid-type content rejected before scanner call'],
         scanId: null,
         provider: null,
         scanners: [],
