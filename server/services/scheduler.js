@@ -30,6 +30,78 @@ const schedulerService = {
       }
     }));
 
+    // ── R3d-4 part 2: expire stale restore-approval rows ─────────────────
+    //
+    // Sweeps three classes of expiry per services/restore-approvals.js:
+    //   (1) strict-mode pending past expires_at (= created_at + window)
+    //   (2) delayed-self-approval pending past hard expiry
+    //       (= created_at + 2 * window)
+    //   (3) approved past consumption deadline
+    //       (= approved_at + window)
+    //
+    // Hourly is plenty -- defense-in-depth checks inside approve(),
+    // findUsableForBackup(), and consumeApproval() enforce expiry
+    // independently at the point of use, so the sweeper exists only
+    // to clean up the queue UI's view of stale rows. A bug in the
+    // sweeper does NOT create a security gap; the row is still
+    // unusable at restore time.
+    this.jobs.push(cron.schedule('0 * * * *', () => {
+      try {
+        const { getDb } = require('../db/init');
+        const approvalsSvc = require('./restore-approvals');
+        const { auditLog } = require('../middleware/audit');
+        const db = getDb();
+        const result = approvalsSvc.expirePending(db);
+        const total =
+          result.strict_pending_expired_ids.length +
+          result.delayed_self_hard_expired_ids.length +
+          result.approved_consumption_expired_ids.length;
+        if (total > 0) {
+          logger.info('Restore-approval sweeper marked rows expired', {
+            strict_pending: result.strict_pending_expired_ids.length,
+            delayed_self_hard: result.delayed_self_hard_expired_ids.length,
+            approved_consumption: result.approved_consumption_expired_ids.length,
+          });
+          // One audit event per non-empty class with the IDs in detail.
+          // Splitting by class lets SIEM rules alert on unusual ratios
+          // (e.g. high consumption-deadline expiry could indicate a
+          // workflow problem where admins approve but never consume).
+          if (result.strict_pending_expired_ids.length > 0) {
+            auditLog(
+              null,
+              'RESTORE_APPROVAL_EXPIRED_STRICT_PENDING',
+              `count=${result.strict_pending_expired_ids.length} ` +
+                `ids=${result.strict_pending_expired_ids.join(',')}`,
+              null,
+            );
+          }
+          if (result.delayed_self_hard_expired_ids.length > 0) {
+            auditLog(
+              null,
+              'RESTORE_APPROVAL_EXPIRED_DELAYED_SELF_HARD',
+              `count=${result.delayed_self_hard_expired_ids.length} ` +
+                `ids=${result.delayed_self_hard_expired_ids.join(',')}`,
+              null,
+            );
+          }
+          if (result.approved_consumption_expired_ids.length > 0) {
+            auditLog(
+              null,
+              'RESTORE_APPROVAL_EXPIRED_CONSUMPTION_DEADLINE',
+              `count=${result.approved_consumption_expired_ids.length} ` +
+                `ids=${result.approved_consumption_expired_ids.join(',')}`,
+              null,
+            );
+          }
+        }
+        db.close();
+      } catch (err) {
+        logger.error('Scheduler: restore-approval expiry sweep failed', {
+          error: err.message,
+        });
+      }
+    }));
+
     // ── Scheduled report generation ──────────────────────────────────────
     this.jobs.push(cron.schedule('0 * * * *', () => {
       try {

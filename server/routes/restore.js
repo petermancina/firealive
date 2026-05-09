@@ -11,7 +11,10 @@
 //
 // v1 backups (legacy raw SQLite .db file copies) restore by reading the
 // file at backup.file_path, hashing, and fs.copyFileSync over DB_PATH.
-// This path is unchanged from v1.0.29.
+// The destructive write itself is unchanged from v1.0.29; the approval
+// gate (R3d-4) and the chain RESTORE_REQUEST/RESTORE_COMPLETE entries
+// (R3d-4 part 2 commit 16) are new for v1 too -- legacy backups must
+// not be a back door around two-person approval.
 //
 // v2 backups (encrypted-signed directory layout) restore by:
 //   1. Verifying the Ed25519 signature on manifest.json against the
@@ -30,6 +33,76 @@
 // raw .db file in the backup dir before any destructive write. The
 // pre-restore path returns success with a note that the server must
 // restart to flush in-memory state -- same as v1.0.29.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// APPROVAL GATE (R3d-4 part 2 commit 16)
+//
+// Every POST /execute/:id call is gated by services/restore-approvals.js
+// regardless of backup format. The route reads the operator-configured
+// mode from system_meta via services/restore-approval-policy.js and
+// branches:
+//
+//   strict, delayed-self-approval:
+//     Request body MUST include approval_id. The approval row must be:
+//       - status = 'approved'
+//       - backup_id matches the path :id    (cross-backup reuse blocked)
+//       - requested_by_user_id matches req.user.id
+//                                            (only the original
+//                                             requester can consume)
+//       - within consumption deadline
+//                                            (approved_at + window_hours)
+//     The route appends RESTORE_REQUEST to the chain FIRST (so the
+//     approval row's chain_request_entry_id can reference it), then
+//     calls consumeApproval. consumeApproval re-checks the consumption
+//     deadline as defense-in-depth. If consume fails, the chain entry
+//     is already written (REQUEST without COMPLETE = forensic signature
+//     of an aborted restore -- intended).
+//
+//   disabled:
+//     Route auto-creates an approval row via createApprovalRequest.
+//     The service writes that row with status='approved' and
+//     approval_method='disabled-mode-bypass' (see
+//     services/restore-approvals.js createApprovalRequest disabled-mode
+//     branch). The route then calls consumeApproval on the same id.
+//     Result: a uniform audit trail across all three modes -- every
+//     destructive restore has a corresponding restore_approvals row
+//     with backup_id, requester, method, and chain_request_entry_id.
+//
+// VALIDATION ORDER inside POST /execute/:id:
+//   1. Backup row exists, status='verified'
+//   2. confirmHash matches first 8 hex chars of backup.sha256_hash
+//   3. Format-aware preconditions
+//        v1: file_path exists on disk
+//        v2: all four files on disk + chain integrity precondition
+//            (chainSvc.verifyChainUpToBackup)
+//   4. Approval gate PRE-VALIDATION (cheap reads only; no row mutation)
+//        - In disabled mode, defer creation+consume to step 7
+//        - In strict / delayed-self-approval, read approval row and
+//          enforce backup_id / requester / status checks. Refuses
+//          loudly with stable error codes the MC can surface.
+//   5. v2: read manifest, verify hash + signature + parse + structure,
+//        verify in-manifest archive/wrapped-key hashes
+//   6. Append RESTORE_REQUEST chain entry (BOTH v1 and v2)
+//   7. consumeApproval(db, { id, chain_request_entry_id })
+//        In disabled mode: createApprovalRequest first (auto-approved
+//        row), then consumeApproval same call site.
+//        Failure here = refuse the restore. Chain entry remains
+//        appended; that is the desired forensic property.
+//   8. v1 destructive: fs.copyFileSync(backup.file_path, DB_PATH)
+//      v2 destructive: pre-restore copy + key unwrap + archive extract
+//                      + atomic rename of recovered .db over DB_PATH
+//   9. Append RESTORE_COMPLETE chain entry on RESTORED DB (BOTH v1 + v2)
+//  10. auditLog DATABASE_RESTORED + response with chain provenance
+//
+// SCOPE NOTE
+//   POST /config-revert/:id is NOT gated in this commit. Config
+//   snapshots are non-destructive in the same sense as a DB restore
+//   (revert auto-saves current state first); they don't carry analyst
+//   data; and they're not subject to the same compromise scenarios.
+//   A future commit can extend the gate to config-revert if the
+//   threat model warrants. Commit 15's commit description named
+//   config-snapshot in the gated set; that was an error in the
+//   description and is corrected here.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -44,6 +117,271 @@ const keyWrapSvc = require('../services/backup-key-wrapping');
 const manifestSvc = require('../services/backup-manifest');
 const signingKeysSvc = require('../services/backup-signing-keys');
 const chainSvc = require('../services/backup-chain');
+const approvalsSvc = require('../services/restore-approvals');
+const approvalPolicy = require('../services/restore-approval-policy');
+
+// ── Approval-gate helpers ────────────────────────────────────────────────────
+//
+// Two helpers split the two phases of the gate so the main handler
+// reads as a flat sequence rather than a deeply nested branch:
+//
+//   preValidateApproval(db, { backup, userId, body, mode })
+//     -> { ok: true,  approvalRow }       on success
+//     -> { ok: false, status, body }      on refusal (route returns this)
+//
+//   ApprovalConsumeError                  thrown from consumeApprovalGated
+//     instances carry { httpStatus, body }
+//
+// Both helpers DO NOT close the db; the handler owns connection
+// lifetime to keep the existing v2 transaction structure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Cheap pre-validation for strict/delayed-self-approval modes. Refuses
+ * the restore early with a clear error before any chain or destructive
+ * work. Does NOT mutate state.
+ *
+ * In 'disabled' mode the approval row is auto-created at consume time
+ * (step 7), so this helper short-circuits with ok=true and a sentinel
+ * approvalRow=null which the consume helper recognizes as the disabled-
+ * mode signal.
+ */
+function preValidateApproval(db, { backup, userId, body, mode, ip }) {
+  if (mode === 'disabled') {
+    return { ok: true, approvalRow: null, autoCreate: true };
+  }
+
+  // strict OR delayed-self-approval: client MUST supply approval_id
+  const approvalId = body && typeof body.approval_id === 'string' ? body.approval_id : null;
+  if (!approvalId) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: `approval_id required (mode=${mode})`,
+        mode,
+        code: 'APPROVAL_REQUIRED',
+        hint: 'create a restore approval request first via POST /api/restore-approvals (commit 17), have a second admin approve, then retry POST /execute with { confirmHash, approval_id }',
+      },
+    };
+  }
+
+  const row = approvalsSvc.getApproval(db, approvalId);
+  if (!row) {
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: 'approval not found',
+        approval_id: approvalId,
+        code: approvalsSvc.CODES.APPROVAL_NOT_FOUND,
+      },
+    };
+  }
+
+  // Security: the approval must be for THIS backup. Otherwise an
+  // operator could accumulate approvals on low-value backups and
+  // redirect them to higher-value ones.
+  if (row.backup_id !== backup.id) {
+    auditLog(
+      userId,
+      'RESTORE_APPROVAL_BACKUP_MISMATCH',
+      `approval=${approvalId} approval_backup=${row.backup_id} requested_backup=${backup.id}`,
+      ip,
+    );
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: 'approval is not for this backup',
+        code: 'APPROVAL_BACKUP_MISMATCH',
+        approval_backup_id: row.backup_id,
+        requested_backup_id: backup.id,
+      },
+    };
+  }
+
+  // Security: only the original requester can consume their approval.
+  // A second admin's approve() advances the row to status=approved
+  // but the consume must come from the original requester. This keeps
+  // the consume API-symmetric with the request: whoever created it
+  // is the only one who can spend it.
+  if (row.requested_by_user_id !== userId) {
+    auditLog(
+      userId,
+      'RESTORE_APPROVAL_REQUESTER_MISMATCH',
+      `approval=${approvalId} approval_requester=${row.requested_by_user_id} consuming_user=${userId}`,
+      ip,
+    );
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: 'only the original requester can consume the approval',
+        code: 'APPROVAL_REQUESTER_MISMATCH',
+      },
+    };
+  }
+
+  if (row.status !== 'approved') {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: `approval is in '${row.status}' state, not 'approved'`,
+        current_status: row.status,
+        code: row.status === 'consumed'
+          ? approvalsSvc.CODES.APPROVAL_TERMINAL
+          : approvalsSvc.CODES.APPROVAL_NOT_APPROVED,
+      },
+    };
+  }
+
+  return { ok: true, approvalRow: row, autoCreate: false };
+}
+
+/**
+ * Custom error type so the handler can let bubble-up errors carry
+ * their HTTP status without re-mapping at every call site.
+ */
+class ApprovalConsumeError extends Error {
+  constructor(httpStatus, body) {
+    super(body && body.error ? body.error : 'approval consume failed');
+    this.name = 'ApprovalConsumeError';
+    this.httpStatus = httpStatus;
+    this.body = body;
+  }
+}
+
+/**
+ * Map an ApprovalError code to an HTTP status. Mirrors the conventions
+ * documented in services/restore-approvals.js:
+ *   INVALID_INPUT                          -> 400
+ *   APPROVAL_NOT_FOUND                     -> 404
+ *   APPROVAL_NOT_PENDING                   -> 409
+ *   APPROVAL_NOT_APPROVED                  -> 409
+ *   APPROVAL_TERMINAL                      -> 409
+ *   APPROVAL_CONSUMPTION_DEADLINE_PASSED   -> 409
+ *   CONCURRENT_MUTATION                    -> 409
+ *   APPROVER_SAME_AS_REQUESTER             -> 403
+ *   WINDOW_NOT_ELAPSED                     -> 403
+ *   DISABLED_MODE_NO_MANUAL_APPROVE        -> 409
+ *   TOTP_NOT_VERIFIED                      -> 403
+ */
+function approvalCodeToHttpStatus(code) {
+  switch (code) {
+    case approvalsSvc.CODES.INVALID_INPUT:
+      return 400;
+    case approvalsSvc.CODES.APPROVAL_NOT_FOUND:
+      return 404;
+    case approvalsSvc.CODES.APPROVAL_NOT_PENDING:
+    case approvalsSvc.CODES.APPROVAL_NOT_APPROVED:
+    case approvalsSvc.CODES.APPROVAL_TERMINAL:
+    case approvalsSvc.CODES.APPROVAL_CONSUMPTION_DEADLINE_PASSED:
+    case approvalsSvc.CODES.CONCURRENT_MUTATION:
+    case approvalsSvc.CODES.DISABLED_MODE_NO_MANUAL_APPROVE:
+      return 409;
+    case approvalsSvc.CODES.APPROVER_SAME_AS_REQUESTER:
+    case approvalsSvc.CODES.WINDOW_NOT_ELAPSED:
+    case approvalsSvc.CODES.TOTP_NOT_VERIFIED:
+      return 403;
+    default:
+      return 500;
+  }
+}
+
+/**
+ * Phase-2 of the gate: actually mutate the row to 'consumed'. Called
+ * AFTER the chain RESTORE_REQUEST entry exists so we have its id.
+ *
+ * For 'disabled' mode this also creates the approval row (auto-
+ * approved with method='disabled-mode-bypass') first.
+ *
+ * Throws ApprovalConsumeError with httpStatus + body on failure.
+ * Returns { approvalRow, consumeResult } on success.
+ */
+function consumeApprovalGated(db, {
+  preValidateResult,
+  backup,
+  userId,
+  body,
+  ip,
+  chainRequestEntryId,
+  mode,
+}) {
+  let approvalRow = preValidateResult.approvalRow;
+
+  if (preValidateResult.autoCreate) {
+    // disabled mode: createApprovalRequest yields a row already in
+    // status='approved' with approval_method='disabled-mode-bypass'.
+    try {
+      approvalRow = approvalsSvc.createApprovalRequest(db, {
+        backup_id: backup.id,
+        requested_by_user_id: userId,
+        request_reason: (body && typeof body.reason === 'string')
+          ? body.reason.slice(0, 1024)
+          : 'disabled-mode auto-approval at restore time',
+        client_ip: ip,
+      });
+      auditLog(
+        userId,
+        'RESTORE_APPROVAL_AUTO_APPROVED',
+        `backup=${backup.id} approval=${approvalRow.id} method=disabled-mode-bypass mode=disabled`,
+        ip,
+      );
+    } catch (err) {
+      logger.error('disabled-mode auto-approval create failed', {
+        backupId: backup.id, error: err.message,
+      });
+      const code = (err && err.code) || 'CREATE_APPROVAL_FAILED';
+      throw new ApprovalConsumeError(500, {
+        error: 'failed to record disabled-mode bypass approval',
+        detail: err.message,
+        code,
+      });
+    }
+  }
+
+  // Now consume. Defense-in-depth: the service re-checks consumption
+  // deadline and the row's current status (approved + not consumed).
+  let consumeResult;
+  try {
+    consumeResult = approvalsSvc.consumeApproval(db, {
+      id: approvalRow.id,
+      chain_request_entry_id: chainRequestEntryId,
+    });
+  } catch (err) {
+    if (err instanceof approvalsSvc.ApprovalError) {
+      auditLog(
+        userId,
+        'RESTORE_APPROVAL_CONSUME_FAILED',
+        `backup=${backup.id} approval=${approvalRow.id} code=${err.code} chain_request_entry=${chainRequestEntryId} mode=${mode}`,
+        ip,
+      );
+      throw new ApprovalConsumeError(approvalCodeToHttpStatus(err.code), {
+        error: err.message,
+        code: err.code,
+        detail: err.detail,
+      });
+    }
+    logger.error('approval consume unexpected error', {
+      approvalId: approvalRow.id, error: err.message,
+    });
+    throw new ApprovalConsumeError(500, {
+      error: 'approval consume failed unexpectedly',
+      detail: err.message,
+    });
+  }
+
+  auditLog(
+    userId,
+    'RESTORE_APPROVAL_CONSUMED',
+    `backup=${backup.id} approval=${approvalRow.id} method=${approvalRow.approval_method || consumeResult.approval_method || 'unknown'} chain_request_entry=${chainRequestEntryId} mode=${mode}`,
+    ip,
+  );
+
+  return { approvalRow, consumeResult };
+}
 
 // ── List Restore Points ──────────────────────────────────────────────────────
 router.get('/points', (req, res) => {
@@ -91,14 +429,26 @@ router.get('/points', (req, res) => {
 // Format-aware. v1 reports just whether the .db file is on disk. v2
 // reports per-file presence and (if all files present) the manifest's
 // metadata so the operator can see what they're about to restore.
+//
+// Preview surfaces the configured approval policy (mode + window) so
+// the MC can render the correct UI -- "request approval first" vs
+// "ready to restore" vs "disabled mode" -- without a separate round
+// trip. Preview does NOT itself trigger any approval state changes.
 router.get('/preview/:id', (req, res) => {
   try {
     const db = getDb();
     const backup = db.prepare('SELECT * FROM backups WHERE id = ?').get(req.params.id);
+    const policySnapshot = approvalPolicy.getConfig(db);
     db.close();
 
     if (!backup) return res.status(404).json({ error: 'Backup not found' });
     if (backup.status !== 'verified') return res.status(400).json({ error: 'Backup not verified — cannot restore' });
+
+    const baseApprovalInfo = {
+      mode: policySnapshot.mode,
+      window_hours: policySnapshot.window_hours,
+      approval_required: policySnapshot.mode !== 'disabled',
+    };
 
     if (backup.format_version === 1) {
       const fileExists = fs.existsSync(backup.file_path || '');
@@ -110,6 +460,7 @@ router.get('/preview/:id', (req, res) => {
         sizeMB: backup.size_bytes ? (backup.size_bytes / 1024 / 1024).toFixed(2) : null,
         hash: backup.sha256_hash,
         fileExists,
+        approval: baseApprovalInfo,
         warning: 'Restoring will replace the current database with this backup. This action is irreversible. A pre-restore backup will be created automatically.',
       });
     }
@@ -166,6 +517,7 @@ router.get('/preview/:id', (req, res) => {
         allPresent,
         manifestPreview,
         manifestParseError,
+        approval: baseApprovalInfo,
         warning: 'Restoring will replace the current database with this backup. This action is irreversible. A pre-restore backup will be created automatically. The server must be restarted after restore to ensure all in-memory state reflects the restored database.',
       });
     }
@@ -189,8 +541,33 @@ router.get('/preview/:id', (req, res) => {
 // an emergency recoverability backstop, not a long-term backup;
 // recovery from it is rare and the format-quality concerns that drive
 // v2 don't apply.
+//
+// Approval gate (R3d-4 part 2 commit 16):
+//   - Reads policy mode from system_meta.
+//   - In strict / delayed-self-approval, requires body.approval_id;
+//     pre-validates row (backup match, requester match, status=approved)
+//     before any chain or destructive work.
+//   - In disabled mode, auto-creates an approval row with
+//     method='disabled-mode-bypass' to keep the audit trail uniform.
+//   - Appends RESTORE_REQUEST chain entry, then consumeApproval with
+//     chain_request_entry_id linkage. consumeApproval re-checks
+//     consumption deadline as defense-in-depth.
+//   - Failure of consumeApproval refuses the restore. The chain entry
+//     remains; REQUEST without COMPLETE is the forensic signature of
+//     an aborted/refused restore -- intended behavior.
 router.post('/execute/:id', async (req, res) => {
   const { confirmHash } = req.body;
+
+  // Resolve the acting user up front. The audit middleware tolerates a
+  // null user but the approval gate cannot -- a destructive operation
+  // without a known actor is exactly what the gate exists to prevent.
+  const userId = req.user && typeof req.user.id === 'string' ? req.user.id : null;
+  if (!userId) {
+    return res.status(401).json({
+      error: 'authentication required for restore',
+      code: 'AUTH_REQUIRED',
+    });
+  }
 
   try {
     const db = getDb();
@@ -208,31 +585,158 @@ router.post('/execute/:id', async (req, res) => {
       });
     }
 
-    // ── v1 path ──────────────────────────────────────────────────────────────
+    // ── Approval gate phase 1: pre-validation ────────────────────────────
+    //
+    // Cheap reads only; no row mutation. Refuses early on obvious
+    // failures (no approval_id, wrong backup, wrong requester, not
+    // approved). Disabled-mode short-circuits with autoCreate=true and
+    // defers row creation to phase 2.
+    const policyMode = approvalPolicy.getMode(db);
+    const preValidate = preValidateApproval(db, {
+      backup,
+      userId,
+      body: req.body,
+      mode: policyMode,
+      ip: req.ip,
+    });
+    if (!preValidate.ok) {
+      db.close();
+      return res.status(preValidate.status).json(preValidate.body);
+    }
+
+    // ── v1 path ──────────────────────────────────────────────────────────
     if (backup.format_version === 1) {
       if (!fs.existsSync(backup.file_path)) {
         db.close();
         return res.status(400).json({ error: 'Backup file not found on disk' });
       }
+
+      // Verify v1 integrity BEFORE any destructive work or approval
+      // consume. If the on-disk file has been tampered, fail loud
+      // without spending the approval.
+      const fileBuffer = fs.readFileSync(backup.file_path);
+      const currentHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+      if (currentHash !== backup.sha256_hash) {
+        db.close();
+        return res.status(400).json({ error: 'Backup integrity check failed — file has been modified since verification' });
+      }
+
+      // Append RESTORE_REQUEST chain entry. v1 backups predate the
+      // chain CREATE step, so there's no integrity precondition to
+      // verify (verifyChainUpToBackup would return no_create_entry).
+      // The RESTORE_REQUEST entry is still meaningful: it documents
+      // the destructive intent in the tamper-evident chain regardless
+      // of whether the source backup itself is chain-anchored.
+      let restoreRequestEntry = null;
+      try {
+        const result = chainSvc.appendChainEntry(db, {
+          eventType: 'RESTORE_REQUEST',
+          backupId: backup.id,
+          actorUserId: userId,
+          payload: {
+            restore_initiated_at: new Date().toISOString(),
+            backup_format_version: 1,
+            backup_created_at: backup.created_at,
+          },
+        });
+        restoreRequestEntry = {
+          id: result.id,
+          this_hash: result.thisHash,
+          created_at: result.createdAt,
+        };
+      } catch (chainErr) {
+        db.close();
+        logger.error('chain RESTORE_REQUEST append failed (v1); refusing restore', {
+          backupId: backup.id, error: chainErr.message,
+        });
+        return res.status(500).json({
+          error: 'v1 chain RESTORE_REQUEST append failed; restore refused',
+          detail: chainErr.message,
+          hint: 'Cannot record restore intent in the chain. Refusing destructive operation. Investigate the chain-signing-keys configuration and retry.',
+        });
+      }
+
+      // Approval gate phase 2: consume.
+      let approvalConsumeResult, approvalRowFinal;
+      try {
+        const consumed = consumeApprovalGated(db, {
+          preValidateResult: preValidate,
+          backup,
+          userId,
+          body: req.body,
+          ip: req.ip,
+          chainRequestEntryId: restoreRequestEntry.id,
+          mode: policyMode,
+        });
+        approvalRowFinal = consumed.approvalRow;
+        approvalConsumeResult = consumed.consumeResult;
+      } catch (err) {
+        db.close();
+        if (err instanceof ApprovalConsumeError) {
+          return res.status(err.httpStatus).json(err.body);
+        }
+        throw err;
+      }
+
       db.close();
 
-      // Pre-restore raw copy
+      // Pre-restore raw copy of CURRENT live DB.
       const { DB_PATH } = require('../db/init');
       const preRestorePath = path.join(path.dirname(backup.file_path), `pre-restore-${Date.now()}.db`);
       fs.copyFileSync(DB_PATH, preRestorePath);
 
-      // Verify v1 integrity
-      const fileBuffer = fs.readFileSync(backup.file_path);
-      const currentHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-      if (currentHash !== backup.sha256_hash) {
-        return res.status(400).json({ error: 'Backup integrity check failed — file has been modified since verification' });
-      }
-
-      // Restore
+      // Destructive write.
       fs.copyFileSync(backup.file_path, DB_PATH);
 
-      auditLog(req.user.id, 'DATABASE_RESTORED', `backup=${backup.id} format=v1 from=${backup.created_at} pre-restore=${path.basename(preRestorePath)}`, req.ip);
-      logger.warn('DATABASE RESTORED (v1)', { backupId: backup.id, from: backup.created_at });
+      // Append RESTORE_COMPLETE on the restored chain. Same degraded-
+      // mode semantics as the v2 path: append failure is logged but
+      // the restore is reported successful.
+      let restoreCompleteEntry = null;
+      let restoreCompleteError = null;
+      try {
+        const newDb = getDb();
+        try {
+          const result = chainSvc.appendChainEntry(newDb, {
+            eventType: 'RESTORE_COMPLETE',
+            backupId: backup.id,
+            actorUserId: userId,
+            payload: {
+              restore_completed_at: new Date().toISOString(),
+              backup_format_version: 1,
+              pre_restore_filename: path.basename(preRestorePath),
+              backup_created_at: backup.created_at,
+              source_chain_request_entry_id: restoreRequestEntry.id,
+              source_chain_request_this_hash: restoreRequestEntry.this_hash,
+              approval_id: approvalRowFinal.id,
+              approval_method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || 'unknown',
+            },
+          });
+          restoreCompleteEntry = {
+            id: result.id,
+            this_hash: result.thisHash,
+            created_at: result.createdAt,
+          };
+        } finally {
+          newDb.close();
+        }
+      } catch (chainErr) {
+        restoreCompleteError = chainErr.message;
+        logger.error(
+          'chain RESTORE_COMPLETE append failed (v1; restore itself succeeded). ' +
+          'Audit log preserves the event but the restored chain is missing the head annotation.',
+          { backupId: backup.id, error: chainErr.message },
+        );
+      }
+
+      auditLog(
+        userId,
+        'DATABASE_RESTORED',
+        `backup=${backup.id} format=v1 from=${backup.created_at} pre-restore=${path.basename(preRestorePath)} approval=${approvalRowFinal.id} method=${approvalRowFinal.approval_method || 'unknown'}`,
+        req.ip,
+      );
+      logger.warn('DATABASE RESTORED (v1)', {
+        backupId: backup.id, from: backup.created_at, approvalId: approvalRowFinal.id,
+      });
 
       return res.json({
         ok: true,
@@ -240,11 +744,22 @@ router.post('/execute/:id', async (req, res) => {
         message: 'Database restored successfully. A pre-restore backup was saved.',
         preRestorePath: path.basename(preRestorePath),
         restoredFrom: backup.created_at,
+        approval: {
+          id: approvalRowFinal.id,
+          method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || null,
+          mode_at_creation: approvalRowFinal.approval_mode_at_creation,
+          consumed_at: approvalConsumeResult.consumed_at,
+        },
+        chain: {
+          request_entry: restoreRequestEntry,
+          complete_entry: restoreCompleteEntry,
+          complete_error: restoreCompleteError,
+        },
         note: 'The server should be restarted to ensure all in-memory state reflects the restored database.',
       });
     }
 
-    // ── v2 path ──────────────────────────────────────────────────────────────
+    // ── v2 path ──────────────────────────────────────────────────────────
     if (backup.format_version === 2) {
       // 1. All four files present
       const filePaths = {
@@ -291,7 +806,7 @@ router.post('/execute/:id', async (req, res) => {
       if (!chainCheck.ok) {
         db.close();
         auditLog(
-          req.user?.id,
+          userId,
           'RESTORE_REFUSED_CHAIN_BROKEN',
           `backup=${backup.id} reason=${chainCheck.reason} brokenAtId=${chainCheck.brokenAtId || 'none'}`,
           req.ip,
@@ -390,7 +905,7 @@ router.post('/execute/:id', async (req, res) => {
         const result = chainSvc.appendChainEntry(db, {
           eventType: 'RESTORE_REQUEST',
           backupId: backup.id,
-          actorUserId: req.user?.id || null,
+          actorUserId: userId,
           payload: {
             restore_initiated_at: new Date().toISOString(),
             backup_signing_key_id: backup.signing_key_id,
@@ -414,6 +929,34 @@ router.post('/execute/:id', async (req, res) => {
           detail: chainErr.message,
           hint: 'Cannot record restore intent in the chain. Restoring without recording intent would create an unauditable destructive operation. Investigate the chain-signing-keys configuration and retry.',
         });
+      }
+
+      // 7c. Approval gate phase 2: consume.
+      //
+      //     The chain RESTORE_REQUEST entry is now committed; consume
+      //     references its id. If consume fails (deadline expired,
+      //     concurrent mutation, etc.), refuse the restore. The
+      //     chain entry remains -- REQUEST without COMPLETE is the
+      //     forensic signature of an aborted restore.
+      let approvalConsumeResult, approvalRowFinal;
+      try {
+        const consumed = consumeApprovalGated(db, {
+          preValidateResult: preValidate,
+          backup,
+          userId,
+          body: req.body,
+          ip: req.ip,
+          chainRequestEntryId: restoreRequestEntry.id,
+          mode: policyMode,
+        });
+        approvalRowFinal = consumed.approvalRow;
+        approvalConsumeResult = consumed.consumeResult;
+      } catch (err) {
+        db.close();
+        if (err instanceof ApprovalConsumeError) {
+          return res.status(err.httpStatus).json(err.body);
+        }
+        throw err;
       }
 
       db.close();
@@ -488,9 +1031,13 @@ router.post('/execute/:id', async (req, res) => {
       //     restored DB's chain sees a RESTORE_COMPLETE entry at
       //     the head documenting that this database was restored
       //     from the named backup at the recorded time. The OLD
-      //     chain (which had the RESTORE_REQUEST) has been
-      //     overwritten -- but the audit log (separate table)
-      //     preserves the REQUEST record.
+      //     chain (which had the RESTORE_REQUEST and the consumed
+      //     approval row) has been overwritten -- but the audit
+      //     log (separate table, also overwritten) preserved the
+      //     REQUEST + CONSUME records up to the moment of the
+      //     atomic rename, and the pre-restore.db preserves the
+      //     full pre-restore state including the consumed approval
+      //     row for forensic reconstruction.
       //
       //     Failure to append RESTORE_COMPLETE is DEGRADED-MODE.
       //     The restore has succeeded; the live DB is the restored
@@ -505,7 +1052,7 @@ router.post('/execute/:id', async (req, res) => {
           const result = chainSvc.appendChainEntry(newDb, {
             eventType: 'RESTORE_COMPLETE',
             backupId: backup.id,
-            actorUserId: req.user?.id || null,
+            actorUserId: userId,
             payload: {
               restore_completed_at: new Date().toISOString(),
               restored_db_size_bytes: extracted.payload.length,
@@ -514,6 +1061,8 @@ router.post('/execute/:id', async (req, res) => {
               backup_created_at: backup.created_at,
               source_chain_request_entry_id: restoreRequestEntry ? restoreRequestEntry.id : null,
               source_chain_request_this_hash: restoreRequestEntry ? restoreRequestEntry.this_hash : null,
+              approval_id: approvalRowFinal.id,
+              approval_method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || 'unknown',
             },
           });
           restoreCompleteEntry = {
@@ -535,9 +1084,9 @@ router.post('/execute/:id', async (req, res) => {
       }
 
       auditLog(
-        req.user.id,
+        userId,
         'DATABASE_RESTORED',
-        `backup=${backup.id} format=v2 from=${backup.created_at} signing_key_id=${backup.signing_key_id} pre-restore=${path.basename(preRestorePath)} manifest_fuse_counter=${manifest.source_db.fuse_counter_at_creation}`,
+        `backup=${backup.id} format=v2 from=${backup.created_at} signing_key_id=${backup.signing_key_id} pre-restore=${path.basename(preRestorePath)} manifest_fuse_counter=${manifest.source_db.fuse_counter_at_creation} approval=${approvalRowFinal.id} method=${approvalRowFinal.approval_method || 'unknown'}`,
         req.ip,
       );
       logger.warn('DATABASE RESTORED (v2)', {
@@ -545,6 +1094,7 @@ router.post('/execute/:id', async (req, res) => {
         from: backup.created_at,
         signingKeyId: backup.signing_key_id,
         manifestFuseCounter: manifest.source_db.fuse_counter_at_creation,
+        approvalId: approvalRowFinal.id,
       });
 
       return res.json({
@@ -555,6 +1105,12 @@ router.post('/execute/:id', async (req, res) => {
         restoredFrom: backup.created_at,
         manifestFuseCounter: manifest.source_db.fuse_counter_at_creation,
         sizeBytes: extracted.payload.length,
+        approval: {
+          id: approvalRowFinal.id,
+          method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || null,
+          mode_at_creation: approvalRowFinal.approval_mode_at_creation,
+          consumed_at: approvalConsumeResult.consumed_at,
+        },
         chain: {
           request_entry: restoreRequestEntry,        // in old (overwritten) chain
           complete_entry: restoreCompleteEntry,      // in new (restored) chain
@@ -576,6 +1132,8 @@ router.post('/execute/:id', async (req, res) => {
 //
 // Unchanged from v1.0.29. Config snapshots are orthogonal to backup
 // format and stay the same shape across the v1 -> v2 transition.
+// The R3d-4 approval gate is NOT applied here; see scope note in the
+// file header.
 router.get('/configs', (req, res) => {
   try {
     const db = getDb();
