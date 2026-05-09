@@ -15,6 +15,59 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **📘 New: See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It's also the reference behind the in-app Help articles in the MC, AC, and GD.
 
+---
+
+## Installation
+
+> **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
+
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.30) under Tags.
+
+See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
+
+### Quick Start (Development)
+```bash
+git clone https://github.com/pmancina/firealive.git
+cd firealive && npm install
+node server/index.js                    # Regional Server on :3000
+cd packages/global-dashboard-server && node index.js  # GD Server on :4001
+cd packages/analyst-client && npm start  # AC Electron app
+cd frontend && npm start                 # MC Electron app
+cd packages/global-dashboard && npm start # GD Electron app
+```
+
+### Environment Variables (Optional Features)
+
+Some FireAlive features require a deployment-time environment variable to enable. These are intentionally **not set by default** — opt in only when you're ready and have considered the security implications.
+
+| Env Var | Purpose | Required For |
+|---------|---------|--------------|
+| `GD_ALLOWED_HOSTS` | Comma-separated allow-list of GD-Server hostnames the MC may push to. Hostname-only (no port). Case-insensitive exact match — no wildcards, no subdomain semantics. | Global Dashboard push pipeline |
+
+Example:
+```bash
+GD_ALLOWED_HOSTS=gd-prod.corp.local,gd-staging.corp.local
+```
+
+The **Global Dashboard push feature is disabled by default.** If `GD_ALLOWED_HOSTS` is unset or empty, the MC will reject any URL passed to `PUT /api/gd-config` and the recurring push service will refuse to send. This is the primary SSRF defense — the URL the MC sends to is restricted to a pre-approved set chosen at deployment time, not freely entered by an admin in the UI. See **Security.md** for the full threat model.
+
+To enable GD push:
+
+1. Set `GD_ALLOWED_HOSTS` on the MC server (env var, systemd unit, container env, etc.) and restart the MC process.
+2. In the MC UI, open the Global Dashboard tab and configure the URL + API key. The URL's hostname must be in the allow-list.
+3. Click Save (with Enabled left off).
+4. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
+5. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
+
+### Building Installers
+```bash
+cd packages/analyst-client && npm run build:mac   # .dmg
+cd frontend && npm run build:win                   # .exe
+cd packages/global-dashboard && npm run build:linux # .AppImage
+```
+
+---
+
 ## Architecture
 
 Five components:
@@ -79,57 +132,6 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 **IR Simulator API (/api/ooda, 15 endpoints):** OODA-loop incident response training generator. Team leads upload IR policies, playbooks, and after-action reports; the system generates choose-your-own-adventure decision-tree training scenarios calibrated to a chosen scenario type (8 categories: ransomware, phishing, data exfil, insider threat, APT, DDoS, supply chain, credential compromise) and difficulty (beginner / intermediate / advanced). Analysts work through the scenarios node-by-node, getting explanations on each correct or incorrect choice. Backed by `server/services/ooda-scenario-generator.js` (orchestration), `server/services/ir-policy-parser.js` (rule-based extraction of detection signals, decision points, escalation paths, roles, containment actions, and communications obligations from uploaded policy text), `server/services/ooda-generation-jobs.js` (background worker for async batched generation; bounded in-process concurrency with crash recovery and per-scenario persistence), and the AI Provider dispatcher (the LLM call). The scenario generator validates every model output structurally — node count bounds, OODA-phase progression, exactly-one-correct-choice per decision node, all `nextNodeId` references resolve to real nodes, exactly one resolution node — and rejects malformed responses rather than persisting a broken scenario. Per-policy replenishment configuration drives auto-generation: threshold mode auto-refills when an analyst's unplayed pool drops below a configured floor, scheduled mode generates batches at fixed times, manual mode disables auto-generation. Per-analyst progress tracked in the canonical `ooda_progress` table; aggregated training metrics (completion rate by scenario type, by difficulty, recent activity feed) available via `GET /api/ooda/mastery` (analyst-only access).
 
 **Upload security (defense in depth, applies to /api/ooda/policies and /api/ooda/aar):** Two scan layers run on every uploaded policy and after-action report before any database write. Layer 1 (`server/services/content-sanitizer.js`) is a deterministic FireAlive-specific scanner — it catches threats that originate from how FireAlive uses the uploaded content, particularly LLM prompt injection (instruction-override patterns, role-switching jailbreaks, chat-template token injection, output-shape hijacking), embedded executables (shell shebangs, PowerShell IEX, VBA macros, reverse-shell signatures, pipe-to-shell installers, suspicious base64 blobs), and encoding attacks (null bytes, RTL override, zero-width invisibles, Unicode tag-character smuggling). Layer 2 (`server/services/integration-manager.js inspectFile()`) routes through the multi-vendor malware scanner system — 15 supported vendors (ClamAV, VirusTotal, CrowdStrike Falcon Sandbox, Microsoft Defender for Endpoint, SentinelOne, Cisco Secure Endpoint, Fortinet FortiSandbox, Trellix ATD, Sophos Intelix, Joe Sandbox, Hybrid Analysis, Palo Alto WildFire, BlackBerry Cylance, Trend Micro DDAN, Kaspersky Sandbox) — catching novel malware signatures and threat-intel matches that the internal sanitizer cannot stay current on. Both layers fail-closed: either layer's rejection blocks the upload. **IR Simulator uploads (/policies and /aar) require at least one enabled scanner**: if no scanner is configured, layer 2 returns "skipped" and the upload is rejected with HTTP 422 and code MALWARE_SCANNER_REQUIRED. Other upload paths in the codebase may still tolerate skipped EDR; this hard gate is local to the IR Simulator routes because their content becomes LLM context for scenario generation.
-
----
-
-## Installation
-
-> **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
-
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.30) under Tags.
-
-See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
-
-### Quick Start (Development)
-```bash
-git clone https://github.com/pmancina/firealive.git
-cd firealive && npm install
-node server/index.js                    # Regional Server on :3000
-cd packages/global-dashboard-server && node index.js  # GD Server on :4001
-cd packages/analyst-client && npm start  # AC Electron app
-cd frontend && npm start                 # MC Electron app
-cd packages/global-dashboard && npm start # GD Electron app
-```
-
-### Environment Variables (Optional Features)
-
-Some FireAlive features require a deployment-time environment variable to enable. These are intentionally **not set by default** — opt in only when you're ready and have considered the security implications.
-
-| Env Var | Purpose | Required For |
-|---------|---------|--------------|
-| `GD_ALLOWED_HOSTS` | Comma-separated allow-list of GD-Server hostnames the MC may push to. Hostname-only (no port). Case-insensitive exact match — no wildcards, no subdomain semantics. | Global Dashboard push pipeline |
-
-Example:
-```bash
-GD_ALLOWED_HOSTS=gd-prod.corp.local,gd-staging.corp.local
-```
-
-The **Global Dashboard push feature is disabled by default.** If `GD_ALLOWED_HOSTS` is unset or empty, the MC will reject any URL passed to `PUT /api/gd-config` and the recurring push service will refuse to send. This is the primary SSRF defense — the URL the MC sends to is restricted to a pre-approved set chosen at deployment time, not freely entered by an admin in the UI. See **Security.md** for the full threat model.
-
-To enable GD push:
-
-1. Set `GD_ALLOWED_HOSTS` on the MC server (env var, systemd unit, container env, etc.) and restart the MC process.
-2. In the MC UI, open the Global Dashboard tab and configure the URL + API key. The URL's hostname must be in the allow-list.
-3. Click Save (with Enabled left off).
-4. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
-5. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
-
-### Building Installers
-```bash
-cd packages/analyst-client && npm run build:mac   # .dmg
-cd frontend && npm run build:win                   # .exe
-cd packages/global-dashboard && npm run build:linux # .AppImage
-```
 
 ---
 
