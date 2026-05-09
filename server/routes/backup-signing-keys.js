@@ -173,7 +173,7 @@ router.post('/', (req, res) => {
     auditLog(
       req.user.id,
       'BACKUP_SIGNING_KEY_REGISTERED',
-      `id=${result.id} fingerprint=${result.publicKeyFingerprint} label="${(key_label || '').replace(/"/g, '\\"')}"`,
+      `id=${result.id} fingerprint=${result.publicKeyFingerprint} label=${JSON.stringify(key_label || '')}`,
       req.ip,
     );
     res.json({
