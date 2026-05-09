@@ -421,13 +421,20 @@ async function browseSource(db, id, log) {
  *     sourceId, sourceName, externalBackupId,
  *     manifest: <parsed manifest object>,
  *     manifestSigOk: bool,
- *     signingKeyId, signingKeyKnown: bool,
+ *     signingKeyId, signingKeyFingerprint, signingKeyKnown: bool,
  *     structure: { ok, missing[], present[], totalSizeBytes }
  *   }
  *
  * If manifestSigOk is false or signingKeyKnown is false, the routes
  * layer should refuse to allow a restore request even if the operator
  * insists. Both are critical safety properties.
+ *
+ * "Known" means the manifest's signing_key_fingerprint matches a row in
+ * this deployment's backup_signing_keys table that hasn't been revoked.
+ * For a backup created on this deployment, the fingerprint resolves to
+ * our own active key. For a backup created elsewhere, the fingerprint
+ * resolves only if an admin has previously registered the foreign
+ * deployment's public key (POST /api/backup-signing-keys).
  */
 async function previewBackup(db, sourceId, externalBackupId, log) {
   const source = rowOrThrow(db, sourceId);
@@ -482,18 +489,19 @@ async function previewBackup(db, sourceId, externalBackupId, log) {
   }
 
   // 4. Verify Ed25519 signature against public key in
-  //    backup_signing_keys. If the signing key id isn't recognized
-  //    (e.g. the backup was signed by a DIFFERENT FireAlive
-  //    deployment whose public key isn't registered here), report
-  //    that distinct condition rather than collapsing both into
-  //    "sig invalid".
-  const signingKeyId = manifest.chain_signing_key_id || manifest.signing_key_id;
-  const verifyKey = signingKeysSvc.getVerificationKey(db, signingKeyId);
+  //    backup_signing_keys. If the signing key fingerprint isn't
+  //    recognized (e.g. the backup was signed by a DIFFERENT
+  //    FireAlive deployment whose public key isn't registered here),
+  //    report that distinct condition rather than collapsing both
+  //    into "sig invalid".
+  const signingKeyId = manifest.signing_key_id;
+  const signingKeyFingerprint = manifest.signing_key_fingerprint;
+  const verifyKey = signingKeysSvc.getVerificationKeyByFingerprint(db, signingKeyFingerprint);
   let manifestSigOk = false;
   let signingKeyKnown = !!verifyKey;
   if (signingKeyKnown) {
     try {
-      manifestSigOk = signingKeysSvc.verifyManifest(db, manifestBytes, signatureBytes, signingKeyId);
+      manifestSigOk = signingKeysSvc.verifyManifestByFingerprint(db, manifestBytes, signatureBytes, signingKeyFingerprint);
     } catch {
       manifestSigOk = false;
     }
@@ -507,6 +515,7 @@ async function previewBackup(db, sourceId, externalBackupId, log) {
     manifest,
     manifestSigOk,
     signingKeyId,
+    signingKeyFingerprint,
     signingKeyKnown,
     structure,
   };
@@ -672,21 +681,22 @@ async function executeRestore(db, args) {
     throw new ExternalRestoreError(CODES.MANIFEST_INVALID,
       `manifest structurally invalid: ${validation.error}`);
   }
-  const signingKeyId = manifest.chain_signing_key_id || manifest.signing_key_id;
-  if (!signingKeysSvc.getVerificationKey(db, signingKeyId)) {
+  const signingKeyId = manifest.signing_key_id;
+  const signingKeyFingerprint = manifest.signing_key_fingerprint;
+  if (!signingKeysSvc.getVerificationKeyByFingerprint(db, signingKeyFingerprint)) {
     throw new ExternalRestoreError(CODES.SIGNING_KEY_UNKNOWN,
-      `manifest signing_key_id ${signingKeyId} is not in the local backup_signing_keys table; register the public key first`);
+      `manifest signing_key_fingerprint ${signingKeyFingerprint} is not registered in this deployment's backup_signing_keys table (or the registered key has been revoked); for cross-deployment restore, register the originating deployment's public key first via POST /api/backup-signing-keys`);
   }
   let manifestSigOk;
   try {
-    manifestSigOk = signingKeysSvc.verifyManifest(db, manifestBytes, signatureBytes, signingKeyId);
+    manifestSigOk = signingKeysSvc.verifyManifestByFingerprint(db, manifestBytes, signatureBytes, signingKeyFingerprint);
   } catch (err) {
     throw new ExternalRestoreError(CODES.MANIFEST_SIG_MISMATCH,
       `manifest signature verification threw: ${err.message}`);
   }
   if (!manifestSigOk) {
     throw new ExternalRestoreError(CODES.MANIFEST_SIG_MISMATCH,
-      `manifest signature does not verify against signing_key_id ${signingKeyId}`);
+      `manifest signature does not verify against signing_key_fingerprint ${signingKeyFingerprint}`);
   }
 
   // 6. Fetch wrapped-key + archive
@@ -731,6 +741,7 @@ async function executeRestore(db, args) {
         external_backup_id: externalBackupId,
         approval_id: approval.id,
         manifest_signing_key_id: signingKeyId,
+        manifest_signing_key_fingerprint: signingKeyFingerprint,
         restore_initiated_at: new Date().toISOString(),
       },
     });
@@ -906,6 +917,7 @@ async function executeRestore(db, args) {
           external_backup_id: externalBackupId,
           approval_id: approval.id,
           manifest_signing_key_id: signingKeyId,
+          manifest_signing_key_fingerprint: signingKeyFingerprint,
           pre_restore_snapshot_path: preRestorePath,
           source_chain_request_entry_id: restoreRequestChainId,
           restored_at: new Date().toISOString(),

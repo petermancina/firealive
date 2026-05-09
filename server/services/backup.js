@@ -314,6 +314,7 @@ async function performBackup(type = 'on-demand', options = {}) {
       keyWrappingScheme,
       kekReference,
       signingKeyId: signingKey.id,
+      signingKeyFingerprint: signingKey.publicKeyFingerprint,
       sourceFuseCounter,
       sourceSchemaVersion,
     });

@@ -42,7 +42,11 @@
 //   - Non-string object keys (JSON only supports string keys)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const MANIFEST_FORMAT_VERSION = 2;
+// Current manifest format. v2 is unsupported (a 1.0.29-pre-release
+// shape that never reached operators); only v3 manifests created on
+// 1.0.30+ are valid for verification and restore.
+const MANIFEST_FORMAT_VERSION = 3;
+
 const SIGNATURE_FILENAME      = 'manifest.sig';
 const ARCHIVE_FILENAME        = 'archive.tar.zst.enc';
 const WRAPPED_KEY_FILENAME    = 'wrapped-key.bin';
@@ -143,6 +147,19 @@ function parse(manifestBytes) {
  *   signingKeyId        (number, required)  — id of the
  *                                              backup_signing_keys row
  *                                              that signed this manifest
+ *                                              on the originating
+ *                                              deployment. Useful for
+ *                                              same-deployment audit
+ *                                              cross-references; not
+ *                                              meaningful across
+ *                                              deployments (use
+ *                                              fingerprint for that).
+ *   signingKeyFingerprint (string, required) — SHA-256 hex (64 chars)
+ *                                              of the signer's public
+ *                                              key SPKI DER. The v3
+ *                                              cross-deployment universal
+ *                                              key identifier; verifiers
+ *                                              look up keys by this.
  *   sourceFuseCounter   (number, required)  — fuseCounter at creation
  *                                              time; consumed during
  *                                              restore for anti-rollback
@@ -156,7 +173,7 @@ function buildManifest(opts) {
   if (!opts || typeof opts !== 'object') {
     throw new Error('buildManifest: opts object required');
   }
-  for (const required of ['backupId', 'backupType', 'fileHashes', 'signingKeyId', 'sourceFuseCounter']) {
+  for (const required of ['backupId', 'backupType', 'fileHashes', 'signingKeyId', 'signingKeyFingerprint', 'sourceFuseCounter']) {
     if (opts[required] === undefined || opts[required] === null) {
       throw new Error(`buildManifest: opts.${required} required`);
     }
@@ -178,6 +195,9 @@ function buildManifest(opts) {
   }
   if (typeof opts.signingKeyId !== 'number' || !Number.isInteger(opts.signingKeyId) || opts.signingKeyId < 1) {
     throw new Error('buildManifest: signingKeyId must be a positive integer');
+  }
+  if (typeof opts.signingKeyFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(opts.signingKeyFingerprint)) {
+    throw new Error('buildManifest: signingKeyFingerprint must be 64 lowercase hex chars (SHA-256 of SPKI DER)');
   }
   if (typeof opts.sourceFuseCounter !== 'number' || !Number.isInteger(opts.sourceFuseCounter) || opts.sourceFuseCounter < 0) {
     throw new Error('buildManifest: sourceFuseCounter must be a non-negative integer');
@@ -226,6 +246,7 @@ function buildManifest(opts) {
       schema_version: opts.sourceSchemaVersion || '1',
     },
     signing_key_id: opts.signingKeyId,
+    signing_key_fingerprint: opts.signingKeyFingerprint,
   };
 }
 
@@ -254,7 +275,7 @@ function validateStructure(manifest) {
       error: `unsupported manifest format_version: expected ${MANIFEST_FORMAT_VERSION}, got ${manifest.format_version}`,
     };
   }
-  for (const required of ['backup_id', 'backup_type', 'created_at', 'files', 'encryption', 'compression', 'key_wrapping', 'source_db', 'signing_key_id']) {
+  for (const required of ['backup_id', 'backup_type', 'created_at', 'files', 'encryption', 'compression', 'key_wrapping', 'source_db', 'signing_key_id', 'signing_key_fingerprint']) {
     if (manifest[required] === undefined) {
       return { ok: false, error: `missing required field: ${required}` };
     }
@@ -291,6 +312,9 @@ function validateStructure(manifest) {
   }
   if (typeof manifest.signing_key_id !== 'number' || !Number.isInteger(manifest.signing_key_id) || manifest.signing_key_id < 1) {
     return { ok: false, error: 'signing_key_id must be a positive integer' };
+  }
+  if (typeof manifest.signing_key_fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(manifest.signing_key_fingerprint)) {
+    return { ok: false, error: 'signing_key_fingerprint must be 64 lowercase hex chars (SHA-256 of SPKI DER)' };
   }
   if (typeof manifest.source_db.fuse_counter_at_creation !== 'number' || !Number.isInteger(manifest.source_db.fuse_counter_at_creation) || manifest.source_db.fuse_counter_at_creation < 0) {
     return { ok: false, error: 'source_db.fuse_counter_at_creation must be a non-negative integer' };

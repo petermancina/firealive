@@ -411,17 +411,58 @@ CREATE TABLE IF NOT EXISTS backups (
 -- recovers from accidental deactivation.
 CREATE TABLE IF NOT EXISTS backup_signing_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  public_key TEXT NOT NULL,                         -- base64 Ed25519 public key (32 bytes)
-  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
+  public_key_fingerprint TEXT,                      -- SHA-256 hex of SPKI DER bytes (64 chars).
+                                                    -- Universal cross-deployment key identifier
+                                                    -- carried in v3 manifests; service layer
+                                                    -- ensures this is set on every insert.
+                                                    -- NULL only on legacy rows pre-R3d-5-pt2
+                                                    -- where the migration couldn't parse the key.
+  private_key_encrypted TEXT,                       -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}.
+                                                    -- NULL for key_origin='external-registered'
+                                                    -- (we have only the public part of foreign
+                                                    -- deployments' keys).
   is_active INTEGER NOT NULL DEFAULT 0
     CHECK (is_active IN (0, 1)),
+  key_origin TEXT NOT NULL DEFAULT 'local-generated'
+    CHECK (key_origin IN ('local-generated', 'external-registered')),
+  registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                                                    -- who pasted/registered the foreign public
+                                                    -- key (NULL for local-generated rows).
+  registered_at TEXT,                               -- when registered (NULL for local-generated).
+  key_label TEXT,                                   -- operator-friendly description for
+                                                    -- external-registered keys (e.g.
+                                                    -- "prod-east deployment, key from
+                                                    -- 2026-04-15").
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
-  notes TEXT
+                                                    -- OR when an external-registered key
+                                                    -- was revoked.
+  notes TEXT,
+  -- Local-generated keys MUST have a private key (we created it ourselves).
+  -- External-registered keys MUST NOT have a private key (we only have the
+  -- public part of a foreign deployment's keypair), MUST be inactive
+  -- (verification-only, never used for signing), and MUST carry registration
+  -- metadata (who/when, for audit).
+  CHECK (
+    (key_origin = 'local-generated'
+     AND private_key_encrypted IS NOT NULL)
+    OR
+    (key_origin = 'external-registered'
+     AND private_key_encrypted IS NULL
+     AND is_active = 0
+     AND registered_at IS NOT NULL
+     AND registered_by_user_id IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active
   ON backup_signing_keys(is_active) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_fingerprint
+  ON backup_signing_keys(public_key_fingerprint)
+  WHERE public_key_fingerprint IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_origin
+  ON backup_signing_keys(key_origin);
 
 
 -- ── R3d-2: CHAIN SIGNING KEYS ────────────────────────────────────────────
@@ -2651,6 +2692,133 @@ function initDb() {
   } catch (r3d5MigrationErr) {
     console.error('restore_approvals R3d-5 migration FAILED:', r3d5MigrationErr.message);
     console.error('The server will start, but external-restore approvals may fail until the migration is investigated.');
+  }
+
+  // ── R3d-5-pt2 migration: extend backup_signing_keys for cross-
+  //    deployment external restore ─────────────────────────────────
+  //
+  // Adds these columns to backup_signing_keys:
+  //   public_key_fingerprint  - SHA-256 of the SPKI DER bytes; the
+  //                              content-addressed key identifier
+  //                              that travels in v3 manifests so a
+  //                              backup signed by a foreign
+  //                              deployment can be verified against
+  //                              the right registered key on a
+  //                              completely different deployment.
+  //   key_origin              - 'local-generated' (this deployment's
+  //                              own keypair) or 'external-registered'
+  //                              (a foreign deployment's public key
+  //                              we trust for verification only).
+  //   registered_by_user_id   - admin who pasted the foreign key
+  //                              (audit trail for trust establishment).
+  //   registered_at           - when registered.
+  //   key_label               - operator-friendly description
+  //                              (e.g. "prod-east, key from 2026-04-15").
+  //
+  // Relaxes private_key_encrypted to NULL for external-registered
+  // keys; we have only the public part of a foreign keypair. The new
+  // table-level CHECK enforces XOR: local-generated rows MUST have a
+  // private key; external-registered rows MUST NOT, MUST be inactive,
+  // and MUST carry registration metadata.
+  //
+  // Computes public_key_fingerprint for all existing rows during
+  // migration. SQLite can't compute SHA-256 of DER bytes natively,
+  // so we read each row's PEM in JS, re-export to DER, and hash.
+  // Rows whose PEM fails to parse keep fingerprint NULL and surface
+  // a warning -- migration doesn't block on a single corrupt row.
+  //
+  // Idempotent: re-running on an already-migrated database is a
+  // no-op (the column-presence check returns true).
+  try {
+    const bskCols = db.prepare("PRAGMA table_info(backup_signing_keys)").all().map(c => c.name);
+    if (bskCols.length && !bskCols.includes('public_key_fingerprint')) {
+      const existingRows = db.prepare("SELECT * FROM backup_signing_keys").all();
+      const fingerprintById = new Map();
+      for (const row of existingRows) {
+        try {
+          const keyObj = crypto.createPublicKey(row.public_key);
+          const der = keyObj.export({ type: 'spki', format: 'der' });
+          const fp = crypto.createHash('sha256').update(der).digest('hex');
+          fingerprintById.set(row.id, fp);
+        } catch (parseErr) {
+          console.warn(`backup_signing_keys row ${row.id} fingerprint computation skipped during R3d-5-pt2 migration: ${parseErr.message}`);
+          fingerprintById.set(row.id, null);
+        }
+      }
+
+      db.pragma('foreign_keys = OFF');
+      try {
+        const migrate = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE backup_signing_keys_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              public_key TEXT NOT NULL,
+              public_key_fingerprint TEXT,
+              private_key_encrypted TEXT,
+              is_active INTEGER NOT NULL DEFAULT 0
+                CHECK (is_active IN (0, 1)),
+              key_origin TEXT NOT NULL DEFAULT 'local-generated'
+                CHECK (key_origin IN ('local-generated', 'external-registered')),
+              registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+              registered_at TEXT,
+              key_label TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              rotated_out_at TEXT,
+              notes TEXT,
+              CHECK (
+                (key_origin = 'local-generated'
+                 AND private_key_encrypted IS NOT NULL)
+                OR
+                (key_origin = 'external-registered'
+                 AND private_key_encrypted IS NULL
+                 AND is_active = 0
+                 AND registered_at IS NOT NULL
+                 AND registered_by_user_id IS NOT NULL)
+              )
+            );
+          `);
+
+          const insertStmt = db.prepare(`
+            INSERT INTO backup_signing_keys_new
+              (id, public_key, public_key_fingerprint, private_key_encrypted,
+               is_active, key_origin, registered_by_user_id, registered_at,
+               key_label, created_at, rotated_out_at, notes)
+            VALUES (?, ?, ?, ?, ?, 'local-generated', NULL, NULL, NULL, ?, ?, ?)
+          `);
+          for (const row of existingRows) {
+            insertStmt.run(
+              row.id,
+              row.public_key,
+              fingerprintById.get(row.id),
+              row.private_key_encrypted,
+              row.is_active,
+              row.created_at,
+              row.rotated_out_at,
+              row.notes,
+            );
+          }
+
+          db.exec(`
+            DROP TABLE backup_signing_keys;
+            ALTER TABLE backup_signing_keys_new RENAME TO backup_signing_keys;
+            CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active
+              ON backup_signing_keys(is_active) WHERE is_active = 1;
+            CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_fingerprint
+              ON backup_signing_keys(public_key_fingerprint)
+              WHERE public_key_fingerprint IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_origin
+              ON backup_signing_keys(key_origin);
+          `);
+        });
+        migrate();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+      console.log(`backup_signing_keys R3d-5-pt2 migration: rebuilt with public_key_fingerprint, key_origin, and registration columns; backfilled fingerprints for ${existingRows.length} existing row(s)`);
+    }
+  } catch (r3d5pt2MigrationErr) {
+    console.error('backup_signing_keys R3d-5-pt2 migration FAILED:', r3d5pt2MigrationErr.message);
+    console.error('The server will start, but cross-deployment external restore (verifying manifests against external-registered keys) may not work until the migration is investigated.');
   }
 
   console.log('Database initialized at', DB_PATH);

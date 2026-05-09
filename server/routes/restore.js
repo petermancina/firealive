@@ -844,17 +844,14 @@ router.post('/execute/:id', async (req, res) => {
         });
       }
 
-      // 4. Verify Ed25519 signature
-      const sigValid = signingKeysSvc.verifyManifest(db, manifestBytes, signature, backup.signing_key_id);
-      if (!sigValid) {
-        db.close();
-        return res.status(400).json({
-          error: 'v2 manifest signature verification failed',
-          signing_key_id: backup.signing_key_id,
-        });
-      }
-
-      // 5. Parse + validate manifest
+      // 4. Parse + validate manifest. Has to come BEFORE signature
+      //    verification because v3 sigs are looked up by the
+      //    fingerprint embedded in the manifest itself; we must
+      //    parse to extract it. JSON.parse is hardened against
+      //    arbitrary input (no code-exec risk) so trusting the
+      //    parse step before the sig-verify step is safe;
+      //    validateStructure additionally rejects malformed
+      //    manifests before we try to use any field.
       let manifest;
       try {
         manifest = manifestSvc.parse(manifestBytes);
@@ -866,6 +863,28 @@ router.post('/execute/:id', async (req, res) => {
       if (!validation.ok) {
         db.close();
         return res.status(400).json({ error: 'v2 manifest structurally invalid', detail: validation.error });
+      }
+
+      // 5. Verify Ed25519 signature against the public key whose
+      //    fingerprint is embedded in the manifest. Cross-deployment-
+      //    safe path: a backup created here resolves to our own
+      //    active key by fingerprint; a backup created elsewhere
+      //    resolves only if an admin has registered the foreign
+      //    deployment's public key. Local restore is always the
+      //    same-deployment case (operators don't restore foreign
+      //    backups via the local-backup table -- that's what
+      //    external-restore is for) but the verification path is
+      //    the same for consistency and so the audit log carries
+      //    the fingerprint.
+      const signingKeyFingerprint = manifest.signing_key_fingerprint;
+      const sigValid = signingKeysSvc.verifyManifestByFingerprint(db, manifestBytes, signature, signingKeyFingerprint);
+      if (!sigValid) {
+        db.close();
+        return res.status(400).json({
+          error: 'v2 manifest signature verification failed',
+          signing_key_id: backup.signing_key_id,
+          signing_key_fingerprint: signingKeyFingerprint,
+        });
       }
 
       // 6. Verify in-manifest file hashes match actual bytes
@@ -910,6 +929,7 @@ router.post('/execute/:id', async (req, res) => {
           payload: {
             restore_initiated_at: new Date().toISOString(),
             backup_signing_key_id: backup.signing_key_id,
+            backup_signing_key_fingerprint: signingKeyFingerprint,
             backup_created_at: backup.created_at,
             backup_chain_create_entry_id: chainCheck.chainEntryId,
           },
@@ -1142,6 +1162,7 @@ router.post('/execute/:id', async (req, res) => {
               restored_db_size_bytes: extracted.payload.length,
               pre_restore_filename: path.basename(preRestorePath),
               backup_signing_key_id: backup.signing_key_id,
+              backup_signing_key_fingerprint: signingKeyFingerprint,
               backup_created_at: backup.created_at,
               source_chain_request_entry_id: restoreRequestEntry ? restoreRequestEntry.id : null,
               source_chain_request_this_hash: restoreRequestEntry ? restoreRequestEntry.this_hash : null,
@@ -1189,13 +1210,14 @@ router.post('/execute/:id', async (req, res) => {
       auditLog(
         userId,
         'DATABASE_RESTORED',
-        `backup=${backup.id} format=v2 from=${backup.created_at} signing_key_id=${backup.signing_key_id} pre-restore=${path.basename(preRestorePath)} manifest_fuse_counter=${manifest.source_db.fuse_counter_at_creation} approval=${approvalRowFinal.id} method=${approvalRowFinal.approval_method || 'unknown'}`,
+        `backup=${backup.id} format=v2 from=${backup.created_at} signing_key_id=${backup.signing_key_id} signing_key_fingerprint=${signingKeyFingerprint} pre-restore=${path.basename(preRestorePath)} manifest_fuse_counter=${manifest.source_db.fuse_counter_at_creation} approval=${approvalRowFinal.id} method=${approvalRowFinal.approval_method || 'unknown'}`,
         req.ip,
       );
       logger.warn('DATABASE RESTORED (v2)', {
         backupId: backup.id,
         from: backup.created_at,
         signingKeyId: backup.signing_key_id,
+        signingKeyFingerprint,
         manifestFuseCounter: manifest.source_db.fuse_counter_at_creation,
         approvalId: approvalRowFinal.id,
       });
