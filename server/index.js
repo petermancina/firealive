@@ -131,6 +131,7 @@ app.use('/api/auth/password', require('./routes/password'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/restore-approvals', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/restore-approvals'));
 app.use('/api/mfa', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/mfa'));
+app.use('/api/kms-providers', authMiddleware(['admin']), require('./routes/kms-providers'));
 app.use('/api/ai-provider', authMiddleware(['lead', 'admin']), require('./routes/ai-provider'));
 app.use('/api/ooda', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ooda'));
 app.use('/api/iam', authMiddleware(['lead', 'admin']), require('./routes/iam'));
