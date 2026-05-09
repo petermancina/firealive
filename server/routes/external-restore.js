@@ -93,6 +93,8 @@ function externalCodeToHttpStatus(code) {
     case externalSvc.CODES.SIGNING_KEY_UNKNOWN:
     case externalSvc.CODES.FILE_HASH_MISMATCH:
     case externalSvc.CODES.EXTRACT_UNEXPECTED_FILE:
+    case externalSvc.CODES.SCANNER_NOT_CONFIGURED:
+    case externalSvc.CODES.MALWARE_DETECTED:
       return 422;
     case externalSvc.CODES.ADAPTER_FAILED:
     case externalSvc.CODES.KEY_UNWRAP_FAILED:
@@ -100,6 +102,7 @@ function externalCodeToHttpStatus(code) {
     case externalSvc.CODES.CHAIN_APPEND_FAILED:
     case externalSvc.CODES.PRE_RESTORE_SNAPSHOT_FAILED:
     case externalSvc.CODES.ATOMIC_APPLY_FAILED:
+    case externalSvc.CODES.SCAN_FAILED:
       return 500;
     default:
       return 500;
