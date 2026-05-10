@@ -2879,7 +2879,7 @@ function initDb() {
       const setResult = db.prepare(`
         UPDATE users
         SET mfa_enrollment_required = 1
-        WHERE role IN ('admin', 'lead', 'developer', 'analyst')
+        WHERE role IN ('admin', 'lead', 'developer', 'analyst') AND auth_method = 'local'
       `).run();
       console.log(`R3f migration: added users.mfa_enrollment_required and set it for ${setResult.changes} user row(s)`);
     }
@@ -2890,7 +2890,7 @@ function initDb() {
     // here because DEFAULT 1 already covered everyone.
     const r3fPt2Backfill = db.prepare(`
       UPDATE users SET mfa_enrollment_required = 1
-      WHERE mfa_enrollment_required = 0
+      WHERE mfa_enrollment_required = 0 AND auth_method = 'local'
     `).run();
     if (r3fPt2Backfill.changes > 0) {
       console.log(`R3f-pt2 backfill: ${r3fPt2Backfill.changes} previously-carved-out row(s) now require MFA`);
