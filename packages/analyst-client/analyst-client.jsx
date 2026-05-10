@@ -265,9 +265,9 @@ const BURNOUT_PRIMER = [
 // ║  operations scope to req.user.id on the server side -- this component   ║
 // ║  never accepts or sends a user_id parameter.                            ║
 // ║                                                                         ║
-// ║  Analysts are not subject to mfa_enrollment_required by default, so     ║
-// ║  enrollment here is voluntary; once enrolled, the same recovery code    ║
-// ║  surface as in the MC applies.                                          ║
+// ║  Per R3f-pt2 SOC-grade policy, analysts are subject to                  ║
+// ║  mfa_enrollment_required (the original analyst carve-out has been       ║
+// ║  removed). Recovery code surface mirrors the MC version exactly.        ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function MyMfaSecuritySection() {
@@ -505,10 +505,10 @@ function MyMfaSecuritySection() {
       {!enrolled && !inEnrollment && (
         <>
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.tm}>NOT ENROLLED</Badge>
-            <M style={{color:C.tm}}>Optional second factor for your account</M>
+            <Badge color={C.d}>NOT ENROLLED</Badge>
+            <M style={{color:C.tm}}>Enroll to add a second factor to your account</M>
           </div>
-          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment. MFA is voluntary for analyst accounts.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment.</M>
           {error && <div style={{fontSize:11,color:C.d,marginBottom:8}}>{error}</div>}
           <Btn primary style={{width:"100%"}} onClick={startEnroll} disabled={busy}>{busy?"Loading...":"Enroll MFA"}</Btn>
         </>
