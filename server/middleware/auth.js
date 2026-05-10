@@ -17,8 +17,40 @@ function signToken(user) {
   );
 }
 
+/**
+ * Verify and decode an auth JWT.
+ *
+ * MFA BRIDGE JWT ASSERTION
+ *
+ * Rejects any token carrying mfa_pending=true. The MFA-bridge JWT
+ * issued by routes/auth.js POST /login (and consumed by /login-mfa
+ * + /login-enroll-confirm) carries this claim to mark itself as a
+ * partial-login token, valid ONLY at the MFA-step endpoints. A
+ * bridge JWT presented to a protected route -- whether by accident,
+ * misuse, or attack -- is refused here regardless of whether the
+ * signature, exp, and other structural checks pass.
+ *
+ * The error is shaped as a JsonWebTokenError so existing consumers
+ * (authMiddleware below, websocket-server.js, password.js, the /me
+ * + /refresh endpoints in routes/auth.js) handle it via their
+ * existing invalid-token branches without code changes.
+ *
+ * Defense-in-depth: today the auth-JWT payload uses the `id` claim
+ * and the bridge-JWT payload uses `sub`, so a bridge JWT presented
+ * here would fail downstream when consumers read decoded.id and
+ * find undefined. That asymmetry is real but implicit -- if
+ * signToken is ever refactored to use `sub` (the more conventional
+ * JWT field), the implicit protection silently disappears. The
+ * explicit assertion below survives that refactor.
+ */
 function verifyToken(token) {
-  return jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+  const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+  if (decoded && decoded.mfa_pending === true) {
+    const e = new Error('MFA bridge JWT cannot be used for authentication');
+    e.name = 'JsonWebTokenError';
+    throw e;
+  }
+  return decoded;
 }
 
 /**

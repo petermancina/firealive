@@ -43,6 +43,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const speakeasy = require('speakeasy');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { encrypt, decrypt } = require('./encryption');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
@@ -58,17 +60,47 @@ const SECRET_BYTE_LENGTH = 20;      // 160 bits -> 32 base32 chars per RFC 4226 
 const ISSUER_DEFAULT = 'FireAlive';
 const LOCKOUT_NAMESPACE = 'totp:';  // separates TOTP failures from login failures
 
+// ── Recovery code configuration ──────────────────────────────────────────────
+//
+// Recovery codes are single-use 14-char alphanumeric strings (e.g.
+// "K7QM-3RTX-W9HJ") generated when the user completes TOTP enrollment.
+// They are the user's fallback if their authenticator device is lost
+// or unavailable. Codes are bcrypt-hashed at rest -- one-way hashing
+// is strictly stronger than encryption for credential storage, since
+// even compromise of TIER3_ENCRYPTION_KEY still leaves recovery codes
+// unrecoverable.
+//
+// Alphabet: 32 unambiguous chars (no O/0/1/I/L), giving 5 bits per
+// character. 12 alphanumeric chars * 5 bits = 60 bits per code; with
+// bcrypt cost 10 (~100ms per check), brute-force on a single hash
+// requires ~10^15 attempts at 100ms = millennia.
+//
+// Cost 10 matches the refresh-token pattern in routes/auth.js and
+// keeps generation time bounded (~1 second sync on enrollment for
+// 10 codes, acceptable for a one-time operation).
+
+const RECOVERY_CODE_COUNT = 10;
+const RECOVERY_CODE_GROUPS = 3;                                           // X-X-X
+const RECOVERY_CODE_GROUP_LENGTH = 4;                                     // 4 chars per group
+const RECOVERY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';        // 32 unambiguous chars
+const RECOVERY_CODE_BCRYPT_COST = 10;                                     // matches refresh-token storage
+
 // ── Stable error codes (route layer maps to HTTP status) ─────────────────────
 
 const CODES = {
-  INVALID_INPUT:             'INVALID_INPUT',
-  USER_NOT_FOUND:            'USER_NOT_FOUND',
-  ALREADY_ENROLLED:          'ALREADY_ENROLLED',
-  NOT_ENROLLED:              'NOT_ENROLLED',
-  CODE_INVALID:              'CODE_INVALID',
-  CODE_REPLAY:               'CODE_REPLAY',
-  LOCKED_OUT:                'LOCKED_OUT',
-  ENCRYPTION_NOT_CONFIGURED: 'ENCRYPTION_NOT_CONFIGURED',
+  INVALID_INPUT:                'INVALID_INPUT',
+  USER_NOT_FOUND:               'USER_NOT_FOUND',
+  ALREADY_ENROLLED:             'ALREADY_ENROLLED',
+  NOT_ENROLLED:                 'NOT_ENROLLED',
+  CODE_INVALID:                 'CODE_INVALID',
+  CODE_REPLAY:                  'CODE_REPLAY',
+  LOCKED_OUT:                   'LOCKED_OUT',
+  ENCRYPTION_NOT_CONFIGURED:    'ENCRYPTION_NOT_CONFIGURED',
+  // R3f: recovery code error codes
+  RECOVERY_CODE_INVALID:        'RECOVERY_CODE_INVALID',
+  RECOVERY_CODES_EXHAUSTED:     'RECOVERY_CODES_EXHAUSTED',
+  NO_RECOVERY_CODES_GENERATED:  'NO_RECOVERY_CODES_GENERATED',
+  RECOVERY_CODE_RACE:           'RECOVERY_CODE_RACE',
 };
 
 class TotpError extends Error {
@@ -174,9 +206,15 @@ function isInEnrollment(db, userId) {
  * Returns: { secret_base32, otpauth_url }
  *
  * The route MUST only return secret_base32 and otpauth_url to the
- * authenticated user themselves. The secret should never appear in any
- * other response, log, or persistence layer (other than the encrypted
- * users.totp_secret column).
+ * authenticated user themselves. The secret should never appear in
+ * any other response, log, or persistence layer (other than the
+ * encrypted users.totp_secret column).
+ *
+ * QR PNG rendering is intentionally NOT done here -- the qrcode npm
+ * library's PNG renderer is Promise-based, and this service file's
+ * sync contract is preserved. Routes layer (POST /api/mfa/enroll-
+ * start) awaits qrcode.toDataURL(otpauth_url) and merges
+ * qr_png_base64 into the response to the client.
  */
 function enrollStart(db, userId, options = {}) {
   const user = getUser(db, userId);
@@ -223,14 +261,23 @@ function enrollStart(db, userId, options = {}) {
 
 /**
  * Confirm TOTP enrollment by verifying the user's first code from their
- * authenticator app. On success, sets totp_enrolled_at and seeds
+ * authenticator app. On success, sets totp_enrolled_at, seeds
  * totp_last_used_step with the verified step (so this same code can
- * never be replayed for verify()).
+ * never be replayed for verify()), AND generates 10 single-use
+ * recovery codes. The recovery codes are returned to the caller in
+ * plaintext for one-time display to the user; their bcrypt hashes
+ * are persisted in totp_recovery_codes_hashed.
  *
  * Failed enrollment confirmations do NOT count toward the lockout
  * counter -- this is a one-shot operation, the user can simply retry
  * by entering a fresh code, or restart enrollment. Lockout protection
  * applies only to verify().
+ *
+ * Returns: { enrolled_at, recovery_codes }
+ *
+ *   recovery_codes is an array of 10 plaintext strings. The caller
+ *   (route handler) MUST display these to the user once and discard
+ *   them; they are not stored plaintext anywhere on the server.
  */
 function enrollConfirm(db, userId, code, clientIp) {
   if (typeof code !== 'string' || !/^\d{6}$/.test(code)) {
@@ -290,7 +337,14 @@ function enrollConfirm(db, userId, code, clientIp) {
   auditLog(userId, 'TOTP_ENROLL_CONFIRM_OK', `step=${usedStep}`, ip);
   logger.info('TOTP enrollment confirmed', { userId, step: usedStep });
 
-  return { enrolled_at: now };
+  // Generate recovery codes now that enrollment is confirmed. The user
+  // just proved possession of the authenticator via the enrollment
+  // code, so no additional MFA verification is needed for code
+  // generation here. Codes are persisted (bcrypt-hashed) and returned
+  // plaintext for one-time display.
+  const recoveryCodes = generateRecoveryCodes(db, userId, { reason: 'enroll', client_ip: ip });
+
+  return { enrolled_at: now, recovery_codes: recoveryCodes };
 }
 
 /**
@@ -426,6 +480,8 @@ function disable(db, userId, code, clientIp) {
     SET totp_secret = NULL,
         totp_enrolled_at = NULL,
         totp_last_used_step = 0,
+        totp_recovery_codes_hashed = NULL,
+        totp_recovery_codes_remaining = NULL,
         updated_at = datetime('now')
     WHERE id = ?
   `).run(userId);
@@ -434,6 +490,278 @@ function disable(db, userId, code, clientIp) {
   logger.info('TOTP disabled', { userId });
 
   return { disabled_at: now };
+}
+
+// ── Recovery codes ───────────────────────────────────────────────────────────
+//
+// Single-use 14-char alphanumeric codes (e.g. "K7QM-3RTX-W9HJ") that
+// substitute for a TOTP code when the user does not have access to
+// their authenticator. Generated when TOTP enrollment is confirmed,
+// regenerable later via regenerateRecoveryCodes (which requires a
+// fresh TOTP code as proof of possession), one-way bcrypt-hashed at
+// rest, single-use (consumption removes the matched hash from the
+// stored array).
+//
+// Threat model:
+//   - Bcrypt cost 10 + 60-bit code entropy -> brute force is
+//     infeasible (~10^15 attempts at ~100ms each = millennia).
+//   - Lockout namespace shared with TOTP (totp:userId) so attackers
+//     can't probe both factors independently.
+//   - One-way hashing -> compromise of TIER3_ENCRYPTION_KEY does
+//     not expose recovery codes.
+//   - Race-safe consume via CAS on the JSON-array column (the same
+//     pattern as the TOTP step replay-protection update).
+
+function generateRandomRecoveryCode() {
+  // 4-4-4 alphanumeric, 60 bits of entropy total. Each character is
+  // sampled from a 32-char unambiguous alphabet using crypto.randomInt
+  // for cryptographically-secure randomness (Math.random would not be
+  // SOC-grade -- it's not designed for cryptographic use).
+  const groups = [];
+  for (let g = 0; g < RECOVERY_CODE_GROUPS; g++) {
+    let group = '';
+    for (let c = 0; c < RECOVERY_CODE_GROUP_LENGTH; c++) {
+      const idx = crypto.randomInt(0, RECOVERY_CODE_ALPHABET.length);
+      group += RECOVERY_CODE_ALPHABET[idx];
+    }
+    groups.push(group);
+  }
+  return groups.join('-');
+}
+
+/**
+ * Generate a fresh batch of recovery codes for an enrolled user. Used
+ * by enrollConfirm (initial generation) and by regenerateRecoveryCodes
+ * (caller-authorized rotation, which adds the TOTP-verified gate on
+ * top). This function does NOT require any prior MFA verification --
+ * the caller is responsible for ensuring the user is authorized to
+ * generate codes (e.g. they just confirmed enrollment, or they
+ * provided a valid TOTP).
+ *
+ * Replaces any existing codes (the column is overwritten, not
+ * appended). All previously-issued codes for this user are
+ * invalidated.
+ *
+ * Returns an array of plaintext codes for one-time display. The
+ * caller MUST display these to the user once and discard; they are
+ * never stored plaintext.
+ *
+ * Args:
+ *   db        better-sqlite3 instance
+ *   userId    string (required)
+ *   options   { reason?: 'enroll' | 'regenerate', client_ip?: string }
+ */
+function generateRecoveryCodes(db, userId, options = {}) {
+  if (typeof userId !== 'string' || userId === '') {
+    throw new TotpError(CODES.INVALID_INPUT, 'userId is required');
+  }
+  const reason = (options && typeof options.reason === 'string') ? options.reason : 'enroll';
+  const ip = (options && typeof options.client_ip === 'string') ? options.client_ip : null;
+
+  const user = getUser(db, userId);
+  if (!user) throw new TotpError(CODES.USER_NOT_FOUND, `user ${userId} not found`);
+  if (!user.totp_secret || !user.totp_enrolled_at) {
+    throw new TotpError(
+      CODES.NOT_ENROLLED,
+      'recovery codes can only be generated for users with confirmed TOTP enrollment',
+    );
+  }
+
+  const codes = [];
+  const hashes = [];
+  for (let i = 0; i < RECOVERY_CODE_COUNT; i++) {
+    const code = generateRandomRecoveryCode();
+    codes.push(code);
+    hashes.push(bcrypt.hashSync(code, RECOVERY_CODE_BCRYPT_COST));
+  }
+
+  db.prepare(`
+    UPDATE users
+    SET totp_recovery_codes_hashed = ?,
+        totp_recovery_codes_remaining = ?,
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(JSON.stringify(hashes), codes.length, userId);
+
+  const eventType = reason === 'regenerate' ? 'TOTP_RECOVERY_REGENERATED' : 'TOTP_RECOVERY_GENERATED';
+  auditLog(userId, eventType, `count=${codes.length}`, ip);
+  logger.info('TOTP recovery codes generated', { userId, reason, count: codes.length });
+
+  return codes;
+}
+
+/**
+ * Regenerate recovery codes, invalidating all previously-issued ones.
+ * Requires a current valid TOTP code as proof of authenticator
+ * possession -- protects against an attacker with a hijacked session
+ * regenerating the codes (which would lock out the legitimate user
+ * from their own recovery path).
+ *
+ * Returns the new plaintext codes for one-time display.
+ */
+function regenerateRecoveryCodes(db, userId, totpCode, clientIp) {
+  // verify() handles all argument validation, lockout, and replay
+  // protection. We piggyback on it so regenerate cannot be used to
+  // sidestep those.
+  verify(db, userId, totpCode, clientIp);
+  return generateRecoveryCodes(db, userId, { reason: 'regenerate', client_ip: clientIp });
+}
+
+/**
+ * Consume a single recovery code. Used as the fallback authentication
+ * factor when the user does not have access to their TOTP
+ * authenticator. Returns { verified: true, remaining } on success.
+ *
+ * Lockout protection: shares the totp:${userId} bucket with TOTP
+ * verify, so attackers can't probe both factors independently. A
+ * recovery code attempt failure counts against the same brute-force
+ * lockout that protects TOTP.
+ *
+ * Race protection: CAS on the totp_recovery_codes_hashed column. If
+ * another consume call wrote between our read and write, our update
+ * is rejected and we throw RECOVERY_CODE_RACE -- the route handler
+ * surfaces this as a transient 409 to the client, which can retry
+ * with a different code.
+ */
+function consumeRecoveryCode(db, userId, code, clientIp) {
+  if (typeof code !== 'string' || code.length === 0 || code.length > 64) {
+    throw new TotpError(CODES.INVALID_INPUT, 'recovery code must be a non-empty string');
+  }
+  const ip = (typeof clientIp === 'string') ? clientIp : null;
+  const lockId = lockoutId(userId);
+
+  // Lockout shared with TOTP verify. An attacker who's exhausting
+  // recovery codes is also exhausting TOTP attempts; one bucket
+  // covers both attack paths.
+  const lockState = checkLockout(lockId);
+  if (lockState.locked) {
+    auditLog(userId, 'TOTP_RECOVERY_BLOCKED', `locked remaining_ms=${lockState.remainingMs}`, ip);
+    throw new TotpError(
+      CODES.LOCKED_OUT,
+      `MFA temporarily locked due to repeated failures; ` +
+      `try again in ${Math.ceil(lockState.remainingMs / 60000)} minutes`,
+      { remaining_ms: lockState.remainingMs },
+    );
+  }
+
+  const user = getUser(db, userId);
+  if (!user) {
+    // Same rationale as verify(): don't recordFailure for user-not-
+    // found, since this is a route-level misconfiguration rather than
+    // a brute-force signal.
+    throw new TotpError(CODES.USER_NOT_FOUND, `user ${userId} not found`);
+  }
+  if (!user.totp_secret || !user.totp_enrolled_at) {
+    throw new TotpError(CODES.NOT_ENROLLED, 'user has not completed TOTP enrollment');
+  }
+
+  // Re-fetch the recovery code state -- getUser doesn't return these
+  // columns by default since most callers don't need them.
+  const recoveryRow = db.prepare(`
+    SELECT totp_recovery_codes_hashed, totp_recovery_codes_remaining
+    FROM users WHERE id = ?
+  `).get(userId);
+
+  if (!recoveryRow.totp_recovery_codes_hashed) {
+    auditLog(userId, 'TOTP_RECOVERY_FAIL', 'no codes generated', ip);
+    throw new TotpError(
+      CODES.NO_RECOVERY_CODES_GENERATED,
+      'no recovery codes have been generated for this user; use the regenerate endpoint',
+    );
+  }
+
+  let hashes;
+  try {
+    hashes = JSON.parse(recoveryRow.totp_recovery_codes_hashed);
+  } catch (parseErr) {
+    logger.error('Recovery codes JSON parse failed', { userId, error: parseErr.message });
+    throw new TotpError(CODES.NO_RECOVERY_CODES_GENERATED, 'recovery code state is corrupt; regenerate');
+  }
+
+  if (!Array.isArray(hashes) || hashes.length === 0) {
+    auditLog(userId, 'TOTP_RECOVERY_EXHAUSTED', 'all consumed', ip);
+    throw new TotpError(
+      CODES.RECOVERY_CODES_EXHAUSTED,
+      'all recovery codes have been used; regenerate or contact admin',
+    );
+  }
+
+  // Linear bcrypt.compareSync scan. Each compare is ~100ms; up to 10
+  // codes = up to 1 sec on the always-fail path. This is intentional:
+  // forces brute-force attackers to spend ~1 sec per attempt even on
+  // the fail path, while legitimate users with a valid code usually
+  // match within the first few comparisons.
+  let matchIndex = -1;
+  for (let i = 0; i < hashes.length; i++) {
+    if (bcrypt.compareSync(code, hashes[i])) {
+      matchIndex = i;
+      break;
+    }
+  }
+
+  if (matchIndex === -1) {
+    recordFailure(lockId);
+    auditLog(userId, 'TOTP_RECOVERY_FAIL', `remaining=${hashes.length}`, ip);
+    throw new TotpError(CODES.RECOVERY_CODE_INVALID, 'recovery code is invalid');
+  }
+
+  // Build new state with the matched hash removed, then CAS-write.
+  const newHashes = hashes.slice(0, matchIndex).concat(hashes.slice(matchIndex + 1));
+  const newRemaining = newHashes.length;
+  const upd = db.prepare(`
+    UPDATE users
+    SET totp_recovery_codes_hashed = ?,
+        totp_recovery_codes_remaining = ?,
+        updated_at = datetime('now')
+    WHERE id = ?
+      AND totp_recovery_codes_hashed = ?
+  `).run(JSON.stringify(newHashes), newRemaining, userId, recoveryRow.totp_recovery_codes_hashed);
+
+  if (upd.changes !== 1) {
+    // CAS failed: another consume raced us and modified the array
+    // between our read and write. Don't credit the verification --
+    // the caller must retry. Don't recordFailure since the code
+    // itself was valid; the failure was transient state contention.
+    auditLog(userId, 'TOTP_RECOVERY_RACE', `attempted_remaining=${newRemaining}`, ip);
+    throw new TotpError(
+      CODES.RECOVERY_CODE_RACE,
+      'recovery code state changed during consumption; retry with a different code',
+    );
+  }
+
+  clearFailures(lockId);
+  auditLog(userId, 'TOTP_RECOVERY_USED', `remaining=${newRemaining}`, ip);
+  logger.info('Recovery code consumed', { userId, remaining: newRemaining });
+
+  return { verified: true, remaining: newRemaining };
+}
+
+/**
+ * Read-only status of a user's recovery codes. Returns:
+ *   { generated: boolean, remaining: number, total: number }
+ *
+ * generated is true once recovery codes have been generated for the
+ * user (even if all have been consumed). remaining is the count of
+ * unused codes; total is the original batch size (always
+ * RECOVERY_CODE_COUNT for now). UI uses this to show a "low recovery
+ * codes" warning when remaining drops below a threshold.
+ */
+function getRecoveryCodesStatus(db, userId) {
+  if (typeof userId !== 'string' || userId === '') {
+    throw new TotpError(CODES.INVALID_INPUT, 'userId is required');
+  }
+  const row = db.prepare(`
+    SELECT totp_recovery_codes_hashed, totp_recovery_codes_remaining
+    FROM users WHERE id = ?
+  `).get(userId);
+  if (!row) {
+    throw new TotpError(CODES.USER_NOT_FOUND, `user ${userId} not found`);
+  }
+  const generated = !!row.totp_recovery_codes_hashed;
+  const remaining = (typeof row.totp_recovery_codes_remaining === 'number')
+    ? row.totp_recovery_codes_remaining
+    : 0;
+  return { generated, remaining, total: RECOVERY_CODE_COUNT };
 }
 
 // ── Exports ──────────────────────────────────────────────────────────────────
@@ -447,6 +775,12 @@ module.exports = {
   verify,
   disable,
 
+  // Recovery codes (R3f)
+  generateRecoveryCodes,
+  consumeRecoveryCode,
+  regenerateRecoveryCodes,
+  getRecoveryCodesStatus,
+
   // Error class + stable codes
   TotpError,
   CODES,
@@ -456,6 +790,7 @@ module.exports = {
   TOTP_WINDOW,
   TOTP_DIGITS,
   TOTP_ALGORITHM,
+  RECOVERY_CODE_COUNT,
 
   // Internal helpers exposed for tests only -- not stable for production callers
   _internal: {
@@ -463,5 +798,6 @@ module.exports = {
     lockoutId,
     encryptSecret,
     decryptSecret,
+    generateRandomRecoveryCode,
   },
 };

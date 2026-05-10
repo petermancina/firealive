@@ -56,6 +56,22 @@ CREATE TABLE IF NOT EXISTS users (
   totp_secret TEXT,  -- v1.0.30: TOTP shared secret (Tier-3 encrypted base32). NULL = not enrolled.
   totp_enrolled_at TEXT,  -- v1.0.30: timestamp of TOTP enrollment confirmation
   totp_last_used_step INTEGER,  -- v1.0.30: replay protection -- last accepted TOTP time-step counter
+  -- ── R3f (v1.0.31): MFA enforcement + recovery codes ─────────────────────
+  mfa_enrollment_required INTEGER NOT NULL DEFAULT 1
+    CHECK (mfa_enrollment_required IN (0, 1)),  -- 1 = login refuses to issue JWT
+                                                -- when totp_enrolled_at IS NULL.
+                                                -- DEFAULT 1: SOC-grade policy
+                                                -- requires MFA for all roles.
+  totp_recovery_codes_hashed TEXT,              -- JSON array of bcrypt hashes of
+                                                -- single-use 14-char alphanumeric
+                                                -- recovery codes. Generated at
+                                                -- enrollment, displayed once,
+                                                -- never stored plaintext.
+                                                -- Consumption removes the matched
+                                                -- hash from the array.
+  totp_recovery_codes_remaining INTEGER,        -- cached count for UI display so
+                                                -- the JSON array doesn't have to
+                                                -- be parsed for status reads.
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
   last_login TEXT
@@ -2820,6 +2836,118 @@ function initDb() {
     console.error('backup_signing_keys R3d-5-pt2 migration FAILED:', r3d5pt2MigrationErr.message);
     console.error('The server will start, but cross-deployment external restore (verifying manifests against external-registered keys) may not work until the migration is investigated.');
   }
+
+  // ── R3f migration: MFA enforcement + recovery codes ──────────────────
+  //
+  // Adds three columns to users for SOC-grade MFA enforcement at login,
+  // and a new mfa_consumed_jtis table for the two-step login flow:
+  //
+  //   mfa_enrollment_required        Set to 1 for all roles. Login
+  //                                  refuses to issue a JWT when this
+  //                                  is set and totp_enrolled_at IS
+  //                                  NULL.
+  //   totp_recovery_codes_hashed     JSON array of bcrypt hashes of
+  //                                  single-use recovery codes.
+  //   totp_recovery_codes_remaining  Cached count for UI display.
+  //
+  // The two-step login flow uses a short-lived signed JWT (5-minute
+  // TTL, mfa_pending claim) as the bridge token between password
+  // verification and the second factor. The JWT is HMAC-SHA256 signed
+  // with the existing JWT_SECRET; verification at /api/auth/login-mfa
+  // and /api/auth/login-enroll-confirm is by signature check (not by
+  // hash-then-DB-lookup). The mfa_consumed_jtis table is a denylist
+  // of JTIs that have been spent, ensuring single-use semantics: once
+  // a JWT's JTI is in the denylist, that token cannot be replayed
+  // even if the signature still verifies and the exp has not passed.
+  // Rows are pruned by expires_at on a periodic basis.
+  //
+  // This design eliminates the "plaintext credential token hashed for
+  // DB lookup" pattern entirely. There is no plaintext-token sink
+  // flowing into a hash function in the verification path: the bridge
+  // token IS its signature, and verification is signature-validation.
+  // No keyed HMAC of user-supplied input, no indexed-lookup-by-hash,
+  // no input that a static analyzer could mistake for a password
+  // hash. Single-use enforcement happens at INSERT-time on the JTI
+  // denylist with ON CONFLICT DO NOTHING + changes() check; this is
+  // race-safe and replay-safe.
+  //
+  // Idempotent: column-presence checks for each ALTER TABLE; CREATE
+  // TABLE IF NOT EXISTS for the new table; DROP TABLE IF EXISTS for
+  // the legacy mfa_login_sessions table that R3f preview installs
+  // may have created.
+  try {
+    const usersCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+    if (!usersCols.includes('mfa_enrollment_required')) {
+      db.exec(`
+        ALTER TABLE users
+          ADD COLUMN mfa_enrollment_required INTEGER NOT NULL DEFAULT 1
+          CHECK (mfa_enrollment_required IN (0, 1));
+      `);
+      // Set the flag for ALL existing user rows. Per R3f-pt2, MFA is
+      // required for every account (admin, lead, developer, analyst).
+      // SOC-grade environments universally require MFA per NIST SP
+      // 800-63B, SOC 2, PCI-DSS. The original R3f carve-out for the
+      // analyst role was UX deference; SOC security policy wins.
+      const setResult = db.prepare(`
+        UPDATE users
+        SET mfa_enrollment_required = 1
+        WHERE role IN ('admin', 'lead', 'developer', 'analyst')
+      `).run();
+      console.log(`R3f migration: added users.mfa_enrollment_required and set it for ${setResult.changes} user row(s)`);
+    }
+    // R3f-pt2 idempotent backfill: catches databases that ran the
+    // original R3f migration under the analyst-carve-out policy
+    // (analyst rows stuck at value 0). Safe to re-run; only updates
+    // rows that still have the old value. Fresh installs hit no rows
+    // here because DEFAULT 1 already covered everyone.
+    const r3fPt2Backfill = db.prepare(`
+      UPDATE users SET mfa_enrollment_required = 1
+      WHERE mfa_enrollment_required = 0
+    `).run();
+    if (r3fPt2Backfill.changes > 0) {
+      console.log(`R3f-pt2 backfill: ${r3fPt2Backfill.changes} previously-carved-out row(s) now require MFA`);
+    }
+    if (!usersCols.includes('totp_recovery_codes_hashed')) {
+      db.exec(`ALTER TABLE users ADD COLUMN totp_recovery_codes_hashed TEXT;`);
+      console.log('R3f migration: added users.totp_recovery_codes_hashed');
+    }
+    if (!usersCols.includes('totp_recovery_codes_remaining')) {
+      db.exec(`ALTER TABLE users ADD COLUMN totp_recovery_codes_remaining INTEGER;`);
+      console.log('R3f migration: added users.totp_recovery_codes_remaining');
+    }
+  } catch (r3fUsersErr) {
+    console.error('R3f users migration FAILED:', r3fUsersErr.message);
+    console.error('The server will start, but MFA enforcement at login may not work until investigated.');
+  }
+
+  // mfa_consumed_jtis: denylist of MFA-bridge JWT IDs (jti claim) that
+  // have already been spent. Single-use enforcement: when /api/auth/
+  // login-mfa or /api/auth/login-enroll-confirm successfully verifies
+  // an MFA-bridge JWT and is ready to issue the real auth JWT, it
+  // INSERTs the JTI here under ON CONFLICT DO NOTHING; if the row
+  // already existed, that's a replay attempt and the request fails.
+  //
+  // expires_at mirrors the JWT's exp claim (Unix-ms epoch). Once
+  // expires_at < now(), the JWT itself would no longer verify (jwt
+  // library throws TokenExpiredError), so the denylist row no longer
+  // adds value; periodic pruning removes expired rows to keep the
+  // table small.
+  //
+  // The legacy mfa_login_sessions table from R3f preview installs is
+  // dropped here. Production never saw v1.0.31 with that table; only
+  // dev / test environments that ran the preview migrations have it.
+  // DROP IF EXISTS is a no-op on installs that never had it.
+  db.exec(`
+    DROP TABLE IF EXISTS mfa_login_sessions;
+
+    CREATE TABLE IF NOT EXISTS mfa_consumed_jtis (
+      jti TEXT PRIMARY KEY,                    -- JWT ID claim, hex-encoded random bytes
+      consumed_at INTEGER NOT NULL,            -- ms-epoch when single-use was spent
+      expires_at INTEGER NOT NULL              -- ms-epoch == JWT's exp claim * 1000; row prunable after this
+    );
+    CREATE INDEX IF NOT EXISTS idx_mfa_consumed_jtis_expires_at
+      ON mfa_consumed_jtis(expires_at);
+  `);
 
   console.log('Database initialized at', DB_PATH);
   db.close();
