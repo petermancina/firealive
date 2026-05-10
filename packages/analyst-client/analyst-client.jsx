@@ -265,9 +265,12 @@ const BURNOUT_PRIMER = [
 // ║  operations scope to req.user.id on the server side -- this component   ║
 // ║  never accepts or sends a user_id parameter.                            ║
 // ║                                                                         ║
-// ║  Per R3f-pt2 SOC-grade policy, analysts are subject to                  ║
-// ║  mfa_enrollment_required (the original analyst carve-out has been       ║
-// ║  removed). Recovery code surface mirrors the MC version exactly.        ║
+// ║  Per R3f-pt2, analyst accounts ARE subject to mfa_enrollment_required   ║
+// ║  (the analyst carve-out was closed for SOC-grade alignment with NIST    ║
+// ║  800-63B / SOC 2 / PCI-DSS). Enrollment is therefore mandatory at       ║
+// ║  first login if not already done; this component handles the post-      ║
+// ║  enrollment self-service surface (regenerate recovery codes, disable    ║
+// ║  TOTP for re-enrollment, etc.).                                         ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function MyMfaSecuritySection() {
@@ -505,10 +508,10 @@ function MyMfaSecuritySection() {
       {!enrolled && !inEnrollment && (
         <>
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.d}>NOT ENROLLED</Badge>
-            <M style={{color:C.tm}}>Enroll to add a second factor to your account</M>
+            <Badge color={C.tm}>NOT ENROLLED</Badge>
+            <M style={{color:C.tm}}>Optional second factor for your account</M>
           </div>
-          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment. MFA is voluntary for analyst accounts.</M>
           {error && <div style={{fontSize:11,color:C.d,marginBottom:8}}>{error}</div>}
           <Btn primary style={{width:"100%"}} onClick={startEnroll} disabled={busy}>{busy?"Loading...":"Enroll MFA"}</Btn>
         </>
@@ -522,11 +525,25 @@ function MyMfaSecuritySection() {
 // ANALYST CLIENT — Main Application Component
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function AnalystClientApp() {
-  const [stage, setStage] = useState("login"); // login → mfa → welcome → app
+  const [stage, setStage] = useState("login"); // login → welcome → app
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-  const [mfaStep, setMfaStep] = useState(false);
+  // R3g login flow state. loginStage replaces the previous mfaStep boolean
+  // and adds enroll-start / enroll-confirm / recovery-display stages so
+  // analysts subject to mfa_enrollment_required (per R3f-pt2) can enroll
+  // their first authenticator at login time.
+  const [loginStage, setLoginStage] = useState("creds");
+    // creds | mfa | enroll-start | enroll-confirm | recovery-display
+  const [mfaSessionToken, setMfaSessionToken] = useState(null);
+  const [recoveryCodeInput, setRecoveryCodeInput] = useState("");
+  const [useRecoveryLogin, setUseRecoveryLogin] = useState(false);
+  const [enrollData, setEnrollData] = useState(null);
+  const [enrollConfirmCode, setEnrollConfirmCode] = useState("");
+  const [recoveryCodesDisplay, setRecoveryCodesDisplay] = useState(null);
+  const [pendingLoginResponse, setPendingLoginResponse] = useState(null);
+  const [loginInFlight, setLoginInFlight] = useState(false);
+  const [apiMode, setApiMode] = useState(null); // null=probing, true=backend, false=demo
   const [loginError, setLoginError] = useState("");
   const [firstLaunch, setFirstLaunch] = useState(true);
 
@@ -611,6 +628,18 @@ export default function AnalystClientApp() {
       if (r?.version) setAppVersion(r.version);
       if (r?.buildId) setAppBuild(r.buildId);
     }).catch(()=>{});
+  }, []);
+
+  // R3g: probe backend health so the LoginScreen can choose between the
+  // real /api/auth/login flow and the demo-mode simulation. apiMode=true
+  // -> hit the backend, apiMode=false -> simulate the enrolled-MFA path
+  // for offline UI testing. The probe runs once on mount; failure modes
+  // (network down, 5xx, missing endpoint) all collapse to demo mode so
+  // the AC is testable without a server.
+  useEffect(()=>{
+    api.get("/api/system/health").then(r=>{
+      setApiMode(r && r.status === 'healthy');
+    }).catch(()=>setApiMode(false));
   }, []);
 
   // F4d: load OODA scenario list on mount.
@@ -962,34 +991,248 @@ export default function AnalystClientApp() {
     );
   };
 
-  // ── LOGIN SCREEN ──
-  if (stage === "login") return (
-    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
-      <style>{CSS}</style>
-      <div style={{width:380,padding:40,background:C.s,border:"1px solid "+C.b,borderRadius:16}}>
-        <div style={{textAlign:"center",marginBottom:32}}>
-          <div style={{fontSize:28,fontWeight:600,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:4}}>FireAlive</div>
-          <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase"}}>Analyst Login</M>
+  // ── LOGIN SCREEN (R3g: real /api/auth/login + three-path MFA flow) ──
+  if (stage === "login") {
+    // Helper: persist the JWT, set the api token, store the refresh token,
+    // and advance the AC into welcome (first launch) or app (returning user).
+    const finalizeLogin = (loginResponse) => {
+      if (loginResponse && loginResponse.accessToken) {
+        api.setToken(loginResponse.accessToken);
+      }
+      if (loginResponse && loginResponse.refreshToken) {
+        try { localStorage.setItem('fa_ac_refresh_token', loginResponse.refreshToken); } catch (_e) {}
+      }
+      logC("LOGIN_SUCCESS", "Authenticated"+(useRecoveryLogin?" via recovery code":" via TOTP"));
+      setStage(firstLaunch ? "welcome" : "app");
+    };
+
+    const submitCreds = async () => {
+      if (!username || !password) { setLoginError("Enter credentials"); return; }
+      setLoginError("");
+      setLoginInFlight(true);
+
+      // Demo mode: simulate the enrolled-MFA path (the most common case
+      // for testing the UI without a backend). Analysts who want to test
+      // the enrollment flow offline can manually setLoginStage to
+      // 'enroll-start' via React DevTools, or run against a real server.
+      if (apiMode === false) {
+        setTimeout(()=>{ setLoginInFlight(false); setLoginStage("mfa"); }, 600);
+        return;
+      }
+
+      const r = await api.post('/api/auth/login', { username, password });
+      setLoginInFlight(false);
+      if (r && r.error) {
+        setLoginError(typeof r.error === 'string' ? r.error : 'Login failed');
+        return;
+      }
+      // Three-path response handling per R3f
+      if (r && r.mfa_required && r.mfa_session_token) {
+        setMfaSessionToken(r.mfa_session_token);
+        setLoginStage("mfa");
+        return;
+      }
+      if (r && r.mfa_enrollment_required && r.mfa_session_token) {
+        setMfaSessionToken(r.mfa_session_token);
+        setLoginStage("enroll-start");
+        return;
+      }
+      if (r && r.accessToken && r.user) {
+        // Direct JWT issuance -- this path exists for users without
+        // mfa_enrollment_required and without TOTP enrolled. After
+        // R3f-pt2, all standard role-based users have
+        // mfa_enrollment_required=1, so this branch should not fire
+        // for typical analyst accounts. Kept for completeness in case
+        // a future role policy change re-introduces a no-MFA path.
+        finalizeLogin(r);
+        return;
+      }
+      setLoginError("Unexpected login response");
+    };
+
+    const submitMfa = async () => {
+      const code = useRecoveryLogin ? recoveryCodeInput.trim() : mfaCode.trim();
+      if (!useRecoveryLogin && code.length < 6) { setLoginError("Enter 6-digit code"); return; }
+      if (useRecoveryLogin && code.length === 0) { setLoginError("Enter recovery code"); return; }
+      setLoginError("");
+      setLoginInFlight(true);
+
+      if (apiMode === false) {
+        setTimeout(()=>{ setLoginInFlight(false); finalizeLogin({}); }, 500);
+        return;
+      }
+
+      const body = useRecoveryLogin
+        ? { mfa_session_token: mfaSessionToken, recovery_code: code }
+        : { mfa_session_token: mfaSessionToken, totp_code: code };
+      const r = await api.post('/api/auth/login-mfa', body);
+      setLoginInFlight(false);
+      if (r && r.error) {
+        setLoginError(typeof r.error === 'string' ? r.error : 'MFA verification failed');
+        return;
+      }
+      if (r && r.accessToken && r.user) { finalizeLogin(r); return; }
+      setLoginError("Unexpected MFA response");
+    };
+
+    const submitEnrollStart = async () => {
+      setLoginError("");
+      setLoginInFlight(true);
+
+      if (apiMode === false) {
+        // Demo mode: simulate enrollment data
+        setTimeout(()=>{
+          setLoginInFlight(false);
+          setEnrollData({
+            secret_base32: "JBSWY3DPEHPK3PXP",
+            otpauth_url: "otpauth://totp/FireAlive:demo@example.com?secret=JBSWY3DPEHPK3PXP&issuer=FireAlive",
+            qr_png_data_url: null,
+          });
+          setLoginStage("enroll-confirm");
+        }, 500);
+        return;
+      }
+
+      const r = await api.post('/api/auth/login-enroll-start', { mfa_session_token: mfaSessionToken });
+      setLoginInFlight(false);
+      if (r && r.error) {
+        setLoginError(typeof r.error === 'string' ? r.error : 'Failed to start enrollment');
+        return;
+      }
+      if (!r || !r.secret_base32) { setLoginError("Enrollment response was incomplete"); return; }
+      setEnrollData(r);
+      setEnrollConfirmCode("");
+      setLoginStage("enroll-confirm");
+    };
+
+    const submitEnrollConfirm = async () => {
+      if (enrollConfirmCode.length < 6) { setLoginError("Enter 6-digit code"); return; }
+      setLoginError("");
+      setLoginInFlight(true);
+
+      if (apiMode === false) {
+        // Demo mode: simulate enrollment confirm + recovery codes
+        setTimeout(()=>{
+          setLoginInFlight(false);
+          setRecoveryCodesDisplay(["DEMO-AAAA-1111","DEMO-BBBB-2222","DEMO-CCCC-3333","DEMO-DDDD-4444","DEMO-EEEE-5555","DEMO-FFFF-6666","DEMO-GGGG-7777","DEMO-HHHH-8888","DEMO-JJJJ-9999","DEMO-KKKK-0000"]);
+          setPendingLoginResponse({ accessToken: null, refreshToken: null, user: { role: "analyst" } });
+          setEnrollConfirmCode("");
+          setLoginStage("recovery-display");
+        }, 500);
+        return;
+      }
+
+      const r = await api.post('/api/auth/login-enroll-confirm', {
+        mfa_session_token: mfaSessionToken,
+        totp_code: enrollConfirmCode,
+      });
+      setLoginInFlight(false);
+      if (r && r.error) {
+        setLoginError(typeof r.error === 'string' ? r.error : 'Enrollment confirmation failed');
+        return;
+      }
+      if (!r || !r.accessToken || !r.user || !Array.isArray(r.recovery_codes)) {
+        setLoginError("Enrollment response was incomplete");
+        return;
+      }
+      // Hold the JWT response until the user has acknowledged the
+      // recovery codes. finalizeLogin runs from the recovery-display
+      // screen when they click "I've saved my recovery codes".
+      setRecoveryCodesDisplay(r.recovery_codes);
+      setPendingLoginResponse(r);
+      setEnrollConfirmCode("");
+      setLoginStage("recovery-display");
+    };
+
+    const acknowledgeRecoveryCodes = () => {
+      if (pendingLoginResponse) finalizeLogin(pendingLoginResponse);
+    };
+
+    return (
+      <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <style>{CSS}</style>
+        <div style={{width:480,padding:40,background:C.s,border:"1px solid "+C.b,borderRadius:16}}>
+          <div style={{textAlign:"center",marginBottom:32}}>
+            <div style={{fontSize:28,fontWeight:600,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:4}}>FireAlive</div>
+            <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase"}}>Analyst Login</M>
+          </div>
+
+          {loginStage === "creds" && (
+            <div>
+              <Input label="Username" value={username} onChange={function(e){setUsername(e.target.value);}} placeholder="analyst@corp.local" disabled={loginInFlight}/>
+              <Input label="Password" value={password} onChange={function(e){setPassword(e.target.value);}} type="password" placeholder="********" disabled={loginInFlight}/>
+              <button onClick={submitCreds} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Signing in...":"Sign In"}</button>
+            </div>
+          )}
+
+          {loginStage === "mfa" && (
+            <div>
+              <M style={{color:C.tm,display:"block",marginBottom:16}}>{useRecoveryLogin?"Enter one of your single-use recovery codes":"Enter the code from your authenticator app"}</M>
+              {!useRecoveryLogin && (
+                <Input label="MFA Code" value={mfaCode} onChange={function(e){setMfaCode(e.target.value.replace(/\D/g,"").slice(0,6));}} placeholder="123456" maxLength={6} disabled={loginInFlight}/>
+              )}
+              {useRecoveryLogin && (
+                <Input label="Recovery Code" value={recoveryCodeInput} onChange={function(e){setRecoveryCodeInput(e.target.value.toUpperCase().slice(0,32));}} placeholder="ABCD-1234-EFGH" maxLength={32} disabled={loginInFlight}/>
+              )}
+              <button onClick={submitMfa} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Verifying...":"Verify"}</button>
+              <button onClick={function(){setUseRecoveryLogin(!useRecoveryLogin);setLoginError("");setMfaCode("");setRecoveryCodeInput("");}} style={{width:"100%",marginTop:10,padding:8,background:"transparent",border:"none",color:C.tm,fontSize:11,cursor:"pointer",textDecoration:"underline"}}>{useRecoveryLogin?"Use authenticator code instead":"Use a recovery code instead"}</button>
+              <button onClick={function(){setLoginStage("creds");setMfaCode("");setRecoveryCodeInput("");setUseRecoveryLogin(false);setMfaSessionToken(null);setLoginError("");}} style={{width:"100%",marginTop:8,padding:10,background:"transparent",border:"1px solid "+C.b,borderRadius:8,color:C.td,fontSize:11,cursor:"pointer"}}>Back</button>
+            </div>
+          )}
+
+          {loginStage === "enroll-start" && (
+            <div>
+              <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:10}}>MFA Enrollment Required</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>FireAlive requires multi-factor authentication for all accounts. You will scan a QR code into an authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter a verification code.</M>
+              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>You will receive 10 single-use recovery codes after enrollment. Save them in a secure place; they are your only way back into your account if you lose access to your authenticator.</M>
+              <button onClick={submitEnrollStart} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Preparing...":"Begin Enrollment"}</button>
+            </div>
+          )}
+
+          {loginStage === "enroll-confirm" && enrollData && (
+            <div>
+              <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:10}}>Scan QR Code</div>
+              <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Scan with your authenticator app, then enter the 6-digit code it generates.</M>
+              <div style={{background:"#fff",borderRadius:8,padding:12,textAlign:"center",marginBottom:12}}>
+                {enrollData.qr_png_data_url ? (
+                  <img src={enrollData.qr_png_data_url} alt="TOTP QR code" style={{width:200,height:200}}/>
+                ) : (
+                  <div style={{width:200,height:200,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",border:"2px dashed #ccc",borderRadius:8,color:"#666",fontSize:11,padding:8}}>QR rendering unavailable.<br/>Use manual entry below.</div>
+                )}
+              </div>
+              <details style={{marginBottom:12}}>
+                <summary style={{cursor:"pointer",color:C.tm,fontSize:11,marginBottom:8}}>Can't scan? Enter manually</summary>
+                <div style={{padding:10,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:8,marginTop:8}}>
+                  <M style={{color:C.td,display:"block",marginBottom:6}}>Secret (base32):</M>
+                  <code style={{display:"block",color:C.t,fontSize:12,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.secret_base32}</code>
+                  <M style={{color:C.td,display:"block",marginTop:10,marginBottom:6}}>Or paste this URL into a TOTP-aware app:</M>
+                  <code style={{display:"block",color:C.t,fontSize:10,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.otpauth_url}</code>
+                </div>
+              </details>
+              <Input label="6-digit code from authenticator" value={enrollConfirmCode} onChange={function(e){setEnrollConfirmCode(e.target.value.replace(/\D/g,"").slice(0,6));}} placeholder="000000" maxLength={6} disabled={loginInFlight}/>
+              <button onClick={submitEnrollConfirm} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Confirming...":"Confirm Enrollment"}</button>
+            </div>
+          )}
+
+          {loginStage === "recovery-display" && recoveryCodesDisplay && (
+            <div>
+              <div style={{fontSize:14,fontWeight:600,color:C.a,marginBottom:10}}>Save Your Recovery Codes</div>
+              <M style={{color:C.d,display:"block",marginBottom:10,lineHeight:1.6,fontWeight:500}}>These codes will not be shown again. Each can be used once if you lose access to your authenticator.</M>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Print them, store them in a password manager, or write them down. The server cannot recover them.</M>
+              <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:8,padding:14,marginBottom:12,fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:C.t,lineHeight:1.8,userSelect:"all"}}>
+                {recoveryCodesDisplay.map(function(c,i){ return <div key={i}>{c}</div>; })}
+              </div>
+              <button onClick={function(){ try { if (navigator && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(recoveryCodesDisplay.join("\n")); } catch (_e) {} }} style={{width:"100%",marginBottom:8,padding:10,background:"transparent",border:"1px solid "+C.b,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Copy all to clipboard</button>
+              <button onClick={acknowledgeRecoveryCodes} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>I've saved my recovery codes</button>
+            </div>
+          )}
+
+          {loginError && <div style={{marginTop:16,padding:10,background:"rgba(239,68,68,0.08)",border:"1px solid "+C.d+"40",borderRadius:8,color:C.d,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>{loginError}</div>}
+          <M style={{color:C.td,display:"block",textAlign:"center",marginTop:24}}>FireAlive{appVersion?` v${appVersion}`:""} AGPL-3.0</M>
         </div>
-        {!mfaStep ? (
-          <div>
-            <Input label="Username" value={username} onChange={function(e){setUsername(e.target.value);}} placeholder="analyst@corp.local"/>
-            <Input label="Password" value={password} onChange={function(e){setPassword(e.target.value);}} type="password" placeholder="********"/>
-            {loginError && <M style={{color:C.d,display:"block",marginBottom:12}}>{loginError}</M>}
-            <button onClick={function(){if(!username||!password){setLoginError("Enter credentials");return;}setLoginError("");setMfaStep(true);}} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>Sign In</button>
-          </div>
-        ) : (
-          <div>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Enter the code from your authenticator app</M>
-            <Input label="MFA Code" value={mfaCode} onChange={function(e){setMfaCode(e.target.value);}} placeholder="123456" maxLength={6}/>
-            <button onClick={function(){if(mfaCode.length>=6){setStage(firstLaunch?"welcome":"app");logC("LOGIN_SUCCESS","Authenticated with MFA");}else{setLoginError("Enter 6-digit code");}}} style={{width:"100%",padding:12,background:C.ad,border:"1px solid "+C.a+"50",borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>Verify</button>
-            <button onClick={function(){setMfaStep(false);setMfaCode("");}} style={{width:"100%",marginTop:8,padding:10,background:"transparent",border:"1px solid "+C.b,borderRadius:8,color:C.td,fontSize:11,cursor:"pointer"}}>Back</button>
-          </div>
-        )}
-        <M style={{color:C.td,display:"block",textAlign:"center",marginTop:24}}>FireAlive{appVersion?` v${appVersion}`:""} AGPL-3.0</M>
       </div>
-    </div>
-  );
+    );
+  }
 
   // ── WELCOME GUIDE ──
   if (stage === "welcome") return (
@@ -1040,7 +1283,7 @@ export default function AnalystClientApp() {
         </div>
         <div style={{display:"flex",gap:8}}>
           <Btn small onClick={()=>setShowHelp(!showHelp)}>Help</Btn>
-          <Btn small onClick={()=>{setStage("login");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
+          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
         </div>
       </div>
       {breakPrompt&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>
