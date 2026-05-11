@@ -363,6 +363,8 @@ const FRAMEWORKS = {
   lgpd: require('./frameworks/lgpd')(checks),
 
   pipeda: require('./frameworks/pipeda')(checks),
+
+  pdpa_sg: require('./frameworks/pdpa_sg')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
