@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.31 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 24 (anti-rollback)
+**Version:** v1.0.32 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 25 (anti-rollback)
 
 ---
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.31) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.32) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -145,6 +145,15 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 5. First shift: AI Burnout Engine records 8 signal readings → baseline established
 6. After baseline: AI generates real-time drift detection + training recommendations
 7. CISO installs GD → registers regional MCs → sees cross-region health
+
+### Locking Configuration (Required Hardening)
+Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before MFA is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires fresh MFA (TOTP code or single-use recovery code) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
+
+When locked, mutating requests to platform-config routes (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, backup destinations, backup push, audit retention, API keys) return HTTP 423 Locked. Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing) are unaffected, so production incident response is never blocked by the lock.
+
+In smaller SOCs where one person handles both Team Lead and Platform Admin duties, assign the `admin` role to that user; the codebase does not collapse the role boundary, which preserves SoD for orgs that do separate the roles.
+
+Audit events: `CONFIG_LOCK_ENABLED`, `CONFIG_LOCK_DISABLED`, `CONFIG_LOCK_GATE_HIT`, `CONFIG_LOCK_BYPASS_ATTEMPT`.
 
 ### Burnout Prevention Routing
 When active (requires SOAR + Ticketing configured):

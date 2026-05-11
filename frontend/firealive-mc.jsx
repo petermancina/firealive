@@ -1594,6 +1594,19 @@ function ManagementConsole() {
   const [padlocks, setPadlocks] = useState({});
   const isPadlocked = (section) => configLocked && (padlocks[section] !== false);
 
+  // R3e: load Config Lock state from server on mount so the MC reflects
+  // server reality (configLocked starts false in useState but the server
+  // may already be locked from a previous admin session). The MC main app
+  // component only renders after stage transitions to "app", so this
+  // useEffect implicitly fires only post-authentication. Lock state
+  // changes within a single session are picked up by the Lock/Unlock
+  // button's own setConfigLocked call, not by this useEffect.
+  useEffect(() => {
+    api.get('/api/config/lock').then(r => {
+      if (r && !r.error) setConfigLocked(!!r.lock_active);
+    });
+  }, []);
+
   // F5 part 2b: Helper Pay management state. Populated when the Helper Pay
   // tab opens. Pending-queue and catalog operations land via the lead and
   // admin endpoints. The MC user is a manager (lead or admin) — admin-only
@@ -1896,7 +1909,7 @@ function ManagementConsole() {
             <button onClick={()=>setShowSetupWizard(true)} style={{width:"100%",padding:"8px 12px",background:"rgba(110,231,183,0.08)",border:`1px solid ${C.a}30`,borderRadius:8,color:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Setup Wizard</button>
             <button onClick={()=>{setShowWelcome(true);setWelcomeStep(0);}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(96,165,250,0.08)",border:`1px solid ${C.i}30`,borderRadius:8,color:C.i,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Welcome Guide</button>
             <button onClick={()=>setTab("help_mc")} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(167,139,250,0.08)",border:`1px solid ${C.p}30`,borderRadius:8,color:C.p,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Help</button>
-            <button onClick={()=>{const code=window.prompt("Enter MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(code&&code.length>=6){api.post("/api/v1/config/lock",{locked:!configLocked}).then(()=>setConfigLocked(!configLocked));addA(configLocked?"MASTER_UNLOCK":"MASTER_LOCK","All configurations "+(configLocked?"unlocked (MFA verified)":"locked"));}else if(code!==null){window.alert("Invalid MFA code. Configurations remain "+(configLocked?"locked":"unlocked")+".");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":"🔓 Configs Unlocked (MFA to lock)"}</button>
+            <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6){if(code!==null)window.alert("Invalid MFA code. Configurations remain "+(configLocked?"locked":"unlocked")+".");return;}const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);addA(r.lock_active?"MASTER_LOCK":"MASTER_UNLOCK","All configurations "+(r.lock_active?"locked":"unlocked (MFA verified)"));}else{window.alert("Lock toggle failed: "+(r?.error||"unknown error"));addA("MASTER_LOCK_FAIL",r?.error||"unknown");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":"🔓 Configs Unlocked (MFA to lock)"}</button>
           </div>
         </div>
         <div style={{flex:1,overflowY:"auto"}}>

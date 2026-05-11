@@ -2949,6 +2949,88 @@ function initDb() {
       ON mfa_consumed_jtis(expires_at);
   `);
 
+  // R3e schema additions (v1.0.32) -- Config Lock with MFA.
+  //
+  // config_lock_state: SOC-grade gate over all platform-config-modifying
+  // routes (KMS provider switch, GD push config, HR integration creds,
+  // IAM role changes, audit log purges, integration onboarding). When
+  // lock_active=1, those routes refuse with 423 Locked until an admin
+  // unlocks via POST /api/config/lock with a fresh MFA proof (TOTP or
+  // single-use recovery code, per the R3f mfa-stepup middleware factory).
+  //
+  // Design properties:
+  //
+  //   1. SINGLETON. Exactly one row, enforced at the storage layer via
+  //      PRIMARY KEY CHECK (id = 1). Application code never inserts new
+  //      rows; it UPDATEs the singleton or reads it. No race window for
+  //      "which row is authoritative" -- there's only ever one.
+  //
+  //   2. DEFAULT UNLOCKED. Fresh installs seed lock_active=0 so initial
+  //      operator setup (configuring KMS, registering signing keys,
+  //      onboarding the first IAM integration, etc.) is not blocked
+  //      before MFA is even enrolled. Locking is an explicit hardening
+  //      step the operator performs once the platform reaches steady
+  //      state. Documented in setup docs as a "lock once production-
+  //      ready" action.
+  //
+  //   3. MFA REQUIRED IN BOTH DIRECTIONS. Lock and unlock both require
+  //      a fresh TOTP / recovery code via the mfa-stepup middleware.
+  //      Symmetric -- no escape hatch where an attacker with a stolen
+  //      session could lock the legitimate admin out without proving
+  //      possession of the second factor.
+  //
+  //   4. ADMIN ROLE ONLY. POST /api/config/lock authorized for users
+  //      with role='admin'. Lead and below cannot toggle. This matches
+  //      SOC 2 Separation of Duties (SoD) norms: the role that runs
+  //      shifts (lead) is distinct from the role that configures the
+  //      platform (admin). Smaller SOCs where one person wears both
+  //      hats assign the admin role to that user at user-setup time;
+  //      the codebase does not collapse the role boundary.
+  //
+  //   5. AUDIT TRAIL. last_mfa_verified_at records the ms-epoch of the
+  //      most recent successful lock/unlock action. CONFIG_LOCK_ENABLED
+  //      / CONFIG_LOCK_DISABLED / CONFIG_LOCK_GATE_HIT /
+  //      CONFIG_LOCK_BYPASS_ATTEMPT audit events written from the
+  //      route handler + middleware. Forensic reconstructability:
+  //      every lock-state transition is attributable to a user_id +
+  //      timestamp with MFA proof, and every gated-route call while
+  //      locked is logged.
+  //
+  // Columns:
+  //
+  //   id                     Always 1. Singleton enforcement.
+  //   lock_active            0 = unlocked (default), 1 = locked.
+  //                          CHECK constraint pins to {0, 1}.
+  //   locked_by_user_id      The user who most recently set
+  //                          lock_active=1. NULL when unlocked. Set by
+  //                          the route handler on successful lock.
+  //                          ON DELETE SET NULL so user deletion does
+  //                          not cascade into the lock state.
+  //   locked_at              ms-epoch when lock_active flipped to 1.
+  //                          NULL when unlocked. Set/cleared atomically
+  //                          with lock_active.
+  //   last_mfa_verified_at   ms-epoch of the most recent successful
+  //                          lock OR unlock action. NULL on fresh
+  //                          install (no MFA-gated action has occurred
+  //                          yet); set on first POST /api/config/lock
+  //                          success.
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS for fresh installs; INSERT
+  // ... ON CONFLICT DO NOTHING for the singleton seed so server
+  // restarts do not reset lock state.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS config_lock_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      lock_active INTEGER NOT NULL DEFAULT 0 CHECK (lock_active IN (0, 1)),
+      locked_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      locked_at INTEGER,
+      last_mfa_verified_at INTEGER
+    );
+    INSERT INTO config_lock_state (id, lock_active)
+      VALUES (1, 0)
+      ON CONFLICT(id) DO NOTHING;
+  `);
+
   console.log('Database initialized at', DB_PATH);
   db.close();
 }

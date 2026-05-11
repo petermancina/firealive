@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL CISO DASHBOARD v1.0.0 — Read-Only Executive View
+// FIREALIVE GLOBAL CISO DASHBOARD — Read-Only Executive View
 // Login, welcome/setup guide, notifications, query, reports, log integrity
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect } from "react";
@@ -407,6 +407,20 @@ export default function GlobalDashboard() {
   const [regionsLoading, setRegionsLoading] = useState(false);
   const [regionsError, setRegionsError] = useState(null);
 
+  // Load Config Lock state once the user lands in the app stage so the UI
+  // reflects server reality (configLocked starts false in useState but the
+  // server may already be locked from a previous admin session). Re-runs
+  // whenever stage transitions back to "app" (e.g., after Sign Out + Sign
+  // In within the same browser session). Lock state changes within a single
+  // session are picked up by the Lock/Unlock button's own setConfigLocked
+  // call, not by this useEffect.
+  useEffect(() => {
+    if (stage !== "app") return;
+    api.get('/api/config/lock').then(r => {
+      if (r && !r.error) setConfigLocked(!!r.lock_active);
+    });
+  }, [stage]);
+
   // Load regions whenever the user lands in the app stage. Also re-runs on
   // tab switches into "overview" / "regions" / "connections" so a CISO who
   // leaves the dashboard open during an active SOC incident sees the live
@@ -783,7 +797,7 @@ export default function GlobalDashboard() {
       <div style={{display:"flex",minHeight:"calc(100vh - 80px)"}}>
         <div style={{width:200,flexShrink:0,borderRight:`1px solid ${C.b}`,background:C.s,padding:"12px 0"}}>
           {navItems.map(n=><button key={n.id} onClick={()=>setTab(n.id)} style={{width:"100%",padding:"10px 16px",background:tab===n.id?"rgba(110,231,183,0.1)":"transparent",border:"none",borderLeft:tab===n.id?`3px solid ${C.a}`:"3px solid transparent",color:tab===n.id?C.a:C.td,fontSize:11,fontWeight:tab===n.id?600:400,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace",textAlign:"left"}}>{n.label}</button>)}
-          <button onClick={()=>{const code=window.prompt("Enter MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(code&&code.length>=6){api.post("/api/v1/config/lock",{locked:!configLocked}).then(()=>setConfigLocked(!configLocked));}}} style={{width:"100%",marginTop:8,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?"rgba(239,68,68,0.2)":"rgba(110,231,183,0.2)"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"Unlock to Make Changes":"Lock All Configs"}</button>
+          <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6)return;const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);showGdToast(r.lock_active?"Configurations locked":"Configurations unlocked");}else{showGdToast("Lock toggle failed: "+(r?.error||"unknown error"));}}} style={{width:"100%",marginTop:8,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?"rgba(239,68,68,0.2)":"rgba(110,231,183,0.2)"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"Unlock to Make Changes":"Lock All Configs"}</button>
         </div>
         <div style={{flex:1,padding:24,overflowY:"auto",animation:"fadeIn 0.3s ease"}}>
 
