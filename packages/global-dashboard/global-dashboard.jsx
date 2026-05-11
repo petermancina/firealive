@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL CISO DASHBOARD v1.0.0 — Read-Only Executive View
+// FIREALIVE GLOBAL CISO DASHBOARD — Read-Only Executive View
 // Login, welcome/setup guide, notifications, query, reports, log integrity
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect } from "react";
