@@ -357,6 +357,8 @@ const FRAMEWORKS = {
   nis2: require('./frameworks/nis2')(checks),
 
   cps234_au: require('./frameworks/cps234_au')(checks),
+
+  ccpa: require('./frameworks/ccpa')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
