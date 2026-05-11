@@ -146,6 +146,15 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 6. After baseline: AI generates real-time drift detection + training recommendations
 7. CISO installs GD → registers regional MCs → sees cross-region health
 
+### Locking Configuration (Required Hardening)
+Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before MFA is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires fresh MFA (TOTP code or single-use recovery code) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
+
+When locked, mutating requests to platform-config routes (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, backup destinations, backup push, audit retention, API keys) return HTTP 423 Locked. Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing) are unaffected, so production incident response is never blocked by the lock.
+
+In smaller SOCs where one person handles both Team Lead and Platform Admin duties, assign the `admin` role to that user; the codebase does not collapse the role boundary, which preserves SoD for orgs that do separate the roles.
+
+Audit events: `CONFIG_LOCK_ENABLED`, `CONFIG_LOCK_DISABLED`, `CONFIG_LOCK_GATE_HIT`, `CONFIG_LOCK_BYPASS_ATTEMPT`.
+
 ### Burnout Prevention Routing
 When active (requires SOAR + Ticketing configured):
 - FireAlive reads queue metadata via Ticketing (READ-ONLY)
