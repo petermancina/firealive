@@ -132,6 +132,7 @@ app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/restore-approvals', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/restore-approvals'));
 app.use('/api/backup-signing-keys', authMiddleware(['admin']), require('./routes/backup-signing-keys'));
 app.use('/api/mfa', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/mfa'));
+app.use('/api/config', require('./routes/config-lock'));
 app.use('/api/kms-providers', authMiddleware(['admin']), require('./routes/kms-providers'));
 app.use('/api/external-restore', authMiddleware(['admin']), require('./routes/external-restore'));
 app.use('/api/ai-provider', authMiddleware(['lead', 'admin']), require('./routes/ai-provider'));
