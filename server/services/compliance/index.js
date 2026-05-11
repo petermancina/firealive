@@ -361,6 +361,8 @@ const FRAMEWORKS = {
   ccpa: require('./frameworks/ccpa')(checks),
 
   lgpd: require('./frameworks/lgpd')(checks),
+
+  pipeda: require('./frameworks/pipeda')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
