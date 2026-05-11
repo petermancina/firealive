@@ -108,12 +108,12 @@ app.use('/api/assessments', authMiddleware(['lead', 'admin', 'analyst']), requir
 app.use('/api/reports', authMiddleware(['lead', 'admin']), require('./routes/reports'));
 app.use('/api/delegations', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/delegations'));
 app.use('/api/integrations', authMiddleware(['admin']), configLockGate(), require('./routes/integrations'));
-app.use('/api/v1/malware-scanners', authMiddleware(['admin']), require('./routes/malware-scanners'));
+app.use('/api/v1/malware-scanners', authMiddleware(['admin']), configLockGate(), require('./routes/malware-scanners'));
 app.use('/api/apikeys', authMiddleware(['admin']), require('./routes/apikeys'));
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
 app.use('/api/backup-chain', authMiddleware(['admin']), require('./routes/backup-chain'));
-app.use('/api/backup-destinations', authMiddleware(['admin']), require('./routes/backup-destinations'));
-app.use('/api/backup-push', authMiddleware(['admin']), require('./routes/backup-push'));
+app.use('/api/backup-destinations', authMiddleware(['admin']), configLockGate(), require('./routes/backup-destinations'));
+app.use('/api/backup-push', authMiddleware(['admin']), configLockGate(), require('./routes/backup-push'));
 app.use('/api/gd-config', authMiddleware(['admin']), configLockGate(), require('./routes/gd-config'));
 app.use('/api/scheduling', authMiddleware(['admin', 'lead']), configLockGate(), require('./routes/scheduling-platform'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), require('./routes/audit'));
