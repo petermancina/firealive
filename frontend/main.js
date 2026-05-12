@@ -6,7 +6,7 @@ let serverProcess = null;
 
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (e) => e.preventDefault());
-  contents.on('new-window', (e) => e.preventDefault());
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
 });
 
 function startServer() {
