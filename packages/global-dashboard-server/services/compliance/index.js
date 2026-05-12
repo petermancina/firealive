@@ -236,6 +236,41 @@ function checkAuditIntegrity(db) {
   };
 }
 
+// ── Check Function Aggregator ────────────────────────────────────────────────
+//
+// Spreads the 13 inline check functions above with the 9 checks/* category
+// modules into a single `checks` namespace that framework factory functions
+// consume. Later spreads in the object literal win on duplicate keys by design:
+// checks/audit.js's checkAuditIntegrity supersedes the inline definition,
+// and checks/config.js's checkChangeManagement supersedes the inline one.
+// Both replacements are deliberate; the checks/* versions surface the
+// SOC-grade detail required for framework references.
+
+const checks = {
+  checkAccessControl,
+  checkUniqueUsers,
+  checkEncryption,
+  checkRBAC,
+  checkAuditControls,
+  checkAuthentication,
+  checkTransmission,
+  checkBoundaries,
+  checkAnomalyDetection,
+  checkChangeManagement,
+  checkIncidentResponse,
+  checkBackups,
+  checkAuditIntegrity,
+  ...require('./checks/access'),
+  ...require('./checks/crypto'),
+  ...require('./checks/audit'),
+  ...require('./checks/data-protection'),
+  ...require('./checks/resilience'),
+  ...require('./checks/vuln'),
+  ...require('./checks/network'),
+  ...require('./checks/config'),
+  ...require('./checks/third-party'),
+};
+
 // ── Framework Registry ───────────────────────────────────────────────────────
 //
 // Empty at commit-32 state. R3g PR2 subsequent commits add one framework
