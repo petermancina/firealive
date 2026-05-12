@@ -5,7 +5,7 @@ const path = require('path');
 // Security: disable navigation to external URLs
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (e) => e.preventDefault());
-  contents.on('new-window', (e) => e.preventDefault());
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
 });
 
 function createWindow() {
