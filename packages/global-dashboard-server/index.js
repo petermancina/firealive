@@ -375,6 +375,38 @@ app.get('/api/auth-logs', authMiddleware(['ciso', 'vp']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to get auth logs' }); }
 });
 
+// ── Compliance Reports ───────────────────────────────────────────────────────
+app.get('/api/compliance/frameworks', authMiddleware(['ciso', 'vp', 'readonly']), (req, res) => {
+  try {
+    const { FRAMEWORKS } = require('./services/compliance');
+    res.json({
+      frameworks: Object.entries(FRAMEWORKS).map(([id, fw]) => ({
+        id,
+        name: fw.name,
+        authority: fw.authority,
+        verifiedControlCount: fw.verifiedControls.length,
+        customerResponsibilityCount: fw.customerResponsibility.length,
+        note: fw.note || null,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: 'Failed to list frameworks' }); }
+});
+
+app.get('/api/compliance/report/:framework', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const { generateComplianceReport, FRAMEWORKS } = require('./services/compliance');
+    const fw = req.params.framework.toLowerCase();
+    if (!FRAMEWORKS[fw]) {
+      return res.status(400).json({ error: 'Unknown framework', available: Object.keys(FRAMEWORKS) });
+    }
+    const report = generateComplianceReport(fw);
+    const db = getDb();
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`);
+    db.close();
+    res.json(report);
+  } catch (e) { res.status(500).json({ error: 'Failed to generate compliance report' }); }
+});
+
 // ── System Health (self-monitoring) ──────────────────────────────────────────
 app.get('/api/system/health-metrics', authMiddleware(['ciso', 'vp']), (req, res) => {
   const mem = process.memoryUsage();
