@@ -292,6 +292,7 @@ const FRAMEWORKS = {
   gdpr: require('./frameworks/gdpr')(checks),
   dora: require('./frameworks/dora')(checks),
   iso_27001: require('./frameworks/iso_27001')(checks),
+  fisma: require('./frameworks/fisma')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
