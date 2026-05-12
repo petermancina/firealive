@@ -293,6 +293,7 @@ const FRAMEWORKS = {
   dora: require('./frameworks/dora')(checks),
   iso_27001: require('./frameworks/iso_27001')(checks),
   fisma: require('./frameworks/fisma')(checks),
+  cyber_essentials: require('./frameworks/cyber_essentials')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
