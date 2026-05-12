@@ -31,7 +31,7 @@
     "@azure/identity": "^4.0.0",
     "@azure/keyvault-keys": "^4.8.0",
     "@azure/storage-blob": "^12.20.0",
-    "@google-cloud/kms": "^4.0.0",
+    "@google-cloud/kms": "^5.5.0",
     "@google-cloud/storage": "^7.0.0",
     "@mongodb-js/zstd": "^2.0.0",
     "bcryptjs": "^3.0.3",
