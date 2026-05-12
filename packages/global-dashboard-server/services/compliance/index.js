@@ -102,6 +102,7 @@
 
 const { getDb } = require('../../db-init');
 const { version } = require('../../package.json');
+const REMEDIATIONS = require('./remediations');
 
 // ── Check Functions ──────────────────────────────────────────────────────────
 //
@@ -266,12 +267,17 @@ function generateComplianceReport(framework) {
     } catch (err) {
       result = { status: 'error', detail: err.message };
     }
-    return {
+    const entry = {
       controlId: ctrl.id,
       controlName: ctrl.name,
       mapping: ctrl.mapping || null,
       ...result,
     };
+    if (entry.status !== 'pass') {
+      const remediation = REMEDIATIONS[ctrl.check.name];
+      if (remediation) entry.remediation = remediation;
+    }
+    return entry;
   });
   db.close();
 
