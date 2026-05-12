@@ -289,6 +289,7 @@ const FRAMEWORKS = {
   hipaa: require('./frameworks/hipaa')(checks),
   soc2: require('./frameworks/soc2')(checks),
   nist_csf: require('./frameworks/nist_csf')(checks),
+  gdpr: require('./frameworks/gdpr')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
