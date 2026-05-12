@@ -285,7 +285,9 @@ const checks = {
 // then, this registry is empty and generateComplianceReport returns null
 // for every framework key.
 
-const FRAMEWORKS = {};
+const FRAMEWORKS = {
+  hipaa: require('./frameworks/hipaa')(checks),
+};
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
 
