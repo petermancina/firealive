@@ -295,6 +295,7 @@ const FRAMEWORKS = {
   fisma: require('./frameworks/fisma')(checks),
   cyber_essentials: require('./frameworks/cyber_essentials')(checks),
   nis2: require('./frameworks/nis2')(checks),
+  cps234_au: require('./frameworks/cps234_au')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
