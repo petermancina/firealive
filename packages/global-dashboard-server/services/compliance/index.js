@@ -287,6 +287,7 @@ const checks = {
 
 const FRAMEWORKS = {
   hipaa: require('./frameworks/hipaa')(checks),
+  soc2: require('./frameworks/soc2')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
