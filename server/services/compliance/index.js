@@ -365,6 +365,8 @@ const FRAMEWORKS = {
   pipeda: require('./frameworks/pipeda')(checks),
 
   pdpa_sg: require('./frameworks/pdpa_sg')(checks),
+
+  appi_jp: require('./frameworks/appi_jp')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
