@@ -294,6 +294,7 @@ const FRAMEWORKS = {
   iso_27001: require('./frameworks/iso_27001')(checks),
   fisma: require('./frameworks/fisma')(checks),
   cyber_essentials: require('./frameworks/cyber_essentials')(checks),
+  nis2: require('./frameworks/nis2')(checks),
 };
 
 // ── Compliance Report Generation ─────────────────────────────────────────────
