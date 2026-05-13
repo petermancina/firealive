@@ -1658,6 +1658,8 @@ CREATE TABLE IF NOT EXISTS gd_push_config (
   api_key_encrypted TEXT,
   push_interval_minutes INTEGER NOT NULL DEFAULT 15
     CHECK (push_interval_minutes >= 1 AND push_interval_minutes <= 1440),
+  compliance_push_cadence_hours INTEGER NOT NULL DEFAULT 24
+    CHECK (compliance_push_cadence_hours >= 1 AND compliance_push_cadence_hours <= 720),  -- R3g PR3: cadence for the separate _complianceTick(); default daily, 30 days max
   retry_max INTEGER NOT NULL DEFAULT 3 CHECK (retry_max >= 0 AND retry_max <= 10),
   retry_backoff_seconds INTEGER NOT NULL DEFAULT 30
     CHECK (retry_backoff_seconds >= 1 AND retry_backoff_seconds <= 3600),
@@ -1667,6 +1669,45 @@ CREATE TABLE IF NOT EXISTS gd_push_config (
   last_push_error TEXT,
   last_push_duration_ms INTEGER,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  -- R3g PR3 Phase 5 (C23): manual-CISO-approval handshake state
+  --
+  -- mc_id is the identifier the GD knows this MC by (UUID assigned at
+  -- /api/mc/register time). The MC stores it locally so it can construct
+  -- the path-bound URL /api/mc/<mc_id>/signing-key when submitting a key
+  -- and so its push tick can correlate audit events on both sides.
+  -- Required when api_key_encrypted is set; enforced by the gd-config.js
+  -- PUT handler in C24, NOT by the schema (NULL allowed at the table
+  -- level so an initial PUT that's only setting endpoint_url doesn't
+  -- have to provide mc_id yet).
+  --
+  -- handshake_status tracks where the MC believes its trust relationship
+  -- with the GD stands. 'none' on first install or after a wipe;
+  -- 'pending_approval' the moment a stage+submit succeeds against the
+  -- GD's C18 endpoint; 'approved' or 'rejected' after the C28 push tick
+  -- polls the GD's C21 status endpoint and observes a transition. The
+  -- value here is the MC's locally-observed status — a CISO who
+  -- approves and then immediately rejects might see this column lag the
+  -- real GD state by one push interval.
+  --
+  -- last_handshake_at is the timestamp of the most recent submit OR poll
+  -- transition. Used for the MC operator UI to show "waiting since X"
+  -- so the operator can chase out-of-band if approval is taking unusually
+  -- long.
+  --
+  -- pending_signing_key_id is a SOFT reference to gd_push_signing_keys.id
+  -- (not a hard FK, matching the rest of this codebase's
+  -- cross-table-reference convention). NULL when no submission is in
+  -- flight; populated with the staged key's local row id when C26's
+  -- /rotate or C27's first-handshake stages a new key. C28's push tick
+  -- polls the GD's status for THIS keyId and commits or rolls back
+  -- locally. Application code (C25's gd-push-signing-keys.js stage/
+  -- commit/rollback) is responsible for keeping this in sync with the
+  -- underlying gd_push_signing_keys table.
+  mc_id TEXT,
+  handshake_status TEXT NOT NULL DEFAULT 'none'
+    CHECK (handshake_status IN ('none', 'pending_approval', 'approved', 'rejected')),
+  last_handshake_at TEXT,
+  pending_signing_key_id INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1676,6 +1717,56 @@ CREATE TABLE IF NOT EXISTS gd_push_config (
 -- /api/gd-config update this row in place.
 INSERT OR IGNORE INTO gd_push_config (id, enabled, push_interval_minutes)
   VALUES (1, 0, 15);
+
+-- ── R3g PR3: GD-PUSH SIGNING KEYS ────────────────────────────────────────
+-- Ed25519 keypair used by this MC to sign every outbound push to its
+-- connected GD. The signing payload format is the request body bytes
+-- (canonical JSON) prefixed by the request timestamp, mirroring the
+-- X-FA-Signature wire format documented in R3G-DETAILED-PLAN-v5.
+--
+-- Public key is plaintext (the GD needs to verify with it; no
+-- confidentiality concern). Private key Tier-1 AES-256-GCM encrypted via
+-- encryptConfig — same envelope used by chain_signing_keys and
+-- gd_push_config.api_key_encrypted on this side, and by
+-- backup_signing_keys for its private material.
+--
+-- DELIBERATELY SEPARATE FROM chain_signing_keys AND backup_signing_keys.
+-- The MC-to-GD trust channel is a distinct cryptographic concern from
+-- backup integrity or chain audit — a compromise of the GD-push key
+-- MUST NOT compromise backup signatures or chain entries. Each key
+-- lives in its own table, its own service module, its own in-memory
+-- KeyObject. The cost is duplicated keypair-management boilerplate; the
+-- security separation justifies it (same rationale as the chain vs
+-- backup signing-key separation in R3d-2).
+--
+-- public_key_fingerprint mirrors backup_signing_keys.public_key_fingerprint
+-- in format: SHA-256 hex of the Ed25519 SPKI DER encoding (64 chars).
+-- Used both as the X-FA-Key-Fingerprint header value on outbound pushes
+-- and as a lookup key on the GD side (signing_keys.public_key_fingerprint).
+-- Same identifier appears in MC and GD logs.
+--
+-- ROTATION MODEL: same as chain_signing_keys / backup_signing_keys — one
+-- active keypair at a time (is_active = 1), old keypairs retained with
+-- is_active = 0 + rotated_out_at so a brief verification grace window
+-- exists across rotations. Manual rotation only in v1.0.33; an automatic
+-- schedule is an open question for a later phase.
+CREATE TABLE IF NOT EXISTS gd_push_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
+  public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER bytes (64 chars)
+  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  is_active INTEGER NOT NULL DEFAULT 0
+    CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gd_push_signing_keys_active
+  ON gd_push_signing_keys(is_active) WHERE is_active = 1;
+
+CREATE INDEX IF NOT EXISTS idx_gd_push_signing_keys_fingerprint
+  ON gd_push_signing_keys(public_key_fingerprint);
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- R3c: HR SCHEDULING PLATFORM CONFIGURATION
@@ -2165,6 +2256,95 @@ function initDb() {
   } catch (replenishMigrationErr) {
     console.error('ir_policies F4c migration FAILED:', replenishMigrationErr.message);
     console.error('The server will start, but per-policy replenishment configuration may use defaults until the migration is investigated.');
+  }
+
+
+  // ── Migration: R3g PR3 — compliance_push_cadence_hours on gd_push_config ──
+  //
+  // Existing deploys (pre-R3g-PR3) have a gd_push_config singleton that
+  // predates the separate compliance push tick added in R3g PR3. The
+  // metrics tick keeps its existing 15-minute default via
+  // push_interval_minutes; the new compliance tick runs on a daily
+  // default via compliance_push_cadence_hours.
+  //
+  // ALTER TABLE ADD COLUMN with a literal-constant DEFAULT is supported
+  // on SQLite even for NOT NULL columns: existing rows get the default
+  // value at ALTER time (no application-side fallback needed). The CHECK
+  // constraint on the new column matches the canonical CREATE TABLE
+  // above: 1-720 hours (max 30 days).
+  //
+  // Guarded by PRAGMA table_info so re-running initDb on an already-
+  // migrated DB is a no-op. Own try/catch so a failure here does not
+  // mask the R0 users migration below.
+  try {
+    const gdPushCols = db.prepare("PRAGMA table_info(gd_push_config)").all().map(c => c.name);
+    if (!gdPushCols.includes('compliance_push_cadence_hours')) {
+      db.exec(
+        `ALTER TABLE gd_push_config ADD COLUMN compliance_push_cadence_hours INTEGER NOT NULL DEFAULT 24 CHECK (compliance_push_cadence_hours >= 1 AND compliance_push_cadence_hours <= 720)`
+      );
+      console.log('gd_push_config migration (R3g PR3): added compliance_push_cadence_hours column');
+    }
+  } catch (compliancePushCadenceMigrationErr) {
+    console.error('gd_push_config R3g PR3 migration FAILED:', compliancePushCadenceMigrationErr.message);
+    console.error('The server will start, but compliance push cadence will be unavailable until the migration is investigated.');
+  }
+
+
+  // ── Migration: R3g PR3 Phase 5 — handshake state on gd_push_config ──────
+  //
+  // Adds four columns backing the manual-CISO-approval handshake the MC
+  // tracks locally. Counterpart to the GD's C14 signing_keys schema
+  // additions: the MC needs to know which submission is awaiting GD-side
+  // approval (pending_signing_key_id), whether the operator has heard
+  // back yet (handshake_status), when the last transition happened
+  // (last_handshake_at), and what the GD calls this MC (mc_id, so the
+  // MC can construct the path-bound URL /api/mc/<mc_id>/signing-key when
+  // submitting).
+  //
+  // PRAGMA-guarded so re-running initDb after the first migration is a
+  // no-op. Each ALTER TABLE adds one column (SQLite limitation) with
+  // any DEFAULT applied to existing rows at ALTER time.
+  //
+  // For existing deploys, the gd_push_config singleton (row id=1) was
+  // seeded by the original INSERT OR IGNORE at table-creation time.
+  // After this migration it has:
+  //   mc_id                  NULL       (operator must set via C24
+  //                                      gd-config PUT before re-enabling
+  //                                      push; the PUT handler will
+  //                                      reject api_key changes without
+  //                                      a paired mc_id)
+  //   handshake_status       'none'     (default applies; the next
+  //                                      gd-config PUT in C27 will stage
+  //                                      and submit, advancing this to
+  //                                      'pending_approval')
+  //   last_handshake_at      NULL
+  //   pending_signing_key_id NULL
+  //
+  // Own try/catch so a failure here does not mask any subsequent
+  // migration in this initDb call.
+  try {
+    const cols = db.prepare("PRAGMA table_info(gd_push_config)").all().map(c => c.name);
+    if (!cols.includes('mc_id')) {
+      db.exec(`ALTER TABLE gd_push_config ADD COLUMN mc_id TEXT`);
+    }
+    if (!cols.includes('handshake_status')) {
+      db.exec(
+        `ALTER TABLE gd_push_config ADD COLUMN handshake_status TEXT NOT NULL DEFAULT 'none' CHECK (handshake_status IN ('none', 'pending_approval', 'approved', 'rejected'))`
+      );
+    }
+    if (!cols.includes('last_handshake_at')) {
+      db.exec(`ALTER TABLE gd_push_config ADD COLUMN last_handshake_at TEXT`);
+    }
+    if (!cols.includes('pending_signing_key_id')) {
+      db.exec(`ALTER TABLE gd_push_config ADD COLUMN pending_signing_key_id INTEGER`);
+    }
+    const added = ['mc_id', 'handshake_status', 'last_handshake_at', 'pending_signing_key_id'].filter(c => !cols.includes(c));
+    if (added.length > 0) {
+      console.log('gd_push_config migration (R3g PR3 Phase 5): added columns', added.join(', '));
+    }
+  } catch (handshakeMigrationErr) {
+    console.error('gd_push_config Phase 5 handshake migration FAILED:', handshakeMigrationErr.message);
+    console.error('The server will start, but the GD-push handshake state will be unavailable until the migration is investigated.');
   }
 
 

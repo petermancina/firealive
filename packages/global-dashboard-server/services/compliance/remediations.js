@@ -48,12 +48,30 @@
 //
 // Several GD check functions report on platform features that are
 // planned but not yet built (Config Lock backend, KMS integration,
-// signing-key registries, integration_config table, etc.). The
-// remediations for those checks describe BOTH the current operator-
-// managed workaround AND the BUILD-PLAN-v16 phase that will close the
-// gap. When the corresponding phase ships, the check transitions to
-// reporting on real platform state and the remediation becomes
-// straightforward configuration guidance.
+// integration_config table, etc.). The remediations for those checks
+// describe BOTH the current operator-managed workaround AND the
+// BUILD-PLAN-v16 phase that will close the gap. When the corresponding
+// phase ships, the check transitions to reporting on real platform
+// state and the remediation becomes straightforward configuration
+// guidance.
+//
+// R3g PR3 has SHIPPED the signing_keys registry (MC-trust verification)
+// + the compliance-report mailbox pattern + the manual CISO approval
+// workflow. Remediation entries that previously contained "when R3g
+// PR3 ships..." language have been updated to past-tense and to point
+// at the current-state endpoints. Three NEW remediation slots cover
+// the operational practices PR3 introduced:
+//   - checkSigningKeyRotationCadence    operator-triggered rotation
+//                                       with CISO approval gate
+//   - checkMailboxFulfillmentLatency    full-report request fulfilment
+//                                       latency expectations
+//   - checkRoleSegregationCisoApprover  role-segregation reminder
+//                                       for orgs assigning
+//                                       signing_key_approver distinct
+//                                       from ciso
+// These slots are not yet wired to dedicated check functions; they
+// serve as operator documentation and forward-compatible hooks for
+// future checks that surface these signals.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -179,7 +197,7 @@ const REMEDIATIONS = {
     steps: [
       'GD has no application-layer IR policy registry (no ir_policies table)',
       'CISO/governance-tier IR planning is operator-managed; document procedures off-platform (e.g., in your wiki or DMS)',
-      'GD-specific scenarios to cover: GD server compromise, GD database corruption, suspicious aggregate metrics from an MC, MC api_key compromise, signing-key registry compromise (post-R3g PR3)',
+      'GD-specific scenarios to cover: GD server compromise, GD database corruption, suspicious aggregate metrics from an MC, MC api_key compromise, signing-key registry compromise (signing_keys table present)',
       'For SOC-level (analyst-facing) IR procedures: those live at the MC, not the GD',
     ],
     uiPath: null,
@@ -261,7 +279,7 @@ const REMEDIATIONS = {
       'Identify MCs registered more than 90 days ago (last column: created_at)',
       'Re-register each stale MC: generate a fresh api_key on the MC side, then update the GD via PATCH /api/management-consoles/:id',
       'GD-stored api_key values are plaintext in management_consoles.api_key — reverse-proxy mTLS strongly advised for the push channel',
-      'R3g PR3 introduces a signing_keys registry for cryptographically signed MC pushes, supplementing the api_key shared secret',
+      'R3g PR3 added a signing_keys registry: cryptographically signed MC pushes supplement the api_key shared secret. See checkSigningKeyRegistry for current registry health and checkSigningKeyRotationCadence for the rotation workflow.',
     ],
     uiPath: 'gd:mcs',
   },
@@ -296,7 +314,7 @@ const REMEDIATIONS = {
       'GD has no in-platform key rotation registry; rotation is operator-managed',
       'Quarterly: generate a new GD_JWT_SECRET, update the env var, restart the GD server (invalidates all existing JWTs)',
       'For MC-trust api_keys: see checkApiKeyRotation (re-register each MC every 90 days)',
-      'When R3g PR3 ships the signing_keys registry, signing key rotation becomes managed via that registry',
+      'For MC-push signing keys (signing_keys registry, R3g PR3): rotation managed via POST /api/gd-signing-key/rotate (operator-initiated, requires CISO or signing_key_approver approval). See checkSigningKeyRotationCadence.',
     ],
     uiPath: null,
   },
@@ -522,7 +540,7 @@ const REMEDIATIONS = {
     steps: [
       'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31)',
       'Document CISO/governance-tier IR procedures off-platform — in your wiki, DMS, or runbook system',
-      'Cover scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC, MC api_key compromise, signing-key registry compromise (post-R3g PR3)',
+      'Cover scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC, MC api_key compromise, signing-key registry compromise (signing_keys table present)',
       'Reference NIST 800-61 and ISO 27035 for IR program structure',
     ],
     uiPath: null,
@@ -605,7 +623,7 @@ const REMEDIATIONS = {
     steps: [
       'GD has no in-platform network-layer middleware (no preventPivot / validateMtls equivalent of MC\'s network-security module)',
       'Operator-managed: configure firewall rules / network ACLs / security groups to restrict access to GD_PORT (default 4001) to authorized sources only',
-      'Inbound: allow only the reverse proxy and the registered MCs (for compliance-report pushes in R3g PR3)',
+      'Inbound: allow only the reverse proxy and the registered MCs (for compliance-report pushes via R3g PR3 signed-push contract)',
       'Outbound: typically minimal (notification delivery, MC heartbeats); explicit allow-list rather than allow-all',
       'No GD-side data tiering — boundary is architectural (analyst data tables do not exist on GD)',
     ],
@@ -617,7 +635,7 @@ const REMEDIATIONS = {
     steps: [
       'GD has no anti-replay middleware (no nonce tracking, no sliding-window protection)',
       'JWT 8h expiry provides time-bounded protection only — within the validity window, a stolen JWT is replayable',
-      'For the MC → GD push channel: R3g PR3 will incorporate anti-replay (signed nonces in the push payload)',
+      'For the MC → GD push channel: R3g PR3 added anti-replay protection via a 5-minute timestamp skew window enforced by verifyPushSignature in services/mc-signature-verifier.js. Persistent server-side nonce tracking remains a future enhancement (would extend the replay window arbitrarily; the 5-minute bound is the current trade-off).',
       'Until PR3: enforce mTLS at the reverse proxy with strict client-cert pinning for inbound MC connections',
       'For interactive JWT replay: reduce JWT validity at the proxy layer (idle timeout shorter than 8h)',
     ],
@@ -717,15 +735,61 @@ const REMEDIATIONS = {
   },
 
   checkSigningKeyRegistry: {
-    summary: 'Provision signing keys as registries land in future phases',
+    summary: 'Maintain signing-key registries: review pending registrations and provision keys for unshipped registries',
     steps: [
-      'CURRENT STATE: no signing-key registries on the GD (no backup_signing_keys, no chain_signing_keys, no signing_keys table)',
-      'R3g PR3 introduces signing_keys for MC-trust verification: each connected MC registers a signing key; GD verifies inbound compliance-report pushes against it',
-      'Future GD backup-signing phase introduces backup_signing_keys + chain_signing_keys: GD\'s own backup manifest and chain signing (parallel to MC R3d-5 pattern)',
-      'When each registry lands: provision at least one active key for each registered signing role; rotate per documented cadence (typically 6-12 months for Ed25519)',
-      'Until registries ship: MC → GD trust is api_key-based and operator-managed; GD backup integrity is hash-only (no cryptographic signature)',
+      'signing_keys (MC-trust verification, R3g PR3): SHIPPED. Pending registrations are surfaced by GET /api/signing-keys/pending. Review and act:',
+      '  - POST /api/mc/<mcId>/signing-keys/<keyId>/approve to promote a pending key to approved + active',
+      '  - POST /api/mc/<mcId>/signing-keys/<keyId>/reject to reject a key (operator must contact CISO out-of-band for the rejection reason — the MC-facing status endpoint deliberately does not surface it)',
+      '  - Stale pending registrations (>7 days) suggest a neglected review queue — see checkRoleSegregationCisoApprover for role-assignment guidance',
+      '  - For signing-key rotation lifecycle (operator triggers /rotate; CISO approves; grace window covers in-flight pushes): see checkSigningKeyRotationCadence',
+      'Future GD backup-signing phase will introduce backup_signing_keys + chain_signing_keys: GD\'s own backup manifest and chain signing (parallel to MC R3d-5 pattern). Until then GD backup integrity is hash-only (no cryptographic signature).',
+      'When the backup-signing registries land: provision at least one active key for each registered signing role; rotate per documented cadence (typically 6-12 months for Ed25519)',
     ],
-    uiPath: null,
+    uiPath: 'gd:signing-keys',
+  },
+
+  // ── R3g PR3 Phase 9 (C42): operator-practice entries for PR3-shipped surfaces ──
+  // These keys are not yet referenced by check functions; they are
+  // forward-compatible documentation slots for the post-PR3 operator
+  // practices (signing-key rotation lifecycle, mailbox-pattern
+  // operator notes, role-segregation reminder). Future check
+  // functions that surface these signals will reference them by name.
+
+  checkSigningKeyRotationCadence: {
+    summary: 'Rotate MC-push signing keys on a documented cadence with CISO approval',
+    steps: [
+      'WHO triggers: operator at the MC (the entity holding the active push signing key)',
+      'HOW: POST /api/gd-signing-key/rotate on the MC. The route stages a fresh Ed25519 keypair, marks it pending_approval=1, and submits the new public key to the GD via C18 (POST /api/mc/<id>/signing-key)',
+      'WHO approves: CISO or signing_key_approver at the GD via POST /api/mc/<mcId>/signing-keys/<keyId>/approve (Commit 19). Role segregation: see checkRoleSegregationCisoApprover',
+      'GRACE WINDOW: when the new key is approved, the prior key is demoted (is_active=0, rotated_out_at=now) but remains in signing_keys with approval_status=\'approved\'. The verifier (C22 Path B) accepts signatures from the demoted key for the configured grace_period_minutes (default 60, range 0-1440). This covers in-flight pushes that signed under the previous key',
+      'CADENCE: industry norm is 6-12 months for Ed25519 keys. Emergency rotation (suspected compromise): set signing_key_grace_period_minutes to 0 before approving the replacement; the old key dies immediately on the new key\'s approval',
+      'MONITORING: checkSigningKeyRegistry (in checks/third-party.js) surfaces the population of approved active keys and any stale-pending review queue',
+    ],
+    uiPath: 'gd:signing-keys',
+  },
+
+  checkMailboxFulfillmentLatency: {
+    summary: 'Tune compliance-tick cadence when full-report request fulfilment is too slow',
+    steps: [
+      'The mailbox pattern (R3g PR3 Phase 7): CISO requests a full report via POST /api/mc/<id>/full-report-requests (C33). The request lands as a pending row in mc_report_requests. The MC observes the pending row on its NEXT compliance tick and POSTs the generated full report back via /api/ingest/compliance-reports?full=true (C35). Fulfilment latency = up to one compliance-tick interval.',
+      'DEFAULT CADENCE: compliance_push_cadence_hours = 24 (set in gd_push_config on the MC side, seeded by R3g PR3 Phase 2 / Commit 6). Range 1-720 hours.',
+      'TUNING: if a CISO routinely needs faster turnaround, reduce the MC-side cadence: PUT /api/gd-config on the MC with compliance_push_cadence_hours = 4 (or whatever interval fits the review workflow). Lower cadences increase compliance push traffic to the GD; balance against total ingest volume',
+      'STALENESS SIGNAL: pending requests older than the cadence + grace period (e.g., older than 25h with a 24h cadence) suggest the MC compliance tick has stopped firing — check gd_push_config.enabled=1, decrypt errors in audit_log, and the circuit breaker state (consecutive_failures column)',
+      'NO ALERTING YET: a future GD enhancement may add an alert when pending requests exceed a configurable age threshold; until then this is operator-monitored via GET /api/audit-logs?event_type=COMPLIANCE_FULL_REPORT_REQUESTED',
+    ],
+    uiPath: 'gd:audit-logs',
+  },
+
+  checkRoleSegregationCisoApprover: {
+    summary: 'Assign signing_key_approver to a user distinct from any ciso to enforce role segregation',
+    steps: [
+      'CONTROL CONTEXT: ISO 27001 A.6.1.2 Segregation of duties; NIST 800-53 AC-5; SOC 2 CC1.3. The compliance principle: the user who registers a new MC should NOT be the same user who establishes its cryptographic trust',
+      'PLATFORM SUPPORT: R3g PR3 Phase 5 (Commit 15) introduced the signing_key_approver role. The approve/reject endpoints (Commits 19) accept either ciso OR signing_key_approver',
+      'GUIDANCE: in orgs with >1 administrator, assign signing_key_approver to a user distinct from the ciso. POST /api/users (or your IdP-provisioning equivalent) with role=\'signing_key_approver\'',
+      'SMALL ORGS: in single-administrator deployments, the ciso may hold both roles. The audit log records the acting role distinctly on each approval (approved_by_role column on signing_keys), so reviewers can see whether segregation was actually exercised',
+      'AUDIT REVIEW: GET /api/audit-logs?event_type=MC_SIGNING_KEY_APPROVED. Look at the approver user id vs the original MC registrant (from MC_REGISTERED events). Matching IDs indicate unexercised segregation; distinct IDs document the control',
+    ],
+    uiPath: 'gd:users',
   },
 };
 

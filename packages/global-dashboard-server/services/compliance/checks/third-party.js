@@ -259,20 +259,41 @@ function checkKmsProviderTrust(db) {
 //   - chain_signing_keys (future GD buildout, parallel to MC's pattern):
 //     signs GD backup chain entries, Ed25519.
 //   - signing_keys (R3g PR3): MC-trust registry for verifying inbound
-//     MC compliance-report pushes. Each connected MC registers a
-//     signing key with the GD; PR3 signs pushed reports and the GD
-//     verifies before accepting.
+//     MC compliance-report and metrics pushes. Each connected MC
+//     registers a signing key with the GD; after manual CISO
+//     approval, the GD verifies inbound push signatures against the
+//     active approved row before accepting.
 //
-// Each registry adds when its corresponding phase ships. The check
-// returns pass for any registry that exists AND has active keys; warning
-// for any registry that doesn't yet exist; fail for any registry that
-// exists but is empty.
+// R3g PR3 Phase 9 (C40): signing_keys is now special-cased to surface
+// the approval workflow's state. Two queries replace the legacy
+// is_active=1 count:
+//   - approved + active: WHERE approval_status='approved' AND is_active=1
+//     (currently-trusted MC signing keys, drives push verification)
+//   - pending_approval:  WHERE approval_status='pending_approval'
+//     (registrations awaiting CISO/signing_key_approver review)
 //
-// Maps to controls including: SOC 2 CC6.7/CC8.1, NIST CSF PR.DS-01 /
-// PR.DS-10, ISO 27001 A.8.24/A.8.13, NIST 800-53 SC-12/SI-7,
-// DORA Art.9(3)/Art.12, HIPAA 164.312(c)(1).
+// Status logic for signing_keys:
+//   - mc_count == 0           -> 'warning' (pre-onboarding, can't have
+//                                signing keys yet)
+//   - approved_active == 0    -> 'warning' (MCs registered but no
+//                                handshakes completed)
+//   - stale_pending > 0       -> 'warning' (pending registrations >7d
+//                                old suggests neglected CISO review,
+//                                a compliance signal under
+//                                ISO 27001 A.6.1.2 segregation /
+//                                A.9.2.5 access reviews)
+//   - else                    -> 'pass'
+//
+// The seven-day staleness threshold reflects industry norms for
+// access-review SLAs. Tighter thresholds (e.g., 24h) generate noise;
+// looser (e.g., 30d) misses neglected workflows.
+//
+// Maps to controls including: SOC 2 CC6.7/CC6.6/CC8.1, NIST CSF
+// PR.DS-01 / PR.DS-10 / PR.AC-01, ISO 27001 A.8.24/A.8.13/A.6.1.2,
+// NIST 800-53 SC-12/SI-7/AC-5, DORA Art.9(3)/Art.12, HIPAA 164.312(c)(1).
 function checkSigningKeyRegistry(db) {
-  const registries = [
+  // ── Backup registries (legacy is_active=1 check) ──
+  const backupRegistries = [
     {
       table: 'backup_signing_keys',
       label: 'backup manifest signing',
@@ -283,14 +304,9 @@ function checkSigningKeyRegistry(db) {
       label: 'backup chain entry signing',
       phaseNote: 'future GD backup-signing phase (parallel to MC pattern)',
     },
-    {
-      table: 'signing_keys',
-      label: 'MC-trust verification',
-      phaseNote: 'R3g PR3 (MC-push verification registry)',
-    },
   ];
 
-  const statuses = registries.map(r => {
+  const backupStatuses = backupRegistries.map(r => {
     if (!tableExists(db, r.table)) {
       return { ...r, state: 'missing', activeCount: 0 };
     }
@@ -301,24 +317,88 @@ function checkSigningKeyRegistry(db) {
       ).get();
       activeCount = row.c;
     } catch (e) {
-      // Table exists but expected columns absent — surface as missing
       return { ...r, state: 'malformed', activeCount: 0 };
     }
     return { ...r, state: activeCount > 0 ? 'present' : 'empty', activeCount };
   });
 
-  const missing = statuses.filter(s => s.state === 'missing');
-  const empty = statuses.filter(s => s.state === 'empty');
-  const malformed = statuses.filter(s => s.state === 'malformed');
-  const present = statuses.filter(s => s.state === 'present');
+  // ── signing_keys (R3g PR3 Phase 5 approval workflow) ──
+  let signingKeysAssessment;
+  if (!tableExists(db, 'signing_keys')) {
+    signingKeysAssessment = {
+      table: 'signing_keys',
+      label: 'MC-trust verification',
+      phaseNote: 'R3g PR3 (MC-push verification registry)',
+      state: 'missing',
+    };
+  } else {
+    try {
+      const mcCountRow = db.prepare(
+        "SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active'"
+      ).get();
+      const approvedActiveRow = db.prepare(
+        "SELECT COUNT(*) AS c FROM signing_keys WHERE approval_status = 'approved' AND is_active = 1"
+      ).get();
+      const pendingRow = db.prepare(
+        "SELECT COUNT(*) AS c FROM signing_keys WHERE approval_status = 'pending_approval'"
+      ).get();
+      const stalePendingRow = db.prepare(
+        "SELECT COUNT(*) AS c FROM signing_keys WHERE approval_status = 'pending_approval' AND registered_at < datetime('now', '-7 days')"
+      ).get();
+      const distinctMcsRow = db.prepare(
+        "SELECT COUNT(DISTINCT mc_id) AS c FROM signing_keys WHERE approval_status = 'approved' AND is_active = 1"
+      ).get();
 
-  if (present.length === 0 && empty.length === 0 && malformed.length === 0) {
-    // All registries missing — pre-phase state.
+      signingKeysAssessment = {
+        table: 'signing_keys',
+        label: 'MC-trust verification',
+        mcCount: mcCountRow.c,
+        approvedActive: approvedActiveRow.c,
+        pending: pendingRow.c,
+        stalePending: stalePendingRow.c,
+        distinctMcs: distinctMcsRow.c,
+      };
+
+      // Classify state for the combined-status logic below
+      if (mcCountRow.c === 0) {
+        signingKeysAssessment.state = 'pre_onboarding';
+      } else if (approvedActiveRow.c === 0) {
+        signingKeysAssessment.state = 'no_handshakes';
+      } else if (stalePendingRow.c > 0) {
+        signingKeysAssessment.state = 'stale_pending';
+      } else {
+        signingKeysAssessment.state = 'healthy';
+      }
+    } catch (e) {
+      // Table exists but expected columns absent — surface as malformed
+      signingKeysAssessment = {
+        table: 'signing_keys',
+        label: 'MC-trust verification',
+        state: 'malformed',
+        error: e.message,
+      };
+    }
+  }
+
+  // ── Combine into single status + detail ──
+  const allBackupMissing = backupStatuses.every(s => s.state === 'missing');
+  const signingKeysMissing = signingKeysAssessment.state === 'missing';
+
+  // Edge case: nothing exists yet
+  if (allBackupMissing && signingKeysMissing) {
     return {
       status: 'warning',
-      detail: `No signing-key registries present on the GD. Each future phase introduces one: ${registries.map(r => `${r.table} (${r.phaseNote})`).join('; ')}. Until those phases ship, MC → GD trust is api_key-based and operator-managed; GD backup integrity is hash-only (no cryptographic signature).`,
+      detail: `No signing-key registries present on the GD. Each future phase introduces one: ${[...backupRegistries, { table: 'signing_keys', label: 'MC-trust verification', phaseNote: 'R3g PR3 (MC-push verification registry)' }].map(r => `${r.table} (${r.phaseNote})`).join('; ')}. Until those phases ship, MC → GD trust is api_key-based and operator-managed; GD backup integrity is hash-only (no cryptographic signature).`,
     };
   }
+
+  // Fail conditions: any registry empty/malformed
+  const empty = backupStatuses.filter(s => s.state === 'empty');
+  const malformed = backupStatuses.filter(s => s.state === 'malformed');
+  if (signingKeysAssessment.state === 'malformed') {
+    malformed.push(signingKeysAssessment);
+  }
+  const present = backupStatuses.filter(s => s.state === 'present');
 
   if (empty.length > 0 || malformed.length > 0) {
     const issues = [];
@@ -328,19 +408,51 @@ function checkSigningKeyRegistry(db) {
     if (malformed.length > 0) {
       issues.push(`malformed registries (table present but expected columns missing): ${malformed.map(s => s.table).join(', ')}`);
     }
+    // Add signing_keys context to the fail detail
+    const skNote = signingKeysAssessment.state === 'malformed'
+      ? ''
+      : signingKeysAssessment.state === 'missing'
+      ? ` signing_keys registry not yet shipped (R3g PR3 phase).`
+      : ` signing_keys: ${signingKeysAssessment.approvedActive || 0} approved active key(s) across ${signingKeysAssessment.distinctMcs || 0} MC(s), ${signingKeysAssessment.pending || 0} pending review.`;
     return {
       status: 'fail',
-      detail: `Signing-key registry gaps: ${issues.join('; ')}. ${present.length} present-and-populated: ${present.map(s => `${s.table} (${s.activeCount} active)`).join(', ') || 'none'}.`,
+      detail: `Signing-key registry gaps: ${issues.join('; ')}. ${present.length} present-and-populated: ${present.map(s => `${s.table} (${s.activeCount} active)`).join(', ') || 'none'}.${skNote}`,
     };
   }
 
+  // signing_keys state-specific signals (the R3g PR3 Phase 9 logic)
+  if (signingKeysAssessment.state === 'pre_onboarding') {
+    return {
+      status: 'warning',
+      detail: `signing_keys registry exists but no Management Consoles are registered yet. MC-trust verification cannot exercise until at least one MC is onboarded via POST /api/mc/register and completes its initial handshake. Backup registries: ${backupStatuses.map(s => s.state === 'present' ? `${s.table} (${s.activeCount} active)` : `${s.table} (${s.state})`).join('; ')}.`,
+    };
+  }
+
+  if (signingKeysAssessment.state === 'no_handshakes') {
+    return {
+      status: 'warning',
+      detail: `${signingKeysAssessment.mcCount} MC(s) registered but 0 approved active signing keys. Handshakes have not yet completed; MC pushes will currently reject for lack of trust. ${signingKeysAssessment.pending} registration(s) awaiting CISO/signing_key_approver review. Operators: invoke POST /api/mc/<id>/signing-keys/<keyId>/approve to unblock.`,
+    };
+  }
+
+  if (signingKeysAssessment.state === 'stale_pending') {
+    return {
+      status: 'warning',
+      detail: `${signingKeysAssessment.approvedActive} signing key(s) are approved and active across ${signingKeysAssessment.distinctMcs} MC(s). ${signingKeysAssessment.pending} registration(s) awaiting CISO/signing_key_approver review, ${signingKeysAssessment.stalePending} of which are older than 7 days — suggests neglected approvals (ISO 27001 A.6.1.2 / A.9.2.5 access-review signal). Operator review of GET /api/signing-keys/pending recommended.`,
+    };
+  }
+
+  // Healthy path
   const presentSummary = present.map(s => `${s.table} (${s.activeCount} active key(s), ${s.label})`).join('; ');
-  const stillMissingSummary = missing.length > 0
-    ? ` Not yet shipped: ${missing.map(s => `${s.table} (${s.phaseNote})`).join('; ')}.`
+  const stillMissingBackup = backupStatuses.filter(s => s.state === 'missing');
+  const stillMissingSummary = stillMissingBackup.length > 0
+    ? ` Not yet shipped: ${stillMissingBackup.map(s => `${s.table} (${s.phaseNote})`).join('; ')}.`
     : '';
+  const skHealthy = `signing_keys (${signingKeysAssessment.approvedActive} signing keys are approved and active across ${signingKeysAssessment.distinctMcs} MCs. ${signingKeysAssessment.pending} registrations are awaiting CISO/signing_key_approver review).`;
+
   return {
     status: 'pass',
-    detail: `Signing-key registries present and populated: ${presentSummary}.${stillMissingSummary}`,
+    detail: `Signing-key registries present and populated: ${presentSummary ? presentSummary + '; ' : ''}${skHealthy}${stillMissingSummary}`,
   };
 }
 

@@ -25,8 +25,13 @@ const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
 const { encrypt, decrypt } = require('../services/encryption');
 const { validateAllowedHost } = require('../services/gd-allow-list');
+// R3g PR3 Phase 5 (C27): the PUT handler auto-fires an initial handshake
+// when api_key + mc_id + endpoint_url first land together, staging a
+// signing keypair locally and submitting to the GD for CISO approval.
+const signingKeysSvc = require('../services/gd-push-signing-keys');
 
 const REQUEST_TIMEOUT_MS = 15000;  // shorter timeout for interactive test calls
+const HANDSHAKE_TIMEOUT_MS = 30000;  // same as gd-push.js outbound; bounds initial-handshake POST
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function readConfigRow(db) {
@@ -111,15 +116,78 @@ async function validateHostnameSafety(hostname) {
   }
 }
 
-function sanitizeForResponse(row) {
+function sanitizeForResponse(row, db) {
   // Omit api_key_encrypted from GET responses; surface a boolean instead so
   // the admin UI can render "API key: configured" or "not set" without ever
   // touching the encrypted blob.
   if (!row) return null;
+
+  // R3g PR3 Phase 5 (C29): look up the fingerprints of the staged AND
+  // current-active signing keys so the operator UI can render statements
+  // like "Active fingerprint: abc123... | Staged: def456..." without
+  // requiring a separate API call. Both lookups are cheap O(1) by id /
+  // by is_active flag; db handle is optional so legacy callers that
+  // don't pass it still get a working sanitized row (fingerprints
+  // simply default to empty strings).
+  //
+  // DELIBERATELY NOT SURFACED: the GD-side rejected_reason for a
+  // handshake that ended in 'rejected'. C21's MC-facing status endpoint
+  // returns minimal signal ({ status } only) by design — the rationale
+  // there was to prevent an attacker with a stolen MC api_key from
+  // learning the CISO's review process patterns (when they act, what
+  // patterns trigger rejection, etc.). The MC simply doesn't have the
+  // reason locally; the operator must contact the CISO out-of-band if
+  // they want to know why a handshake was rejected. The C29 UI banner
+  // for handshake_status='rejected' reads "Rejected by CISO. Re-save
+  // GD config (typically with corrected api_key or endpoint_url) to
+  // retry. Contact your CISO for details if needed."
+  let staged_fingerprint = '';
+  let active_fingerprint = '';
+  if (db) {
+    try {
+      if (row.pending_signing_key_id) {
+        const stagedRow = db.prepare(
+          'SELECT public_key_fingerprint FROM gd_push_signing_keys WHERE id = ?'
+        ).get(row.pending_signing_key_id);
+        staged_fingerprint = stagedRow?.public_key_fingerprint || '';
+      }
+      const activeRow = db.prepare(
+        'SELECT public_key_fingerprint FROM gd_push_signing_keys WHERE is_active = 1 LIMIT 1'
+      ).get();
+      active_fingerprint = activeRow?.public_key_fingerprint || '';
+    } catch (err) {
+      // gd_push_signing_keys table absent or corrupt — fall back to
+      // empty fingerprints rather than failing the whole response. The
+      // operator can still read the rest of the config fields, and the
+      // schema migration that creates the table is part of the same
+      // initDb sequence as gd_push_config so missing-table is an
+      // exceptional state worth logging but not exploding on.
+      logger.error('GD config: signing-key fingerprint lookup failed', { error: err.message });
+    }
+  }
+
   return {
     enabled: row.enabled === 1,
     endpoint_url: row.endpoint_url || '',
     api_key_set: !!row.api_key_encrypted,
+    // R3g PR3 Phase 5 (C24): expose mc_id so the operator UI can show
+    // "GD knows this MC as: <mc_id>" and surface configuration errors
+    // visibly. Not sensitive — mc_id is a public identifier on the GD
+    // side (visible to any CISO browsing the management consoles list).
+    mc_id: row.mc_id || '',
+    // R3g PR3 Phase 5 (C27): expose handshake state so the operator UI
+    // can render banner messages like "Awaiting CISO approval"
+    // (pending_approval), "Approved" (approved), or "Rejected — re-save
+    // config to retry" (rejected). The operator-facing UI is deferred to
+    // PR4; these fields prepare the route surface for it.
+    handshake_status: row.handshake_status || 'none',
+    pending_signing_key_id: row.pending_signing_key_id,
+    last_handshake_at: row.last_handshake_at,
+    // R3g PR3 Phase 5 (C29): fingerprint lookups — empty string when
+    // not applicable (no staged key / no active key) rather than null,
+    // so the UI can render "Active: <empty> means no key yet" naturally.
+    staged_fingerprint,
+    active_fingerprint,
     push_interval_minutes: row.push_interval_minutes,
     retry_max: row.retry_max,
     retry_backoff_seconds: row.retry_backoff_seconds,
@@ -162,12 +230,40 @@ function validateApiKey(value) {
   return { ok: true, value: trimmed };
 }
 
+// R3g PR3 Phase 5 (C24): mc_id is the identifier the GD assigned to this MC
+// at /api/mc/register time. Used to construct the path-bound URL
+// /api/mc/<mc_id>/signing-key when the MC submits a key (the GD's C18
+// endpoint requires both api_key in the body AND :id in the path to match
+// a single MC, so the MC has to know its own GD-side id).
+//
+// The current GD generates these as crypto.randomBytes(4).toString('hex')
+// (8 lowercase hex chars), but operators running modified GDs or custom
+// deployments may use UUIDs or other formats. The validator is permissive
+// enough to accept the default 8-hex shape PLUS UUIDs PLUS other reasonable
+// ASCII-safe identifiers; rejects clear garbage (whitespace, control
+// characters, oversize input).
+//
+// Length cap 128 is generous — UUIDs are 36, GD-generated ids are 8;
+// anything longer is almost certainly a misconfiguration.
+function validateMcId(value) {
+  if (typeof value !== 'string') return { ok: false, error: 'mc_id must be a string' };
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: false, error: 'mc_id cannot be empty' };
+  if (trimmed.length > 128) return { ok: false, error: 'mc_id too long (max 128)' };
+  // ASCII-safe: alphanumerics, hyphens, underscores. Covers hex,
+  // UUIDs (with hyphens), and most identifier conventions.
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return { ok: false, error: 'mc_id must contain only letters, digits, hyphens, and underscores' };
+  }
+  return { ok: true, value: trimmed };
+}
+
 // ── GET /api/gd-config ────────────────────────────────────────────────────
 router.get('/', (req, res) => {
   const db = getDb();
   try {
     const row = readConfigRow(db);
-    res.json(sanitizeForResponse(row) || { enabled: false, api_key_set: false });
+    res.json(sanitizeForResponse(row, db) || { enabled: false, api_key_set: false });
   } catch (err) {
     logger.error('GD config read error', { error: err.message });
     res.status(500).json({ error: 'Failed to read GD push configuration' });
@@ -176,6 +272,195 @@ router.get('/', (req, res) => {
   }
 });
 
+// ── R3g PR3 Phase 5 (C27): initial-handshake firing ──────────────────────
+//
+// When the operator finishes configuring the GD push relationship —
+// endpoint_url + mc_id + api_key all present in gd_push_config — the PUT
+// handler auto-fires an initial handshake instead of requiring the
+// operator to call POST /api/gd-signing-key/rotate as a second action.
+// This mirrors C26's /rotate-route logic (stage locally, POST to GD,
+// update pending state OR rollback) but is triggered as a side effect of
+// the config save.
+//
+// FIRING CONDITIONS (post-update row state):
+//
+//   - endpoint_url is set, AND
+//   - mc_id is set, AND
+//   - api_key_encrypted is set, AND
+//   - handshake_status is 'none' or 'rejected'
+//
+// 'none' is first-time setup. 'rejected' lets the operator retry after a
+// CISO rejection by re-saving config (typically with corrected api_key /
+// endpoint_url). 'pending_approval' means a handshake is already in
+// flight — don't re-fire, let it complete or get observed-as-rejected by
+// the C28 push tick. 'approved' means a working key exists — explicit
+// rotation goes through POST /api/gd-signing-key/rotate (C26).
+//
+// FAILURE MODES (config save still succeeds, handshake failure surfaced
+// in the response body's `handshake` field):
+//
+//   stage=allowlist     — endpoint hostname not in GD_ALLOWED_HOSTS
+//   stage=decrypt       — api_key decryption failed (TIER1_ENCRYPTION_KEY)
+//   stage=local_stage   — local DB insert of the staged keypair failed
+//   stage=network       — fetch threw (DNS/TCP/TLS/timeout/redirect-block)
+//   stage=gd_rejection  — GD responded with 4xx
+//   stage=gd_5xx        — GD responded with 5xx
+//
+// On any failure after the staged row is inserted, the staged row is
+// rolled back via rollbackStagedKeypair so the operator can retry without
+// manual cleanup. The config-side fields (endpoint_url, mc_id, api_key)
+// remain saved — they're the operator's intent, separate from whether
+// the handshake worked. handshake_status is NOT advanced on failure.
+//
+// Returns null when conditions aren't met (no auto-fire). Returns an
+// object describing the outcome otherwise.
+async function fireInitialHandshakeIfReady(db, updatedRow, req) {
+  // ── Gate ──
+  if (!updatedRow) return null;
+  if (!updatedRow.endpoint_url || !updatedRow.mc_id || !updatedRow.api_key_encrypted) {
+    return null;
+  }
+  if (updatedRow.handshake_status !== 'none' && updatedRow.handshake_status !== 'rejected') {
+    return null;
+  }
+
+  // ── Build + validate submission URL ──
+  const submitUrl = updatedRow.endpoint_url.replace(/\/+$/, '') +
+    '/api/mc/' + encodeURIComponent(updatedRow.mc_id) + '/signing-key';
+  let parsedUrl;
+  try { parsedUrl = new URL(submitUrl); }
+  catch (err) {
+    auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED', `stage=invalid_url detail=${err.message}`, req.ip);
+    return { status: 'failed', stage: 'invalid_url', error: 'Configured GD URL is malformed: ' + err.message };
+  }
+  const allowed = validateAllowedHost(parsedUrl.hostname);
+  if (!allowed.ok) {
+    auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED', `stage=allowlist reason=${allowed.error}`, req.ip);
+    return { status: 'failed', stage: 'allowlist', error: 'GD allow-list rejected hostname: ' + allowed.error };
+  }
+
+  // ── Decrypt api_key ──
+  let apiKey;
+  try {
+    apiKey = decrypt(Buffer.from(updatedRow.api_key_encrypted, 'base64'), 'TIER1_ENCRYPTION_KEY');
+  } catch (err) {
+    logger.error('GD config handshake: api_key decrypt failed', { error: err.message });
+    auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED', 'stage=decrypt reason=api_key_decrypt_failed', req.ip);
+    return { status: 'failed', stage: 'decrypt', error: 'Failed to decrypt stored api_key — check TIER1_ENCRYPTION_KEY env var' };
+  }
+
+  // ── Stage keypair locally ──
+  let staged;
+  try {
+    staged = signingKeysSvc.stageNewPushKeypair(db, { notes: 'initial handshake from gd-config PUT' });
+  } catch (err) {
+    logger.error('GD config handshake: local stage failed', { error: err.message });
+    auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED', `stage=local_stage reason=${err.message.slice(0, 200)}`, req.ip);
+    return { status: 'failed', stage: 'local_stage', error: 'Failed to stage new keypair locally' };
+  }
+
+  // ── POST to GD ──
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
+  let gdResp;
+  let gdBody;
+  try {
+    try {
+      gdResp = await fetch(submitUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey,
+          public_key: staged.publicKeyPem,
+          public_key_fingerprint: staged.publicKeyFingerprint,
+        }),
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      const text = await gdResp.text();
+      try { gdBody = JSON.parse(text); }
+      catch { gdBody = { error: text.slice(0, 500) }; }
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (netErr) {
+    rollbackAndAuditHandshake(db, staged, req, 'network', netErr.message);
+    return {
+      status: 'failed',
+      stage: 'network',
+      error: 'Failed to submit signing key to GD',
+      detail: netErr.message.slice(0, 200),
+    };
+  }
+
+  if (!gdResp.ok) {
+    const stage = gdResp.status >= 500 ? 'gd_5xx' : 'gd_rejection';
+    rollbackAndAuditHandshake(db, staged, req, stage, `status=${gdResp.status} code=${gdBody?.code || 'unknown'}`);
+    return {
+      status: 'failed',
+      stage,
+      error: gdBody?.error || 'GD rejected signing key submission',
+      code: gdBody?.code,
+      gdStatus: gdResp.status,
+    };
+  }
+
+  // ── Success: update gd_push_config bookkeeping ──
+  try {
+    db.prepare(`
+      UPDATE gd_push_config
+      SET handshake_status = 'pending_approval',
+          pending_signing_key_id = ?,
+          last_handshake_at = datetime('now'),
+          updated_at = datetime('now')
+      WHERE id = 1
+    `).run(staged.id);
+  } catch (err) {
+    // Submission succeeded on the GD; local bookkeeping failed. Don't
+    // roll back the staged row (the GD has it). Surface for manual fix.
+    logger.error('GD config handshake: post-submit bookkeeping failed', {
+      error: err.message,
+      stagedId: staged.id,
+      gdAccepted: true,
+    });
+    auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED',
+      `stage=post_submit_bookkeeping stagedId=${staged.id} note=GD_ACCEPTED_BUT_LOCAL_BOOKKEEPING_FAILED reason=${err.message.slice(0, 200)}`, req.ip);
+    return {
+      status: 'failed',
+      stage: 'post_submit_bookkeeping',
+      error: 'Submission succeeded on GD but local state update failed; check gd_push_config row manually',
+      stagedKeyId: staged.id,
+      fingerprint: staged.publicKeyFingerprint,
+    };
+  }
+
+  auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FIRED',
+    `stagedId=${staged.id} fingerprint=${staged.publicKeyFingerprint} gdStatus=${gdResp.status}`, req.ip);
+  return {
+    status: 'pending_approval',
+    stagedKeyId: staged.id,
+    fingerprint: staged.publicKeyFingerprint,
+    handshakeNote: 'Awaiting CISO approval on the GD side. The next push tick will poll for status and commit (or roll back) the staged keypair when the CISO decides.',
+  };
+}
+
+// Best-effort rollback for the staged row when the GD submission fails.
+// Rollback errors are logged but don't change the response returned to
+// the operator — the original handshake failure is what they need to
+// act on.
+function rollbackAndAuditHandshake(db, staged, req, stage, reason) {
+  try {
+    signingKeysSvc.rollbackStagedKeypair(db, staged.id);
+  } catch (rbErr) {
+    logger.error('GD config handshake: rollback failed', {
+      error: rbErr.message,
+      stagedId: staged.id,
+    });
+  }
+  auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED',
+    `stage=${stage} stagedId=${staged.id} fingerprint=${staged.publicKeyFingerprint} rolledBack=true reason=${reason.slice(0, 300)}`, req.ip);
+}
+
 // ── PUT /api/gd-config ────────────────────────────────────────────────────
 // Request body fields, all optional except where noted:
 //   enabled                  — boolean
@@ -183,13 +468,19 @@ router.get('/', (req, res) => {
 //   api_key                  — plaintext API key from POST /api/mc/register on
 //                              the GD-Server. If present, it is encrypted at
 //                              rest. Omit to leave the existing key in place.
+//                              Setting api_key requires a paired mc_id (either
+//                              in this same PUT or already stored).
+//   mc_id                    — the GD-side identifier for this MC, returned
+//                              by /api/mc/register alongside the api_key.
+//                              ASCII-safe (letters, digits, hyphens,
+//                              underscores), max 128 chars. R3g PR3 Phase 5.
 //   clear_api_key            — boolean; if true, clears the stored key (overrides api_key)
 //   push_interval_minutes    — 1-1440
 //   retry_max                — 0-10
 //   retry_backoff_seconds    — 1-3600
 //   reset_failure_counter    — boolean; if true, sets consecutive_failures=0.
 //                              Used after the circuit breaker has tripped.
-router.put('/', (req, res) => {
+router.put('/', async (req, res) => {
   const body = req.body || {};
   const db = getDb();
 
@@ -231,6 +522,31 @@ router.put('/', (req, res) => {
         const v = validateEndpointUrl(body.endpoint_url);
         if (!v.ok) { db.close(); return res.status(400).json({ error: v.error }); }
         updates.push('endpoint_url = ?');
+        params.push(v.value);
+      }
+    }
+
+    // mc_id — R3g PR3 Phase 5 (C24). The GD-side identifier the MC submits
+    // its signing key under. Validated independently here; the cross-field
+    // rule that an api_key change requires a paired mc_id is enforced below.
+    if (body.mc_id !== undefined) {
+      if (body.mc_id === '' || body.mc_id === null) {
+        // Allow clearing only if no api_key is set on the post-update state.
+        // If api_key remains set without mc_id, the MC can't construct the
+        // path-bound submission URL and the trust handshake is unworkable.
+        const willKeyBeSet = body.clear_api_key === true
+          ? false
+          : (body.api_key !== undefined ? true : !!current.api_key_encrypted);
+        if (willKeyBeSet) {
+          db.close();
+          return res.status(400).json({ error: 'Cannot clear mc_id while api_key is set; clear api_key first or set a new mc_id' });
+        }
+        updates.push('mc_id = ?');
+        params.push(null);
+      } else {
+        const v = validateMcId(body.mc_id);
+        if (!v.ok) { db.close(); return res.status(400).json({ error: v.error }); }
+        updates.push('mc_id = ?');
         params.push(v.value);
       }
     }
@@ -315,6 +631,34 @@ router.put('/', (req, res) => {
       }
     }
 
+    // ── Cross-field: setting api_key requires a paired mc_id (R3g PR3 Phase 5)
+    //
+    // Without mc_id, the MC cannot construct the path-bound URL
+    // /api/mc/<mc_id>/signing-key required by the GD's C18 endpoint to
+    // submit a public key. Accepting an api_key change without mc_id would
+    // leave the MC in a state where it has credentials but cannot do
+    // anything with them — the next handshake attempt would fail with a
+    // routing error.
+    //
+    // The mc_id can come from either:
+    //   - This same PUT body (body.mc_id is a non-empty string), OR
+    //   - The currently-stored row (current.mc_id is non-empty)
+    //
+    // Reject only when api_key is being set AND no mc_id is available
+    // through either source.
+    const apiKeyBeingSet = body.api_key !== undefined && body.clear_api_key !== true;
+    if (apiKeyBeingSet) {
+      const finalMcId = body.mc_id !== undefined
+        ? (body.mc_id || null)
+        : current.mc_id;
+      if (!finalMcId) {
+        db.close();
+        return res.status(400).json({
+          error: 'mc_id is required when setting api_key — provide it alongside the api_key from /api/mc/register, or set mc_id first'
+        });
+      }
+    }
+
     if (updates.length === 0) {
       db.close();
       return res.status(400).json({ error: 'No fields to update' });
@@ -329,7 +673,25 @@ router.put('/', (req, res) => {
       req.ip);
 
     const updated = readConfigRow(db);
-    res.json(sanitizeForResponse(updated));
+
+    // R3g PR3 Phase 5 (C27): auto-fire the initial handshake if conditions
+    // are met. Returns null if not eligible (e.g. handshake already in
+    // flight or completed, or one of the three identity fields still
+    // missing). Failures here do NOT invalidate the config save — the
+    // operator's intent (storing endpoint/mc_id/api_key) was honored;
+    // the handshake outcome is reported as a separate field.
+    const handshake = await fireInitialHandshakeIfReady(db, updated, req);
+
+    // Re-read AFTER the handshake; on success it updated handshake_status,
+    // pending_signing_key_id, and last_handshake_at, which the operator
+    // UI needs visible in the response.
+    const final = handshake && handshake.status === 'pending_approval'
+      ? readConfigRow(db)
+      : updated;
+
+    const responseBody = sanitizeForResponse(final, db);
+    if (handshake) responseBody.handshake = handshake;
+    res.json(responseBody);
   } catch (err) {
     logger.error('GD config update error', { error: err.message });
     res.status(500).json({ error: 'Failed to update GD push configuration' });

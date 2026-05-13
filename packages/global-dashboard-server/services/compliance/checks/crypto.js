@@ -12,11 +12,26 @@
 //
 // PLATFORM STATE NOTES (GD-specific gaps relative to MC)
 //
-//   - GD has no backup_signing_keys table. Backups are SHA-256-hashed
-//     (backups.hash column) but the hashes are not cryptographically
-//     signed; there is no Ed25519 key registry on the GD side. The MC
-//     PR1 implementation of checkKeyRotation queries that registry;
-//     the GD version returns 'warning' surfacing the absence.
+//   - GD has no backup_signing_keys table. GD-side backups are
+//     SHA-256-hashed (backups.hash column) but the hashes are not
+//     cryptographically signed; there is no Ed25519 key registry for
+//     GD's own backup manifests. The MC PR1 implementation of
+//     checkKeyRotation queries that registry; the GD version returns
+//     'warning' surfacing the absence. (Distinct from the signing_keys
+//     table below, which holds MC public keys for verifying inbound
+//     pushes — not GD's own signing material.)
+//   - R3g PR3 (this PR) SHIPPED the signing_keys table: a per-MC public-
+//     key registry for verifying inbound metrics and compliance-report
+//     pushes. Each row tracks one MC's Ed25519 public key with
+//     approval_status ('pending_approval' | 'approved' | 'rejected'),
+//     gated by manual CISO or signing_key_approver review per ISO
+//     27001 A.6.1.2 role segregation. Cryptographic trust
+//     establishment requires manual CISO approval per role
+//     segregation policy (ISO 27001 A.6.1.2). The signing_keys
+//     registry's health is surfaced by checkSigningKeyRegistry in
+//     checks/third-party.js; this file's checkKeyRotation focuses on
+//     GD's own cryptographic posture (JWT secret) and cross-references
+//     the MC-trust registry rather than re-evaluating it.
 //   - GD has no TIER1/TIER3 encryption keys. The GD doesn't have a
 //     tiered data-classification scheme — by design the GD holds only
 //     aggregate metrics (regional_metrics) and account data (users).
@@ -37,11 +52,16 @@
 // Check functions in this file use a tableExists() helper to gracefully
 // handle GD platform features that are planned but not yet shipped. As
 // later BUILD-PLAN-v16 phases land (a future GD KMS integration phase
-// for kms_providers, plus R3g PR3 for the MC-trust signing key
-// registry), the corresponding check functions automatically begin
-// reporting on real platform state without requiring code changes
+// for kms_providers), the corresponding check functions automatically
+// begin reporting on real platform state without requiring code changes
 // here. This pattern keeps the compliance library aligned with the
 // platform's roadmap rather than locked to a snapshot.
+//
+// R3g PR3 has SHIPPED the signing_keys table for MC-trust verification.
+// The forward-compatible skip-path for that registry has been replaced
+// with active evaluation in checks/third-party.js's
+// checkSigningKeyRegistry (Phase 9 / Commit 40). The remaining
+// forward-compat skip is checkKmsProvider's kms_providers branch.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -59,10 +79,8 @@ function tableExists(db, name) {
 }
 
 // ── checkKeyRotation ─────────────────────────────────────────────────────────
-// Verifies cryptographic key rotation posture. The GD does not currently
-// maintain a signing-key registry (no equivalent of MC's
-// backup_signing_keys table); the closest GD-side cryptographic keys
-// are:
+// Verifies cryptographic key rotation posture for the GD's OWN
+// cryptographic material. The GD has two relevant key surfaces:
 //
 //   - GD_JWT_SECRET: the HMAC key for signing JWTs. Set once at
 //     deployment via env var; no in-platform rotation mechanism.
@@ -72,14 +90,33 @@ function tableExists(db, name) {
 //     MC → GD push channel. Rotation cadence covered by
 //     checkApiKeyRotation in checks/access.js, not duplicated here.
 //
-// Honest gap: no rotation tracking on the GD side. SOC-grade
-// deployments rotate GD_JWT_SECRET on a documented cadence (typically
-// quarterly) with planned downtime; the platform does not currently
-// enforce or measure that cadence.
+// R3g PR3 added a THIRD signing-key surface: signing_keys (the
+// MC-public-key trust registry for verifying inbound pushes). That
+// registry's rotation pattern differs fundamentally — keys are
+// generated MC-side via POST /api/gd-signing-key/rotate, submitted
+// for GD-side review, and require manual CISO or
+// signing_key_approver approval before they become trusted
+// (approval_status='approved' AND is_active=1). Cryptographic trust
+// establishment requires manual CISO approval per role segregation
+// policy (ISO 27001 A.6.1.2). The rotation lifecycle is observable
+// to operators via GET /api/signing-keys/pending and GET
+// /api/mc/<id>/signing-keys (Commits 19-20). checkSigningKeyRegistry
+// in checks/third-party.js surfaces its health (including a stale-
+// pending signal at 7 days that flags neglected approval queues).
+// This check does not re-evaluate signing_keys; the registry
+// health belongs in third-party.js.
+//
+// Honest gap (unchanged by PR3): no rotation tracking on the GD side
+// for GD_JWT_SECRET itself. SOC-grade deployments rotate
+// GD_JWT_SECRET on a documented cadence (typically quarterly) with
+// planned downtime; the platform does not currently enforce or
+// measure that cadence.
 //
 // Maps to controls including: HIPAA 164.312(a)(2)(iv), SOC 2 CC6.7,
-// NIST CSF PR.DS-01, ISO 27001 A.8.24, NIST 800-53 SC-12, NIS2
-// Art.21(2)(h), DORA Art.9(3).
+// NIST CSF PR.DS-01, ISO 27001 A.8.24, A.6.1.2 (role segregation
+// for trust establishment, surfaced via signing_keys approval
+// workflow), NIST 800-53 SC-12, AC-5 (segregation of duties),
+// NIS2 Art.21(2)(h), DORA Art.9(3).
 function checkKeyRotation() {
   const jwtKeyConfigured = !!process.env.GD_JWT_SECRET && !process.env.GD_JWT_SECRET.startsWith('CHANGE_ME');
   if (!jwtKeyConfigured) {
@@ -90,7 +127,7 @@ function checkKeyRotation() {
   }
   return {
     status: 'warning',
-    detail: 'GD has no in-platform key rotation registry. Active cryptographic key is GD_JWT_SECRET (set via env var, persistent across restarts). Operator-managed rotation: regenerate secret and restart server (invalidates existing JWTs). SOC-grade norm is quarterly rotation; the platform does not currently track or enforce this cadence. MC-trust api_key rotation tracked separately by checkApiKeyRotation.',
+    detail: 'GD has no in-platform rotation registry for its own cryptographic material (GD_JWT_SECRET). Active key is GD_JWT_SECRET (set via env var, persistent across restarts). Operator-managed rotation: regenerate secret and restart server (invalidates existing JWTs). SOC-grade norm is quarterly rotation; the platform does not currently track or enforce this cadence. MC-trust api_key rotation tracked separately by checkApiKeyRotation. Inbound-push signing keys (signing_keys table, R3g PR3) have their own rotation lifecycle: MC-side generation, manual CISO/signing_key_approver approval, surfaced by checkSigningKeyRegistry in checks/third-party.js.',
   };
 }
 
@@ -108,8 +145,11 @@ function checkKeyRotation() {
 // strength below SOC-grade norms.
 //
 // Maps to controls including: HIPAA 164.312(a)(2)(iv), SOC 2 CC6.7
-// confidentiality, NIST CSF PR.DS-01, ISO 27001 A.8.24, NIST 800-53
-// SC-13 Cryptographic Protection, NIS2 Art.21(2)(h), DORA Art.9(3).
+// confidentiality, NIST CSF PR.DS-01, ISO 27001 A.8.24, A.6.1.2
+// (where signing_keys' approval workflow enforces role segregation
+// for trust-establishment cryptographic material), NIST 800-53
+// SC-13 Cryptographic Protection, AC-5 (segregation), NIS2
+// Art.21(2)(h), DORA Art.9(3).
 function checkAlgorithmStrength() {
   const jwtKey = process.env.GD_JWT_SECRET;
   if (!jwtKey || jwtKey.startsWith('CHANGE_ME')) {

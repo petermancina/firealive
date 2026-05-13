@@ -16,6 +16,8 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { getDb, initDb } = require('./db-init');
+const { verifyPushSignature } = require('./services/mc-signature-verifier');
+const signingKeysSvc = require('./services/signing-keys');
 
 const app = express();
 const PORT = process.env.GD_PORT || 4001;
@@ -25,7 +27,19 @@ const JWT_SECRET = process.env.GD_JWT_SECRET || crypto.randomBytes(32).toString(
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(compression());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+  limit: '10mb',
+  // R3g PR3: capture the raw request body for MC signature verification.
+  // The X-FA-Signature is computed by the MC over the raw body bytes;
+  // verification must hash exactly those bytes (not a re-canonicalized
+  // JSON serialization). express.json's verify hook runs before parsing
+  // and gets the raw Buffer — we stash it on req for downstream handlers.
+  // Applied app-wide because mc-signature-verifier may be called from
+  // any ingest route added later in PR3 (compliance summaries, mailbox
+  // poll, full-report fulfillment); a future per-route raw-body
+  // middleware would have to be remembered on every new ingest path.
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // Rate limiting on /api/. Mirrors the pattern in MC server/index.js to keep
 // both servers' DoS protection consistent. 1000 req per 15-minute window per
@@ -126,7 +140,18 @@ app.post('/api/auth/mfa-verify', (req, res) => {
 });
 
 // ── Regional MC Data Ingest (receives pushes from Regional Servers) ──────────
-// This is the PRIMARY data flow: Regional Servers push aggregate data here
+// This is the PRIMARY data flow: Regional Servers push aggregate data here.
+//
+// R3g PR3 (12 May 2026): every inbound push MUST carry a valid
+// X-FA-Signature. After api_key resolves to an MC, the verifier
+// (services/mc-signature-verifier.js) looks up the active row in the
+// signing_keys trust registry (mc_id + public_key_fingerprint header,
+// is_active = 1) and checks an Ed25519 signature over
+// `timestamp + "\n" + rawBody`. Strict mode: no grace period, no
+// backwards-compatibility flag — unsigned or invalid-signature pushes
+// reject with 401 and an INGEST_SIGNATURE_REJECTED audit event.
+// The MC handshake (added in Commit 13) ensures every newly-configured
+// GD-push connection registers its signing key before the first push.
 app.post('/api/ingest/metrics', (req, res) => {
   try {
     const { apiKey, metrics } = req.body;
@@ -134,6 +159,25 @@ app.post('/api/ingest/metrics', (req, res) => {
     // Verify the API key belongs to a registered MC
     const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
     if (!mc) { db.close(); return res.status(403).json({ error: 'Invalid or inactive MC API key' }); }
+
+    // R3g PR3: verify X-FA-Signature against the MC's active signing key.
+    // Runs AFTER api_key resolution because we need mc.id to scope the
+    // trust lookup (per-MC fingerprint registry; same fingerprint
+    // hypothetically reused across MCs still scopes correctly).
+    const sigResult = verifyPushSignature(db, {
+      mcId: mc.id,
+      headers: req.headers,
+      rawBody: req.rawBody,
+    });
+    if (!sigResult.ok) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
+        .run(`mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      db.close();
+      return res.status(401).json({
+        error: sigResult.error,
+        code: sigResult.code,
+      });
+    }
 
     // Store the aggregate metrics
     db.prepare(`INSERT INTO regional_metrics 
@@ -168,11 +212,481 @@ app.post('/api/ingest/metrics', (req, res) => {
     }
 
     db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('METRICS_INGESTED', ?, 'info')")
-      .run(`From ${mc.name}: health=${metrics.healthScore}, util=${metrics.utilization}%`);
+      .run(`From ${mc.name}: health=${metrics.healthScore}, util=${metrics.utilization}% fingerprint=${sigResult.fingerprint}`);
     db.close();
     res.json({ success: true, mc: mc.name });
   } catch (e) { console.error('Ingest error:', e); res.status(500).json({ error: 'Metrics ingest failed' }); }
 });
+
+// ── POST /api/ingest/compliance-reports — R3g PR3 Phase 6 (C30) ───────────
+//
+// Signed-push ingest endpoint for per-framework compliance summaries
+// pushed by the MC's _complianceTick (Commit 32, default 24h cadence).
+// Stores into mc_compliance_reports for hot-path CISO queries and trend
+// visibility; the cross_region_rollup materialization is updated in a
+// later Phase 6 commit.
+//
+// Body shape:
+//   {
+//     apiKey:    string,          // identifies the MC; resolved against
+//                                 // management_consoles.api_key
+//     framework: string,          // e.g. 'hipaa', 'soc2', 'nist_csf'
+//                                 // ASCII-safe, max 64 chars
+//     summary:   object           // { passed, total, perCategoryCounts,
+//                                 //   topFailingControls, generatedAt,
+//                                 //   digestHash } — stored as
+//                                 //   JSON.stringify'd into summary_json
+//   }
+//
+// Authentication: api_key resolves the MC. Signature verification via
+// verifyPushSignature (same machinery as /api/ingest/metrics; Phase 5's
+// C22 verifier accepts active key OR grace-window approved key).
+//
+// MULTI-FRAMEWORK: an MC submits one POST per framework per tick. Reports
+// for different frameworks accumulate as separate rows in
+// mc_compliance_reports; the lookup index (mc_id, framework, received_at
+// DESC) gives O(log n) "latest report per framework" queries.
+//
+// RETENTION: rows accumulate. A future retention policy may prune older
+// than N days; tracked in build plan as a deferred item.
+//
+// Returns:
+//   202 { success: true, mc, reportId } on accept
+//   401 { error, code }                on signature verification failure
+//   403 { error }                       on invalid api_key
+//   400 { error }                       on missing/invalid body fields
+//   500 { error }                       on storage failure
+//
+// Audit events:
+//   INGEST_SIGNATURE_REJECTED            severity=critical, sig verify fail
+//   COMPLIANCE_REPORT_INGESTED           severity=info, success
+//   COMPLIANCE_REPORT_INGEST_REJECTED    severity=warning, body validation fail
+//
+// Framework validation: same regex as mc_id / role inputs elsewhere —
+// /^[A-Za-z0-9_-]+$/ with length 1-64. Catches typos and weird input
+// without restricting to a hardcoded enumeration (frameworks are
+// extensible by operator policy; the GD admin UI surfaces whichever
+// frameworks have rows present).
+const COMPLIANCE_FRAMEWORK_PATTERN = /^[A-Za-z0-9_-]+$/;
+const COMPLIANCE_FRAMEWORK_MAX_LEN = 64;
+const COMPLIANCE_SUMMARY_MAX_BYTES = 64 * 1024;  // 64 KB cap on stringified summary
+// R3g PR3 Phase 7 (C35): cap for fulfilled full reports. The schema
+// comment estimates "tens of KB per framework × 16 frameworks"; 1 MB
+// per report leaves headroom for verbose verifiedControls + remediation
+// detail and customerResponsibility enumeration without inviting abuse.
+// The 30-day TTL on mc_compliance_report_fulls bounds storage growth.
+const COMPLIANCE_FULL_REPORT_MAX_BYTES = 1024 * 1024;
+
+// ── handleFullReportIngest — R3g PR3 Phase 7 (C35) ────────────────────────
+//
+// Dispatched from the /api/ingest/compliance-reports route when the
+// caller passes ?full=true. Closes the mailbox loop:
+//
+//   1. CISO requests via C33 -> mc_report_requests row, status='pending'
+//   2. MC polls via C34 -> sees the pending row
+//   3. MC generates full report locally, signs, POSTs HERE
+//   4. This handler:
+//      a. Validates the request exists + belongs to this MC + still pending
+//      b. Validates report payload (framework matches, body shape, size)
+//      c. INSERTs into mc_compliance_report_fulls (30-day TTL)
+//      d. UPDATEs mc_report_requests: status='fulfilled', fulfilled_at,
+//         fulfilled_report_id pointer
+//      e. UPSERTs cross_region_rollup with passed/total AND
+//         per_control_status (the full report has per-control
+//         granularity that summary pushes lack; C31's preservation
+//         logic lets this overwrite per_control_status while summary
+//         pushes leave it alone)
+//      f. Audits COMPLIANCE_FULL_REPORT_FULFILLED on success
+//
+// BODY SHAPE:
+//   {
+//     apiKey,
+//     requestId,    // integer or numeric string; mc_report_requests.id
+//     framework,    // must match the request's framework
+//     report        // object, the full generateComplianceReport output;
+//                   // expected fields: summary.{verified|passed|total},
+//                   // verifiedControls[]
+//   }
+//
+// AUTHENTICATION: api_key resolves MC; verifyPushSignature validates
+// signature. Same machinery as the summary ingest path. Re-implemented
+// here rather than extracted because the divergent body/storage logic
+// would dominate any shared helper anyway.
+//
+// IDEMPOTENCY: Re-POST of the same requestId after successful
+// fulfillment returns 409 Conflict. Reasoning: the MC's C36 logic
+// already cleaned up its local state on the first success; a second
+// attempt is either a retry where the first response was lost (rare,
+// recoverable by the MC catching 409 as success) or a bug. We prefer
+// the explicit 409 over silently inserting a duplicate full-report
+// row.
+//
+// CROSS-MC SCOPING: If requestId exists but belongs to a different MC,
+// return 404 — same code as nonexistent requestId. Mirrors the C20
+// admin endpoint's cross-MC enumeration closure pattern.
+//
+// FRAMEWORK MUST MATCH: The framework in the body must equal the
+// framework recorded in the request row. Catches MC bugs (submitting
+// wrong-framework report for a request) without losing the request to
+// fulfillment.
+function handleFullReportIngest(req, res) {
+  let db;
+  try {
+    const { apiKey, requestId, framework, report } = req.body || {};
+    db = getDb();
+
+    // ── Validate apiKey type before SQL ──
+    // node:sqlite throws on undefined parameters. Validate the type up
+    // front so callers passing an empty body get a clean 400 rather
+    // than a defensive 500 from the outer catch.
+    if (!apiKey || typeof apiKey !== 'string') {
+      db.close();
+      return res.status(400).json({
+        error: 'apiKey is required',
+        code: 'MISSING_API_KEY',
+      });
+    }
+
+    // ── Resolve MC ──
+    const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
+    if (!mc) {
+      db.close();
+      return res.status(403).json({ error: 'Invalid or inactive MC API key' });
+    }
+
+    // ── Verify signature ──
+    const sigResult = verifyPushSignature(db, {
+      mcId: mc.id,
+      headers: req.headers,
+      rawBody: req.rawBody,
+    });
+    if (!sigResult.ok) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
+        .run(`endpoint=compliance-reports-full mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      db.close();
+      return res.status(401).json({ error: sigResult.error, code: sigResult.code });
+    }
+
+    // ── Validate requestId ──
+    let requestIdNum;
+    if (typeof requestId === 'number' && Number.isInteger(requestId) && requestId > 0) {
+      requestIdNum = requestId;
+    } else if (typeof requestId === 'string' && /^[1-9][0-9]*$/.test(requestId)) {
+      requestIdNum = parseInt(requestId, 10);
+    } else {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=invalid_request_id fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'requestId is required and must be a positive integer' });
+    }
+
+    // ── Validate framework ──
+    if (typeof framework !== 'string' || !framework.trim()) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=missing_framework fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'framework is required and must be a non-empty string' });
+    }
+    const fw = framework.trim();
+    if (fw.length > COMPLIANCE_FRAMEWORK_MAX_LEN || !COMPLIANCE_FRAMEWORK_PATTERN.test(fw)) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({
+        error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${COMPLIANCE_FRAMEWORK_MAX_LEN} chars`,
+      });
+    }
+
+    // ── Validate report object ──
+    if (!report || typeof report !== 'object' || Array.isArray(report)) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=missing_or_invalid_report fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'report is required and must be an object' });
+    }
+    let reportJson;
+    try { reportJson = JSON.stringify(report); }
+    catch (jsonErr) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_not_serializable fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'report contains values that cannot be JSON-serialized' });
+    }
+    if (reportJson.length > COMPLIANCE_FULL_REPORT_MAX_BYTES) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_too_large bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({
+        error: `report exceeds maximum size of ${COMPLIANCE_FULL_REPORT_MAX_BYTES} bytes`,
+      });
+    }
+
+    // ── Look up the request row + enforce belongs-to-MC + still-pending ──
+    const requestRow = db.prepare(`
+      SELECT id, mc_id, framework, status
+      FROM mc_report_requests
+      WHERE id = ?
+    `).get(requestIdNum);
+    if (!requestRow || requestRow.mc_id !== mc.id) {
+      // Collapse "doesn't exist" and "exists but belongs to a different MC"
+      // into the same 404 so an attacker can't enumerate other MCs'
+      // request IDs.
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=request_not_found_for_mc fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(404).json({ error: 'requestId not found for this MC' });
+    }
+    if (requestRow.framework !== fw) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} body_framework=${fw} request_framework=${requestRow.framework} reason=framework_mismatch fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({
+        error: `framework mismatch: request expects ${requestRow.framework}, body has ${fw}`,
+      });
+    }
+    if (requestRow.status !== 'pending') {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} request_status=${requestRow.status} reason=request_not_pending fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(409).json({
+        error: `request is no longer pending (status=${requestRow.status})`,
+        code: 'NOT_PENDING',
+      });
+    }
+
+    // ── Insert the full report ──
+    const fullResult = db.prepare(`
+      INSERT INTO mc_compliance_report_fulls
+        (mc_id, framework, report_json, signature_fingerprint)
+      VALUES (?, ?, ?, ?)
+    `).run(mc.id, fw, reportJson, sigResult.fingerprint);
+    const fullReportId = fullResult.lastInsertRowid;
+
+    // ── Mark the request fulfilled ──
+    db.prepare(`
+      UPDATE mc_report_requests
+      SET status = 'fulfilled',
+          fulfilled_at = datetime('now'),
+          fulfilled_report_id = ?
+      WHERE id = ?
+    `).run(fullReportId, requestIdNum);
+
+    // ── Update cross_region_rollup (refresh aggregates AND per_control_status) ──
+    // The full report has per-control granularity that summary pushes
+    // lack. This UPSERT updates passed/total/last_push_at AND
+    // per_control_status from the verifiedControls — overwriting any
+    // prior per_control_status value with the freshest data. Subsequent
+    // summary pushes (C31) deliberately leave per_control_status alone.
+    let rollupUpdated = false;
+    try {
+      const verified = report.summary?.verified || {};
+      const fallback = report.summary || {};
+      const rawPassed = (verified.passed !== undefined ? verified.passed : fallback.passed);
+      const rawTotal = (verified.total !== undefined ? verified.total : fallback.total);
+      const passedNum = Number(rawPassed);
+      const totalNum = Number(rawTotal);
+      const passed = (Number.isFinite(passedNum) && passedNum >= 0) ? Math.floor(passedNum) : 0;
+      const total = (Number.isFinite(totalNum) && totalNum >= 0) ? Math.floor(totalNum) : 0;
+
+      // Build {controlId: status} from verifiedControls
+      const perControl = {};
+      if (Array.isArray(report.verifiedControls)) {
+        for (const c of report.verifiedControls) {
+          if (c && typeof c.controlId === 'string' && typeof c.status === 'string') {
+            perControl[c.controlId] = c.status;
+          }
+        }
+      }
+      const perControlJson = JSON.stringify(perControl);
+
+      db.prepare(`
+        INSERT INTO cross_region_rollup (framework, mc_id, passed, total, per_control_status, last_push_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(framework, mc_id) DO UPDATE SET
+          passed             = excluded.passed,
+          total              = excluded.total,
+          per_control_status = excluded.per_control_status,
+          last_push_at       = excluded.last_push_at
+      `).run(fw, mc.id, passed, total, perControlJson);
+      rollupUpdated = true;
+    } catch (rollupErr) {
+      console.error('cross_region_rollup update failed (full report):', rollupErr.message);
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_ROLLUP_UPDATE_FAILED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} fullReportId=${fullReportId} reason=${rollupErr.message.slice(0, 200)}`);
+    }
+
+    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_FULFILLED', ?, 'info')")
+      .run(`From ${mc.name}: framework=${fw} requestId=${requestIdNum} fullReportId=${fullReportId} bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`);
+    db.close();
+
+    return res.status(202).json({
+      success: true,
+      mc: mc.name,
+      requestId: requestIdNum,
+      fullReportId,
+      framework: fw,
+    });
+  } catch (e) {
+    console.error('Full-report ingest error:', e);
+    try { if (db) db.close(); } catch (_) {}
+    return res.status(500).json({ error: 'Full report ingest failed' });
+  }
+}
+
+app.post('/api/ingest/compliance-reports', (req, res) => {
+  // R3g PR3 Phase 7 (C35): dispatch to the full-report handler when the
+  // caller signals fulfillment intent. Validation/auth duplication between
+  // the two paths is acceptable; the divergent body shapes + storage
+  // logic dominate any shared helper.
+  if (req.query?.full === 'true') {
+    return handleFullReportIngest(req, res);
+  }
+  try {
+    const { apiKey, framework, summary } = req.body || {};
+    const db = getDb();
+
+    // ── Resolve MC by api_key ──
+    const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
+    if (!mc) {
+      db.close();
+      return res.status(403).json({ error: 'Invalid or inactive MC API key' });
+    }
+
+    // ── Verify signature (must come after mc resolution; trust lookup is per-MC) ──
+    const sigResult = verifyPushSignature(db, {
+      mcId: mc.id,
+      headers: req.headers,
+      rawBody: req.rawBody,
+    });
+    if (!sigResult.ok) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
+        .run(`endpoint=compliance-reports mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      db.close();
+      return res.status(401).json({
+        error: sigResult.error,
+        code: sigResult.code,
+      });
+    }
+
+    // ── Validate body shape ──
+    if (typeof framework !== 'string' || !framework.trim()) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=missing_framework fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'framework is required and must be a non-empty string' });
+    }
+    const fw = framework.trim();
+    if (fw.length > COMPLIANCE_FRAMEWORK_MAX_LEN || !COMPLIANCE_FRAMEWORK_PATTERN.test(fw)) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({
+        error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${COMPLIANCE_FRAMEWORK_MAX_LEN} chars`,
+      });
+    }
+    if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=missing_or_invalid_summary fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'summary is required and must be an object' });
+    }
+
+    let summaryJson;
+    try {
+      summaryJson = JSON.stringify(summary);
+    } catch (jsonErr) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_not_serializable fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'summary contains values that cannot be JSON-serialized (e.g., circular references)' });
+    }
+    if (summaryJson.length > COMPLIANCE_SUMMARY_MAX_BYTES) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_too_large bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({
+        error: `summary exceeds maximum size of ${COMPLIANCE_SUMMARY_MAX_BYTES} bytes (use the full-report mailbox pattern for larger payloads)`,
+      });
+    }
+
+    // ── Insert ──
+    const result = db.prepare(`
+      INSERT INTO mc_compliance_reports
+        (mc_id, framework, summary_json, signature_fingerprint)
+      VALUES (?, ?, ?, ?)
+    `).run(mc.id, fw, summaryJson, sigResult.fingerprint);
+
+    // ── R3g PR3 Phase 6 (C31): refresh cross_region_rollup materialization ──
+    //
+    // The rollup table holds one row per (framework, mc_id) materializing
+    // the LATEST aggregate pass/total counts so CISO interactive queries
+    // ("Show me all MCs' status for Framework X") are O(N MCs) lookups
+    // rather than scans of mc_compliance_reports history. Every successful
+    // ingest refreshes that row so CISO queries see fresh data without
+    // waiting on a separate rollup-build job.
+    //
+    // FIELD MAPPING from the summary payload:
+    //   summary.passed -> rollup.passed   (defaulted to 0 if missing/NaN)
+    //   summary.total  -> rollup.total    (same)
+    //   datetime('now') -> last_push_at
+    //
+    // per_control_status is DELIBERATELY NOT TOUCHED from a summary push.
+    // The summary payload only carries aggregates (passed/total) plus
+    // perCategoryCounts + topFailingControls[3] — NOT per-control
+    // granularity. Per-control drill-down comes from the full-report
+    // mailbox pattern (mc_compliance_report_fulls, populated in Phase 7),
+    // which sets per_control_status when a CISO-requested full report
+    // arrives. Overwriting per_control_status with NULL or stale data
+    // from a summary push would erase the most recent drill-down data
+    // the CISO has, so the UPSERT preserves the existing value.
+    //
+    // ROLLUP FAILURE IS NON-FATAL. If the UPSERT throws (FK violation
+    // during MC offboarding race, disk full, etc.), the summary remains
+    // stored in mc_compliance_reports and the operator sees the audit
+    // event with rollup_updated=false. The CISO query layer can fall back
+    // to "latest from history" via the idx_mc_compliance_reports_lookup
+    // index when the rollup is stale.
+    let rollupUpdated = false;
+    try {
+      // Defensive integer coercion — the summary may have been generated
+      // by a future MC version with passed/total as strings, or by a
+      // misbehaving generator that omits them entirely.
+      const rawPassed = (summary.passed !== undefined && summary.passed !== null) ? Number(summary.passed) : 0;
+      const rawTotal = (summary.total !== undefined && summary.total !== null) ? Number(summary.total) : 0;
+      const passed = (Number.isFinite(rawPassed) && rawPassed >= 0) ? Math.floor(rawPassed) : 0;
+      const total = (Number.isFinite(rawTotal) && rawTotal >= 0) ? Math.floor(rawTotal) : 0;
+
+      db.prepare(`
+        INSERT INTO cross_region_rollup (framework, mc_id, passed, total, last_push_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(framework, mc_id) DO UPDATE SET
+          passed = excluded.passed,
+          total = excluded.total,
+          last_push_at = excluded.last_push_at
+      `).run(fw, mc.id, passed, total);
+      rollupUpdated = true;
+    } catch (rollupErr) {
+      console.error('cross_region_rollup update failed:', rollupErr.message);
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_ROLLUP_UPDATE_FAILED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reportId=${result.lastInsertRowid} reason=${rollupErr.message.slice(0, 200)}`);
+    }
+
+    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGESTED', ?, 'info')")
+      .run(`From ${mc.name}: framework=${fw} reportId=${result.lastInsertRowid} bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`);
+    db.close();
+
+    return res.status(202).json({
+      success: true,
+      mc: mc.name,
+      reportId: result.lastInsertRowid,
+      framework: fw,
+    });
+  } catch (e) {
+    console.error('Compliance ingest error:', e);
+    res.status(500).json({ error: 'Compliance report ingest failed' });
+  }
+});
+
 
 // ── Management Console Registration ──────────────────────────────────────────
 app.post('/api/mc/register', authMiddleware(['ciso', 'vp']), (req, res) => {
@@ -209,6 +723,1032 @@ app.put('/api/mc/:id/offboard', authMiddleware(['ciso']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'MC offboarding failed' }); }
 });
 
+// ── MC Signing Key Registration (R3g PR3 Phase 5) ────────────────────────────
+//
+// POST /api/mc/:id/signing-key
+//   Body: { apiKey, public_key, public_key_fingerprint }
+//
+// Called by an MC during its first GD-push handshake (and on every
+// subsequent rotation handshake) to submit its Ed25519 public key to
+// the GD's trust registry. UNDER R3g PR3 PHASE 5 (manual CISO approval),
+// the row lands in signing_keys with approval_status='pending_approval'
+// and is_active=0. NEVER auto-activated under any code path. A user
+// holding the 'ciso' or 'signing_key_approver' role reviews the
+// fingerprint out-of-band with the MC operator and clicks approve
+// (POST /api/mc/:id/signing-keys/:keyId/approve, landing in Commit 19)
+// or reject. Only an approved row is consulted by mc-signature-verifier
+// (Commit 22) when verifying inbound pushes.
+//
+// REPLACES the C13 hot-fix 503 that gated the endpoint while this
+// gold-standard flow was being built. Foundational Rule 22 (BUILD-PLAN-
+// v18): trust establishment requires authentication an api_key thief
+// wouldn't have. api_key in the body authenticates "which MC is
+// claiming this submission"; manual CISO approval is the trust
+// authentication.
+//
+// AUTHENTICATION + DEFENSIVE :id CHECK
+//
+// api_key in the body resolves to the MC. The :id path parameter MUST
+// match the resolved mc.id. This check is NOT the security control —
+// api_key already scopes the submission to one MC; the :id match
+// catches client-side configuration bugs early (the MC operator
+// configured the wrong mc_id locally) with a clear 403 error rather
+// than letting the submission silently land against the api_key's MC.
+//
+// IDEMPOTENCY (delegated to signing-keys service)
+//
+//   - Existing pending row with same fingerprint: 200 OK,
+//     action=idempotent_pending. Handshake re-runs (which happen on
+//     every gd-config PUT) don't churn the table.
+//   - Existing approved active row with same fingerprint: 200 OK,
+//     action=idempotent_approved. Re-submitting the currently-trusted
+//     key is a no-op.
+//   - Different fingerprint, no existing matching row: 202 Accepted,
+//     action=submitted. Row lands pending; CISO must approve.
+//   - Existing fingerprint previously ROTATED OUT: 409 Conflict.
+//     Fresh trust requires fresh keys.
+//   - Existing fingerprint previously REJECTED: 409 Conflict.
+//     A rejection is a deliberate CISO decision; re-submitting the
+//     same bytes implies retrying that decision.
+//
+// FINGERPRINT VALIDATION
+//
+// The signing-keys service recomputes the fingerprint from the
+// supplied public_key and rejects mismatch (400 FINGERPRINT_MISMATCH).
+// Prevents the class of bug where a caller-supplied fingerprint
+// disagrees with the actual key bytes — which would silently work at
+// submission time and then fail at verification time when the verifier
+// hashes the real bytes.
+//
+// AUDIT EVENTS
+//
+//   MC_SIGNING_KEY_SUBMITTED       — successful submit/idempotent path,
+//                                    severity=info, detail carries mc,
+//                                    keyId, fingerprint, action.
+//   MC_SIGNING_KEY_SUBMIT_REJECTED — validation/auth failure,
+//                                    severity=warning, detail carries
+//                                    api_key-resolved mc (or 'unknown'),
+//                                    path :id, error code.
+app.post('/api/mc/:id/signing-key', (req, res) => {
+  let db;
+  try {
+    const { apiKey, public_key, public_key_fingerprint } = req.body || {};
+    db = getDb();
+
+    // Always audit the attempt — successful and failed paths both
+    // write one INSERT so response timing is similar regardless of
+    // input validity (no oracle leak on api_key validity).
+    const auditWarn = (mcLabel, code, extra = '') =>
+      db.prepare(
+        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_SUBMIT_REJECTED', ?, 'warning')"
+      ).run(
+        `attempted_mc=${mcLabel} path_id=${req.params.id || 'none'} code=${code}${extra ? ' ' + extra : ''}`
+      );
+
+    if (!apiKey || !public_key || !public_key_fingerprint) {
+      auditWarn('unknown', 'MISSING_FIELDS');
+      db.close();
+      return res.status(400).json({
+        error: 'apiKey, public_key, and public_key_fingerprint are required',
+        code: 'MISSING_FIELDS',
+      });
+    }
+
+    const mc = db.prepare(
+      "SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'"
+    ).get(apiKey);
+    if (!mc) {
+      auditWarn('unknown', 'INVALID_API_KEY');
+      db.close();
+      return res.status(403).json({
+        error: 'Invalid or inactive MC API key',
+        code: 'INVALID_API_KEY',
+      });
+    }
+
+    if (mc.id !== req.params.id) {
+      auditWarn(`${mc.name} (${mc.id})`, 'MC_ID_MISMATCH', `path_id=${req.params.id}`);
+      db.close();
+      return res.status(403).json({
+        error: 'API key does not match path mc_id',
+        code: 'MC_ID_MISMATCH',
+      });
+    }
+
+    // Delegate to the service. submitPending enforces fingerprint
+    // recomputation, state-machine invariants, and idempotency rules.
+    let result;
+    try {
+      result = signingKeysSvc.submitPending(db, {
+        mcId: mc.id,
+        publicKey: public_key,
+        publicKeyFingerprint: public_key_fingerprint,
+      });
+    } catch (svcErr) {
+      if (svcErr instanceof signingKeysSvc.SigningKeysError) {
+        const C = signingKeysSvc.CODES;
+        let status;
+        switch (svcErr.code) {
+          case C.INVALID_INPUT:
+          case C.INVALID_PEM:
+          case C.FINGERPRINT_MISMATCH:
+            status = 400; break;
+          case C.MC_NOT_FOUND:
+            status = 403; break;
+          case C.KEY_PREVIOUSLY_ROTATED:
+          case C.KEY_PREVIOUSLY_REJECTED:
+          case C.INVALID_STATE:
+            status = 409; break;
+          default:
+            status = 500;
+        }
+        auditWarn(`${mc.name} (${mc.id})`, svcErr.code);
+        db.close();
+        const body = { error: svcErr.message, code: svcErr.code };
+        // FINGERPRINT_MISMATCH surfaces the server-computed fingerprint
+        // so the client can correct its calculation.
+        if (svcErr.code === C.FINGERPRINT_MISMATCH && svcErr.details && svcErr.details.computed) {
+          body.computed_fingerprint = svcErr.details.computed;
+        }
+        return res.status(status).json(body);
+      }
+      // Non-typed error — log + 500.
+      console.error('signing-key submit unexpected error:', svcErr);
+      auditWarn(`${mc.name} (${mc.id})`, 'INTERNAL_ERROR');
+      db.close();
+      return res.status(500).json({ error: 'Signing key submission failed' });
+    }
+
+    // Success path. Action determines HTTP status:
+    //   submitted              -> 202 Accepted (new pending row created)
+    //   idempotent_pending     -> 200 OK (already pending; no state change)
+    //   idempotent_approved    -> 200 OK (already approved active)
+    db.prepare(
+      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_SUBMITTED', ?, 'info')"
+    ).run(
+      `mc=${mc.name} mc_id=${mc.id} keyId=${result.id} fingerprint=${result.fingerprint} action=${result.action}`
+    );
+
+    db.close();
+
+    const httpStatus = result.action === 'submitted' ? 202 : 200;
+    res.status(httpStatus).json({
+      status: result.action === 'idempotent_approved' ? 'approved' : 'pending_approval',
+      action: result.action,
+      keyId: result.id,
+      fingerprint: result.fingerprint,
+      message: result.action === 'submitted'
+        ? 'Awaiting administrator approval. Contact your CISO if approval is taking longer than expected.'
+        : result.action === 'idempotent_pending'
+        ? 'This key is already pending approval.'
+        : 'This key is already approved.',
+    });
+  } catch (e) {
+    console.error('Signing-key endpoint error:', e);
+    try { if (db) db.close(); } catch (_) {}
+    return res.status(500).json({ error: 'Signing key submission failed' });
+  }
+});
+
+// ── MC Signing Key Approval Workflow — Admin (R3g PR3 Phase 5) ──────────────
+//
+// Two endpoints exercising the human side of the manual CISO approval
+// flow introduced in Commit 18. Both require either the 'ciso' or the
+// 'signing_key_approver' role (added in Commit 15). The two-role
+// authorization set implements role segregation per ISO 27001 A.6.1.2
+// and NIST 800-53 AC-5: an organization can assign 'signing_key_approver'
+// to a user distinct from any 'ciso' so that whoever onboards an MC
+// (via POST /api/mc/register, which is 'ciso'/'vp') is not the same
+// person who establishes its cryptographic trust. Smaller orgs can
+// give both roles to one human; the audit log records each action with
+// the acting role distinctly so reviewers can see whether segregation
+// was actually exercised.
+//
+// POST /api/mc/:id/signing-keys/:keyId/approve
+//   Body: { confirmation_fingerprint?: string }  (optional)
+//
+// Approves a pending signing-key submission. The signing-keys service
+// performs the atomic state transition: any current is_active=1 row
+// for the same MC is demoted (is_active=0, rotated_out_at=now, BUT
+// approval_status STAYS 'approved' so the verifier's grace-window
+// query (Commit 22) can match it within the configured window) and
+// the target row is promoted (is_active=1, approval_status='approved',
+// approved_at, approved_by_user_id, approved_by_role).
+//
+// confirmation_fingerprint is an optional CISO-side double-check: if
+// provided, the server compares it to the keyId's stored fingerprint
+// and returns 400 on mismatch. Protects against UI mistakes — the
+// CISO pastes the fingerprint they verified out-of-band, and a UI
+// bug or copy-paste error that points the approve button at the wrong
+// row is caught here rather than silently approving the wrong key.
+//
+// POST /api/mc/:id/signing-keys/:keyId/reject
+//   Body: { reason: string }  (required, trimmed, ≤500 chars)
+//
+// Rejects a pending submission. Sets approval_status='rejected',
+// rejected_at, rejected_reason. Does NOT touch is_active (stays 0;
+// the row never becomes verifiable). The reason is INTERNAL ONLY:
+// it's captured in the GD audit log and visible through the
+// listForMc admin endpoint (Commit 20), but the MC-facing status-
+// query endpoint (Commit 21) returns only the bare 'rejected'
+// status with no reason — so an attacker probing the endpoint with
+// a stolen api_key cannot learn anything about the CISO's
+// operational reasoning.
+//
+// PATH PARAM VALIDATION
+//
+// :id MUST resolve to an active MC; otherwise 404 MC_NOT_FOUND.
+// :keyId is parsed as a positive integer; non-numeric returns 400
+// INVALID_KEY_ID. After service-level lookup, if the key's mc_id
+// doesn't equal :id, returns 404 KEY_NOT_FOUND (NOT 403 — collapsing
+// "wrong MC" and "doesn't exist" into one error code so cross-MC
+// keyId enumeration is closed off; an admin who can list pending
+// across all MCs gets the full picture through the C20 endpoint).
+//
+// AUDIT EVENTS
+//
+//   MC_SIGNING_KEY_APPROVED  severity=info; detail carries
+//                            user_id=<approver> role=<acting role>
+//                            mc=<name (id)> keyId=<n>
+//                            fingerprint=<hex> action=<approved_initial|
+//                            approved_replacement> [prior_keyId=<n>
+//                            prior_fingerprint=<hex>]
+//
+//   MC_SIGNING_KEY_REJECTED  severity=info; detail carries
+//                            user_id=<rejecter> role=<acting role>
+//                            mc=<name (id)> keyId=<n>
+//                            fingerprint=<hex> reason=<full reason text>
+
+function mapSigningSvcError(svcErr, CODES) {
+  if (!(svcErr instanceof signingKeysSvc.SigningKeysError)) {
+    return { status: 500, body: { error: 'Internal error' } };
+  }
+  const body = { error: svcErr.message, code: svcErr.code };
+  let status;
+  switch (svcErr.code) {
+    case CODES.INVALID_INPUT:
+    case CODES.INVALID_REASON:
+      status = 400; break;
+    case CODES.MC_NOT_FOUND:
+    case CODES.KEY_NOT_FOUND:
+      status = 404; break;
+    case CODES.INVALID_STATE:
+      status = 409; break;
+    default:
+      status = 500;
+  }
+  return { status, body };
+}
+
+app.post('/api/mc/:id/signing-keys/:keyId/approve',
+  authMiddleware(['ciso', 'signing_key_approver']),
+  (req, res) => {
+    let db;
+    try {
+      db = getDb();
+
+      const keyIdNum = parseInt(req.params.keyId, 10);
+      if (!Number.isInteger(keyIdNum) || keyIdNum <= 0 || String(keyIdNum) !== req.params.keyId) {
+        db.close();
+        return res.status(400).json({ error: 'keyId must be a positive integer', code: 'INVALID_KEY_ID' });
+      }
+
+      // Resolve the target row up front so we can validate :id binding
+      // and (optionally) check confirmation_fingerprint before the
+      // service call mutates state.
+      const target = db.prepare(`
+        SELECT id, mc_id, public_key_fingerprint, approval_status
+        FROM signing_keys WHERE id = ?
+      `).get(keyIdNum);
+
+      if (!target || target.mc_id !== req.params.id) {
+        // Collapsed: "doesn't exist" and "belongs to a different MC"
+        // both return 404 KEY_NOT_FOUND, closing cross-MC enumeration.
+        db.close();
+        return res.status(404).json({ error: 'signing key not found for this MC', code: 'KEY_NOT_FOUND' });
+      }
+
+      // Verify the MC is active. signing-keys service also enforces
+      // this, but we surface a clean 404 path-bound error here.
+      const mc = db.prepare("SELECT id, name, status FROM management_consoles WHERE id = ?").get(req.params.id);
+      if (!mc || mc.status !== 'active') {
+        db.close();
+        return res.status(404).json({ error: 'MC not found or not active', code: 'MC_NOT_FOUND' });
+      }
+
+      // Optional CISO-side double-check on fingerprint.
+      const supplied = (req.body || {}).confirmation_fingerprint;
+      if (supplied !== undefined && supplied !== null) {
+        if (typeof supplied !== 'string' || supplied.toLowerCase() !== target.public_key_fingerprint) {
+          db.prepare(
+            "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVE_BLOCKED', ?, 'warning')"
+          ).run(
+            req.user.id,
+            `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} reason=confirmation_fingerprint_mismatch`
+          );
+          db.close();
+          return res.status(400).json({
+            error: 'confirmation_fingerprint does not match the keyId\'s stored fingerprint',
+            code: 'CONFIRMATION_FINGERPRINT_MISMATCH',
+          });
+        }
+      }
+
+      let result;
+      try {
+        result = signingKeysSvc.approve(db, {
+          keyId: keyIdNum,
+          userId: req.user.id,
+          userRole: req.user.role,
+        });
+      } catch (svcErr) {
+        const mapped = mapSigningSvcError(svcErr, signingKeysSvc.CODES);
+        db.prepare(
+          "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVE_FAILED', ?, 'warning')"
+        ).run(
+          req.user.id,
+          `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`
+        );
+        db.close();
+        return res.status(mapped.status).json(mapped.body);
+      }
+
+      const priorTail = result.priorKeyId
+        ? ` prior_keyId=${result.priorKeyId} prior_fingerprint=${result.priorFingerprint}`
+        : '';
+      db.prepare(
+        "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVED', ?, 'info')"
+      ).run(
+        req.user.id,
+        `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} action=${result.action}${priorTail}`
+      );
+
+      db.close();
+      return res.json({
+        ok: true,
+        action: result.action,
+        keyId: result.keyId,
+        fingerprint: result.fingerprint,
+        priorKeyId: result.priorKeyId,
+        priorFingerprint: result.priorFingerprint,
+      });
+    } catch (e) {
+      console.error('signing-key approve error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Approve operation failed' });
+    }
+  }
+);
+
+app.post('/api/mc/:id/signing-keys/:keyId/reject',
+  authMiddleware(['ciso', 'signing_key_approver']),
+  (req, res) => {
+    let db;
+    try {
+      db = getDb();
+
+      const keyIdNum = parseInt(req.params.keyId, 10);
+      if (!Number.isInteger(keyIdNum) || keyIdNum <= 0 || String(keyIdNum) !== req.params.keyId) {
+        db.close();
+        return res.status(400).json({ error: 'keyId must be a positive integer', code: 'INVALID_KEY_ID' });
+      }
+
+      const { reason } = req.body || {};
+      if (!reason || typeof reason !== 'string' || !reason.trim()) {
+        db.close();
+        return res.status(400).json({ error: 'reason is required', code: 'INVALID_REASON' });
+      }
+
+      const target = db.prepare(`
+        SELECT id, mc_id, public_key_fingerprint, approval_status
+        FROM signing_keys WHERE id = ?
+      `).get(keyIdNum);
+
+      if (!target || target.mc_id !== req.params.id) {
+        db.close();
+        return res.status(404).json({ error: 'signing key not found for this MC', code: 'KEY_NOT_FOUND' });
+      }
+
+      const mc = db.prepare("SELECT id, name, status FROM management_consoles WHERE id = ?").get(req.params.id);
+      if (!mc || mc.status !== 'active') {
+        db.close();
+        return res.status(404).json({ error: 'MC not found or not active', code: 'MC_NOT_FOUND' });
+      }
+
+      let result;
+      try {
+        result = signingKeysSvc.reject(db, {
+          keyId: keyIdNum,
+          userId: req.user.id,
+          userRole: req.user.role,
+          reason,
+        });
+      } catch (svcErr) {
+        const mapped = mapSigningSvcError(svcErr, signingKeysSvc.CODES);
+        db.prepare(
+          "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_REJECT_FAILED', ?, 'warning')"
+        ).run(
+          req.user.id,
+          `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`
+        );
+        db.close();
+        return res.status(mapped.status).json(mapped.body);
+      }
+
+      // Reason captured verbatim in audit detail (internal only — never
+      // returned to MC).
+      db.prepare(
+        "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_REJECTED', ?, 'info')"
+      ).run(
+        req.user.id,
+        `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} reason=${reason.trim()}`
+      );
+
+      db.close();
+      return res.json({
+        ok: true,
+        keyId: result.keyId,
+        fingerprint: result.fingerprint,
+      });
+    } catch (e) {
+      console.error('signing-key reject error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Reject operation failed' });
+    }
+  }
+);
+
+// ── MC Signing Key Listing — Admin Discovery (R3g PR3 Phase 5) ──────────────
+//
+// Read-only complement to the approve/reject endpoints from Commit 19.
+// A CISO can't approve what they can't see, so these two endpoints
+// expose the discovery surface: the cross-MC list of pending
+// submissions awaiting review, and the per-MC full history of every
+// signing-key transition.
+//
+// GET /api/signing-keys/pending
+//
+//   Returns all rows with approval_status='pending_approval' across
+//   all active MCs, with mc.name joined in for display. For the
+//   CISO/signing_key_approver dashboard view — "what is awaiting my
+//   approval right now". Ordered newest-first via the service.
+//
+//   Response: { pending: [{ id, mcId, mcName, fingerprint,
+//                           submittedAt }] }
+//
+// GET /api/mc/:id/signing-keys?status=<filter>
+//
+//   Returns the full signing-key history for one MC, optionally
+//   filtered by approval_status. Used for forensic review — when a
+//   CISO wants to see "what trust events happened on MC-X" they get
+//   the complete row including rejected_reason. This is the only
+//   surface where rejected_reason is exposed; the MC-facing status
+//   endpoint (Commit 21) strips it.
+//
+//   Query param status (optional): pending_approval | approved |
+//                                    rejected
+//
+//   Response: { keys: [{ id, fingerprint, isActive, approvalStatus,
+//                        registeredAt, rotatedOutAt, approvedAt,
+//                        approvedByUserId, approvedByRole,
+//                        rejectedAt, rejectedReason, notes }] }
+//
+// AUTH: Both gated by authMiddleware(['ciso', 'signing_key_approver']).
+//       VP and readonly roles do NOT see these surfaces — the trust
+//       registry is sensitive enough that even passive read access is
+//       scoped to the two approval-capable roles. (PR4 may add a
+//       readonly variant if dashboards need broader visibility.)
+//
+// AUDIT: Read paths don't audit individual queries — high-volume
+//        dashboard refreshes would flood the audit log. The
+//        access-log middleware at the top of this file already
+//        records every authenticated request with user_id + path.
+
+app.get('/api/signing-keys/pending',
+  authMiddleware(['ciso', 'signing_key_approver']),
+  (req, res) => {
+    let db;
+    try {
+      db = getDb();
+      const pending = signingKeysSvc.listPending(db);
+      db.close();
+      return res.json({ pending });
+    } catch (e) {
+      console.error('signing-keys/pending list error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Failed to list pending signing keys' });
+    }
+  }
+);
+
+app.get('/api/mc/:id/signing-keys',
+  authMiddleware(['ciso', 'signing_key_approver']),
+  (req, res) => {
+    let db;
+    try {
+      db = getDb();
+
+      // Validate the path-bound MC exists and is active before the
+      // service call so we return a clean 404 with a path-aware
+      // error rather than letting MC_NOT_FOUND surface as a generic
+      // service error.
+      const mc = db.prepare("SELECT id, name, status FROM management_consoles WHERE id = ?").get(req.params.id);
+      if (!mc || mc.status !== 'active') {
+        db.close();
+        return res.status(404).json({ error: 'MC not found or not active', code: 'MC_NOT_FOUND' });
+      }
+
+      const statusFilter = req.query.status;
+      let keys;
+      try {
+        keys = signingKeysSvc.listForMc(db, req.params.id, statusFilter);
+      } catch (svcErr) {
+        const mapped = mapSigningSvcError(svcErr, signingKeysSvc.CODES);
+        db.close();
+        return res.status(mapped.status).json(mapped.body);
+      }
+
+      db.close();
+      return res.json({ mcId: mc.id, mcName: mc.name, keys });
+    } catch (e) {
+      console.error('mc signing-keys list error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Failed to list signing keys for MC' });
+    }
+  }
+);
+
+// ── MC Full-Report Request — CISO-Facing (R3g PR3 Phase 7 / C33) ───────────
+//
+// POST /api/mc/:id/full-report-requests
+//   Body: { framework }
+//
+// Half one of the mailbox pattern (Foundational Rule 21). A CISO clicking
+// "Request full report for Framework X from MC Y" in the GD UI invokes
+// this endpoint. The request is recorded with status='pending' in
+// mc_report_requests; the MC observes it on its next compliance tick
+// (Commit 36 polls GET /api/mc/me/pending-requests landed in Commit 34),
+// generates the full report locally, and POSTs it back via
+// /api/ingest/compliance-reports?full=true (Commit 35). The handler there
+// stores the report in mc_compliance_report_fulls with a 30-day TTL and
+// flips this row's status to 'fulfilled' with fulfilled_report_id set.
+//
+// WHY MAILBOX INSTEAD OF DIRECT FETCH FROM GD-TO-MC
+//
+// Foundational Rule 21 mandates strict one-way data flow from MC to GD.
+// The GD never initiates a connection to an MC — MCs are typically behind
+// corporate firewalls and the GD has no business punching through them.
+// All on-demand data exchange (this full-report flow, future similar
+// patterns) goes through the mailbox: GD writes a request, MC polls on
+// its own schedule, MC pushes the result. Latency between request and
+// fulfillment is bounded by the MC's compliance tick cadence (default 24h
+// but typically reduced when full-report requests are in flight).
+//
+// AUTHENTICATION
+//
+// Admin-only (CISO or VP role). The CISO is the typical caller; VPs may
+// invoke for organization-level reviews. The decoded JWT user id is
+// recorded in requested_by_user_id so the GD audit trail captures who
+// initiated each request.
+//
+// VALIDATION
+//
+//   - :id must resolve to an active MC. Inactive (offboarded) MCs reject
+//     with 404; the CISO probably looked at a stale list. Returning 410
+//     (Gone) would be more semantically correct but other endpoints in
+//     this file use 404 for offboarded; consistency wins.
+//
+//   - framework must match /^[A-Za-z0-9_-]+$/ and be ≤ 64 chars. Same
+//     pattern + cap as the /api/ingest/compliance-reports endpoint
+//     (Commit 30). Frameworks are extensible; the GD doesn't validate
+//     against a hardcoded enumeration. If the MC doesn't recognize the
+//     framework when it tries to generate, the fulfillment endpoint
+//     (Commit 35) gets a status='failed' response.
+//
+// IDEMPOTENCY
+//
+// Two CISO requests for the same (mc_id, framework) create TWO pending
+// rows. Each fulfills independently, producing two full-report rows. The
+// schema comment in mc_report_requests acknowledges this as a known
+// trade-off; deduplication at request-time is tracked as a deferred
+// improvement. Most operator UIs would gate the click in their client to
+// avoid double-requests, so this rarely manifests in practice.
+//
+// RESPONSE SHAPE (201 Created):
+//   {
+//     success: true,
+//     requestId,
+//     mc_id,
+//     framework,
+//     requested_at,
+//     status: 'pending'
+//   }
+//
+// ERROR PATHS:
+//   400 — missing or invalid framework
+//   401 — auth missing (handled by middleware)
+//   403 — auth role mismatch (handled by middleware)
+//   404 — MC not found or not active
+//   500 — storage failure
+
+const FULL_REPORT_FRAMEWORK_PATTERN = /^[A-Za-z0-9_-]+$/;
+const FULL_REPORT_FRAMEWORK_MAX_LEN = 64;
+
+app.post('/api/mc/:id/full-report-requests',
+  authMiddleware(['ciso', 'vp']),
+  (req, res) => {
+    let db;
+    try {
+      const { framework } = req.body || {};
+      const mcId = req.params.id;
+
+      if (typeof framework !== 'string' || !framework.trim()) {
+        return res.status(400).json({ error: 'framework is required and must be a non-empty string' });
+      }
+      const fw = framework.trim();
+      if (fw.length > FULL_REPORT_FRAMEWORK_MAX_LEN || !FULL_REPORT_FRAMEWORK_PATTERN.test(fw)) {
+        return res.status(400).json({
+          error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${FULL_REPORT_FRAMEWORK_MAX_LEN} chars`,
+        });
+      }
+
+      db = getDb();
+      const mc = db.prepare("SELECT id, name FROM management_consoles WHERE id = ? AND status = 'active'").get(mcId);
+      if (!mc) {
+        db.close();
+        return res.status(404).json({ error: 'MC not found or not active' });
+      }
+
+      const result = db.prepare(`
+        INSERT INTO mc_report_requests
+          (mc_id, framework, requested_by_user_id, status)
+        VALUES (?, ?, ?, 'pending')
+      `).run(mc.id, fw, req.user.id);
+
+      const row = db.prepare(`
+        SELECT id, mc_id, framework, requested_by_user_id, requested_at, status
+        FROM mc_report_requests WHERE id = ?
+      `).get(result.lastInsertRowid);
+
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_REQUESTED', ?, 'info')")
+        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} requestId=${row.id} requestedBy=${req.user.id}`);
+      db.close();
+
+      return res.status(201).json({
+        success: true,
+        requestId: row.id,
+        mc_id: row.mc_id,
+        framework: row.framework,
+        requested_at: row.requested_at,
+        status: row.status,
+      });
+    } catch (e) {
+      console.error('full-report request error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Failed to create full-report request' });
+    }
+  }
+);
+
+// ── MC Signing Key Status Query — MC-Facing (R3g PR3 Phase 5) ──────────────
+//
+// POST /api/mc/me/signing-key-status
+//   Body: { apiKey, keyId }
+//
+// Called by the MC's gd-push.js (rewrite landing in Commit 28) on every
+// push tick to check whether a pending signing-key submission has been
+// approved or rejected by the CISO. Returns the bare approval status
+// string and nothing else.
+//
+// WHY POST NOT GET
+//
+// The plan in R3G-DETAILED-PLAN-v7 originally specified GET with a
+// query-param api_key. Implementation uses POST with api_key in the
+// JSON body instead. Reasons:
+//
+//   1. CONSISTENCY: every other MC -> GD authenticated endpoint in
+//      this codebase puts api_key in the POST body (/api/mc/register,
+//      /api/ingest/metrics, /api/mc/:id/signing-key). Using GET with
+//      api_key in a query string would be the only outlier — and the
+//      one most likely to leak credentials.
+//
+//   2. CREDENTIAL HYGIENE: query strings are logged by every
+//      intermediate (load balancer, reverse proxy, CDN, the GD's own
+//      access-log middleware at the top of this file). An api_key
+//      in the URL ends up in places the api_key in the body does not.
+//
+//   3. RATE-LIMIT CONSUMPTION: the endpoint has a side effect (token
+//      bucket decrement). Strict REST would still call this GET, but
+//      since we're picking between GET-with-query-param-leak and
+//      POST-with-clean-body, POST is the lesser evil.
+//
+// The semantic shape is still "read the status" — the MC isn't
+// asking the GD to mutate state, it's asking the GD to report state.
+// The MC's gd-push.js will call this on every push tick and is
+// expected to handle 200 (status returned), 429 (rate limited),
+// 403 (api_key invalid), and 400 (bad input).
+//
+// MINIMAL SIGNAL — NO TIMESTAMPS, NO REASON, NO APPROVER IDENTITY
+//
+// Response on success is exactly { status: <string> } — nothing else.
+// No rejectedReason, no approvedAt, no approvedByUserId. An attacker
+// with a stolen MC api_key probing this endpoint cannot learn:
+//
+//   - Why a key was rejected (reason captured only in GD audit log
+//     and visible only via the C20 admin listing endpoints)
+//   - When the CISO acted (no timestamps surfaced)
+//   - Who acted (no approver identity surfaced)
+//   - Any pattern in CISO behavior across MCs (per-MC scoping below)
+//
+// CROSS-MC ENUMERATION CLOSURE
+//
+// If the supplied keyId doesn't belong to the resolved MC, the
+// response is { status: 'rejected' } — IDENTICAL to a genuinely
+// rejected key for this MC. Three states map to one response:
+//
+//   - keyId exists for this MC and is rejected -> { status: 'rejected' }
+//   - keyId exists for a DIFFERENT MC          -> { status: 'rejected' }
+//   - keyId doesn't exist anywhere             -> { status: 'rejected' }
+//
+// An attacker with a stolen api_key for MC-A cannot use this endpoint
+// to probe whether keyId N exists for MC-B, or which keyIds are
+// pending vs approved across MCs they don't have credentials for.
+// Every probe of an out-of-scope keyId looks identical to a probe of
+// an in-scope rejected key.
+//
+// RATE LIMITING
+//
+// signingKeysSvc.checkRateLimit(mcId, keyId) — token bucket capacity
+// 5, refill 1/min per (mcId, keyId) tuple. A well-behaved MC polls
+// this once per push tick (default 15min metrics or 24h compliance),
+// well under the sustained rate. An attacker probing the endpoint
+// at high frequency exhausts the bucket after 5 bursts and gets 429
+// with Retry-After.
+//
+// CONSTANT-TIME RESPONSE SHAPE
+//
+// Success and rate-limit paths both write similar audit logs and
+// return similar JSON shapes (single { status } key for success,
+// single { error, code } key for rate limit). Validation failures
+// short-circuit early but go through the same audit path so timing
+// doesn't reveal whether the api_key was valid.
+//
+// AUDIT
+//
+//   MC_SIGNING_KEY_STATUS_QUERIED        severity=info — successful
+//                                        status return. Detail carries
+//                                        mc=<name (id)> keyId=<n>
+//                                        status=<returned>. Audited
+//                                        because frequency is low
+//                                        (once per push tick) and
+//                                        useful for forensics if a
+//                                        rotation is mid-flight.
+//
+//   MC_SIGNING_KEY_STATUS_BLOCKED        severity=warning — rate
+//                                        limited, invalid api_key,
+//                                        or malformed input. Detail
+//                                        carries the resolution result
+//                                        and the reason.
+
+app.post('/api/mc/me/signing-key-status', (req, res) => {
+  let db;
+  try {
+    const { apiKey, keyId } = req.body || {};
+    db = getDb();
+
+    const auditBlock = (mcLabel, code, extra = '') =>
+      db.prepare(
+        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_STATUS_BLOCKED', ?, 'warning')"
+      ).run(`attempted_mc=${mcLabel} keyId=${keyId === undefined ? 'none' : keyId} code=${code}${extra ? ' ' + extra : ''}`);
+
+    if (!apiKey || keyId === undefined || keyId === null) {
+      auditBlock('unknown', 'MISSING_FIELDS');
+      db.close();
+      return res.status(400).json({
+        error: 'apiKey and keyId are required',
+        code: 'MISSING_FIELDS',
+      });
+    }
+
+    // keyId must be a positive integer. Accept it as either a JSON
+    // number or a string of digits; reject anything else.
+    let keyIdNum;
+    if (typeof keyId === 'number' && Number.isInteger(keyId) && keyId > 0) {
+      keyIdNum = keyId;
+    } else if (typeof keyId === 'string' && /^[1-9][0-9]*$/.test(keyId)) {
+      keyIdNum = parseInt(keyId, 10);
+    } else {
+      auditBlock('unknown', 'INVALID_KEY_ID');
+      db.close();
+      return res.status(400).json({
+        error: 'keyId must be a positive integer',
+        code: 'INVALID_KEY_ID',
+      });
+    }
+
+    const mc = db.prepare(
+      "SELECT id, name FROM management_consoles WHERE api_key = ? AND status = 'active'"
+    ).get(apiKey);
+    if (!mc) {
+      auditBlock('unknown', 'INVALID_API_KEY');
+      db.close();
+      return res.status(403).json({
+        error: 'Invalid or inactive MC API key',
+        code: 'INVALID_API_KEY',
+      });
+    }
+
+    // Rate-limit check BEFORE the DB query. Token-bucket decrement
+    // happens here; if rate-limited we never touch signing_keys.
+    const rl = signingKeysSvc.checkRateLimit(mc.id, keyIdNum);
+    if (!rl.allowed) {
+      auditBlock(`${mc.name} (${mc.id})`, 'RATE_LIMITED', `retry_after_seconds=${rl.retryAfterSeconds}`);
+      db.close();
+      res.set('Retry-After', String(rl.retryAfterSeconds));
+      return res.status(429).json({
+        error: 'Rate limit exceeded for signing-key status queries',
+        code: 'RATE_LIMITED',
+        retryAfterSeconds: rl.retryAfterSeconds,
+      });
+    }
+
+    // Service returns { status: <string> } or { status: null } if
+    // keyId doesn't belong to this mc. We collapse null to 'rejected'
+    // so out-of-scope keyId probes are indistinguishable from in-
+    // scope rejected keys (cross-MC enumeration closed).
+    const raw = signingKeysSvc.getStatusForMc(db, { mcId: mc.id, keyId: keyIdNum });
+    const status = raw.status === null ? 'rejected' : raw.status;
+
+    db.prepare(
+      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_STATUS_QUERIED', ?, 'info')"
+    ).run(`mc=${mc.name} (${mc.id}) keyId=${keyIdNum} status=${status}${raw.status === null ? ' note=collapsed_from_null' : ''}`);
+
+    db.close();
+    return res.json({ status });
+  } catch (e) {
+    console.error('signing-key status query error:', e);
+    try { if (db) db.close(); } catch (_) {}
+    return res.status(500).json({ error: 'Status query failed' });
+  }
+});
+
+// ── MC Pending-Requests Poll — MC-Facing (R3g PR3 Phase 7 / C34) ───────────
+//
+// POST /api/mc/me/pending-requests
+//   Body:    { apiKey }                                + signature headers
+//   Headers: X-FA-Key-Fingerprint, X-FA-Timestamp, X-FA-Signature
+//
+// The MC-facing half of the mailbox pattern's read side. The MC calls
+// this endpoint on every compliance tick (Commit 36 wires it into the
+// existing _complianceTick) to discover any CISO-initiated full-report
+// requests that haven't been fulfilled yet. Returns:
+//
+//   {
+//     requests: [
+//       { id, framework, requested_at },
+//       ...
+//     ]
+//   }
+//
+// Only pending rows are returned — fulfilled, failed, and expired rows
+// are filtered out at the GD. The MC iterates the returned list,
+// generates the corresponding full report per request, and POSTs each
+// one back to /api/ingest/compliance-reports?full=true (Commit 35).
+//
+// POST INSTEAD OF GET — same reasoning as the C21 status query:
+//   1. Consistency: every other MC -> GD authenticated endpoint puts
+//      api_key in the POST body. /api/mc/me/signing-key-status (C21),
+//      /api/ingest/metrics (C11), /api/ingest/compliance-reports (C30),
+//      /api/mc/:id/signing-key (C18). GET with api_key in a query
+//      string would be the one outlier most prone to credential leaks.
+//   2. Credential hygiene: query strings get logged by every
+//      intermediate (LB, reverse proxy, CDN, access-log middleware).
+//      Body parameters don't show up in those places.
+//   3. The MC may want to send additional filter/pagination params in
+//      future versions without breaking the URL shape.
+//
+// AUTHENTICATION
+//
+// Same machinery as every other MC-facing endpoint: api_key resolves
+// the MC, then verifyPushSignature validates X-FA-Signature against
+// the MC's active (or grace-window approved) signing key. The MC
+// can only see ITS OWN pending requests — the SELECT is scoped by
+// mc.id, so a stolen api_key for MC-A cannot enumerate MC-B's
+// mailbox.
+//
+// RESPONSE SHAPE
+//
+// Only id + framework + requested_at per request. Specifically NOT
+// returned:
+//
+//   - requested_by_user_id  CISO identity is the GD's concern, not
+//                           the MC's. An attacker with a stolen MC
+//                           api_key shouldn't learn which CISO is
+//                           requesting reports.
+//   - error_detail          Only set on failed (terminal) requests
+//                           which never appear in this filter
+//                           anyway, but listing the field publicly
+//                           would invite operational confusion.
+//   - status                Always 'pending' for returned rows
+//                           (the filter guarantees it); echoing it
+//                           is noise.
+//
+// ORDERING
+//
+// Returned oldest-first (ORDER BY id ASC) so the MC processes the
+// longest-waiting request first. The id column auto-increments
+// monotonically with insert time, so ORDER BY id matches
+// ORDER BY requested_at without needing a separate index lookup.
+//
+// AUDIT
+//
+//   COMPLIANCE_PENDING_REQUESTS_QUERIED  severity=info, on success.
+//                                        Detail captures mc, count
+//                                        of pending requests, the
+//                                        fingerprint that verified
+//                                        the poll, and viaGraceWindow
+//                                        for forensic correlation.
+//
+//   COMPLIANCE_PENDING_REQUESTS_BLOCKED  severity=warning, on every
+//                                        failure path. Detail tags
+//                                        the resolution stage.
+//
+// EMPTY RESULT IS NORMAL
+//
+// Most compliance ticks find no pending requests (CISOs don't
+// request full reports daily for every framework). An empty
+// requests array is the steady-state response. The MC's logic
+// (C36) handles empty cleanly — no per-request work, just continue
+// to the normal per-framework summary push loop.
+
+app.post('/api/mc/me/pending-requests', (req, res) => {
+  let db;
+  try {
+    const { apiKey } = req.body || {};
+    db = getDb();
+
+    const auditBlock = (mcLabel, code, extra = '') =>
+      db.prepare(
+        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_BLOCKED', ?, 'warning')"
+      ).run(`attempted_mc=${mcLabel} code=${code}${extra ? ' ' + extra : ''}`);
+
+    if (!apiKey || typeof apiKey !== 'string') {
+      auditBlock('unknown', 'MISSING_API_KEY');
+      db.close();
+      return res.status(400).json({
+        error: 'apiKey is required',
+        code: 'MISSING_API_KEY',
+      });
+    }
+
+    const mc = db.prepare(
+      "SELECT id, name FROM management_consoles WHERE api_key = ? AND status = 'active'"
+    ).get(apiKey);
+    if (!mc) {
+      auditBlock('unknown', 'INVALID_API_KEY');
+      db.close();
+      return res.status(403).json({
+        error: 'Invalid or inactive MC API key',
+        code: 'INVALID_API_KEY',
+      });
+    }
+
+    const sigResult = verifyPushSignature(db, {
+      mcId: mc.id,
+      headers: req.headers,
+      rawBody: req.rawBody,
+    });
+    if (!sigResult.ok) {
+      db.prepare(
+        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_BLOCKED', ?, 'warning')"
+      ).run(`attempted_mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'}`);
+      db.close();
+      return res.status(401).json({
+        error: sigResult.error,
+        code: sigResult.code,
+      });
+    }
+
+    const rows = db.prepare(`
+      SELECT id, framework, requested_at
+      FROM mc_report_requests
+      WHERE mc_id = ? AND status = 'pending'
+      ORDER BY id ASC
+    `).all(mc.id);
+
+    db.prepare(
+      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_QUERIED', ?, 'info')"
+    ).run(`mc=${mc.name} mc_id=${mc.id} count=${rows.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''}`);
+    db.close();
+
+    return res.json({ requests: rows });
+  } catch (e) {
+    console.error('pending-requests query error:', e);
+    try { if (db) db.close(); } catch (_) {}
+    return res.status(500).json({ error: 'Pending requests query failed' });
+  }
+});
+
 // ── Global Metrics & Overview ────────────────────────────────────────────────
 app.get('/api/metrics/global', authMiddleware(['ciso', 'vp', 'readonly']), (req, res) => {
   try {
@@ -237,6 +1777,451 @@ app.get('/api/metrics/history/:mcId', authMiddleware(['ciso', 'vp', 'readonly'])
     res.json({ history });
   } catch (e) { res.status(500).json({ error: 'Failed to get metric history' }); }
 });
+
+// ── Cross-Region Compliance Rollup — Admin (R3g PR3 Phase 8 / C37) ─────────
+//
+// GET /api/compliance/rollup
+//
+// Returns the materialized per-(framework, mc_id) compliance state that
+// the CISO UI uses to render its framework × MC heat-map matrix. Reads
+// from cross_region_rollup, the table that Commits 31 + 35 have been
+// populating via UPSERT on every successful compliance ingest (both
+// summary pushes and full-report fulfillments).
+//
+// AUTH: ['ciso', 'vp', 'readonly'] — standard read access for compliance
+// reporting. The endpoint reveals no MC-internal data, only aggregates
+// the MCs themselves have already pushed.
+//
+// QUERY PARAMETERS (all optional, all filters AND together):
+//   framework   ASCII-safe pattern, max 64 chars. Limits results to one
+//               framework. The CISO UI uses this for "drill into HIPAA
+//               status across all my MCs" views.
+//   mc_id       ASCII-safe pattern, max 64 chars. Limits results to one
+//               MC. Used for "show all framework state for this MC"
+//               views.
+//   region      ASCII-safe pattern, max 64 chars. Limits results to MCs
+//               in a specific region (e.g. 'eu', 'us-east'). Used for
+//               regional compliance reviews.
+//
+// RESPONSE SHAPE:
+//   {
+//     rollups: [
+//       {
+//         framework, mc_id, mc_name, region,
+//         passed, total,
+//         last_push_at,
+//         has_drilldown            // true iff cross_region_rollup.
+//                                  // per_control_status IS NOT NULL.
+//                                  // The UI uses this to decide
+//                                  // whether to offer the
+//                                  // "see per-control detail" link
+//                                  // (which calls C38/C39).
+//       },
+//       ...
+//     ]
+//   }
+//
+// DELIBERATELY NOT INCLUDED IN RESPONSE:
+//
+//   per_control_status  The full per-control JSON drilldown can be
+//                       large (~50 KB per framework). Across 50 MCs ×
+//                       16 frameworks that's 40 MB on a single call.
+//                       The UI fetches drilldown one cell at a time
+//                       via C38/C39 (drilldown_endpoints) when the
+//                       CISO clicks into a specific (mc, framework).
+//
+// ACTIVE MCS ONLY: JOIN with management_consoles filters status='active'.
+// Offboarded MCs' historical rollup rows still exist (FK cascade only
+// fires on full delete) but shouldn't appear in the live heat map.
+//
+// ORDERING: BY framework ASC, mc_id ASC. Stable across calls; the UI
+// can rely on the matrix shape being consistent for client-side
+// row/column indexing.
+//
+// EMPTY STATE: Returns { rollups: [] } when no data has arrived yet
+// (e.g. on a freshly-deployed GD with no MCs pushing). The UI shows
+// "No compliance data yet" appropriately.
+//
+// NOT AUDITED: Read-only admin queries. Auth failure audits at the
+// middleware level; success queries are not noisy enough to warrant
+// per-call audit entries.
+
+const ROLLUP_FILTER_PATTERN = /^[A-Za-z0-9_-]+$/;
+const ROLLUP_FILTER_MAX_LEN = 64;
+
+app.get('/api/compliance/rollup',
+  authMiddleware(['ciso', 'vp', 'readonly']),
+  (req, res) => {
+    try {
+      const { framework, mc_id, region } = req.query || {};
+
+      // ── Validate optional filters ──
+      for (const [name, val] of Object.entries({ framework, mc_id, region })) {
+        if (val === undefined) continue;
+        if (typeof val !== 'string') {
+          return res.status(400).json({
+            error: `${name} must be a string`,
+          });
+        }
+        if (val.length > ROLLUP_FILTER_MAX_LEN || !ROLLUP_FILTER_PATTERN.test(val)) {
+          return res.status(400).json({
+            error: `${name} must be ASCII-safe (letters, digits, hyphens, underscores) and max ${ROLLUP_FILTER_MAX_LEN} chars`,
+          });
+        }
+      }
+
+      const db = getDb();
+      const whereClauses = ["mc.status = 'active'"];
+      const params = [];
+      if (framework) { whereClauses.push('r.framework = ?'); params.push(framework); }
+      if (mc_id) { whereClauses.push('r.mc_id = ?'); params.push(mc_id); }
+      if (region) { whereClauses.push('mc.region = ?'); params.push(region); }
+
+      const sql = `
+        SELECT
+          r.framework,
+          r.mc_id,
+          mc.name AS mc_name,
+          mc.region,
+          r.passed,
+          r.total,
+          r.last_push_at,
+          CASE WHEN r.per_control_status IS NOT NULL THEN 1 ELSE 0 END AS has_drilldown
+        FROM cross_region_rollup r
+        JOIN management_consoles mc ON mc.id = r.mc_id
+        WHERE ${whereClauses.join(' AND ')}
+        ORDER BY r.framework ASC, r.mc_id ASC
+      `;
+      const rows = db.prepare(sql).all(...params);
+      db.close();
+
+      // Coerce has_drilldown to boolean for cleaner JSON output (SQLite
+      // returns 0/1 integers from CASE expressions).
+      const rollups = rows.map(r => ({
+        framework: r.framework,
+        mc_id: r.mc_id,
+        mc_name: r.mc_name,
+        region: r.region,
+        passed: r.passed,
+        total: r.total,
+        last_push_at: r.last_push_at,
+        has_drilldown: r.has_drilldown === 1,
+      }));
+
+      return res.json({ rollups });
+    } catch (e) {
+      console.error('compliance rollup error:', e);
+      return res.status(500).json({ error: 'Failed to read compliance rollup' });
+    }
+  }
+);
+
+// ── MC Full-Reports List — Admin (R3g PR3 Phase 8 / C38) ──────────────────
+//
+// GET /api/mc/:id/full-reports[?framework=&limit=]
+//
+// Lists fulfilled full-report METADATA for a specific MC. Used by the
+// CISO UI when a user drills into an MC's profile and wants to see
+// "history of full reports the CISO has requested and received."
+// Returns metadata only (framework, received_at, expires_at, bytes,
+// signature_fingerprint); the actual report payload comes from the
+// detail endpoint (C39, upcoming).
+//
+// AUTH: ['ciso', 'vp', 'readonly']. Same access tier as the rollup
+// matrix — reading historical compliance artifacts is part of routine
+// review.
+//
+// QUERY PARAMS:
+//   framework   (optional) ASCII-safe key, max 64 chars. Narrows
+//               to one framework. UI uses this for "show me HIPAA
+//               report history for this MC" views.
+//   limit       (optional) integer 1-200, default 50. Bounds
+//               response size. The mc_compliance_report_fulls
+//               table grows over time (until 30-day TTL prunes
+//               old rows) and a CISO who requests full reports
+//               often could accumulate hundreds.
+//
+// PATH PARAM:
+//   :id   MC's internal id. Looked up against management_consoles
+//         WITHOUT filtering on status — offboarded MCs' historical
+//         reports remain visible for compliance audit purposes.
+//         Diverges from the rollup endpoint (C37) which IS active-
+//         only because that endpoint surfaces live current state.
+//         Returns 404 only if the MC never existed at all.
+//
+// RESPONSE SHAPE (200):
+//   {
+//     reports: [
+//       {
+//         id, framework, received_at, expires_at,
+//         signature_fingerprint, bytes
+//       },
+//       ...
+//     ]
+//   }
+//
+// DELIBERATELY EXCLUDED FROM LIST:
+//
+//   report_json   The full report payload can be ~50 KB per row
+//                 and up to 1 MB. Across 50 reports that's 50 MB
+//                 on a single list call. The UI fetches the body
+//                 one report at a time via C39 when the user
+//                 clicks a specific row.
+//
+// EXPIRED ROWS INCLUDED BY DEFAULT
+//
+// Rows past their expires_at but not yet pruned by the cleanup
+// job are still listed. Reasoning: the row exists, is queryable,
+// and is honest data. The UI renders an "Expired (will be pruned)"
+// badge based on the response's expires_at vs current time. The
+// 30-day TTL is the GD's storage policy; the UI surfaces it
+// honestly rather than the API hiding pre-prune rows.
+//
+// ORDERING
+//
+// received_at DESC, then id DESC as a tiebreaker (two reports
+// arriving in the same second from the same MC for different
+// frameworks share received_at). Newest-first matches CISO mental
+// model: "show me what came in recently."
+//
+// NOT AUDITED
+//
+// Read-only admin queries. Auth middleware audits failed
+// authorizations; success queries are not noisy enough for
+// per-call audit.
+
+const FULL_REPORTS_FILTER_PATTERN = /^[A-Za-z0-9_-]+$/;
+const FULL_REPORTS_FILTER_MAX_LEN = 64;
+const FULL_REPORTS_DEFAULT_LIMIT = 50;
+const FULL_REPORTS_MAX_LIMIT = 200;
+
+app.get('/api/mc/:id/full-reports',
+  authMiddleware(['ciso', 'vp', 'readonly']),
+  (req, res) => {
+    let db;
+    try {
+      const mcId = req.params.id;
+      const { framework, limit } = req.query || {};
+
+      // ── Validate mc_id ──
+      if (typeof mcId !== 'string' || mcId.length > FULL_REPORTS_FILTER_MAX_LEN || !FULL_REPORTS_FILTER_PATTERN.test(mcId)) {
+        return res.status(400).json({
+          error: `mc id must be ASCII-safe (letters, digits, hyphens, underscores) and max ${FULL_REPORTS_FILTER_MAX_LEN} chars`,
+        });
+      }
+
+      // ── Validate framework filter ──
+      if (framework !== undefined) {
+        if (typeof framework !== 'string') {
+          return res.status(400).json({ error: 'framework must be a string' });
+        }
+        if (framework.length > FULL_REPORTS_FILTER_MAX_LEN || !FULL_REPORTS_FILTER_PATTERN.test(framework)) {
+          return res.status(400).json({
+            error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${FULL_REPORTS_FILTER_MAX_LEN} chars`,
+          });
+        }
+      }
+
+      // ── Validate limit ──
+      let limitNum = FULL_REPORTS_DEFAULT_LIMIT;
+      if (limit !== undefined) {
+        const parsed = parseInt(limit, 10);
+        if (!Number.isInteger(parsed) || parsed < 1 || parsed > FULL_REPORTS_MAX_LIMIT || String(parsed) !== String(limit).trim()) {
+          return res.status(400).json({
+            error: `limit must be an integer between 1 and ${FULL_REPORTS_MAX_LIMIT}`,
+          });
+        }
+        limitNum = parsed;
+      }
+
+      db = getDb();
+
+      // ── Verify MC exists at all (any status) ──
+      const mc = db.prepare("SELECT id FROM management_consoles WHERE id = ?").get(mcId);
+      if (!mc) {
+        db.close();
+        return res.status(404).json({ error: 'MC not found' });
+      }
+
+      // ── Query reports ──
+      const whereClauses = ['mc_id = ?'];
+      const params = [mcId];
+      if (framework) {
+        whereClauses.push('framework = ?');
+        params.push(framework);
+      }
+      params.push(limitNum);
+
+      const rows = db.prepare(`
+        SELECT
+          id,
+          framework,
+          received_at,
+          expires_at,
+          signature_fingerprint,
+          length(report_json) AS bytes
+        FROM mc_compliance_report_fulls
+        WHERE ${whereClauses.join(' AND ')}
+        ORDER BY received_at DESC, id DESC
+        LIMIT ?
+      `).all(...params);
+      db.close();
+
+      return res.json({ reports: rows });
+    } catch (e) {
+      console.error('mc full-reports list error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Failed to list full reports' });
+    }
+  }
+);
+
+// ── MC Full-Report Detail — Admin (R3g PR3 Phase 8 / C39) ─────────────────
+//
+// GET /api/mc/:id/full-reports/:reportId
+//
+// Fetches a single fulfilled full-report's complete payload — metadata
+// PLUS the parsed report body. This is the ONLY endpoint that returns
+// report_json content; C37 (rollup) and C38 (list) deliberately omit
+// the heavy data field.
+//
+// AUTH: ['ciso', 'vp', 'readonly']. Same access tier as the rollup
+// matrix and report list — the report's contents are the MC's own
+// pushed data, no GD-internal secrets.
+//
+// PATH PARAMS:
+//   :id        MC's internal id. Validated against the ASCII-safe
+//              pattern. Looked up against management_consoles WITHOUT
+//              filtering on status (offboarded MCs' historical reports
+//              remain accessible for audit retention; consistent with
+//              C38).
+//   :reportId  mc_compliance_report_fulls.id. Must be a positive
+//              integer (accepted as JSON number or string of digits).
+//
+// PER-MC SCOPING — CROSS-MC ENUMERATION CLOSURE
+//
+// The report row must satisfy BOTH (id = :reportId AND mc_id = :id).
+// A report id that exists but belongs to a DIFFERENT MC returns the
+// SAME 404 message as a nonexistent id. An attacker enumerating
+// report ids cannot probe which IDs exist on other MCs they don't
+// have access to. Mirrors the C35 fulfillment endpoint's collapse
+// pattern.
+//
+// RESPONSE SHAPE (200):
+//   {
+//     report: {
+//       id, mc_id, framework, received_at, expires_at,
+//       signature_fingerprint, bytes,
+//       data: { /* parsed report_json */ }
+//     }
+//   }
+//
+// FIELD NAMING NOTE: the original C35 ingest body field was `report`
+// and the storage column is `report_json`. To avoid clashing with the
+// outer `report:` wrapper key, the parsed body surfaces as `data` in
+// the response. Three names for the same data is unavoidable; the
+// response field is the only one we control without breaking existing
+// integrations.
+//
+// JSON PARSE FALLBACK
+//
+// report_json was inserted by C35 via JSON.stringify(report) and should
+// always be valid JSON. Defensive: if parse fails (data corruption,
+// disk error during ingest, manual DB tampering), return 500 with a
+// generic error message and log the report id for forensic
+// investigation. The 500 is appropriate — the data is stored but
+// damaged; this isn't a client error.
+//
+// EXPIRED REPORTS STILL SERVED
+//
+// Same logic as C38: reports past their expires_at but not yet pruned
+// remain queryable. The UI surfaces the expiry timestamp; clients
+// requesting an expired-but-extant report get the data. The 30-day
+// TTL is a storage policy, not an API contract.
+//
+// NOT AUDITED
+//
+// Read-only admin queries. Auth middleware handles authorization
+// auditing.
+
+const FULL_REPORT_DETAIL_FILTER_PATTERN = /^[A-Za-z0-9_-]+$/;
+const FULL_REPORT_DETAIL_FILTER_MAX_LEN = 64;
+
+app.get('/api/mc/:id/full-reports/:reportId',
+  authMiddleware(['ciso', 'vp', 'readonly']),
+  (req, res) => {
+    let db;
+    try {
+      const mcId = req.params.id;
+      const reportIdRaw = req.params.reportId;
+
+      // ── Validate mc_id ──
+      if (typeof mcId !== 'string' || mcId.length > FULL_REPORT_DETAIL_FILTER_MAX_LEN || !FULL_REPORT_DETAIL_FILTER_PATTERN.test(mcId)) {
+        return res.status(400).json({
+          error: `mc id must be ASCII-safe (letters, digits, hyphens, underscores) and max ${FULL_REPORT_DETAIL_FILTER_MAX_LEN} chars`,
+        });
+      }
+
+      // ── Validate reportId (positive integer, accepts numeric strings) ──
+      if (typeof reportIdRaw !== 'string' || !/^[1-9][0-9]*$/.test(reportIdRaw)) {
+        return res.status(400).json({ error: 'reportId must be a positive integer' });
+      }
+      const reportIdNum = parseInt(reportIdRaw, 10);
+
+      db = getDb();
+
+      // ── Verify MC exists at all ──
+      const mc = db.prepare("SELECT id FROM management_consoles WHERE id = ?").get(mcId);
+      if (!mc) {
+        db.close();
+        return res.status(404).json({ error: 'MC not found' });
+      }
+
+      // ── Fetch report; collapse cross-MC mismatch to same 404 ──
+      const row = db.prepare(`
+        SELECT
+          id, mc_id, framework, report_json, signature_fingerprint,
+          received_at, expires_at,
+          length(report_json) AS bytes
+        FROM mc_compliance_report_fulls
+        WHERE id = ? AND mc_id = ?
+      `).get(reportIdNum, mcId);
+      db.close();
+
+      if (!row) {
+        // Could be nonexistent reportId OR reportId belonging to another
+        // MC. Same 404 for both — prevents cross-MC enumeration.
+        return res.status(404).json({ error: 'Report not found for this MC' });
+      }
+
+      // ── Parse the stored JSON body ──
+      let parsedBody;
+      try {
+        parsedBody = JSON.parse(row.report_json);
+      } catch (parseErr) {
+        console.error('mc full-report parse error:', { id: row.id, error: parseErr.message });
+        return res.status(500).json({ error: 'Stored report data is corrupted' });
+      }
+
+      return res.json({
+        report: {
+          id: row.id,
+          mc_id: row.mc_id,
+          framework: row.framework,
+          received_at: row.received_at,
+          expires_at: row.expires_at,
+          signature_fingerprint: row.signature_fingerprint,
+          bytes: row.bytes,
+          data: parsedBody,
+        },
+      });
+    } catch (e) {
+      console.error('mc full-report detail error:', e);
+      try { if (db) db.close(); } catch (_) {}
+      return res.status(500).json({ error: 'Failed to read full report' });
+    }
+  }
+);
 
 // ── Notifications ────────────────────────────────────────────────────────────
 app.get('/api/notifications', authMiddleware(['ciso', 'vp']), (req, res) => {
