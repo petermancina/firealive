@@ -601,6 +601,7 @@ function initDb() {
   setCfg.run('ha_config', JSON.stringify({ enabled: false, mode: 'active_passive' }));
   setCfg.run('posture_config', JSON.stringify({ enabled: true, require_on_connect: true }));
   setCfg.run('wifi_policy', JSON.stringify({ minimum_protocol: 'wpa2_enterprise' }));
+  setCfg.run('signing_key_grace_period_minutes', '60');
 
   console.log('Global Dashboard database initialized at', DB_PATH);
   db.close();
