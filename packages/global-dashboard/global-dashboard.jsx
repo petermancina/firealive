@@ -14,6 +14,33 @@ const Badge=({children,color})=><span style={{fontSize:9,padding:"2px 8px",borde
 const Input=({label,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<input style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}/></div>;
 const Sel=({label,children,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<select style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}>{children}</select></div>;
 
+// ── COMPLIANCE_FRAMEWORKS ───────────────────────────────────────────────────
+// The 16 frameworks registered in PR1 (MC) and PR2 (GD). Each entry maps the
+// canonical framework id (URL-safe identifier passed as the :framework path
+// param to /api/compliance/report/:framework) to its operator-facing display
+// label. The two Compliance tabs (Compliance Posture + Cross-Region
+// Compliance, both added in PR4) consume this same list so the selector copy
+// stays consistent across views. Keep the order stable across releases for
+// muscle-memory of CISO users.
+const COMPLIANCE_FRAMEWORKS = [
+  {id:"hipaa",            label:"HIPAA"},
+  {id:"soc2",             label:"SOC 2"},
+  {id:"nist_csf",         label:"NIST CSF 2.0"},
+  {id:"gdpr",             label:"GDPR"},
+  {id:"dora",             label:"DORA"},
+  {id:"iso_27001",        label:"ISO/IEC 27001:2022"},
+  {id:"fisma",            label:"FISMA / NIST 800-53"},
+  {id:"cyber_essentials", label:"UK Cyber Essentials"},
+  {id:"nis2",             label:"EU NIS2"},
+  {id:"cps234_au",        label:"APRA CPS 234"},
+  {id:"ccpa",             label:"CCPA / CPRA"},
+  {id:"lgpd",             label:"LGPD (Brazil)"},
+  {id:"pipeda",           label:"PIPEDA (Canada)"},
+  {id:"pdpa_sg",          label:"PDPA (Singapore)"},
+  {id:"appi_jp",          label:"APPI (Japan)"},
+  {id:"popia_za",         label:"POPIA (South Africa)"},
+];
+
 // ── API Client ──────────────────────────────────────────────────────────────
 // Same shape as the MC api helper in frontend/firealive-mc.jsx so the two
 // stay easy to keep in sync. JSON-only request/response with an {error: ...}
@@ -407,6 +434,138 @@ export default function GlobalDashboard() {
   const [regionsLoading, setRegionsLoading] = useState(false);
   const [regionsError, setRegionsError] = useState(null);
 
+  // Compliance Posture tab — fetches THIS GD's own compliance report
+  // per-framework via PR2's GET /api/compliance/report/:framework.
+  // Selector + fetch state added in C2; rendering of summary +
+  // verifiedControls + customerResponsibility lands in C3-C4.
+  const [postureFramework, setPostureFramework] = useState("");
+  const [postureReport, setPostureReport] = useState(null);
+  const [postureLoading, setPostureLoading] = useState(false);
+  const [postureError, setPostureError] = useState(null);
+
+  // Cross-Region Compliance tab — fetches the framework x MC rollup
+  // matrix via PR3 C37's GET /api/compliance/rollup. The endpoint returns
+  // a flat list of {framework, mc_id, mc_name, region, passed, total,
+  // last_push_at, has_drilldown} cells; the UI groups by framework for
+  // the matrix display. per_control_status is deliberately excluded
+  // from this endpoint per the layered payload-size pattern (PR3 lock);
+  // drilldown into per-control detail comes via C38/C39 endpoints which
+  // are wired in C7-C8 of PR4. Filter controls (framework/mc_id/region)
+  // are added in C6.
+  const [rollupData, setRollupData] = useState(null);
+  const [rollupLoading, setRollupLoading] = useState(false);
+  const [rollupError, setRollupError] = useState(null);
+  // Filters for the Cross-Region matrix (added in C6). Empty string means
+  // "no filter on this axis." Applied client-side against the unfiltered
+  // rollupData so the dropdown option sets stay stable across filter
+  // changes — selecting one filter never hides another filter's options.
+  // The C37 endpoint also accepts these as query params for future
+  // programmatic / shareable-URL access; client-side filtering is the
+  // C6 implementation since rollupData is small (max ~800 cells for 50
+  // MCs x 16 frameworks).
+  const [rollupFilterFramework, setRollupFilterFramework] = useState("");
+  const [rollupFilterMcId, setRollupFilterMcId] = useState("");
+  const [rollupFilterRegion, setRollupFilterRegion] = useState("");
+
+  // Per-cell full-report metadata list (added in C7). Clicking a matrix
+  // row sets selectedCell to {mc_id, framework}; the useEffect below
+  // fires PR3 C38's GET /api/mc/:id/full-reports?framework=<fw> and the
+  // result is rendered inline beneath the clicked row. Clicking the same
+  // row again clears selectedCell (toggle). report_json bodies are
+  // deliberately excluded from C38's response per the layered payload-
+  // size pattern; per-report detail (the actual control body) is
+  // fetched by C8 via C39 when the user clicks a specific report row.
+  const [selectedCell, setSelectedCell] = useState(null);
+  const [reportsList, setReportsList] = useState(null);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [reportsError, setReportsError] = useState(null);
+
+  // Per-report parsed body (added in C8). Clicking a report row in the
+  // C7 expansion sets selectedReportId; the useEffect below fires PR3
+  // C39's GET /api/mc/:id/full-reports/:reportId and the parsed body
+  // renders inline beneath the clicked report row. C39 is the ONLY
+  // endpoint that returns the report_json payload (C37/C38 exclude it
+  // per the layered payload-size pattern). The parsed body has the
+  // same shape Phase 1 renders for THIS GD's own posture — framework
+  // header, 4-up summary, verifiedControls list with status badges,
+  // customerResponsibility list — but reads from a stored MC report
+  // rather than a live generation. selectedReportId is cleared when
+  // selectedCell changes (different cell = different report list,
+  // so no carry-over).
+  const [selectedReportId, setSelectedReportId] = useState(null);
+  const [reportDetail, setReportDetail] = useState(null);
+  const [reportDetailLoading, setReportDetailLoading] = useState(false);
+  const [reportDetailError, setReportDetailError] = useState(null);
+
+  // Mailbox-pattern Request Full Report flow (added in C9). Clicking
+  // the per-cell Request Full Report button POSTs PR3 C33's
+  // /api/mc/:id/full-report-requests with body {framework}; on 201
+  // success the requestId + requested_at are recorded in
+  // submittedRequests so the cell's panel immediately renders a
+  // "request pending fulfillment" state. The MC observes the pending
+  // row on its next compliance tick (default 24h cadence) and pushes
+  // the fulfillment via the mailbox-pattern flow; the fulfillment
+  // shows up in the C7 reports list on next refresh. submittedRequests
+  // is in-memory only — refreshing the GD or switching tabs and back
+  // resets to whatever the next C5 rollup fetch reports.
+  const [submittingFullReport, setSubmittingFullReport] = useState(false);
+  const [submittedRequests, setSubmittedRequests] = useState([]);
+  const [submitFullReportError, setSubmitFullReportError] = useState(null);
+
+  // Signing-key admin queue (added in C11). Renders at the top of the
+  // MC Connections tab as a cross-MC "Pending Signing Key Approvals"
+  // card sourced from PR3 C20's GET /api/signing-keys/pending. Each
+  // entry: {id, mcId, mcName, fingerprint, submittedAt}. The endpoint
+  // is gated to ['ciso', 'signing_key_approver'] roles — VP and
+  // readonly users get a 403 which surfaces as the error message.
+  // Approve / reject actions on individual entries land in C13 + C14.
+  const [pendingKeys, setPendingKeys] = useState(null);
+  const [pendingKeysLoading, setPendingKeysLoading] = useState(false);
+  const [pendingKeysError, setPendingKeysError] = useState(null);
+
+  // Per-MC signing-keys history panel (added in C12). Clicking the
+  // "View keys" affordance on a connections-tab MC row toggles the
+  // expansion and fetches PR3 C20's other surface
+  // GET /api/mc/:id/signing-keys. Returns the FULL key history for
+  // that MC — approved, pending, AND rejected rows, with their
+  // approved_at / rotated_out_at / approved_by_role / rejected_at /
+  // rejected_reason metadata. This is the ONLY UI surface where
+  // rejected_reason is exposed — the MC-facing status endpoint (C21)
+  // strips it per the privacy invariant. Single-open pattern: only
+  // one MC's keys panel is open at a time (clicking a second one
+  // closes the first).
+  const [expandedMcKeysFor, setExpandedMcKeysFor] = useState(null);
+  const [mcKeysData, setMcKeysData] = useState(null);
+  const [mcKeysLoading, setMcKeysLoading] = useState(false);
+  const [mcKeysError, setMcKeysError] = useState(null);
+
+  // Approve-action in-flight tracker (added in C13). Holds the keyId
+  // of the currently-approving key so the Approve button on that
+  // specific row can disable itself during the POST; other Approve
+  // buttons in the queue or per-MC panel remain interactive. Cleared
+  // on settle (success or error). approveError surfaces the last
+  // server-side failure message (e.g. CONFIRMATION_FINGERPRINT_MISMATCH
+  // when the optional double-check fingerprint disagrees with the
+  // stored value; INVALID_STATE on a duplicate-click race; etc.).
+  const [approvingKeyId, setApprovingKeyId] = useState(null);
+  const [approveError, setApproveError] = useState(null);
+
+  // Reject-action modal state (added in C14). Reject is a destructive
+  // permanent state transition that captures a free-form rationale —
+  // window.confirm cannot host a multi-line textarea so the reject
+  // flow uses an inline modal overlay instead. rejectModalKey holds
+  // the target row context ({mcId, keyId, fingerprint, mcName}) while
+  // the modal is open; null when closed. rejectReason is the textarea
+  // value. rejecting gates the Submit button during the POST.
+  // rejectErrorInline surfaces server-side validation failures
+  // (INVALID_REASON for empty/over-cap reasons; INVALID_STATE for
+  // race conditions) inside the modal so the operator can correct
+  // and retry without losing their typed reason.
+  const [rejectModalKey, setRejectModalKey] = useState(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectErrorInline, setRejectErrorInline] = useState(null);
+
   // Load Config Lock state once the user lands in the app stage so the UI
   // reflects server reality (configLocked starts false in useState but the
   // server may already be locked from a previous admin session). Re-runs
@@ -494,7 +653,54 @@ export default function GlobalDashboard() {
         setMcsError(r?.error || 'Failed to load MCs');
       }
     }).finally(() => setMcsLoading(false));
+    // Cross-MC pending signing-key approval queue (PR3 C20, added in
+    // PR4 C11). Endpoint is gated to ['ciso','signing_key_approver'].
+    // A VP or readonly user landing on the connections tab will see
+    // the queue's error state ("403 forbidden" or equivalent) rather
+    // than a populated list — by design; trust-registry read access
+    // is scoped tighter than the connection-management surface.
+    setPendingKeysLoading(true);
+    setPendingKeysError(null);
+    api.get('/api/signing-keys/pending').then(r => {
+      if (r && !r.error && Array.isArray(r.pending)) {
+        setPendingKeys(r.pending);
+      } else {
+        setPendingKeysError(r?.error || 'Failed to load pending signing-key approvals');
+      }
+    }).finally(() => setPendingKeysLoading(false));
   }, [stage, tab]);
+
+  // Per-MC signing-keys history fetch (PR4 C12). Fires whenever the
+  // operator expands a different MC's keys panel; resets when the
+  // panel is collapsed. Cleared on tab leave by the cleanup effect
+  // below so re-entering connections starts with no panel open.
+  useEffect(() => {
+    if (!expandedMcKeysFor) {
+      setMcKeysData(null);
+      setMcKeysError(null);
+      return;
+    }
+    setMcKeysLoading(true);
+    setMcKeysError(null);
+    setMcKeysData(null);
+    const url = '/api/mc/' + encodeURIComponent(expandedMcKeysFor) + '/signing-keys';
+    api.get(url).then(r => {
+      if (r && !r.error && Array.isArray(r.keys)) {
+        setMcKeysData(r);
+      } else {
+        setMcKeysError(r?.error || 'Failed to load signing-key history');
+      }
+    }).finally(() => setMcKeysLoading(false));
+  }, [expandedMcKeysFor]);
+
+  // Collapse the per-MC keys panel when leaving the connections tab
+  // so re-entering the tab starts clean. The data fetched is small
+  // and re-fetching on next expand is fine.
+  useEffect(() => {
+    if (tab !== "connections" && expandedMcKeysFor !== null) {
+      setExpandedMcKeysFor(null);
+    }
+  }, [tab, expandedMcKeysFor]);
 
   // Load notification config + list when notifications tab is active.
   useEffect(() => {
@@ -533,6 +739,182 @@ export default function GlobalDashboard() {
     }).finally(() => setDrilldownLoading(false));
   }, [stage, drilldownMcId]);
 
+  // Load cross-region rollup matrix when the Cross-Region Compliance
+  // tab is active. The endpoint returns active MCs only (server-side
+  // JOIN filter on status='active'); offboarded MCs' historical rollup
+  // rows are excluded server-side and stay out of the heat-map view.
+  // Filter controls (framework / mc_id / region) wire in C6 and will
+  // pass query params to the same endpoint.
+  useEffect(() => {
+    if (stage !== "app" || tab !== "compliance_xregion") return;
+    setRollupLoading(true);
+    setRollupError(null);
+    api.get('/api/compliance/rollup').then(r => {
+      if (r && !r.error && Array.isArray(r.rollups)) {
+        setRollupData(r.rollups);
+      } else {
+        setRollupError(r?.error || 'Failed to load cross-region rollup');
+      }
+    }).finally(() => setRollupLoading(false));
+  }, [stage, tab]);
+
+  // Load per-MC full-report metadata when a cell is selected (C7).
+  // Endpoint: PR3 C38's GET /api/mc/:id/full-reports?framework=<fw>.
+  // Returns metadata only (id, framework, received_at, expires_at,
+  // signature_fingerprint, bytes); the actual report body comes via
+  // C39 wired in C8. Strict server-side limits apply (default 50,
+  // max 200); the UI shows what the server returns without paging.
+  // selectedCell null clears the panel.
+  useEffect(() => {
+    if (!selectedCell) { setReportsList(null); setReportsError(null); return; }
+    setReportsLoading(true);
+    setReportsError(null);
+    setReportsList(null);
+    const url = '/api/mc/' + encodeURIComponent(selectedCell.mc_id) +
+                '/full-reports?framework=' + encodeURIComponent(selectedCell.framework);
+    api.get(url).then(r => {
+      if (r && !r.error && Array.isArray(r.reports)) {
+        setReportsList(r.reports);
+      } else {
+        setReportsError(r?.error || 'Failed to load full-report list');
+      }
+    }).finally(() => setReportsLoading(false));
+  }, [selectedCell]);
+
+  // Load per-report parsed body when a report row is clicked (C8).
+  // Endpoint: PR3 C39's GET /api/mc/:id/full-reports/:reportId. ONLY
+  // endpoint that returns the report_json payload (under the `data`
+  // field — the field is named `data` rather than `report` to avoid
+  // collision with the outer `report:` wrapper key per the PR3 C39
+  // contract). Cross-MC enumeration closure applies: a report id
+  // belonging to a different MC returns the SAME 404 message as a
+  // nonexistent id, so the UI can't probe other MCs' id space.
+  // selectedReportId null clears the panel.
+  useEffect(() => {
+    if (!selectedReportId || !selectedCell) {
+      setReportDetail(null);
+      setReportDetailError(null);
+      return;
+    }
+    setReportDetailLoading(true);
+    setReportDetailError(null);
+    setReportDetail(null);
+    const url = '/api/mc/' + encodeURIComponent(selectedCell.mc_id) +
+                '/full-reports/' + encodeURIComponent(selectedReportId);
+    api.get(url).then(r => {
+      if (r && !r.error && r.report) {
+        setReportDetail(r.report);
+      } else {
+        setReportDetailError(r?.error || 'Failed to load full-report detail');
+      }
+    }).finally(() => setReportDetailLoading(false));
+  }, [selectedReportId, selectedCell]);
+
+  // Approve a pending signing key (added in C13). Used by both the
+  // C11 cross-MC pending queue and the C12 per-MC keys panel. Issues
+  // a window.confirm with the fingerprint inlined so the operator
+  // sees the value they are committing to before the POST fires — a
+  // last-mile guard against approving the wrong row from muscle
+  // memory. Sends the fingerprint as confirmation_fingerprint in the
+  // request body, exercising PR3 C19's optional CISO-side double-
+  // check: the server compares the value to the stored fingerprint
+  // and returns 400 CONFIRMATION_FINGERPRINT_MISMATCH on disagree,
+  // catching UI bugs and copy-paste errors that might otherwise
+  // silently approve the wrong key. On success, refetches both
+  // surfaces (cross-MC pending queue and the open per-MC panel, if
+  // any) so the approved key transitions out of pending state in
+  // both views without a manual refresh. Server-side audit event
+  // MC_SIGNING_KEY_APPROVED captures user_id, role, mc, keyId,
+  // fingerprint, and action (approved_initial vs approved_replacement
+  // for rotation events).
+  const handleApproveKey = async (mcId, keyId, fingerprint, mcName) => {
+    const confirmMessage =
+      "Approve signing key #" + keyId + " for " + (mcName || mcId) + "?\n\n" +
+      "Fingerprint:\n" + fingerprint + "\n\n" +
+      "Verify this fingerprint OUT OF BAND with the MC operator (phone, in-person, separate encrypted channel) BEFORE confirming. Approval is recorded permanently in the GD audit log.";
+    if (!window.confirm(confirmMessage)) return;
+    setApprovingKeyId(keyId);
+    setApproveError(null);
+    const url = "/api/mc/" + encodeURIComponent(mcId) +
+                "/signing-keys/" + encodeURIComponent(keyId) + "/approve";
+    const r = await api.post(url, { confirmation_fingerprint: fingerprint });
+    setApprovingKeyId(null);
+    if (r && !r.error && r.ok) {
+      const verb = r.action === "approved_replacement" ? "approved (rotation)" : "approved";
+      showGdToast("Signing key #" + keyId + " " + verb + " for " + (mcName || mcId));
+      api.get('/api/signing-keys/pending').then(x => {
+        if (x && !x.error && Array.isArray(x.pending)) setPendingKeys(x.pending);
+      });
+      if (expandedMcKeysFor === mcId) {
+        api.get('/api/mc/' + encodeURIComponent(mcId) + '/signing-keys').then(x => {
+          if (x && !x.error && Array.isArray(x.keys)) setMcKeysData(x);
+        });
+      }
+    } else {
+      const msg = r?.error || 'Approve failed';
+      setApproveError(msg);
+      showGdToast("Approve failed: " + msg);
+    }
+  };
+
+  // Reject-modal lifecycle helpers (added in C14). openRejectModal
+  // primes the form with the target row context and resets the
+  // textarea + error slot. closeRejectModal returns to the resting
+  // state without firing the POST. handleSubmitReject performs the
+  // PR3 C19 reject POST with the user-entered reason in the body;
+  // server enforces non-empty (after trim) and ≤500 chars
+  // (REASON_MAX_LEN). Client-side mirrors the same guards so the
+  // operator sees a fast inline error rather than a server round-
+  // trip on a trivially-invalid input. Reason is captured server-
+  // side in the audit log + signing_keys.rejected_reason; the
+  // MC-facing status endpoint (PR3 C21) strips it per the privacy
+  // invariant.
+  const REJECT_REASON_MAX = 500;
+  const openRejectModal = (mcId, keyId, fingerprint, mcName) => {
+    setRejectModalKey({ mcId, keyId, fingerprint, mcName });
+    setRejectReason("");
+    setRejectErrorInline(null);
+  };
+  const closeRejectModal = () => {
+    setRejectModalKey(null);
+    setRejectReason("");
+    setRejectErrorInline(null);
+  };
+  const handleSubmitReject = async () => {
+    if (!rejectModalKey) return;
+    const trimmed = rejectReason.trim();
+    if (!trimmed) {
+      setRejectErrorInline("Reason is required.");
+      return;
+    }
+    if (trimmed.length > REJECT_REASON_MAX) {
+      setRejectErrorInline("Reason exceeds " + REJECT_REASON_MAX + " characters.");
+      return;
+    }
+    setRejecting(true);
+    setRejectErrorInline(null);
+    const { mcId, keyId, mcName } = rejectModalKey;
+    const url = "/api/mc/" + encodeURIComponent(mcId) +
+                "/signing-keys/" + encodeURIComponent(keyId) + "/reject";
+    const r = await api.post(url, { reason: trimmed });
+    setRejecting(false);
+    if (r && !r.error && r.ok) {
+      showGdToast("Signing key #" + keyId + " rejected for " + (mcName || mcId));
+      setRejectModalKey(null);
+      setRejectReason("");
+      api.get('/api/signing-keys/pending').then(x => {
+        if (x && !x.error && Array.isArray(x.pending)) setPendingKeys(x.pending);
+      });
+      if (expandedMcKeysFor === mcId) {
+        api.get('/api/mc/' + encodeURIComponent(mcId) + '/signing-keys').then(x => {
+          if (x && !x.error && Array.isArray(x.keys)) setMcKeysData(x);
+        });
+      }
+    } else {
+      setRejectErrorInline(r?.error || "Reject failed");
+    }
+  };
+
   const totalAnalysts=regions.reduce((s,r)=>s+r.analysts,0);
   const avgHealth=regions.length?Math.round(regions.reduce((s,r)=>s+r.healthScore,0)/regions.length):0;
   const avgUtil=regions.length?Math.round(regions.reduce((s,r)=>s+r.utilization,0)/regions.length):0;
@@ -559,6 +941,7 @@ export default function GlobalDashboard() {
     {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"vuln_scan",label:"Vulnerability Scan"},
     {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha_cluster",label:"HA & Clustering"},
     {id:"backup",label:"Backup & Restore"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
+    {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
     {id:"troubleshooter",label:"Troubleshooter"},{id:"app_updates",label:"App Updates"},
     {id:"audit_dash",label:"Audit & Forensics"},
   ];
@@ -775,6 +1158,27 @@ export default function GlobalDashboard() {
   return(
     <div style={{minHeight:"100vh",background:C.bg,color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {/* Reject-signing-key modal (PR4 C14). Renders only when a reject flow is active. */}
+      {rejectModalKey&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}} onClick={()=>{if(!rejecting)closeRejectModal();}}>
+        <Card style={{maxWidth:560,width:"100%",cursor:"default",borderColor:C.d+"60"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:14,fontWeight:600,color:C.d,fontFamily:"'Fraunces',serif",marginBottom:6}}>Reject signing key</div>
+          <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5,fontSize:11}}>You are about to reject signing key #{rejectModalKey.keyId} for <span style={{color:C.t,fontWeight:500}}>{rejectModalKey.mcName||rejectModalKey.mcId}</span>. The MC's pending key will be marked rejected and will never become verifiable. Rejection is permanent and recorded in the GD audit log.</M>
+          <div style={{padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderLeft:`2px solid ${C.d}`,borderRadius:4,marginBottom:10}}>
+            <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>fingerprint</M>
+            <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{rejectModalKey.fingerprint||"—"}</M>
+          </div>
+          <M style={{color:C.tm,display:"block",marginBottom:4,fontSize:10,fontWeight:500}}>Reason (required) <span style={{color:C.td,fontWeight:400}}>— recorded server-side in audit log + visible in this admin panel only. NEVER exposed to the MC.</span></M>
+          <textarea value={rejectReason} onChange={e=>setRejectReason(e.target.value)} disabled={rejecting} rows={4} placeholder="e.g. fingerprint did not match out-of-band verification on 2026-05-13 with MC operator J. Doe (Slack DM)" style={{width:"100%",boxSizing:"border-box",padding:"8px 10px",background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:11,fontFamily:"'DM Sans',sans-serif",lineHeight:1.4,resize:"vertical"}}/>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4,marginBottom:8}}>
+            <M style={{color:rejectReason.length>REJECT_REASON_MAX?C.d:C.td,fontSize:9}}>{rejectReason.length}/{REJECT_REASON_MAX} characters</M>
+          </div>
+          {rejectErrorInline&&<M style={{color:C.d,display:"block",marginBottom:8,fontSize:10}}>{rejectErrorInline}</M>}
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:4}}>
+            <Btn small disabled={rejecting} onClick={closeRejectModal}>Cancel</Btn>
+            <Btn small primary disabled={rejecting||!rejectReason.trim()||rejectReason.length>REJECT_REASON_MAX} onClick={handleSubmitReject}>{rejecting?"Rejecting...":"Submit Reject"}</Btn>
+          </div>
+        </Card>
+      </div>}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>
@@ -972,21 +1376,115 @@ export default function GlobalDashboard() {
           {tab==="connections"&&(<div>
             <L>Management Console Connections</L>
             <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Each Regional MC pushes aggregate metrics to this GD-Server. Register a new MC to generate its API key, then provide the key to the MC's admin who configures it in the MC's Settings → Global Dashboard Push tab.</M>
+            {/* Pending Signing Key Approvals (PR4 C11 — read-side only; approve/reject in C13-C14). */}
+            <Card style={{marginBottom:12,borderColor:(pendingKeys&&pendingKeys.length>0)?C.w+"40":C.b}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Pending Signing Key Approvals</div>
+                {pendingKeys&&<Badge color={pendingKeys.length>0?C.w:C.a}>{pendingKeys.length}</Badge>}
+              </div>
+              <M style={{color:C.tm,display:"block",marginBottom:10,fontSize:10,lineHeight:1.5}}>Cryptographic trust establishment requires manual CISO approval per role segregation policy (ISO 27001 A.6.1.2). Verify each pending fingerprint OUT OF BAND with the MC operator before approving. Once approved the MC's signed pushes will verify against this key; without approval the MC's pushes are rejected at ingest with INGEST_SIGNATURE_REJECTED (severity=critical).</M>
+              {pendingKeysLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading approval queue...</M>}
+              {pendingKeysError&&<M style={{color:C.d,display:"block"}}>{pendingKeysError}</M>}
+              {pendingKeys&&!pendingKeysLoading&&pendingKeys.length===0&&<M style={{color:C.a,fontStyle:"italic",display:"block"}}>No keys awaiting review.</M>}
+              {pendingKeys&&!pendingKeysLoading&&pendingKeys.length>0&&<div>
+                {pendingKeys.map((k,i)=><div key={k.id} style={{padding:"10px 0",borderBottom:i<pendingKeys.length-1?`1px solid ${C.b}`:"none"}}>
+                  <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:4}}>
+                    <Badge color={C.w}>PENDING</Badge>
+                    <div style={{flex:1,minWidth:0}}>
+                      <M style={{color:C.t,fontWeight:500,display:"block"}}>{k.mcName||k.mcId}</M>
+                      <M style={{color:C.td,display:"block",fontSize:10}}>mc: {k.mcId} · key #{k.id} · submitted {k.submittedAt?new Date(k.submittedAt).toLocaleString():"—"}</M>
+                    </div>
+                  </div>
+                  <div style={{padding:"6px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.w}`,borderRadius:4,marginTop:4}}>
+                    <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>fingerprint</M>
+                    <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{k.fingerprint||"—"}</M>
+                  </div>
+                  <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                    <Btn small primary disabled={approvingKeyId===k.id} onClick={()=>handleApproveKey(k.mcId,k.id,k.fingerprint,k.mcName)}>{approvingKeyId===k.id?"Approving...":"Approve"}</Btn>
+                    <Btn small disabled={approvingKeyId===k.id} onClick={()=>openRejectModal(k.mcId,k.id,k.fingerprint,k.mcName)}>Reject</Btn>
+                  </div>
+                </div>)}
+                {approveError&&<M style={{color:C.d,display:"block",marginTop:8,fontSize:10}}>{approveError}</M>}
+                <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>Verify fingerprint OUT OF BAND before approving; reject with rationale captured for the audit log otherwise.</M>
+              </div>}
+            </Card>
             {mcsError&&<Card style={{padding:12,borderColor:C.d+"40",marginBottom:12}}><M style={{color:C.d}}>{mcsError}</M></Card>}
             {mcs.length===0&&!mcsLoading&&!mcsError&&<Card style={{padding:14,borderColor:C.w+"30",marginBottom:12}}><M style={{color:C.w}}>No MCs registered yet. Register one below to get started.</M></Card>}
-            {mcs.map(mc=><Card key={mc.id} style={{marginBottom:8}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div>
-                  <M style={{color:C.t,fontWeight:500}}>{mc.name}</M>
-                  <M style={{color:C.td,display:"block",fontSize:10}}>id: {mc.id} · region: {mc.region||"—"} · framework: {mc.regulatory_framework||"none"}</M>
-                  <M style={{color:C.td,display:"block",fontSize:10}}>endpoint: {mc.endpoint||"—"} · analysts: {mc.analyst_count??"—"} · last sync: {mc.last_sync||"never"}</M>
+            {mcs.length>0&&Array.isArray(pendingKeys)&&pendingKeys.length>0&&(()=>{
+              // C15: surface the count of distinct MCs needing signing-key
+              // review at the top of the MC list. Distinct count rather
+              // than raw row count because the same MC can have multiple
+              // pending submissions (rotation events submitting before
+              // the prior pending is resolved).
+              const distinctMcs = new Set(pendingKeys.map(k=>k.mcId));
+              return <M style={{color:C.w,display:"block",fontSize:11,fontStyle:"italic",marginBottom:8}}>{distinctMcs.size} MC{distinctMcs.size===1?"":"s"} below {distinctMcs.size===1?"has":"have"} signing keys awaiting review — look for the amber "Review keys" affordance.</M>;
+            })()}
+            {mcs.map(mc=>{
+              const keysOpen = expandedMcKeysFor===mc.id;
+              // Per-MC handshake state (PR4 C15). Derived from the already-
+              // fetched cross-MC pending queue rather than a per-MC fetch —
+              // the queue tells us which MCs have one or more pending
+              // submissions awaiting approval, which is the actionable
+              // surface. Other states (approved / rejected / none) are
+              // visible in the Keys panel on expand; the badge here
+              // focuses operator attention on cards with action items
+              // without scaling fetch count linearly with MC count.
+              const mcPendingCount = Array.isArray(pendingKeys) ? pendingKeys.filter(k=>k.mcId===mc.id).length : 0;
+              const hasPendingKeys = mcPendingCount > 0;
+              const cardBorder = keysOpen ? C.a+"40" : hasPendingKeys ? C.w+"40" : C.b;
+              return <Card key={mc.id} style={{marginBottom:8,borderColor:cardBorder}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div>
+                    <M style={{color:C.t,fontWeight:500}}>{mc.name}</M>
+                    <M style={{color:C.td,display:"block",fontSize:10}}>id: {mc.id} · region: {mc.region||"—"} · framework: {mc.regulatory_framework||"none"}</M>
+                    <M style={{color:C.td,display:"block",fontSize:10}}>endpoint: {mc.endpoint||"—"} · analysts: {mc.analyst_count??"—"} · last sync: {mc.last_sync||"never"}</M>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",justifyContent:"flex-end"}}>
+                    <Badge color={mc.status==="active"?C.a:(mc.status==="offboarded"?C.tm:C.w)}>{mc.status||"unknown"}</Badge>
+                    {hasPendingKeys&&<Badge color={C.w}>{mcPendingCount} PENDING KEY{mcPendingCount===1?"":"S"}</Badge>}
+                    <Btn small primary={hasPendingKeys} onClick={()=>setExpandedMcKeysFor(keysOpen?null:mc.id)}>{keysOpen?"Hide keys":hasPendingKeys?"Review keys":"Keys"}</Btn>
+                    {mc.status==="active"&&<Btn small onClick={()=>{if(window.confirm("Offboard "+mc.name+"? The MC will stop being able to push metrics. This cannot be undone."))api.put("/api/mc/"+mc.id+"/offboard",{}).then(r=>{if(r&&!r.error){showGdToast(mc.name+" offboarded");api.get("/api/mc/list").then(x=>{if(x&&x.managementConsoles)setMcs(x.managementConsoles);});}else showGdToast("Offboard failed: "+(r?.error||"unknown"));});}}>Offboard</Btn>}
+                  </div>
                 </div>
-                <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                  <Badge color={mc.status==="active"?C.a:(mc.status==="offboarded"?C.tm:C.w)}>{mc.status||"unknown"}</Badge>
-                  {mc.status==="active"&&<Btn small onClick={()=>{if(window.confirm("Offboard "+mc.name+"? The MC will stop being able to push metrics. This cannot be undone."))api.put("/api/mc/"+mc.id+"/offboard",{}).then(r=>{if(r&&!r.error){showGdToast(mc.name+" offboarded");api.get("/api/mc/list").then(x=>{if(x&&x.managementConsoles)setMcs(x.managementConsoles);});}else showGdToast("Offboard failed: "+(r?.error||"unknown"));});}}>Offboard</Btn>}
-                </div>
-              </div>
-            </Card>)}
+                {keysOpen&&<div style={{marginTop:12,padding:"10px 12px",background:"rgba(0,0,0,0.2)",borderLeft:`2px solid ${C.a}`,borderRadius:"0 6px 6px 0"}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:8,fontSize:10,fontWeight:500}}>Signing-key history for {mc.name}</M>
+                  {mcKeysLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading key history...</M>}
+                  {mcKeysError&&<M style={{color:C.d,display:"block"}}>{mcKeysError}</M>}
+                  {mcKeysData&&!mcKeysLoading&&Array.isArray(mcKeysData.keys)&&mcKeysData.keys.length===0&&<M style={{color:C.td,fontStyle:"italic",display:"block"}}>No signing keys on file for this MC. The MC's first signed push will register a pending key here.</M>}
+                  {mcKeysData&&!mcKeysLoading&&Array.isArray(mcKeysData.keys)&&mcKeysData.keys.length>0&&<div>
+                    {mcKeysData.keys.map((k,i)=>{
+                      const sc = k.approvalStatus==="approved"?C.a:k.approvalStatus==="rejected"?C.d:C.w;
+                      const sl = k.approvalStatus==="approved"?"APPROVED":k.approvalStatus==="rejected"?"REJECTED":"PENDING";
+                      return <div key={k.id} style={{padding:"10px 0",borderBottom:i<mcKeysData.keys.length-1?`1px solid ${C.b}`:"none"}}>
+                        <div style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                          <Badge color={sc}>{sl}</Badge>
+                          {k.isActive&&<Badge color={C.a}>ACTIVE</Badge>}
+                          {k.rotatedOutAt&&<Badge color={C.tm}>ROTATED</Badge>}
+                          <M style={{color:C.t,fontWeight:500,fontSize:11}}>key #{k.id}</M>
+                          <M style={{color:C.td,fontSize:10}}>registered {k.registeredAt?new Date(k.registeredAt).toLocaleString():"—"}</M>
+                        </div>
+                        <div style={{padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderLeft:`2px solid ${sc}`,borderRadius:4,marginTop:4,marginBottom:4}}>
+                          <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>fingerprint</M>
+                          <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{k.fingerprint||"—"}</M>
+                        </div>
+                        {k.approvalStatus==="approved"&&<M style={{color:C.tm,display:"block",fontSize:9}}>approved {k.approvedAt?new Date(k.approvedAt).toLocaleString():"—"} by user #{k.approvedByUserId??"—"} (role: {k.approvedByRole||"—"})</M>}
+                        {k.rotatedOutAt&&<M style={{color:C.tm,display:"block",fontSize:9}}>rotated out {new Date(k.rotatedOutAt).toLocaleString()}</M>}
+                        {k.approvalStatus==="rejected"&&<div style={{marginTop:4,padding:"6px 8px",background:"rgba(239,68,68,0.06)",borderLeft:`2px solid ${C.d}`,borderRadius:4}}>
+                          <M style={{color:C.d,display:"block",fontSize:9,fontWeight:500}}>rejected {k.rejectedAt?new Date(k.rejectedAt).toLocaleString():"—"}</M>
+                          {k.rejectedReason&&<M style={{color:C.t,display:"block",fontSize:10,marginTop:2,lineHeight:1.5}}>reason: {k.rejectedReason}</M>}
+                        </div>}
+                        {k.notes&&<M style={{color:C.tm,display:"block",fontSize:9,marginTop:4,fontStyle:"italic"}}>notes: {k.notes}</M>}
+                        {k.approvalStatus==="pending_approval"&&<div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                          <Btn small primary disabled={approvingKeyId===k.id} onClick={()=>handleApproveKey(mc.id,k.id,k.fingerprint,mc.name)}>{approvingKeyId===k.id?"Approving...":"Approve"}</Btn>
+                          <Btn small disabled={approvingKeyId===k.id} onClick={()=>openRejectModal(mc.id,k.id,k.fingerprint,mc.name)}>Reject</Btn>
+                        </div>}
+                      </div>;
+                    })}
+                  </div>}
+                  <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>This panel is the only UI surface that exposes rejected_reason. The MC operator sees a generic "contact your CISO" status; full rationale lives in the GD audit log + this view.</M>
+                </div>}
+              </Card>;
+            })}
             {lastRegisteredMc&&<Card style={{padding:14,borderColor:C.a+"60",marginTop:16,marginBottom:8,background:"rgba(110,231,183,0.04)"}}>
               <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:6}}>✓ MC registered successfully</M>
               <M style={{color:C.t,display:"block",marginBottom:10,fontSize:11}}>{lastRegisteredMc.message||"Provide this API key to the Regional MC admin"}</M>
@@ -1289,7 +1787,6 @@ export default function GlobalDashboard() {
               <Sel label="GD Server data residency"><option value="">Select...</option><option>US</option><option>Canada</option><option>UK</option><option>EU</option><option>Germany</option><option>France</option><option>Switzerland</option><option>Sweden</option><option>Ireland</option><option>Israel</option><option>UAE</option><option>India</option><option>Singapore</option><option>Japan</option><option>Korea</option><option>Australia</option><option>South Africa</option><option>Brazil</option></Sel>
               <M style={{color:C.td,display:"block",marginTop:8}}>All data stored on this server remains in the selected jurisdiction. Regional MCs push aggregate data to this location only.</M>
             </Card>
-                    <Card style={{marginTop:16}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Compliance Reports</div><Sel label="Framework"><option value="">Select...</option><option>NIST CSF</option><option>ISO 27001</option><option>SOC 2</option><option>HIPAA</option><option>GDPR</option><option>DORA</option><option>CCPA</option><option>PIPEDA</option><option>LGPD</option><option>NIS2</option><option>CPS 234</option><option>Cyber Essentials</option><option>FISMA</option></Sel><Btn primary disabled={configLocked} onClick={()=>api.post("/api/v1/compliance/scan",{framework:""}).then(r=>showGdToast("Compliance: "+r?.summary?.passed+"/"+r?.summary?.total+" passed"))}>Generate</Btn></Card>
 </div>)}
 
           {/* ══════════ RECERTIFICATION ══════════ */}
@@ -1301,6 +1798,323 @@ export default function GlobalDashboard() {
               <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Send email reminders to CISO</M></label>
               <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Notify affected MC Team Leads</M></label>
             </Card>
+          </div>)}
+
+          {/* ══════════ COMPLIANCE POSTURE (PR4 C2: selector + fetch; C3-C4 add report rendering) ══════════ */}
+          {tab==="compliance_posture"&&(<div>
+            <L>Compliance Posture</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>The Global Dashboard's own compliance posture across 16 frameworks. Each framework returns technical-control verification (automated) plus enumerated customer-managed responsibilities (operator-attested). Reports here describe THIS GD instance — not aggregated cross-region results. See Cross-Region Compliance for the matrix view of all connected MCs.</M>
+            <Card>
+              <Sel label="Framework" value={postureFramework} onChange={e=>setPostureFramework(e.target.value)} disabled={postureLoading}>
+                <option value="">Select a framework...</option>
+                {COMPLIANCE_FRAMEWORKS.map(f=><option key={f.id} value={f.id}>{f.label}</option>)}
+              </Sel>
+              <Btn primary disabled={postureLoading||!postureFramework} onClick={async()=>{
+                setPostureLoading(true);
+                setPostureError(null);
+                setPostureReport(null);
+                const r = await api.get("/api/compliance/report/"+encodeURIComponent(postureFramework));
+                setPostureLoading(false);
+                if (r && r.error) {
+                  setPostureError(typeof r.error === "string" ? r.error : "Failed to generate report");
+                  return;
+                }
+                setPostureReport(r);
+                showGdToast("Report generated for "+postureFramework);
+              }}>{postureLoading?"Generating...":"Generate Report"}</Btn>
+            </Card>
+            {postureError&&<Card style={{borderColor:C.d+"40"}}><M style={{color:C.d}}>{postureError}</M></Card>}
+            {postureLoading&&<Card><M style={{color:C.tm,fontStyle:"italic"}}>Loading {postureFramework} compliance report...</M></Card>}
+            {postureReport&&!postureLoading&&(<>
+              {/* Framework header */}
+              <Card style={{marginBottom:12}}>
+                <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:6,fontFamily:"'Fraunces',serif"}}>{postureReport.framework}</div>
+                {postureReport.authority&&<M style={{color:C.tm,display:"block",marginBottom:4}}>{postureReport.authority}</M>}
+                {postureReport.citation&&<M style={{color:C.td,display:"block",marginBottom:6,fontSize:10}}>{postureReport.citation}</M>}
+                <M style={{color:C.td,display:"block",fontSize:10}}>Generated {postureReport.generatedAt?new Date(postureReport.generatedAt).toLocaleString():"—"} · GD v{postureReport.appVersion||"—"}</M>
+                {postureReport.note&&<M style={{color:C.i,display:"block",marginTop:8,fontSize:10,fontStyle:"italic"}}>{postureReport.note}</M>}
+              </Card>
+
+              {/* Summary: 4-up verified counts + customerResponsibility total */}
+              <Card style={{marginBottom:12}}>
+                <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:10}}>Summary</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:12}}>
+                  {[
+                    {l:"Total",v:postureReport.summary?.total??0,c:C.t},
+                    {l:"Pass",v:postureReport.summary?.passed??0,c:C.a},
+                    {l:"Warn",v:postureReport.summary?.warnings??0,c:C.w},
+                    {l:"Fail",v:postureReport.summary?.failed??0,c:C.d},
+                  ].map(m=><div key={m.l} style={{textAlign:"center",padding:"8px 0",background:"rgba(0,0,0,0.15)",borderRadius:6}}><div style={{fontSize:18,fontWeight:600,color:m.c,fontFamily:"'IBM Plex Mono',monospace"}}>{m.v}</div><M style={{color:C.td}}>{m.l}</M></div>)}
+                </div>
+                <M style={{color:C.tm,display:"block"}}>Verified controls (automated): <span style={{color:C.t}}>{postureReport.summary?.verified?.total??0}</span></M>
+                <M style={{color:C.tm,display:"block",marginTop:4}}>Customer responsibilities (operator-attested): <span style={{color:C.t}}>{postureReport.summary?.customerResponsibility?.total??0}</span></M>
+                {postureReport.summary?.customerResponsibility?.byCategory&&Object.keys(postureReport.summary.customerResponsibility.byCategory).length>0&&<div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`,display:"flex",flexWrap:"wrap",gap:6}}>
+                  {Object.entries(postureReport.summary.customerResponsibility.byCategory).map(([cat,count])=><Badge key={cat} color={C.p}>{cat}: {count}</Badge>)}
+                </div>}
+              </Card>
+
+              {/* verifiedControls list */}
+              <Card>
+                <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:10}}>Verified Controls ({postureReport.verifiedControls?.length||0})</div>
+                {(!postureReport.verifiedControls||postureReport.verifiedControls.length===0)&&<M style={{color:C.td,fontStyle:"italic"}}>No verified controls in this framework.</M>}
+                {postureReport.verifiedControls&&postureReport.verifiedControls.map((ctrl,i)=>{
+                  const statusColor = ctrl.status==="pass"?C.a:ctrl.status==="warning"?C.w:C.d;
+                  const statusLabel = ctrl.status==="pass"?"PASS":ctrl.status==="warning"?"WARN":ctrl.status==="fail"?"FAIL":ctrl.status==="error"?"ERROR":(ctrl.status||"?").toUpperCase();
+                  return <div key={ctrl.controlId||i} style={{padding:"10px 0",borderBottom:i<postureReport.verifiedControls.length-1?`1px solid ${C.b}`:"none"}}>
+                    <div style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:6}}>
+                      <Badge color={statusColor}>{statusLabel}</Badge>
+                      <div style={{flex:1,minWidth:0}}>
+                        <M style={{color:C.t,fontWeight:500,display:"block"}}>{ctrl.controlId} — {ctrl.controlName}</M>
+                      </div>
+                    </div>
+                    {ctrl.mapping&&<M style={{color:C.tm,display:"block",marginBottom:4,fontSize:10,lineHeight:1.5}}>Mapping: {ctrl.mapping}</M>}
+                    {ctrl.detail&&<M style={{color:ctrl.status==="pass"?C.tm:C.t,display:"block",marginBottom:4,fontSize:10,lineHeight:1.5}}>Detail: {ctrl.detail}</M>}
+                    {ctrl.remediation&&<div style={{marginTop:6,padding:"8px 10px",background:"rgba(245,158,11,0.06)",borderLeft:`2px solid ${C.w}`,borderRadius:4}}>
+                      <M style={{color:C.w,fontWeight:500,display:"block",marginBottom:4,fontSize:10}}>Remediation: {ctrl.remediation.summary}</M>
+                      {ctrl.remediation.steps&&ctrl.remediation.steps.length>0&&<ol style={{margin:"4px 0 0 16px",padding:0}}>{ctrl.remediation.steps.map((s,j)=><li key={j} style={{fontSize:10,color:C.tm,fontFamily:"'IBM Plex Mono',monospace",lineHeight:1.5,marginBottom:2}}>{s}</li>)}</ol>}
+                      {ctrl.remediation.uiPath&&<M style={{color:C.i,display:"block",marginTop:4,fontSize:9}}>UI: {ctrl.remediation.uiPath}</M>}
+                    </div>}
+                  </div>;
+                })}
+              </Card>
+
+              {/* customerResponsibility list */}
+              <Card>
+                <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:6}}>Customer Responsibility ({postureReport.customerResponsibility?.length||0})</div>
+                <M style={{color:C.tm,display:"block",marginBottom:12,fontSize:10,lineHeight:1.5}}>Operator-attested duties — controls the platform cannot verify on your behalf. Enumerated here so an auditor or CISO can see the complete framework surface in one report. The CISO and operations leads should track these against internal policy + evidence binders.</M>
+                {(!postureReport.customerResponsibility||postureReport.customerResponsibility.length===0)&&<M style={{color:C.td,fontStyle:"italic"}}>No customer-responsibility items in this framework.</M>}
+                {postureReport.customerResponsibility&&postureReport.customerResponsibility.map((item,i)=><div key={item.id||i} style={{padding:"10px 0",borderBottom:i<postureReport.customerResponsibility.length-1?`1px solid ${C.b}`:"none"}}>
+                  <div style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:6}}>
+                    <Badge color={C.p}>{item.category||"—"}</Badge>
+                    <div style={{flex:1,minWidth:0}}>
+                      <M style={{color:C.t,fontWeight:500,display:"block"}}>{item.id} — {item.name}</M>
+                    </div>
+                  </div>
+                  {item.detail&&<M style={{color:C.tm,display:"block",fontSize:10,lineHeight:1.5}}>{item.detail}</M>}
+                </div>)}
+              </Card>
+            </>)}
+            {!postureFramework&&!postureLoading&&!postureError&&!postureReport&&<Card>
+              <M style={{color:C.td,fontStyle:"italic"}}>Select a framework above and click Generate Report to see this GD's compliance posture.</M>
+            </Card>}
+          </div>)}
+
+          {/* ══════════ CROSS-REGION COMPLIANCE (PR4 C5: rollup matrix; C6-C10 add filters + drilldown + mailbox UI) ══════════ */}
+          {tab==="compliance_xregion"&&(<div>
+            <L>Cross-Region Compliance</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Aggregated compliance posture across every connected Regional MC. CISOs can review the framework x MC matrix, drill into a specific MC's last-pushed summary, request a fresh full report via the mailbox pattern, and inspect per-control detail when fulfilled. MCs push compliance summaries on their configured cadence (default 24h); full reports arrive on the next MC tick after a CISO request.</M>
+            {/* Top-of-tab pending banner (PR4 C10) — visible regardless of matrix state. */}
+            {submittedRequests.length>0&&<Card style={{marginBottom:12,borderColor:C.i+"40"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div style={{fontSize:12,fontWeight:500,color:C.i}}>{submittedRequests.length} full-report request{submittedRequests.length===1?"":"s"} pending fulfillment</div>
+                <Btn small disabled={rollupLoading} onClick={()=>{
+                  setRollupLoading(true);
+                  setRollupError(null);
+                  api.get('/api/compliance/rollup').then(r=>{
+                    if (r && !r.error && Array.isArray(r.rollups)) setRollupData(r.rollups);
+                    else setRollupError(r?.error || 'Failed to load cross-region rollup');
+                  }).finally(()=>setRollupLoading(false));
+                }}>{rollupLoading?"Refreshing...":"Refresh matrix"}</Btn>
+              </div>
+              {submittedRequests.map((req,i)=>{
+                const f = COMPLIANCE_FRAMEWORKS.find(x=>x.id===req.framework);
+                return <div key={req.requestId} style={{padding:"6px 0",borderBottom:i<submittedRequests.length-1?`1px solid ${C.b}`:"none",display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <M style={{color:C.t,fontWeight:500,display:"block",fontSize:11}}>#{req.requestId} · {req.mc_id} / {f?f.label:req.framework}</M>
+                    <M style={{color:C.td,display:"block",fontSize:9}}>submitted {req.requested_at?new Date(req.requested_at).toLocaleString():"just now"}</M>
+                  </div>
+                  <Btn small onClick={()=>setSubmittedRequests(prev=>prev.filter(r=>r.requestId!==req.requestId))}>Dismiss</Btn>
+                </div>;
+              })}
+              <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>Dismissing clears the local tracker only — the request still exists on the GD-side mailbox and the MC will fulfill on its next compliance tick.</M>
+            </Card>}
+            {rollupError&&<Card style={{borderColor:C.d+"40"}}><M style={{color:C.d}}>{rollupError}</M></Card>}
+            {rollupLoading&&<Card><M style={{color:C.tm,fontStyle:"italic"}}>Loading cross-region rollup...</M></Card>}
+            {rollupData&&!rollupLoading&&rollupData.length===0&&<Card>
+              <M style={{color:C.td,fontStyle:"italic"}}>No compliance data yet. Active MCs push compliance summaries on their configured cadence (default 24h); once the first push lands, this matrix will populate. Verify MC connections in the MC Connections tab.</M>
+            </Card>}
+            {rollupData&&!rollupLoading&&rollupData.length>0&&(()=>{
+              // Distinct MC + region option sets, derived from the unfiltered
+              // rollupData so dropdown options stay stable across filter changes.
+              const seenMcs = new Map();
+              const seenRegions = new Set();
+              rollupData.forEach(c=>{
+                if (c.mc_id && !seenMcs.has(c.mc_id)) seenMcs.set(c.mc_id, c.mc_name||c.mc_id);
+                if (c.region) seenRegions.add(c.region);
+              });
+              const mcOptions = [...seenMcs.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
+              const regionOptions = [...seenRegions].sort();
+              const filterActive = !!(rollupFilterFramework||rollupFilterMcId||rollupFilterRegion);
+
+              // Apply filters client-side. Empty filter string = no filter.
+              const filtered = rollupData.filter(c=>{
+                if (rollupFilterFramework && c.framework !== rollupFilterFramework) return false;
+                if (rollupFilterMcId && c.mc_id !== rollupFilterMcId) return false;
+                if (rollupFilterRegion && c.region !== rollupFilterRegion) return false;
+                return true;
+              });
+
+              // Group filtered cells by framework, preserving server-side order.
+              const grouped = {};
+              const order = [];
+              filtered.forEach(c=>{
+                if (!grouped[c.framework]) { grouped[c.framework] = []; order.push(c.framework); }
+                grouped[c.framework].push(c);
+              });
+              const frameworkLabel = (id) => {
+                const f = COMPLIANCE_FRAMEWORKS.find(x=>x.id===id);
+                return f ? f.label : id;
+              };
+              return <>
+                {/* Filter controls */}
+                <Card style={{marginBottom:12}}>
+                  <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:10}}>Filters</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr",gap:0}}>
+                    <Sel label="Framework" value={rollupFilterFramework} onChange={e=>setRollupFilterFramework(e.target.value)}>
+                      <option value="">All frameworks</option>
+                      {COMPLIANCE_FRAMEWORKS.map(f=><option key={f.id} value={f.id}>{f.label}</option>)}
+                    </Sel>
+                    <Sel label="MC" value={rollupFilterMcId} onChange={e=>setRollupFilterMcId(e.target.value)}>
+                      <option value="">All MCs</option>
+                      {mcOptions.map(([id,name])=><option key={id} value={id}>{name} ({id})</option>)}
+                    </Sel>
+                    <Sel label="Region" value={rollupFilterRegion} onChange={e=>setRollupFilterRegion(e.target.value)}>
+                      <option value="">All regions</option>
+                      {regionOptions.map(r=><option key={r} value={r}>{r}</option>)}
+                    </Sel>
+                  </div>
+                  {filterActive&&<Btn small onClick={()=>{setRollupFilterFramework("");setRollupFilterMcId("");setRollupFilterRegion("");}}>Clear filters</Btn>}
+                </Card>
+                <Card style={{marginBottom:12,padding:"10px 14px"}}>
+                  <M style={{color:C.tm}}>{filtered.length} of {rollupData.length} rollup cell{rollupData.length===1?"":"s"} {filterActive?"shown after filter ":""}across {order.length} framework{order.length===1?"":"s"}.</M>
+                </Card>
+                {filtered.length===0&&<Card>
+                  <M style={{color:C.td,fontStyle:"italic"}}>No cells match the active filter. Clear the filter to see all rollup data.</M>
+                </Card>}
+                {order.map(fw=><Card key={fw} style={{marginBottom:10}}>
+                  <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:10}}>{frameworkLabel(fw)} <span style={{color:C.td,fontWeight:400}}>({grouped[fw].length} MC{grouped[fw].length===1?"":"s"})</span></div>
+                  {grouped[fw].map((cell,i)=>{
+                    const ratio = cell.total>0 ? cell.passed/cell.total : 0;
+                    const statColor = ratio>=0.9?C.a:ratio>=0.7?C.w:C.d;
+                    const isOpen = selectedCell && selectedCell.mc_id===cell.mc_id && selectedCell.framework===cell.framework;
+                    const isPending = submittedRequests.some(r=>r.mc_id===cell.mc_id&&r.framework===cell.framework);
+                    return <div key={cell.mc_id}>
+                      <div onClick={()=>{setSelectedReportId(null);setSelectedCell(isOpen?null:{mc_id:cell.mc_id,framework:cell.framework});}} style={{borderBottom:!isOpen&&i<grouped[fw].length-1?`1px solid ${C.b}`:"none",display:"flex",alignItems:"center",gap:10,cursor:"pointer",background:isOpen?"rgba(110,231,183,0.04)":"transparent",margin:isOpen?"0 -10px":"0",padding:isOpen?"8px 10px":"8px 0",borderRadius:isOpen?6:0}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <M style={{color:C.t,fontWeight:500,display:"block"}}>{cell.mc_name||cell.mc_id}</M>
+                          <M style={{color:C.td,display:"block",fontSize:10}}>{cell.mc_id} · {cell.region||"—"}</M>
+                        </div>
+                        <div style={{textAlign:"right",minWidth:90}}>
+                          <M style={{color:statColor,fontWeight:600,fontSize:13,fontFamily:"'IBM Plex Mono',monospace"}}>{cell.passed}/{cell.total}</M>
+                          <M style={{color:C.td,display:"block",fontSize:9}}>{cell.last_push_at?new Date(cell.last_push_at).toLocaleString():"never"}</M>
+                        </div>
+                        {isPending&&<Badge color={C.i}>PENDING</Badge>}
+                        {cell.has_drilldown&&<Badge color={C.i}>FULL</Badge>}
+                        <M style={{color:C.td,fontSize:14,marginLeft:4}}>{isOpen?"▾":"▸"}</M>
+                      </div>
+                      {isOpen&&<div style={{padding:"10px 10px 4px",margin:"0 -10px 8px",background:"rgba(0,0,0,0.15)",borderLeft:`2px solid ${C.a}`,borderRadius:"0 6px 6px 0"}}>
+                        <M style={{color:C.tm,display:"block",marginBottom:8,fontSize:10}}>Full reports for {cell.mc_name||cell.mc_id} / {frameworkLabel(cell.framework)}</M>
+                        {reportsLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading full-report history...</M>}
+                        {reportsError&&<M style={{color:C.d,display:"block"}}>{reportsError}</M>}
+                        {reportsList&&!reportsLoading&&reportsList.length===0&&<M style={{color:C.td,fontStyle:"italic",display:"block"}}>No full reports yet for this MC + framework.</M>}
+                        {reportsList&&!reportsLoading&&reportsList.length>0&&<div>
+                          {reportsList.map((rep,j)=>{
+                            const expired = rep.expires_at && new Date(rep.expires_at) < new Date();
+                            const repOpen = selectedReportId === rep.id;
+                            return <div key={rep.id}>
+                              <div onClick={()=>setSelectedReportId(repOpen?null:rep.id)} style={{padding:"6px 0",borderBottom:!repOpen&&j<reportsList.length-1?`1px solid ${C.b}`:"none",display:"flex",alignItems:"center",gap:8,cursor:"pointer",background:repOpen?"rgba(96,165,250,0.06)":"transparent",margin:repOpen?"0 -10px":"0",borderRadius:repOpen?4:0}}>
+                                <div style={{flex:1,minWidth:0,padding:repOpen?"0 10px":"0"}}>
+                                  <M style={{color:C.t,fontWeight:500,display:"block",fontSize:11}}>#{rep.id} · {new Date(rep.received_at).toLocaleString()}</M>
+                                  <M style={{color:C.td,display:"block",fontSize:9}}>fp: {rep.signature_fingerprint?String(rep.signature_fingerprint).slice(0,16)+"…":"—"} · {rep.bytes?Math.round(rep.bytes/1024)+" KB":"—"} · expires {rep.expires_at?new Date(rep.expires_at).toLocaleDateString():"—"}</M>
+                                </div>
+                                {expired&&<Badge color={C.w}>EXPIRED</Badge>}
+                                <M style={{color:C.td,fontSize:12,marginRight:repOpen?10:0}}>{repOpen?"▾":"▸"}</M>
+                              </div>
+                              {repOpen&&<div style={{padding:"10px 12px",margin:"0 -10px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.i}`,borderRadius:"0 4px 4px 0"}}>
+                                {reportDetailLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading report body...</M>}
+                                {reportDetailError&&<M style={{color:C.d,display:"block"}}>{reportDetailError}</M>}
+                                {reportDetail&&!reportDetailLoading&&(()=>{
+                                  const body = reportDetail.data || {};
+                                  const sum = body.summary || {};
+                                  const vc = Array.isArray(body.verifiedControls) ? body.verifiedControls : [];
+                                  const cr = Array.isArray(body.customerResponsibility) ? body.customerResponsibility : [];
+                                  return <div>
+                                    <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:4,fontSize:11}}>{body.framework||frameworkLabel(reportDetail.framework)}</M>
+                                    {body.authority&&<M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>{body.authority}</M>}
+                                    {body.citation&&<M style={{color:C.td,display:"block",fontSize:9,marginBottom:6}}>{body.citation}</M>}
+                                    <M style={{color:C.td,display:"block",fontSize:9,marginBottom:8,fontFamily:"'IBM Plex Mono',monospace"}}>generated: {body.generatedAt?new Date(body.generatedAt).toLocaleString():"—"} · MC app: {body.appVersion||"—"} · fp: {reportDetail.signature_fingerprint||"—"}</M>
+                                    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:10}}>
+                                      {[
+                                        {l:"Total",v:sum.total??0,c:C.t},
+                                        {l:"Pass",v:sum.passed??0,c:C.a},
+                                        {l:"Warn",v:sum.warnings??0,c:C.w},
+                                        {l:"Fail",v:sum.failed??0,c:C.d},
+                                      ].map(m=><div key={m.l} style={{textAlign:"center",padding:"6px 0",background:"rgba(0,0,0,0.3)",borderRadius:4}}><div style={{fontSize:14,fontWeight:600,color:m.c,fontFamily:"'IBM Plex Mono',monospace"}}>{m.v}</div><M style={{color:C.td,fontSize:9}}>{m.l}</M></div>)}
+                                    </div>
+                                    {vc.length>0&&<div style={{marginBottom:10}}>
+                                      <M style={{color:C.tm,display:"block",marginBottom:6,fontSize:10,fontWeight:500}}>Verified Controls ({vc.length})</M>
+                                      {vc.map((ctrl,k)=>{
+                                        const sc = ctrl.status==="pass"?C.a:ctrl.status==="warning"?C.w:C.d;
+                                        const sl = ctrl.status==="pass"?"PASS":ctrl.status==="warning"?"WARN":ctrl.status==="fail"?"FAIL":ctrl.status==="error"?"ERROR":(ctrl.status||"?").toUpperCase();
+                                        return <div key={ctrl.controlId||k} style={{padding:"6px 0",borderBottom:k<vc.length-1?`1px solid ${C.b}`:"none"}}>
+                                          <div style={{display:"flex",alignItems:"flex-start",gap:6,marginBottom:3}}>
+                                            <Badge color={sc}>{sl}</Badge>
+                                            <M style={{color:C.t,fontWeight:500,flex:1,minWidth:0,fontSize:10}}>{ctrl.controlId} — {ctrl.controlName}</M>
+                                          </div>
+                                          {ctrl.detail&&<M style={{color:ctrl.status==="pass"?C.tm:C.t,display:"block",fontSize:9,lineHeight:1.5}}>{ctrl.detail}</M>}
+                                        </div>;
+                                      })}
+                                    </div>}
+                                    {cr.length>0&&<div>
+                                      <M style={{color:C.tm,display:"block",marginBottom:6,fontSize:10,fontWeight:500}}>Customer Responsibility ({cr.length})</M>
+                                      {cr.map((item,k)=><div key={item.id||k} style={{padding:"6px 0",borderBottom:k<cr.length-1?`1px solid ${C.b}`:"none"}}>
+                                        <div style={{display:"flex",alignItems:"flex-start",gap:6,marginBottom:3}}>
+                                          <Badge color={C.p}>{item.category||"—"}</Badge>
+                                          <M style={{color:C.t,fontWeight:500,flex:1,minWidth:0,fontSize:10}}>{item.id} — {item.name}</M>
+                                        </div>
+                                        {item.detail&&<M style={{color:C.tm,display:"block",fontSize:9,lineHeight:1.5}}>{item.detail}</M>}
+                                      </div>)}
+                                    </div>}
+                                  </div>;
+                                })()}
+                              </div>}
+                            </div>;
+                          })}
+                        </div>}
+                        {/* Request Full Report — mailbox-pattern POST per PR3 C33. */}
+                        {(()=>{
+                          const cellKey = cell.mc_id+"::"+cell.framework;
+                          const pending = submittedRequests.find(r=>r.mc_id===cell.mc_id&&r.framework===cell.framework);
+                          if (pending) {
+                            return <div style={{marginTop:8,padding:"8px 10px",background:"rgba(96,165,250,0.06)",borderLeft:`2px solid ${C.i}`,borderRadius:4}}>
+                              <M style={{color:C.i,fontWeight:500,display:"block",fontSize:10}}>Request pending fulfillment</M>
+                              <M style={{color:C.tm,display:"block",fontSize:9,marginTop:2}}>request #{pending.requestId} submitted {pending.requested_at?new Date(pending.requested_at).toLocaleString():"just now"}. MC observes pending on its next compliance tick (cadence configured per MC; default 24h). Fulfillment will appear in the reports list above on next refresh.</M>
+                            </div>;
+                          }
+                          return <div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`}}>
+                            {submitFullReportError&&<M style={{color:C.d,display:"block",marginBottom:6,fontSize:10}}>{submitFullReportError}</M>}
+                            <Btn small primary disabled={submittingFullReport} onClick={async(e)=>{
+                              e.stopPropagation();
+                              setSubmittingFullReport(true);
+                              setSubmitFullReportError(null);
+                              const r = await api.post("/api/mc/"+encodeURIComponent(cell.mc_id)+"/full-report-requests",{framework:cell.framework});
+                              setSubmittingFullReport(false);
+                              if (r && !r.error && r.success && r.requestId) {
+                                setSubmittedRequests(prev=>[...prev,{mc_id:cell.mc_id,framework:cell.framework,requestId:r.requestId,requested_at:r.requested_at}]);
+                                showGdToast("Full report requested for "+(cell.mc_name||cell.mc_id)+" / "+frameworkLabel(cell.framework));
+                              } else {
+                                setSubmitFullReportError(r?.error||"Failed to submit full-report request");
+                              }
+                            }}>{submittingFullReport?"Requesting...":"Request Full Report"}</Btn>
+                            <M style={{color:C.td,display:"block",marginTop:4,fontSize:9}}>Writes a pending row to the MC's mailbox. The MC will fulfill on its next compliance tick.</M>
+                          </div>;
+                        })()}
+                      </div>}
+                    </div>;
+                  })}
+                </Card>)}
+              </>;
+            })()}
           </div>)}
 
           {/* ══════════ MC OFFBOARDING ══════════ */}

@@ -4080,7 +4080,17 @@ regression:
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate framework-specific compliance reports that check the running system against control requirements.</M>
           <div style={{display:"flex",gap:8,marginBottom:16}}>
             <Sel label="Compliance Framework" value={complianceFw} onChange={e=>setCompFw(e.target.value)}><option value="nist_csf">NIST CSF</option><option value="iso_27001">ISO 27001</option><option value="soc2">SOC 2</option><option value="hipaa">HIPAA</option><option value="gdpr">GDPR</option><option value="dora">DORA</option><option value="ccpa">CCPA</option><option value="pipeda">PIPEDA</option><option value="lgpd">LGPD</option><option value="pdpa_sg">PDPA</option><option value="appi_jp">APPI</option><option value="popia_za">POPIA</option><option value="nis2">NIS2</option><option value="cps234_au">CPS 234</option><option value="cyber_essentials">Cyber Essentials</option><option value="fisma">FISMA</option></Sel>
-            <Btn primary style={{marginTop:8}} onClick={()=>{const fw=complianceFw;const baseControls=[{id:"AC-1",name:"Access Control",status:"pass",detail:"JWT + API key + RBAC enforced on all routes"},{id:"AU-1",name:"Audit Controls",status:"pass",detail:"Immutable audit trail with CEF SIEM streaming"},{id:"EN-1",name:"Encryption",status:"pass",detail:"AES-256-GCM (Tier-3/Tier-1) + NaCl box (E2EE)"},{id:"IA-1",name:"Authentication",status:"pass",detail:"JWT 15-min + refresh + LDAP/SAML/OIDC SSO"},{id:"CM-1",name:"Change Management",status:"pass",detail:"Anti-rollback fuse + startup integrity check"},{id:"IR-1",name:"Incident Response",status:"pass",detail:"CISM retro protocol + routing disable"}];const hipaaControls=[...baseControls,{id:"PHI-1",name:"PHI Classification",status:"warning",detail:"Wellbeing signals may constitute PHI. Treat Tier-3 as PHI."}];const controls=fw==="hipaa"?hipaaControls:baseControls;const warnings=controls.filter(c=>c.status==="warning").length;setCompReport({framework:fw.toUpperCase(),generatedAt:new Date().toISOString(),summary:{total:controls.length,passed:controls.filter(c=>c.status==="pass").length,warnings,failed:controls.filter(c=>c.status==="fail").length},controls});api.post("/api/v1/compliance/scan",{framework:fw}).then(r=>{if(r.controls)setCompReport(r);addA("COMP",fw.toUpperCase()+" scanned: "+r?.summary?.passed+"/"+r?.summary?.total+" passed");});}}>Generate Report</Btn>
+            <Btn primary style={{marginTop:8}} onClick={async()=>{
+              const fw=complianceFw;
+              setCompReport(null);
+              const r=await api.get("/api/compliance/report/"+encodeURIComponent(fw));
+              if(r&&!r.error){
+                setCompReport(r);
+                addA("COMP",(r.framework||fw.toUpperCase())+" generated: "+r?.summary?.passed+"/"+r?.summary?.total+" passed");
+              }else{
+                addA("COMP",(fw.toUpperCase())+" report failed: "+(r?.error||"unknown"));
+              }
+            }}>Generate Report</Btn>
           </div>
           {complianceReport&&(<Card>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
@@ -4092,9 +4102,9 @@ regression:
               <div style={{padding:"8px 16px",background:complianceReport.summary.warnings>0?C.wd:"rgba(255,255,255,0.02)",borderRadius:8,textAlign:"center"}}><div style={{fontSize:20,fontWeight:600,color:complianceReport.summary.warnings>0?C.w:C.td}}>{complianceReport.summary.warnings}</div><M style={{color:C.w}}>Warnings</M></div>
               <div style={{padding:"8px 16px",background:complianceReport.summary.failed>0?C.dd:"rgba(255,255,255,0.02)",borderRadius:8,textAlign:"center"}}><div style={{fontSize:20,fontWeight:600,color:complianceReport.summary.failed>0?C.d:C.td}}>{complianceReport.summary.failed}</div><M style={{color:C.d}}>Failed</M></div>
             </div>
-            {complianceReport.controls.map((ctrl,i)=>(
-              <div key={i} style={{padding:"8px 12px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><M style={{color:C.t,fontWeight:500}}>{ctrl.id} — {ctrl.name}</M><br/><M style={{color:C.tm}}>{ctrl.detail}</M></div>
+            {complianceReport.verifiedControls&&complianceReport.verifiedControls.map((ctrl,i)=>(
+              <div key={ctrl.controlId||i} style={{padding:"8px 12px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div><M style={{color:C.t,fontWeight:500}}>{ctrl.controlId} — {ctrl.controlName}</M><br/><M style={{color:C.tm}}>{ctrl.detail}</M></div>
                 <Badge color={ctrl.status==="pass"?C.a:ctrl.status==="warning"?C.w:C.d}>{ctrl.status}</Badge>
               </div>
             ))}
@@ -5051,6 +5061,41 @@ regression:
         {tab==="global_dash"&&(<div>
           <L>Global Dashboard Push</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure this Regional MC to push aggregate metrics to a Global Dashboard Server (GD-Server) — a separate read-only backend operated by your CISO/VP that aggregates region-level data across multiple MCs. The CISO obtains an API key by registering this MC on the GD-Server, then provides it here. Pushes are one-way (this MC pushes; GD-Server never writes back) and contain only team-level aggregate data — no individual analyst data is transmitted.</M>
+          {/* Handshake state banner (PR4 C18). Surfaces signing-key trust state from
+              the GD-side perspective via the local gd_push_config row's handshake_status
+              field. NEVER surfaces rejected_reason — that lives on the GD side audit log
+              + GD admin UI only. The operator sees status + actionable copy; CISO
+              contact is the recourse for rejected handshakes. */}
+          {globalDashCfg._loaded&&(()=>{
+            const hs = globalDashCfg.handshake_status || "none";
+            const active = globalDashCfg.active_fingerprint || "";
+            const staged = globalDashCfg.staged_fingerprint || "";
+            const lastAt = globalDashCfg.last_handshake_at;
+            const config = {
+              none:     { color:C.tm, label:"NOT CONFIGURED",     headline:"No handshake yet",                copy:"Finish configuring endpoint_url + mc_id + API key below and save. The MC will auto-fire an initial signing-key handshake; status will move to 'pending CISO approval' once the GD receives the submission." },
+              pending_approval: { color:C.w,  label:"PENDING APPROVAL",    headline:"Awaiting CISO approval",       copy:"This MC submitted a signing-key fingerprint to the GD. A CISO with role 'ciso' or 'signing_key_approver' must verify the fingerprint OUT OF BAND (phone, in-person, encrypted channel) and approve in the GD admin UI before signed pushes will be accepted. Reach out to your CISO with the staged fingerprint shown below to expedite review." },
+              approved: { color:C.a,  label:"APPROVED",            headline:"Handshake approved",           copy:"The GD has approved this MC's signing key. Signed pushes will be accepted. If you need to rotate the key, save the configuration with a new staged keypair (or use the rotate endpoint); the new key will enter 'pending CISO approval' until the CISO approves the replacement." },
+              rejected: { color:C.d,  label:"REJECTED",            headline:"Rejected by CISO",             copy:"The GD rejected this MC's signing key. Re-save the GD configuration (typically with a corrected api_key or endpoint_url) to retry — that will stage a fresh keypair and re-fire the handshake. The CISO's rationale is recorded server-side in their audit log and is NOT exposed to the MC by design. Contact your CISO for details if needed." },
+            }[hs] || { color:C.tm, label:hs.toUpperCase(), headline:"Unknown handshake state", copy:"The handshake_status field returned by the local gd_push_config row is '"+hs+"', which is not a recognized state. Check the MC server logs for migration issues." };
+            return <Card style={{marginBottom:16,borderColor:config.color+"60"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8,flexWrap:"wrap"}}>
+                <Badge color={config.color}>{config.label}</Badge>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>{config.headline}</div>
+              </div>
+              <M style={{color:C.tm,display:"block",marginBottom:10,fontSize:11,lineHeight:1.6}}>{config.copy}</M>
+              {(active||staged)&&<div style={{display:"grid",gridTemplateColumns:"1fr",gap:6,marginBottom:6}}>
+                {active&&<div style={{padding:"6px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.a}`,borderRadius:4}}>
+                  <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>active fingerprint</M>
+                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{active}</M>
+                </div>}
+                {staged&&staged!==active&&<div style={{padding:"6px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.w}`,borderRadius:4}}>
+                  <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>staged fingerprint (awaiting CISO approval)</M>
+                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{staged}</M>
+                </div>}
+              </div>}
+              {lastAt&&<M style={{color:C.td,display:"block",fontSize:9,marginTop:4}}>last handshake activity: {new Date(lastAt).toLocaleString()}</M>}
+            </Card>;
+          })()}
           <Card style={{marginBottom:16,borderColor:globalDashCfg.last_push_status==="failure"?C.d+"40":(globalDashCfg.last_push_status==="success"?C.a+"40":C.b)}}>
             <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Connection Status</div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:11}}>

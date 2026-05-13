@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.32 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 25 (anti-rollback)
+**Version:** v1.0.33 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 26 (anti-rollback)
 
 ---
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.32) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.33) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -174,9 +174,21 @@ When active (requires SOAR + Ticketing configured):
 
 ## Compliance
 
-Real compliance scanning against actual app state for 16 frameworks: NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA.
+Compliance reports for 16 frameworks: NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA.
 
-Checks include: access control (RBAC), encryption (AES-256-GCM), audit trail (SHA-256 chain), authentication (IAM/SSO), config management (e-fuse), incident response (IR policies), data protection (pseudonymization), network (SIEM/SOAR), backups, notifications, and AI engine status.
+Each report follows a **Shared Responsibility** model split into two halves:
+
+- **verifiedControls** — technical controls FireAlive observes by inspecting its own running state. Categories: access control (RBAC), encryption (AES-256-GCM at rest, TLS in transit, NaCl box for E2EE), audit trail (SHA-256-chained immutable log), authentication (JWT + IAM/SSO + MFA), configuration management (e-fuse anti-rollback), incident response infrastructure (CISM retro protocol, routing-disable kill switches), data protection (pseudonymization, Tier-3 isolation), network (SIEM/SOAR), backups, notifications, and AI engine status.
+
+- **customerResponsibility** — organizational, procedural, physical, and contractual controls the operating organization must attest separately. Examples: risk-analysis methodology, workforce sanction policy, designated security official, business associate / data processor contracts, physical safeguards on the deployment environment, breach-notification procedures, board-level governance evidence (ISO 27001 management review minutes, internal audit reports), subprocessor agreements and data-transfer impact assessments. For HIPAA, verifiedControls covers 19 controls; customerResponsibility covers 42. The ratio varies by framework but reflects the reality that software handles a minority of any major compliance regime.
+
+Three reporting surfaces:
+
+- **MC → Reports & Compliance tab** — per-region operational view. The MC generates reports against its own running state.
+- **GD → Compliance Posture tab** — CISO view of the GD-Server's own compliance posture (cross-region aggregation integrity, signing-key trust registry, mailbox-pattern fulfillment).
+- **GD → Cross-Region Compliance tab** — framework × MC matrix sourced from MCs' pushed compliance summaries. Drill into any cell for that MC's full-report history, request a fresh fulfillment via the per-cell Request Full Report button, and inspect per-control parsed report bodies when fulfilled. Active MCs only.
+
+See **SETUP.md → Shared Responsibility in Compliance Reports** for the operator-facing framing of what compliance reports do and do not tell you.
 
 ---
 

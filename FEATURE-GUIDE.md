@@ -622,15 +622,24 @@ The external mode is for compromise recovery. If an AC, MC, or GD has been compr
 5. Recipients see team trends, training needs, capacity issues — but never individual data
 
 ### Compliance
-**What it's for:** Generate framework-specific compliance reports against the running system. Picks a framework (NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA), system runs real checks against actual app state, produces an audit-ready report. Output formats: PDF and DOCX, generated using the same document generator as the TTX feature.
+**What it's for:** Generate framework-specific compliance reports against the running system. Picks a framework (NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA), system runs real checks against actual app state, produces an audit-ready report.
+
+Each report has TWO halves per the Shared Responsibility model:
+- **verifiedControls:** technical controls FireAlive observes by inspecting its own running state (status pass / warning / fail / error, with per-control detail, taxonomy mapping, and remediation guidance when not pass)
+- **customerResponsibility:** organizational, procedural, physical, and contractual controls the operating organization must attest separately — listed explicitly so an auditor can match each entry to the organization's evidence binder
+
+For HIPAA, the verified half covers 19 controls; the customer-responsibility half covers 42 (164.308 Administrative Safeguards, 164.310 Physical Safeguards, 164.400-414 Breach Notification). Ratio varies by framework.
 
 **Workflow:**
 1. Auditor announces audit
 2. Lead picks the relevant framework
 3. Clicks Generate Report
-4. System runs control checks against actual app state — access control, encryption, audit trail, authentication, config management, IR, data protection, network, backups, notifications
-5. Generated report opens a download window (PDF or DOCX) and can also be emailed to recipients
-6. Lead reviews, hands to auditor
+4. System runs the technical-control checks against actual app state — access control, encryption, audit trail, authentication, config management, IR infrastructure, data protection, network, backups, notifications, AI engine
+5. Lead reviews both halves: verifiedControls (technical evidence) + customerResponsibility (operator TODO)
+6. Lead pulls supporting documentation for the customer-responsibility items from the organization's evidence binder / GRC tool
+7. Combined evidence package handed to auditor
+
+See SETUP.md → "Shared Responsibility in Compliance Reports" for the longer operator framing.
 
 ### Recertification
 **What it's for:** Periodic review of all accounts, integrations, assessments, and configurations. Quarterly recommended. Ensures stale accounts are removed, integrations are still current, settings still appropriate. Triggers a workflow rather than a one-time view.
@@ -997,7 +1006,39 @@ Per-region health bars, automation rates, cert coverage.
 Generate executive reports for board presentations.
 
 ### MC Connections
-Manage which MCs feed data here. Add/remove regional MCs.
+**What it's for:** Manage which Regional MCs feed data here. Register new MCs, view their connection health, offboard decommissioned ones. The connections tab is also the trust-registry admin surface for signing keys.
+
+**Pending Signing Key Approvals queue:** When a Regional MC first connects (and on every key rotation), it submits a signing-key fingerprint that this GD must approve before signed pushes are accepted. The queue at the top of the connections tab shows all pending submissions across all MCs with their full fingerprints. A CISO or signing_key_approver verifies each fingerprint OUT OF BAND with the MC operator (phone, in-person, separate encrypted channel) and clicks Approve or Reject. The Approve click fires a confirmation dialog displaying the fingerprint one more time before the irreversible state transition; the click also sends the fingerprint to the server as a confirmation parameter, so a UI bug pointing approve at the wrong row is caught server-side (CONFIRMATION_FINGERPRINT_MISMATCH). Reject opens a modal capturing a free-form rejection reason (required, ≤500 chars); the reason is recorded in the GD audit log and the GD-side admin view only — never exposed to the MC operator (privacy invariant). Both actions emit MC_SIGNING_KEY_APPROVED / MC_SIGNING_KEY_REJECTED audit events.
+
+**Per-MC Keys panel:** Each MC card has a "Keys" button (becomes "Review keys" in primary styling when that MC has pending submissions, with a per-MC pending count badge). Expanding the panel shows the COMPLETE signing-key history for that MC: every approved, pending, and rejected row with their full fingerprints, registration timestamps, approval metadata (timestamp + approver user id + approver role), rotation metadata (rotated_out_at when the key was demoted by a successor), and rejection metadata (rejected_at + rejected_reason). This panel is the ONLY UI surface where rejected_reason is exposed; the MC-facing status endpoint strips it.
+
+**Top-of-list summary line:** When any MCs have pending submissions, a one-line summary above the MC list names the distinct count and points the operator at the amber "Review keys" affordance.
+
+### Compliance Posture
+**What it's for:** Generate a compliance report against THIS GD-Server's own running state. Same 16-framework selector as the MC side, same Shared Responsibility two-bucket structure (verifiedControls + customerResponsibility), but the controls checked are GD-specific: cross-region aggregation integrity, signing-key trust registry hygiene, mailbox-pattern fulfillment, GD-side audit log integrity, GD-side encryption, GD-side authentication, GD-side configuration locking. Each report carries the framework name, authority, citation, generation timestamp, and the app version that produced it — useful provenance metadata for audit evidence.
+
+**Workflow:**
+1. CISO opens Compliance Posture tab
+2. Selects a framework from the 16-option dropdown
+3. Clicks Generate Report
+4. Sees 4-up summary (Total / Pass / Warn / Fail) plus the verified-control list with status badges, per-control mapping to the framework taxonomy (NIST control id, HIPAA citation, ISO clause), and a remediation pane on any non-pass row describing what the GD operator needs to do to fix the finding
+5. Sees the customer-responsibility list below — the controls the OPERATING ORGANIZATION must attest separately for the GD layer (e.g., subprocessor agreements for the GD's hosting, GD-side personnel access policies)
+6. CISO files the report in the org's audit-evidence binder alongside the corresponding MC reports
+
+### Cross-Region Compliance
+**What it's for:** Roll up compliance posture across every connected Regional MC. The matrix view shows framework x MC cells with passed/total counts colored by health (green ≥90%, amber ≥70%, red below). Filter by framework, by MC, or by region to narrow the view. Drill into any cell to see that (MC, framework)'s full-report history — past CISO-requested fulfillments with timestamps, signature fingerprints (for forensic verification), and payload sizes. Click any report row to see the parsed report body: framework summary, full verifiedControls list with status badges, and customerResponsibility list.
+
+If a cell's most recent report is stale or there's no full-report history at all, the CISO can request a fresh fulfillment via the **Request Full Report** button. The request follows the mailbox pattern (Foundational Rule 21 — GD never dials MC; data flows MC-to-GD only). The button writes a pending row to the GD-side mailbox; the MC observes the request on its next compliance tick (default 24h cadence) and pushes the full report via the ingest endpoint. After submit, the cell shows a PENDING badge and a top-of-tab pending banner with a Refresh Matrix button that re-fetches the rollup to check for fulfillments.
+
+**Auth:** Cross-Region Compliance reads are gated to ciso / vp / readonly roles; mailbox writes (Request Full Report) are gated tighter to ciso / vp only.
+
+**Workflow:**
+1. CISO opens Cross-Region Compliance
+2. Reviews the matrix at a glance — colored stats per (framework, MC) cell
+3. Optionally narrows with filters (e.g., framework=HIPAA to see one regulation across all MCs)
+4. Drills into a specific cell to see the report history
+5. Either reads the most recent full report inline or clicks Request Full Report to get a fresh fulfillment
+6. After fulfillment lands (MC's next tick), refreshes the matrix and reviews the new report body
 
 ### MC Offboarding
 When a regional SOC is decommissioned, offboard its MC. Historical data retention per policy.

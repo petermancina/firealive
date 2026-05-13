@@ -60,6 +60,55 @@
 
 ---
 
+## Shared Responsibility in Compliance Reports
+
+Compliance reports produced by FireAlive (Reports & Compliance on the MC, Compliance Posture on the GD) follow a **Shared Responsibility** model that separates controls FireAlive can verify automatically from controls the operating organization must attest to separately.
+
+Understanding this split matters for two reasons:
+1. **Audit evidence.** An auditor reading a FireAlive compliance report needs to know which control results are software-verified (FireAlive ran a check against the running system and observed a pass / warning / fail) and which are documentation the organization must produce on its own (policy text, training records, contract clauses with subprocessors, board-level governance evidence, etc.).
+2. **Operator workload.** A passing FireAlive report does NOT mean the framework is satisfied end to end. The customer-responsibility items are the operator's homework — they need to be tracked in your evidence binder, policy library, or GRC tool alongside the FireAlive report.
+
+### What FireAlive Verifies Automatically (verifiedControls)
+
+These are the **technical** controls FireAlive can observe by inspecting its own configuration, code, and runtime state. Examples vary by framework, but the verified set generally covers:
+- Authentication and session management (JWT lifetime, MFA enforcement, SSO integration)
+- Access control and role separation (RBAC, multi-MFA-approval gates for sensitive actions)
+- Audit logging (immutable storage, syslog/CEF export, retention)
+- Encryption at rest and in transit (AES-256-GCM for stored data, TLS for transport, NaCl box for E2EE messages)
+- Anti-rollback and integrity checks (fuse counter, startup integrity verification)
+- Incident response infrastructure (CISM retro protocol, routing-disable kill switches)
+
+Each verifiedControls entry in a report carries a `status` (pass / warning / fail / error), a `detail` describing what was observed, a `mapping` showing which control taxonomy it maps to (NIST control id, HIPAA citation, ISO clause, etc.), and a `remediation` block when the status is not pass.
+
+### What You Attest (customerResponsibility)
+
+These are the **organizational, procedural, physical, and contractual** controls that exist outside FireAlive's software boundary. The platform cannot observe them; only your organization can produce the evidence. Examples:
+- Risk analysis methodology and findings (HIPAA 164.308(a)(1)(ii)(A) — the most-cited violation; FireAlive provides infrastructure that supports the analysis but cannot perform it)
+- Workforce sanction policy and HR records of sanctions applied
+- Designated security official by name + contact info + accountability documentation
+- Business associate / data processor contracts with required compliance clauses
+- Physical safeguards on the deployment environment (facility access controls, workstation security)
+- Breach notification procedures, including timeline tracking and regulator-notification templates
+- Board-level governance evidence (ISO 27001 management review minutes, internal audit reports)
+- Subprocessor agreements and data-transfer impact assessments (GDPR Article 28 + Chapter V; DORA ICT third-party risk)
+
+Each customerResponsibility entry in a report carries an `id`, `name`, `category` (organizational, procedural, contractual, physical, governance), and `detail` describing exactly what your organization must document. For HIPAA, FireAlive's verifiedControls covers 19 entries; customerResponsibility covers 42 entries (the 164.308 Administrative Safeguards, all 164.310 Physical Safeguards, and the 164.400-414 Breach Notification subsection). The ratio varies by framework but always reflects this reality: software handles a minority of any major compliance regime.
+
+### Why It Matters
+
+When you present a FireAlive compliance report to an internal auditor or external assessor:
+- A pass on the verified half is evidence that FireAlive's technical controls satisfy the in-scope requirements **as configured today**. Re-run the report after any material change to confirm.
+- The customer-responsibility half is your TODO list. An auditor will expect you to produce documentation matching each entry. The report enumerates them explicitly so nothing is forgotten.
+- A FireAlive report that omits the customer-responsibility section is incomplete by design — the platform refuses to produce a "complete compliance certificate" because that would falsely imply the verified half covers the whole regime.
+
+### Where to Find the Reports
+
+- **MC side (per-region operational view):** Reports & Compliance tab. Select a framework and click Generate Report. The report is generated against the local MC's running state.
+- **GD side (CISO posture view):** Compliance Posture tab. Same framework selector; the report is generated against the GD-Server's running state, which covers GD-specific controls (cross-region aggregation integrity, signing-key trust registry, mailbox-pattern fulfillment).
+- **GD side (cross-MC rollup view):** Cross-Region Compliance tab. Renders a framework x MC matrix sourced from MCs' pushed compliance summaries. Drill into any cell for that MC's full report history; request a fresh fulfillment via the per-cell Request Full Report button if the most recent summary is stale.
+
+---
+
 ## Building from Source
 
 ### Prerequisites
