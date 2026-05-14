@@ -183,7 +183,9 @@ router.post('/sessions/:sessionId/rate', (req, res) => {
       req.user.id,
       stars,
       comment,
-      helpfulnessTags
+      helpfulnessTags,
+      req.ip,
+      req.headers['user-agent']
     );
 
     // If points actually accrued, notify the helper.
