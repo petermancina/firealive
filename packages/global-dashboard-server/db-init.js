@@ -1,0 +1,669 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIREALIVE GLOBAL DASHBOARD SERVER — Database Initialization
+// Independent backend for the CISO Global Dashboard. 
+// Stores: regional MC data, users, sessions, audit logs, configs, backups,
+// notifications, compliance data, system health metrics.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Database = require('better-sqlite3');
+const path = require('path');
+const crypto = require('crypto');
+
+const DB_PATH = process.env.GD_DB_PATH || path.join(__dirname, 'data', 'global-dashboard.db');
+
+const SCHEMA = `
+-- Users (CISOs, VPs, signing-key approvers, read-only analysts)
+--
+-- ROLE SEGREGATION (R3g PR3 Phase 5, C15):
+-- 'signing_key_approver' is a new role distinct from 'ciso', segregated
+-- per ISO 27001 A.6.1.2 (segregation of duties) and NIST 800-53 AC-5.
+-- The user who registers an MC (must hold 'ciso' to call
+-- POST /api/mc/register) should not be the same user who approves that
+-- MC's signing keys (requires 'ciso' OR 'signing_key_approver'). An
+-- organization with smaller ops can assign both roles to one human; the
+-- audit log records each action with its acting role distinctly so
+-- reviewers can see whether segregation was actually exercised.
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT,
+  role TEXT NOT NULL CHECK (role IN ('ciso', 'vp', 'readonly', 'signing_key_approver')),
+  name TEXT NOT NULL,
+  mfa_secret TEXT,
+  mfa_enabled INTEGER DEFAULT 0,
+  auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
+  created_at TEXT DEFAULT (datetime('now')),
+  last_login TEXT
+);
+
+-- Sessions
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  token TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  ip TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- Connected Management Consoles (regional)
+CREATE TABLE IF NOT EXISTS management_consoles (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  name TEXT NOT NULL,
+  region TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  country TEXT,
+  regulatory_framework TEXT DEFAULT 'none',
+  status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'offboarded')),
+  analyst_count INTEGER DEFAULT 0,
+  last_sync TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  offboarded_at TEXT
+);
+
+-- ── R3g PR3: MC SIGNING-KEY REGISTRY ─────────────────────────────────────
+-- Per-MC Ed25519 public-key trust registry. Populated via the MC handshake
+-- on first GD-push config setup (MC POSTs its just-generated public key to
+-- POST /api/mc/:id/signing-key). Every inbound MC push verifies its
+-- X-FA-Signature against an active row here, looked up by mc_id +
+-- public_key_fingerprint.
+--
+-- TRUST MODEL: One approved active key per MC at a time (approval_status =
+-- 'approved' AND is_active = 1). Under R3g PR3 Phase 5 the trust path is
+-- manual CISO approval: a new row is submitted by an MC handshake with
+-- approval_status='pending_approval' and is_active=0; a user holding the
+-- 'ciso' or 'signing_key_approver' role reviews the fingerprint out-of-
+-- band with the MC operator and clicks approve, which atomically demotes
+-- any prior approved active row (is_active=0, rotated_out_at=now, the
+-- prior row's approval_status STAYS 'approved' so the verifier's
+-- grace-window query can match it during the configured grace period)
+-- and promotes the new row (is_active=1, approved_at=now,
+-- approved_by_user_id, approved_by_role recorded for audit segregation
+-- per ISO 27001 A.6.1.2 / NIST 800-53 AC-5).
+--
+-- FINGERPRINT FORMAT: SHA-256 hex of the Ed25519 SPKI DER encoding
+-- (64 lowercase hex chars). Matches the format used by the MC's
+-- backup_signing_keys.public_key_fingerprint column so operators see a
+-- consistent identifier across MC and GD logs.
+--
+-- ON DELETE CASCADE: removing an MC row (hard-delete, not the usual
+-- status='offboarded' soft-delete) drops its trust rows; orphan keys
+-- shouldn't outlive the MC they were registered for.
+--
+-- APPROVAL COLUMNS (R3g PR3 Phase 5, C14): the manual-approval workflow
+-- adds approval_status, approved_at, approved_by_user_id,
+-- approved_by_role, rejected_at, and rejected_reason. The rejected_*
+-- columns capture audit detail; rejected_reason is INTERNAL ONLY and is
+-- never surfaced through the MC-facing status-query endpoint (the MC
+-- sees only the bare status string with no reason — minimal signal so
+-- the endpoint is not a recon surface for an attacker probing the
+-- CISO's operational habits).
+CREATE TABLE IF NOT EXISTS signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 SPKI
+  public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER (64 chars)
+  is_active INTEGER NOT NULL DEFAULT 0              -- R3g PR3 Phase 5: default 0 (was 1 in C1).
+    CHECK (is_active IN (0, 1)),                    -- Approval flow promotes to 1 on CISO approve.
+  registered_at TEXT DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
+  notes TEXT,
+  -- R3g PR3 Phase 5 approval columns (C14)
+  approval_status TEXT NOT NULL DEFAULT 'pending_approval'
+    CHECK (approval_status IN ('pending_approval', 'approved', 'rejected')),
+  approved_at TEXT,                                 -- ISO 8601, set on CISO approve
+  approved_by_user_id TEXT,                         -- users.id (no FK; soft reference for audit)
+  approved_by_role TEXT                             -- which role approved — segregation audit
+    CHECK (approved_by_role IS NULL
+           OR approved_by_role IN ('ciso', 'signing_key_approver')),
+  rejected_at TEXT,                                 -- ISO 8601, set on CISO reject
+  rejected_reason TEXT,                             -- INTERNAL ONLY — never returned to MC
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- Hot path for signature verification on every inbound push: look up
+-- (mc_id, fingerprint) tuple and confirm is_active = 1.
+CREATE INDEX IF NOT EXISTS idx_signing_keys_mc_fingerprint
+  ON signing_keys(mc_id, public_key_fingerprint);
+
+-- Partial index for the "find the active key for this MC" query path
+-- used during MC re-handshake / admin inspection.
+CREATE INDEX IF NOT EXISTS idx_signing_keys_active
+  ON signing_keys(mc_id) WHERE is_active = 1;
+
+-- ── R3g PR3: MC COMPLIANCE REPORT SUMMARIES ──────────────────────────────
+-- Per-MC, per-framework compliance push summaries. Receives the daily
+-- (or admin-tunable cadence) summary push from each connected MC. Each
+-- row is one framework's compressed result: passed/total counts, top
+-- failing controls, generated-at timestamp, digest hash of the full
+-- report. The full report itself lives in mc_compliance_report_fulls
+-- (mailbox-fulfilled on CISO request, not pushed continuously).
+--
+-- RETENTION: Rows accumulate over time as MCs continue pushing. The
+-- materialized cross_region_rollup table reads the latest row per
+-- (mc_id, framework) for O(1) CISO-side queries. Historical rows
+-- preserve trend visibility but a future retention policy may prune
+-- entries older than N days.
+--
+-- SIGNATURE_FINGERPRINT: identifies which signing_keys row verified the
+-- push that delivered this report. Useful for forensic correlation if a
+-- key rotation overlapped a reporting window.
+CREATE TABLE IF NOT EXISTS mc_compliance_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  framework TEXT NOT NULL,                          -- e.g. 'hipaa', 'soc2', 'nist_csf'
+  summary_json TEXT NOT NULL,                       -- JSON: {passed, total, perCategoryCounts,
+                                                    --        topFailingControls[3], generatedAt, digestHash}
+  signature_fingerprint TEXT NOT NULL,              -- which signing_keys.public_key_fingerprint
+                                                    -- verified the delivering push
+  received_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- Hot path for CISO interactive queries and rollup updates: latest
+-- summary per (mc_id, framework) ordered by received_at DESC.
+CREATE INDEX IF NOT EXISTS idx_mc_compliance_reports_lookup
+  ON mc_compliance_reports(mc_id, framework, received_at DESC);
+
+-- ── R3g PR3: MC COMPLIANCE FULL REPORTS (mailbox-fulfilled) ──────────────
+-- Storage for full compliance reports delivered via the mailbox pattern
+-- (Foundational Rule 21). When a CISO requests a full report for a
+-- specific (mc_id, framework), a row is written to mc_report_requests
+-- below. The MC sees the pending request on its next push tick (via the
+-- GET /api/mc/me/pending-requests poll), generates a fresh full report,
+-- and POSTs it back to /api/ingest/compliance-reports?full=true. The
+-- handler stores the report here and marks the request fulfilled.
+--
+-- 30-DAY TTL: full reports are large (tens of KB per framework × 16
+-- frameworks × N MCs adds up); they're retained 30 days from receipt and
+-- pruned by a periodic cleanup job that queries on the expires_at index.
+-- CISOs who want a long-lived archived copy export from the UI before
+-- expiry. TTL is currently hard-coded for v1.0.33; an open question in
+-- the build plan tracks possible future operator configurability.
+--
+-- expires_at is materialized at insert time as received_at + 30 days via
+-- SQLite date arithmetic in the DEFAULT clause; no background scheduler
+-- needed to compute it.
+CREATE TABLE IF NOT EXISTS mc_compliance_report_fulls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  framework TEXT NOT NULL,
+  report_json TEXT NOT NULL,                        -- full generateComplianceReport output
+  signature_fingerprint TEXT NOT NULL,              -- signing_keys row that verified the fulfilling push
+  received_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL DEFAULT (datetime('now', '+30 days')),
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- Hot path: CISO retrieval of latest full report per (mc_id, framework).
+CREATE INDEX IF NOT EXISTS idx_mc_full_reports_lookup
+  ON mc_compliance_report_fulls(mc_id, framework, received_at DESC);
+
+-- Background cleanup path: DELETE WHERE expires_at < datetime('now').
+CREATE INDEX IF NOT EXISTS idx_mc_full_reports_expiry
+  ON mc_compliance_report_fulls(expires_at);
+
+-- ── R3g PR3: CISO FULL-REPORT REQUEST MAILBOX ────────────────────────────
+-- The mailbox half of the mailbox pattern (Foundational Rule 21). A CISO
+-- clicking "Request full report for Framework X from MC Y" in the GD UI
+-- writes a pending row here. The MC reads pending rows for itself on its
+-- next push tick (GET /api/mc/me/pending-requests, signature-
+-- authenticated so an MC can only see its own requests). On fulfillment,
+-- status flips 'pending' -> 'fulfilled' and fulfilled_report_id points
+-- to the resulting mc_compliance_report_fulls row.
+--
+-- STATUS MACHINE:
+--   pending    - written by CISO action, not yet fetched by MC
+--   fulfilled  - MC delivered the full report; fulfilled_report_id is set
+--   failed     - MC reported an error during report generation; error_detail
+--                describes the cause (rare)
+--   expired    - MC didn't fulfill within the timeout window (e.g. MC
+--                offline for an extended period); cleanup job marks these
+--
+-- ON DELETE SET NULL on fulfilled_report_id: if the linked full report is
+-- pruned by TTL cleanup, the request row survives as a historical record
+-- but loses its pointer. The status field still reads 'fulfilled' so the
+-- historical fact is preserved.
+--
+-- Concurrent CISO requests for the same (mc_id, framework) currently
+-- result in two fulfilled rows (idempotent, slightly wasteful). An open
+-- question in the build plan tracks dedup-at-request-time if scale ever
+-- warrants it.
+CREATE TABLE IF NOT EXISTS mc_report_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  framework TEXT NOT NULL,
+  requested_by_user_id TEXT NOT NULL,
+  requested_at TEXT DEFAULT (datetime('now')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'fulfilled', 'failed', 'expired')),
+  fulfilled_at TEXT,
+  fulfilled_report_id INTEGER,
+  error_detail TEXT,
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE,
+  FOREIGN KEY (requested_by_user_id) REFERENCES users(id),
+  FOREIGN KEY (fulfilled_report_id) REFERENCES mc_compliance_report_fulls(id) ON DELETE SET NULL
+);
+
+-- Hot path for the MC's pending-request poll: pending rows for a
+-- specific MC.
+CREATE INDEX IF NOT EXISTS idx_mc_report_requests_pending
+  ON mc_report_requests(mc_id) WHERE status = 'pending';
+
+-- ── R3g PR3: CROSS-REGION COMPLIANCE ROLLUP (materialized aggregator) ────
+-- Materialized per-(framework, MC) compliance state, updated as a side
+-- effect of every successful compliance-summary ingest. Read-side stays
+-- O(1) for CISO interactive queries regardless of MC count: 500 MCs ×
+-- 16 frameworks = ~8000 rows, indexed lookups, no fan-out aggregation.
+--
+-- This is the standard SOC dashboard pattern: Splunk summary indexes,
+-- Datadog rollups, Grafana recording rules. Write cost is paid at push
+-- time (already a write transaction); read cost stays flat at any scale.
+--
+-- POPULATION: the compliance-reports ingest handler (added later in PR3)
+-- upserts a row here for every (mc_id, framework) tuple in an incoming
+-- push. Existing row gets last_push_at + passed + total + per_control_status
+-- replaced; new (mc_id, framework) tuples get an insert. No background
+-- recomputation; the table is always current as of the last push.
+--
+-- The materialized table doubles as a historical record of state-at-
+-- push-time per region — useful audit trail for "what did Region X look
+-- like on Date Y" queries (the last_push_at + a periodic snapshot
+-- archive would extend this; out of scope for v1.0.33).
+--
+-- PRIMARY KEY (framework, mc_id) enforces one row per tuple and makes
+-- the upsert pattern (INSERT ... ON CONFLICT DO UPDATE) efficient.
+CREATE TABLE IF NOT EXISTS cross_region_rollup (
+  framework TEXT NOT NULL,
+  mc_id TEXT NOT NULL,
+  passed INTEGER NOT NULL DEFAULT 0,                -- verifiedControls passing for this (mc, framework)
+  total INTEGER NOT NULL DEFAULT 0,                 -- total verifiedControls for this (mc, framework)
+  per_control_status TEXT,                          -- JSON {controlId: 'pass'|'warn'|'fail'} for drill-down
+                                                    -- without joining back to mc_compliance_reports
+  last_push_at TEXT NOT NULL,                       -- when the latest push for this tuple landed
+  PRIMARY KEY (framework, mc_id),
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- "Show me all MCs' status for Framework X" query path.
+CREATE INDEX IF NOT EXISTS idx_cross_region_rollup_framework
+  ON cross_region_rollup(framework);
+
+-- ── R3h: REGIONAL LEADERBOARD AGGREGATION ───────────────────────────────
+-- One row per (mc_id, analyst_pseudonym) representing this MC's most recent
+-- leaderboard push for that analyst. The GD's _leaderboardTick push from
+-- the MC (server/services/gd-push.js _performLeaderboardPush) sends a
+-- complete top-50 list every cadence; the ingest handler at
+-- POST /api/ingest/leaderboard atomically REPLACES this MC's rows with
+-- the new push entries (so an analyst who falls out of the top 50 or
+-- opts out of the leaderboard disappears from this table on the next
+-- push within one cadence).
+--
+-- PRIVACY INVARIANT I3 (OPT-IN PROPAGATION)
+-- Each row's analyst_pseudonym corresponds to an MC analyst who has
+-- explicitly opted in to the leaderboard via their AC toggle. The MC's
+-- helperPay.getLeaderboard query enforces leaderboard_opt_in = 1 at the
+-- source; opt-out analysts never appear in any push payload, so they
+-- never appear in this table.
+--
+-- PRIVACY INVARIANT I4 (PSEUDONYM-ONLY)
+-- analyst_pseudonym is a string. Real names, user_ids, and emails are
+-- intentionally NOT carried in this table. A team that hasn't enabled
+-- pseudonyms on its MC will see empty leaderboard pushes (the MC push
+-- layer strips entries without a pseudonym) and therefore an empty
+-- view in the GD's Helper Recognition tab — by design.
+--
+-- ATOMIC REPLACEMENT
+-- The ingest handler runs DELETE FROM regional_leaderboard WHERE mc_id=?
+-- followed by INSERTs for the new push entries inside a single SQLite
+-- transaction. This avoids a race where the matrix render could observe
+-- partial state (some old rows + some new) during the swap.
+--
+-- pushed_at carries the MC's timestamp at push build time; received_at
+-- carries the GD's receipt timestamp. Both are useful for forensic
+-- review and for detecting clock drift between MC and GD.
+CREATE TABLE IF NOT EXISTS regional_leaderboard (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  analyst_pseudonym TEXT NOT NULL,                  -- pseudonym only; never real name
+  points INTEGER NOT NULL,
+  sessions_count INTEGER NOT NULL,
+  avg_rating REAL,                                  -- nullable when analyst has no ratings yet
+  pushed_at TEXT NOT NULL,                          -- MC-supplied push timestamp
+  received_at TEXT NOT NULL DEFAULT (datetime('now')),
+  signature_fingerprint TEXT NOT NULL,              -- signing_keys row that verified the push
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- Hot path: matrix view fetches all rows for the cross-MC roll-up.
+CREATE INDEX IF NOT EXISTS idx_regional_leaderboard_mc
+  ON regional_leaderboard(mc_id);
+
+-- Drilldown: per-MC view sorts by points DESC for top-N display.
+CREATE INDEX IF NOT EXISTS idx_regional_leaderboard_mc_points
+  ON regional_leaderboard(mc_id, points DESC);
+
+-- Regional aggregate data (received from MCs)
+CREATE TABLE IF NOT EXISTS regional_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  timestamp TEXT DEFAULT (datetime('now')),
+  health_score INTEGER,
+  utilization_pct INTEGER,
+  automation_rate INTEGER,
+  cert_coverage_pct INTEGER,
+  sla_compliance_pct INTEGER,
+  turnover_risk TEXT CHECK (turnover_risk IN ('low', 'medium', 'high', 'critical')),
+  analyst_count INTEGER,
+  active_incidents INTEGER DEFAULT 0,
+  burnout_routing_active INTEGER DEFAULT 1,
+  proactive_breaks_given INTEGER DEFAULT 0,
+  upskilling_hours_used INTEGER DEFAULT 0,
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id)
+);
+
+-- Audit log
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TEXT DEFAULT (datetime('now')),
+  user_id TEXT,
+  event_type TEXT NOT NULL,
+  detail TEXT,
+  ip TEXT,
+  severity TEXT DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'error', 'critical'))
+);
+
+-- Auth log (login attempts)
+CREATE TABLE IF NOT EXISTS auth_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TEXT DEFAULT (datetime('now')),
+  username TEXT,
+  action TEXT NOT NULL,
+  ip TEXT,
+  method TEXT,
+  reason TEXT
+);
+
+-- Configuration store
+CREATE TABLE IF NOT EXISTS config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- Backup records
+CREATE TABLE IF NOT EXISTS backups (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  type TEXT NOT NULL CHECK (type IN ('full', 'incremental', 'differential', 'snapshot')),
+  status TEXT DEFAULT 'completed',
+  size_bytes INTEGER,
+  hash TEXT,
+  destination TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  retention_until TEXT
+);
+
+-- Backup schedules
+CREATE TABLE IF NOT EXISTS backup_schedules (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  type TEXT NOT NULL,
+  frequency TEXT NOT NULL,
+  time TEXT,
+  day TEXT,
+  destination TEXT,
+  retention_days INTEGER DEFAULT 90,
+  encrypted INTEGER DEFAULT 1,
+  regulatory_preset TEXT DEFAULT 'none',
+  active INTEGER DEFAULT 1
+);
+
+-- Notification config and history
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,
+  mc_id TEXT,
+  message TEXT NOT NULL,
+  severity TEXT DEFAULT 'info',
+  acknowledged INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- System health metrics (self-monitoring)
+CREATE TABLE IF NOT EXISTS system_health (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TEXT DEFAULT (datetime('now')),
+  cpu_pct REAL,
+  memory_mb INTEGER,
+  heap_mb INTEGER,
+  db_reads_per_min INTEGER,
+  uptime_sec INTEGER,
+  connected_mcs INTEGER
+);
+
+-- Generated reports
+CREATE TABLE IF NOT EXISTS reports (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  type TEXT NOT NULL,
+  generated_at TEXT DEFAULT (datetime('now')),
+  data TEXT NOT NULL,
+  format TEXT DEFAULT 'json'
+);
+
+-- System metadata
+CREATE TABLE IF NOT EXISTS system_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+function getDb() {
+  const fs = require('fs');
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return new Database(DB_PATH);
+}
+
+function initDb() {
+  const db = getDb();
+  db.exec(SCHEMA);
+
+  // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
+  //
+  // The canonical CREATE TABLE above includes approval_status, approved_at,
+  // approved_by_user_id, approved_by_role, rejected_at, and rejected_reason
+  // for fresh installs. For deploys that ran any of C1-C13 before this
+  // commit, signing_keys has the original schema (no approval columns).
+  // This block detects that case and applies ALTER TABLE ADD COLUMN for
+  // each new column, then backfills any existing rows.
+  //
+  // Backfill rationale: any existing row from a C1-C13 deploy was either
+  //   (a) created by C12 (which auto-activated rows with is_active=1), or
+  //   (b) was never created at all (C13 hot-fix blocks all writes via this
+  //       endpoint and no other code path writes to signing_keys before
+  //       C18).
+  // Case (a) rows were considered trusted under the old design, so we
+  // mark them approval_status='approved' on migration so the verifier
+  // continues to accept their signatures uninterrupted. New rows from
+  // C18+ explicitly set approval_status='pending_approval' (and the
+  // canonical CREATE TABLE's DEFAULT is also 'pending_approval' for
+  // belt-and-suspenders safety against future code paths that forget to
+  // specify it).
+  //
+  // Idempotency: guarded by PRAGMA table_info — if approval_status
+  // column already exists, the entire block is skipped, so the backfill
+  // never runs twice (which would clobber real pending_approval rows
+  // created by C18+).
+  try {
+    const skCols = db.prepare("PRAGMA table_info(signing_keys)").all();
+    const hasApprovalStatus = skCols.some(c => c.name === 'approval_status');
+    if (!hasApprovalStatus) {
+      db.exec(`
+        ALTER TABLE signing_keys
+          ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'pending_approval'
+            CHECK (approval_status IN ('pending_approval', 'approved', 'rejected'));
+      `);
+      db.exec(`ALTER TABLE signing_keys ADD COLUMN approved_at TEXT;`);
+      db.exec(`ALTER TABLE signing_keys ADD COLUMN approved_by_user_id TEXT;`);
+      db.exec(`
+        ALTER TABLE signing_keys
+          ADD COLUMN approved_by_role TEXT
+            CHECK (approved_by_role IS NULL
+                   OR approved_by_role IN ('ciso', 'signing_key_approver'));
+      `);
+      db.exec(`ALTER TABLE signing_keys ADD COLUMN rejected_at TEXT;`);
+      db.exec(`ALTER TABLE signing_keys ADD COLUMN rejected_reason TEXT;`);
+
+      // Backfill: every existing row (pre-Phase-5) gets approval_status =
+      // 'approved' since it was considered trusted under the C12 design.
+      // The ALTER above set every existing row to 'pending_approval' via
+      // the column DEFAULT; this UPDATE corrects them.
+      const backfill = db.prepare(`
+        UPDATE signing_keys
+        SET approval_status = 'approved'
+        WHERE approval_status = 'pending_approval'
+      `).run();
+
+      console.log(
+        `Migrated signing_keys: added approval workflow columns; ${backfill.changes} pre-existing row(s) backfilled to approved`
+      );
+    }
+  } catch (e) {
+    // Don't mask other initDb work if the migration fails; log and continue.
+    // A failed migration leaves the table in its prior state — the next
+    // initDb() call will retry.
+    console.error('signing_keys approval migration failed:', e.message);
+  }
+
+  // ── R3g PR3 Phase 5 migration: add 'signing_key_approver' role to users CHECK ──
+  //
+  // SQLite cannot ALTER CHECK constraints directly; they're stored in the
+  // table's CREATE TABLE SQL, captured in sqlite_master at table-creation
+  // time and immutable thereafter. To extend the role check from
+  //   CHECK (role IN ('ciso', 'vp', 'readonly'))
+  // to
+  //   CHECK (role IN ('ciso', 'vp', 'readonly', 'signing_key_approver'))
+  // we use the SQLite "12-step table rebuild" pattern documented at
+  // https://www.sqlite.org/lang_altertable.html#otheralter.
+  //
+  // FK PRESERVATION: sessions.user_id and mc_report_requests.requested_by_
+  // user_id both reference users(id). FK references are stored by table
+  // NAME (not by row pointer), so renaming users_new -> users preserves
+  // the FK targets correctly. PRAGMA foreign_keys is disabled during the
+  // rebuild to prevent FK enforcement from rejecting the intermediate
+  // DROP TABLE; PRAGMA foreign_key_check after the rebuild confirms no
+  // dangling references resulted.
+  //
+  // IDEMPOTENCY: the guard reads the actual stored CREATE TABLE SQL from
+  // sqlite_master and checks whether 'signing_key_approver' appears in
+  // the CHECK clause. If the canonical CREATE TABLE (fresh-install path)
+  // already produced a table with the new constraint, sqlite_master.sql
+  // will contain the new role string, and the rebuild block is skipped.
+  // For migrated deploys from C1-C14, the stored SQL still has the old
+  // three-role constraint, and the rebuild runs once.
+  try {
+    const usersSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+    ).get();
+    const needsRoleMigration =
+      usersSchema && !usersSchema.sql.includes("'signing_key_approver'");
+
+    if (needsRoleMigration) {
+      // Disable FK enforcement during the rebuild. sessions(user_id) and
+      // mc_report_requests(requested_by_user_id) both reference users(id)
+      // — we DON'T want SQLite rejecting the DROP TABLE users mid-rebuild.
+      db.exec('PRAGMA foreign_keys = OFF');
+
+      db.exec('BEGIN TRANSACTION');
+      try {
+        // Create users_new with the extended CHECK constraint. Schema
+        // mirrors the canonical CREATE TABLE above EXACTLY (column order,
+        // defaults, secondary constraints) so the rebuild preserves all
+        // pre-existing column semantics.
+        db.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT,
+            role TEXT NOT NULL CHECK (role IN ('ciso', 'vp', 'readonly', 'signing_key_approver')),
+            name TEXT NOT NULL,
+            mfa_secret TEXT,
+            mfa_enabled INTEGER DEFAULT 0,
+            auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
+            created_at TEXT DEFAULT (datetime('now')),
+            last_login TEXT
+          );
+        `);
+
+        // Transfer all rows. Existing roles are all in the old check set
+        // ('ciso', 'vp', 'readonly') which is a strict subset of the new
+        // check set, so every row passes the new CHECK on insert.
+        const transferred = db.prepare(`
+          INSERT INTO users_new
+            (id, username, password_hash, role, name, mfa_secret,
+             mfa_enabled, auth_method, created_at, last_login)
+          SELECT id, username, password_hash, role, name, mfa_secret,
+                 mfa_enabled, auth_method, created_at, last_login
+          FROM users
+        `).run();
+
+        db.exec('DROP TABLE users');
+        db.exec('ALTER TABLE users_new RENAME TO users');
+
+        db.exec('COMMIT');
+
+        // FK validity check after the rebuild. Any FK that didn't resolve
+        // back to the renamed users table would surface here.
+        const fkIssues = db.prepare('PRAGMA foreign_key_check').all();
+        if (fkIssues.length > 0) {
+          console.error('users role migration left FK issues:', fkIssues);
+        } else {
+          console.log(
+            `Migrated users table: added 'signing_key_approver' to role CHECK; ${transferred.changes} user row(s) preserved`
+          );
+        }
+      } catch (rebuildErr) {
+        // ROLLBACK if any step inside the transaction failed.
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        // Re-enable FK enforcement regardless of success/failure.
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (e) {
+    console.error('users role migration failed:', e.message);
+  }
+
+  const setMeta = db.prepare('INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)');
+  setMeta.run('fuse_counter', '31');
+  setMeta.run('app_version', '0.0.31');
+  setMeta.run('app_type', 'global_dashboard_server');
+  setMeta.run('schema_version', '1');
+  setMeta.run('installed_at', new Date().toISOString());
+
+  // Default configs
+  const setCfg = db.prepare('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)');
+  setCfg.run('notification_config', JSON.stringify({
+    burnout_threshold: 65,
+    turnover_risk_high: true,
+    sla_below: 85,
+    email: true,
+    sms: false,
+    recipients: ''
+  }));
+  setCfg.run('ha_config', JSON.stringify({ enabled: false, mode: 'active_passive' }));
+  setCfg.run('posture_config', JSON.stringify({ enabled: true, require_on_connect: true }));
+  setCfg.run('wifi_policy', JSON.stringify({ minimum_protocol: 'wpa2_enterprise' }));
+  setCfg.run('signing_key_grace_period_minutes', '60');
+
+  console.log('Global Dashboard database initialized at', DB_PATH);
+  db.close();
+}
+
+if (require.main === module) {
+  require('dotenv').config();
+  initDb();
+}
+
+module.exports = { getDb, initDb, DB_PATH };
