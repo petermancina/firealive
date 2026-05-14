@@ -620,6 +620,16 @@ export default function AnalystClientApp() {
   const [redeemConfirm, setRedeemConfirm] = useState(null);
   const [redeemFb, setRedeemFb] = useState(null);
 
+  // R3h: Leaderboard opt-in state. Populated by GET /api/helper-pay/me/
+  // visibility on tab open; written by PUT /api/helper-pay/visibility when
+  // the analyst toggles the checkbox. helperOptIn is null while loading
+  // so the toggle UI can show a loading affordance. helperOptInSaving
+  // gates the checkbox during the in-flight PUT to prevent rapid double-
+  // clicks. helperOptInFb surfaces success/error feedback inline.
+  const [helperOptIn, setHelperOptIn] = useState(null);
+  const [helperOptInSaving, setHelperOptInSaving] = useState(false);
+  const [helperOptInFb, setHelperOptInFb] = useState(null);
+
   // ── Runtime version info from /api/system/version (Phase 1.4 release-v1.0.10) ──
   const [appVersion, setAppVersion] = useState("");
   const [appBuild, setAppBuild] = useState("");
@@ -754,7 +764,8 @@ export default function AnalystClientApp() {
       api.get("/api/helper-pay/ledger?limit=20"),
       api.get("/api/helper-pay/options"),
       api.get("/api/helper-pay/redemptions"),
-    ]).then(([b, l, o, m]) => {
+      api.get("/api/helper-pay/me/visibility"),
+    ]).then(([b, l, o, m, v]) => {
       if (cancelled) return;
       if (b?.error || l?.error || o?.error || m?.error) {
         setHelperError("Could not load Helper Pay data.");
@@ -764,11 +775,60 @@ export default function AnalystClientApp() {
       setHelperLedger(Array.isArray(l?.entries) ? l.entries : []);
       setHelperOptions(Array.isArray(o?.options) ? o.options : []);
       setHelperMyRedemptions(Array.isArray(m?.redemptions) ? m.redemptions : []);
+      // R3h: visibility fetch is best-effort. A 5xx leaves helperOptIn null
+      // and the visibility Card shows a loading affordance; the rest of the
+      // tab still renders. The opt-in state defaults to opt-out per the
+      // schema, so a load failure does not accidentally expose the analyst.
+      if (v && typeof v.optIn === "boolean") {
+        setHelperOptIn(v.optIn);
+      }
     }).finally(() => {
       if (!cancelled) setHelperLoading(false);
     });
     return () => { cancelled = true; };
   }, [tab]);
+
+  // R3h: PUT /api/helper-pay/visibility. Flips the authenticated user's
+  // leaderboard opt-in. Optimistic UI: helperOptIn updates immediately so
+  // the checkbox doesn't lag the click; on server error we revert to the
+  // pre-click value and surface the error via helperOptInFb. The rate
+  // limit (50/hr per user) on the server side returns 429 RATE_LIMIT_
+  // EXCEEDED which we map to a user-friendly message.
+  const submitVisibility = (nextOptIn) => {
+    const prev = helperOptIn;
+    setHelperOptIn(nextOptIn);
+    setHelperOptInSaving(true);
+    setHelperOptInFb(null);
+    api.put("/api/helper-pay/visibility", { optIn: nextOptIn }).then((r) => {
+      if (r?.error) {
+        // Revert optimistic update on error.
+        setHelperOptIn(prev);
+        const msg = r.error === "RATE_LIMIT_EXCEEDED"
+          ? "Too many visibility changes recently. Try again in a few minutes."
+          : (r.message || "Could not update leaderboard visibility.");
+        setHelperOptInFb({ kind: "error", message: msg });
+        return;
+      }
+      // Server-confirmed state takes precedence over optimistic.
+      if (typeof r?.optIn === "boolean") {
+        setHelperOptIn(r.optIn);
+      }
+      setHelperOptInFb({
+        kind: "success",
+        message: r.optIn
+          ? "You are now visible on the Helper Recognition leaderboard."
+          : "You are now hidden from the Helper Recognition leaderboard.",
+      });
+      logC("helper_pay_visibility_" + (r.optIn ? "opt_in" : "opt_out"),
+        "Leaderboard visibility set to " + (r.optIn ? "visible" : "hidden"));
+    }).catch(() => {
+      setHelperOptIn(prev);
+      setHelperOptInFb({ kind: "error",
+        message: "Could not reach the server. Try again." });
+    }).finally(() => {
+      setHelperOptInSaving(false);
+    });
+  };
 
   // F5 part 2a: submit a redemption request. On approval (auto-approve
   // options) the balance is debited server-side; we re-fetch balance,
@@ -1647,6 +1707,33 @@ export default function AnalystClientApp() {
               <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:8,letterSpacing:1.5,textTransform:"uppercase"}}>Your Balance</div>
               <div style={{fontSize:48,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace",lineHeight:1}}>{helperBalance}</div>
               <div style={{fontSize:11,color:C.tm,marginTop:6}}>points</div>
+            </Card>
+
+            {/* R3h: Leaderboard opt-in toggle. Gates whether this analyst's name appears on the Helper Recognition leaderboard the lead reviews. Does NOT gate earning, balance, or redemptions — those continue regardless. Default is opt-out per the schema. */}
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:10,letterSpacing:1.5,textTransform:"uppercase"}}>Leaderboard Visibility</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Your team lead reviews a Helper Recognition leaderboard showing top peer-support contributors. Opt in to be listed by name. This setting only controls leaderboard display — you keep earning points, accruing your balance, and redeeming rewards either way.</M>
+              {helperOptIn === null ? (
+                <M style={{color:C.tm}}>Loading...</M>
+              ) : (
+                <label style={{display:"flex",alignItems:"center",gap:10,cursor:helperOptInSaving?"wait":"pointer",padding:"6px 0"}}>
+                  <input
+                    type="checkbox"
+                    checked={!!helperOptIn}
+                    disabled={helperOptInSaving}
+                    onChange={e=>submitVisibility(e.target.checked)}
+                    style={{cursor:helperOptInSaving?"wait":"pointer"}}
+                  />
+                  <span style={{fontSize:12,color:helperOptIn?C.a:C.t}}>
+                    {helperOptIn ? "Visible on the leaderboard" : "Hidden from the leaderboard"}
+                  </span>
+                </label>
+              )}
+              {helperOptInFb && (
+                <div style={{marginTop:10,padding:"8px 10px",background:helperOptInFb.kind==="success"?"rgba(110,231,183,0.08)":"rgba(239,68,68,0.08)",border:`1px solid ${(helperOptInFb.kind==="success"?C.a:C.d)}40`,borderRadius:6}}>
+                  <M style={{color:helperOptInFb.kind==="success"?C.a:C.d}}>{helperOptInFb.message}</M>
+                </div>
+              )}
             </Card>
 
             <L style={{marginBottom:8}}>Available Rewards</L>

@@ -204,8 +204,43 @@ The actual assessment module is hosted on an external platform — HackTheBox, T
 1. Lead opens Peer Skill-Share Configuration
 2. Configures scheduling restrictions (allow during shift toggle, block hours, max session duration, inactivity timeout)
 3. Configures Helper Pay: USD per 100 points, PTO minutes per 100 points, tier multipliers (L3 senior helpers earn more), redemption minimum, approval workflow
-4. Reviews helper recognition leaderboard (opt-in only — helpers choose if they're visible)
-5. Reads chat disclaimer — the lead can NOT edit it; this is the analysts' protected space
+4. Reads chat disclaimer — the lead can NOT edit it; this is the analysts' protected space
+
+### Helper Recognition Leaderboard
+**What it's for:** Top opted-in helpers ranked by Helper Pay points. Lives on the same peersupport tab as the Peer Skill-Share Configuration. The leaderboard is a recognition surface — it shows analysts who have explicitly opted in via their AC's Helper Pay tab. Analysts who have not opted in are absent from this list regardless of how many points they've earned; opt-in is per-analyst and defaults to off.
+
+Points come from 4-5 star peer-session ratings (1-2 star yields zero points, 3 star yields a low amount). A minimum session duration gate and a daily-cap clamp prevent gaming via short or excessive ratings. The Confirm Fraud / Dismiss queue (below) catches sock-puppet abuse beyond what the static gates cover.
+
+**Workflow:**
+1. Lead opens peersupport tab
+2. Sees the top 10 opted-in helpers by points
+3. Per row: pseudonym (or real name if pseudonyms not enabled), sessions count, average rating, points balance
+4. Can send an anonymous thank-you to any helper via the Thank button — no name reveal to the helper
+
+### Team Helper Scores (operational view)
+**What it's for:** Full-roster view showing EVERY active analyst's Helper Pay state, regardless of whether they've opted in to the recognition leaderboard. This is the lead's operational surface for payroll reconciliation, compensation discussions, and quarterly performance reviews. The opt-in indicator on each row is purely informational — only the analyst can flip it from their AC; the lead cannot toggle it on behalf of someone else.
+
+This surface deliberately bypasses the opt-in filter that gates the recognition leaderboard above — Helper Pay involves real money / PTO redemption, and the lead needs complete visibility for those administrative duties. Privacy invariant I5 in the architectural docs.
+
+**Workflow:**
+1. Lead opens peersupport tab
+2. Scrolls past the recognition leaderboard to Team Helper Scores
+3. Sees every active analyst: pseudonym/name, opt-in badge (Visible / Hidden), sessions, avg rating, points balance
+4. Uses for payroll, performance reviews, or to spot disengagement signals (analyst with zero points who hasn't accepted any peer sessions)
+
+### Pending Sock-Puppet Review
+**What it's for:** Lead-side review queue for sock-puppet abuse detection. The detector flags a rating when its rater's IP hash OR device hash matches 2+ other ratings against the same helper within the last 7 days — a pattern that suggests the same person is faking ratings under multiple accounts to grind points for a helper.
+
+Flagged ratings still grant points at rating time (the helper sees their balance immediately for legitimate ratings), but the flagged contribution is excluded from the recognition leaderboard until lead review. Confirm Fraud triggers a reversal ledger entry that permanently removes the points; the rating row stays flagged forever as audit evidence. Dismiss clears the flag and the points re-appear on the leaderboard. Both decisions are logged via explicit audit_log events.
+
+**Workflow:**
+1. Detection runs on each new rating POST — checks IP and device hash clusters against same helper within 7 days
+2. If cluster ≥ 3 ratings, the new rating is flagged
+3. Lead opens peersupport tab → Pending Sock-Puppet Review Card
+4. Per flagged row: rater pseudonym, helper pseudonym, stars given, comment (if any), cluster reason (IP / device / both), flagged timestamp
+5. Lead inspects: legitimate small-team usage where 3 analysts genuinely rated the same helper from one office network? Confirm Fraud (real sock-puppet) or Dismiss (false positive)
+6. Confirm path: reverses the points via the existing fraud reversal flow; audit event LEADERBOARD_SOCKPUPPET_CONFIRMED
+7. Dismiss path: clears the flag, points restored to leaderboard; audit event LEADERBOARD_SOCKPUPPET_DISMISSED
 
 ### Pseudonyms
 **What it's for:** The architectural privacy commitment: every analyst gets a permanent UUID and rotating pseudonym (Analyst-Falcon, Analyst-Kestrel, etc.). All burnout metrics, peer chat messages, reduced-routing requests, and wellness signals are stored against the pseudonym — never the real name. If the database is breached, attackers see "Analyst-Falcon is in elevated burnout" rather than a real person. The mapping (UUID → pseudonym → real name) is exported as an encrypted file the lead stores offline.
@@ -902,6 +937,23 @@ Second — and equally important — true positives that are nonetheless low-lev
 5. Session times out, chat is gone — but the helper earned points (Helper Pay)
 6. Either analyst can post-session flag if conduct was inappropriate
 
+### Helper Pay (AC-side)
+**What it's for:** The analyst's own view of their Helper Pay state — points earned from helping peers, current balance, transaction ledger, available rewards, and the leaderboard visibility toggle that controls whether their pseudonym appears on the lead's recognition leaderboard.
+
+Points come from 4-5 star peer-session ratings the analyst has received. Each rating writes a ledger entry (1-2 stars yield zero points; 3 stars yields a low amount). The analyst sees their full ledger here — every entry, daily-cap clamps, and any admin-side fraud reversals. Rewards are redeemed against the catalog the lead configured (USD, PTO minutes, custom rewards); requests go to the lead for approval and fulfillment.
+
+The leaderboard visibility toggle defaults to OFF (opt-out). Flipping it on adds the analyst's pseudonym (or real name if pseudonyms aren't enabled team-wide) to the lead's recognition leaderboard on the MC. Earning, balance, and redemption are NOT affected by this toggle — they continue regardless of leaderboard visibility. Only the public-display surface changes.
+
+**Workflow:**
+1. Analyst opens Helper Pay tab in their AC
+2. Sees current balance prominently displayed
+3. Optionally toggles "Visible on the leaderboard" — feedback panel confirms the new state
+4. Browses the Available Rewards catalog
+5. Hits Redeem on a reward — confirmation modal explains the points cost and the approval workflow
+6. Submits redemption request; appears in their My Redemptions list as Pending
+7. Lead approves/declines (separate MC tab); on approval, points debit from the analyst's balance
+8. On fulfillment, the analyst sees the request status flip to Fulfilled; they receive their PTO or USD per the org's payout method
+
 ### Board
 **What it's for:** Async forum for tips, questions, burnout strategies. Posts auto-expire after 7 days (so it's a current-conversation space, not a permanent record). Each post supports threaded responses so analysts can ask follow-up questions or add comments. The same conduct rules and tiered abuse flagging system from peer chat apply here too.
 
@@ -1039,6 +1091,20 @@ If a cell's most recent report is stale or there's no full-report history at all
 4. Drills into a specific cell to see the report history
 5. Either reads the most recent full report inline or clicks Request Full Report to get a fresh fulfillment
 6. After fulfillment lands (MC's next tick), refreshes the matrix and reviews the new report body
+
+### Helper Recognition
+**What it's for:** Cross-MC Helper Pay leaderboard. Each active MC pushes its top opted-in helpers on a configurable cadence (default 15 minutes); this tab displays the aggregated view across every connected MC. Only analysts who have explicitly opted in via their AC's Helper Pay tab appear here, and only their pseudonyms cross the wire — real names, user IDs, and earning details stay on the MC.
+
+The push payload is signed with the MC's Ed25519 key and verified GD-side via the same signing-key trust registry used for metrics and compliance pushes. Each ingested row carries the signing fingerprint for forensic provenance display.
+
+**Auth:** Helper Recognition reads are gated to ciso / vp / readonly roles. No writes from the GD side — the data flows one-way (MC → GD).
+
+**Workflow:**
+1. CISO opens Helper Recognition
+2. Sees the matrix at a glance — one card per active MC with that MC's top 5 inline
+3. Clicks a card to drill into that MC's full top-50 leaderboard
+4. Drilldown shows each helper's pseudonym, sessions, average rating, points, plus a truncated signing fingerprint per row (hover for full value)
+5. Uses for cross-region comparison ("which MC has the highest engagement?"), recognition reporting up the leadership chain, or forensic correlation between this surface and the GD audit log
 
 ### MC Offboarding
 When a regional SOC is decommissioned, offboard its MC. Historical data retention per policy.

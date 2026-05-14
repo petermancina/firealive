@@ -2848,6 +2848,239 @@ app.post('/api/gd/query', authMiddleware(['ciso', 'vp']), (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// R3h — Helper Recognition Leaderboard ingest + read endpoints
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Three endpoints supporting the cross-MC Helper Recognition feature:
+//
+//   POST /api/ingest/leaderboard       — MC pushes signed top-N summary
+//   GET  /api/leaderboard/regional     — cross-MC matrix for the GD tab
+//   GET  /api/leaderboard/mc/:id       — per-MC drilldown
+//
+// PRIVACY INVARIANT I3 (OPT-IN PROPAGATION)
+//   The GD has NO concept of "all analysts" — only what the MC pushes
+//   crosses the wire, and the MC only pushes opted-in analysts. So
+//   the GD's surfaces can never expose an opted-out analyst.
+//
+// PRIVACY INVARIANT I4 (PSEUDONYM-ONLY)
+//   regional_leaderboard stores analyst_pseudonym only. Real names,
+//   user_ids, emails are NOT carried in the table or returned by any
+//   endpoint.
+
+app.post('/api/ingest/leaderboard', (req, res) => {
+  try {
+    const { apiKey, leaderboard } = req.body || {};
+    const db = getDb();
+
+    // ── Resolve MC by api_key ──
+    const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
+    if (!mc) {
+      db.close();
+      return res.status(403).json({ error: 'Invalid or inactive MC API key' });
+    }
+
+    // ── Verify signature (trust lookup is per-MC) ──
+    const sigResult = verifyPushSignature(db, {
+      mcId: mc.id,
+      headers: req.headers,
+      rawBody: req.rawBody,
+    });
+    if (!sigResult.ok) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
+        .run(`endpoint=leaderboard mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      db.close();
+      return res.status(401).json({ error: sigResult.error, code: sigResult.code });
+    }
+
+    // ── Validate body shape ──
+    if (!leaderboard || typeof leaderboard !== 'object' || Array.isArray(leaderboard)) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=missing_or_invalid_leaderboard fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'leaderboard is required and must be an object' });
+    }
+    const pushedAt = typeof leaderboard.pushed_at === 'string' ? leaderboard.pushed_at : null;
+    if (!pushedAt) {
+      db.close();
+      return res.status(400).json({ error: 'leaderboard.pushed_at is required (ISO timestamp string)' });
+    }
+    const entries = Array.isArray(leaderboard.entries) ? leaderboard.entries : null;
+    if (!entries) {
+      db.close();
+      return res.status(400).json({ error: 'leaderboard.entries is required (array, possibly empty)' });
+    }
+    if (entries.length > 100) {
+      // Defensive ceiling. The MC's LEADERBOARD_PUSH_LIMIT is 50; anything
+      // more than 100 indicates either a misconfigured MC or an attempt to
+      // flood the GD. Reject rather than silently truncate.
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_REJECTED', ?, 'warning')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=entries_too_many count=${entries.length} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(400).json({ error: 'leaderboard.entries exceeds maximum (100)' });
+    }
+
+    // ── Per-entry validation ──
+    // Each entry must have analyst_pseudonym (string, non-empty),
+    // points (integer >= 0), sessions_count (integer >= 0), and
+    // avg_rating (number 0-5 or null). Reject the whole push on any
+    // invalid entry — partial ingest of a malformed push would leave
+    // the GD's state ambiguous about what the MC intended.
+    const validated = [];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (!e || typeof e !== 'object') {
+        db.close();
+        return res.status(400).json({ error: `entries[${i}] is not an object` });
+      }
+      if (typeof e.analyst_pseudonym !== 'string' || !e.analyst_pseudonym.trim()) {
+        db.close();
+        return res.status(400).json({ error: `entries[${i}].analyst_pseudonym must be a non-empty string` });
+      }
+      if (!Number.isInteger(e.points) || e.points < 0) {
+        db.close();
+        return res.status(400).json({ error: `entries[${i}].points must be a non-negative integer` });
+      }
+      if (!Number.isInteger(e.sessions_count) || e.sessions_count < 0) {
+        db.close();
+        return res.status(400).json({ error: `entries[${i}].sessions_count must be a non-negative integer` });
+      }
+      const avg = e.avg_rating;
+      if (avg !== null && (typeof avg !== 'number' || avg < 0 || avg > 5)) {
+        db.close();
+        return res.status(400).json({ error: `entries[${i}].avg_rating must be a number between 0 and 5 or null` });
+      }
+      validated.push({
+        pseudonym: e.analyst_pseudonym.trim().slice(0, 200),
+        points: e.points,
+        sessions_count: e.sessions_count,
+        avg_rating: avg,
+      });
+    }
+
+    // ── Atomic REPLACE: DELETE this MC's rows, INSERT the new payload ──
+    // Inside a single transaction so a matrix read in parallel cannot
+    // observe partial state.
+    try {
+      const insertStmt = db.prepare(`
+        INSERT INTO regional_leaderboard
+          (mc_id, analyst_pseudonym, points, sessions_count, avg_rating,
+           pushed_at, signature_fingerprint)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const txn = db.transaction(() => {
+        db.prepare("DELETE FROM regional_leaderboard WHERE mc_id = ?").run(mc.id);
+        for (const v of validated) {
+          insertStmt.run(mc.id, v.pseudonym, v.points, v.sessions_count,
+            v.avg_rating, pushedAt, sigResult.fingerprint);
+        }
+      });
+      txn();
+    } catch (txnErr) {
+      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_FAILED', ?, 'critical')")
+        .run(`mc=${mc.name} mc_id=${mc.id} reason=transaction_failed error=${JSON.stringify(txnErr.message).slice(0, 200)} fingerprint=${sigResult.fingerprint}`);
+      db.close();
+      return res.status(500).json({ error: 'Failed to persist leaderboard' });
+    }
+
+    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_SUCCESS', ?, 'info')")
+      .run(`mc=${mc.name} mc_id=${mc.id} entries=${validated.length} fingerprint=${sigResult.fingerprint}`);
+    db.close();
+    res.json({ ok: true, entries: validated.length });
+  } catch (err) {
+    console.error('Leaderboard ingest error:', err);
+    res.status(500).json({ error: 'Leaderboard ingest failed' });
+  }
+});
+
+app.get('/api/leaderboard/regional',
+  authMiddleware(['ciso', 'vp', 'readonly']), (req, res) => {
+  try {
+    const db = getDb();
+    try {
+      // Cross-MC matrix: every active MC with its top-N entries inline.
+      // The GD frontend renders this as a per-MC card with the top
+      // helpers. Per-MC sub-arrays are bounded by the MC's push limit
+      // (LEADERBOARD_PUSH_LIMIT = 50 from C9b); the limit query param
+      // here further caps the per-MC display to N (default 10).
+      const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 10));
+
+      const mcs = db.prepare(
+        "SELECT id, name, region FROM management_consoles WHERE status = 'active' ORDER BY name"
+      ).all();
+
+      const result = mcs.map(mc => {
+        const entries = db.prepare(`
+          SELECT analyst_pseudonym, points, sessions_count, avg_rating,
+                 pushed_at, received_at
+            FROM regional_leaderboard
+           WHERE mc_id = ?
+           ORDER BY points DESC, sessions_count DESC, analyst_pseudonym ASC
+           LIMIT ?
+        `).all(mc.id, limit);
+        const lastPushedAt = entries.length > 0 ? entries[0].pushed_at : null;
+        return {
+          mc_id: mc.id,
+          mc_name: mc.name,
+          region: mc.region,
+          entries,
+          last_pushed_at: lastPushedAt,
+        };
+      });
+      db.close();
+      res.json({ matrix: result, limit });
+    } catch (qErr) {
+      db.close();
+      throw qErr;
+    }
+  } catch (err) {
+    console.error('Regional leaderboard read error:', err);
+    res.status(500).json({ error: 'Failed to load regional leaderboard' });
+  }
+});
+
+app.get('/api/leaderboard/mc/:id',
+  authMiddleware(['ciso', 'vp', 'readonly']), (req, res) => {
+  try {
+    const db = getDb();
+    try {
+      const mc = db.prepare(
+        "SELECT id, name, region, status FROM management_consoles WHERE id = ?"
+      ).get(req.params.id);
+      if (!mc) {
+        db.close();
+        return res.status(404).json({ error: 'MC not found' });
+      }
+      // Per-MC drilldown: full top-N for that MC plus the most recent
+      // push timestamps + signature fingerprint for forensic display.
+      const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 50));
+      const entries = db.prepare(`
+        SELECT analyst_pseudonym, points, sessions_count, avg_rating,
+               pushed_at, received_at, signature_fingerprint
+          FROM regional_leaderboard
+         WHERE mc_id = ?
+         ORDER BY points DESC, sessions_count DESC, analyst_pseudonym ASC
+         LIMIT ?
+      `).all(mc.id, limit);
+      db.close();
+      res.json({
+        mc_id: mc.id,
+        mc_name: mc.name,
+        region: mc.region,
+        mc_status: mc.status,
+        entries,
+        entry_count: entries.length,
+      });
+    } catch (qErr) {
+      db.close();
+      throw qErr;
+    }
+  } catch (err) {
+    console.error('Per-MC leaderboard read error:', err);
+    res.status(500).json({ error: 'Failed to load per-MC leaderboard' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FireAlive Global Dashboard Server v0.0.31 running on port ${PORT}`);
   console.log('Awaiting aggregate data pushes from Regional Servers');

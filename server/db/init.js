@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS users (
   totp_recovery_codes_remaining INTEGER,        -- cached count for UI display so
                                                 -- the JSON array doesn't have to
                                                 -- be parsed for status reads.
+  -- ── R3h (v1.0.34): Helper Recognition Leaderboard opt-in ─────────────────
+  leaderboard_opt_in INTEGER NOT NULL DEFAULT 0
+    CHECK (leaderboard_opt_in IN (0, 1)),       -- 1 = analyst's name + points
+                                                -- appear on the Helper
+                                                -- Recognition leaderboard
+                                                -- reviewed by the lead.
+                                                -- DEFAULT 0: opt-out by
+                                                -- default for privacy.
+                                                -- Earning, accruing, and
+                                                -- redeeming Helper Pay
+                                                -- points are independent
+                                                -- of this flag.
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
   last_login TEXT
@@ -1466,6 +1478,29 @@ CREATE TABLE IF NOT EXISTS peer_session_ratings (
   comment TEXT,
   helpfulness_tags TEXT NOT NULL DEFAULT '[]',  -- JSON array, e.g. ["clear","patient"]
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- ── R3h (v1.0.34): anti-gaming fingerprint capture ──────────────────────
+  rater_ip_hash TEXT,            -- SHA-256(req.ip), first 16 hex chars.
+                                 -- NULL for rows inserted pre-R3h. The
+                                 -- short hash supports clustering against
+                                 -- the same rated_user_id without storing
+                                 -- raw IPs in this table.
+  rater_device_hash TEXT,        -- SHA-256(req.headers['user-agent']),
+                                 -- first 16 hex chars. NULL pre-R3h.
+                                 -- Coarse device fingerprint that
+                                 -- complements IP for shared-network
+                                 -- scenarios (multiple devices behind
+                                 -- one NAT).
+  flagged_sockpuppet INTEGER NOT NULL DEFAULT 0
+    CHECK (flagged_sockpuppet IN (0, 1)),  -- set by detection logic in
+                                           -- C8 when a rater hash cluster
+                                           -- exceeds threshold for the
+                                           -- same rated_user_id within
+                                           -- a recent window.
+  flagged_at TEXT,               -- timestamp when flagged_sockpuppet
+                                 -- flipped to 1; null pre-flag.
+  flagged_reason TEXT,           -- 'ip_cluster' | 'device_cluster' | 'both'
+                                 -- — set in tandem with flagged_at; null
+                                 -- pre-flag.
   UNIQUE (session_id, rated_by_id)
 );
 
@@ -1660,6 +1695,8 @@ CREATE TABLE IF NOT EXISTS gd_push_config (
     CHECK (push_interval_minutes >= 1 AND push_interval_minutes <= 1440),
   compliance_push_cadence_hours INTEGER NOT NULL DEFAULT 24
     CHECK (compliance_push_cadence_hours >= 1 AND compliance_push_cadence_hours <= 720),  -- R3g PR3: cadence for the separate _complianceTick(); default daily, 30 days max
+  leaderboard_push_cadence_minutes INTEGER NOT NULL DEFAULT 15
+    CHECK (leaderboard_push_cadence_minutes >= 1 AND leaderboard_push_cadence_minutes <= 1440),  -- R3h: cadence for the separate _leaderboardTick(); default 15 min, 24h max
   retry_max INTEGER NOT NULL DEFAULT 3 CHECK (retry_max >= 0 AND retry_max <= 10),
   retry_backoff_seconds INTEGER NOT NULL DEFAULT 30
     CHECK (retry_backoff_seconds >= 1 AND retry_backoff_seconds <= 3600),
@@ -2287,6 +2324,33 @@ function initDb() {
   } catch (compliancePushCadenceMigrationErr) {
     console.error('gd_push_config R3g PR3 migration FAILED:', compliancePushCadenceMigrationErr.message);
     console.error('The server will start, but compliance push cadence will be unavailable until the migration is investigated.');
+  }
+
+
+  // ── Migration: R3h — leaderboard_push_cadence_minutes on gd_push_config ───
+  //
+  // Existing deploys (v1.0.33 and earlier) have a gd_push_config singleton
+  // that predates the separate leaderboard push tick added in R3h. The
+  // tick uses its own cadence column so cadence is independently tunable
+  // from the metrics push (push_interval_minutes) and the compliance push
+  // (compliance_push_cadence_hours). Default 15 min matches the build
+  // plan; range 1-1440 (24h) gives operators flexibility without allowing
+  // pathologically long cadences that would let stale leaderboard data
+  // sit on the GD.
+  //
+  // Independent try/catch so a failure here doesn't mask the compliance
+  // cadence migration above and vice versa.
+  try {
+    const gdPushCols = db.prepare("PRAGMA table_info(gd_push_config)").all().map(c => c.name);
+    if (!gdPushCols.includes('leaderboard_push_cadence_minutes')) {
+      db.exec(
+        `ALTER TABLE gd_push_config ADD COLUMN leaderboard_push_cadence_minutes INTEGER NOT NULL DEFAULT 15 CHECK (leaderboard_push_cadence_minutes >= 1 AND leaderboard_push_cadence_minutes <= 1440)`
+      );
+      console.log('gd_push_config migration (R3h): added leaderboard_push_cadence_minutes column');
+    }
+  } catch (leaderboardPushCadenceMigrationErr) {
+    console.error('gd_push_config R3h migration FAILED:', leaderboardPushCadenceMigrationErr.message);
+    console.error('The server will start, but leaderboard push cadence will be unavailable until the migration is investigated.');
   }
 
 
@@ -3098,6 +3162,82 @@ function initDb() {
   } catch (r3fUsersErr) {
     console.error('R3f users migration FAILED:', r3fUsersErr.message);
     console.error('The server will start, but MFA enforcement at login may not work until investigated.');
+  }
+
+  // ── Migration: Phase R3h — leaderboard opt-in flag ─────────────────────────
+  //
+  // R3h adds a Helper Recognition Leaderboard surface (peersupport tab on
+  // the MC, regional aggregation on the GD). Analysts opt in to be
+  // displayed on the leaderboard; the default is opt-out for privacy.
+  //
+  // Earning points, accruing balances, and redeeming rewards are entirely
+  // independent of this flag — leaderboard_opt_in solely controls whether
+  // the analyst's name + points are rendered in the recognition ranking.
+  // The lead's operational view (per-analyst Helper Score full-roster on
+  // the peersupport tab, the Helper Pay administrative tab) is not gated
+  // by this flag; it's a payroll/compensation surface for the lead and
+  // reads from the ledger directly.
+  //
+  // Idempotent ALTER guarded by a PRAGMA table_info check matching the
+  // R0 / R3c / R3f patterns above. The migration runs in its own
+  // try/catch so a failure here doesn't mask the R3f block above and
+  // vice versa.
+  try {
+    const usersCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+    if (!usersCols.includes('leaderboard_opt_in')) {
+      db.exec(`ALTER TABLE users ADD COLUMN leaderboard_opt_in INTEGER NOT NULL DEFAULT 0
+        CHECK (leaderboard_opt_in IN (0, 1));`);
+      console.log('R3h migration: added users.leaderboard_opt_in (default 0 = opt-out)');
+    }
+  } catch (r3hMigrationErr) {
+    console.error('R3h leaderboard_opt_in migration FAILED:', r3hMigrationErr.message);
+    console.error('The server will start, but the leaderboard opt-in toggle may not function until investigated.');
+  }
+
+  // ── Migration: Phase R3h-pt2 — anti-gaming fingerprint columns ────────────
+  //
+  // Adds five columns to peer_session_ratings for sock-puppet detection
+  // (C7 establishes the data foundation; C8 adds the detection logic and
+  // the lead review queue UI):
+  //
+  //   rater_ip_hash       SHA-256 hash of req.ip, first 16 hex chars
+  //   rater_device_hash   SHA-256 hash of User-Agent, first 16 hex chars
+  //   flagged_sockpuppet  0/1 flag set by C8 detection
+  //   flagged_at          timestamp of flag-flip
+  //   flagged_reason      'ip_cluster' | 'device_cluster' | 'both'
+  //
+  // Hash truncation rationale: 16 hex chars = 64 bits, ample for the
+  // clustering use case (false-collision probability << threshold needed
+  // to flag a sock-puppet). Storing full 64-char hashes would bloat the
+  // row size with no detection benefit at v1.0.34's scale.
+  //
+  // Existing rows (pre-R3h-pt2) get NULL for all five columns. The
+  // detection logic in C8 treats NULL ip/device hashes as "no data" and
+  // does not flag rows lacking fingerprints — pre-migration ratings are
+  // grandfathered and not retroactively scrutinized.
+  //
+  // Idempotent ALTER guarded by PRAGMA table_info check matching the
+  // R0/R3c/R3f/R3h-pt1 patterns above. Each ALTER runs only if its
+  // column is missing.
+  try {
+    const ratingsCols = db.prepare("PRAGMA table_info(peer_session_ratings)").all().map(c => c.name);
+    const addRatingsCol = (col, ddl) => {
+      if (!ratingsCols.includes(col)) {
+        db.exec(`ALTER TABLE peer_session_ratings ADD COLUMN ${ddl}`);
+        console.log(`R3h-pt2 migration: added peer_session_ratings.${col}`);
+      }
+    };
+    addRatingsCol('rater_ip_hash', 'rater_ip_hash TEXT');
+    addRatingsCol('rater_device_hash', 'rater_device_hash TEXT');
+    addRatingsCol('flagged_sockpuppet',
+      `flagged_sockpuppet INTEGER NOT NULL DEFAULT 0
+        CHECK (flagged_sockpuppet IN (0, 1))`);
+    addRatingsCol('flagged_at', 'flagged_at TEXT');
+    addRatingsCol('flagged_reason', 'flagged_reason TEXT');
+  } catch (r3hPt2MigrationErr) {
+    console.error('R3h-pt2 peer_session_ratings migration FAILED:',
+      r3hPt2MigrationErr.message);
+    console.error('The server will start, but sock-puppet detection (C8) cannot operate until investigated.');
   }
 
   // mfa_consumed_jtis: denylist of MFA-bridge JWT IDs (jti claim) that

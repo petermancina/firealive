@@ -1098,6 +1098,128 @@ function ManagementConsole() {
       setPeerFlags(r?.flags || []);
     }).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));
   }, [tab, peerFlagStatus, peerFlagTierFilter]);
+
+  // R3h: When peersupport tab opens, fetch the Helper Recognition
+  // leaderboard. Returns top 10 opted-in analysts by points. The
+  // service-layer filter (leaderboard_opt_in = 1) means an analyst
+  // who has not opted in via their AC toggle is absent from this
+  // list, regardless of how many points they have earned. Empty list
+  // is the expected steady state until at least one analyst opts in.
+  useEffect(()=>{
+    if (tab !== "peersupport") return;
+    setPeerHelpersLoading(true);
+    setPeerHelpersError(null);
+    api.get("/api/helper-pay/leaderboard?limit=10").then(r=>{
+      if (r?.error) {
+        setPeerHelpersError(r.message || "Could not load leaderboard.");
+        setPeerHelpers([]);
+        return;
+      }
+      setPeerHelpers(Array.isArray(r?.entries) ? r.entries : []);
+    }).catch(()=>{
+      setPeerHelpersError("Could not reach the server.");
+      setPeerHelpers([]);
+    }).finally(()=>setPeerHelpersLoading(false));
+  }, [tab]);
+
+  // R3h: When peersupport tab opens, also fetch the full-roster team
+  // scores. This is the lead's operational view of ALL active analysts'
+  // helper-pay state, regardless of opt-in. Per privacy invariant I5,
+  // this surface is for payroll/compensation use — a separate concern
+  // from the recognition leaderboard above. Endpoint is lead/admin-only
+  // server-side; a 403 here means the current user is an analyst who
+  // shouldn't be on the peersupport tab in the first place (the MC
+  // mounts peersupport for lead/admin).
+  useEffect(()=>{
+    if (tab !== "peersupport") return;
+    setTeamScoresLoading(true);
+    setTeamScoresError(null);
+    api.get("/api/helper-pay/team-scores").then(r=>{
+      if (r?.error) {
+        setTeamScoresError(r.message || "Could not load team scores.");
+        setTeamScores([]);
+        return;
+      }
+      setTeamScores(Array.isArray(r?.entries) ? r.entries : []);
+    }).catch(()=>{
+      setTeamScoresError("Could not reach the server.");
+      setTeamScores([]);
+    }).finally(()=>setTeamScoresLoading(false));
+  }, [tab]);
+
+  // R3h-pt2: When peersupport tab opens, also fetch flagged ratings for
+  // the sock-puppet review queue. Lead/admin only (server-side
+  // isLeadOrAdmin guard); a 403 here would mean the current user is
+  // an analyst who shouldn't be on the peersupport tab in the first
+  // place (the MC mounts peersupport for lead/admin). Empty list is
+  // the expected steady state when no sock-puppet activity has been
+  // detected.
+  useEffect(()=>{
+    if (tab !== "peersupport") return;
+    setFlaggedRatingsLoading(true);
+    setFlaggedRatingsError(null);
+    api.get("/api/helper-pay/flagged-ratings").then(r=>{
+      if (r?.error) {
+        setFlaggedRatingsError(r.message || "Could not load flagged ratings.");
+        setFlaggedRatings([]);
+        return;
+      }
+      setFlaggedRatings(Array.isArray(r?.entries) ? r.entries : []);
+    }).catch(()=>{
+      setFlaggedRatingsError("Could not reach the server.");
+      setFlaggedRatings([]);
+    }).finally(()=>setFlaggedRatingsLoading(false));
+  }, [tab]);
+
+  // R3h-pt2: decide a flagged rating. confirmFraud=true triggers
+  // reversePointsForFraud server-side; confirmFraud=false clears the
+  // flag and re-includes the rating in the leaderboard.
+  //
+  // window.confirm provides a hard double-tap on each decision so a
+  // single tap on the wrong button doesn't fire an irreversible action.
+  // The confirm copy spells out the consequence so the lead knows
+  // exactly what will happen.
+  //
+  // On success, optimistically removes the rating from the local
+  // flaggedRatings list so the queue updates without a refetch. On
+  // 409 RATING_NOT_FLAGGED (the row was already decided by another
+  // lead in the same window), refetches to reconcile.
+  const decideFlagged = (ratingId, confirmFraud, helperLabel) => {
+    const message = confirmFraud
+      ? `Confirm fraud on this rating?\n\nThe helper "${helperLabel}" will lose the points from this rating via a reversal ledger entry. This action is logged in the audit log. The rating row stays flagged forever as audit evidence.`
+      : `Dismiss this flag?\n\nThe rating returns to normal status, its points contribution re-appears on the leaderboard, and the flag is cleared. This action is logged in the audit log.`;
+    if (!window.confirm(message)) return;
+    setFlaggedDecideBusy(ratingId);
+    setFlaggedDecideFb(null);
+    api.post(`/api/helper-pay/flagged-ratings/${ratingId}/decide`,
+      { confirmFraud }
+    ).then(r=>{
+      if (r?.error) {
+        if (r.error === "RATING_NOT_FLAGGED") {
+          // Already decided by someone else. Refetch the queue.
+          setFlaggedRatings(prev => prev.filter(x => x.rating_id !== ratingId));
+          setFlaggedDecideFb({ kind: "info",
+            message: "This flag was already resolved." });
+          return;
+        }
+        setFlaggedDecideFb({ kind: "error",
+          message: r.message || "Could not record decision." });
+        return;
+      }
+      setFlaggedRatings(prev => prev.filter(x => x.rating_id !== ratingId));
+      setFlaggedDecideFb({ kind: "success",
+        message: confirmFraud
+          ? "Fraud confirmed — points reversed and audit logged."
+          : "Flag dismissed — points restored to the leaderboard." });
+      addA(confirmFraud
+        ? "LEADERBOARD_SOCKPUPPET_CONFIRMED"
+        : "LEADERBOARD_SOCKPUPPET_DISMISSED",
+        `Sock-puppet review decided for rating ${ratingId.slice(0, 8)}...`);
+    }).catch(()=>{
+      setFlaggedDecideFb({ kind: "error",
+        message: "Could not reach the server." });
+    }).finally(()=>setFlaggedDecideBusy(null));
+  };
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
@@ -1435,6 +1557,32 @@ function ManagementConsole() {
   const [peerScheduleCfg, setPeerSchedCfg] = useState({allowDuringShift:true,blockedDays:[],blockedHoursStart:null,blockedHoursEnd:null,maxSessionMinutes:30,inactivityTimeoutMinutes:5});
   // Helper leaderboard populated from real peer sessions.
   const [peerHelpers, setPeerHelpers] = useState([]);
+  // R3h: leaderboard fetch state. peerHelpers is the rendered list;
+  // peerHelpersLoading/Error gate the loading and error affordances on
+  // the peersupport tab Card. Populated by GET /api/helper-pay/leaderboard
+  // when the peersupport tab opens.
+  const [peerHelpersLoading, setPeerHelpersLoading] = useState(false);
+  const [peerHelpersError, setPeerHelpersError] = useState(null);
+  // R3h: team-scores fetch state. Populated by GET /api/helper-pay/
+  // team-scores when the peersupport tab opens. Lead operational view
+  // showing ALL active analysts (not opt-in-gated, per privacy invariant
+  // I5 — this is the payroll/compensation surface, not the recognition
+  // leaderboard). The endpoint is lead/admin-gated server-side; if an
+  // analyst-role MC user somehow opens this tab, the fetch returns 403
+  // and the Card shows an error.
+  const [teamScores, setTeamScores] = useState([]);
+  const [teamScoresLoading, setTeamScoresLoading] = useState(false);
+  const [teamScoresError, setTeamScoresError] = useState(null);
+  // R3h-pt2: flagged-ratings review queue state. Populated by GET
+  // /api/helper-pay/flagged-ratings when the peersupport tab opens.
+  // flaggedDecideBusy tracks which rating's decide POST is in flight
+  // so Approve/Dismiss buttons disable per-row during the round trip
+  // rather than blocking the entire Card.
+  const [flaggedRatings, setFlaggedRatings] = useState([]);
+  const [flaggedRatingsLoading, setFlaggedRatingsLoading] = useState(false);
+  const [flaggedRatingsError, setFlaggedRatingsError] = useState(null);
+  const [flaggedDecideBusy, setFlaggedDecideBusy] = useState(null);
+  const [flaggedDecideFb, setFlaggedDecideFb] = useState(null);
   // Restore
   const [restorePoints, setRestorePoints] = useState([{id:"bk1",type:"daily-auto",createdAt:"2026-03-27 02:00",sizeMB:"2.4",hash:"a3f8c…"},{id:"bk2",type:"daily-auto",createdAt:"2026-03-26 02:00",sizeMB:"2.3",hash:"b7e2d…"}]);
   const [erSources,setErSources]=useState([]); const [erSelSrc,setErSelSrc]=useState(""); const [erBackups,setErBackups]=useState([]); const [erPreview,setErPreview]=useState(null); const [erReason,setErReason]=useState(""); const [erApproval,setErApproval]=useState(null);
@@ -3881,16 +4029,108 @@ regression:
           </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Helper Recognition — Points Leaderboard</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Analysts who accept peer support requests earn helpfulness points (1-5 rating). Points are visible only to you — helpers receive anonymous praise messages.</M>
-            <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{peerHelpers.map((h,i)=>(
-              <div key={i} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><M style={{color:C.t,fontWeight:500}}>{h.name}</M><br/><M style={{color:C.td}}>{h.sessions} sessions · avg {h.avg}/5</M></div>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <div style={{fontSize:18,fontWeight:600,color:C.a}}>{h.points}</div>
-                  <Btn small onClick={()=>addA("PEER_THANKED",`Sent thank-you to ${h.name}`)}>Thank</Btn>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Top opted-in helpers, sorted by Helper Pay points. Analysts who have not opted in via their Analyst Client are absent from this list, regardless of their points balance — opt-in is per-analyst and defaults to off. Points come from 3-5 star peer-session ratings; daily caps and minimum-duration gates limit gaming. Anonymous praise can be sent via the Thank button below — no name reveal to the helper.</M>
+            {peerHelpersLoading ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>Loading leaderboard...</M></div>
+            ) : peerHelpersError ? (
+              <div style={{padding:"14px",background:"rgba(239,68,68,0.08)",border:`1px solid ${C.d}40`,borderRadius:10}}><M style={{color:C.d}}>{peerHelpersError}</M></div>
+            ) : peerHelpers.length === 0 ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>No analysts on the leaderboard yet. Analysts opt in from their AC Helper Pay tab; the list will populate as they choose to be visible.</M></div>
+            ) : (
+              <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{peerHelpers.map((h,i)=>(
+                <div key={h.user_id || i} style={{padding:"10px 14px",borderBottom:i<peerHelpers.length-1?`1px solid ${C.b}`:"none",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div>
+                    <M style={{color:C.t,fontWeight:500}}>{h.pseudonym || h.name}</M>
+                    <br/>
+                    <M style={{color:C.td}}>{h.sessions_count} session{h.sessions_count===1?"":"s"} · avg {h.avg_rating!=null?h.avg_rating:"—"}/5</M>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <div style={{fontSize:18,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{h.points}</div>
+                    <Btn small onClick={()=>addA("PEER_THANKED",`Sent thank-you to ${h.pseudonym || h.name}`)}>Thank</Btn>
+                  </div>
                 </div>
+              ))}</div>
+            )}
+          </Card>
+          {/* R3h: Team Helper Scores — full-roster operational view. NOT opt-in-gated. Lead operational surface for payroll, compensation discussions, and team reviews. Privacy invariant I5: bypasses the opt-in filter that gates the leaderboard above; this surface is analogous to how the Helper Pay administrative tab already exposes user-level redemption and ledger data without opt-in gating. The opt-in indicator on each row is purely informational — the lead cannot toggle it on behalf of an analyst (only the analyst can, from their AC). */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Team Helper Scores — Operational View</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Full roster of active analysts with their Helper Pay state. Unlike the recognition leaderboard above, this list includes every analyst regardless of their leaderboard opt-in choice — use it for payroll reconciliation, compensation discussions, and quarterly team reviews. The opt-in badge shows each analyst's current leaderboard visibility (informational only; only the analyst can flip it from their AC).</M>
+            {teamScoresLoading ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>Loading team scores...</M></div>
+            ) : teamScoresError ? (
+              <div style={{padding:"14px",background:"rgba(239,68,68,0.08)",border:`1px solid ${C.d}40`,borderRadius:10}}><M style={{color:C.d}}>{teamScoresError}</M></div>
+            ) : teamScores.length === 0 ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>No active analysts on this team.</M></div>
+            ) : (
+              <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{teamScores.map((a,i)=>{
+                const visible = a.leaderboard_opt_in === 1;
+                return (
+                  <div key={a.user_id || i} style={{padding:"10px 14px",borderBottom:i<teamScores.length-1?`1px solid ${C.b}`:"none",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+                        <M style={{color:C.t,fontWeight:500}}>{a.pseudonym || a.name}</M>
+                        <span style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:visible?"rgba(110,231,183,0.12)":C.b,color:visible?C.a:C.tm,textTransform:"uppercase",letterSpacing:1.2,fontWeight:600}}>{visible?"Visible":"Hidden"}</span>
+                      </div>
+                      <M style={{color:C.td}}>{a.sessions_count} session{a.sessions_count===1?"":"s"} · avg {a.avg_rating!=null?a.avg_rating:"—"}/5</M>
+                    </div>
+                    <div style={{fontSize:18,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace",flexShrink:0}}>{a.points}</div>
+                  </div>
+                );
+              })}</div>
+            )}
+          </Card>
+          {/* R3h-pt2: Pending Sock-Puppet Review queue. Detection runs at rating time on POST /sessions/:id/rate — when a new rating's rater IP hash OR device hash matches 2+ other ratings against the same helper within the last 7 days, the rating is flagged. The flagged rating still grants points immediately (the ledger entry is written) but its contribution is excluded from the recognition leaderboard via the adjusted_points CTE in the leaderboard query. The lead reviews each flag here: Confirm Fraud triggers reversePointsForFraud (negative ledger entry, points permanently removed from helper's balance, original rating stays flagged forever as audit evidence); Dismiss clears the flag (points stay, leaderboard re-includes on next cache miss). All decisions write explicit LEADERBOARD_SOCKPUPPET_CONFIRMED / LEADERBOARD_SOCKPUPPET_DISMISSED audit_log events. */}
+          <Card style={{marginBottom:16,borderColor:flaggedRatings.length>0?"#FBBF2440":C.b}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Pending Sock-Puppet Review</div>
+              {flaggedRatings.length>0 && (
+                <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:"#FBBF2420",color:"#FBBF24",fontWeight:600,textTransform:"uppercase",letterSpacing:1.2}}>{flaggedRatings.length} pending</span>
+              )}
+            </div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Ratings flagged by the sock-puppet detector. A rating is flagged when its rater shares an IP or device hash with 2+ other ratings against the same helper in the last 7 days. Flagged ratings still grant points to the helper at rating time, but their contribution is excluded from the leaderboard until you decide. Confirm Fraud reverses the points and keeps the rating flagged forever as audit evidence. Dismiss clears the flag and restores the points to the leaderboard.</M>
+            {flaggedRatingsLoading ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>Loading review queue...</M></div>
+            ) : flaggedRatingsError ? (
+              <div style={{padding:"14px",background:"rgba(239,68,68,0.08)",border:`1px solid ${C.d}40`,borderRadius:10}}><M style={{color:C.d}}>{flaggedRatingsError}</M></div>
+            ) : flaggedRatings.length === 0 ? (
+              <div style={{padding:"14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10}}><M style={{color:C.tm}}>No ratings currently flagged. The detector runs on each new rating; flagged items will appear here for your review.</M></div>
+            ) : (
+              <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{flaggedRatings.map((r,i)=>{
+                const helperLabel = r.rated_user_pseudonym || r.rated_user_name;
+                const raterLabel = r.rated_by_pseudonym || r.rated_by_name;
+                const busy = flaggedDecideBusy === r.rating_id;
+                const reasonLabel = r.flagged_reason === "both"
+                  ? "IP + device cluster match"
+                  : r.flagged_reason === "ip_cluster"
+                    ? `IP cluster match (${r.ip_cluster_size} other rating${r.ip_cluster_size===1?"":"s"})`
+                    : `Device cluster match (${r.device_cluster_size} other rating${r.device_cluster_size===1?"":"s"})`;
+                return (
+                  <div key={r.rating_id} style={{padding:"12px 14px",borderBottom:i<flaggedRatings.length-1?`1px solid ${C.b}`:"none"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6,gap:12}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <M style={{color:C.t,fontWeight:500,display:"block",marginBottom:2}}>{raterLabel} rated {helperLabel} — {r.stars}/5 stars</M>
+                        <M style={{color:C.td,display:"block"}}>{reasonLabel} · flagged {r.flagged_at}</M>
+                      </div>
+                    </div>
+                    {r.comment && (
+                      <div style={{padding:"8px 10px",background:C.s,borderRadius:6,marginBottom:8,marginTop:4}}>
+                        <M style={{color:C.tm,fontStyle:"italic"}}>{r.comment}</M>
+                      </div>
+                    )}
+                    <div style={{display:"flex",gap:8,marginTop:6}}>
+                      <Btn small disabled={busy} onClick={()=>decideFlagged(r.rating_id,true,helperLabel)} style={{background:"rgba(239,68,68,0.12)",color:C.d,borderColor:C.d+"40"}}>{busy?"...":"Confirm Fraud"}</Btn>
+                      <Btn small disabled={busy} onClick={()=>decideFlagged(r.rating_id,false,helperLabel)}>{busy?"...":"Dismiss"}</Btn>
+                    </div>
+                  </div>
+                );
+              })}</div>
+            )}
+            {flaggedDecideFb && (
+              <div style={{marginTop:10,padding:"8px 10px",background:flaggedDecideFb.kind==="success"?"rgba(110,231,183,0.08)":flaggedDecideFb.kind==="info"?C.s:"rgba(239,68,68,0.08)",border:`1px solid ${flaggedDecideFb.kind==="success"?C.a:flaggedDecideFb.kind==="info"?C.b:C.d}40`,borderRadius:6}}>
+                <M style={{color:flaggedDecideFb.kind==="success"?C.a:flaggedDecideFb.kind==="info"?C.tm:C.d}}>{flaggedDecideFb.message}</M>
               </div>
-            ))}</div>
+            )}
           </Card>
           <Card style={{marginBottom:16,borderColor:C.p+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.p,marginBottom:10}}>Helper Pay (Quality-Based)</div><M style={{color:C.tm,display:"block",marginBottom:12}}>Points from 4-5 star ratings. Pseudonymized leaderboard.</M><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Enable</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/integrations/save",{type:"helper_pay",platform:"internal"}).then(()=>addA("HP","Helper pay config saved"))}>Save</Btn></Card>
           <Card><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Chat Disclaimer</div>

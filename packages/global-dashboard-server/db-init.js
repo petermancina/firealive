@@ -291,6 +291,60 @@ CREATE TABLE IF NOT EXISTS cross_region_rollup (
 CREATE INDEX IF NOT EXISTS idx_cross_region_rollup_framework
   ON cross_region_rollup(framework);
 
+-- ── R3h: REGIONAL LEADERBOARD AGGREGATION ───────────────────────────────
+-- One row per (mc_id, analyst_pseudonym) representing this MC's most recent
+-- leaderboard push for that analyst. The GD's _leaderboardTick push from
+-- the MC (server/services/gd-push.js _performLeaderboardPush) sends a
+-- complete top-50 list every cadence; the ingest handler at
+-- POST /api/ingest/leaderboard atomically REPLACES this MC's rows with
+-- the new push entries (so an analyst who falls out of the top 50 or
+-- opts out of the leaderboard disappears from this table on the next
+-- push within one cadence).
+--
+-- PRIVACY INVARIANT I3 (OPT-IN PROPAGATION)
+-- Each row's analyst_pseudonym corresponds to an MC analyst who has
+-- explicitly opted in to the leaderboard via their AC toggle. The MC's
+-- helperPay.getLeaderboard query enforces leaderboard_opt_in = 1 at the
+-- source; opt-out analysts never appear in any push payload, so they
+-- never appear in this table.
+--
+-- PRIVACY INVARIANT I4 (PSEUDONYM-ONLY)
+-- analyst_pseudonym is a string. Real names, user_ids, and emails are
+-- intentionally NOT carried in this table. A team that hasn't enabled
+-- pseudonyms on its MC will see empty leaderboard pushes (the MC push
+-- layer strips entries without a pseudonym) and therefore an empty
+-- view in the GD's Helper Recognition tab — by design.
+--
+-- ATOMIC REPLACEMENT
+-- The ingest handler runs DELETE FROM regional_leaderboard WHERE mc_id=?
+-- followed by INSERTs for the new push entries inside a single SQLite
+-- transaction. This avoids a race where the matrix render could observe
+-- partial state (some old rows + some new) during the swap.
+--
+-- pushed_at carries the MC's timestamp at push build time; received_at
+-- carries the GD's receipt timestamp. Both are useful for forensic
+-- review and for detecting clock drift between MC and GD.
+CREATE TABLE IF NOT EXISTS regional_leaderboard (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  analyst_pseudonym TEXT NOT NULL,                  -- pseudonym only; never real name
+  points INTEGER NOT NULL,
+  sessions_count INTEGER NOT NULL,
+  avg_rating REAL,                                  -- nullable when analyst has no ratings yet
+  pushed_at TEXT NOT NULL,                          -- MC-supplied push timestamp
+  received_at TEXT NOT NULL DEFAULT (datetime('now')),
+  signature_fingerprint TEXT NOT NULL,              -- signing_keys row that verified the push
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+
+-- Hot path: matrix view fetches all rows for the cross-MC roll-up.
+CREATE INDEX IF NOT EXISTS idx_regional_leaderboard_mc
+  ON regional_leaderboard(mc_id);
+
+-- Drilldown: per-MC view sorts by points DESC for top-N display.
+CREATE INDEX IF NOT EXISTS idx_regional_leaderboard_mc_points
+  ON regional_leaderboard(mc_id, points DESC);
+
 -- Regional aggregate data (received from MCs)
 CREATE TABLE IF NOT EXISTS regional_metrics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

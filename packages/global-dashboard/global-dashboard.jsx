@@ -467,6 +467,22 @@ export default function GlobalDashboard() {
   const [rollupFilterMcId, setRollupFilterMcId] = useState("");
   const [rollupFilterRegion, setRollupFilterRegion] = useState("");
 
+  // ── R3h: Helper Recognition leaderboard state ────────────────────────────
+  // hrMatrix is the cross-MC aggregation from GET /api/leaderboard/regional —
+  // one entry per active MC with that MC's top-10 opted-in helpers inline.
+  // hrDrilldownMcId, when non-null, switches the tab body to the per-MC
+  // drilldown view fetched from GET /api/leaderboard/mc/:id (returns the
+  // full top-50 plus signature_fingerprint for forensic display). The
+  // drilldown is dismissed by setting hrDrilldownMcId back to null,
+  // returning the user to the matrix view.
+  const [hrMatrix, setHrMatrix] = useState(null);
+  const [hrMatrixLoading, setHrMatrixLoading] = useState(false);
+  const [hrMatrixError, setHrMatrixError] = useState(null);
+  const [hrDrilldownMcId, setHrDrilldownMcId] = useState(null);
+  const [hrDrilldownData, setHrDrilldownData] = useState(null);
+  const [hrDrilldownLoading, setHrDrilldownLoading] = useState(false);
+  const [hrDrilldownError, setHrDrilldownError] = useState(null);
+
   // Per-cell full-report metadata list (added in C7). Clicking a matrix
   // row sets selectedCell to {mc_id, framework}; the useEffect below
   // fires PR3 C38's GET /api/mc/:id/full-reports?framework=<fw> and the
@@ -758,6 +774,43 @@ export default function GlobalDashboard() {
     }).finally(() => setRollupLoading(false));
   }, [stage, tab]);
 
+  // R3h: Load Helper Recognition matrix when the tab is active. Returns
+  // one entry per active MC with that MC's top-10 inline (limit=10 is
+  // the default; client could pass ?limit=N for a wider view in a future
+  // iteration). The matrix view is the primary surface; drilldown into
+  // a specific MC is triggered by clicking the MC's card.
+  useEffect(() => {
+    if (stage !== "app" || tab !== "helper_recognition") return;
+    setHrMatrixLoading(true);
+    setHrMatrixError(null);
+    api.get('/api/leaderboard/regional?limit=10').then(r => {
+      if (r && !r.error && Array.isArray(r.matrix)) {
+        setHrMatrix(r.matrix);
+      } else {
+        setHrMatrixError(r?.error || 'Failed to load Helper Recognition matrix');
+      }
+    }).finally(() => setHrMatrixLoading(false));
+  }, [stage, tab]);
+
+  // R3h: Load per-MC drilldown when hrDrilldownMcId is set. Endpoint
+  // returns the full top-50 for the MC plus the signature_fingerprint
+  // on each row for forensic provenance display. Setting hrDrilldown
+  // McId to null returns the user to the matrix view without firing
+  // another fetch.
+  useEffect(() => {
+    if (stage !== "app" || !hrDrilldownMcId) return;
+    setHrDrilldownLoading(true);
+    setHrDrilldownData(null);
+    setHrDrilldownError(null);
+    api.get('/api/leaderboard/mc/' + hrDrilldownMcId).then(r => {
+      if (r && !r.error) {
+        setHrDrilldownData(r);
+      } else {
+        setHrDrilldownError(r?.error || 'Failed to load per-MC leaderboard');
+      }
+    }).finally(() => setHrDrilldownLoading(false));
+  }, [stage, hrDrilldownMcId]);
+
   // Load per-MC full-report metadata when a cell is selected (C7).
   // Endpoint: PR3 C38's GET /api/mc/:id/full-reports?framework=<fw>.
   // Returns metadata only (id, framework, received_at, expires_at,
@@ -942,6 +995,7 @@ export default function GlobalDashboard() {
     {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha_cluster",label:"HA & Clustering"},
     {id:"backup",label:"Backup & Restore"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
+    {id:"helper_recognition",label:"Helper Recognition"},
     {id:"troubleshooter",label:"Troubleshooter"},{id:"app_updates",label:"App Updates"},
     {id:"audit_dash",label:"Audit & Forensics"},
   ];
@@ -2127,6 +2181,93 @@ export default function GlobalDashboard() {
               <Sel label="Data retention"><option value="keep">Keep historical data indefinitely</option><option value="1year">Retain for 1 year then purge</option><option value="purge_now">Purge immediately (irreversible)</option></Sel>
               <Btn danger>Offboard MC</Btn>
             </Card>
+          </div>)}
+
+          {/* ══════════ HELPER RECOGNITION (R3h) ══════════ */}
+          {tab==="helper_recognition"&&(<div>
+            <L>Helper Recognition</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Cross-region Helper Pay leaderboard. Active MCs push their top opted-in helpers on a configurable cadence (default 15 min); this surface displays the matrix. Only analysts who have explicitly opted in via their AC appear here, and only their pseudonyms cross the wire — real names, user IDs, and earning details stay on the MC. Click a card to drill into that MC's full leaderboard with signature provenance.</M>
+            {/* DRILLDOWN MODE — visible when hrDrilldownMcId is set */}
+            {hrDrilldownMcId ? (<>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                <Btn small onClick={()=>{setHrDrilldownMcId(null);setHrDrilldownData(null);setHrDrilldownError(null);}}>{"<-"} Back to matrix</Btn>
+                {hrDrilldownData&&<M style={{color:C.t,fontWeight:500}}>{hrDrilldownData.mc_name} <span style={{color:C.td,fontWeight:400}}>· {hrDrilldownData.region||"region-unknown"}</span></M>}
+              </div>
+              {hrDrilldownLoading&&<Card><M style={{color:C.tm,fontStyle:"italic"}}>Loading per-MC leaderboard...</M></Card>}
+              {hrDrilldownError&&<Card style={{borderColor:C.d+"40"}}><M style={{color:C.d}}>{hrDrilldownError}</M></Card>}
+              {hrDrilldownData&&!hrDrilldownLoading&&hrDrilldownData.entries.length===0&&(
+                <Card><M style={{color:C.td,fontStyle:"italic"}}>This MC has not pushed any leaderboard entries yet, or all helpers on this MC have opted out of leaderboard visibility.</M></Card>
+              )}
+              {hrDrilldownData&&!hrDrilldownLoading&&hrDrilldownData.entries.length>0&&(
+                <Card>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <div style={{fontSize:12,fontWeight:500,color:C.t}}>{hrDrilldownData.entry_count} helper{hrDrilldownData.entry_count===1?"":"s"} on the leaderboard</div>
+                    <div style={{fontSize:9,color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>last push: {hrDrilldownData.entries[0]?.pushed_at||"—"}</div>
+                  </div>
+                  <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>
+                    {hrDrilldownData.entries.map((e,i)=>(
+                      <div key={i} style={{padding:"10px 14px",borderBottom:i<hrDrilldownData.entries.length-1?`1px solid ${C.b}`:"none",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+                            <div style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:C.b,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>#{i+1}</div>
+                            <M style={{color:C.t,fontWeight:500}}>{e.analyst_pseudonym}</M>
+                          </div>
+                          <M style={{color:C.td}}>{e.sessions_count} session{e.sessions_count===1?"":"s"} · avg {e.avg_rating!=null?e.avg_rating:"—"}/5</M>
+                        </div>
+                        <div style={{textAlign:"right",flexShrink:0}}>
+                          <div style={{fontSize:18,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{e.points}</div>
+                          <div style={{fontSize:8,color:C.td,fontFamily:"'IBM Plex Mono',monospace",marginTop:2}} title={"signature_fingerprint: "+e.signature_fingerprint}>{(e.signature_fingerprint||"").slice(0,12)}...</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <M style={{color:C.td,display:"block",marginTop:10,fontSize:9,fontStyle:"italic"}}>Each row carries the signing fingerprint of the MC push that delivered it (truncated to 12 chars; hover for full value). Used for forensic correlation between this surface and the GD-side audit log.</M>
+                </Card>
+              )}
+            </>) : (<>
+              {/* MATRIX MODE — default */}
+              {hrMatrixLoading&&<Card><M style={{color:C.tm,fontStyle:"italic"}}>Loading Helper Recognition matrix...</M></Card>}
+              {hrMatrixError&&<Card style={{borderColor:C.d+"40"}}><M style={{color:C.d}}>{hrMatrixError}</M></Card>}
+              {hrMatrix&&!hrMatrixLoading&&hrMatrix.length===0&&(
+                <Card><M style={{color:C.td,fontStyle:"italic"}}>No active MCs are pushing leaderboard data yet. The MC→GD leaderboard push tick fires on a configurable cadence (default 15 min); once the first push from any active MC arrives, this matrix will populate. Verify MC connections in the MC Connections tab.</M></Card>
+              )}
+              {hrMatrix&&!hrMatrixLoading&&hrMatrix.length>0&&(
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(320px, 1fr))",gap:12}}>
+                  {hrMatrix.map(m=>(
+                    <Card key={m.mc_id} style={{cursor:"pointer"}} onClick={()=>setHrDrilldownMcId(m.mc_id)}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                        <div>
+                          <M style={{color:C.t,fontWeight:500,display:"block"}}>{m.mc_name}</M>
+                          <M style={{color:C.td}}>{m.region||"region-unknown"}</M>
+                        </div>
+                        <div style={{fontSize:9,color:C.td,fontFamily:"'IBM Plex Mono',monospace",textAlign:"right"}}>{m.entries.length} entr{m.entries.length===1?"y":"ies"}</div>
+                      </div>
+                      {m.entries.length===0 ? (
+                        <M style={{color:C.td,fontStyle:"italic",fontSize:11}}>No opted-in helpers on this MC.</M>
+                      ) : (
+                        <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:8,overflow:"hidden",marginBottom:6}}>
+                          {m.entries.slice(0,5).map((e,i)=>(
+                            <div key={i} style={{padding:"6px 10px",borderBottom:i<Math.min(4,m.entries.length-1)?`1px solid ${C.b}`:"none",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                              <div style={{display:"flex",alignItems:"center",gap:6,minWidth:0,flex:1}}>
+                                <div style={{fontSize:8,color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>#{i+1}</div>
+                                <M style={{color:C.t,fontSize:11}}>{e.analyst_pseudonym}</M>
+                              </div>
+                              <div style={{fontSize:13,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace"}}>{e.points}</div>
+                            </div>
+                          ))}
+                          {m.entries.length>5&&(
+                            <div style={{padding:"4px 10px",borderTop:`1px solid ${C.b}`,textAlign:"center"}}>
+                              <M style={{color:C.td,fontSize:9,fontStyle:"italic"}}>+{m.entries.length-5} more...</M>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div style={{fontSize:8,color:C.td,fontFamily:"'IBM Plex Mono',monospace"}}>last push: {m.last_pushed_at||"never"}</div>
+                    </Card>
+                  ))}
+                </div>
+              )}
+            </>)}
           </div>)}
 
           {/* ══════════ TROUBLESHOOTER ══════════ */}

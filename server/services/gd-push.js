@@ -134,23 +134,45 @@ const { signPushPayload } = require('./gd-push-signer');
 // R3g PR3 Phase 6 (C32): compliance summary generation
 const { generateComplianceReport, FRAMEWORKS } = require('./compliance');
 
+// R3h: helper-pay service supplies the leaderboard payload for the
+// MC→GD leaderboard push pipeline added in C9b. Only opted-in analysts
+// are returned by getLeaderboard; the opt-in invariant propagates from
+// the MC's users.leaderboard_opt_in column through this push to the
+// GD's regional_leaderboard table per privacy invariant I3.
+const helperPay = require('./helper-pay');
+
 const CIRCUIT_BREAKER_THRESHOLD = 20;
 const REQUEST_TIMEOUT_MS = 30000;
 const STATUS_POLL_TIMEOUT_MS = 15000;  // shorter than push — status poll is cheap
 const DEFAULT_COMPLIANCE_CADENCE_HOURS = 24;
 const MAX_COMPLIANCE_CADENCE_HOURS = 720;  // 30-day ceiling from gd_push_config CHECK
 
+// R3h: leaderboard tick cadence + payload size discipline.
+//   Cadence 15 min default matches the build plan v1 and the leaderboard's
+//   natural rate of change (rating events occur in low-minute frequency
+//   during active hours, leaderboard re-orders on each rating). The 24-hour
+//   ceiling matches the gd_push_config CHECK.
+//   Limit 50 entries gives the GD enough roster depth to render its own
+//   top-N (the GD Helper Recognition tab in C11 displays top 10 or top 20
+//   depending on view) while keeping the signed payload well under the
+//   GD's ingest body size limits.
+const DEFAULT_LEADERBOARD_CADENCE_MINUTES = 15;
+const MAX_LEADERBOARD_CADENCE_MINUTES = 1440;  // 24h ceiling from gd_push_config CHECK
+const LEADERBOARD_PUSH_LIMIT = 50;
+
 class GdPushService {
   constructor() {
     this.timerId = null;
     // R3g PR3 Phase 6 (C32): separate timer for compliance pushes
     this.complianceTimerId = null;
+    // R3h (C9b): separate timer for leaderboard pushes
+    this.leaderboardTimerId = null;
     this.shuttingDown = false;
   }
 
   // ── Public lifecycle ──────────────────────────────────────────────────────
   start() {
-    if (this.timerId || this.complianceTimerId) return;
+    if (this.timerId || this.complianceTimerId || this.leaderboardTimerId) return;
     this.shuttingDown = false;
     this._scheduleNext(0);  // metrics tick: first fire immediately so a
                             // freshly-configured push doesn't wait the
@@ -159,7 +181,13 @@ class GdPushService {
                                       // immediately for the same reason —
                                       // operator gets feedback within the
                                       // first cadence rather than a day later
-    logger.info('GD push service started (metrics + compliance ticks)');
+    this._scheduleNextLeaderboard(0);  // R3h: leaderboard tick — same
+                                       // immediate-first-fire rationale.
+                                       // The 15-min default cadence is
+                                       // tight enough that operators see
+                                       // first push within the GD's HTTP
+                                       // request window of the start.
+    logger.info('GD push service started (metrics + compliance + leaderboard ticks)');
   }
 
   stop() {
@@ -171,6 +199,10 @@ class GdPushService {
     if (this.complianceTimerId) {
       clearTimeout(this.complianceTimerId);
       this.complianceTimerId = null;
+    }
+    if (this.leaderboardTimerId) {
+      clearTimeout(this.leaderboardTimerId);
+      this.leaderboardTimerId = null;
     }
     logger.info('GD push service stopped');
   }
@@ -1207,6 +1239,180 @@ class GdPushService {
       `requestId=${requestId} framework=${framework} attempts=${attempt} reason=${(lastError?.message || 'unknown').slice(0, 200)}`);
     logger.warn('GD compliance: full-report push failed after retries',
       { requestId, framework, attempts: attempt, error: lastError?.message });
+    return false;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // R3h (C9b): Leaderboard tick — separate cadence from metrics + compliance
+  // ──────────────────────────────────────────────────────────────────────────
+  //
+  // Pushes the top-50 opted-in helpers' leaderboard summary to the GD on a
+  // configurable cadence (default 15 min, gd_push_config.leaderboard_push_
+  // cadence_minutes). The push is signed by the same Ed25519 contract as
+  // the metrics and compliance pushes; the GD verifies and writes to its
+  // regional_leaderboard table (lands in C10).
+  //
+  // PRIVACY INVARIANT I3 (OPT-IN PROPAGATION)
+  //
+  // helperPay.getLeaderboard(LEADERBOARD_PUSH_LIMIT) filters at the SQL
+  // layer to leaderboard_opt_in = 1. The MC never sends an analyst's name
+  // or score to the GD without that analyst having explicitly opted in
+  // via their AC. The opt-in invariant therefore propagates from the
+  // MC's users column through this push to the GD's regional_leaderboard
+  // table — the GD has no path to see opted-out analysts.
+  //
+  // PRIVACY INVARIANT I4 (PSEUDONYM PREFERENCE)
+  //
+  // The payload's entry shape strips real names and forwards only
+  // pseudonyms when the analyst has one. analyst_pseudonym is the
+  // ONLY identifier crossing the wire — never name, never user_id,
+  // never email. The GD's regional_leaderboard.analyst_pseudonym
+  // column is sized for pseudonym strings, not user identifiers.
+  //
+  // PAYLOAD SHAPE
+  //
+  //   { apiKey, leaderboard: {
+  //       pushed_at: ISO timestamp,
+  //       entries: [
+  //         { analyst_pseudonym, points, sessions_count, avg_rating }
+  //       ]
+  //     }
+  //   }
+  //
+  // The pushed_at timestamp lets the GD detect stale-vs-fresh pushes
+  // (a push older than the latest stored push for this MC can be
+  // ignored if it arrives out of order).
+
+  _scheduleNextLeaderboard(delayMs) {
+    if (this.shuttingDown) return;
+    this.leaderboardTimerId = setTimeout(() => this._leaderboardTick(), delayMs);
+  }
+
+  async _leaderboardTick() {
+    if (this.shuttingDown) return;
+    let cadenceMinutes = DEFAULT_LEADERBOARD_CADENCE_MINUTES;
+    try {
+      const config = this._readConfig();
+      // Read cadence with defensive coercion: invalid values fall back
+      // to the default. Same pattern as the metrics and compliance ticks.
+      const raw = config?.leaderboard_push_cadence_minutes;
+      if (Number.isInteger(raw) && raw >= 1 && raw <= MAX_LEADERBOARD_CADENCE_MINUTES) {
+        cadenceMinutes = raw;
+      }
+      if (config && config.enabled === 1 && config.endpoint_url && config.api_key_encrypted) {
+        await this._performLeaderboardPush(config);
+      }
+    } catch (err) {
+      logger.error('GD leaderboard tick error', { error: err.message });
+    } finally {
+      // Always schedule the next leaderboard tick, even after errors.
+      this._scheduleNextLeaderboard(cadenceMinutes * 60 * 1000);
+    }
+  }
+
+  async _performLeaderboardPush(config) {
+    // Active-key check — same gate as the metrics and compliance ticks.
+    // No active signing key means the handshake hasn't completed; skip
+    // cleanly with an info log and let the next tick retry.
+    const dbCheck = getDb();
+    let activeFingerprint;
+    try {
+      activeFingerprint = signingKeysSvc.getActiveFingerprint(dbCheck);
+    } finally {
+      dbCheck.close();
+    }
+    if (!activeFingerprint) {
+      logger.info('GD leaderboard push: no active signing key; skipping tick',
+        { handshake_status: config.handshake_status });
+      return;
+    }
+
+    // Decrypt the api_key once for this tick. Never logged, never put
+    // in audit detail.
+    let apiKey;
+    try {
+      apiKey = this._decryptKey(config.api_key_encrypted);
+    } catch (err) {
+      logger.error('GD leaderboard push: api_key decrypt failed', { error: err.message });
+      return;
+    }
+
+    // Build the payload. helperPay.getLeaderboard filters to opt-in,
+    // active, role='analyst', balance > 0 at the SQL layer (privacy
+    // invariant I1 + I3). Per privacy invariant I4, we forward only
+    // analyst_pseudonym across the wire — never real names.
+    let entries;
+    try {
+      const rows = helperPay.getLeaderboard(LEADERBOARD_PUSH_LIMIT);
+      entries = rows
+        .filter(r => r.pseudonym)  // Skip rows without a pseudonym (team
+                                   // not configured for pseudonyms); the
+                                   // GD-side surface requires a stable
+                                   // identifier, and forwarding a real
+                                   // name would violate I4. Operators
+                                   // who want GD-side leaderboard
+                                   // visibility must enable team
+                                   // pseudonyms first.
+        .map(r => ({
+          analyst_pseudonym: r.pseudonym,
+          points: r.points,
+          sessions_count: r.sessions_count,
+          avg_rating: r.avg_rating,
+        }));
+    } catch (err) {
+      logger.error('GD leaderboard push: build failed', { error: err.message });
+      return;
+    }
+
+    // Even when entries is empty (no opted-in analysts on this MC), we
+    // still send the push — the GD needs to know "this MC has no
+    // leaderboard right now" so it can clear stale entries from a
+    // previous push. The ingest handler in C10 atomically replaces
+    // this MC's rows in regional_leaderboard with the new entries.
+
+    const bodyObj = {
+      apiKey,
+      leaderboard: {
+        pushed_at: new Date().toISOString(),
+        entries,
+      },
+    };
+    const retryMax = Number.isInteger(config.retry_max) ? config.retry_max : 3;
+    const backoffSeconds = Number.isInteger(config.retry_backoff_seconds)
+      ? config.retry_backoff_seconds : 30;
+
+    let attempt = 0;
+    let lastError = null;
+    while (attempt <= retryMax) {
+      attempt++;
+      try {
+        // Sign on every attempt — same rationale as the metrics and
+        // compliance ticks: GD's 5-minute timestamp skew window means
+        // we need a fresh timestamp if backoff pushes us past it.
+        const dbSign = getDb();
+        let signed;
+        try {
+          signed = signPushPayload(dbSign, bodyObj);
+        } finally {
+          dbSign.close();
+        }
+        await this._postToGd(config.endpoint_url, '/api/ingest/leaderboard', signed);
+        auditLog(null, 'GD_LEADERBOARD_PUSH_SUCCESS',
+          `attempt=${attempt} entries=${entries.length} fingerprint=${signed.fingerprint}`);
+        return true;
+      } catch (err) {
+        lastError = err;
+        if (attempt <= retryMax) {
+          const backoffMs = backoffSeconds * 1000 * attempt;
+          await new Promise((r) => setTimeout(r, backoffMs));
+        }
+      }
+    }
+
+    auditLog(null, 'GD_LEADERBOARD_PUSH_FAILURE',
+      `attempts=${attempt} reason=${(lastError?.message || 'unknown').slice(0, 200)}`);
+    logger.warn('GD leaderboard push: failed after retries',
+      { attempts: attempt, error: lastError?.message });
     return false;
   }
 }

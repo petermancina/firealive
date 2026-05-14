@@ -47,6 +47,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 
 const helperPay = require('../services/helper-pay');
@@ -85,6 +86,12 @@ function statusForError(code) {
       return 409;
     case 'LEDGER_ENTRY_NOT_FOUND':
       return 404;
+    case 'USER_NOT_FOUND':
+      return 404;
+    case 'RATING_NOT_FOUND':
+      return 404;
+    case 'RATING_NOT_FLAGGED':
+      return 409;
     default:
       return 500;
   }
@@ -558,6 +565,234 @@ router.get('/admin/export.csv', (req, res) => {
     res.status(500).json({ error: 'INTERNAL_ERROR' });
   } finally {
     db.close();
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// R3h — Helper Recognition Leaderboard endpoints
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Four new endpoints supporting the v1.0.34 Helper Recognition Leaderboard:
+//
+//   GET  /leaderboard?limit=N     — top opted-in helpers (any authed role)
+//   GET  /me/visibility           — current user's opt-in state for AC toggle
+//   PUT  /visibility              — toggle current user's opt-in (rate-limited)
+//   GET  /team-scores             — full-roster lead operational view
+//
+// Privacy invariants enforced at this layer:
+//   I1: GET /leaderboard returns only opted-in analysts (filter in service)
+//   I2: PUT /visibility writes ONLY req.user.id's row (route hard-codes
+//       the userId from the authenticated session; no body-supplied
+//       target user accepted)
+//   I5: GET /team-scores bypasses opt-in but is gated to lead/admin
+//
+// Rate limiting: PUT /visibility is per-user 50/hr to prevent rapid-toggle
+// abuse (the cache bust is cheap but logged actions add audit-log churn).
+// keyGenerator uses req.user.id rather than the default IP, so a shared-
+// office IP doesn't bucket multiple users together.
+
+const visibilityToggleLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,  // 1 hour
+  max: 50,
+  message: { error: 'RATE_LIMIT_EXCEEDED',
+    message: 'Too many visibility toggle requests. Please try again later.' },
+  keyGenerator: (req) => (req.user && req.user.id) || req.ip,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.get('/leaderboard', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 10;
+    const entries = helperPay.getLeaderboard(limit);
+    res.json({ entries, limit });
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay leaderboard read failed', {
+      userId: req.user && req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+router.get('/me/visibility', (req, res) => {
+  try {
+    const result = helperPay.getVisibility(req.user.id);
+    res.json(result);
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay visibility read failed', {
+      userId: req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+router.put('/visibility', visibilityToggleLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    if (typeof body.optIn !== 'boolean') {
+      return res.status(400).json({ error: 'BAD_REQUEST',
+        message: 'body must include optIn as a boolean' });
+    }
+    // Privacy invariant I2: hard-code the userId from the authenticated
+    // session. Any body field claiming to target another user is ignored.
+    const result = helperPay.setVisibility(req.user.id, body.optIn);
+
+    // Explicit audit_log row for this privacy-sensitive event, in
+    // addition to the auditMiddleware's automatic API-action row.
+    // event_type LEADERBOARD_OPT_IN_FLIPPED is queryable for forensic
+    // and compliance review.
+    try {
+      const db = getDb();
+      try {
+        db.prepare(
+          `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
+             VALUES (?, ?, ?, ?)`
+        ).run(
+          req.user.id,
+          'LEADERBOARD_OPT_IN_FLIPPED',
+          JSON.stringify({ optIn: result.optIn }),
+          req.ip || null
+        );
+      } finally {
+        db.close();
+      }
+    } catch (auditErr) {
+      // Audit log failure must not fail the request; the canonical
+      // state change (users.leaderboard_opt_in) is already committed.
+      logger.warn('helper-pay visibility audit-log write failed',
+        { userId: req.user.id, error: auditErr.message });
+    }
+
+    res.json(result);
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay visibility write failed', {
+      userId: req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+router.get('/team-scores', (req, res) => {
+  if (!isLeadOrAdmin(req)) {
+    return res.status(403).json({ error: 'FORBIDDEN',
+      message: 'team-scores requires lead or admin role' });
+  }
+  try {
+    const entries = helperPay.getTeamScores();
+    res.json({ entries });
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay team-scores read failed', {
+      userId: req.user && req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// R3h-pt2 — Sock-puppet review queue endpoints
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Two new endpoints supporting the lead's sock-puppet review workflow:
+//
+//   GET  /flagged-ratings           — list currently-flagged ratings
+//   POST /flagged-ratings/:id/decide — confirm fraud OR dismiss flag
+//
+// Both endpoints are lead/admin-only (the recognition leaderboard is a
+// management surface; an analyst reviewing flags against their peers
+// would defeat the whole point of the protection). The auditMiddleware
+// writes a generic API-action row on each call; these handlers ALSO
+// write explicit audit_log rows with event_type
+// LEADERBOARD_SOCKPUPPET_CONFIRMED or LEADERBOARD_SOCKPUPPET_DISMISSED
+// so the audit trail is queryable by event type for forensic and
+// compliance review.
+
+router.get('/flagged-ratings', (req, res) => {
+  if (!isLeadOrAdmin(req)) {
+    return res.status(403).json({ error: 'FORBIDDEN',
+      message: 'flagged-ratings review requires lead or admin role' });
+  }
+  try {
+    const entries = helperPay.getFlaggedRatings();
+    res.json({ entries });
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay flagged-ratings read failed', {
+      userId: req.user && req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+router.post('/flagged-ratings/:ratingId/decide', (req, res) => {
+  if (!isLeadOrAdmin(req)) {
+    return res.status(403).json({ error: 'FORBIDDEN',
+      message: 'flagged-ratings decisions require lead or admin role' });
+  }
+  try {
+    const body = req.body || {};
+    if (typeof body.confirmFraud !== 'boolean') {
+      return res.status(400).json({ error: 'BAD_REQUEST',
+        message: 'body must include confirmFraud as a boolean' });
+    }
+    const note = typeof body.note === 'string' ? body.note.slice(0, 500) : null;
+    const result = helperPay.decideFlaggedRating(
+      req.params.ratingId,
+      req.user.id,
+      body.confirmFraud,
+      note
+    );
+
+    // Explicit audit_log row with the right event_type for queryable
+    // forensic review. Includes the rating id, decider, decision,
+    // reversal ledger id (if any), and the lead-supplied note.
+    try {
+      const db = getDb();
+      try {
+        db.prepare(
+          `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
+             VALUES (?, ?, ?, ?)`
+        ).run(
+          req.user.id,
+          body.confirmFraud
+            ? 'LEADERBOARD_SOCKPUPPET_CONFIRMED'
+            : 'LEADERBOARD_SOCKPUPPET_DISMISSED',
+          JSON.stringify({
+            ratingId: req.params.ratingId,
+            reversalLedgerId: result.reversalLedgerId || null,
+            note: note || null,
+          }),
+          req.ip || null
+        );
+      } finally {
+        db.close();
+      }
+    } catch (auditErr) {
+      // Audit log failure must not fail the request; the canonical
+      // state change is already committed.
+      logger.warn('helper-pay flagged-rating decide audit-log write failed',
+        { userId: req.user.id, ratingId: req.params.ratingId,
+          error: auditErr.message });
+    }
+
+    res.json(result);
+  } catch (err) {
+    if (err.code) {
+      return sendServiceError(res, err);
+    }
+    logger.error('helper-pay flagged-rating decide failed', {
+      userId: req.user && req.user.id,
+      ratingId: req.params.ratingId,
+      error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
 });
 
