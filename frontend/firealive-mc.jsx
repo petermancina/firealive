@@ -1719,7 +1719,7 @@ function ManagementConsole() {
       {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cluster",label:"Cluster / Scaling"},{id:"cicd",label:"CI/CD"},
     ]},
     {cat:"data",label:"Data & Backup",items:[
-      {id:"backup",label:"Backup & Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},
+      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},
     ]},
     {cat:"reports",label:"Reports & Compliance",items:[
       {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},
