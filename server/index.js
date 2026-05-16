@@ -160,6 +160,7 @@ app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
+app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));
