@@ -267,7 +267,7 @@ router.get('/config', (req, res) => {
     db.close();
     if (row) {
       const freqOrInterval = row.frequency || row.interval || 'daily';
-      const retentionMatch = /(\d+)\s*day/i.exec(row.retention || '');
+      const retentionMatch = /^(\d+)\s*day/i.exec(row.retention || '');
       const retentionDays = retentionMatch
         ? parseInt(retentionMatch[1], 10)
         : 30;
