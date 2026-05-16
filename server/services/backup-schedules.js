@@ -274,7 +274,7 @@ function _parseRetentionDays(retentionDays, retentionString) {
     return retentionDays;
   }
   if (typeof retentionString === 'string') {
-    const match = /(\d+)\s*day/i.exec(retentionString);
+    const match = /^(\d+)\s*day/i.exec(retentionString);
     if (match) return parseInt(match[1], 10);
   }
   return null;
