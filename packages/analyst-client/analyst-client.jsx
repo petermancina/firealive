@@ -888,7 +888,7 @@ export default function AnalystClientApp() {
 
   // ── Tab navigation ──
   const [tab, setTab] = useState("home");
-  React.useEffect(() => { const iv = setInterval(() => api.post("/api/v1/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
+  React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
   // ── Inbox state (Phase 1.4a) ──────────────────────────────────────────
   const [inboxItems, setInboxItems] = useState([]);
