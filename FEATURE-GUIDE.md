@@ -51,16 +51,36 @@ The whole thing is built on three privacy commitments:
 3. Per-analyst capacity cards show utilization bars, ticket counts, complexity caps
 4. Lead spots someone over capacity, makes routing adjustments in the Routing tab
 
-### Routing & SOAR
-**What it's for:** Where the lead configures FireAlive's burnout-aware ticket routing. The lead connects to their existing SOAR platform (so FireAlive can write ticket assignments) and ticketing system (read-only — to see queue metadata). Once connected, FireAlive routes tickets to analysts with the highest capacity scores rather than dumping them on whoever's available.
+### Routing
+**What it's for:** Where the lead manages FireAlive's burnout-aware ticket routing — per-analyst complexity caps, the equity engine, the live feed, the panic button, and the silent-pause toggle. This tab is the operational surface; the integration credentials live one tab over in **SOAR & Ticketing**.
 
 **Workflow:**
-1. Lead enters SOAR platform credentials, ticketing platform credentials
-2. Tests the connection
-3. Sets per-analyst complexity caps (tier 1 might cap at complexity 2, tier 3 might handle complexity 5)
-4. Activates burnout-aware routing
-5. From now on, when a ticket comes in, FireAlive checks each analyst's burnout signals and capacity, then writes the ticket assignment back to SOAR
-6. Live feed shows routing decisions as they happen
+1. Lead opens Routing tab
+2. Adjusts per-analyst complexity caps using +/- buttons (tier 1 might cap at complexity 2, tier 3 might handle complexity 5)
+3. Clicks Apply to save the changes to the canonical routing API
+4. Watches the live feed for routing decisions as they happen
+5. If team-wide intake needs to pause briefly (scheduled maintenance, integration troubleshooting), the silent-pause toggle in this tab stops FireAlive from publishing routing variables to the SOAR until re-enabled — distinct from panic mode below, this is silent and doesn't notify analysts
+
+**Panic button (always visible in the MC header).** A red button at the top right of every MC screen lets the lead engage panic mode with one click + a confirmation dialog. Panic mode disables all wellness routing, sets every analyst's complexity cap to maximum (5), and broadcasts an in-app notification to every active analyst that wellness routing is OFF and they may receive tickets above their usual complexity cap. The lead can restore normal routing with another click on the same button; restoration also broadcasts a notification to every analyst. After deactivation, a green "Panic mode lifted — wellness routing restored" banner shows at the top of the MC and AC for 5 minutes, then vanishes.
+
+**Top-of-MC panic banner.** When panic mode is active, a red full-width banner sits above the page header on every tab: "PANIC MODE ACTIVE — All wellness routing disabled. Every analyst is at maximum complexity." After deactivation the banner turns green for 5 minutes, then disappears. The MC polls the canonical panic-state endpoint every 30 seconds so the banner is always in sync with the current state regardless of which tab is open.
+
+**The routing_enabled silent-pause toggle** is distinct from panic mode in two ways. First, it's silent — analysts are not notified. Second, it only pauses outbound variable publishing to the SOAR; the analyst's local complexity caps remain in effect. Use it when the SOAR doesn't need fresh variables (scheduled maintenance, non-business-hours integration debugging) without panicking the team.
+
+### SOAR & Ticketing
+**What it's for:** Where the lead configures FireAlive's integration with the existing SOAR platform (so FireAlive can publish capacity intelligence the SOAR uses to make routing decisions) and ticketing system (read-only — for queue metadata). This is the **configuration** surface; the operational surface for adjusting caps and watching routing happen lives in the **Routing** tab.
+
+**Workflow:**
+1. Lead enters SOAR platform name, API endpoint, service account, API key
+2. Optionally enables auto-escalation (when a ticket exceeds the assigned analyst's complexity cap, the SOAR auto-routes to a senior tier rather than dropping or queueing)
+3. Enters ticketing platform name, read-only API endpoint, API key
+4. Clicks Save SOAR Config (saves both SOAR and ticketing configurations in sequence)
+5. Clicks Test Connection to verify the SOAR is reachable; the response includes a round-trip confirmation if auto-escalation is enabled
+6. Watches the **Live SOAR Routing State** card — shows the 6 routing variables FireAlive is currently publishing to the SOAR, refreshed every 30 seconds while this tab is open
+
+**SOAR Polling Contract.** Once the SOAR is configured, it polls `GET /api/routing/variables` on its own cadence (typical 30–60 seconds) with an api-key authenticated against the `routing:read` scope. FireAlive returns the current state: per-analyst capacity context (keyed by pseudonym, never by user ID), panic mode state, the silent-pause toggle state, and the six SOAR variables (`analyst_capacity`, `complexity_cap`, `equity_weights`, `skill_matrix`, `burnout_risk_tier`, `shift_handoff`). The SOAR uses these values in its own playbook logic to make routing decisions; FireAlive never distributes tickets directly. When the SOAR completes a routing decision, it posts the decision back via `POST /api/routing/soar-events` (api-key + `routing:events` scope), and FireAlive persists the event for the capacity-feedback loop. See `docs/integrations-privacy.md` for the full contract including the pseudonym-only privacy invariant.
+
+**Ticketing read-only invariant.** The ticketing integration is enforced read-only server-side: whatever the lead supplies for the `readOnly` flag (or omits) is overwritten with `true` before the configuration is encrypted to disk. The MC's SOAR & Ticketing tab doesn't expose a `readOnly` toggle at all. This is a defense-in-depth measure: even an attacker who bypasses the UI cannot reconfigure ticketing for write access. The integration in v1.0.36 ships with the contract established and a mock-shape queue-metadata endpoint (`GET /api/integrations/ticketing/queue`); real per-platform adapters (ServiceNow, Jira, TheHive, PagerDuty, Freshservice) land in a future phase.
 
 ### Shift Handoff
 **What it's for:** Structured shift-to-shift handoffs to prevent the information loss that causes errors during transitions. Research shows handoff errors peak in the last two hours of shifts when analysts are most fatigued. This formalizes the handoff so context doesn't get dropped.
@@ -912,6 +932,8 @@ This is the cloud-specific companion to the Vulnerability Scan feature (which au
 **What it's for:** Analyst's daily landing. Shows their current burnout stage in big print, with optional context. Quick-action tiles for the four most common things they'd want to do (peer skill-share, delegate, training, self-scan) plus prominent buttons for "Request Reduced Tickets" and "Message Team Lead." Recent impact section showing positive reinforcement.
 
 The "Request Reduced Tickets" button is two-state: when reduced routing is OFF, the button activates it; when reduced routing is ON, the button turns it off. The analyst always has control over their own load reduction request.
+
+**Top-of-AC panic banner.** When the team lead engages panic mode (from the MC), a red full-width banner appears at the top of every AC screen: "PANIC MODE ACTIVE — All wellness routing is OFF. You may receive tickets above your usual complexity cap until your lead restores normal routing." This explains what the analyst is about to experience — tickets above their cap are not a mistake, they're a deliberate decision the lead made in response to a major incident. When the lead restores normal routing, the banner turns green for 5 minutes ("Panic mode lifted — wellness routing restored") then vanishes. The AC polls the canonical state endpoint every 30 seconds so the banner is always in sync regardless of which AC tab the analyst is on.
 
 **Workflow:**
 1. Analyst logs in at start of shift

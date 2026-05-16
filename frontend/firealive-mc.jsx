@@ -129,6 +129,11 @@ const RESEARCH_KB = [
 const KB_VERSION = "2026.03.3";
 const KB_ENTRY_COUNT = RESEARCH_KB.length;
 
+// R3j C9: linger window for the post-deactivation "Panic mode lifted" green
+// banner. Mirrors the server-side PANIC_DEACTIVATED_LINGER_SECONDS in
+// server/routes/routing.js. 300 seconds = 5 minutes.
+const PANIC_BANNER_LINGER_SECONDS = 300;
+
 // ── Skills Assessment Taxonomy ───────────────────────────────────────────────
 const SKILLS_TAXONOMY = [
   {id:"triage",name:"Alert Triage",cat:"Core",tier:[1,2,3],desc:"Classify, prioritize, and route security alerts based on severity and context."},
@@ -1040,6 +1045,105 @@ function ManagementConsole() {
     }).finally(()=>setAiLoading(false));
   }, [tab]);
 
+  // R3j C7: Hydrate SOAR + Ticketing forms from canonical /api/integrations
+  // when tab==="soar" is opened. Parallel fetch; tolerant of either
+  // integration being unconfigured (returns {status:"not_configured",config:null}).
+  // Sensitive fields are server-redacted on GET (apiKey: "1234••••••••"); the
+  // user can edit to replace.
+  useEffect(()=>{
+    if (tab !== "soar" || soarHydrated) return;
+    Promise.all([
+      api.get("/api/integrations/soar"),
+      api.get("/api/integrations/ticketing"),
+    ]).then(([soarRes, ticketingRes])=>{
+      if (soarRes && !soarRes.error && soarRes.config) {
+        setSoarPlatform(soarRes.config.platform || "");
+        setSoarUrl(soarRes.config.apiEndpoint || "");
+        setSoarServiceAccount(soarRes.config.serviceAccount || "");
+        setSoarApiKey(soarRes.config.apiKey || "");
+        setSoarAutoEscalate(soarRes.config.autoEscalate === true);
+      }
+      if (ticketingRes && !ticketingRes.error && ticketingRes.config) {
+        setSoarTicketingPlatform(ticketingRes.config.platform || "");
+        setSoarTicketingEndpoint(ticketingRes.config.apiEndpoint || "");
+        setSoarTicketingApiKey(ticketingRes.config.apiKey || "");
+      }
+      setSoarHydrated(true);
+    }).catch(()=>setSoarHydrated(true));
+  }, [tab, soarHydrated]);
+
+  // R3j C8: Hydrate routing caps from canonical /api/routing when
+  // tab==="routing" is opened. Response shape: {caps: [{analyst_id,
+  // max_complexity, is_override, override_reason, ...}]}. Each cap is
+  // merged into the routingCaps state keyed by analyst_id. In mock-mode
+  // (no real analysts in DB) the response.caps array is empty and the
+  // initial state derived from ANALYSTS_INIT remains the source of truth.
+  // In real-deployment mode the server-stored max_complexity values
+  // override the defaults.
+  useEffect(()=>{
+    if (tab !== "routing" || routingHydrated) return;
+    api.get("/api/routing").then(res=>{
+      if (res && !res.error && Array.isArray(res.caps)) {
+        setRC(prev=>{
+          const next = {...prev};
+          for (const c of res.caps) {
+            if (c?.analyst_id != null && c?.max_complexity != null) {
+              next[c.analyst_id] = c.max_complexity;
+            }
+          }
+          return next;
+        });
+      }
+      setRoutingHydrated(true);
+    }).catch(()=>setRoutingHydrated(true));
+  }, [tab, routingHydrated]);
+
+  // R3j C9: Poll /api/routing/panic every 30s to keep panicMode and the
+  // post-deactivation linger banner in sync with the canonical state.
+  // Runs always (not gated on tab) so the top-of-MC banner stays live as
+  // the lead moves between tabs. Tolerates fetch errors silently — a
+  // missed poll just delays the banner update to the next tick.
+  useEffect(()=>{
+    let cancelled = false;
+    const fetchPanic = () => {
+      api.get("/api/routing/panic").then(r=>{
+        if (cancelled) return;
+        if (r && !r.error) {
+          setPanicMode(r.active === true);
+          setPanicDeactivatedAt(r.deactivated_at ?? null);
+        }
+      }).catch(()=>{});
+    };
+    fetchPanic();
+    const handle = setInterval(fetchPanic, 30000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, []);
+
+  // R3j C10: Poll /api/routing/soar every 30s while tab==="soar" is open
+  // to refresh the Live SOAR Routing State card. The 6 variables shown
+  // are the values FireAlive is currently publishing TO the SOAR (read
+  // from team_config soar_* keys, JSON-parsed). When the tab is not open
+  // the interval is cleared via the cleanup function — no background
+  // network traffic if the lead isn't viewing this surface. First fetch
+  // fires immediately on tab open so the card doesn't show stale state
+  // from the previous open.
+  useEffect(()=>{
+    if (tab !== "soar") return;
+    let cancelled = false;
+    const fetchLive = () => {
+      api.get("/api/routing/soar").then(r=>{
+        if (cancelled) return;
+        if (r && !r.error) {
+          setSoarLiveVariables(r.variables || {});
+          setSoarLiveLastFetched(new Date().toISOString());
+        }
+      }).catch(()=>{});
+    };
+    fetchLive();
+    const handle = setInterval(fetchLive, 30000);
+    return ()=>{ cancelled = true; clearInterval(handle); };
+  }, [tab]);
+
   // Poll download progress when a download is active
   useEffect(()=>{
     if (!aiDownloadPolling) return;
@@ -1411,6 +1515,13 @@ function ManagementConsole() {
   const [updateCheck, setUpdateCheck] = useState(null); // null | "checking" | {available,version} | "current"
   const [routingCaps, setRC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,a.tier===3?5:a.tier===2?3:2])));
   const [unsaved, setUnsaved] = useState(false);
+  // R3j C8: routing-tab canonical wiring state. routingHydrated gates the
+  // one-shot useEffect that fetches /api/routing on tab open. routingSaveError
+  // surfaces a server error inline under the Apply button. routingSaveBusy
+  // disables Apply during in-flight PUT batch.
+  const [routingHydrated, setRoutingHydrated] = useState(false);
+  const [routingSaveError, setRoutingSaveError] = useState(null);
+  const [routingSaveBusy, setRoutingSaveBusy] = useState(false);
   const [liveFeed, setLF] = useState([]);
   const [sessCt, setSC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,{t:0,h:0}])));
   const [auditPage, setAuditPage] = useState(0);
@@ -1460,9 +1571,45 @@ function ManagementConsole() {
   const [soarPlatform, setSoarPlatform] = useState("splunk_soar");
   const [soarUrl, setSoarUrl] = useState("");
   const [soarApiKey, setSoarApiKey] = useState("");
+  // R3j C7: SOAR + Ticketing form state. Hydrated from canonical
+  // /api/integrations/soar and /api/integrations/ticketing on tab open.
+  // Sensitive fields (apiKey) return redacted from the server (prefix + ••••••••);
+  // the form shows the redacted form as the current value and the user
+  // can edit to replace.
+  const [soarServiceAccount, setSoarServiceAccount] = useState("");
+  const [soarAutoEscalate, setSoarAutoEscalate] = useState(false);
+  const [soarTicketingPlatform, setSoarTicketingPlatform] = useState("");
+  const [soarTicketingEndpoint, setSoarTicketingEndpoint] = useState("");
+  const [soarTicketingApiKey, setSoarTicketingApiKey] = useState("");
+  const [soarHydrated, setSoarHydrated] = useState(false);
+  const [soarSaveError, setSoarSaveError] = useState(null);
+  const [soarSaveBusy, setSoarSaveBusy] = useState(false);
+  const [soarTestResult, setSoarTestResult] = useState(null);
+  const [soarTestBusy, setSoarTestBusy] = useState(false);
+  // R3j C10: Live SOAR Routing State surface. soarLiveVariables holds the 6
+  // currently-published SOAR variables fetched from GET /api/routing/soar
+  // (the variables FireAlive is publishing TO the SOAR right now). The
+  // companion polling useEffect refreshes this every 30s while tab==="soar"
+  // is open; soarLiveLastFetched holds the ISO timestamp of the most recent
+  // successful fetch for the "Last updated ... ago" display under the card.
+  const [soarLiveVariables, setSoarLiveVariables] = useState(null);
+  const [soarLiveLastFetched, setSoarLiveLastFetched] = useState(null);
 
   // ── New v1.0.0 state ──────────────────────────────────────────────────
   const [panicMode, setPanicMode] = useState(false);
+  // R3j C9: canonical panic state hydration + post-deactivation linger window.
+  // panicMode is now hydrated by polling /api/routing/panic every 30s rather
+  // than being a local-only toggle. panicDeactivatedAt holds the ISO timestamp
+  // of the most recent deactivation; when present and within
+  // PANIC_BANNER_LINGER_SECONDS of now, the top-of-MC banner renders the green
+  // "routing restored" indicator. After the linger window the banner vanishes.
+  // The server's GET /api/routing/panic enforces the same 300s window
+  // server-side via opportunistic cleanup; the client recomputes against
+  // Date.now() on every render so the green banner disappears at the right
+  // moment even between 30s polls.
+  const [panicDeactivatedAt, setPanicDeactivatedAt] = useState(null);
+  const [panicBusy, setPanicBusy] = useState(false);
+  const [panicError, setPanicError] = useState(null);
   // ── v1.0.0 state that was in wrong component (fixed in v1.0.0) ──
   const [humanImpactReport, setHIR] = useState(null);
   const [hirLoading, setHirLoading] = useState(false);
@@ -1895,7 +2042,7 @@ function ManagementConsole() {
   const toggleNav = (cat) => setNavExpanded(prev=>{const next={};next[cat]=!prev[cat];return next;});
   const navGroups = [
     {cat:"ops",label:"Operations",items:[
-      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing & SOAR"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
+      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing"},{id:"soar",label:"SOAR & Ticketing"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
@@ -2204,6 +2351,23 @@ function ManagementConsole() {
   return(
     <div style={{minHeight:"100vh",background:C.bg,color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {/* R3j C9: Top-of-MC panic banner. Red while panic_mode is active; green for
+          PANIC_BANNER_LINGER_SECONDS after deactivation; absent otherwise. Recomputes
+          age against Date.now() on every render so the green banner vanishes at the
+          right moment even between 30s server polls. */}
+      {(()=>{
+        if (panicMode) {
+          return (<div style={{padding:"12px 24px",background:C.d,color:"#fff",fontWeight:600,textAlign:"center",fontSize:13,letterSpacing:0.5,animation:"pulse 1.5s infinite",borderBottom:`1px solid ${C.d}`}}>⚠ PANIC MODE ACTIVE — All wellness routing disabled. Every analyst is at maximum complexity.</div>);
+        }
+        if (panicDeactivatedAt) {
+          const ageSec = (Date.now() - new Date(panicDeactivatedAt).getTime()) / 1000;
+          if (ageSec >= 0 && ageSec <= PANIC_BANNER_LINGER_SECONDS) {
+            return (<div style={{padding:"10px 24px",background:C.a,color:"#0d1117",fontWeight:600,textAlign:"center",fontSize:12,borderBottom:`1px solid ${C.a}`}}>✓ Panic mode lifted — wellness routing restored.</div>);
+          }
+        }
+        return null;
+      })()}
+      {panicError&&(<div style={{padding:"8px 24px",background:C.d+"22",color:C.d,fontSize:11,textAlign:"center",borderBottom:`1px solid ${C.d}40`}}>Panic toggle error: {panicError} <button onClick={()=>setPanicError(null)} style={{marginLeft:8,background:"transparent",border:"none",color:C.d,cursor:"pointer",textDecoration:"underline"}}>dismiss</button></div>)}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
@@ -2213,7 +2377,26 @@ function ManagementConsole() {
           </div>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
             {/* ROUTING PANIC BUTTON — always visible */}
-            <button onClick={()=>{if(window.confirm(panicMode?'Restore wellness routing?':'DISABLE all wellness routing? All analysts will receive maximum complexity tickets.')){setPanicMode(!panicMode);addA(panicMode?"PANIC_DEACTIVATED":"PANIC_ACTIVATED",panicMode?"Routing+training+filter RESTORED":"ALL HANDS — wellness routing disabled");}}} style={{padding:"8px 14px",background:panicMode?"rgba(239,68,68,0.2)":"rgba(239,68,68,0.06)",border:`1px solid ${panicMode?C.d:C.d+"40"}`,borderRadius:20,color:C.d,fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace",animation:panicMode?"pulse 1.5s infinite":"none"}}>{panicMode?"⚠ ROUTING OFF — RESTORE":"Disable Burnout Prevention Routing"}</button>
+            <button disabled={panicBusy} onClick={async()=>{
+              if (panicBusy) return;
+              if (!window.confirm(panicMode?'Restore wellness routing?':'DISABLE all wellness routing? All analysts will receive maximum complexity tickets.')) return;
+              setPanicError(null);
+              setPanicBusy(true);
+              try {
+                const wasActive = panicMode;
+                const r = await api.post("/api/routing/panic", {activate: !wasActive});
+                if (r?.error) { setPanicError("Panic toggle failed: "+r.error); return; }
+                // Optimistic local update; next 30s poll confirms.
+                if (wasActive) {
+                  setPanicMode(false);
+                  setPanicDeactivatedAt(new Date().toISOString());
+                } else {
+                  setPanicMode(true);
+                  setPanicDeactivatedAt(null);
+                }
+                addA(wasActive?"PANIC_DEACTIVATED":"PANIC_ACTIVATED", r?.message || (wasActive?"Wellness routing restored":"ALL HANDS — wellness routing disabled"));
+              } finally { setPanicBusy(false); }
+            }} style={{padding:"8px 14px",background:panicMode?"rgba(239,68,68,0.2)":"rgba(239,68,68,0.06)",border:`1px solid ${panicMode?C.d:C.d+"40"}`,borderRadius:20,color:C.d,fontSize:10,fontWeight:600,cursor:panicBusy?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",animation:panicMode?"pulse 1.5s infinite":"none",opacity:panicBusy?0.6:1}}>{panicBusy?"…":(panicMode?"⚠ ROUTING OFF — RESTORE":"Disable Burnout Prevention Routing")}</button>
             <div onClick={()=>setTab("overview")} style={{padding:"8px 16px",background:`${sc.c}15`,border:`1px solid ${sc.c}40`,borderRadius:20,display:"flex",alignItems:"center",gap:8,cursor:"pointer",transition:"opacity 0.15s ease"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.8"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>
               <div style={{width:8,height:8,borderRadius:"50%",background:sc.c,boxShadow:`0 0 6px ${sc.c}`,animation:th.status==="critical"?"pulse 1.5s infinite":"none"}}/>
               <M style={{color:sc.c,fontWeight:500,fontSize:12}}>Team: {sc.l} ({th.score})</M>
@@ -2382,6 +2565,32 @@ function ManagementConsole() {
               <M style={{color:C.tm,lineHeight:1.8}}>{tierLbl(c.tier)} · {c.shift}<br/>Host: {c.hostname}<br/>Activation: {c.id}</M>
             </Card>)}
           </div></>}
+
+          {/* R3j C10: Recent Routing Decisions surface. Sourced from liveFeed
+              (the existing audit-log-backed feed populated via addA) for R3j v1
+              — a dedicated GET /api/routing/recent-events endpoint backed by the
+              soar_routing_events table is deferred to a future phase. Shows the
+              last 5 routing-related feed entries with the assigned analyst's
+              indicator. If no routing activity yet, shows a placeholder. */}
+          <L>Recent Routing Decisions</L>
+          <Card style={{marginBottom:24,padding:12}}>
+            {(()=>{
+              const routingEntries = (liveFeed || []).slice(0, 5);
+              if (routingEntries.length === 0) {
+                return (<M style={{color:C.td,display:"block",padding:"12px 0",textAlign:"center",fontStyle:"italic"}}>No routing decisions yet. Decisions appear here as the SOAR routes alerts (manual or auto-assigned).</M>);
+              }
+              return routingEntries.map(e => (
+                <div key={e.id} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`,display:"flex",gap:10,alignItems:"center",fontSize:11}}>
+                  <M style={{color:C.td,fontSize:9,minWidth:60}}>{e.ts}</M>
+                  <M style={{color:e.cx>=4?C.d:e.cx>=3?C.w:C.tm,minWidth:22,fontFamily:"'IBM Plex Mono',monospace"}}>P{e.cx}</M>
+                  <span style={{flex:1,color:C.t}}>{e.alert}</span>
+                  {e.auto ? (<Badge color={C.i}>→ {e.autoN}</Badge>) : (<M style={{color:e.eq?C.a:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>→ {e.to}{e.eq?" ⚖":""}</M>)}
+                </div>
+              ));
+            })()}
+            {liveFeed && liveFeed.length > 0 && (<M style={{color:C.td,display:"block",marginTop:8,fontSize:10,textAlign:"right"}}>Showing {Math.min(5, liveFeed.length)} of {liveFeed.length} recent. Full feed in Routing tab.</M>)}
+          </Card>
+
           <L>All Shifts</L>
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
             {["day","swing","night"].map(s=>{const sa=analysts.filter(a=>a.shift===s);return(
@@ -2695,12 +2904,17 @@ function ManagementConsole() {
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Connect to your SOAR platform to give FireAlive write access to analyst routing and assignment playbooks. The platform feeds capacity intelligence — utilization, burnout signals, skill levels, equity metrics — into your SOAR's routing decisions in real time. This is the core operational integration: your SOAR handles alert enrichment and triage; FireAlive tells it which analysts have capacity and what complexity they can handle.</M>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>SOAR Platform</div>
-            <Sel label="Platform"><option value="">Select...</option><option value="splunk">Splunk SOAR</option><option value="qradar">IBM QRadar SOAR</option><option value="fortisoar">FortiSOAR</option><option value="torq">Torq Hyperautomation</option><option value="cortex">Cortex XSOAR (Palo Alto)</option><option value="sentinel">Microsoft Sentinel Playbooks</option><option value="chronicle">Google SecOps / Chronicle SOAR</option><option value="swimlane">Swimlane</option><option value="tines">Tines</option><option value="custom">Custom REST API</option></Sel>
-            <Input label="SOAR API endpoint" placeholder="https://soar.corp.local/api/v2" maxLength={512}/>
+            <Sel label="Platform" value={soarPlatform} onChange={e=>setSoarPlatform(e.target.value)}><option value="">Select...</option><option value="splunk">Splunk SOAR</option><option value="qradar">IBM QRadar SOAR</option><option value="fortisoar">FortiSOAR</option><option value="torq">Torq Hyperautomation</option><option value="cortex">Cortex XSOAR (Palo Alto)</option><option value="sentinel">Microsoft Sentinel Playbooks</option><option value="chronicle">Google SecOps / Chronicle SOAR</option><option value="swimlane">Swimlane</option><option value="tines">Tines</option><option value="custom">Custom REST API</option></Sel>
+            <Input label="SOAR API endpoint" value={soarUrl} onChange={e=>setSoarUrl(e.target.value)} placeholder="https://soar.corp.local/api/v2" maxLength={512}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Service account / API user" placeholder="svc-firealive-routing" maxLength={256}/>
-              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" placeholder="Stored in secrets manager (Vault/AWS SM/Azure KV)" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
+              <Input label="Service account / API user" value={soarServiceAccount} onChange={e=>setSoarServiceAccount(e.target.value)} placeholder="svc-firealive-routing" maxLength={256}/>
+              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" value={soarApiKey} onChange={e=>setSoarApiKey(e.target.value)} placeholder="Stored in secrets manager (Vault/AWS SM/Azure KV)" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
             </div>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:12,color:C.t,cursor:"pointer"}}>
+              <input type="checkbox" checked={soarAutoEscalate} onChange={e=>setSoarAutoEscalate(e.target.checked)} style={{accentColor:C.a}}/>
+              Auto-escalate alerts above analyst complexity cap to senior tier
+            </label>
+            <M style={{color:C.td,display:"block",marginTop:4,lineHeight:1.5}}>When enabled, the SOAR auto-escalates an alert that exceeds the assigned analyst's complexity cap (P-tier) to a higher-tier analyst rather than queueing or dropping. Optional; off by default.</M>
           </Card>
 
           <Card style={{marginBottom:16,borderColor:C.i+"30"}}>
@@ -2716,16 +2930,77 @@ function ManagementConsole() {
 
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Ticketing System (Read-Only)</div>
-            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>FireAlive also reads from your ticketing system (ServiceNow, Jira, TheHive, etc.) for metrics — MTTA/MTTR, ticket counts, resolution times. This is a read-only integration separate from the SOAR write channel.</M>
-            <Sel label="Ticketing platform"><option value="">Select...</option><option value="servicenow">ServiceNow</option><option value="jira">Jira Service Management</option><option value="thehive">TheHive</option><option value="pagerduty">PagerDuty</option><option value="custom">Custom REST API</option></Sel>
-            <Input label="Read-only API endpoint" placeholder="https://corp.service-now.com/api/now/table/incident" maxLength={512}/>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>FireAlive also reads from your ticketing system (ServiceNow, Jira, TheHive, etc.) for metrics — MTTA/MTTR, ticket counts, resolution times. This is a read-only integration separate from the SOAR write channel. The read-only invariant is enforced server-side; the ticketing integration cannot be configured for write access from this UI or any other.</M>
+            <Sel label="Ticketing platform" value={soarTicketingPlatform} onChange={e=>setSoarTicketingPlatform(e.target.value)}><option value="">Select...</option><option value="servicenow">ServiceNow</option><option value="jira">Jira Service Management</option><option value="thehive">TheHive</option><option value="pagerduty">PagerDuty</option><option value="freshservice">Freshservice</option><option value="custom">Custom REST API</option></Sel>
+            <Input label="Read-only API endpoint" value={soarTicketingEndpoint} onChange={e=>setSoarTicketingEndpoint(e.target.value)} placeholder="https://corp.service-now.com/api/now/table/incident" maxLength={512}/>
+            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" value={soarTicketingApiKey} onChange={e=>setSoarTicketingApiKey(e.target.value)} placeholder="Read-only credentials" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
           </Card>
 
           <Card style={{padding:12,borderColor:C.a+"30",marginBottom:16}}>
             <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>How the integration works</M>
             <M style={{color:C.tm,lineHeight:1.8}}>1. SOAR playbook triggers on new alert → 2. Playbook queries FireAlive API for analyst capacity, caps, equity weights → 3. SOAR routes alert to optimal analyst based on FireAlive intelligence + its own enrichment logic → 4. FireAlive reads ticket assignment from ticketing system to update utilization metrics → 5. Loop continues in real time. FireAlive never directly assigns tickets — it provides the intelligence layer that makes SOAR routing decisions capacity-aware.</M>
           </Card>
-          <div style={{display:"flex",gap:8}}><Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"SOAR_INTEGRATION_SAVED",detail:"SOAR integration configured with routing write access"}).then(()=>addA("SOAR_INTEGRATION_SAVED","SOAR integration configured with routing write access"))}>Save SOAR Config</Btn><Btn onClick={()=>api.post("/api/v1/audit/log",{event:"SOAR_TEST",detail:"Testing SOAR API connection and permissions..."}).then(()=>addA("SOAR_TEST","Testing SOAR API connection and permissions..."))}>Test Connection</Btn></div>
+
+          {/* R3j C10: Live SOAR Routing State card — read-only display of what
+              FireAlive is currently publishing to the SOAR. Polls /api/routing/soar
+              every 30s while this tab is open. */}
+          <Card style={{marginBottom:16,borderColor:C.i+"30"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:500,color:C.i}}>Live SOAR Routing State</div>
+              <M style={{color:C.td,fontSize:10,fontFamily:"'IBM Plex Mono',monospace"}}>{soarLiveLastFetched ? ("Last fetched "+(()=>{const sec=Math.max(0,Math.round((Date.now()-new Date(soarLiveLastFetched).getTime())/1000));return sec<60?(sec+"s ago"):(Math.floor(sec/60)+"m ago");})()) : "Waiting for first fetch..."}</M>
+            </div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Read-only view of the 6 routing variables FireAlive is currently publishing to the configured SOAR. These values update as analyst capacity, complexity caps, equity weights, skill matrix, and shift handoff state change. The SOAR consumes these via its polling cadence against GET /api/routing/variables (api-key + routing:read scope).</M>
+            {["analyst_capacity","complexity_cap","equity_weights","skill_matrix","burnout_risk_tier","shift_handoff"].map(key=>{
+              const value = soarLiveVariables ? soarLiveVariables[key] : undefined;
+              const present = value !== undefined && value !== null;
+              let display = "(not published yet)";
+              if (present) {
+                if (typeof value === "object") {
+                  try { display = JSON.stringify(value); } catch (_e) { display = "[unserializable object]"; }
+                } else {
+                  display = String(value);
+                }
+              }
+              return (
+                <div key={key} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12}}>
+                  <M style={{color:"#E8EDF5",fontWeight:500,fontFamily:"'IBM Plex Mono',monospace",fontSize:11,minWidth:140,flexShrink:0}}>{key}</M>
+                  <M style={{color:present?C.t:C.td,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-word",textAlign:"right",fontStyle:present?"normal":"italic"}}>{display}</M>
+                </div>
+              );
+            })}
+          </Card>
+
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <Btn primary disabled={soarSaveBusy} onClick={async()=>{
+              setSoarSaveError(null);
+              setSoarSaveBusy(true);
+              try {
+                const soarConfig = {platform:soarPlatform, apiEndpoint:soarUrl, serviceAccount:soarServiceAccount, apiKey:soarApiKey, autoEscalate:soarAutoEscalate};
+                const soarRes = await api.put("/api/integrations/soar", {config:soarConfig});
+                if (soarRes?.error) { setSoarSaveError("SOAR save failed: "+soarRes.error); return; }
+                const ticketingConfig = {platform:soarTicketingPlatform, apiEndpoint:soarTicketingEndpoint, apiKey:soarTicketingApiKey};
+                const tkRes = await api.put("/api/integrations/ticketing", {config:ticketingConfig});
+                if (tkRes?.error) { setSoarSaveError("Ticketing save failed: "+tkRes.error); return; }
+                addA("SOAR_CONFIG_SAVED","SOAR + Ticketing integrations saved");
+              } finally { setSoarSaveBusy(false); }
+            }}>{soarSaveBusy?"Saving...":"Save SOAR Config"}</Btn>
+            <Btn disabled={soarTestBusy} onClick={async()=>{
+              setSoarTestResult(null);
+              setSoarTestBusy(true);
+              try {
+                const r = await api.post("/api/integrations/soar/test", {});
+                setSoarTestResult(r?.error ? {success:false, message:r.error} : r);
+                addA("SOAR_TEST", r?.success ? ("Connection OK ("+r.latencyMs+"ms)") : "Connection failed");
+              } finally { setSoarTestBusy(false); }
+            }}>{soarTestBusy?"Testing...":"Test Connection"}</Btn>
+          </div>
+          {soarSaveError&&<Card style={{padding:10,marginTop:10,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Save error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{soarSaveError}</M></Card>}
+          {soarTestResult&&<Card style={{padding:10,marginTop:10,borderColor:(soarTestResult.success?C.a:C.d)+"60",background:(soarTestResult.success?C.a:C.d)+"14"}}>
+            <M style={{color:soarTestResult.success?C.a:C.d,fontWeight:500}}>{soarTestResult.success?"Test passed":"Test failed"}</M>
+            <M style={{color:C.t,display:"block",marginTop:4}}>{soarTestResult.message}</M>
+            {typeof soarTestResult.latencyMs==="number"&&<M style={{color:C.tm,display:"block",marginTop:2}}>Latency: {soarTestResult.latencyMs}ms</M>}
+            {soarTestResult.autoEscalatePolicyDetected&&<M style={{color:C.i,display:"block",marginTop:2}}>Auto-escalate policy round-trip confirmed.</M>}
+          </Card>}
         </div>)}
 
         {/* AUTOMATION */}
@@ -2750,7 +3025,32 @@ function ManagementConsole() {
 
         {/* ROUTING */}
         {tab==="routing"&&(<div>
-          <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}><div><L style={{marginBottom:4}}>Live Routing · Day Shift</L><M style={{color:C.tm}}>Auto-equity 35% cap active.</M></div>{unsaved&&<Btn primary onClick={()=>{setUnsaved(false);api.post("/api/v1/audit/log",{event:"ROUTING_APPLIED",detail:"Caps updated"}).then(()=>addA("ROUTING_APPLIED","Caps updated"));}}>Apply</Btn>}</div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}><div><L style={{marginBottom:4}}>Live Routing · Day Shift</L><M style={{color:C.tm}}>Auto-equity 35% cap active.</M></div>{unsaved&&<Btn primary disabled={routingSaveBusy} onClick={async()=>{
+            setRoutingSaveError(null);
+            setRoutingSaveBusy(true);
+            try {
+              const failures = [];
+              for (const a of dayAnalysts) {
+                const cap = routingCaps[a.id];
+                if (cap == null) continue;
+                const r = await api.put("/api/routing/"+a.id, {maxComplexity:cap});
+                // Tolerate "Analyst not found" 404 silently — happens in mock
+                // mode where dayAnalysts comes from ANALYSTS_INIT (short IDs)
+                // and the server's users table has different IDs. Real
+                // failures (500s, validation errors) get surfaced.
+                if (r?.error && !/not found/i.test(r.error)) {
+                  failures.push(a.name+": "+r.error);
+                }
+              }
+              if (failures.length > 0) {
+                setRoutingSaveError(failures.join("; "));
+                return;
+              }
+              setUnsaved(false);
+              addA("ROUTING_APPLIED","Caps updated ("+dayAnalysts.length+" analyst(s))");
+            } finally { setRoutingSaveBusy(false); }
+          }}>{routingSaveBusy?"Saving...":"Apply"}</Btn>}</div>
+          {routingSaveError&&<Card style={{padding:10,marginBottom:14,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Save error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{routingSaveError}</M></Card>}
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
             {dayAnalysts.map(a=>{const cap=routingCaps[a.id]||2;const ct=sessCt[a.id]||{t:0,h:0};const tot=Object.values(sessCt).reduce((s,c)=>s+c.t,0)||1;return(
               <Card key={a.id} style={{padding:12}}>
@@ -2769,12 +3069,6 @@ function ManagementConsole() {
             {liveFeed.slice(0,30).map(e=><div key={e.id} style={{padding:"8px 12px",borderBottom:`1px solid ${C.b}`,fontSize:11,display:"flex",gap:10,alignItems:"center"}}><M style={{color:C.td,fontSize:9,minWidth:60}}>{e.ts}</M><M style={{color:e.cx>=4?C.d:e.cx>=3?C.w:C.tm,minWidth:22}}>P{e.cx}</M><span style={{flex:1}}>{e.alert}</span>{e.auto?<Badge color={C.i}>→ {e.autoN}</Badge>:<M style={{color:e.eq?C.a:C.tm}}>→ {e.to}{e.eq?" ⚖":""}</M>}</div>)}
             {liveFeed.length===0&&<div style={{padding:20,textAlign:"center",color:C.td,fontSize:11}}>Waiting...</div>}
           </div>
-          <L style={{marginTop:24}}>SOAR Integration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:12}}>SOAR = WRITE access to ticket distribution.</M>
-          <Card style={{marginBottom:16}}><Sel label="SOAR"><option value="">Select...</option><option>Splunk SOAR</option><option>XSOAR</option><option>QRadar SOAR</option><option>Tines</option><option>Torq</option><option>Swimlane</option><option>Custom</option></Sel><Input label="Endpoint" placeholder="https://soar.corp.com/api"/><Input label="Key" type="password"/><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/integrations/save",{type:"soar",platform:document.querySelector("[label=SOAR] select")?.value,endpoint:document.querySelector("[label=Endpoint] input")?.value,apiKey:document.querySelector("[label=Key] input")?.value}).then(()=>api.post("/api/v1/audit/log",{event:"SO",detail:"SOAR saved"}).then(()=>addA("SO","SOAR saved")))}>Save</Btn></Card>
-          <L>Ticketing System</L>
-          <M style={{color:C.tm,display:"block",marginBottom:12}}>Ticketing = READ-ONLY queue metadata.</M>
-          <Card style={{marginBottom:16}}><Sel label="Platform"><option value="">Select...</option><option>ServiceNow</option><option>Jira</option><option>Zendesk</option><option>PagerDuty</option><option>Freshservice</option><option>Custom</option></Sel><Input label="Endpoint"/><Input label="Key" type="password"/><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/integrations/save",{type:"ticketing",platform:"",endpoint:"",apiKey:""}).then(()=>addA("TK","Ticketing saved"))}>Save</Btn></Card>
         </div>)}
 
         {/* REPORTS — NEW v0.0.8 */}

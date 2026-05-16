@@ -3982,6 +3982,304 @@ function initDb() {
     console.error('The server will start, but operators upgrading from a singleton-config install may need to manually re-create their schedule via the Backup Schedules UI.');
   }
 
+  // ── R3j schema additions (v1.0.36) — SOAR Routing Events ──────────────
+  //
+  // Phase R3j wires the SOAR (Security Orchestration, Automation, and
+  // Response) integration end-to-end. The architectural contract is:
+  //
+  //   - FireAlive PUBLISHES routing variables (per-analyst capacity,
+  //     complexity caps, equity weights, skill matrix, aggregate burnout
+  //     risk tier, shift handoff state) via:
+  //
+  //         GET /api/routing/variables (api-key auth, routing:read scope)
+  //
+  //     The SOAR polls this at its own cadence.
+  //
+  //   - The SOAR uses those variables in its own playbook logic to make
+  //     ticket-routing decisions. FireAlive does NOT distribute tickets.
+  //
+  //   - The SOAR reports its routing decisions BACK to FireAlive via:
+  //
+  //         POST /api/routing/soar-events (api-key auth, routing:events scope)
+  //
+  //     FireAlive persists each event into this table. The persisted row
+  //     is also INSERTed into ticket_assignments (status=open) or used to
+  //     UPDATE ticket_assignments (status=closed) depending on event_type,
+  //     which closes the capacity-feedback loop: signal-collector.js reads
+  //     from ticket_assignments on its next tick and the SOAR-reported
+  //     assignment volume influences capacity_score automatically. No
+  //     code changes in signal-collector are needed.
+  //
+  // C1 ships ONLY the soar_routing_events table + indexes. The
+  // routing_enabled global toggle backfill row lands in C2 (separate
+  // commit, same file).
+  //
+  // Schema notes:
+  //
+  //   id                              16-byte random hex slug. SQLite's
+  //                                   randomblob() + hex() pattern
+  //                                   matches the existing convention
+  //                                   for opaque IDs in this database.
+  //
+  //   soar_source                     Operator-defined identifier for
+  //                                   the SOAR instance (e.g.
+  //                                   'splunk_soar_prod',
+  //                                   'cortex_xsoar_lab'). Nullable for
+  //                                   SOARs that don't supply one;
+  //                                   strongly recommended for
+  //                                   multi-SOAR deployments.
+  //
+  //   external_event_id               The SOAR's own event identifier.
+  //                                   Used as the right half of the
+  //                                   UNIQUE idempotency index. Nullable
+  //                                   for SOARs that don't supply one;
+  //                                   strongly recommended.
+  //
+  //   event_type                      One of:
+  //                                     'ticket_assigned'
+  //                                     'ticket_reassigned'
+  //                                     'ticket_closed'
+  //                                   CHECK constraint pins the
+  //                                   vocabulary.
+  //
+  //   ticket_id                       SOAR-side or ticketing-platform-
+  //                                   side ticket identifier. Not a FK
+  //                                   into any local table — tickets
+  //                                   live in the external system.
+  //
+  //   analyst_pseudonym               Snapshot of the analyst's
+  //                                   pseudonym at event-receipt time.
+  //                                   Stored verbatim so subsequent
+  //                                   pseudonym rotation (controlled by
+  //                                   pseudonym_rotated_at) does not
+  //                                   retroactively rewrite history.
+  //                                   This is the ONLY analyst
+  //                                   identifier the SOAR ever sees per
+  //                                   the privacy invariant
+  //                                   "FireAlive does not leak analyst
+  //                                   identifiers to external systems."
+  //
+  //   analyst_id                      Resolved at event-receipt time via
+  //                                   pseudonym lookup. ON DELETE SET
+  //                                   NULL so analyst offboarding does
+  //                                   not cascade-delete historical
+  //                                   routing data (the pseudonym
+  //                                   snapshot above still preserves
+  //                                   the audit trail anonymously).
+  //
+  //   priority                        SOAR-side priority string ('P1',
+  //                                   'P2', etc.). Free-form because
+  //                                   different SOARs use different
+  //                                   priority vocabularies; not
+  //                                   constrained at the schema layer.
+  //
+  //   complexity                      1-5 integer typically, but
+  //                                   nullable for closed events that
+  //                                   don't carry complexity context.
+  //
+  //   reason                          Free-text rationale supplied by
+  //                                   the SOAR (e.g. "auto-routing via
+  //                                   FireAlive capacity variables",
+  //                                   "manual reassignment by SOC
+  //                                   lead"). Optional but useful for
+  //                                   audit clarity.
+  //
+  //   soar_metadata                   JSON blob, stored verbatim.
+  //                                   FireAlive does NOT interpret this
+  //                                   field; SOAR vendors use it to
+  //                                   carry vendor-specific context
+  //                                   (playbook IDs, enrichment results,
+  //                                   severity scoring path). Storing
+  //                                   verbatim future-proofs the
+  //                                   contract against vendor-specific
+  //                                   extensions without schema
+  //                                   migrations.
+  //
+  //   assigned_at                     SOAR's timestamp from the request
+  //                                   body. ISO 8601 string per
+  //                                   convention with the rest of this
+  //                                   schema.
+  //
+  //   received_at                     ISO 8601 timestamp of FireAlive
+  //                                   receipt. May differ from
+  //                                   assigned_at if the SOAR batches
+  //                                   webhooks or there's network
+  //                                   delay.
+  //
+  // Index strategy:
+  //
+  //   idx_soar_routing_events_external (UNIQUE, partial)
+  //     Composite UNIQUE on (soar_source, external_event_id). Partial
+  //     WHERE external_event_id IS NOT NULL so SOARs that don't supply
+  //     an external_event_id are not constrained (each NULL row is
+  //     unique by SQL NULL semantics anyway, but the partial index makes
+  //     this explicit and avoids index bloat for NULL rows). This is
+  //     the idempotency backbone: a SOAR retry of the same webhook
+  //     POSTs again with the same external_event_id; the route handler
+  //     detects the duplicate via lookup against this index and returns
+  //     200 {idempotent: true} without double-counting.
+  //
+  //   idx_soar_routing_events_analyst (composite)
+  //     (analyst_id, received_at). Supports per-analyst rollups (e.g.
+  //     "how many tickets did this analyst receive in the last 24h").
+  //     received_at ordering supports time-windowed queries without an
+  //     additional sort step.
+  //
+  //   idx_soar_routing_events_ticket (single-column)
+  //     (ticket_id). Supports the ticket_closed event flow: when the
+  //     SOAR reports a closure, the handler needs to find any prior
+  //     assignment events for the same ticket to compute close-time
+  //     metrics.
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+  // Re-running migrations against an existing database is a no-op.
+  //
+  // Runs in its own try/catch for fault isolation; a failure here does
+  // not mask any prior R3e / R3g / R3h / R3i migration block.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS soar_routing_events (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        soar_source TEXT,
+        external_event_id TEXT,
+        event_type TEXT NOT NULL
+          CHECK (event_type IN ('ticket_assigned', 'ticket_reassigned', 'ticket_closed')),
+        ticket_id TEXT NOT NULL,
+        analyst_pseudonym TEXT NOT NULL,
+        analyst_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        priority TEXT,
+        complexity INTEGER,
+        reason TEXT,
+        soar_metadata TEXT,
+        assigned_at TEXT NOT NULL,
+        received_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_soar_routing_events_external
+        ON soar_routing_events (soar_source, external_event_id)
+        WHERE external_event_id IS NOT NULL;
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_soar_routing_events_analyst
+        ON soar_routing_events (analyst_id, received_at);
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_soar_routing_events_ticket
+        ON soar_routing_events (ticket_id);
+    `);
+
+    const eventCount = db
+      .prepare('SELECT COUNT(*) AS n FROM soar_routing_events')
+      .get().n;
+    console.log(
+      `R3j migration: soar_routing_events table ready (${eventCount} event(s) present)`
+    );
+  } catch (r3jSoarEventsMigrationErr) {
+    console.error(
+      'R3j soar_routing_events migration FAILED:',
+      r3jSoarEventsMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the SOAR webhook receiver (POST /api/routing/soar-events) will fail until this migration completes successfully. The polling endpoint (GET /api/routing/variables) does not depend on this table and continues to function.'
+    );
+  }
+
+  // ── R3j C2 — routing_enabled global toggle backfill row ──────────────
+  //
+  // Seeds a single row in team_config keyed 'routing_enabled' with
+  // value 'true' (JSON-encoded boolean). This is the silent-pause
+  // toggle for FireAlive's outbound SOAR variable publishing, distinct
+  // from panic_mode.
+  //
+  // Semantics:
+  //
+  //   routing_enabled = true   FireAlive publishes routing variables
+  //                            to the SOAR on the normal cadence.
+  //                            Default state.
+  //
+  //   routing_enabled = false  Silent pause. FireAlive stops pushing
+  //                            SOAR variables on the next scheduled
+  //                            push. Analysts are NOT notified
+  //                            (contrast with panic_mode which
+  //                            broadcasts an emergency notification).
+  //                            Used for scheduled maintenance,
+  //                            integration troubleshooting, or
+  //                            non-business hours where the SOAR
+  //                            doesn't need fresh variables.
+  //
+  //   panic_mode = active      Emergency override (separate key).
+  //                            Disables ALL wellness-aware routing,
+  //                            sets all caps to maximum complexity,
+  //                            broadcasts notification to every active
+  //                            analyst, and writes panic_saved_caps so
+  //                            the prior state can be restored on
+  //                            deactivation. Always takes precedence
+  //                            over routing_enabled.
+  //
+  // Storage format matches the team_config convention used by
+  // routing.js:
+  //
+  //   value column is JSON-stringified. 'true' is the JSON encoding
+  //   of boolean true (4 characters: t, r, u, e). Consumers run
+  //   JSON.parse(row.value) and get a JS boolean. This mirrors the
+  //   existing pattern where panic_mode stores '"active"' (the JSON
+  //   string "active") and soar_burnout_risk_tier stores e.g.
+  //   '"bypassed"' (string) or a JSON-stringified object.
+  //
+  // C4 (routing.js) adds the matching surface endpoints:
+  //
+  //   GET  /api/routing/enabled   reads this row, returns
+  //                               {enabled, updated_at, updated_by}
+  //
+  //   PUT  /api/routing/enabled   upserts this row, audit-logs
+  //                               ROUTING_ENABLED_TOGGLED
+  //
+  //   GET  /api/routing/variables also surfaces routing_enabled as a
+  //                               top-level field in the polling
+  //                               response so the SOAR knows whether
+  //                               to honor the variables it's about
+  //                               to fetch.
+  //
+  // Idempotent: INSERT OR IGNORE against the PRIMARY KEY 'key'.
+  // Re-running this migration against an already-seeded database is
+  // a no-op. If an operator has already manually toggled
+  // routing_enabled to false (via the UI in C8 or directly via SQL),
+  // the existing row is preserved — the seed never overwrites.
+  //
+  // Fault isolation: separate try/catch from C1. A failure here does
+  // not mask the C1 soar_routing_events migration or any prior
+  // R3e/R3g/R3h/R3i migration.
+  try {
+    const insertResult = db
+      .prepare(
+        "INSERT OR IGNORE INTO team_config (key, value, updated_by) VALUES ('routing_enabled', 'true', NULL)"
+      )
+      .run();
+
+    if (insertResult.changes > 0) {
+      console.log('R3j migration: seeded routing_enabled = true in team_config');
+    } else {
+      const current = db
+        .prepare("SELECT value FROM team_config WHERE key = 'routing_enabled'")
+        .get();
+      console.log(
+        `R3j migration: routing_enabled row already present in team_config (current value: ${current ? current.value : 'unknown'})`
+      );
+    }
+  } catch (r3jRoutingEnabledMigrationErr) {
+    console.error(
+      'R3j routing_enabled migration FAILED:',
+      r3jRoutingEnabledMigrationErr.message
+    );
+    console.error(
+      'The server will start, but GET /api/routing/enabled will return {enabled: true} as the default (the route handler in C4 treats absence-of-row as enabled). The PUT endpoint will still be able to create the row on first toggle.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   db.close();
 }

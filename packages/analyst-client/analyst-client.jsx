@@ -111,6 +111,13 @@ const RESEARCH_KB = [
 const KB_VERSION = "2026.03.3";
 const KB_ENTRY_COUNT = RESEARCH_KB.length;
 
+// R3j C12: linger window for the post-deactivation "Panic mode lifted" green
+// banner at the top of the AC. Mirrors PANIC_DEACTIVATED_LINGER_SECONDS in
+// server/routes/status.js and server/routes/routing.js, plus the matching
+// PANIC_BANNER_LINGER_SECONDS in frontend/firealive-mc.jsx. All four values
+// must move together if the linger window is ever changed.
+const PANIC_BANNER_LINGER_SECONDS = 300;
+
 // ── Skills Assessment Taxonomy ───────────────────────────────────────────────
 const SKILLS_TAXONOMY = [
   {id:"triage",name:"Alert Triage",cat:"Core",tier:[1,2,3],desc:"Classify, prioritize, and route security alerts based on severity and context."},
@@ -888,7 +895,32 @@ export default function AnalystClientApp() {
 
   // ── Tab navigation ──
   const [tab, setTab] = useState("home");
-  React.useEffect(() => { const iv = setInterval(() => api.post("/api/v1/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
+  React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
+
+  // ── R3j C12: panic banner state + polling ──────────────────────────────
+  // The AC polls /api/status/panic (mounted with ['analyst', 'lead', 'admin'])
+  // every 30s and renders a top-of-screen banner mirroring the MC banner from
+  // C9: red while active, green for PANIC_BANNER_LINGER_SECONDS after
+  // deactivation, absent otherwise. Analysts see the same indicator their
+  // lead sees, with the same client-side recomputation against Date.now() so
+  // the green banner vanishes at the right moment between 30s polls.
+  const [panicActive, setPanicActive] = useState(false);
+  const [panicDeactivatedAt, setPanicDeactivatedAt] = useState(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    const fetchPanic = () => {
+      api.get("/api/status/panic").then(r => {
+        if (cancelled) return;
+        if (r && !r.error) {
+          setPanicActive(r.active === true);
+          setPanicDeactivatedAt(r.deactivated_at ?? null);
+        }
+      }).catch(()=>{});
+    };
+    fetchPanic();
+    const handle = setInterval(fetchPanic, 30000);
+    return () => { cancelled = true; clearInterval(handle); };
+  }, []);
 
   // ── Inbox state (Phase 1.4a) ──────────────────────────────────────────
   const [inboxItems, setInboxItems] = useState([]);
@@ -1333,6 +1365,23 @@ export default function AnalystClientApp() {
   return(
     <div style={{minHeight:"100vh",background:"#060A10",color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {/* R3j C12: Top-of-AC panic banner. Red while panic_mode is active; green for
+          PANIC_BANNER_LINGER_SECONDS after deactivation; absent otherwise. Recomputes
+          age against Date.now() on every render so the green banner vanishes at the
+          right moment even between 30s server polls. State fed by the polling
+          useEffect against /api/status/panic. */}
+      {(()=>{
+        if (panicActive) {
+          return (<div style={{padding:"12px 24px",background:C.d,color:"#fff",fontWeight:600,textAlign:"center",fontSize:13,letterSpacing:0.5,animation:"pulse 1.5s infinite",borderBottom:`1px solid ${C.d}`}}>⚠ PANIC MODE ACTIVE — All wellness routing is OFF. You may receive tickets above your usual complexity cap until your lead restores normal routing.</div>);
+        }
+        if (panicDeactivatedAt) {
+          const ageSec = (Date.now() - new Date(panicDeactivatedAt).getTime()) / 1000;
+          if (ageSec >= 0 && ageSec <= PANIC_BANNER_LINGER_SECONDS) {
+            return (<div style={{padding:"10px 24px",background:C.a,color:"#0d1117",fontWeight:600,textAlign:"center",fontSize:12,borderBottom:`1px solid ${C.a}`}}>✓ Panic mode lifted — wellness routing restored.</div>);
+          }
+        }
+        return null;
+      })()}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>

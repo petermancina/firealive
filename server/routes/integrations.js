@@ -1,10 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE — Integrations Routes
-// GET    /api/integrations            — list all integration configs
-// GET    /api/integrations/:type      — get specific integration config
-// PUT    /api/integrations/:type      — create/update integration config
-// POST   /api/integrations/:type/test — test integration connectivity
-// DELETE /api/integrations/:type      — remove integration config
+// GET    /api/integrations               — list all integration configs
+// GET    /api/integrations/:type         — get specific integration config
+// GET    /api/integrations/ticketing/queue — read-only ticketing queue metadata (R3j)
+// PUT    /api/integrations/:type         — create/update integration config
+// POST   /api/integrations/:type/test    — test integration connectivity
+// DELETE /api/integrations/:type         — remove integration config
+//
+// R3j (v1.0.36) absorbs v054 SOAR/ticketing capabilities into canonical:
+//   - soar config gains optional autoEscalate boolean (persisted verbatim)
+//   - ticketing config has readOnly:true enforced server-side (invariant)
+//   - new GET /ticketing/queue surfaces aggregate queue metadata
+//   - runConnectivityTest echoes autoEscalatePolicyDetected on soar tests
+//     for UI round-trip confirmation
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -80,6 +88,56 @@ router.get('/:type', (req, res) => {
   }
 });
 
+// ── R3j: Ticketing Queue Metadata (read-only) ────────────────────────────────
+// GET /api/integrations/ticketing/queue — returns aggregate queue stats from
+// the configured ticketing platform. Read-only by construction (matches the
+// ticketing integration's readOnly:true invariant enforced in PUT below).
+//
+// v1.0.36 ships with MOCK values. The endpoint shape is the contract; the
+// MC frontend (C7-C9) consumes this shape so it doesn't need to be re-wired
+// when real ticketing-API adapters land. Per-platform adapters (ServiceNow,
+// Jira, TheHive, PagerDuty, Freshservice) are deferred to R3k or later
+// per the build plan's "out of scope for R3j" list.
+//
+// Path is literal (`/ticketing/queue`) not parameterized (`/:type/queue`)
+// because ticketing is the only integration type with a queue concept; if
+// SIEM or other integrations later need similar aggregate-metadata
+// endpoints, they get their own literal paths so the contract per
+// integration stays explicit.
+//
+// Registered BEFORE the parameterized `GET /:type` would be a concern, but
+// Express matches 2-segment paths (`/ticketing/queue`) independently of
+// 1-segment paths (`/:type`), so ordering doesn't matter for correctness
+// here. Placed in this position for logical grouping with the other read
+// operations.
+router.get('/ticketing/queue', (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT * FROM integration_config WHERE integration_type = 'ticketing'").get();
+    db.close();
+
+    if (!row) {
+      return res.status(404).json({ configured: false, error: 'Ticketing integration not configured' });
+    }
+
+    // R3j C5: mock-shape response. Real ticketing-API call deferred.
+    // In production: decrypt row.config_encrypted, dispatch to the
+    // per-platform adapter (config.platform → ServiceNow/Jira/etc),
+    // fetch live queue depth + avg priority + last sync timestamp.
+    res.json({
+      configured: true,
+      queueDepth: 0,
+      avgPriority: 'medium',
+      lastSync: new Date().toISOString(),
+      _mock: true,
+      _note: 'Live ticketing-API integration deferred to a future phase. The shape of this response is stable; the values become real once per-platform adapters land.',
+    });
+  } catch (err) {
+    logger.error('Get ticketing queue metadata error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch ticketing queue metadata' });
+  }
+});
+
 // ── Create/Update Config ─────────────────────────────────────────────────────
 router.put('/:type', (req, res) => {
   if (!VALID_TYPES.includes(req.params.type)) {
@@ -91,8 +149,14 @@ router.put('/:type', (req, res) => {
     return res.status(400).json({ error: 'config object required' });
   }
 
+  // R3j: per-type normalization runs BEFORE encryption. The function
+  // returns a possibly-modified copy of config along with audit-log
+  // marker strings for any invariants enforced. See normalizeConfigForType
+  // at the bottom of this file.
+  const { normalized, auditMarkers } = normalizeConfigForType(req.params.type, config);
+
   try {
-    const encrypted = encryptConfig(config);
+    const encrypted = encryptConfig(normalized);
     const db = getDb();
 
     const existing = db.prepare('SELECT id FROM integration_config WHERE integration_type = ?').get(req.params.type);
@@ -110,7 +174,10 @@ router.put('/:type', (req, res) => {
     }
 
     db.close();
-    auditLog(req.user.id, 'INTEGRATION_CONFIGURED', `type=${req.params.type}`, req.ip);
+    const detail = auditMarkers.length > 0
+      ? `type=${req.params.type} (${auditMarkers.join('; ')})`
+      : `type=${req.params.type}`;
+    auditLog(req.user.id, 'INTEGRATION_CONFIGURED', detail, req.ip);
     res.json({ ok: true, type: req.params.type, status: 'configured' });
   } catch (err) {
     logger.error('Configure integration error', { error: err.message });
@@ -186,12 +253,69 @@ function runConnectivityTest(type, config) {
   // Simulated test — returns success with synthetic latency
   // In production, replace with actual HTTP/LDAP/SAML probe
   const latency = Math.floor(Math.random() * 150) + 50;
-  return {
+  const result = {
     success: true,
     message: `Connection to ${config.platform || config.provider || config.server || config.host || type} successful`,
     latencyMs: latency,
     testedAt: new Date().toISOString(),
   };
+
+  // R3j: SOAR test echoes the autoEscalate flag if set. The UI uses this
+  // to confirm round-trip persistence (the field was correctly saved into
+  // the encrypted config blob on the prior PUT and is now visible to the
+  // server's read path). The echo is informational only — no behavior
+  // change in the simulated test itself.
+  if (type === 'soar' && config.autoEscalate === true) {
+    result.autoEscalatePolicyDetected = true;
+  }
+
+  return result;
+}
+
+// ── R3j: Per-Type Config Normalization ───────────────────────────────────────
+// Runs in PUT /:type before encryption. Returns:
+//   { normalized: <possibly-modified config>, auditMarkers: <string[]> }
+//
+// The function is purely transformational — no DB access, no side
+// effects. Type-specific rules:
+//
+//   soar:
+//     Coerce config.autoEscalate to a strict boolean if present.
+//     Accepts truthy/falsy values but stores a boolean so subsequent
+//     reads always get a known type.
+//
+//   ticketing:
+//     Enforce the readOnly:true invariant server-side. Whatever the
+//     client supplies (true/false/missing/undefined) is replaced with
+//     literal true. This matches the v054 design intent line 35-37
+//     where the original stub hardcoded readOnly:true at the storage
+//     layer. The PUT response audit log includes the marker
+//     "READ-ONLY invariant enforced" so operators see the action in
+//     the audit trail.
+//
+//   default:
+//     Pass through unchanged. Other integration types have no per-type
+//     invariants in R3j scope.
+function normalizeConfigForType(type, config) {
+  const normalized = { ...config };
+  const auditMarkers = [];
+
+  if (type === 'soar') {
+    if ('autoEscalate' in normalized) {
+      const coerced = Boolean(normalized.autoEscalate);
+      if (coerced !== normalized.autoEscalate) {
+        auditMarkers.push(`autoEscalate coerced to ${coerced}`);
+      }
+      normalized.autoEscalate = coerced;
+    }
+  } else if (type === 'ticketing') {
+    if (normalized.readOnly !== true) {
+      auditMarkers.push('READ-ONLY invariant enforced');
+    }
+    normalized.readOnly = true;
+  }
+
+  return { normalized, auditMarkers };
 }
 
 module.exports = router;
