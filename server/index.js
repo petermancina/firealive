@@ -157,6 +157,7 @@ app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v030-features'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-monitoring'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
+app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));
