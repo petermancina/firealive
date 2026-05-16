@@ -591,12 +591,33 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines include lint, r
 4. Lead can trigger manual backups or restore from any backup
 
 ### Backup Schedules
-**What it's for:** Configure multiple backup schedules with regulatory-framework presets (GDPR, HIPAA, SOX, PCI-DSS, etc.). Picking a regulatory preset auto-configures retention/encryption/destination to match that framework's requirements.
+**What it's for:** Configure multiple backup schedules with optional regulatory-framework presets. Each schedule fires independently on its own cadence (hourly / daily / weekly / monthly) at a configured time, to a configured destination, with a configured retention. Picking a regulatory preset (HIPAA, SOX, PCI-DSS, GDPR, NIST CSF, ISO 27001, SOC 2) applies that framework's compliance floor — minimum retention and required encryption — to the schedule. The operator can set retention HIGHER than the floor (legal-hold scenarios, longer compliance windows) but cannot reduce below the floor. Schedules without a preset have full operator flexibility.
+
+**Floor-enforcement model:** Hybrid floor + upward flexibility. When a preset is selected, the API rejects retention below the framework minimum (e.g. HIPAA = 6 years / 2190 days) and rejects unencrypted schedules when the framework requires AES-256. Recommended frequency and destination class are pre-filled from the preset but not enforced — operators can pick hourly instead of the recommended daily if their risk profile demands it. The "None" preset (the default) skips floor enforcement entirely. SOC-grade compliance posture requires the floor to have teeth (auditor asks "what is your retention?" not "what preset did you pick?"), but operator legitimate use cases require upward flexibility.
+
+**Framework citations** displayed in the preset metadata for operator transparency:
+- HIPAA — 45 CFR 164.316(b)(2)(i) — 6-year PHI retention (2190 days)
+- SOX — 17 CFR 210.2-06 / 18 USC 1520 — 7-year auditor record retention (2555 days)
+- PCI-DSS — PCI DSS v4.0 Requirement 10.7.1 — 1-year audit log retention (365 days)
+- GDPR — Articles 5(1)(e), 25, 32, Chapter V — 30-day operational floor; storage-limitation upper bound is operator-managed
+- NIST CSF — NIST CSF 2.0 PR.DS-11 — flexible per policy (1-year default)
+- ISO 27001 — ISO/IEC 27001:2022 Annex A.8.13 — flexible per policy (1-year default)
+- SOC 2 — TSC CC9.1 / CC6.1 — flexible per policy (1-year default)
 
 **Workflow:**
-1. Lead opens Backup Schedules
-2. Adds a schedule: type, frequency, time, destination, retention
-3. Picks regulatory preset if applicable — auto-configures the rest to match the framework
+1. Lead opens Backup Schedules from the Data & Backup nav category
+2. Reviews existing schedules in the Active Schedules list: name, type, frequency, time, destination, retention, encryption status, preset tag, next run time, last run time + status, last error if any
+3. Removes any schedules they no longer want (60-second scheduler poll picks up the deletion and tears down the cron within a minute)
+4. Adds a new schedule via the Add Schedule form: name, type (full / incremental / differential / snapshot), frequency (hourly / daily / weekly / monthly), time (HH:MM), day-of-week or day-of-month for weekly / monthly schedules, destination, retention in days
+5. Optionally picks a regulatory preset — auto-fills retention to the framework floor, locks encryption on (when AES-256 is required), pre-fills frequency and destination with the framework recommendation. The operator can edit retention upward but not below the floor; below-floor entries get a server-side 400 RETENTION_BELOW_FLOOR with an inline error
+6. If the schedule's fire times overlap within 5 minutes of another schedule's fire times, the server returns 409 SCHEDULE_OVERLAP and the UI surfaces a confirm-to-queue modal showing the conflicting schedule names + fire times — the operator confirms (commits with force_queue=true, audit-log records BACKUP_SCHEDULE_OVERLAP_QUEUED) or cancels and adjusts the time
+7. Schedule lands in backup_schedules table; scheduler picks it up within 60 seconds via the reload poll and registers a cron for it; fires at the configured time, executes the backup via the existing performBackup pipeline, records last_status / last_run / last_error on the schedule row
+
+**Multi-schedule semantics:** Each schedule fires independently. The scheduler maintains a separate cron registration per active schedule. When two schedules' fire times collide (within ±5 minutes), the overlap detection surfaces a 409 at create / update time so operators can adjust timing. Operators who explicitly want overlapping schedules (e.g. daily + monthly on the same day-of-month) can confirm-to-queue via the modal. The 5-minute window protects against I/O contention on the source DB and the destination — backup operations have variable execution duration and starting two backups at the same moment risks read locking and destination push throttling.
+
+**Legacy compatibility:** Pre-v1.0.35 installs that configured a single backup schedule via /api/backup/config (the singleton-only legacy endpoint) get their singleton automatically migrated to a "Legacy default" row in backup_schedules on first boot post-upgrade. The /api/backup/config endpoint stays live as a deprecated read/write shim over the first row of backup_schedules for one version of deprecation grace — external tooling that still calls it sees a deprecated:true response with a replacement: '/api/backup-schedules' hint. Operators should migrate clients to the modern endpoint when convenient. The v100 stub route POST /api/v1/backup/schedule/add also remains live and now delegates to the canonical service via BackupService.addSchedule (changed in R3i; preserves the v100 public contract).
+
+**MC orchestrating AC backups** is a separate concern from this feature and out of scope for v1.0.35. The "Backup All Clients" button on the Client Provisioning tab remains a placeholder pending a future phase that builds AC-side backup orchestration.
 
 ### Restore
 **What it's for:** Restore from backup or revert configuration. Two modes: internal (revert to a recent FireAlive backup of this same install) and external (restore from a backup stored on a network share, NAS, S3, Azure, SFTP).

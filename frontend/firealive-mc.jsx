@@ -1171,7 +1171,173 @@ function ManagementConsole() {
     }).finally(()=>setFlaggedRatingsLoading(false));
   }, [tab]);
 
-  // R3h-pt2: decide a flagged rating. confirmFraud=true triggers
+  // R3i: When the backup_schedules tab opens, parallel-fetch the
+  // schedules list and the regulatory presets list. Schedules drive
+  // the Active Schedules render; presets drive the Add Schedule form's
+  // preset dropdown (C9 wires the form). Both endpoints are admin-only
+  // and gated by configLockGate on the server, so a 401/403/423 here
+  // means the operator must unlock the config lock first (handled
+  // via the existing config-lock-state surface, not re-implemented
+  // here).
+  useEffect(()=>{
+    if (tab !== "backup_schedules") return;
+    setSchedulesLoading(true);
+    setSchedulesError(null);
+    Promise.all([
+      api.get("/api/backup-schedules"),
+      api.get("/api/backup-schedules/presets"),
+    ]).then(([sRes, pRes])=>{
+      if (sRes?.error) {
+        setSchedulesError(sRes.message || "Could not load schedules.");
+        setSchedules([]);
+      } else {
+        setSchedules(Array.isArray(sRes?.schedules) ? sRes.schedules : []);
+      }
+      if (pRes?.error) {
+        setPresets([]);
+      } else {
+        setPresets(Array.isArray(pRes?.presets) ? pRes.presets : []);
+      }
+    }).catch(()=>{
+      setSchedulesError("Could not reach the server.");
+      setSchedules([]);
+      setPresets([]);
+    }).finally(()=>setSchedulesLoading(false));
+  }, [tab]);
+
+  // R3i: delete a backup schedule by id. Optimistic UI — remove the
+  // row from local state immediately, then call DELETE. On failure,
+  // refetch to restore. The scheduler's 60-second poll picks up the
+  // delete and tears down the cron job within the next minute.
+  const deleteSchedule = (id, name) => {
+    if (!window.confirm(`Delete backup schedule "${name || "#" + id}"? The scheduler will stop running this schedule within 60 seconds. Existing backups already taken under this schedule are NOT deleted.`)) return;
+    setSchedulesFb(null);
+    const previous = schedules;
+    setSchedules(previous.filter(s => s.id !== id));
+    api.del(`/api/backup-schedules/${id}`).then(r=>{
+      if (r?.error) {
+        setSchedules(previous);
+        setSchedulesFb({error: r.message || "Delete failed."});
+        return;
+      }
+      setSchedulesFb({success: `Deleted schedule "${name || "#" + id}".`});
+      addA("BACKUP_SCHEDULE_DELETED_UI", `Schedule deleted via MC UI: ${name || "#" + id}`);
+    }).catch(()=>{
+      setSchedules(previous);
+      setSchedulesFb({error: "Could not reach the server."});
+    });
+  };
+
+  // R3i: format retention days as human-readable text for the
+  // floor-minimum badge. 2190 -> "6 years", 2555 -> "7 years",
+  // 30 -> "30 days", 365 -> "1 year", 366 -> "1 year 1 days".
+  const formatRetention = (days) => {
+    if (typeof days !== "number" || days < 0) return "—";
+    if (days < 365) return `${days} days`;
+    const years = Math.floor(days / 365);
+    const rem = days % 365;
+    const yLabel = `${years} year${years !== 1 ? "s" : ""}`;
+    return rem === 0 ? yLabel : `${yLabel} ${rem} days`;
+  };
+
+  // R3i: apply a regulatory preset's floor values to the
+  // newSchedule form buffer. Picking 'None' (empty string)
+  // clears the preset and leaves the operator with full
+  // flexibility. Picking a preset pre-fills retention_days
+  // and encrypted to the floor and frequency / destination
+  // to the preset's recommendations. The operator can still
+  // edit retention UPWARD; the server validates on submit.
+  // encryption pre-fill is locked when required_encryption
+  // is 'AES-256' (the UI disables the checkbox; the operator
+  // sees the locked state).
+  const applyPresetDefaults = (presetId) => {
+    if (!presetId) {
+      setNewSchedule(prev => ({ ...prev, regulatory_preset_id: null }));
+      return;
+    }
+    const preset = presets.find(p => p.id === presetId);
+    if (!preset) {
+      setNewSchedule(prev => ({ ...prev, regulatory_preset_id: presetId }));
+      return;
+    }
+    setNewSchedule(prev => ({
+      ...prev,
+      regulatory_preset_id: presetId,
+      retention_days: preset.min_retention_days,
+      encrypted: preset.required_encryption === "AES-256",
+      frequency: preset.recommended_frequency || prev.frequency,
+      destination: preset.recommended_destination_type || prev.destination,
+    }));
+  };
+
+  // R3i: submit the new schedule. forceQueue=true is used by the
+  // overlap-confirmation modal's retry path; the first submit
+  // never sets it. On 409 SCHEDULE_OVERLAP, surface the overlap
+  // list in overlapConfirm; on 400 RETENTION_BELOW_FLOOR or
+  // ENCRYPTION_REQUIRED, surface the error inline above the
+  // form via setAddError. On success, prepend the new schedule
+  // to the list (the server-side response carries the full row
+  // including next_run), reset the form, show a success
+  // feedback banner.
+  const submitNewSchedule = async (forceQueue = false) => {
+    setAddBusy(true);
+    setAddError(null);
+    const body = {
+      name: newSchedule.name || null,
+      type: newSchedule.type,
+      frequency: newSchedule.frequency,
+      time: newSchedule.frequency === "hourly" ? null : newSchedule.time,
+      day_of_week: newSchedule.frequency === "weekly" ? newSchedule.day_of_week : null,
+      day_of_month: newSchedule.frequency === "monthly" ? newSchedule.day_of_month : null,
+      destination: newSchedule.destination,
+      retention_days: typeof newSchedule.retention_days === "string"
+        ? (parseInt(newSchedule.retention_days, 10) || 0)
+        : newSchedule.retention_days,
+      encrypted: !!newSchedule.encrypted,
+      regulatory_preset_id: newSchedule.regulatory_preset_id || null,
+      active: newSchedule.active !== false,
+    };
+    if (forceQueue) body.force_queue = true;
+    try {
+      const r = await api.post("/api/backup-schedules", body);
+      if (r?.error) {
+        if (r.error === "SCHEDULE_OVERLAP") {
+          setOverlapConfirm({ overlaps: r.overlaps || [], body });
+          setAddBusy(false);
+          return;
+        }
+        setAddError(r.message || r.error || "Failed to create schedule.");
+        setAddBusy(false);
+        return;
+      }
+      // Success.
+      setOverlapConfirm(null);
+      const created = r.schedule;
+      if (created) setSchedules(prev => [created, ...prev]);
+      setSchedulesFb({success: `Schedule "${created?.name || body.name || "#" + (created?.id || "?")}" added.`});
+      addA("BACKUP_SCHEDULE_ADDED",
+        `Schedule added via MC UI: ${created?.name || body.name || "(unnamed)"} (${body.frequency}, preset: ${body.regulatory_preset_id || "None"})`);
+      // Reset form.
+      setNewSchedule({
+        name: "", type: "full", frequency: "daily", time: "02:00",
+        day_of_week: 0, day_of_month: 1, destination: "local",
+        retention_days: 30, encrypted: true, regulatory_preset_id: null,
+        active: true,
+      });
+    } catch (e) {
+      setAddError("Could not reach the server.");
+    } finally {
+      setAddBusy(false);
+    }
+  };
+
+  // Derived: the preset currently selected by the operator (or
+  // null when no preset is selected). Used by the form to show
+  // the (minimum: N days) badge next to the retention input and
+  // to disable the encryption checkbox when AES-256 is required.
+  const activePreset = newSchedule.regulatory_preset_id
+    ? presets.find(p => p.id === newSchedule.regulatory_preset_id) || null
+    : null;
   // reversePointsForFraud server-side; confirmFraud=false clears the
   // flag and re-includes the rating in the leaderboard.
   //
@@ -1443,12 +1609,37 @@ function ManagementConsole() {
     }).catch(() => {});
   }, [tab, schedCfg._loaded]);
 
-  // Backup enhancements
-  const [backupSchedules, setBackupSchedules] = useState([
-    {id:"bs1",type:"incremental",frequency:"daily",time:"02:00",destination:"local",retentionDays:30,encrypted:true,regulatoryPreset:"none"},
-    {id:"bs2",type:"full",frequency:"weekly",day:"sunday",time:"03:00",destination:"s3",retentionDays:90,encrypted:true,regulatoryPreset:"none"},
-  ]);
-  const [newBackupSched, setNewBackupSched] = useState({type:"incremental",frequency:"daily",time:"02:00",day:"sunday",destination:"local",retentionDays:30,encrypted:true,regulatoryPreset:"none"});
+  // R3i: API-backed Backup Schedules state. Replaces the v1.0.28
+  // frontend-state-only backupSchedules array + the newBackupSched
+  // form-buffer state with state hydrated from /api/backup-schedules
+  // (the C5 routes consuming the C4 service consuming the C1+C2
+  // tables). The Add Schedule form's form-buffer state is added back
+  // in C9 with the hybrid floor-enforcement model wired to the
+  // presets endpoint.
+  const [schedules, setSchedules] = useState([]);
+  const [schedulesLoading, setSchedulesLoading] = useState(false);
+  const [schedulesError, setSchedulesError] = useState(null);
+  const [schedulesFb, setSchedulesFb] = useState(null);
+  const [presets, setPresets] = useState([]);
+  // R3i: Add Schedule form-buffer state. Replaces the v1.0.28
+  // newBackupSched local-only buffer with a server-aware shape
+  // matching the POST /api/backup-schedules body. addBusy gates
+  // the submit button during the in-flight request; addError
+  // surfaces the 400 error message inline (above the form);
+  // overlapConfirm is non-null when the server returned a 409
+  // SCHEDULE_OVERLAP — it carries the overlap list AND the
+  // form data that triggered it so the operator can confirm
+  // queuing via a force_queue=true retry without re-entering
+  // the form.
+  const [newSchedule, setNewSchedule] = useState({
+    name: "", type: "full", frequency: "daily", time: "02:00",
+    day_of_week: 0, day_of_month: 1, destination: "local",
+    retention_days: 30, encrypted: true, regulatory_preset_id: null,
+    active: true,
+  });
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState(null);
+  const [overlapConfirm, setOverlapConfirm] = useState(null);
   // Burnout stats sync interval
   const [syncIntervalCfg, setSyncIntervalCfg] = useState({intervalMin:15,adaptiveSync:true,urgentThresholdSec:30,batchMode:true});
   // Feature toggles
@@ -1719,7 +1910,7 @@ function ManagementConsole() {
       {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cluster",label:"Cluster / Scaling"},{id:"cicd",label:"CI/CD"},
     ]},
     {cat:"data",label:"Data & Backup",items:[
-      {id:"backup",label:"Backup & Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},
+      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},
     ]},
     {cat:"reports",label:"Reports & Compliance",items:[
       {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},
@@ -5006,7 +5197,7 @@ regression:
                 else if(q.toLowerCase().includes("siem")) checks.push("✓ SIEM feed: "+(featureToggles.siem_feed?"enabled":"disabled"),"→ Check: Ensure SIEM integration is enabled in Features tab and SIEM endpoint is configured in SIEM tab.");
                 else if(q.toLowerCase().includes("peer")||q.toLowerCase().includes("chat")) checks.push("✓ Peer chat feature: "+(featureToggles.peer_chat?"enabled":"disabled"),"✓ Peer scheduling: "+(featureToggles.peer_scheduling?"enabled":"disabled"),"→ Check: Ensure both are enabled in Features tab. Verify E2EE keys are provisioned for the analysts.");
                 else if(q.toLowerCase().includes("routing")||q.toLowerCase().includes("ticket")) checks.push("✓ Burnout routing: "+(featureToggles.burnout_routing?"enabled":"disabled"),"✓ Panic mode: "+(panicMode?"ACTIVE — routing is disabled!":"off"),"✓ Fail-open: "+(failOpenCfg.enabled?"enabled":"disabled"),"→ If tickets aren't being filtered, check if panic mode was accidentally activated.");
-                else if(q.toLowerCase().includes("backup")||q.toLowerCase().includes("restore")) checks.push("✓ Latest backup: "+backups[0]?.ts,"✓ Backup status: "+backups[0]?.status,"✓ Backup schedules: "+backupSchedules.length+" configured","→ Check: Verify backup schedule in Backup Schedules tab. Ensure disk space is available.");
+                else if(q.toLowerCase().includes("backup")||q.toLowerCase().includes("restore")) checks.push("✓ Latest backup: "+backups[0]?.ts,"✓ Backup status: "+backups[0]?.status,"✓ Backup schedules: "+schedules.length+" configured","→ Check: Verify backup schedule in Backup Schedules tab. Ensure disk space is available.");
                 else if(q.toLowerCase().includes("client")||q.toLowerCase().includes("provision")) checks.push("✓ Provisioned clients: "+provisionedClients.length,"✓ Client sync interval: "+syncIntervalCfg.intervalMin+"min","→ If a client can't connect: verify server is running, config.json has correct endpoint, firewall allows port 3001, enrollment token is valid");
                 else if(q.toLowerCase().includes("mfa")||q.toLowerCase().includes("auth")) checks.push("✓ MFA: "+(mfaCfg.status==="configured"?"configured":"not configured"),"✓ MFA method: "+mfaCfg.method,"✓ Auth logs: "+authLogs.length+" events","→ If MFA isn't working: verify TOTP secret is synced with authenticator app. If using WebAuthn, ensure browser supports FIDO2.");
                 else if(q.toLowerCase().includes("tripwire")) checks.push("✓ Tripwire: "+(tripwireCfg.enabled?"enabled":"disabled"),"✓ Threshold: "+tripwireCfg.thresholdPct+"%","✓ Status: "+(tripwireTriggered?"TRIGGERED":"armed"),"→ If tripwire triggered unexpectedly, check if analysts legitimately requested reduced load vs. compromise.");
@@ -5235,43 +5426,120 @@ regression:
         </div>)}
 
         {/* ══════════ v1.0.0 — BACKUP SCHEDULES ══════════ */}
-        {tab==="backup_sched"&&(<div>
+        {tab==="backup_schedules"&&(<div>
           <L>Backup Schedules</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure multiple backup schedules with different types, frequencies, and destinations. All backups are AES-256-GCM encrypted by default. You can optionally align backup schedules with regulatory framework requirements.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure multiple backup schedules with different types, frequencies, and destinations. All backups are AES-256-GCM encrypted by default. You can optionally align backup schedules with regulatory framework requirements (HIPAA, SOX, PCI-DSS, GDPR, NIST CSF, ISO 27001, SOC 2) — picking a preset enforces that framework's retention and encryption floors but leaves you free to set retention higher than the minimum.</M>
+          {schedulesFb && (
+            <Card style={{marginBottom:12,padding:10,borderColor:(schedulesFb.error?C.d:C.a)+"50"}}>
+              <M style={{color:schedulesFb.error?C.d:C.a}}>{schedulesFb.error || schedulesFb.success}</M>
+            </Card>
+          )}
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Active Schedules ({backupSchedules.length})</div>
-            {backupSchedules.map(bs=>(
-              <div key={bs.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
-                <div>
-                  <M style={{color:C.t,fontWeight:500}}>{bs.type} · {bs.frequency}{bs.frequency==="weekly"?" ("+bs.day+")":""} at {bs.time}</M>
-                  <M style={{color:C.td,display:"block"}}>Destination: {bs.destination} · Retention: {bs.retentionDays} days · {bs.encrypted?"Encrypted":"⚠ UNENCRYPTED"}{bs.regulatoryPreset!=="none"?" · "+bs.regulatoryPreset:""}</M>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Active Schedules{schedulesLoading?"":" ("+schedules.length+")"}</div>
+            {schedulesLoading && (<M style={{color:C.td}}>Loading schedules...</M>)}
+            {!schedulesLoading && schedulesError && (<M style={{color:C.d}}>{schedulesError}</M>)}
+            {!schedulesLoading && !schedulesError && schedules.length===0 && (
+              <M style={{color:C.td}}>No backup schedules configured yet. The Add Schedule form lands in the next commit; until then, no new schedules can be created from this UI.</M>
+            )}
+            {!schedulesLoading && !schedulesError && schedules.map(s=>{
+              const freq = s.frequency || s.interval || "?";
+              const day = s.frequency==="weekly" && typeof s.day_of_week==="number" ? ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][s.day_of_week] : (s.frequency==="monthly" && s.day_of_month ? "day "+s.day_of_month : null);
+              const presetTag = s.preset_name ? " · "+s.preset_name : "";
+              const nextRunDisplay = s.next_run ? new Date(s.next_run).toLocaleString() : "—";
+              const lastRunDisplay = s.last_run ? new Date(s.last_run).toLocaleString() : "never";
+              const statusColor = s.last_status==="success"?C.a:(s.last_status==="failed"?C.d:(s.last_status==="running"?C.i:C.tm));
+              return (
+                <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                  <div style={{flex:1}}>
+                    <M style={{color:C.t,fontWeight:500}}>{s.name || "Schedule #"+s.id} · {s.type || "full"} · {freq}{day?" ("+day+")":""}{s.time?" at "+s.time:""}</M>
+                    <M style={{color:C.td,display:"block"}}>Destination: {s.destination || "—"} · Retention: {s.retention || "—"} · {s.encrypted?"Encrypted":"⚠ UNENCRYPTED"}{presetTag}</M>
+                    <M style={{color:C.td,display:"block",fontSize:11}}>Next run: {nextRunDisplay} · Last run: <span style={{color:statusColor}}>{lastRunDisplay}{s.last_status?" ("+s.last_status+")":""}</span>{s.last_error?" · Error: "+s.last_error:""}</M>
+                  </div>
+                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                    <Badge color={s.encrypted?C.a:C.d}>{s.encrypted?"AES-256":"plain"}</Badge>
+                    {s.active===0 && <Badge color={C.tm}>paused</Badge>}
+                    <Btn small onClick={()=>deleteSchedule(s.id, s.name)}>Remove</Btn>
+                  </div>
                 </div>
-                <div style={{display:"flex",gap:6}}><Badge color={bs.encrypted?C.a:C.d}>{bs.encrypted?"AES-256":"plain"}</Badge><Btn small onClick={()=>setBackupSchedules(prev=>prev.filter(b=>b.id!==bs.id))}>Remove</Btn></div>
-              </div>
-            ))}
+              );
+            })}
           </Card>
+          {overlapConfirm && (
+            <Card style={{marginBottom:16,borderColor:C.w+"60",padding:14}}>
+              <div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:8}}>Schedule overlap detected</div>
+              <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>This schedule would fire within 5 minutes of {overlapConfirm.overlaps.length} existing fire time{overlapConfirm.overlaps.length===1?"":"s"}. Running concurrent backups risks I/O contention. You can confirm to queue this schedule behind the conflicting one, or cancel and adjust the time.</M>
+              <div style={{marginBottom:10,maxHeight:140,overflowY:"auto"}}>
+                {overlapConfirm.overlaps.slice(0,5).map((o,i)=>(
+                  <M key={i} style={{color:C.td,display:"block",fontSize:11,marginBottom:4}}>
+                    · Conflicts with "{o.scheduleName}" at {new Date(o.conflictingFireTime).toLocaleString()} (your schedule would fire at {new Date(o.fireTime).toLocaleString()})
+                  </M>
+                ))}
+                {overlapConfirm.overlaps.length > 5 && (
+                  <M style={{color:C.td,display:"block",fontSize:11}}>...and {overlapConfirm.overlaps.length - 5} more</M>
+                )}
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <Btn small onClick={()=>{setOverlapConfirm(null);}}>Cancel</Btn>
+                <Btn small primary disabled={addBusy} onClick={()=>submitNewSchedule(true)}>{addBusy?"Queueing...":"Queue behind existing"}</Btn>
+              </div>
+            </Card>
+          )}
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Add Schedule</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
-              <Sel label="Backup type" value={newBackupSched.type} onChange={e=>setNewBackupSched(prev=>({...prev,type:e.target.value}))}>
-                <option value="incremental">Incremental</option><option value="differential">Differential</option><option value="full">Full</option><option value="snapshot">Snapshot</option>
+            {addError && (<M style={{color:C.d,display:"block",marginBottom:8}}>{addError}</M>)}
+            <Input label="Name" value={newSchedule.name} onChange={e=>setNewSchedule(p=>({...p,name:e.target.value}))} placeholder="e.g. Daily HIPAA backup to S3"/>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginTop:8}}>
+              <Sel label="Backup type" value={newSchedule.type} onChange={e=>setNewSchedule(p=>({...p,type:e.target.value}))}>
+                <option value="full">Full</option><option value="incremental">Incremental</option><option value="differential">Differential</option><option value="snapshot">Snapshot</option>
               </Sel>
-              <Sel label="Frequency" value={newBackupSched.frequency} onChange={e=>setNewBackupSched(prev=>({...prev,frequency:e.target.value}))}>
+              <Sel label="Frequency" value={newSchedule.frequency} onChange={e=>setNewSchedule(p=>({...p,frequency:e.target.value}))}>
                 <option value="hourly">Hourly</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
               </Sel>
-              <Input label="Time" value={newBackupSched.time} onChange={e=>setNewBackupSched(prev=>({...prev,time:e.target.value}))} type="time"/>
+              {newSchedule.frequency==="hourly" ? (
+                <div><M style={{color:C.td,fontSize:11,display:"block",marginTop:18}}>Fires at the top of every hour</M></div>
+              ) : (
+                <Input label="Time (HH:MM)" value={newSchedule.time} onChange={e=>setNewSchedule(p=>({...p,time:e.target.value}))} type="time"/>
+              )}
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginTop:8}}>
-              <Sel label="Destination" value={newBackupSched.destination} onChange={e=>setNewBackupSched(prev=>({...prev,destination:e.target.value}))}>
-                <option value="local">Local storage</option><option value="s3">AWS S3</option><option value="azure_blob">Azure Blob</option><option value="gcs">GCS</option><option value="nfs">NFS share</option><option value="tape">Tape (LTO)</option>
+            {newSchedule.frequency==="weekly" && (
+              <Sel label="Day of week" value={newSchedule.day_of_week} onChange={e=>setNewSchedule(p=>({...p,day_of_week:parseInt(e.target.value,10)}))}>
+                <option value={0}>Sunday</option><option value={1}>Monday</option><option value={2}>Tuesday</option><option value={3}>Wednesday</option><option value={4}>Thursday</option><option value={5}>Friday</option><option value={6}>Saturday</option>
               </Sel>
-              <Input label="Retention (days)" value={newBackupSched.retentionDays} onChange={e=>setNewBackupSched(prev=>({...prev,retentionDays:parseInt(e.target.value)||30}))} type="number"/>
-              <Sel label="Regulatory preset" value={newBackupSched.regulatoryPreset} onChange={e=>setNewBackupSched(prev=>({...prev,regulatoryPreset:e.target.value}))}>
-                <option value="none">None</option><option value="HIPAA">HIPAA (daily, 6yr retention)</option><option value="SOX">SOX (daily, 7yr retention)</option><option value="PCI_DSS">PCI-DSS (daily, 1yr retention)</option><option value="GDPR">GDPR (encrypted, right to erasure support)</option><option value="NIST_CSF">NIST CSF (per policy)</option>
+            )}
+            {newSchedule.frequency==="monthly" && (
+              <Input label="Day of month (1-31)" value={newSchedule.day_of_month} onChange={e=>setNewSchedule(p=>({...p,day_of_month:parseInt(e.target.value,10)||1}))} type="number" min={1} max={31}/>
+            )}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
+              <Sel label="Destination" value={newSchedule.destination} onChange={e=>setNewSchedule(p=>({...p,destination:e.target.value}))}>
+                <option value="local">Local storage</option><option value="s3">AWS S3</option><option value="azure_blob">Azure Blob</option><option value="gcs">GCS</option><option value="nfs">NFS share</option><option value="offsite">Offsite (generic)</option><option value="air_gapped">Air-gapped</option><option value="tape">Tape (LTO)</option>
+              </Sel>
+              <Sel label={"Regulatory preset"+(activePreset?" — "+activePreset.framework_citation:"")} value={newSchedule.regulatory_preset_id || ""} onChange={e=>applyPresetDefaults(e.target.value || null)}>
+                <option value="">None (full flexibility)</option>
+                {presets.map(p=>(<option key={p.id} value={p.id}>{p.name} — {p.description}</option>))}
               </Sel>
             </div>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" checked={newBackupSched.encrypted} onChange={e=>setNewBackupSched(prev=>({...prev,encrypted:e.target.checked}))}/><M style={{color:C.t}}>Encrypt backup (AES-256-GCM)</M></label>
-            <Btn primary onClick={()=>{const preset=newBackupSched.regulatoryPreset;let sched={...newBackupSched,id:"bs"+Date.now()};if(preset==="HIPAA"){sched.frequency="daily";sched.retentionDays=2190;sched.encrypted=true;}else if(preset==="SOX"){sched.frequency="daily";sched.retentionDays=2555;sched.encrypted=true;}else if(preset==="PCI_DSS"){sched.frequency="daily";sched.retentionDays=365;sched.encrypted=true;}setBackupSchedules(prev=>[...prev,sched]);setNewBackupSched({type:"incremental",frequency:"daily",time:"02:00",day:"sunday",destination:"local",retentionDays:30,encrypted:true,regulatoryPreset:"none"});addA("BACKUP_SCHEDULE_ADDED","Backup schedule added: "+sched.type+" "+sched.frequency);}}>+ Add Schedule</Btn>
+            <div style={{marginTop:8}}>
+              <Input
+                label={"Retention (days)"+(activePreset?` — ${activePreset.name} minimum: ${formatRetention(activePreset.min_retention_days)}`:"")}
+                value={newSchedule.retention_days}
+                onChange={e=>setNewSchedule(p=>({...p,retention_days:parseInt(e.target.value,10)||0}))}
+                type="number"
+                min={activePreset?activePreset.min_retention_days:1}
+              />
+              {activePreset && newSchedule.retention_days < activePreset.min_retention_days && (
+                <M style={{color:C.d,display:"block",fontSize:11,marginTop:4}}>Below {activePreset.name} minimum of {formatRetention(activePreset.min_retention_days)}. Server will reject.</M>
+              )}
+            </div>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"10px 0"}}>
+              <input
+                type="checkbox"
+                checked={!!newSchedule.encrypted}
+                disabled={activePreset && activePreset.required_encryption==="AES-256"}
+                onChange={e=>setNewSchedule(p=>({...p,encrypted:e.target.checked}))}
+              />
+              <M style={{color:C.t}}>Encrypt backup (AES-256-GCM){activePreset && activePreset.required_encryption==="AES-256"?` — required by ${activePreset.name}`:""}</M>
+            </label>
+            <Btn primary disabled={addBusy} onClick={()=>submitNewSchedule(false)}>{addBusy?"Adding...":"+ Add Schedule"}</Btn>
           </Card>
         </div>)}
 

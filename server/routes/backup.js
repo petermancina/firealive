@@ -246,14 +246,51 @@ router.get('/:id/verify', async (req, res) => {
 
 // ── Backup Schedule Config ───────────────────────────────────────────────────
 //
-// Unchanged from v1.0.29. Schedule config is orthogonal to format and
-// stays the same shape across the v1 -> v2 transition.
+// R3i C11: /api/backup/config GET and POST are now backwards-
+// compatibility shims over the canonical backup_schedules table
+// (promoted into init.js migration discipline in C2). The legacy
+// singleton at team_config.backup_config was backfilled into a
+// 'Legacy default' row in C11's init migration if the singleton
+// existed; if the singleton never existed, the GET endpoint
+// surfaces the hardcoded v1.0.x defaults the original
+// implementation returned. New callers should use
+// /api/backup-schedules (multi-schedule with preset enforcement);
+// these two endpoints stay live for one version of deprecation
+// grace, with the response body carrying deprecated:true and a
+// replacement hint for caller discovery.
 router.get('/config', (req, res) => {
   try {
     const db = getDb();
-    const config = db.prepare("SELECT value FROM team_config WHERE key = 'backup_config'").get();
+    const row = db.prepare(
+      "SELECT id, frequency, interval, time, retention FROM backup_schedules ORDER BY id LIMIT 1"
+    ).get();
     db.close();
-    res.json(config ? JSON.parse(config.value) : { schedule: 'daily', time: '02:00', retentionDays: 30 });
+    if (row) {
+      const freqOrInterval = row.frequency || row.interval || 'daily';
+      const retentionMatch = /^(\d+)\s*day/i.exec(row.retention || '');
+      const retentionDays = retentionMatch
+        ? parseInt(retentionMatch[1], 10)
+        : 30;
+      res.json({
+        schedule: freqOrInterval,
+        time: row.time || '02:00',
+        retentionDays,
+        deprecated: true,
+        replacement: '/api/backup-schedules',
+      });
+    } else {
+      // No schedules in the canonical table; surface the hardcoded
+      // v1.0.x defaults the original singleton-config implementation
+      // returned when team_config.backup_config was empty. Pre-R3i
+      // callers depending on this shape continue to receive it.
+      res.json({
+        schedule: 'daily',
+        time: '02:00',
+        retentionDays: 30,
+        deprecated: true,
+        replacement: '/api/backup-schedules',
+      });
+    }
   } catch (err) {
     logger.error('Get backup config error', { error: err.message });
     res.status(500).json({ error: 'Failed to get backup config' });
@@ -264,15 +301,88 @@ router.post('/config', (req, res) => {
   const { schedule, time, retentionDays } = req.body;
   try {
     const db = getDb();
-    const config = JSON.stringify({
-      schedule: ['daily', 'weekly', 'monthly'].includes(schedule) ? schedule : 'daily',
-      time: /^\d{2}:\d{2}$/.test(time) ? time : '02:00',
-      retentionDays: Math.max(7, Math.min(365, parseInt(retentionDays, 10) || 30)),
-    });
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('backup_config', ?, ?)").run(config, req.user.id);
+    const validated = {
+      schedule: ['daily', 'weekly', 'monthly'].includes(schedule)
+        ? schedule
+        : 'daily',
+      time: /^\d{1,2}:\d{2}$/.test(time) ? time : '02:00',
+      retentionDays: Math.max(
+        7,
+        Math.min(365, parseInt(retentionDays, 10) || 30),
+      ),
+    };
+    // Find the first row (singleton-semantic) or create a 'Legacy
+    // default' row if none exists. Direct SQL rather than service
+    // call because the legacy endpoint preserves singleton-overwrite
+    // semantics (no preset, no overlap detection, no validation
+    // beyond the legacy bounds).
+    const existing = db.prepare(
+      'SELECT id FROM backup_schedules ORDER BY id LIMIT 1'
+    ).get();
+    if (existing) {
+      db.prepare(`
+        UPDATE backup_schedules
+        SET interval = ?, time = ?, retention = ?
+        WHERE id = ?
+      `).run(
+        validated.schedule,
+        validated.time,
+        `${validated.retentionDays} days`,
+        existing.id,
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO backup_schedules
+          (type, interval, retention, destination, encrypted,
+           active, last_run, created_at, name, regulatory_preset_id,
+           time, day_of_week, day_of_month, next_run,
+           last_status, last_error)
+        VALUES
+          ('full', ?, ?, 'local', 1,
+           1, NULL, ?, 'Legacy default', NULL,
+           ?, NULL, NULL, NULL,
+           NULL, NULL)
+      `).run(
+        validated.schedule,
+        `${validated.retentionDays} days`,
+        new Date().toISOString(),
+        validated.time,
+      );
+    }
     db.close();
-    auditLog(req.user.id, 'BACKUP_CONFIG_UPDATED', config, req.ip);
-    res.json(JSON.parse(config));
+    // Update team_config.backup_config singleton too, so any external
+    // tooling still reading the singleton directly sees the latest
+    // value. The canonical table is the source of truth; the
+    // singleton is a read-shadow.
+    try {
+      const shadowDb = getDb();
+      const shadow = JSON.stringify({
+        schedule: validated.schedule,
+        time: validated.time,
+        retentionDays: validated.retentionDays,
+      });
+      shadowDb.prepare(
+        "INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('backup_config', ?, ?)"
+      ).run(shadow, req.user.id);
+      shadowDb.close();
+    } catch (shadowErr) {
+      logger.warn('R3i: legacy backup_config shadow write failed', {
+        error: shadowErr.message,
+      });
+    }
+    auditLog(
+      req.user.id,
+      'BACKUP_CONFIG_DEPRECATED_USAGE',
+      `Legacy /api/backup/config POST used; consider migrating to POST /api/backup-schedules. Singleton: ${JSON.stringify(validated)}`,
+      req.ip,
+    );
+    res.json({
+      schedule: validated.schedule,
+      time: validated.time,
+      retentionDays: validated.retentionDays,
+      deprecated: true,
+      replacement: '/api/backup-schedules',
+    });
   } catch (err) {
     logger.error('Update backup config error', { error: err.message });
     res.status(500).json({ error: 'Failed to update backup config' });

@@ -126,17 +126,33 @@ const schedulerService = {
       }
     }));
 
-    // ── Automated backup ─────────────────────────────────────────────────
-    const backupSchedule = process.env.BACKUP_SCHEDULE || '0 2 * * *';
-    this.jobs.push(cron.schedule(backupSchedule, () => {
-      try {
-        logger.info('Starting scheduled backup');
-        // Backup logic will be in backup route/service
-        const { performBackup } = require('./backup');
-        performBackup('daily-auto');
-      } catch (err) {
-        logger.error('Scheduler: backup failed', { error: err.message });
-      }
+    // ── R3i: DB-driven multi-schedule backup registration ────────────────
+    //
+    // Replaces the single hardcoded BACKUP_SCHEDULE env-var cron job with
+    // a per-schedule registration pattern: every row in backup_schedules
+    // with active=1 gets its own cron.schedule() registered. The job
+    // handler loads the schedule fresh by id at fire time (defends against
+    // mid-flight edits), runs performBackup, and records last_status /
+    // last_run / last_error / next_run back to the row.
+    //
+    // Legacy env-var fallback: when no active schedules exist in the DB
+    // AND process.env.BACKUP_SCHEDULE is set, a single legacy job runs
+    // off the env var. Matches the C11 migration behavior — existing
+    // installs that have not yet had their team_config.backup_config
+    // singleton migrated continue to back up.
+    //
+    // Reload-on-mutation: a 60-second poll computes a checksum of the
+    // active backup_schedules rows. When the checksum changes (any
+    // create / update / delete), reloadBackupJobs() tears down the
+    // current backup cron jobs and re-registers from the fresh DB
+    // state. The poll cadence trades 60-second responsiveness against
+    // simpler cross-module decoupling — the backup-schedules service
+    // does not need to call into scheduler directly. Admin-grade
+    // schedule mutations are infrequent enough that the lag is
+    // operator-acceptable.
+    this._registerBackupJobs();
+    this.jobs.push(cron.schedule('* * * * *', () => {
+      this._maybeReloadBackupJobs();
     }));
 
     // ── R3d-2: scheduled chain integrity verification ──────────────────────
@@ -423,9 +439,308 @@ const schedulerService = {
 
   stop() {
     this.jobs.forEach(j => j.stop());
+    for (const job of this.backupJobs.values()) {
+      job.stop();
+    }
+    this.backupJobs.clear();
+    this._lastBackupSignature = null;
     this.jobs = [];
     logger.info('Scheduler stopped');
-  }
+  },
+
+  // ── R3i: backup job lifecycle ──────────────────────────────────────────
+  //
+  // backupJobs is a Map keyed by schedule id (or the sentinel
+  // '__legacy_env__' when running off process.env.BACKUP_SCHEDULE).
+  // Values are node-cron Job instances. Tracking these separately
+  // from this.jobs lets reloadBackupJobs() tear down only the
+  // backup-related crons without touching the unrelated jobs
+  // (lighter expiry, restore-approval sweeps, GD push, etc.).
+  backupJobs: new Map(),
+  _lastBackupSignature: null,
+
+  _registerBackupJobs() {
+    // Stop any currently-registered backup jobs.
+    for (const job of this.backupJobs.values()) {
+      try { job.stop(); } catch (_) { /* idempotent */ }
+    }
+    this.backupJobs.clear();
+
+    const { getDb } = require('../db/init');
+    let db = null;
+    try {
+      db = getDb();
+      const schedules = db.prepare(
+        'SELECT * FROM backup_schedules WHERE active = 1'
+      ).all();
+
+      if (schedules.length === 0) {
+        // Legacy env-var fallback.
+        const envSchedule = process.env.BACKUP_SCHEDULE;
+        if (envSchedule) {
+          this._registerLegacyEnvBackupJob(envSchedule);
+          logger.info(`Scheduler: no DB schedules — registered legacy env-var backup job (${envSchedule})`);
+        } else {
+          logger.info('Scheduler: no DB schedules and no BACKUP_SCHEDULE env var — backup cron is idle');
+        }
+      } else {
+        let registered = 0;
+        let skipped = 0;
+        for (const schedule of schedules) {
+          if (this._registerBackupJob(schedule)) {
+            registered += 1;
+          } else {
+            skipped += 1;
+          }
+        }
+        logger.info(`Scheduler: registered ${registered} backup schedule(s)${skipped > 0 ? ` (skipped ${skipped} unschedulable)` : ''}`);
+      }
+
+      // Update the signature so the next poll does not see this state
+      // as a change.
+      this._lastBackupSignature = this._computeBackupSignature(db);
+    } catch (err) {
+      logger.error('Scheduler: backup jobs registration failed', { error: err.message });
+    } finally {
+      if (db) { try { db.close(); } catch (_) { /* idempotent */ } }
+    }
+  },
+
+  _registerBackupJob(schedule) {
+    const cronExpr = this._scheduleToCronExpression(schedule);
+    if (!cronExpr) {
+      logger.warn('Scheduler: skipping unschedulable backup', {
+        scheduleId: schedule.id,
+        name: schedule.name,
+        frequency: schedule.frequency,
+        interval: schedule.interval,
+      });
+      return false;
+    }
+    try {
+      const job = cron.schedule(cronExpr, () => {
+        this._runBackupJob(schedule.id);
+      });
+      this.backupJobs.set(schedule.id, job);
+      return true;
+    } catch (registerErr) {
+      logger.error('Scheduler: cron.schedule registration failed', {
+        scheduleId: schedule.id,
+        cronExpr,
+        error: registerErr.message,
+      });
+      return false;
+    }
+  },
+
+  _registerLegacyEnvBackupJob(cronExpr) {
+    try {
+      const job = cron.schedule(cronExpr, () => {
+        try {
+          logger.info('Starting legacy env-var scheduled backup');
+          const { performBackup } = require('./backup');
+          performBackup('daily-auto');
+        } catch (err) {
+          logger.error('Scheduler: legacy backup failed', { error: err.message });
+        }
+      });
+      this.backupJobs.set('__legacy_env__', job);
+    } catch (registerErr) {
+      logger.error('Scheduler: legacy env-var backup registration failed', {
+        cronExpr,
+        error: registerErr.message,
+      });
+    }
+  },
+
+  _runBackupJob(scheduleId) {
+    const { getDb } = require('../db/init');
+    const backupSchedules = require('./backup-schedules');
+    let db = null;
+    try {
+      db = getDb();
+      const schedule = db.prepare(
+        'SELECT * FROM backup_schedules WHERE id = ?'
+      ).get(scheduleId);
+      if (!schedule || schedule.active === 0) {
+        logger.warn('Scheduler: backup fire for missing/inactive schedule', { scheduleId });
+        return;
+      }
+
+      // Compute the NEXT fire time (after this one) and write it back.
+      // The current invocation IS the previous next_run; from now we
+      // look forward for the subsequent one.
+      const next = backupSchedules.nextFireTime({
+        active: schedule.active,
+        frequency: schedule.frequency,
+        interval: schedule.interval,
+        time: schedule.time,
+        day_of_week: schedule.day_of_week,
+        day_of_month: schedule.day_of_month,
+      });
+
+      db.prepare(
+        'UPDATE backup_schedules SET last_status = ?, next_run = ? WHERE id = ?'
+      ).run('running', next, scheduleId);
+
+      // performBackup accepts a limited type enum:
+      // 'daily-auto' | 'on-demand' | 'snapshot'. The schedule.type
+      // column stores a broader vocabulary ('full' | 'incremental' |
+      // 'differential' | 'snapshot') that this layer collapses for
+      // execution. Future cleanup can broaden performBackup; for now
+      // snapshot maps to snapshot, everything else to daily-auto.
+      const backupType = schedule.type === 'snapshot' ? 'snapshot' : 'daily-auto';
+      const startedAt = new Date().toISOString();
+
+      logger.info('Scheduler: starting scheduled backup', {
+        scheduleId,
+        name: schedule.name,
+        type: backupType,
+      });
+
+      const { performBackup } = require('./backup');
+      Promise.resolve(performBackup(backupType)).then(() => {
+        try {
+          const successDb = getDb();
+          successDb.prepare(
+            'UPDATE backup_schedules SET last_status = ?, last_run = ?, last_error = NULL WHERE id = ?'
+          ).run('success', startedAt, scheduleId);
+          successDb.close();
+          logger.info('Scheduler: scheduled backup complete', {
+            scheduleId,
+            name: schedule.name,
+          });
+        } catch (recordSuccessErr) {
+          logger.error('Scheduler: failed to record backup success', {
+            scheduleId,
+            error: recordSuccessErr.message,
+          });
+        }
+      }).catch((jobErr) => {
+        try {
+          const failDb = getDb();
+          failDb.prepare(
+            'UPDATE backup_schedules SET last_status = ?, last_error = ? WHERE id = ?'
+          ).run('failed', String(jobErr.message || jobErr), scheduleId);
+          failDb.close();
+        } catch (recordFailErr) {
+          logger.error('Scheduler: failed to record backup failure', {
+            scheduleId,
+            error: recordFailErr.message,
+          });
+        }
+        logger.error('Scheduler: scheduled backup failed', {
+          scheduleId,
+          name: schedule.name,
+          error: jobErr.message,
+        });
+      });
+    } catch (err) {
+      logger.error('Scheduler: backup job runner threw', {
+        scheduleId,
+        error: err.message,
+      });
+    } finally {
+      if (db) { try { db.close(); } catch (_) { /* idempotent */ } }
+    }
+  },
+
+  // Cron expression builder. node-cron format: m h dom mon dow.
+  // Limitation: monthly schedules where day_of_month exceeds the
+  // current month's last day (e.g. 31 in February) will simply not
+  // fire that month under raw cron rules. The nextFireTime helper
+  // in backup-schedules clamps to the last day for UI prediction
+  // purposes, but the cron registration itself uses raw rules.
+  // A future cleanup phase can implement the clamp at fire time
+  // by registering a daily cron + checking the date inside the
+  // handler.
+  _scheduleToCronExpression(schedule) {
+    if (!schedule) return null;
+    const frequency = schedule.frequency
+      || this._legacyIntervalToFrequency(schedule.interval);
+    if (!frequency) return null;
+
+    const time = schedule.time || '02:00';
+    const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(time);
+    if (!timeMatch && frequency !== 'hourly') return null;
+    const h = timeMatch ? parseInt(timeMatch[1], 10) : 0;
+    const m = timeMatch ? parseInt(timeMatch[2], 10) : 0;
+    if (frequency !== 'hourly' && (h < 0 || h > 23 || m < 0 || m > 59)) return null;
+
+    if (frequency === 'hourly') return '0 * * * *';
+    if (frequency === 'daily') return `${m} ${h} * * *`;
+    if (frequency === 'weekly') {
+      const dow = schedule.day_of_week;
+      if (typeof dow !== 'number' || dow < 0 || dow > 6) return null;
+      return `${m} ${h} * * ${dow}`;
+    }
+    if (frequency === 'monthly') {
+      const dom = schedule.day_of_month;
+      if (typeof dom !== 'number' || dom < 1 || dom > 31) return null;
+      return `${m} ${h} ${dom} * *`;
+    }
+    return null;
+  },
+
+  _legacyIntervalToFrequency(interval) {
+    if (!interval || typeof interval !== 'string') return null;
+    const lower = interval.toLowerCase();
+    if (lower.includes('hour')) return 'hourly';
+    if (lower.includes('week')) return 'weekly';
+    if (lower.includes('month')) return 'monthly';
+    if (lower.includes('day') || lower === 'daily') return 'daily';
+    return null;
+  },
+
+  _computeBackupSignature(db) {
+    // Concatenate the scheduling-relevant fields of every active
+    // schedule. Any change to frequency / time / day / activeness
+    // shifts the signature and triggers a reload on next poll.
+    const rows = db.prepare(`
+      SELECT id, COALESCE(frequency, interval, '') AS f,
+             COALESCE(time, '') AS t,
+             COALESCE(day_of_week, -1) AS dow,
+             COALESCE(day_of_month, -1) AS dom,
+             active
+      FROM backup_schedules
+      ORDER BY id
+    `).all();
+    return rows.map(r =>
+      `${r.id}:${r.f}:${r.t}:${r.dow}:${r.dom}:${r.active}`
+    ).join('|');
+  },
+
+  _maybeReloadBackupJobs() {
+    const { getDb } = require('../db/init');
+    let db = null;
+    try {
+      db = getDb();
+      const sig = this._computeBackupSignature(db);
+      if (sig !== this._lastBackupSignature) {
+        logger.info('Scheduler: backup schedule signature changed; reloading jobs');
+        // _registerBackupJobs opens its own DB connection; close ours
+        // first so we don't hold two simultaneously.
+        try { db.close(); } catch (_) { /* idempotent */ }
+        db = null;
+        this._registerBackupJobs();
+      } else if (db) {
+        try { db.close(); } catch (_) { /* idempotent */ }
+        db = null;
+      }
+    } catch (err) {
+      logger.error('Scheduler: poll-and-reload failed', { error: err.message });
+      if (db) { try { db.close(); } catch (_) { /* idempotent */ } }
+    }
+  },
+
+  // Public hook: callers (the backup-schedules service or admin
+  // route handlers) can trigger an immediate reload after a known
+  // mutation. The 60-second poll guarantees eventual consistency
+  // even without this hook, but explicit callers avoid the lag.
+  reloadBackupJobs() {
+    logger.info('Scheduler: reloadBackupJobs called');
+    this._registerBackupJobs();
+  },
 };
 
 function generateReport(db, config, type) {

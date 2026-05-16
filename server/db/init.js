@@ -3351,6 +3351,637 @@ function initDb() {
       ON CONFLICT(id) DO NOTHING;
   `);
 
+  // ── R3i schema additions (v1.0.35) — Backup Multi-Schedule with Regulatory Presets ──
+  //
+  // Phase R3i ships multi-schedule backup with regulatory framework
+  // presets (HIPAA, SOX, PCI-DSS, GDPR, NIST CSF, ISO 27001, SOC 2).
+  // The full architecture lives across two new tables introduced in
+  // this phase:
+  //
+  //   regulatory_presets   (this commit, C1)
+  //     stores framework-specific compliance floors (min retention,
+  //     required encryption, recommended frequency / destination
+  //     type, framework citation). The UI uses these to pre-fill new
+  //     schedules with the framework's defaults; the API uses them
+  //     to enforce the floors on schedule create / update.
+  //
+  //   backup_schedules     (commit C2)
+  //     promotes the existing class-managed table from
+  //     server/services/backup-service.js into init.js migration
+  //     discipline, extending with name / regulatory_preset_id /
+  //     time / day_of_week / day_of_month / next_run / last_status /
+  //     last_error columns.
+  //
+  // Floor-enforcement model (hybrid floor + upward flexibility):
+  //
+  //   When a schedule is created or updated with a non-null
+  //   regulatory_preset_id, the API validates that:
+  //
+  //     - retention_days >= preset.min_retention_days
+  //     - encrypted == 1 if preset.required_encryption == 'AES-256'
+  //
+  //   Recommended fields (frequency, destination_type) are pre-filled
+  //   on preset selection in the UI but NOT enforced by the API.
+  //   The operator may set retention HIGHER than the floor (legal-hold
+  //   use cases, longer compliance windows) but may NOT go below.
+  //   Switching presets re-applies the new floor. The 'None' preset is
+  //   the absence of a regulatory_preset_id (NULL foreign-key value);
+  //   no floor enforcement runs in that case.
+  //
+  // Schema notes:
+  //
+  //   id                              Stable lowercase-snake-case slug
+  //                                   used as a foreign key target from
+  //                                   backup_schedules.regulatory_preset_id.
+  //                                   Examples: 'hipaa', 'sox',
+  //                                   'pci_dss', 'gdpr', 'nist_csf',
+  //                                   'iso_27001', 'soc_2'.
+  //
+  //   name                            Display name surfaced in the UI
+  //                                   (e.g. 'HIPAA', 'PCI-DSS').
+  //
+  //   description                     One-line operator-facing
+  //                                   description of the preset's
+  //                                   purpose. Surfaced in the preset
+  //                                   selector tooltip.
+  //
+  //   min_retention_days              Lower bound for retention. The
+  //                                   API rejects schedules below this
+  //                                   value with 400
+  //                                   RETENTION_BELOW_FLOOR when the
+  //                                   preset is selected.
+  //
+  //   required_encryption             'AES-256' = enforced on schedule
+  //                                   create/update (encrypted column
+  //                                   MUST be 1). 'none' = not enforced
+  //                                   (operator chooses).
+  //
+  //   recommended_frequency           Suggested frequency. Pre-fills
+  //                                   the UI dropdown on preset
+  //                                   selection but is not enforced.
+  //
+  //   recommended_destination_type    Suggested destination class
+  //                                   ('local', 's3', 'offsite',
+  //                                   'air_gapped'). Pre-fills the UI
+  //                                   destination selector but is not
+  //                                   enforced. NULL when no specific
+  //                                   destination class is recommended.
+  //
+  //   framework_citation              Authoritative citation for the
+  //                                   floor (e.g. '45 CFR 164.316(b)(2)(i)'
+  //                                   for HIPAA). Surfaced in the
+  //                                   preset selector metadata for
+  //                                   operator transparency.
+  //
+  //   created_at                      ISO timestamp of preset row
+  //                                   creation. Useful when future
+  //                                   phases add updated_at and want
+  //                                   to track which presets are
+  //                                   originals vs operator-edited.
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS. Re-running migrations
+  // against an existing database is a no-op. The seven seed rows ship
+  // in C3 (in this same migration block, after the table create); this
+  // commit (C1) just establishes the table shape.
+  //
+  // Runs in its own try/catch for fault isolation; a failure here
+  // does not mask any prior R3e / R3g / R3h migration block.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS regulatory_presets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        min_retention_days INTEGER NOT NULL,
+        required_encryption TEXT NOT NULL
+          CHECK (required_encryption IN ('AES-256', 'none')),
+        recommended_frequency TEXT NOT NULL,
+        recommended_destination_type TEXT,
+        framework_citation TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    // R3i C3 — Seed 7 regulatory framework presets ────────────────
+    //
+    // Seeds the regulatory_presets table with the seven frameworks
+    // declared in scope for R3i: HIPAA, SOX, PCI-DSS, GDPR, NIST
+    // CSF, ISO 27001, SOC 2.
+    //
+    // Floor values per framework:
+    //
+    //   HIPAA       6 years (2190 days)  PHI retention requirement
+    //               45 CFR 164.316(b)(2)(i)
+    //
+    //   SOX         7 years (2555 days)  Auditor record retention
+    //               17 CFR 210.2-06 / 18 USC 1520
+    //
+    //   PCI-DSS     1 year (365 days)    Audit log retention floor
+    //               PCI DSS v4.0 Requirement 10.7.1
+    //
+    //   GDPR        30 days              Storage limitation
+    //               Articles 5(1)(e), 25, 32, Chapter V
+    //               (operational floor for incident recovery; the
+    //                storage-limitation upper bound is operator-
+    //                managed via retention review, not encoded here)
+    //
+    //   NIST CSF    365 days (default)   Backup data protection
+    //               NIST CSF 2.0 PR.DS-11
+    //               (framework specifies HAVING a backup policy,
+    //                not a specific retention; 1-year sensible
+    //                default that operator can adjust per policy)
+    //
+    //   ISO 27001   365 days (default)   Information backup
+    //               ISO/IEC 27001:2022 Annex A.8.13
+    //               (framework specifies HAVING a backup policy,
+    //                not a specific retention; 1-year default)
+    //
+    //   SOC 2       365 days (default)   Trust Services Criteria
+    //               TSC CC9.1 / CC6.1
+    //               (framework specifies backup controls, not a
+    //                specific retention; 1-year default)
+    //
+    // All seven presets require AES-256 encryption per current
+    // SOC-grade default. Operators wanting legacy un-encrypted
+    // backups select the 'None' preset (no regulatory_preset_id)
+    // which releases this constraint.
+    //
+    // Recommended destination types:
+    //
+    //   HIPAA / SOX                  'offsite'    secure offsite
+    //   PCI-DSS                      'air_gapped' cardholder isolation
+    //   GDPR                         'offsite'    (with EU-region
+    //                                             constraint applied
+    //                                             via destination
+    //                                             config; not encoded
+    //                                             at preset level)
+    //   NIST CSF / ISO 27001 / SOC 2  NULL        no specific class;
+    //                                             operator chooses
+    //                                             per policy
+    //
+    // Recommended frequency is 'daily' for all seven presets. This
+    // is the standard operational cadence for SOC-grade backup
+    // posture. Operators are free to set higher (hourly) or
+    // different cadences per their specific risk profile via the
+    // upward-flexibility model.
+    //
+    // Idempotency:
+    //
+    //   INSERT OR IGNORE on the primary-key id slug. Re-running
+    //   migrations against an already-seeded DB is a no-op.
+    //   Operators who want to override a preset's floor values can
+    //   UPDATE the row directly; the seed on subsequent boots
+    //   will NOT overwrite their changes (INSERT OR IGNORE skips
+    //   the row entirely if the id already exists).
+    //
+    // Framework citation format:
+    //
+    //   Plain-text ASCII-only citations. Section symbols avoided
+    //   for cross-environment rendering reliability.
+    const seedPresets = [
+      {
+        id: 'hipaa',
+        name: 'HIPAA',
+        description: 'Protected health information - 6-year retention, AES-256, daily backup',
+        min_retention_days: 2190,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: 'offsite',
+        framework_citation: '45 CFR 164.316(b)(2)(i)',
+      },
+      {
+        id: 'sox',
+        name: 'SOX',
+        description: 'Financial audit trails - 7-year retention, AES-256, daily backup',
+        min_retention_days: 2555,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: 'offsite',
+        framework_citation: '17 CFR 210.2-06 / 18 USC 1520',
+      },
+      {
+        id: 'pci_dss',
+        name: 'PCI-DSS',
+        description: 'Cardholder data - 1-year retention, AES-256, daily backup',
+        min_retention_days: 365,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: 'air_gapped',
+        framework_citation: 'PCI DSS v4.0 Requirement 10.7.1',
+      },
+      {
+        id: 'gdpr',
+        name: 'GDPR',
+        description: 'EU personal data - 30-day minimum, AES-256, EU-region destination',
+        min_retention_days: 30,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: 'offsite',
+        framework_citation: 'Articles 5(1)(e), 25, 32, Chapter V',
+      },
+      {
+        id: 'nist_csf',
+        name: 'NIST CSF',
+        description: 'Cybersecurity Framework 2.0 - flexible retention, AES-256 required',
+        min_retention_days: 365,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: null,
+        framework_citation: 'NIST CSF 2.0 PR.DS-11',
+      },
+      {
+        id: 'iso_27001',
+        name: 'ISO 27001',
+        description: 'Information security management - flexible retention, AES-256 required',
+        min_retention_days: 365,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: null,
+        framework_citation: 'ISO/IEC 27001:2022 Annex A.8.13',
+      },
+      {
+        id: 'soc_2',
+        name: 'SOC 2',
+        description: 'Trust Services Criteria - flexible retention, AES-256 required',
+        min_retention_days: 365,
+        required_encryption: 'AES-256',
+        recommended_frequency: 'daily',
+        recommended_destination_type: null,
+        framework_citation: 'TSC CC9.1 / CC6.1',
+      },
+    ];
+    const insertPreset = db.prepare(`
+      INSERT OR IGNORE INTO regulatory_presets
+        (id, name, description, min_retention_days, required_encryption,
+         recommended_frequency, recommended_destination_type, framework_citation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    let seededCount = 0;
+    for (const preset of seedPresets) {
+      const result = insertPreset.run(
+        preset.id,
+        preset.name,
+        preset.description,
+        preset.min_retention_days,
+        preset.required_encryption,
+        preset.recommended_frequency,
+        preset.recommended_destination_type,
+        preset.framework_citation,
+      );
+      if (result.changes > 0) seededCount += 1;
+    }
+    if (seededCount > 0) {
+      console.log(`R3i migration: seeded ${seededCount} regulatory_presets row(s)`);
+    }
+
+    const presetCount = db.prepare('SELECT COUNT(*) AS n FROM regulatory_presets').get().n;
+    console.log(`R3i migration: regulatory_presets table ready (${presetCount} preset(s) present)`);
+  } catch (r3iPresetsMigrationErr) {
+    console.error('R3i regulatory_presets migration FAILED:', r3iPresetsMigrationErr.message);
+    console.error('The server will start, but multi-schedule backup with regulatory presets will not function until investigated.');
+  }
+
+  // ── R3i schema additions (v1.0.35) — backup_schedules promotion + extend ──
+  //
+  // Phase R3i second schema commit (C2). Promotes the existing
+  // backup_schedules table from server/services/backup-service.js
+  // (where it was lazily created in BackupService._initTables() on
+  // class construction) into init.js migration discipline, and
+  // extends with eight new columns to support multi-schedule
+  // backup with regulatory framework presets.
+  //
+  // The legacy lazy-create pattern was an artifact of the v1.0.0
+  // baseline (server/routes/v100-features.js POST /api/v1/backup/
+  // schedule/add path). It worked but lived outside the
+  // canonical init-time migration discipline: schema changes
+  // happened on first BackupService construction, with no
+  // guaranteed ordering relative to other init steps and no
+  // visibility in the central init.js migration log.
+  //
+  // After this commit, the table:
+  //
+  //   1. Is created at init.js boot time if missing (fresh installs)
+  //   2. Has its eight new columns added via idempotent ALTER if
+  //      missing (upgrade from v1.0.34 where the legacy lazy create
+  //      ran but only knew the original 9 columns)
+  //
+  // The BackupService._initTables() call in backup-service.js is
+  // left in place for now. Its CREATE TABLE IF NOT EXISTS is a
+  // no-op after this migration runs (init.js owns the schema).
+  // C10 (BackupService.addSchedule delegation) is the commit that
+  // removes the lazy _initTables call and migrates the v100 stub
+  // route to use the new persistence layer.
+  //
+  // Column inventory:
+  //
+  //   LEGACY (preserved from BackupService._initTables, original
+  //   v1.0.0 shape — backwards-compatible with v100 stub callers):
+  //
+  //     id              INTEGER PRIMARY KEY AUTOINCREMENT
+  //     type            TEXT          'full' | 'incremental' |
+  //                                   'differential' | 'snapshot'
+  //     interval        TEXT          legacy free-form string
+  //                                   e.g. 'Every 4hr' — preserved
+  //                                   for v100 callers; new rows
+  //                                   created via the modern
+  //                                   service leave this NULL
+  //     retention       TEXT          legacy free-form string
+  //                                   e.g. '30 days' — new rows
+  //                                   use retention_days (INTEGER)
+  //                                   on a follow-up cleanup phase
+  //                                   could deprecate this column
+  //     destination     TEXT          destination identifier
+  //                                   (matches backup_destinations
+  //                                   row id when modern shape)
+  //     encrypted       INTEGER       DEFAULT 1 (encryption is
+  //                                   the strong default)
+  //     active          INTEGER       DEFAULT 1 (schedule is on
+  //                                   until explicitly paused)
+  //     last_run        TEXT          ISO timestamp of most recent
+  //                                   run (success or failure)
+  //     created_at      TEXT          ISO timestamp of row create
+  //
+  //   NEW (R3i additions for multi-schedule + regulatory presets):
+  //
+  //     name                  TEXT          operator-supplied label
+  //                                         surfaced in the UI list
+  //                                         e.g. 'Daily HIPAA backup
+  //                                         to S3'
+  //
+  //     regulatory_preset_id  TEXT          FK to regulatory_presets
+  //                                         (id) ON DELETE SET NULL.
+  //                                         NULL = 'None' preset
+  //                                         (full operator
+  //                                         flexibility, no floor
+  //                                         enforcement).
+  //
+  //     time                  TEXT          'HH:MM' 24-hour format
+  //                                         for the daily/weekly/
+  //                                         monthly fire time.
+  //                                         NULL for hourly or
+  //                                         legacy schedules using
+  //                                         interval.
+  //
+  //     day_of_week           INTEGER       0-6 (Sunday=0) for
+  //                                         weekly schedules. NULL
+  //                                         otherwise.
+  //
+  //     day_of_month          INTEGER       1-31 for monthly
+  //                                         schedules. NULL
+  //                                         otherwise. Schedules
+  //                                         set to day_of_month=31
+  //                                         on a 30-day month
+  //                                         fire on the last day
+  //                                         (scheduler logic).
+  //
+  //     next_run              TEXT          ISO timestamp of the
+  //                                         next scheduled fire.
+  //                                         Computed by the
+  //                                         scheduler on register
+  //                                         and after each run.
+  //                                         NULL when paused
+  //                                         (active=0).
+  //
+  //     last_status           TEXT          'success' | 'failed' |
+  //                                         'running' | NULL.
+  //                                         Surfaced inline in the
+  //                                         schedules list UI.
+  //
+  //     last_error            TEXT          Error message captured
+  //                                         from the most recent
+  //                                         failure. NULL on
+  //                                         success or never-run.
+  //
+  // Foreign-key behavior:
+  //
+  //   regulatory_preset_id REFERENCES regulatory_presets(id)
+  //   ON DELETE SET NULL — if a preset is somehow removed in a
+  //   future operation (not currently exposed via any UI; theoretical
+  //   only), affected schedules survive with no preset (full
+  //   flexibility). Schedules are NEVER cascade-deleted by preset
+  //   removal — the operator's schedule definition outlives the
+  //   preset metadata.
+  //
+  // Idempotency:
+  //
+  //   CREATE TABLE IF NOT EXISTS handles fresh installs. For
+  //   upgrades from v1.0.34 where BackupService._initTables already
+  //   created the table with the legacy 9 columns, the PRAGMA
+  //   table_info check + per-column ALTER pattern (matching
+  //   R3h-pt2's peer_session_ratings approach) adds only the
+  //   missing new columns. Re-running migrations against a
+  //   fully-migrated database is a no-op.
+  //
+  // Column ordering note:
+  //
+  //   The CREATE TABLE places new columns AFTER the legacy
+  //   columns. Fresh installs get this ordering. Upgrades end up
+  //   with the same final column ordering after ALTER ADD
+  //   COLUMNs append in the same order. PRAGMA table_info on
+  //   fresh-install and upgraded deployments produces identical
+  //   output, eliminating cross-deployment schema drift.
+  //
+  // Fault isolation:
+  //
+  //   Wrapped in its own try/catch so a failure here does not
+  //   mask the C1 regulatory_presets block above or any prior
+  //   R3e / R3g / R3h migration. On failure the server still
+  //   starts; the operator sees an explicit console error
+  //   pointing to multi-schedule backup as the affected surface.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS backup_schedules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT,
+        interval TEXT,
+        retention TEXT,
+        destination TEXT,
+        encrypted INTEGER DEFAULT 1,
+        active INTEGER DEFAULT 1,
+        last_run TEXT,
+        created_at TEXT,
+        name TEXT,
+        regulatory_preset_id TEXT
+          REFERENCES regulatory_presets(id) ON DELETE SET NULL,
+        time TEXT,
+        day_of_week INTEGER,
+        day_of_month INTEGER,
+        next_run TEXT,
+        last_status TEXT,
+        last_error TEXT
+      );
+    `);
+    const schedulesCols = db.prepare("PRAGMA table_info(backup_schedules)").all().map(c => c.name);
+    const addScheduleCol = (col, ddl) => {
+      if (!schedulesCols.includes(col)) {
+        db.exec(`ALTER TABLE backup_schedules ADD COLUMN ${ddl}`);
+        console.log(`R3i migration: added backup_schedules.${col}`);
+        schedulesCols.push(col);
+      }
+    };
+    addScheduleCol('name', 'name TEXT');
+    addScheduleCol('regulatory_preset_id',
+      `regulatory_preset_id TEXT REFERENCES regulatory_presets(id) ON DELETE SET NULL`);
+    addScheduleCol('time', 'time TEXT');
+    addScheduleCol('day_of_week', 'day_of_week INTEGER');
+    addScheduleCol('day_of_month', 'day_of_month INTEGER');
+    addScheduleCol('next_run', 'next_run TEXT');
+    addScheduleCol('last_status', 'last_status TEXT');
+    addScheduleCol('last_error', 'last_error TEXT');
+    const scheduleCount = db.prepare('SELECT COUNT(*) AS n FROM backup_schedules').get().n;
+    console.log(`R3i migration: backup_schedules table ready (${scheduleCount} schedule(s) present)`);
+  } catch (r3iSchedulesMigrationErr) {
+    console.error('R3i backup_schedules migration FAILED:', r3iSchedulesMigrationErr.message);
+    console.error('The server will start, but multi-schedule backup will not function until investigated.');
+  }
+
+  // ── R3i C11: legacy backup_config singleton backfill ─────────────────
+  //
+  // Pre-R3i installs stored a single backup config as a JSON blob in
+  // team_config.backup_config:
+  //
+  //   { schedule: 'daily'|'weekly'|'monthly',
+  //     time: 'HH:MM',
+  //     retentionDays: int }
+  //
+  // /api/backup/config GET/POST read/wrote this singleton; the
+  // scheduler ignored it and ran off process.env.BACKUP_SCHEDULE
+  // instead. C11 closes that gap by promoting the singleton (if
+  // present) into a row in the canonical backup_schedules table
+  // — the same table the new scheduler reads from (C6) and the
+  // new UI manages (C7+C8+C9). After C11, the singleton at
+  // team_config.backup_config becomes informational; the
+  // /api/backup/config endpoints get rewritten in the same C11
+  // commit pair (server/routes/backup.js) to read/write the
+  // first row of backup_schedules and surface a deprecation
+  // hint to callers.
+  //
+  // Migration safety:
+  //
+  //   - Only runs when the legacy singleton actually exists. A
+  //     fresh install (no team_config.backup_config row) skips
+  //     the entire block silently.
+  //
+  //   - Only runs when backup_schedules has zero rows. An install
+  //     that has been editing schedules via the new UI (or the
+  //     v100 stub route via BackupService.addSchedule) is left
+  //     alone — the operator has already moved past the singleton
+  //     and any backfill could create a confusing duplicate.
+  //
+  //   - JSON.parse wrapped in try/catch; a malformed singleton
+  //     (e.g. legacy migration artifact) is logged and skipped
+  //     rather than crashing the boot sequence.
+  //
+  //   - team_config table existence check: very old installs
+  //     might not have team_config yet. PRAGMA-style existence
+  //     check guards the SELECT.
+  //
+  //   - Backfilled row name: 'Legacy default'. Operator can
+  //     rename via the modern UI without losing the schedule.
+  //
+  // Column mapping from singleton -> canonical row:
+  //
+  //   schedule       -> frequency        (validated 'daily'|'weekly'|'monthly')
+  //   time           -> time             (validated 'HH:MM')
+  //   retentionDays  -> retention        ('N days' legacy string)
+  //   (implicit)     -> type             'full'
+  //   (implicit)     -> destination      'local'
+  //   (implicit)     -> encrypted        1
+  //   (implicit)     -> active           1
+  //   (implicit)     -> name             'Legacy default'
+  //
+  //   day_of_week and day_of_month are left NULL. Weekly schedules
+  //   backfilled this way will not fire (the scheduler skips
+  //   weekly rows without day_of_week per the C6 cron expression
+  //   builder); operators upgrading from a weekly singleton see
+  //   the 'Legacy default' row in the UI and configure day_of_week
+  //   explicitly. This is intentional — the singleton never
+  //   carried day_of_week, so the migration has no value to
+  //   propagate. Daily schedules backfill cleanly without this
+  //   gap.
+  //
+  // Idempotent: re-running the migration against an already-
+  // migrated database hits the "backup_schedules has rows" guard
+  // and skips. The team_config.backup_config row itself is left
+  // in place for backwards compat with any external tooling that
+  // still reads it directly (deprecated path; the /api/backup/
+  // config endpoints are rewritten in C11 to read from the
+  // canonical table instead).
+  try {
+    const teamConfigExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='team_config'"
+    ).get();
+    if (teamConfigExists) {
+      const legacyConfig = db.prepare(
+        "SELECT value FROM team_config WHERE key = 'backup_config'"
+      ).get();
+      if (legacyConfig && legacyConfig.value) {
+        const existingSchedules = db.prepare(
+          'SELECT COUNT(*) AS n FROM backup_schedules'
+        ).get();
+        if (existingSchedules.n === 0) {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(legacyConfig.value);
+          } catch (parseErr) {
+            console.warn('R3i migration: legacy backup_config exists but is unparseable JSON; skipping backfill:', parseErr.message);
+          }
+          if (parsed) {
+            const validFrequencies = ['daily', 'weekly', 'monthly'];
+            const frequency = validFrequencies.includes(parsed.schedule)
+              ? parsed.schedule
+              : 'daily';
+            const time = /^\d{1,2}:\d{2}$/.test(parsed.time)
+              ? parsed.time
+              : '02:00';
+            const retentionDays = (
+              typeof parsed.retentionDays === 'number'
+              && Number.isInteger(parsed.retentionDays)
+              && parsed.retentionDays > 0
+            ) ? parsed.retentionDays : 30;
+            db.prepare(`
+              INSERT INTO backup_schedules
+                (type, interval, retention, destination, encrypted,
+                 active, last_run, created_at, name, regulatory_preset_id,
+                 time, day_of_week, day_of_month, next_run,
+                 last_status, last_error)
+              VALUES
+                ('full', NULL, ?, 'local', 1,
+                 1, NULL, ?, 'Legacy default', NULL,
+                 ?, NULL, NULL, NULL,
+                 NULL, NULL)
+            `).run(
+              `${retentionDays} days`,
+              new Date().toISOString(),
+              time,
+            );
+            // Update frequency column separately since the v100
+            // shape uses interval, not frequency. The modern
+            // service reads frequency first when present.
+            const lastInsertedId = db.prepare(
+              'SELECT id FROM backup_schedules ORDER BY id DESC LIMIT 1'
+            ).get();
+            if (lastInsertedId) {
+              db.prepare(
+                'UPDATE backup_schedules SET interval = ? WHERE id = ?'
+              ).run(frequency, lastInsertedId.id);
+            }
+            console.log(
+              `R3i migration: backfilled legacy team_config.backup_config singleton into backup_schedules as "Legacy default" (frequency: ${frequency}, time: ${time}, retention: ${retentionDays} days)`
+            );
+          }
+        } else {
+          console.log(
+            `R3i migration: legacy team_config.backup_config singleton present but backup_schedules already has ${existingSchedules.n} row(s); skipping backfill (operator already migrated)`
+          );
+        }
+      }
+    }
+  } catch (r3iLegacyMigrationErr) {
+    console.error('R3i legacy backup_config migration FAILED:', r3iLegacyMigrationErr.message);
+    console.error('The server will start, but operators upgrading from a singleton-config install may need to manually re-create their schedule via the Backup Schedules UI.');
+  }
+
   console.log('Database initialized at', DB_PATH);
   db.close();
 }
