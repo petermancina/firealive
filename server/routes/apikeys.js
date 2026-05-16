@@ -14,7 +14,7 @@ const { logger } = require('../services/logger');
 
 const VALID_SCOPES = [
   'health:read', 'siem:read', 'siem:write',
-  'reports:generate', 'routing:read', 'routing:write',
+  'reports:generate', 'routing:read', 'routing:write', 'routing:events',
   'audit:read', 'backup:trigger', 'assessments:read',
   'integrations:read', 'integrations:write',
 ];
