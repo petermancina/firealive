@@ -4280,6 +4280,413 @@ function initDb() {
     );
   }
 
+  // ── R3k C1 — cicd_configs + cicd_runs tables ─────────────────────────
+  //
+  // R3k's CI/CD pipeline-config generator (Sub-phase 4) needs two
+  // persistence surfaces:
+  //
+  //   cicd_configs   one row per generated pipeline configuration.
+  //                  Stores: which platform was targeted (GitHub
+  //                  Actions, GitLab CI, Jenkinsfile, CircleCI),
+  //                  what purpose (custom-build for an org's fork or
+  //                  upstream-contribution targeting the public
+  //                  FireAlive repo), when generated, where the
+  //                  output YAML lives on disk, and a JSON snapshot
+  //                  of the current install at generation time (used
+  //                  by the generator to bake the install's
+  //                  integration list + encryption mode + KMS
+  //                  provider + data volume into the pipeline as the
+  //                  build baseline).
+  //
+  //   cicd_runs      one row per external CI run reported back via
+  //                  the webhook receiver (POST /api/cicd/runs).
+  //                  Idempotency on (platform, external_run_id): the
+  //                  same CI vendor reporting the same run id twice
+  //                  collapses to the same row. Two different
+  //                  vendors can independently use overlapping
+  //                  external_run_id values (e.g., both GitLab and
+  //                  Jenkins emitting numeric counters starting at 1)
+  //                  because the platform discriminator is part of
+  //                  the composite key.
+  //
+  // Schema conventions match the canonical patterns established in
+  // R3d (backups), R3i (backup_schedules, regulatory_presets), and
+  // R3j (soar_routing_events):
+  //
+  //   - TEXT PRIMARY KEY with DEFAULT (lower(hex(randomblob(16))))
+  //     for application-level UUIDv4-shape ids when the row's id is
+  //     not derived from external state. R3k C1 follows this for
+  //     both cicd_configs.id and cicd_runs.id.
+  //
+  //   - CHECK constraints on enum columns (platform, purpose,
+  //     status) so SQLite rejects unknown values at INSERT time. The
+  //     route handler in C13 (routes/cicd.js) also validates against
+  //     the same enums in JS for friendlier error messages, but the
+  //     DB CHECK is the load-bearing invariant.
+  //
+  //   - FOREIGN KEY (created_by → users.id) without ON DELETE
+  //     CASCADE: if a user is deleted, their generated pipeline
+  //     configs are preserved for audit. The CI/CD listing endpoint
+  //     in C15 surfaces "user deleted" instead of dropping the row.
+  //
+  //   - FOREIGN KEY (config_id → cicd_configs.id) is NULLABLE
+  //     because external CI runs can arrive before any operator has
+  //     registered a generated config — the webhook receiver in
+  //     C11 records them anyway with config_id NULL so the audit
+  //     trail captures every signal. Operators can retroactively
+  //     associate runs with configs later if needed.
+  //
+  //   - received_at on cicd_runs uses DEFAULT (datetime('now')) so
+  //     the webhook handler doesn't need to pass an explicit
+  //     timestamp. started_at, finished_at come from the CI payload
+  //     and are application-supplied.
+  //
+  // Webhook idempotency design (matches R3j C1 soar_routing_events):
+  //
+  //   The UNIQUE INDEX on (platform, external_run_id) means SQLite
+  //   raises SQLITE_CONSTRAINT_UNIQUE on duplicate INSERTs. The
+  //   webhook handler in C11 catches that error and returns
+  //   {idempotent: true, run_id: <existing row's id>} 200 OK rather
+  //   than 409 — retried webhooks from a CI vendor that lost its
+  //   ack should not error.
+  //
+  // Indexes:
+  //
+  //   idx_cicd_configs_platform     speeds the "show me all GitHub
+  //                                 Actions configs" filter on the
+  //                                 MC CI/CD tab listing.
+  //
+  //   idx_cicd_runs_external        UNIQUE composite enforcing
+  //                                 idempotency; also serves the
+  //                                 "look up this specific external
+  //                                 run" query path.
+  //
+  //   idx_cicd_runs_config          speeds the "show me runs for
+  //                                 this saved config in reverse
+  //                                 chronological order" query
+  //                                 issued by the MC CI/CD tab's
+  //                                 history sub-card (C19).
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT
+  // EXISTS. Re-running migrations against an existing database is a
+  // no-op.
+  //
+  // Runs in its own try/catch for fault isolation; a failure here
+  // does not mask any prior R3e/R3g/R3h/R3i/R3j migration block.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cicd_configs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        platform TEXT NOT NULL
+          CHECK (platform IN ('github-actions', 'gitlab-ci', 'jenkins', 'circleci')),
+        purpose TEXT NOT NULL
+          CHECK (purpose IN ('custom-build', 'upstream-contribution')),
+        generated_at TEXT NOT NULL,
+        generated_yaml_path TEXT NOT NULL,
+        current_install_snapshot_json TEXT NOT NULL,
+        created_by INTEGER NOT NULL REFERENCES users(id)
+      );
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cicd_configs_platform
+        ON cicd_configs (platform);
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cicd_runs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        external_run_id TEXT NOT NULL,
+        platform TEXT NOT NULL
+          CHECK (platform IN ('github-actions', 'gitlab-ci', 'jenkins', 'circleci')),
+        config_id TEXT REFERENCES cicd_configs(id),
+        status TEXT NOT NULL
+          CHECK (status IN ('queued', 'running', 'passed', 'failed', 'cancelled')),
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        commit_sha TEXT,
+        branch TEXT,
+        step_results_json TEXT,
+        ci_metadata_json TEXT,
+        received_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_cicd_runs_external
+        ON cicd_runs (platform, external_run_id);
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cicd_runs_config
+        ON cicd_runs (config_id, received_at);
+    `);
+
+    const configCount = db
+      .prepare('SELECT COUNT(*) AS n FROM cicd_configs')
+      .get().n;
+    const runCount = db
+      .prepare('SELECT COUNT(*) AS n FROM cicd_runs')
+      .get().n;
+    console.log(
+      `R3k migration: cicd_configs + cicd_runs tables ready (${configCount} config(s), ${runCount} run(s) present)`
+    );
+  } catch (r3kCicdSchemaMigrationErr) {
+    console.error(
+      'R3k cicd_configs + cicd_runs migration FAILED:',
+      r3kCicdSchemaMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the CI/CD generator (POST /api/cicd/generate) and webhook receiver (POST /api/cicd/runs) will fail until this migration completes successfully. All other surfaces (routing, integrations, backup, regression) are independent of this table and continue to function.'
+    );
+  }
+
+  // ── R3k C2 — cloud_iac_signing_keys table + backups.kind column ──
+  //
+  // R3k's Cloud & IaC artifact generator (Sub-phase 4) signs every
+  // generated bundle archive with a FireAlive-managed signing key.
+  // This is a SEPARATE signing concern from the backup signing keys
+  // (one signing key per signing concern, no multiplexing) per the
+  // R3K-DETAILED-BUILD-PLAN cross-cutting Sigstore decision. The new
+  // table holds the key material:
+  //
+  //   cloud_iac_signing_keys
+  //     id                    PK, UUID-shape
+  //     public_key            PEM-encoded cosign public key
+  //     private_key_wrapped   KMS-wrapped private key (encrypted at
+  //                           rest via the active KMS DEK; never
+  //                           plaintext on disk)
+  //     algorithm             defaults to 'cosign-ecdsa-p256', the
+  //                           Sigstore-compatible default. Future
+  //                           rotations may emit other algorithms.
+  //     status                'active' on creation; flips to
+  //                           'rotated' when a successor key takes
+  //                           over (with rotated_at set); flips to
+  //                           'revoked' for emergency invalidation.
+  //                           Index serves the "find the active
+  //                           key" hot-path query issued every time
+  //                           the generator signs a new bundle.
+  //     created_at            ISO 8601 timestamp, DEFAULT now().
+  //     rotated_at            ISO 8601 timestamp when this key was
+  //                           rotated out; NULL while active.
+  //
+  // The 'cloud_iac_signing_keys' name parallels 'backup_signing_keys'
+  // for operator predictability — both manage signing key lifecycle
+  // (generate, rotate, revoke); both expose admin-side CRUD via a
+  // dedicated route file (in R3k Sub-phase 4 / C10 for cloud_iac).
+  // They are intentionally NOT a single shared table because:
+  //
+  //   - Different threat models. A backup-key compromise affects
+  //     past backup integrity; a cloud-iac-key compromise affects
+  //     supply-chain trust in deployment artifacts. Conflating the
+  //     two means a single rotation event has to be coordinated
+  //     across both concerns, and a compromise of one forces
+  //     rotation of the other.
+  //
+  //   - Different rotation cadences. Backup keys rotate on an
+  //     audit-driven schedule (typically annual). Cloud & IaC
+  //     signing keys may rotate per major release if the operator
+  //     wants per-release attestation chains.
+  //
+  //   - Different signature consumers. Backup signatures are
+  //     verified by FireAlive's own restore path. Cloud & IaC
+  //     signatures are verified by third-party cosign clients in
+  //     operator deployment pipelines.
+  //
+  // Also extends the existing backups table with a new column:
+  //
+  //   backups.kind            'single-db' or 'full-suite'. Existing
+  //                           rows backfill to 'single-db' via the
+  //                           DEFAULT, which preserves the current
+  //                           backup history without manual data
+  //                           migration. R3k's full-suite backup
+  //                           service (Sub-phase 6) writes rows
+  //                           with kind='full-suite'; the canonical
+  //                           single-DB backup path (existing
+  //                           /api/backup) continues to write rows
+  //                           with the default 'single-db'. The
+  //                           CHECK constraint enforces these are
+  //                           the only two values.
+  //
+  // The ALTER TABLE ADD COLUMN is guarded by a PRAGMA table_info
+  // check matching the canonical pattern established for backups
+  // column additions earlier in this file (R3d-1 + later phases).
+  //
+  // Two independent try/catch blocks for fault isolation between
+  // the table-creation migration and the column-addition migration.
+  // A failure in one does not mask the other, and neither masks
+  // any prior R3e/R3g/R3h/R3i/R3j/R3k-C1 migration.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_iac_signing_keys (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        public_key TEXT NOT NULL,
+        private_key_wrapped TEXT NOT NULL,
+        algorithm TEXT NOT NULL DEFAULT 'cosign-ecdsa-p256',
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'rotated', 'revoked')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        rotated_at TEXT
+      );
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cloud_iac_signing_keys_status
+        ON cloud_iac_signing_keys (status);
+    `);
+
+    const keyCount = db
+      .prepare('SELECT COUNT(*) AS n FROM cloud_iac_signing_keys')
+      .get().n;
+    console.log(
+      `R3k migration: cloud_iac_signing_keys table ready (${keyCount} key(s) present)`
+    );
+  } catch (r3kCloudIacKeysMigrationErr) {
+    console.error(
+      'R3k cloud_iac_signing_keys migration FAILED:',
+      r3kCloudIacKeysMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Cloud & IaC generator (POST /api/cloud/package) will fail until this migration completes successfully — the generator requires an active signing key from this table to sign output bundles. All other R3k surfaces (CI/CD, backup full-suite, regression) are independent and continue to function.'
+    );
+  }
+
+  try {
+    const backupsCols = db
+      .prepare("PRAGMA table_info(backups)")
+      .all()
+      .map(c => c.name);
+    if (!backupsCols.includes('kind')) {
+      db.exec(
+        `ALTER TABLE backups ADD COLUMN kind TEXT NOT NULL DEFAULT 'single-db' CHECK (kind IN ('single-db', 'full-suite'))`
+      );
+      console.log(
+        "R3k migration: added column kind to backups (default 'single-db' backfills existing rows)"
+      );
+    } else {
+      console.log(
+        'R3k migration: backups.kind column already present (no-op)'
+      );
+    }
+  } catch (r3kBackupsKindMigrationErr) {
+    console.error(
+      'R3k backups.kind column migration FAILED:',
+      r3kBackupsKindMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the comprehensive backup path (POST /api/backup/full-suite) will fail to record kind=full-suite rows until this migration completes successfully. The canonical single-DB backup path (existing /api/backup) continues to function — its INSERTs omit kind and rely on the DEFAULT, which works once the column is added.'
+    );
+  }
+
+  // ── R3k C12 — cloud_packages table ────────────────────────────────────
+  //
+  // Persistence layer for the Cloud & IaC generator (Sub-phase 4 / C13).
+  // One row per generated deployment bundle, capturing the manifest +
+  // SBOM + signature paths and SHA-256 hashes, the signing key id that
+  // produced the signature, and a JSON snapshot of the current install
+  // at generation time (users count, integrations list with platform
+  // names but no credentials, encryption mode, KMS provider, data
+  // volume — per the locked Q1 decision; the snapshot lets the bundle
+  // be regenerated or audited later without re-inspecting the install).
+  //
+  // SCHEMA NOTES
+  //
+  //   id                       UUID-shape, matching the R3j/R3k C1
+  //                            convention.
+  //   provider, iac_tool       CHECK-constrained enums covering the
+  //                            6 providers and 9 IaC output formats
+  //                            from the Q1/Q2 locked decisions. Not
+  //                            every (provider, iac_tool) combination
+  //                            is valid (CloudFormation is AWS-only,
+  //                            Bicep is Azure-only, GCP Deployment
+  //                            Manager is GCP-only); the route handler
+  //                            in C19 validates the combination
+  //                            before invoking the generator. The
+  //                            CHECK constraints are the load-bearing
+  //                            invariant at the DB layer.
+  //   generated_by             FK to users(id) without ON DELETE
+  //                            CASCADE — deleting the originating
+  //                            user preserves their generated
+  //                            bundles for audit (C19 listing
+  //                            surfaces "user deleted" instead of
+  //                            hiding the row).
+  //   signing_key_id           FK to cloud_iac_signing_keys(id) —
+  //                            preserved even after key rotation so
+  //                            the verification path can fetch the
+  //                            public key for any historical signed
+  //                            bundle.
+  //   install_snapshot_json    JSON blob with the at-generation-time
+  //                            install posture summary. Does NOT
+  //                            contain credentials.
+  //
+  // Indexes:
+  //
+  //   idx_cloud_packages_provider_tool   filters the listing by
+  //                                       (provider, iac_tool) — the
+  //                                       MC Cloud tab will surface
+  //                                       this filter once C20 wires
+  //                                       the showIaC modal to the
+  //                                       canonical listing endpoint.
+  //   idx_cloud_packages_generated_at    reverse-chronological listing
+  //                                       sort, the default order in
+  //                                       the lead's "recent bundles"
+  //                                       view.
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT
+  // EXISTS. Own try/catch for fault isolation; a failure here does
+  // not mask any prior R3e/R3g/R3h/R3i/R3j/R3k-C1/R3k-C2 migration.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_packages (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        provider TEXT NOT NULL
+          CHECK (provider IN ('aws', 'azure', 'gcp', 'hetzner', 'ovhcloud', 'exoscale')),
+        iac_tool TEXT NOT NULL
+          CHECK (iac_tool IN (
+            'terraform', 'pulumi', 'cloudformation', 'docker-compose',
+            'docker-manifest', 'kubernetes', 'helm', 'bicep', 'gcp-dm'
+          )),
+        generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        generated_by INTEGER NOT NULL REFERENCES users(id),
+        bundle_dir_path TEXT NOT NULL,
+        bundle_archive_path TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        sbom_path TEXT NOT NULL,
+        sbom_sha256 TEXT NOT NULL,
+        signature_path TEXT NOT NULL,
+        signature_sha256 TEXT NOT NULL,
+        signing_key_id TEXT NOT NULL REFERENCES cloud_iac_signing_keys(id),
+        install_snapshot_json TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL
+      );
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cloud_packages_provider_tool
+        ON cloud_packages (provider, iac_tool);
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cloud_packages_generated_at
+        ON cloud_packages (generated_at);
+    `);
+
+    const pkgCount = db
+      .prepare('SELECT COUNT(*) AS n FROM cloud_packages')
+      .get().n;
+    console.log(
+      `R3k migration: cloud_packages table ready (${pkgCount} package(s) present)`
+    );
+  } catch (r3kCloudPackagesMigrationErr) {
+    console.error(
+      'R3k cloud_packages migration FAILED:',
+      r3kCloudPackagesMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Cloud & IaC generator (POST /api/cloud/package) will fail until this migration completes successfully — generated bundles need a row in this table for the manifest + signature + SBOM tracking and for download-by-id retrieval. All other R3k surfaces (CI/CD, backup full-suite, regression) are independent and continue to function.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   db.close();
 }

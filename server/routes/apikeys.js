@@ -17,6 +17,7 @@ const VALID_SCOPES = [
   'reports:generate', 'routing:read', 'routing:write', 'routing:events',
   'audit:read', 'backup:trigger', 'assessments:read',
   'integrations:read', 'integrations:write',
+  'cicd:webhook',
 ];
 
 // ── List Keys (never returns raw key) ────────────────────────────────────────

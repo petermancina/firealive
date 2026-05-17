@@ -657,6 +657,128 @@ function initDb() {
   setCfg.run('wifi_policy', JSON.stringify({ minimum_protocol: 'wpa2_enterprise' }));
   setCfg.run('signing_key_grace_period_minutes', '60');
 
+  // ── R3k C27 — Sub-phase 6 GD-side schema mirrors ──────────────────────
+  //
+  // Adds the GD-server's own state tables for Cloud & IaC generator
+  // (Sub-phase 7 / C28) and CI/CD generator (Sub-phase 7 / C29).
+  // Schemas mirror the MC-side tables created in R3k C1 + C2 + C12 so
+  // the route handlers can share semantics across MC and GD, while
+  // remaining independent at the database layer (each side has its
+  // own deployment-bundle history; GD doesn't aggregate MC bundles).
+  //
+  // FK note: GD's users.id is INTEGER (vs MC's id which is also
+  // INTEGER); generated_by / created_by columns FK to GD's users(id)
+  // without ON DELETE CASCADE so bundle history is preserved across
+  // user deletion (CISO accounts may rotate while bundle audit
+  // history must survive).
+  //
+  // Idempotent CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT
+  // EXISTS. Single try/catch around all four migrations is sufficient
+  // here (vs MC's per-table isolation) because all four are net-new
+  // tables with no prior data dependencies — a failure mode would
+  // indicate a fundamental DB issue affecting everything, not a
+  // surgical-migration concern.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_iac_signing_keys (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        public_key TEXT NOT NULL,
+        private_key_wrapped TEXT NOT NULL,
+        algorithm TEXT NOT NULL DEFAULT 'cosign-ecdsa-p256',
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'rotated', 'revoked')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        rotated_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cloud_iac_signing_keys_status
+        ON cloud_iac_signing_keys (status);
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_packages (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        provider TEXT NOT NULL
+          CHECK (provider IN ('aws', 'azure', 'gcp', 'hetzner', 'ovhcloud', 'exoscale')),
+        iac_tool TEXT NOT NULL
+          CHECK (iac_tool IN (
+            'terraform', 'pulumi', 'cloudformation', 'docker-compose',
+            'docker-manifest', 'kubernetes', 'helm', 'bicep', 'gcp-dm'
+          )),
+        generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        generated_by INTEGER NOT NULL REFERENCES users(id),
+        bundle_dir_path TEXT NOT NULL,
+        bundle_archive_path TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        sbom_path TEXT NOT NULL,
+        sbom_sha256 TEXT NOT NULL,
+        signature_path TEXT NOT NULL,
+        signature_sha256 TEXT NOT NULL,
+        signing_key_id TEXT NOT NULL REFERENCES cloud_iac_signing_keys(id),
+        install_snapshot_json TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cloud_packages_provider_tool
+        ON cloud_packages (provider, iac_tool);
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cloud_packages_generated_at
+        ON cloud_packages (generated_at);
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cicd_configs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        platform TEXT NOT NULL
+          CHECK (platform IN ('github-actions', 'gitlab-ci', 'jenkins', 'circleci')),
+        purpose TEXT NOT NULL
+          CHECK (purpose IN ('custom-build', 'upstream-contribution')),
+        generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        generated_yaml_path TEXT NOT NULL,
+        current_install_snapshot_json TEXT NOT NULL,
+        created_by INTEGER NOT NULL REFERENCES users(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cicd_configs_platform
+        ON cicd_configs (platform);
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cicd_configs_generated_at
+        ON cicd_configs (generated_at);
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cicd_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        external_run_id TEXT NOT NULL,
+        platform TEXT NOT NULL
+          CHECK (platform IN ('github-actions', 'gitlab-ci', 'jenkins', 'circleci')),
+        config_id TEXT REFERENCES cicd_configs(id),
+        status TEXT NOT NULL
+          CHECK (status IN ('queued', 'running', 'passed', 'failed', 'cancelled')),
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        commit_sha TEXT,
+        branch TEXT,
+        step_results_json TEXT,
+        ci_metadata_json TEXT,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (platform, external_run_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_gd_cicd_runs_received_at
+        ON cicd_runs (received_at);
+    `);
+
+    const pkgCount = db.prepare('SELECT COUNT(*) AS n FROM cloud_packages').get().n;
+    const cfgCount = db.prepare('SELECT COUNT(*) AS n FROM cicd_configs').get().n;
+    console.log(`R3k C27 GD migration: cloud_packages=${pkgCount}, cicd_configs=${cfgCount} (Sub-phase 6 ready)`);
+  } catch (r3kGdMigrationErr) {
+    console.error('R3k C27 GD migration FAILED:', r3kGdMigrationErr.message);
+    console.error(
+      'The GD-server will start, but the Sub-phase-6 routes (/api/cloud/* added in C28, /api/cicd/* added in C29) will return 500 until this migration completes successfully. The existing /api/regression-test (C26) and all v1.0.36 GD surfaces are independent of these tables and continue to function.'
+    );
+  }
+
   console.log('Global Dashboard database initialized at', DB_PATH);
   db.close();
 }

@@ -1497,6 +1497,19 @@ function ManagementConsole() {
   const [showCEF, setShowCEF] = useState(false);
   const [showCloudWF, setShowCloudWF] = useState(null);
   const [showIaC, setShowIaC] = useState(false);
+  // R3k C36 — Cloud & IaC server-side generator wiring
+  const [iacProvider, setIacProvider] = useState("");
+  const [iacTool, setIacTool] = useState("");
+  const [iacResult, setIacResult] = useState(null);
+  const [iacBusy, setIacBusy] = useState(false);
+  const IAC_TOOLS_BY_PROVIDER = {
+    aws:      ["terraform","pulumi","cloudformation","docker-compose","docker-manifest","kubernetes","helm"],
+    azure:    ["terraform","pulumi","bicep","docker-compose","docker-manifest","kubernetes","helm"],
+    gcp:      ["terraform","pulumi","gcp-dm","docker-compose","docker-manifest","kubernetes","helm"],
+    hetzner:  ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+    ovhcloud: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+    exoscale: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+  };
   const [backups, setBackups] = useState([{id:1,ts:"2026-03-27 02:00",type:"daily-auto",size:"2.4 GB",status:"verified",hash:"sha256:a3f8c…"},{id:2,ts:"2026-03-26 02:00",type:"daily-auto",size:"2.3 GB",status:"verified",hash:"sha256:b7e2d…"}]);
   const [snapshots, setSnapshots] = useState([]);
   const [forensicExports, setFE] = useState([]);
@@ -1929,7 +1942,11 @@ function ManagementConsole() {
   // v1.0.0 state
   const [regressionResults, setRegressionResults] = useState(null);
   const [regressionRunning, setRegressionRunning] = useState(false);
-  const [cicdPlatform, setCicdPlatform] = useState("github_actions");
+  const [cicdPlatform, setCicdPlatform] = useState("github-actions");
+  // R3k C37 — CI/CD server-side wiring
+  const [cicdPurpose, setCicdPurpose] = useState("custom-build");
+  const [cicdResult, setCicdResult] = useState(null);
+  const [cicdBusy, setCicdBusy] = useState(false);
   const [playbookType, setPlaybookType] = useState("app_compromise");
   const [generatedPlaybook, setGenPlaybook] = useState(null);
   const [clientNotifCfg, setClientNotifCfg] = useState({enabled:true,channels:{desktop:true,slack:false,teams:false,email:false},slackWebhook:"",teamsWebhook:"",rules:{peerChatRequest:{enabled:true,realtime:true,channel:"desktop"},weeklyMetricsReminder:{enabled:true,day:"friday",time:"16:00",channel:"desktop"},burnoutSpike:{enabled:false,channel:"desktop"},shiftHandoff:{enabled:true,channel:"desktop"},scheduledChatReminder:{enabled:true,minutesBefore:15,channel:"desktop"}}});
@@ -3489,105 +3506,48 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ].map((o,i)=><Card key={i} style={{marginBottom:8,padding:"12px 14px"}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:2}}>{o.t}</div><M style={{color:C.tm}}>{o.d}</M></Card>)}
           </Modal>}
 
-          {showIaC&&<Modal title="Generate Infrastructure as Code" onClose={()=>setShowIaC(false)} width={560}>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate Terraform, CloudFormation, or Pulumi templates for deploying the full platform.</M>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
-              {[{n:"Terraform",d:"Multi-cloud. HCL.",f:"main.tf"},{n:"CloudFormation",d:"AWS native. YAML.",f:"template.yaml"},{n:"Pulumi",d:"TypeScript/Python.",f:"index.ts"}].map(t=>(
-                <Card key={t.n} style={{textAlign:"center",cursor:"pointer"}} onClick={()=>{
-                  let content="";const D="$";const ts=new Date().toISOString();
-                  if(t.n==="Terraform"){content=[
-                    "# FireAlive v"+(appVersion||"unknown")+" — Terraform Deployment","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
-                    "terraform {","  required_version = \">= 1.5.0\"","  required_providers {","    aws = { source = \"hashicorp/aws\", version = \"~> 5.0\" }","  }","}","",
-                    "variable \"environment\" {","  type    = string","  default = \"production\"","}","",
-                    "variable \"vpc_cidr\" {","  type    = string","  default = \"10.0.0.0/16\"","}","",
-                    "# VPC with private subnets for tier isolation","module \"vpc\" {","  source  = \"terraform-aws-modules/vpc/aws\"","  version = \"~> 5.0\"",
-                    "  name    = \"firealive-"+D+"{var.environment}\"","  cidr    = var.vpc_cidr",
-                    "  azs             = [\"us-east-1a\", \"us-east-1b\", \"us-east-1c\"]",
-                    "  private_subnets = [\"10.0.1.0/24\", \"10.0.2.0/24\", \"10.0.3.0/24\"]",
-                    "  public_subnets  = [\"10.0.101.0/24\", \"10.0.102.0/24\"]",
-                    "  enable_nat_gateway = true","  single_nat_gateway = var.environment != \"production\"","}","",
-                    "# ECS Cluster","resource \"aws_ecs_cluster\" \"firealive\" {","  name = \"firealive-"+D+"{var.environment}\"",
-                    "  setting {","    name  = \"containerInsights\"","    value = \"enabled\"","  }","}","",
-                    "# Tier-3 data store (AES-256-GCM, CMK)","resource \"aws_kms_key\" \"tier3\" {",
-                    "  description = \"FireAlive Tier-3 analyst data encryption\"","  enable_key_rotation = true","}","",
-                    "resource \"aws_dynamodb_table\" \"tier3_signals\" {","  name         = \"firealive-tier3-signals-"+D+"{var.environment}\"",
-                    "  billing_mode = \"PAY_PER_REQUEST\"","  hash_key     = \"analyst_id\"","  range_key    = \"timestamp\"",
-                    "  attribute { name = \"analyst_id\"; type = \"S\" }","  attribute { name = \"timestamp\"; type = \"S\" }",
-                    "  server_side_encryption { enabled = true; kms_key_arn = aws_kms_key.tier3.arn }",
-                    "  point_in_time_recovery { enabled = true }","}","",
-                    "# Tier-1 data store — team aggregates only","resource \"aws_kms_key\" \"tier1\" {",
-                    "  description = \"FireAlive Tier-1 team aggregate encryption\"","  enable_key_rotation = true","}","",
-                    "resource \"aws_dynamodb_table\" \"tier1_aggregates\" {","  name         = \"firealive-tier1-aggregates-"+D+"{var.environment}\"",
-                    "  billing_mode = \"PAY_PER_REQUEST\"","  hash_key     = \"shift_date\"","  range_key    = \"metric_type\"",
-                    "  attribute { name = \"shift_date\"; type = \"S\" }","  attribute { name = \"metric_type\"; type = \"S\" }",
-                    "  server_side_encryption { enabled = true; kms_key_arn = aws_kms_key.tier1.arn }","}","",
-                    "# ALB for management console","resource \"aws_lb\" \"mgmt\" {","  name               = \"firealive-mgmt-"+D+"{var.environment}\"",
-                    "  internal           = true","  load_balancer_type = \"application\"","  subnets            = module.vpc.private_subnets","}","",
-                    "# CloudWatch log groups","resource \"aws_cloudwatch_log_group\" \"audit\" {",
-                    "  name              = \"/firealive/"+D+"{var.environment}/audit\"","  retention_in_days = 365","}","",
-                    "output \"cluster_name\" { value = aws_ecs_cluster.firealive.name }",
-                    "output \"tier3_table\"  { value = aws_dynamodb_table.tier3_signals.name }",
-                    "output \"tier1_table\"  { value = aws_dynamodb_table.tier1_aggregates.name }",
-                  ].join("\n");}
-                  else if(t.n==="CloudFormation"){content=[
-                    "# FireAlive v"+(appVersion||"unknown")+" — CloudFormation Template","# Generated: "+ts,"# AGPL-3.0 | github.com/pmancina/firealive","",
-                    "AWSTemplateFormatVersion: '2010-09-09'","Description: FireAlive SOC Analyst Wellbeing Platform","",
-                    "Parameters:","  Environment:","    Type: String","    Default: production","    AllowedValues: [production, staging, development]",
-                    "  VpcCidr:","    Type: String","    Default: '10.0.0.0/16'","",
-                    "Resources:","  VPC:","    Type: AWS::EC2::VPC","    Properties:","      CidrBlock: !Ref VpcCidr","      EnableDnsHostnames: true",
-                    "      Tags:","        - Key: Name","          Value: !Sub firealive-"+D+"{Environment}","",
-                    "  Tier3KmsKey:","    Type: AWS::KMS::Key","    Properties:","      Description: FireAlive Tier-3 analyst data encryption",
-                    "      EnableKeyRotation: true","      KeyPolicy:","        Version: '2012-10-17'","        Statement:",
-                    "          - Sid: Enable IAM policies","            Effect: Allow","            Principal:",
-                    "              AWS: !Sub arn:aws:iam::"+D+"{AWS::AccountId}:root","            Action: kms:*","            Resource: '*'","",
-                    "  Tier3Table:","    Type: AWS::DynamoDB::Table","    Properties:",
-                    "      TableName: !Sub firealive-tier3-signals-"+D+"{Environment}","      BillingMode: PAY_PER_REQUEST",
-                    "      KeySchema:","        - AttributeName: analyst_id","          KeyType: HASH",
-                    "        - AttributeName: timestamp","          KeyType: RANGE",
-                    "      AttributeDefinitions:","        - AttributeName: analyst_id","          AttributeType: S",
-                    "        - AttributeName: timestamp","          AttributeType: S",
-                    "      SSESpecification:","        SSEEnabled: true","        KMSMasterKeyId: !Ref Tier3KmsKey","        SSEType: KMS",
-                    "      PointInTimeRecoverySpecification:","        PointInTimeRecoveryEnabled: true","",
-                    "  ECSCluster:","    Type: AWS::ECS::Cluster","    Properties:",
-                    "      ClusterName: !Sub firealive-"+D+"{Environment}",
-                    "      ClusterSettings:","        - Name: containerInsights","          Value: enabled","",
-                    "  AuditLogGroup:","    Type: AWS::Logs::LogGroup","    Properties:",
-                    "      LogGroupName: !Sub /firealive/"+D+"{Environment}/audit","      RetentionInDays: 365","",
-                    "Outputs:","  ClusterName:","    Value: !Ref ECSCluster","  Tier3Table:","    Value: !Ref Tier3Table",
-                  ].join("\n");}
-                  else{content=[
-                    "// FireAlive v"+(appVersion||"unknown")+" — Pulumi Deployment","// Generated: "+ts,"// AGPL-3.0 | github.com/pmancina/firealive","",
-                    "import * as pulumi from \"@pulumi/pulumi\";","import * as aws from \"@pulumi/aws\";","",
-                    "const config = new pulumi.Config();","const env = config.get(\"environment\") || \"production\";","",
-                    "// VPC with tier-isolated subnets","const vpc = new aws.ec2.Vpc(\"firealive-vpc\", {",
-                    "  cidrBlock: \"10.0.0.0/16\",","  enableDnsHostnames: true,",
-                    "  tags: { Name: \"firealive-\" + env },","});","",
-                    "// Tier-3 encryption key","const tier3Key = new aws.kms.Key(\"tier3-key\", {",
-                    "  description: \"FireAlive Tier-3 analyst data encryption\",","  enableKeyRotation: true,","});","",
-                    "// Tier-3 signals table","const tier3Table = new aws.dynamodb.Table(\"tier3-signals\", {",
-                    "  name: \"firealive-tier3-signals-\" + env,","  billingMode: \"PAY_PER_REQUEST\",",
-                    "  hashKey: \"analyst_id\",","  rangeKey: \"timestamp\",",
-                    "  attributes: [","    { name: \"analyst_id\", type: \"S\" },","    { name: \"timestamp\", type: \"S\" },","  ],",
-                    "  serverSideEncryption: { enabled: true, kmsKeyArn: tier3Key.arn },",
-                    "  pointInTimeRecovery: { enabled: true },","});","",
-                    "// Tier-1 encryption key","const tier1Key = new aws.kms.Key(\"tier1-key\", {",
-                    "  description: \"FireAlive Tier-1 team aggregate encryption\",","  enableKeyRotation: true,","});","",
-                    "// ECS Cluster","const cluster = new aws.ecs.Cluster(\"firealive-cluster\", {",
-                    "  name: \"firealive-\" + env,","  settings: [{ name: \"containerInsights\", value: \"enabled\" }],","});","",
-                    "// Audit log group","const auditLogs = new aws.cloudwatch.LogGroup(\"audit-logs\", {",
-                    "  name: \"/firealive/\" + env + \"/audit\",","  retentionInDays: 365,","});","",
-                    "export const clusterName = cluster.name;","export const tier3TableName = tier3Table.name;",
-                  ].join("\n");}
-                  const blob=new Blob([content],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=t.f;a.click();URL.revokeObjectURL(url);
-                  addA("IAC_GENERATED",t.n+" → "+t.f+" ("+content.length+" bytes)");
-                }}>
-                  <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{t.n}</div>
-                  <M style={{color:C.tm}}>{t.d}</M>
-                  <Btn small primary style={{marginTop:10}}>Generate {t.f}</Btn>
-                </Card>
-              ))}
-            </div>
-            <Card style={{padding:12}}><M style={{color:C.td,lineHeight:1.8}}>Generated IaC includes: VPC/VNet, K8s cluster, managed DB (separate Tier-1/Tier-3), storage, KMS, IAM roles/policies, monitoring, WAF, secrets. Parameterized for environment (dev/staging/prod).</M></Card>
+          {showIaC&&<Modal title="Generate Infrastructure as Code" onClose={()=>{setShowIaC(false);setIacProvider("");setIacTool("");setIacResult(null);setIacBusy(false);}} width={560}>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate a signed deployment bundle for FireAlive MC-server. The server packages IaC files, an SPDX-JSON SBOM, and a Sigstore signature into a tar.gz ready to deploy.</M>
+            <Sel label="Cloud Provider" value={iacProvider} onChange={e=>{setIacProvider(e.target.value);setIacTool("");setIacResult(null);}}>
+              <option value="">Select provider...</option>
+              <option value="aws">AWS</option>
+              <option value="azure">Azure</option>
+              <option value="gcp">GCP</option>
+              <option value="hetzner">Hetzner (DE)</option>
+              <option value="ovhcloud">OVHcloud (FR)</option>
+              <option value="exoscale">Exoscale (CH)</option>
+            </Sel>
+            {iacProvider&&<Sel label="IaC Format" value={iacTool} onChange={e=>{setIacTool(e.target.value);setIacResult(null);}}>
+              <option value="">Select format...</option>
+              {IAC_TOOLS_BY_PROVIDER[iacProvider].map(t=><option key={t} value={t}>{t}</option>)}
+            </Sel>}
+            {iacResult&&iacResult.ok&&<Card style={{marginBottom:12,borderColor:C.a+"30",padding:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:8}}>Bundle generated</div>
+              <M style={{color:C.tm,display:"block",marginBottom:2}}>Package ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{iacResult.data.id}</span></M>
+              <M style={{color:C.tm,display:"block",marginBottom:2}}>Size: {(iacResult.data.size_bytes/1024).toFixed(1)} KB</M>
+              <M style={{color:C.tm,display:"block",marginBottom:2}}>Manifest SHA-256: <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:9}}>{iacResult.data.manifest_sha256.slice(0,32)}...</span></M>
+              <M style={{color:C.tm,display:"block",marginBottom:2}}>Signing key fingerprint: <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:9}}>{(iacResult.data.signing_key_fingerprint||"").slice(0,32)}...</span></M>
+              <Btn small primary style={{marginTop:10}} onClick={()=>{window.open("/api/cloud/packages/"+iacResult.data.id+"/download","_blank");}}>Download bundle.tar.gz</Btn>
+              <Btn small style={{marginTop:10,marginLeft:6}} onClick={()=>{window.open("/api/cloud/packages/"+iacResult.data.id+"/public-key","_blank");}}>View public key</Btn>
+            </Card>}
+            {iacResult&&!iacResult.ok&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:C.d,marginBottom:6}}>Generation failed</div>
+              <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{iacResult.message}</M>
+              {iacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Syft on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin</code></M>}
+              {iacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Cosign on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
+            </Card>}
+            <Btn primary disabled={!iacProvider||!iacTool||iacBusy} onClick={async()=>{
+              setIacBusy(true);setIacResult(null);
+              try{
+                const r=await api.post("/api/cloud/package",{provider:iacProvider,iac_tool:iacTool});
+                setIacResult({ok:true,data:r.data});
+                addA("CLOUD_PACKAGE_GENERATED",iacProvider+"/"+iacTool+" id="+r.data.id);
+              }catch(err){
+                const ed=err.response&&err.response.data?err.response.data:{};
+                setIacResult({ok:false,message:ed.message||err.message||"Generation failed",code:ed.code});
+              }finally{setIacBusy(false);}
+            }}>{iacBusy?"Generating bundle...":"Generate Bundle"}</Btn>
+            <Card style={{padding:12,marginTop:12}}><M style={{color:C.td,lineHeight:1.8}}>The generated bundle contains: IaC files for the chosen (provider, format), SPDX-JSON SBOM (Syft), Sigstore signature (Cosign keyless via the server-managed signing key), and a deployment README with the provider-specific secrets mapping. Verify the archive offline with <code>cosign verify-blob --key &lt;public-key.pem&gt; --signature bundle.tar.gz.sig bundle.tar.gz</code> before applying.</M></Card>
           </Modal>}
         </div>)}
 
@@ -3658,7 +3618,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* BACKUP */}
         {tab==="backup"&&(<div>
           <L>Backup, Recovery & Storage Routing</L>
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Backup Scheduler</div><Sel label="Type"><option>Full</option><option>DB only</option><option>Configs</option><option>Audit</option></Sel><Sel label="Interval"><option>Every 4hr</option><option>Every 8hr</option><option>Daily 02:00</option><option>Weekly Sun</option></Sel><Sel label="Retention"><option>7 days</option><option>30 days</option><option>90 days</option><option>1 year</option></Sel><Input label="Destination" placeholder="smb://backup/"/><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Encrypt (AES-256)</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/backup/schedule/add",{type:"full",interval:"daily",retention:"30d",destination:"local"}).then(()=>api.post("/api/v1/audit/log",{event:"BK",detail:"Backup schedule saved"}).then(()=>addA("BK","Backup schedule saved")))}>Save</Btn></Card>
+          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Backup Scheduler</div><Sel label="Type"><option>Full</option><option>DB only</option><option>Configs</option><option>Audit</option></Sel><Sel label="Interval"><option>Every 4hr</option><option>Every 8hr</option><option>Daily 02:00</option><option>Weekly Sun</option></Sel><Sel label="Retention"><option>7 days</option><option>30 days</option><option>90 days</option><option>1 year</option></Sel><Input label="Destination" placeholder="smb://backup/"/><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Encrypt (AES-256)</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/backup-schedules",{name:"Backup tab quick-save",type:"full",frequency:"daily",time:"02:00",destination:"local",retention_days:30,encrypted:true,active:true}).then(r=>addA("BK","Backup schedule saved (id="+(r&&r.schedule?r.schedule.id:"?")+")")).catch(e=>addA("BK_FAIL",e.message||"Failed to save schedule"))}>Save</Btn></Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:C.i,marginBottom:12}}>Storage Destination Configuration</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Route each data type to its appropriate storage destination. Each type can target a different system — backups to one location, audit logs to another, forensic exports to a third.</M>
@@ -3692,8 +3652,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-            <Btn primary onClick={()=>{const id=genId();const entry={id:Date.now(),ts:new Date().toISOString(),type:"on-demand",size:"2.4 GB",status:"running",hash:"generating..."};setBackups(prev=>[entry,...prev]);addA("BACKUP_TRIGGERED",`Full backup ${id}`);setTimeout(()=>setBackups(prev=>prev.map(b=>b.id===entry.id?{...b,status:"verified",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:b)),2000);}}>Trigger Full Backup Now</Btn>
-            <Btn onClick={()=>{const snap={id:Date.now(),ts:new Date().toISOString(),label:`Snapshot-${snapshots.length+1}`,status:"captured",hash:`sha256:${Math.random().toString(36).substr(2,8)}`};setSnapshots(prev=>[snap,...prev]);addA("SNAPSHOT",snap.label);}}>Capture Snapshot Now</Btn>
+            <Btn primary onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),type:"full-suite",size:"...",status:"running",hash:"generating..."};setBackups(prev=>[placeholder,...prev]);addA("FULL_SUITE_BACKUP_TRIGGERED","Full-suite backup requested");try{const r=await api.post("/api/backup/full-suite",{});setBackups(prev=>prev.map(b=>b.id===localId?{id:r.id||localId,ts:new Date().toISOString(),type:"full-suite",size:r.size_bytes?(r.size_bytes/1024/1024).toFixed(1)+" MB":"?",status:"verified",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(no manifest)"}:b));addA("FULL_SUITE_BACKUP_CREATED","id="+r.id+" size="+r.size_bytes);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"backup failed";setBackups(prev=>prev.map(b=>b.id===localId?{...b,status:"failed",hash:msg.slice(0,40)}:b));addA("FULL_SUITE_BACKUP_FAILED",msg);}}}>Trigger Full Backup Now</Btn>
+            <Btn onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"capturing",hash:"..."};setSnapshots(prev=>[placeholder,...prev]);try{const r=await api.post("/api/backup",{});setSnapshots(prev=>prev.map(s=>s.id===localId?{id:r.id||localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"captured",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(captured)"}:s));addA("SNAPSHOT","id="+r.id);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"snapshot failed";setSnapshots(prev=>prev.map(s=>s.id===localId?{...s,status:"failed",hash:msg.slice(0,40)}:s));addA("SNAPSHOT_FAILED",msg);}}}>Capture Snapshot Now</Btn>
             <Btn danger onClick={()=>{const exp={id:Date.now(),ts:new Date().toISOString(),status:"generating",format:"forensic-archive"};setFE(prev=>[exp,...prev]);api.post("/api/v1/audit/log",{event:"FORENSIC_EXPORT",detail:"Initiated"}).then(()=>addA("FORENSIC_EXPORT","Initiated"));setTimeout(()=>setFE(prev=>prev.map(e=>e.id===exp.id?{...e,status:"ready",size:"3.1 GB",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:e)),2500);}}>Export for Forensics</Btn>
           </div>
           {snapshots.length>0&&<><L>Snapshots</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{snapshots.map(s=><div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{s.label}</M><br/><M style={{color:C.td}}>{new Date(s.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={C.a}>{s.status}</Badge><br/><M style={{color:C.td,fontSize:8}}>{s.hash}</M></div></div>)}</div></>}
@@ -3872,7 +3832,29 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {tab==="regression"&&(<div>
           <L>Security Regression Testing</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run automated checks to verify all integrations and security controls still function correctly after an update. The test examines every configured integration and reports incompatibilities, missing connections, or deprecated features that need attention.</M>
-          <Btn primary disabled={regressionRunning} onClick={()=>{setRegressionRunning(true);setTimeout(()=>{setRegressionResults({timestamp:new Date().toISOString(),version:appVersion,passed:9,failed:0,warnings:1,checks:[{id:"SIEM",name:"SIEM Integration",status:"pass",detail:"Splunk CEF stream · TLS 6514"},{id:"SOAR",name:"SOAR Platform",status:"pass",detail:"Splunk SOAR · Webhook active"},{id:"IAM",name:"SSO/LDAP",status:"pass",detail:"SAML, OIDC, AD configured"},{id:"ENCRYPTION",name:"Encryption Modules",status:"pass",detail:"AES-256-GCM + NaCl box + HMAC-SHA256"},{id:"SASE",name:"SASE Integration",status:"warning",detail:"Not configured — recommended for cloud deployments",recommendation:"Configure SASE for zero-trust network access"},{id:"VULNSCAN",name:"Vulnerability Scanner",status:"pass",detail:"Nessus · Weekly"},{id:"BACKUP",name:"Backup System",status:"pass",detail:"Daily auto with AES-256-GCM"},{id:"ANTI_ROLLBACK",name:"Anti-Rollback Fuse",status:"pass",detail:"Fuse counter: 1 · Ed25519 signed"},{id:"CALENDAR",name:"Calendar Integration",status:"pass",detail:"2 analysts configured"},{id:"NOTIFICATIONS",name:"Client Notifications",status:"pass",detail:"Desktop notifications active"}]});setRegressionRunning(false);api.post("/api/v1/audit/log",{event:"REGRESSION_TEST",detail:"Security regression test completed: 9 pass, 0 fail, 1 warning"}).then(()=>addA("REGRESSION_TEST","Security regression test completed: 9 pass, 0 fail, 1 warning"));},1500);}}>{regressionRunning?"Running checks...":"Run Regression Test"}</Btn>
+          <Btn primary disabled={regressionRunning} onClick={async()=>{
+            setRegressionRunning(true);
+            try{
+              const r=await api.post("/api/regression/run",{});
+              setRegressionResults({
+                timestamp:r.ranAt||new Date().toISOString(),
+                version:r.version||appVersion,
+                fuse:r.fuse,
+                passed:r.passed||0,
+                failed:r.failed||0,
+                warnings:0,
+                total:r.total||0,
+                checks:(r.results||[]).map(c=>({id:c.category,name:c.name,status:c.status,detail:c.detail})),
+              });
+              addA("REGRESSION_RUN","MC regression: "+(r.passed||0)+"/"+(r.total||0)+" pass, "+(r.failed||0)+" fail");
+            }catch(err){
+              const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"Regression run failed";
+              setRegressionResults({timestamp:new Date().toISOString(),version:appVersion,passed:0,failed:1,warnings:0,total:1,checks:[{id:"RUNNER",name:"Regression runner",status:"fail",detail:msg}]});
+              addA("REGRESSION_RUN_FAILED",msg);
+            }finally{
+              setRegressionRunning(false);
+            }
+          }}>{regressionRunning?"Running checks...":"Run Regression Test"}</Btn>
           {regressionResults&&(<div style={{marginTop:16}}>
             <div style={{display:"flex",gap:12,marginBottom:16}}>
               <Card style={{flex:1,padding:12,borderColor:C.a+"30",textAlign:"center"}}><div style={{fontSize:24,fontWeight:700,color:C.a}}>{regressionResults.passed}</div><M style={{color:C.tm}}>Passed</M></Card>
@@ -3919,76 +3901,40 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* ══════════ CI/CD ══════════ */}
         {tab==="cicd"&&(<div>
           <L>CI/CD Pipeline Configuration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate CI/CD pipeline configurations for the FireAlive 4-app suite (Server, Management Console, Analyst Client, Global Dashboard). Each pipeline includes test, security audit, build, Electron packaging, and deployment stages across all packages.</M>
-          <div style={{display:"flex",gap:8,marginBottom:16}}>
-            {[{v:"github_actions",l:"GitHub Actions"},{v:"gitlab_ci",l:"GitLab CI"},{v:"jenkins",l:"Jenkins"}].map(p=>(
-              <div key={p.v} onClick={()=>setCicdPlatform(p.v)} style={{padding:"10px 20px",background:cicdPlatform===p.v?"rgba(110,231,183,0.12)":"rgba(255,255,255,0.02)",border:`1px solid ${cicdPlatform===p.v?C.a:C.b}`,borderRadius:8,cursor:"pointer",fontSize:12,color:cicdPlatform===p.v?C.a:C.tm,fontWeight:cicdPlatform===p.v?600:400}}>{p.l}</div>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate a signed CI/CD pipeline configuration for FireAlive. The server produces a platform-native pipeline file with embedded lint, test, security scan, SBOM, SLSA L3 build, Cosign signing, CVE scan, and fuse-counter check stages.</M>
+          <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+            {[{v:"github-actions",l:"GitHub Actions"},{v:"gitlab-ci",l:"GitLab CI"},{v:"jenkins",l:"Jenkins"},{v:"circleci",l:"CircleCI"}].map(p=>(
+              <div key={p.v} onClick={()=>{setCicdPlatform(p.v);setCicdResult(null);}} style={{padding:"10px 20px",background:cicdPlatform===p.v?"rgba(110,231,183,0.12)":"rgba(255,255,255,0.02)",border:`1px solid ${cicdPlatform===p.v?C.a:C.b}`,borderRadius:8,cursor:"pointer",fontSize:12,color:cicdPlatform===p.v?C.a:C.tm,fontWeight:cicdPlatform===p.v?600:400}}>{p.l}</div>
             ))}
           </div>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{cicdPlatform==="github_actions"?".github/workflows/firealive-ci.yml":cicdPlatform==="gitlab_ci"?".gitlab-ci.yml":"Jenkinsfile"}</div>
-            <pre style={{background:"rgba(0,0,0,0.3)",padding:14,borderRadius:8,fontSize:11,color:C.tm,lineHeight:1.7,overflow:"auto",maxHeight:300,fontFamily:"'IBM Plex Mono',monospace"}}>{cicdPlatform==="github_actions"?`name: FireAlive CI/CD
-on:
-  push: { branches: [main] }
-  pull_request: { branches: [main] }
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npm ci
-      - run: npm test
-      - run: npm run lint
-  security:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm audit --production
-      - run: npx snyk test || true
-  build:
-    runs-on: ubuntu-latest
-    needs: [test, security]
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t firealive:\${{ github.sha }} .
-  regression:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm ci && npm run regression-test`:cicdPlatform==="gitlab_ci"?`stages: [test, security, build, regression]
-test:
-  stage: test
-  image: node:20
-  script: [npm ci, npm test, npm run lint]
-security:
-  stage: security
-  image: node:20
-  script: [npm audit --production]
-  allow_failure: true
-build:
-  stage: build
-  image: docker:latest
-  services: [docker:dind]
-  script: [docker build -t firealive:$CI_COMMIT_SHA .]
-regression:
-  stage: regression
-  image: node:20
-  script: [npm ci, npm run regression-test]`:`pipeline {
-  agent any
-  stages {
-    stage('Test') { steps { sh 'npm ci && npm test' } }
-    stage('Security') { steps { sh 'npm audit --production' } }
-    stage('Build') { steps { sh 'docker build -t firealive:$BUILD_NUMBER .' } }
-    stage('Regression') { steps { sh 'npm run regression-test' } }
-  }
-}`}</pre>
-            <Btn small style={{marginTop:8}} onClick={()=>{const fn=cicdPlatform==="github_actions"?"firealive-ci.yml":cicdPlatform==="gitlab_ci"?".gitlab-ci.yml":"Jenkinsfile";const blob=new Blob([document.querySelector("pre").textContent],{type:"text/plain"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=fn;a.click();addA("CICD_EXPORT","Exported "+cicdPlatform+" pipeline config");}}>Download File</Btn>
-          </Card>
-          <Card style={{padding:12,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>DevSecOps Pipeline Stages</M><M style={{color:C.tm,lineHeight:1.8}}>Test (unit + lint) → Security audit (npm audit + Snyk) → Build (Docker image) → Regression test (all integrations + security controls) → Deploy (with fuse increment)</M></Card>
+          <Sel label="Purpose" value={cicdPurpose} onChange={e=>{setCicdPurpose(e.target.value);setCicdResult(null);}}>
+            <option value="custom-build">Custom build (fork tailored to your org's integrations)</option>
+            <option value="upstream-contribution">Upstream contribution (target public FireAlive repo)</option>
+          </Sel>
+          {cicdResult&&cicdResult.ok&&<Card style={{marginBottom:12,borderColor:C.a+"30",padding:12}}>
+            <div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:8}}>Pipeline config generated</div>
+            <M style={{color:C.tm,display:"block",marginBottom:2}}>Config ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{cicdResult.data.id}</span></M>
+            <M style={{color:C.tm,display:"block",marginBottom:2}}>Platform: {cicdResult.data.platform}</M>
+            <M style={{color:C.tm,display:"block",marginBottom:2}}>Pipeline path in your repo: <code style={{background:C.s,padding:"2px 4px",borderRadius:3,fontSize:9}}>{cicdResult.data.pipeline_relative_path}</code></M>
+            <Btn small primary style={{marginTop:10}} onClick={()=>{window.open("/api/cicd/configs/"+cicdResult.data.id+"/download","_blank");}}>Download pipeline file</Btn>
+          </Card>}
+          {cicdResult&&!cicdResult.ok&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
+            <div style={{fontSize:12,fontWeight:500,color:C.d,marginBottom:6}}>Generation failed</div>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{cicdResult.message}</M>
+          </Card>}
+          <Btn primary disabled={!cicdPlatform||!cicdPurpose||cicdBusy} onClick={async()=>{
+            setCicdBusy(true);setCicdResult(null);
+            try{
+              const r=await api.post("/api/cicd/generate",{platform:cicdPlatform,purpose:cicdPurpose});
+              setCicdResult({ok:true,data:r.data});
+              addA("CICD_CONFIG_GENERATED",cicdPlatform+"/"+cicdPurpose+" id="+r.data.id);
+            }catch(err){
+              const ed=err.response&&err.response.data?err.response.data:{};
+              setCicdResult({ok:false,message:ed.message||err.message||"Generation failed"});
+            }finally{setCicdBusy(false);}
+          }}>{cicdBusy?"Generating pipeline...":"Generate Pipeline"}</Btn>
+          <Card style={{padding:12,borderColor:C.i+"30",marginTop:12}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Embedded pipeline stages</M><M style={{color:C.tm,lineHeight:1.8}}>1. Lint (ESLint) -> 2. Test (npm test) -> 3. Regression test (POST /api/regression/run) -> 4. npm audit -> 5. Snyk -> 6. SBOM (Syft) -> 7. Dep-pin verify -> 8. Build (docker buildx with SLSA L3 provenance) -> 9. Sign (Cosign keyless OIDC, key-based via COSIGN_KEY_MODE override) -> 10. CVE scan (Trivy) -> 11. Fuse-counter check -> 12. Deploy (placeholder).</M></Card>
+          <Card style={{padding:12,borderColor:C.p+"30",marginTop:12}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Webhook reporting (optional)</M><M style={{color:C.tm,lineHeight:1.8}}>The generated pipeline can POST run status back to this MC via the /api/cicd/runs endpoint with an api-key carrying the <code>cicd:webhook</code> scope. Idempotent on (platform, external_run_id). Configure FIREALIVE_WEBHOOK_URL + FIREALIVE_WEBHOOK_TOKEN secrets in your CI platform.</M></Card>
         </div>)}
 
         {/* ══════════ IR SIMULATOR (OODA) — MANAGEMENT ══════════ */}

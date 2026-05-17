@@ -15,9 +15,11 @@ const compression = require('compression');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { getDb, initDb } = require('./db-init');
+const { getDb, initDb, DB_PATH } = require('./db-init');
 const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
+const cloudIacBundle = require('./services/cloud-iac-bundle');
+const cicdBundle = require('./services/cicd-bundle');
 
 const app = express();
 const PORT = process.env.GD_PORT || 4001;
@@ -2480,27 +2482,835 @@ app.post('/api/compromise-scan', authMiddleware(['ciso']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Compromise scan failed' }); }
 });
 
-// ── Regression Test ──────────────────────────────────────────────────────────
+// ── Regression Test (R3k C26) ────────────────────────────────────────────────
+//
+// Replaces the v1.0.36 8-pass mock with a real 22-check regression
+// runner covering GD-side schema integrity, MC trust, auth, cross-
+// region rollup, compliance pipeline, backup machinery, and system
+// health. Symmetric to the MC-side /api/regression/run rewrite in
+// R3k C4-C6 but checks the GD-server's own canonical state rather
+// than the MC's.
+//
+// CHECK CATEGORIES (22 total)
+//
+//   schema (4):       integrity_check PRAGMA, canonical-table
+//                     presence, backups.format_version column,
+//                     signing_keys expected columns
+//   mc-trust (3):     management_consoles accessible, signing_keys
+//                     active-key coverage, signing-keys service
+//                     loadable
+//   auth (3):         JWT_SECRET configured, users table accessible
+//                     + CISO count, sessions table accessible
+//   cross-region (3): cross_region_rollup accessible, regional_metrics
+//                     accessible, mc-signature-verifier loadable
+//   compliance (3):   mc_compliance_reports + _fulls + _requests
+//                     all reachable
+//   backup (3):       backups v2-aware, backup_schedules accessible,
+//                     latest backup status sane
+//   system (3):       Node version >= 18, process RSS sanity,
+//                     SQLite version check
+//
+// Each check returns {name, category, status: 'pass'|'fail'|'skip',
+// detail}. Aggregate response: {timestamp, tests, passed, failed,
+// skipped, total, overall, summary}.
+//
+// Endpoint remains POST /api/regression-test, authMiddleware(['ciso'])
+// — same surface contract; the response shape is backward-compatible
+// (tests[] + passed + total + overall) with additional fields for
+// the new richer output.
+
+const CANONICAL_GD_TABLES = [
+  'audit_log', 'auth_log', 'backup_schedules', 'backups',
+  'config', 'cross_region_rollup', 'management_consoles',
+  'mc_compliance_report_fulls', 'mc_compliance_reports',
+  'mc_report_requests', 'notifications',
+  'regional_leaderboard', 'regional_metrics',
+  'reports', 'sessions', 'signing_keys',
+  'system_health', 'system_meta', 'users',
+];
+
+function runGdRegression(db) {
+  const tests = [];
+  const record = (category, name, fn) => {
+    try {
+      const detail = fn();
+      tests.push({ category, name, status: 'pass', detail: detail || 'ok' });
+    } catch (err) {
+      tests.push({ category, name, status: 'fail', detail: String(err.message || err).slice(0, 500) });
+    }
+  };
+
+  // ── Schema (4) ─────────────────────────────────────────────────────────
+  record('schema', 'sqlite integrity_check', () => {
+    const r = db.prepare('PRAGMA integrity_check').get();
+    if (!r || (r.integrity_check !== 'ok' && r['integrity_check'] !== 'ok')) {
+      throw new Error(`integrity_check returned ${JSON.stringify(r)}`);
+    }
+    return 'ok';
+  });
+  record('schema', 'canonical tables present', () => {
+    const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+    const present = new Set(rows.map(r => r.name));
+    const missing = CANONICAL_GD_TABLES.filter(t => !present.has(t));
+    if (missing.length > 0) throw new Error(`missing tables: ${missing.join(', ')}`);
+    return `${CANONICAL_GD_TABLES.length} canonical tables present`;
+  });
+  record('schema', 'backups.format_version column (v2)', () => {
+    const cols = db.prepare('PRAGMA table_info(backups)').all();
+    const names = cols.map(c => c.name);
+    if (!names.includes('format_version')) throw new Error('backups.format_version column missing');
+    return 'format_version present';
+  });
+  record('schema', 'signing_keys schema', () => {
+    const cols = db.prepare('PRAGMA table_info(signing_keys)').all();
+    const required = ['id', 'mc_id', 'public_key', 'status'];
+    const names = cols.map(c => c.name);
+    const missing = required.filter(c => !names.includes(c));
+    if (missing.length > 0) throw new Error(`signing_keys missing columns: ${missing.join(', ')}`);
+    return `${cols.length} columns, all required present`;
+  });
+
+  // ── MC trust (3) ───────────────────────────────────────────────────────
+  record('mc-trust', 'management_consoles accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM management_consoles').get().n;
+    return `${n} MC registration(s)`;
+  });
+  record('mc-trust', 'signing_keys active-key coverage', () => {
+    const mcs = db.prepare("SELECT id FROM management_consoles WHERE status='active'").all();
+    if (mcs.length === 0) return '0 active MCs (vacuously covered)';
+    const uncovered = [];
+    for (const mc of mcs) {
+      const k = db.prepare("SELECT COUNT(*) AS n FROM signing_keys WHERE mc_id = ? AND status = 'active'").get(mc.id);
+      if (k.n === 0) uncovered.push(mc.id);
+    }
+    if (uncovered.length > 0) throw new Error(`MCs without active signing key: ${uncovered.length}`);
+    return `${mcs.length} active MC(s), all with active signing key`;
+  });
+  record('mc-trust', 'signing-keys service loadable', () => {
+    if (typeof signingKeysSvc !== 'object' || signingKeysSvc === null) throw new Error('signingKeysSvc not loaded');
+    if (typeof signingKeysSvc.submitPending !== 'function') throw new Error('signingKeysSvc.submitPending missing');
+    return 'service module loaded';
+  });
+
+  // ── Auth (3) ───────────────────────────────────────────────────────────
+  record('auth', 'JWT_SECRET configured', () => {
+    if (!JWT_SECRET || typeof JWT_SECRET !== 'string' || JWT_SECRET.length < 16) {
+      throw new Error('JWT_SECRET missing or too short');
+    }
+    if (!process.env.GD_JWT_SECRET) return 'using ephemeral fallback (set GD_JWT_SECRET for persistence across restarts)';
+    return 'GD_JWT_SECRET env var present';
+  });
+  record('auth', 'users table + CISO coverage', () => {
+    const total = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+    const ciso = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role='ciso'").get().n;
+    return `${total} user(s), ${ciso} CISO`;
+  });
+  record('auth', 'sessions table accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n;
+    return `${n} session row(s)`;
+  });
+
+  // ── Cross-region (3) ───────────────────────────────────────────────────
+  record('cross-region', 'cross_region_rollup accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM cross_region_rollup').get().n;
+    return `${n} rollup row(s)`;
+  });
+  record('cross-region', 'regional_metrics accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM regional_metrics').get().n;
+    return `${n} metric row(s)`;
+  });
+  record('cross-region', 'mc-signature-verifier loadable', () => {
+    if (typeof verifyPushSignature !== 'function') throw new Error('verifyPushSignature not loaded');
+    return 'verifier module loaded';
+  });
+
+  // ── Compliance (3) ─────────────────────────────────────────────────────
+  record('compliance', 'mc_compliance_reports accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM mc_compliance_reports').get().n;
+    return `${n} report summary row(s)`;
+  });
+  record('compliance', 'mc_compliance_report_fulls accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM mc_compliance_report_fulls').get().n;
+    return `${n} full-report row(s)`;
+  });
+  record('compliance', 'mc_report_requests accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM mc_report_requests').get().n;
+    return `${n} report request row(s)`;
+  });
+
+  // ── Backup (3) ─────────────────────────────────────────────────────────
+  record('backup', 'backups v2-aware', () => {
+    const cols = db.prepare('PRAGMA table_info(backups)').all().map(c => c.name);
+    const v2Required = ['format_version', 'manifest_path', 'archive_path'];
+    const missing = v2Required.filter(c => !cols.includes(c));
+    if (missing.length > 0) throw new Error(`v2 columns missing: ${missing.join(', ')}`);
+    return 'v2 columns present';
+  });
+  record('backup', 'backup_schedules accessible', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM backup_schedules').get().n;
+    return `${n} schedule row(s)`;
+  });
+  record('backup', 'latest backup status sane', () => {
+    const latest = db.prepare('SELECT id, status, created_at FROM backups ORDER BY created_at DESC LIMIT 1').get();
+    if (!latest) return 'no backups recorded yet';
+    if (latest.status === 'corrupt' || latest.status === 'tampered') {
+      throw new Error(`latest backup id=${latest.id} status=${latest.status}`);
+    }
+    return `latest id=${latest.id} status=${latest.status}`;
+  });
+
+  // ── System (3) ─────────────────────────────────────────────────────────
+  record('system', 'Node.js >= 18', () => {
+    const major = parseInt((process.versions.node || '0').split('.')[0], 10);
+    if (!(major >= 18)) throw new Error(`Node major version ${major} < 18`);
+    return `Node ${process.versions.node}`;
+  });
+  record('system', 'process RSS sanity', () => {
+    const rss = process.memoryUsage().rss;
+    if (rss > 4 * 1024 * 1024 * 1024) throw new Error(`RSS ${rss} > 4GB`);
+    return `RSS ${(rss / 1024 / 1024).toFixed(1)} MiB`;
+  });
+  record('system', 'SQLite version', () => {
+    const r = db.prepare('SELECT sqlite_version() AS v').get();
+    if (!r || !r.v) throw new Error('sqlite_version() returned null');
+    return `sqlite ${r.v}`;
+  });
+
+  const passed = tests.filter(t => t.status === 'pass').length;
+  const failed = tests.filter(t => t.status === 'fail').length;
+  const skipped = tests.filter(t => t.status === 'skip').length;
+  const total = tests.length;
+
+  return {
+    timestamp: new Date().toISOString(),
+    tests,
+    passed,
+    failed,
+    skipped,
+    total,
+    overall: failed === 0 ? 'pass' : 'fail',
+    summary: { passed, failed, skipped, total },
+    side: 'gd',
+  };
+}
+
 app.post('/api/regression-test', authMiddleware(['ciso']), (req, res) => {
   try {
-    const results = {
-      timestamp: new Date().toISOString(),
-      tests: [
-        { name: 'MC ingest endpoint', status: 'pass' },
-        { name: 'Authentication flow', status: 'pass' },
-        { name: 'MFA verification', status: 'pass' },
-        { name: 'Report generation', status: 'pass' },
-        { name: 'Notification dispatch', status: 'pass' },
-        { name: 'Audit logging', status: 'pass' },
-        { name: 'Backup execution', status: 'pass' },
-        { name: 'Database queries', status: 'pass' },
-      ],
-      passed: 8,
-      total: 8,
-      overall: 'pass',
-    };
+    const db = getDb();
+    const results = runGdRegression(db);
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'REGRESSION_RUN', ?, ?)")
+      .run(req.user.id, `result: ${results.passed}/${results.total} pass, ${results.failed} fail`, results.failed === 0 ? 'info' : 'warning');
+    db.close();
     res.json(results);
-  } catch (e) { res.status(500).json({ error: 'Regression test failed' }); }
+  } catch (e) {
+    res.status(500).json({ error: 'Regression test failed', message: e.message });
+  }
+});
+
+// ── Cloud & IaC Generator (R3k C30, Sub-phase 6) ─────────────────────────────
+//
+// GD-side equivalent of MC's /api/cloud/* surface. Generates deploy-
+// ment bundles for FIREALIVE GD-server itself (image
+// ghcr.io/petermancina/firealive-gd, port 4001) rather than for MC-
+// server. Consumes cloud-iac-bundle.js (R3k C29) which collapses
+// MC's R3k C9-C22 services into one consolidated module.
+//
+//   GET  /api/cloud/providers                provider x iac_tool matrix
+//                                            + secrets mapping
+//   POST /api/cloud/package                  generate bundle. Body:
+//                                            {provider, iac_tool}.
+//                                            Returns full result manifest.
+//   GET  /api/cloud/packages                 list past bundles (100 most
+//                                            recent, reverse-chrono).
+//   GET  /api/cloud/packages/:id             fetch row + parsed snapshot.
+//   GET  /api/cloud/packages/:id/download    stream bundle.tar.gz.
+//   GET  /api/cloud/packages/:id/public-key  retrieve the verifier PEM
+//                                            for the signing key that
+//                                            produced this bundle's sig.
+//   POST /api/cloud/signing-keys/rotate      operator-triggered rotation.
+//
+// AUTH: ciso for write ops (generate, rotate); ciso + vp for reads.
+// 503 mapped from SyftNotInstalledError / CosignNotInstalledError so
+// the operator sees a clear install-command message when the
+// supply-chain binaries are missing.
+
+app.get('/api/cloud/providers', authMiddleware(['ciso', 'vp']), (req, res) => {
+  res.json({
+    provider_tool_matrix: cloudIacBundle.PROVIDER_TOOL_MATRIX,
+    secrets_mapping: cloudIacBundle.SECRETS_MAPPING_BY_PROVIDER,
+    deploy_shape: cloudIacBundle.GD_DEPLOY_SHAPE,
+  });
+});
+
+app.post('/api/cloud/package', authMiddleware(['ciso']), (req, res) => {
+  const { provider, iac_tool } = req.body || {};
+  if (!provider || !iac_tool) {
+    return res.status(400).json({
+      error: 'provider and iac_tool are required',
+      providers: Object.keys(cloudIacBundle.PROVIDER_TOOL_MATRIX),
+    });
+  }
+  let db;
+  try {
+    db = getDb();
+    const result = cloudIacBundle.generatePackage(db, provider, iac_tool, { userId: req.user.id });
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_PACKAGE_GENERATED', ?, 'info')")
+      .run(req.user.id, `id=${result.id} provider=${provider} iac_tool=${iac_tool}`);
+    db.close();
+    res.json(result);
+  } catch (err) {
+    if (db) { try { db.close(); } catch (_) { /* ignore */ } }
+    if (err.name === 'SyftNotInstalledError' || err.code === 'SYFT_NOT_INSTALLED') {
+      return res.status(503).json({ error: 'Syft not installed', message: err.message, code: 'SYFT_NOT_INSTALLED' });
+    }
+    if (err.name === 'CosignNotInstalledError' || err.code === 'COSIGN_NOT_INSTALLED') {
+      return res.status(503).json({ error: 'Cosign not installed', message: err.message, code: 'COSIGN_NOT_INSTALLED' });
+    }
+    if (/^invalid (provider|\(provider)/.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    try {
+      const adb = getDb();
+      adb.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_PACKAGE_FAILED', ?, 'warning')")
+        .run(req.user.id, `provider=${provider} iac_tool=${iac_tool} error=${(err.message || '').slice(0, 200)}`);
+      adb.close();
+    } catch (_) { /* swallow audit failure */ }
+    res.status(500).json({ error: 'Cloud package generation failed', message: err.message });
+  }
+});
+
+app.get('/api/cloud/packages', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT id, provider, iac_tool, generated_at, generated_by,
+                bundle_archive_path, manifest_sha256, sbom_sha256,
+                signature_sha256, signing_key_id, size_bytes
+           FROM cloud_packages
+           ORDER BY generated_at DESC
+           LIMIT 100`,
+      )
+      .all();
+    db.close();
+    res.json({ packages: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list cloud packages', message: e.message });
+  }
+});
+
+app.get('/api/cloud/packages/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT * FROM cloud_packages WHERE id = ?').get(req.params.id);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'package not found' });
+    let snapshot = null;
+    try { snapshot = JSON.parse(row.install_snapshot_json); } catch (e) { /* leave null */ }
+    res.json({ ...row, install_snapshot: snapshot });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch package', message: e.message });
+  }
+});
+
+app.get('/api/cloud/packages/:id/download', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT bundle_archive_path, provider, iac_tool FROM cloud_packages WHERE id = ?').get(req.params.id);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'package not found' });
+    const fs = require('fs');
+    if (!fs.existsSync(row.bundle_archive_path)) {
+      return res.status(410).json({ error: 'bundle archive no longer on disk' });
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="firealive-gd-${row.provider}-${row.iac_tool}-${req.params.id}.tar.gz"`);
+    res.setHeader('Content-Type', 'application/gzip');
+    fs.createReadStream(row.bundle_archive_path).pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to download package', message: e.message });
+  }
+});
+
+app.get('/api/cloud/packages/:id/public-key', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT signing_key_id FROM cloud_packages WHERE id = ?').get(req.params.id);
+    if (!row) { db.close(); return res.status(404).json({ error: 'package not found' }); }
+    const key = cloudIacBundle.signingKeys.getVerificationKey(db, row.signing_key_id);
+    db.close();
+    if (!key) return res.status(404).json({ error: 'signing key not found' });
+    res.json({
+      key_id: key.id,
+      public_key_pem: key.publicKeyPem,
+      algorithm: key.algorithm,
+      status: key.status,
+      fingerprint_sha256: key.publicKeyFingerprint,
+      created_at: key.createdAt,
+      rotated_at: key.rotatedAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch public key', message: e.message });
+  }
+});
+
+app.post('/api/cloud/signing-keys/rotate', authMiddleware(['ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const result = cloudIacBundle.signingKeys.rotateActiveKey(db);
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_SIGNING_KEY_ROTATED', ?, 'info')")
+      .run(req.user.id, `oldId=${result.oldId || '(none)'} newId=${result.newId}`);
+    db.close();
+    res.json({ rotated: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: 'Signing key rotation failed', message: e.message });
+  }
+});
+
+// ── CI/CD Pipeline Generator (R3k C32, Sub-phase 6) ──────────────────────────
+//
+// GD-side equivalent of MC's /api/cicd/* surface (R3k C24). Generates
+// CI pipeline configs for FIREALIVE GD-server deployment.
+//
+//   GET  /api/cicd/platforms                   ciso + vp
+//   POST /api/cicd/generate                    ciso
+//   GET  /api/cicd/configs                     ciso + vp
+//   GET  /api/cicd/configs/:id                 ciso + vp
+//   GET  /api/cicd/configs/:id/download        ciso + vp
+//   POST /api/cicd/runs                        shared-secret header auth
+//   GET  /api/cicd/runs                        ciso + vp
+//   GET  /api/cicd/runs/:id                    ciso + vp
+//   GET  /api/cicd/webhook-secret              ciso (reveal current)
+//   POST /api/cicd/webhook-secret/rotate       ciso (rotate)
+//
+// AUTH DIVERGENCE FROM MC
+// =======================
+//
+// MC's /api/cicd uses dual auth (admin JWT + api-key with cicd:webhook
+// scope). GD has no general api-key + scope infrastructure (the only
+// "api keys" on GD-side are management_consoles.api_key values, used
+// in request bodies for MC-to-GD ingest endpoints, not as auth
+// headers for arbitrary requests). Rather than build that
+// infrastructure for one webhook receiver, GD's C32 uses a simpler
+// shared-secret header model:
+//
+//   - X-CICD-Webhook-Secret: <secret>
+//   - Secret is auto-generated on first /api/cicd/webhook-secret read,
+//     stored in config table as 'cicd_webhook_secret'.
+//   - CISO can reveal the current secret via GET, or rotate via
+//     POST .../rotate. Old secret is invalid immediately after
+//     rotation.
+//
+// This matches the SOC-grade lift of the feature (single-purpose
+// webhook receiver, CI is the only consumer) without expanding the
+// auth model.
+
+function gdGetOrCreateCicdWebhookSecret(db) {
+  const existing = db.prepare("SELECT value FROM config WHERE key = 'cicd_webhook_secret'").get();
+  if (existing) return existing.value;
+  const newSecret = crypto.randomBytes(32).toString('hex');
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cicd_webhook_secret', ?)").run(newSecret);
+  return newSecret;
+}
+
+function gdVerifyCicdWebhookSecret(req, db) {
+  const supplied = req.headers['x-cicd-webhook-secret'];
+  if (!supplied || typeof supplied !== 'string') return false;
+  const row = db.prepare("SELECT value FROM config WHERE key = 'cicd_webhook_secret'").get();
+  if (!row || !row.value) return false;
+  // Constant-time compare
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(row.value);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.get('/api/cicd/platforms', authMiddleware(['ciso', 'vp']), (req, res) => {
+  res.json({
+    platforms: cicdBundle.VALID_PLATFORMS,
+    purposes: cicdBundle.VALID_PURPOSES,
+    filenames: cicdBundle.PLATFORM_FILENAME,
+    deploy_shape: cicdBundle.GD_CICD_SHAPE,
+  });
+});
+
+app.post('/api/cicd/generate', authMiddleware(['ciso']), (req, res) => {
+  const { platform, purpose } = req.body || {};
+  if (!platform || !purpose) {
+    return res.status(400).json({
+      error: 'platform and purpose are required',
+      valid_platforms: cicdBundle.VALID_PLATFORMS,
+      valid_purposes: cicdBundle.VALID_PURPOSES,
+    });
+  }
+  let db;
+  try {
+    db = getDb();
+    const result = cicdBundle.generateConfig(db, platform, purpose, { userId: req.user.id });
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_CONFIG_GENERATED', ?, 'info')")
+      .run(req.user.id, `id=${result.id} platform=${platform} purpose=${purpose}`);
+    db.close();
+    res.json(result);
+  } catch (err) {
+    if (db) { try { db.close(); } catch (_) { /* ignore */ } }
+    if (/^invalid (platform|purpose)/.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    try {
+      const adb = getDb();
+      adb.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_CONFIG_FAILED', ?, 'warning')")
+        .run(req.user.id, `platform=${platform} purpose=${purpose} error=${(err.message || '').slice(0, 200)}`);
+      adb.close();
+    } catch (_) { /* swallow */ }
+    res.status(500).json({ error: 'CICD config generation failed', message: err.message });
+  }
+});
+
+app.get('/api/cicd/configs', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(`SELECT id, platform, purpose, generated_at, generated_yaml_path, created_by FROM cicd_configs ORDER BY generated_at DESC LIMIT 100`)
+      .all();
+    db.close();
+    res.json({ configs: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list cicd configs', message: e.message });
+  }
+});
+
+app.get('/api/cicd/configs/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT * FROM cicd_configs WHERE id = ?').get(req.params.id);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'config not found' });
+    let snapshot = null;
+    try { snapshot = JSON.parse(row.current_install_snapshot_json); } catch (e) { /* leave null */ }
+    res.json({ ...row, install_snapshot: snapshot });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch cicd config', message: e.message });
+  }
+});
+
+app.get('/api/cicd/configs/:id/download', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT platform, generated_yaml_path FROM cicd_configs WHERE id = ?').get(req.params.id);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'config not found' });
+    const fs = require('fs');
+    if (!fs.existsSync(row.generated_yaml_path)) {
+      return res.status(410).json({ error: 'pipeline file no longer on disk' });
+    }
+    const filename = cicdBundle.PLATFORM_FILENAME[row.platform] || 'pipeline.yml';
+    const downloadName = filename.split('/').pop();
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    res.setHeader('Content-Type', 'text/yaml');
+    fs.createReadStream(row.generated_yaml_path).pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: 'download failed', message: e.message });
+  }
+});
+
+// Shared-secret-authenticated webhook receiver (NO JWT required)
+app.post('/api/cicd/runs', (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    if (!gdVerifyCicdWebhookSecret(req, db)) {
+      db.close();
+      return res.status(403).json({ error: 'Invalid or missing X-CICD-Webhook-Secret header' });
+    }
+
+    const {
+      external_run_id, platform, config_id, status,
+      started_at, finished_at, commit_sha, branch,
+      step_results, ci_metadata,
+    } = req.body || {};
+
+    const missing = [];
+    if (!external_run_id) missing.push('external_run_id');
+    if (!platform) missing.push('platform');
+    if (!status) missing.push('status');
+    if (!started_at) missing.push('started_at');
+    if (missing.length > 0) {
+      db.close();
+      return res.status(400).json({ error: 'Missing required fields', fields: missing });
+    }
+    if (!cicdBundle.VALID_PLATFORMS.includes(platform)) {
+      db.close();
+      return res.status(400).json({ error: 'Invalid platform', valid: cicdBundle.VALID_PLATFORMS });
+    }
+    const VALID_STATUSES = ['queued', 'running', 'passed', 'failed', 'cancelled'];
+    if (!VALID_STATUSES.includes(status)) {
+      db.close();
+      return res.status(400).json({ error: 'Invalid status', valid: VALID_STATUSES });
+    }
+
+    try {
+      db.prepare(
+        `INSERT INTO cicd_runs
+           (external_run_id, platform, config_id, status, started_at,
+            finished_at, commit_sha, branch, step_results_json,
+            ci_metadata_json, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      ).run(
+        external_run_id, platform, config_id || null, status,
+        started_at, finished_at || null, commit_sha || null, branch || null,
+        step_results ? JSON.stringify(step_results) : null,
+        ci_metadata ? JSON.stringify(ci_metadata) : null,
+      );
+      const inserted = db
+        .prepare(`SELECT id, received_at FROM cicd_runs WHERE platform = ? AND external_run_id = ?`)
+        .get(platform, external_run_id);
+      db.close();
+      res.json({
+        received: true,
+        idempotent: false,
+        run_id: inserted.id,
+        received_at: inserted.received_at,
+      });
+    } catch (insertErr) {
+      if (insertErr.code === 'SQLITE_CONSTRAINT_UNIQUE' || /UNIQUE constraint/i.test(insertErr.message)) {
+        const existing = db
+          .prepare(`SELECT id, received_at FROM cicd_runs WHERE platform = ? AND external_run_id = ?`)
+          .get(platform, external_run_id);
+        db.close();
+        return res.json({
+          received: true,
+          idempotent: true,
+          run_id: existing ? existing.id : null,
+          received_at: existing ? existing.received_at : null,
+        });
+      }
+      db.close();
+      throw insertErr;
+    }
+  } catch (e) {
+    if (db) { try { db.close(); } catch (_) { /* ignore */ } }
+    res.status(500).json({ error: 'cicd run insert failed', message: e.message });
+  }
+});
+
+app.get('/api/cicd/runs', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(`SELECT id, external_run_id, platform, config_id, status, started_at, finished_at, commit_sha, branch, received_at FROM cicd_runs ORDER BY received_at DESC LIMIT 200`)
+      .all();
+    db.close();
+    res.json({ runs: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'runs list failed', message: e.message });
+  }
+});
+
+app.get('/api/cicd/runs/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT * FROM cicd_runs WHERE id = ?').get(req.params.id);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'run not found' });
+    let stepResults = null, ciMeta = null;
+    try { stepResults = row.step_results_json ? JSON.parse(row.step_results_json) : null; } catch (e) {}
+    try { ciMeta = row.ci_metadata_json ? JSON.parse(row.ci_metadata_json) : null; } catch (e) {}
+    res.json({ ...row, step_results: stepResults, ci_metadata: ciMeta });
+  } catch (e) {
+    res.status(500).json({ error: 'run fetch failed', message: e.message });
+  }
+});
+
+app.get('/api/cicd/webhook-secret', authMiddleware(['ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const secret = gdGetOrCreateCicdWebhookSecret(db);
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_WEBHOOK_SECRET_REVEALED', 'CISO revealed CICD webhook secret', 'info')")
+      .run(req.user.id);
+    db.close();
+    res.json({ secret, header: 'X-CICD-Webhook-Secret' });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to read webhook secret', message: e.message });
+  }
+});
+
+app.post('/api/cicd/webhook-secret/rotate', authMiddleware(['ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const newSecret = crypto.randomBytes(32).toString('hex');
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cicd_webhook_secret', ?)").run(newSecret);
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_WEBHOOK_SECRET_ROTATED', 'CISO rotated CICD webhook secret', 'info')")
+      .run(req.user.id);
+    db.close();
+    res.json({ rotated: true, secret: newSecret, header: 'X-CICD-Webhook-Secret' });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to rotate webhook secret', message: e.message });
+  }
+});
+
+// ── Full-Suite Backup (R3k C33, Sub-phase 6 final) ───────────────────────────
+//
+// GD-side adaptation of MC's R3k C7+C8 full-suite backup. The MC
+// full-suite path sits atop a v2 backup engine (separate manifest +
+// archive + signature + wrapped-key files). GD has only v1 backups
+// (single tar.gz at backups.destination, SHA-256 in backups.hash),
+// so this is a v1-shape implementation rather than a v2 extension:
+//
+//   Output:    data/backups/<id>-firealive-gd-full-suite.tar.gz
+//   Archive:   global-dashboard.db
+//              config-snapshot.json    (all rows from config table)
+//              version-manifest.json   (version, fuse, build_id,
+//                                       MCs total/active, signing_keys
+//                                       total/active, captured_at)
+//   Hash:      SHA-256 of the tar.gz, stored in backups.hash.
+//   DB row:    backups.type='full', destination=<archive path>,
+//              size_bytes, hash, status='completed'.
+//
+// The destination filename embeds the literal token 'full-suite' so
+// operators (and the future restore path) can distinguish full-suite
+// archives from plain v1 single-DB snapshots by inspection, without
+// the schema needing a 'kind' column. The R3k C26 regression runner's
+// "backups v2-aware" check will continue to report fail on GD since
+// the v2 columns it asserts are intentionally absent here — that
+// gap stays diagnostic surface noting the GD's v1 posture.
+//
+// SIGNING: deferred. MC's full-suite is signed via the v2 manifest
+// signature. The GD v1 shape doesn't have manifest separation; a
+// future migration to a v2-style backup engine on GD would unlock
+// cosign-signed archives. For now, the SHA-256 in backups.hash
+// provides tamper-detect integrity.
+//
+//   POST /api/backup/full-suite   ciso
+
+function gdPerformFullSuiteBackup(db, options) {
+  const fs = require('fs');
+  const path = require('path');
+  const { execFileSync } = require('child_process');
+
+  const backupsDir =
+    options.backupsDir
+    || process.env.GD_BACKUPS_DIR
+    || path.join(__dirname, 'data', 'backups');
+  if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
+
+  const id = crypto.randomBytes(8).toString('hex');
+  const workDir = path.join(backupsDir, `_work-${id}`);
+  fs.mkdirSync(workDir, { recursive: true });
+
+  try {
+    // 1. Copy DB snapshot
+    if (!fs.existsSync(DB_PATH)) {
+      throw new Error(`GD database not found at ${DB_PATH}`);
+    }
+    const dbCopyPath = path.join(workDir, 'global-dashboard.db');
+    // Use VACUUM INTO for a transactionally-consistent snapshot
+    // rather than a raw file copy (which races against in-flight
+    // writes). VACUUM INTO is the SQLite-canonical hot-snapshot
+    // method.
+    try {
+      db.prepare(`VACUUM INTO ?`).run(dbCopyPath);
+    } catch (vacErr) {
+      // Fallback to raw copy if VACUUM INTO fails (rare; some
+      // older SQLite builds restricted it).
+      fs.copyFileSync(DB_PATH, dbCopyPath);
+    }
+
+    // 2. config-snapshot.json
+    const configRows = db.prepare('SELECT key, value FROM config').all();
+    const configSnap = {};
+    for (const r of configRows) configSnap[r.key] = r.value;
+    fs.writeFileSync(
+      path.join(workDir, 'config-snapshot.json'),
+      JSON.stringify(configSnap, null, 2),
+      'utf8',
+    );
+
+    // 3. version-manifest.json
+    const mcs = db.prepare("SELECT COUNT(*) AS n FROM management_consoles").get().n;
+    const mcsActive = db.prepare("SELECT COUNT(*) AS n FROM management_consoles WHERE status='active'").get().n;
+    const sks = db.prepare("SELECT COUNT(*) AS n FROM signing_keys").get().n;
+    const sksActive = db.prepare("SELECT COUNT(*) AS n FROM signing_keys WHERE status='active'").get().n;
+    let versionInfo = { version: 'unknown', fuse_counter: null, build_id: null };
+    try {
+      const pkg = require('./package.json');
+      versionInfo = {
+        version: pkg.version || 'unknown',
+        fuse_counter: typeof pkg.fuseCounter === 'number' ? pkg.fuseCounter : null,
+        build_id: pkg.buildId || null,
+      };
+    } catch (e) { /* keep defaults */ }
+    const manifest = {
+      format: 'firealive-gd-full-suite-v1',
+      backup_id: id,
+      captured_at: new Date().toISOString(),
+      version: versionInfo,
+      management_consoles: { total: mcs, active: mcsActive },
+      signing_keys: { total: sks, active: sksActive },
+      side: 'gd',
+    };
+    fs.writeFileSync(
+      path.join(workDir, 'version-manifest.json'),
+      JSON.stringify(manifest, null, 2),
+      'utf8',
+    );
+
+    // 4. tar+gzip the workdir into a single archive
+    const archivePath = path.join(backupsDir, `${id}-firealive-gd-full-suite.tar.gz`);
+    execFileSync(
+      'tar',
+      ['-czf', archivePath, '-C', workDir, '.'],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+
+    // 5. SHA-256 of the archive
+    const archiveBytes = fs.readFileSync(archivePath);
+    const sha256 = crypto.createHash('sha256').update(archiveBytes).digest('hex');
+    const sizeBytes = archiveBytes.length;
+
+    // 6. INSERT backups row
+    db.prepare(
+      `INSERT INTO backups (id, type, status, size_bytes, hash, destination, created_at)
+       VALUES (?, 'full', 'completed', ?, ?, ?, datetime('now'))`,
+    ).run(id, sizeBytes, sha256, archivePath);
+
+    // 7. Cleanup workdir (archive remains)
+    fs.rmSync(workDir, { recursive: true, force: true });
+
+    return {
+      id,
+      type: 'full',
+      kind: 'full-suite',
+      destination: archivePath,
+      size_bytes: sizeBytes,
+      hash: sha256,
+      manifest,
+      status: 'completed',
+    };
+  } catch (err) {
+    try { if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); }
+    catch (cleanupErr) { /* swallow */ }
+    throw err;
+  }
+}
+
+app.post('/api/backup/full-suite', authMiddleware(['ciso']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const result = gdPerformFullSuiteBackup(db, {});
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'FULL_SUITE_BACKUP_CREATED', ?, 'info')")
+      .run(req.user.id, `id=${result.id} size=${result.size_bytes} hash=${result.hash.slice(0, 16)}`);
+    db.close();
+    res.json(result);
+  } catch (err) {
+    if (db) {
+      try {
+        db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'FULL_SUITE_BACKUP_FAILED', ?, 'warning')")
+          .run(req.user.id, (err.message || '').slice(0, 200));
+        db.close();
+      } catch (_) { /* swallow */ }
+    }
+    res.status(500).json({ error: 'Full-suite backup failed', message: err.message });
+  }
 });
 
 // ── Configuration ────────────────────────────────────────────────────────────

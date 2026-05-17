@@ -15,6 +15,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { performBackup } = require('../services/backup');
+const { performFullSuiteBackup } = require('../services/backup-full-suite');
 const manifestSvc = require('../services/backup-manifest');
 const signingKeysSvc = require('../services/backup-signing-keys');
 
@@ -72,6 +73,35 @@ router.post('/', async (req, res) => {
     logger.error('Trigger backup error', { error: err.message });
     auditLog(req.user.id, 'BACKUP_FAILED', `error=${err.message.slice(0, 200)}`, req.ip);
     res.status(500).json({ error: 'Backup failed', message: err.message });
+  }
+});
+
+// ── Trigger Full-Suite Comprehensive Backup (R3k) ─────────────────────────────
+//
+// Operator-initiated comprehensive backup capturing the regional DB
+// snapshot, on-disk config files (integrity-manifest.json, electron-
+// security.js if present), and a backup-time version manifest.
+// Returns the same shape as POST / with an additional kind:
+// 'full-suite' field. Same audit event-type pattern as single-DB
+// backup, namespaced FULL_SUITE_* for distinct lifecycle tracking.
+//
+// Synchronous-await mirrors POST /. Per BUILD-PLAN-v23 Assumptions,
+// full-suite payload remains under the v2 engine's 8 GB ceiling for
+// typical install volumes.
+router.post('/full-suite', async (req, res) => {
+  try {
+    const result = await performFullSuiteBackup({ type: 'on-demand' });
+    auditLog(
+      req.user.id,
+      'FULL_SUITE_BACKUP_CREATED',
+      `id=${result.id} format=v${result.format_version} kind=${result.kind} size=${result.size_bytes} manifestSha=${result.manifest_sha256.slice(0, 16)}`,
+      req.ip,
+    );
+    res.json(result);
+  } catch (err) {
+    logger.error('Trigger full-suite backup error', { error: err.message });
+    auditLog(req.user.id, 'FULL_SUITE_BACKUP_FAILED', `error=${err.message.slice(0, 200)}`, req.ip);
+    res.status(500).json({ error: 'Full-suite backup failed', message: err.message });
   }
 });
 

@@ -376,6 +376,26 @@ export default function GlobalDashboard() {
   const [gdHealth, setGdHealth] = useState({cpu:"—",memory:"—",uptime:"—"});
   const [gdToast, setGdToast] = useState(null);
   const showGdToast = (msg) => { setGdToast(msg); setTimeout(() => setGdToast(null), 3000); };
+  // R3k C40 — GD Cloud & IaC + CI/CD server-side wiring
+  const [gdIacProvider, setGdIacProvider] = useState("");
+  const [gdIacTool, setGdIacTool] = useState("");
+  const [gdIacResult, setGdIacResult] = useState(null);
+  const [gdIacBusy, setGdIacBusy] = useState(false);
+  const [gdCicdPlatform, setGdCicdPlatform] = useState("github-actions");
+  const [gdCicdPurpose, setGdCicdPurpose] = useState("custom-build");
+  const [gdCicdResult, setGdCicdResult] = useState(null);
+  const [gdCicdBusy, setGdCicdBusy] = useState(false);
+  const GD_IAC_TOOLS_BY_PROVIDER = {
+    aws:      ["terraform","pulumi","cloudformation","docker-compose","docker-manifest","kubernetes","helm"],
+    azure:    ["terraform","pulumi","bicep","docker-compose","docker-manifest","kubernetes","helm"],
+    gcp:      ["terraform","pulumi","gcp-dm","docker-compose","docker-manifest","kubernetes","helm"],
+    hetzner:  ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+    ovhcloud: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+    exoscale: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+  };
+  // R3k C41 — GD Full-suite backup wiring
+  const [gdBackupBusy, setGdBackupBusy] = useState(false);
+  const [gdBackupResult, setGdBackupResult] = useState(null);
   const [welcomeStep, setWelcomeStep] = useState(0);
   const [queryText, setQueryText] = useState("");
   const [queryResults, setQueryResults] = useState(null);
@@ -1741,19 +1761,82 @@ export default function GlobalDashboard() {
             </Card>
           </div>)}
 
-          {/* ══════════ CLOUD & IaC ══════════ */}
+          {/* ══════════ CLOUD & IaC (R3k C40 wired) ══════════ */}
           {tab==="cloud_iac"&&(<div>
             <L>Cloud & Infrastructure as Code</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Deploy and manage the GD Server infrastructure.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16}}>Generate signed deployment bundles for the GD Server (image, port 4001, GD_JWT_SECRET + GD_ENCRYPTION_KEY env vars). The server packages IaC files, an SPDX-JSON SBOM, and a Sigstore signature into a tar.gz ready to deploy.</M>
             <Card style={{marginBottom:12}}>
-              <Sel label="Cloud provider"><option value="">Select...</option><option value="aws">AWS</option><option value="gcp">GCP</option><option value="azure">Azure</option><option value="hetzner">Hetzner (privacy-first)</option><option value="ovhcloud">OVHcloud (EU sovereignty)</option><option value="exoscale">Exoscale (Swiss privacy)</option></Sel>
-              <Sel label="IaC tool"><option value="terraform">Terraform</option><option value="pulumi">Pulumi</option><option value="cloudformation">CloudFormation (AWS)</option><option value="arm">ARM Templates (Azure)</option></Sel>
-              <Btn primary>Generate IaC Config</Btn>
+              <Sel label="Cloud provider" value={gdIacProvider} onChange={e=>{setGdIacProvider(e.target.value);setGdIacTool("");setGdIacResult(null);}}>
+                <option value="">Select...</option>
+                <option value="aws">AWS</option>
+                <option value="gcp">GCP</option>
+                <option value="azure">Azure</option>
+                <option value="hetzner">Hetzner (privacy-first)</option>
+                <option value="ovhcloud">OVHcloud (EU sovereignty)</option>
+                <option value="exoscale">Exoscale (Swiss privacy)</option>
+              </Sel>
+              {gdIacProvider&&<Sel label="IaC format" value={gdIacTool} onChange={e=>{setGdIacTool(e.target.value);setGdIacResult(null);}}>
+                <option value="">Select format...</option>
+                {GD_IAC_TOOLS_BY_PROVIDER[gdIacProvider].map(t=><option key={t} value={t}>{t}</option>)}
+              </Sel>}
+              {gdIacResult&&gdIacResult.ok&&<Card style={{marginTop:8,padding:10,borderColor:C.a+"30"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.a,marginBottom:6}}>Bundle generated</div>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Package ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{gdIacResult.data.id}</span></M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Size: {(gdIacResult.data.size_bytes/1024).toFixed(1)} KB</M>
+                <Btn small primary style={{marginTop:8}} onClick={()=>{window.open(gdServerUrl+"/api/cloud/packages/"+gdIacResult.data.id+"/download","_blank");}}>Download bundle.tar.gz</Btn>
+                <Btn small style={{marginTop:8,marginLeft:6}} onClick={()=>{window.open(gdServerUrl+"/api/cloud/packages/"+gdIacResult.data.id+"/public-key","_blank");}}>View public key</Btn>
+              </Card>}
+              {gdIacResult&&!gdIacResult.ok&&<Card style={{marginTop:8,padding:10,borderColor:C.d+"40"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.d,marginBottom:4}}>Generation failed</div>
+                <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{gdIacResult.message}</M>
+                {gdIacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Syft on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin</code></M>}
+                {gdIacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Cosign on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
+              </Card>}
+              <Btn primary disabled={!gdIacProvider||!gdIacTool||gdIacBusy} style={{marginTop:10}} onClick={async()=>{
+                setGdIacBusy(true);setGdIacResult(null);
+                const r=await api.post("/api/cloud/package",{provider:gdIacProvider,iac_tool:gdIacTool});
+                if(r.error){
+                  setGdIacResult({ok:false,message:r.message||r.error,code:r.code});
+                }else{
+                  setGdIacResult({ok:true,data:r});
+                  setGdAudit(a=>[{ts:new Date().toISOString(),event:"CLOUD_PACKAGE_GENERATED",detail:gdIacProvider+"/"+gdIacTool+" id="+r.id},...a]);
+                }
+                setGdIacBusy(false);
+              }}>{gdIacBusy?"Generating bundle...":"Generate IaC Config"}</Btn>
             </Card>
             <Card>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>CI/CD Pipeline</div>
-              <Sel label="CI/CD platform"><option value="github">GitHub Actions</option><option value="gitlab">GitLab CI</option><option value="jenkins">Jenkins</option></Sel>
-              <Btn primary>Generate Pipeline Config</Btn>
+              <Sel label="CI/CD platform" value={gdCicdPlatform} onChange={e=>{setGdCicdPlatform(e.target.value);setGdCicdResult(null);}}>
+                <option value="github-actions">GitHub Actions</option>
+                <option value="gitlab-ci">GitLab CI</option>
+                <option value="jenkins">Jenkins</option>
+                <option value="circleci">CircleCI</option>
+              </Sel>
+              <Sel label="Purpose" value={gdCicdPurpose} onChange={e=>{setGdCicdPurpose(e.target.value);setGdCicdResult(null);}}>
+                <option value="custom-build">Custom build (org-tailored)</option>
+                <option value="upstream-contribution">Upstream contribution (public repo)</option>
+              </Sel>
+              {gdCicdResult&&gdCicdResult.ok&&<Card style={{marginTop:8,padding:10,borderColor:C.a+"30"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.a,marginBottom:6}}>Pipeline config generated</div>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Config ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{gdCicdResult.data.id}</span></M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Pipeline path: <code style={{background:C.s,padding:"2px 4px",borderRadius:3,fontSize:9}}>{gdCicdResult.data.pipeline_relative_path}</code></M>
+                <Btn small primary style={{marginTop:8}} onClick={()=>{window.open(gdServerUrl+"/api/cicd/configs/"+gdCicdResult.data.id+"/download","_blank");}}>Download pipeline file</Btn>
+              </Card>}
+              {gdCicdResult&&!gdCicdResult.ok&&<Card style={{marginTop:8,padding:10,borderColor:C.d+"40"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.d,marginBottom:4}}>Generation failed</div>
+                <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{gdCicdResult.message}</M>
+              </Card>}
+              <Btn primary disabled={gdCicdBusy} style={{marginTop:10}} onClick={async()=>{
+                setGdCicdBusy(true);setGdCicdResult(null);
+                const r=await api.post("/api/cicd/generate",{platform:gdCicdPlatform,purpose:gdCicdPurpose});
+                if(r.error){
+                  setGdCicdResult({ok:false,message:r.message||r.error});
+                }else{
+                  setGdCicdResult({ok:true,data:r});
+                  setGdAudit(a=>[{ts:new Date().toISOString(),event:"CICD_CONFIG_GENERATED",detail:gdCicdPlatform+"/"+gdCicdPurpose+" id="+r.id},...a]);
+                }
+                setGdCicdBusy(false);
+              }}>{gdCicdBusy?"Generating pipeline...":"Generate Pipeline Config"}</Btn>
             </Card>
           </div>)}
 
@@ -1813,7 +1896,29 @@ export default function GlobalDashboard() {
               ))}
             </Card>
             <Card style={{marginBottom:12}}>
-              <Btn primary>Trigger Manual Backup Now</Btn>
+              <Btn primary disabled={gdBackupBusy} onClick={async()=>{
+                setGdBackupBusy(true);setGdBackupResult(null);
+                const r=await api.post("/api/backup/full-suite",{});
+                if(r.error){
+                  setGdBackupResult({ok:false,message:r.message||r.error});
+                }else{
+                  setGdBackupResult({ok:true,data:r});
+                  setGdAudit(a=>[{ts:new Date().toISOString(),event:"FULL_SUITE_BACKUP_CREATED",detail:"id="+r.id+" size="+r.size_bytes+" hash="+(r.hash||"").slice(0,16)},...a]);
+                }
+                setGdBackupBusy(false);
+              }}>{gdBackupBusy?"Creating full-suite backup...":"Trigger Manual Backup Now"}</Btn>
+              {gdBackupResult&&gdBackupResult.ok&&<Card style={{marginTop:10,padding:10,borderColor:C.a+"30"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.a,marginBottom:6}}>Full-suite backup created</div>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Backup ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{gdBackupResult.data.id}</span></M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Size: {(gdBackupResult.data.size_bytes/1024/1024).toFixed(2)} MB</M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Archive: <code style={{background:C.s,padding:"2px 4px",borderRadius:3,fontSize:9}}>{gdBackupResult.data.destination}</code></M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>SHA-256: <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:9}}>{(gdBackupResult.data.hash||"").slice(0,32)}...</span></M>
+                {gdBackupResult.data.manifest&&<M style={{color:C.td,display:"block",marginTop:4,fontSize:9}}>Format: {gdBackupResult.data.manifest.format} · MCs: {gdBackupResult.data.manifest.management_consoles.active}/{gdBackupResult.data.manifest.management_consoles.total} active</M>}
+              </Card>}
+              {gdBackupResult&&!gdBackupResult.ok&&<Card style={{marginTop:10,padding:10,borderColor:C.d+"40"}}>
+                <div style={{fontSize:11,fontWeight:500,color:C.d,marginBottom:4}}>Backup failed</div>
+                <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{gdBackupResult.message}</M>
+              </Card>}
             </Card>
             <Card>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Restore from Backup</div>
