@@ -103,6 +103,7 @@ app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team')
 app.use('/api/analysts', authMiddleware(['analyst']), require('./routes/analysts'));
 app.use('/api/signals', authMiddleware(['analyst']), require('./routes/signals'));
 app.use('/api/impacts', authMiddleware(['analyst']), require('./routes/impacts'));
+app.use('/api/training-recommendations', authMiddleware(['analyst']), require('./routes/training-recommendations'));
 app.use('/api/routing', authMiddleware(['lead', 'admin']), require('./routes/routing'));
 app.use('/api/handoffs', authMiddleware(['lead', 'admin']), require('./routes/handoffs'));
 app.use('/api/retro', authMiddleware(['lead', 'admin']), require('./routes/retro'));
