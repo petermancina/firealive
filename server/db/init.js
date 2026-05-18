@@ -4744,6 +4744,7 @@ function initDb() {
   }
 
   console.log('Database initialized at', DB_PATH);
+  require('./seed-training-library').seedTrainingLibrary(db);
   db.close();
 }
 
