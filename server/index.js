@@ -253,6 +253,7 @@ async function start() {
     let wsServer = null;
     try {
       wsServer = new FireAliveWebSocket(server, getDb());
+      app.locals.wsServer = wsServer;
       wsServer.startHeartbeatCheck();
       logger.info('WebSocket server started on /ws');
     } catch (e) {
