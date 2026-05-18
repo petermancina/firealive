@@ -121,6 +121,7 @@ app.use('/api/backup-schedules', authMiddleware(['admin']), configLockGate(), re
 app.use('/api/gd-config', authMiddleware(['admin']), configLockGate(), require('./routes/gd-config'));
 app.use('/api/gd-signing-key', authMiddleware(['admin']), configLockGate(), require('./routes/gd-signing-key'));
 app.use('/api/scheduling', authMiddleware(['admin', 'lead']), configLockGate(), require('./routes/scheduling-platform'));
+app.use('/api/audit/event', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/audit-event'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/audit'));
 app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
