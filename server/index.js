@@ -167,6 +167,7 @@ app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
+app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));
