@@ -134,7 +134,7 @@ Checks include: access control (RBAC), encryption (AES-256-GCM), audit trail (SH
 | IAM | READ | Authentication, offboarding detection |
 | EDR | READ | Malware scanning of uploads/data |
 | Scheduling | READ | Shift data for upskilling |
-| Training Platforms | LINK | Assessment modules, training content |
+| Training Platforms | LINK | Assessment modules, training content — see [training-library.md](training-library.md) for the catalog schema, URL provenance rules, and the recommendation and review workflow. |
 | KMS | READ/WRITE | Encryption key management |
 
 ---
