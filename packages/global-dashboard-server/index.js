@@ -22,6 +22,7 @@ const signingKeysSvc = require('./services/signing-keys');
 const cloudIacBundle = require('./services/cloud-iac-bundle');
 const cicdBundle = require('./services/cicd-bundle');
 const forensicExport = require('./services/forensic-export');
+const legalHoldExport = require('./services/legal-hold-export');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 
@@ -4177,6 +4178,318 @@ app.delete('/api/forensic-exports/:id', authMiddleware(['ciso']), (req, res) => 
   } catch (err) {
     console.error('forensic export delete failed:', err.message);
     res.status(500).json({ error: 'delete failed', message: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGAL HOLD EXPORT ROUTES (R3l C47e/f — GD parity with MC C46)
+//
+// GD-side HTTP surface for the legal hold export orchestrator (C47c).
+// Mirrors MC C46 with these GD-specific adaptations:
+//
+//   - vp creates / ciso releases (separate-actor invariant); MC was admin-or-ciso
+//     for create and ciso-only for release. The GD role surface differs but
+//     the schema-level CHECK constraint enforces the same invariant regardless.
+//   - inline audit_log INSERT via auditLogLegalHold helper (GD has no
+//     auditLog middleware; matches the forensic-export pattern from C32a/b)
+//   - inlined into index.js to match GD's existing routes convention (no
+//     routes/ subdirectory pattern on the GD server — lesson carried from
+//     2a's C32 lesson where a separate routes/ file had to be redone inline)
+//
+// Six endpoints:
+//
+//   POST   /api/legal-hold-exports                create + run a hold (vp OR ciso)
+//   GET    /api/legal-hold-exports                list 100 most recent (vp or ciso)
+//   GET    /api/legal-hold-exports/:id/download   stream tar.gz (vp or ciso)
+//   GET    /api/legal-hold-exports/:id/manifest   stream manifest.json (vp or ciso)
+//   POST   /api/legal-hold-exports/:id/release    separate-actor release (CISO ONLY)
+//   GET    /api/legal-hold-exports/chain          chain inspection (vp or ciso)
+//
+// TRIPLE-LAYER SEPARATE-ACTOR ENFORCEMENT ON RELEASE
+//
+//   Layer 1 — THIS ROUTE HANDLER: explicit comparison + 403 + audit log
+//             BEFORE invoking the orchestrator
+//   Layer 2 — ORCHESTRATOR: releaseLegalHold re-checks; throws
+//             SeparateActorViolation if bypassed
+//   Layer 3 — SCHEMA: SQLite CHECK constraint refuses the UPDATE
+//
+// All three must agree. Schema is the final backstop.
+
+function auditLogLegalHold(userId, eventType, detail, ip, severity) {
+  let db;
+  try {
+    db = getDb();
+    db.prepare(
+      "INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, ?, ?, ?, ?)"
+    ).run(userId || 'anonymous', eventType, detail || '', ip || null, severity || 'info');
+  } catch (e) {
+    // Silent — audit failures must not crash handlers.
+  } finally {
+    if (db) try { db.close(); } catch (_e) { /* ignore */ }
+  }
+}
+
+function appendLegalHoldChainEntry(db, opts) {
+  // Used by the download handler to record HOLD_DOWNLOADED. Release goes
+  // through legalHoldExport.releaseLegalHold which appends HOLD_RELEASED
+  // internally; create emits HOLD_CREATED + HOLD_COMPLETED in the orchestrator.
+  const { holdId, actorUserId, eventType } = opts;
+  const keyRow = db
+    .prepare(
+      'SELECT id, public_key, private_key_encrypted, fingerprint FROM legal_hold_chain_signing_keys WHERE active = 1 LIMIT 1'
+    )
+    .get();
+  if (!keyRow) throw new Error('No active legal hold signing key found');
+  const { pem } = decryptForensicConfig(keyRow.private_key_encrypted);
+  const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
+
+  const prevRow = db
+    .prepare('SELECT this_hash FROM legal_hold_chain ORDER BY id DESC LIMIT 1')
+    .get();
+  const prevHash = prevRow ? prevRow.this_hash : null;
+
+  const payload = {
+    event_type: eventType,
+    hold_ref: holdId,
+    actor_user_id: actorUserId,
+    timestamp: new Date().toISOString(),
+  };
+  const payloadBytes = canonicalSerialize(payload);
+  const linkInput = prevHash
+    ? Buffer.concat([Buffer.from(prevHash, 'hex'), payloadBytes])
+    : payloadBytes;
+  const thisHash = crypto.createHash('sha256').update(linkInput).digest('hex');
+  const signature = crypto.sign(null, Buffer.from(thisHash, 'hex'), privateKey).toString('hex');
+
+  db.prepare(
+    'INSERT INTO legal_hold_chain (prev_hash, this_hash, signature, event_type, hold_ref, actor_user_id) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(prevHash, thisHash, signature, eventType, holdId, actorUserId);
+
+  return { prevHash, thisHash, signature };
+}
+
+// ── POST /api/legal-hold-exports — create + run ───────────────────────────
+// VP OR CISO (broader than forensic's vp-only — legal counsel CISOs may
+// initiate holds)
+
+app.post('/api/legal-hold-exports', authMiddleware(['vp', 'ciso']), (req, res) => {
+  const {
+    caseId, rationale,
+    timeWindowStart, timeWindowEnd,
+    custodianFilter, outputFormats,
+    indefiniteRetention,
+    includeAuditLog, includeBackupChain, includeIncidentRecords,
+    includeAuthenticationLogs, includeUserAccessLogs,
+  } = req.body || {};
+
+  if (!caseId || typeof caseId !== 'string' || caseId.trim().length === 0) {
+    return res.status(400).json({ error: 'caseId required — every legal hold must reference a litigation/regulatory matter' });
+  }
+  if (!rationale || typeof rationale !== 'string' || rationale.trim().length < 20) {
+    return res.status(400).json({ error: 'rationale required, min 20 chars — every legal hold must document why' });
+  }
+  if (!Array.isArray(outputFormats) || outputFormats.length === 0) {
+    return res.status(400).json({ error: 'outputFormats (non-empty array) required' });
+  }
+  if (custodianFilter != null && !Array.isArray(custodianFilter)) {
+    return res.status(400).json({ error: 'custodianFilter must be an array of user_ids when provided' });
+  }
+
+  try {
+    const db = getDb();
+    const result = legalHoldExport.createLegalHold(db, {
+      requestedByUserId: req.user.id,
+      caseId: caseId.trim(),
+      rationale: rationale.trim(),
+      timeWindowStart: timeWindowStart || null,
+      timeWindowEnd: timeWindowEnd || null,
+      custodianFilter: custodianFilter || null,
+      outputFormats,
+      indefiniteRetention: indefiniteRetention !== false,
+      includeAuditLog: includeAuditLog !== false,
+      includeBackupChain: includeBackupChain !== false,
+      includeIncidentRecords: includeIncidentRecords !== false,
+      includeAuthenticationLogs: includeAuthenticationLogs !== false,
+      includeUserAccessLogs: includeUserAccessLogs !== false,
+    });
+
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_CREATED',
+      'id=' + result.id + ' case=' + result.caseId + ' formats=' + outputFormats.join(',') +
+      ' size=' + result.sizeBytes + ' sha256=' + (result.archiveSha256 || '').slice(0, 16) +
+      ' key=' + (result.signingKeyFingerprint || '').slice(0, 16) +
+      ' indef=' + result.indefiniteRetention, req.ip, 'info');
+    res.json(result);
+  } catch (err) {
+    console.error('legal hold creation failed:', err.message);
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_FAILED',
+      'error=' + (err.message || '').slice(0, 200), req.ip, 'warning');
+    if (/format not registered/i.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (/caseId required|rationale required|at least one output format required|requestedByUserId required/i.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Legal hold creation failed', message: err.message });
+  }
+});
+
+// ── GET /api/legal-hold-exports — list 100 most recent ────────────────────
+
+app.get('/api/legal-hold-exports', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, case_id, requested_by_user_id, requested_at, rationale,' +
+      ' time_window_start, time_window_end, custodian_filter, output_formats,' +
+      ' status, archive_sha256, size_bytes, completed_at, error_message,' +
+      ' manifest_signing_key_fingerprint, cosign_signature_path,' +
+      ' indefinite_retention, hold_released_at, hold_released_by_user_id,' +
+      ' hold_release_rationale, downloaded_at, downloaded_by_user_id' +
+      ' FROM legal_hold_exports ORDER BY requested_at DESC LIMIT 100'
+    ).all();
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_LISTED', 'count=' + rows.length, req.ip, 'info');
+    res.json({ holds: rows });
+  } catch (err) {
+    console.error('legal hold list failed:', err.message);
+    res.status(500).json({ error: 'list failed', message: err.message });
+  }
+});
+
+// ── GET /api/legal-hold-exports/chain — chain inspection ──────────────────
+
+app.get('/api/legal-hold-exports/chain', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, prev_hash, this_hash, signature, event_type, hold_ref, actor_user_id, created_at' +
+      ' FROM legal_hold_chain ORDER BY id DESC LIMIT 1000'
+    ).all();
+    const activeKey = db.prepare(
+      'SELECT id, public_key, fingerprint, created_at FROM legal_hold_chain_signing_keys WHERE active = 1 LIMIT 1'
+    ).get();
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_CHAIN_INSPECTED', 'rows=' + rows.length, req.ip, 'info');
+    res.json({ chain: rows, active_signing_key: activeKey || null });
+  } catch (err) {
+    console.error('legal hold chain fetch failed:', err.message);
+    res.status(500).json({ error: 'chain fetch failed', message: err.message });
+  }
+});
+
+// ── GET /api/legal-hold-exports/:id/download — stream tar.gz ──────────────
+
+app.get('/api/legal-hold-exports/:id/download', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, case_id, archive_path, size_bytes, status FROM legal_hold_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'legal hold not found' });
+    if (!row.archive_path || !fs.existsSync(row.archive_path)) {
+      return res.status(404).json({ error: 'archive file not found on disk' });
+    }
+    if (row.status !== 'active' && row.status !== 'released') {
+      return res.status(409).json({ error: 'hold not in downloadable state (current status: ' + row.status + ')' });
+    }
+
+    db.prepare(
+      'UPDATE legal_hold_exports SET downloaded_at = ?, downloaded_by_user_id = ? WHERE id = ?'
+    ).run(new Date().toISOString().replace('T', ' ').substring(0, 19), req.user.id, row.id);
+
+    appendLegalHoldChainEntry(db, {
+      holdId: row.id, actorUserId: req.user.id, eventType: 'HOLD_DOWNLOADED',
+    });
+
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_DOWNLOADED',
+      'id=' + row.id + ' case=' + row.case_id + ' size=' + row.size_bytes, req.ip, 'info');
+
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + row.id + '.tar.gz"');
+    if (row.size_bytes) res.setHeader('Content-Length', String(row.size_bytes));
+    fs.createReadStream(row.archive_path).pipe(res);
+  } catch (err) {
+    console.error('legal hold download failed:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'download failed', message: err.message });
+  }
+});
+
+// ── GET /api/legal-hold-exports/:id/manifest — fetch manifest JSON ────────
+
+app.get('/api/legal-hold-exports/:id/manifest', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, case_id, manifest_path FROM legal_hold_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'legal hold not found' });
+    if (!row.manifest_path || !fs.existsSync(row.manifest_path)) {
+      return res.status(404).json({ error: 'manifest file not found on disk' });
+    }
+    const manifestBytes = fs.readFileSync(row.manifest_path);
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_MANIFEST_FETCHED',
+      'id=' + row.id + ' case=' + row.case_id, req.ip, 'info');
+    res.setHeader('Content-Type', 'application/json');
+    res.send(manifestBytes);
+  } catch (err) {
+    console.error('legal hold manifest fetch failed:', err.message);
+    res.status(500).json({ error: 'manifest fetch failed', message: err.message });
+  }
+});
+
+// ── POST /api/legal-hold-exports/:id/release — separate-actor release ─────
+// CISO only (must be a different user than the requesting vp/ciso)
+
+app.post('/api/legal-hold-exports/:id/release', authMiddleware(['ciso']), (req, res) => {
+  const { rationale } = req.body || {};
+
+  if (!rationale || typeof rationale !== 'string' || rationale.trim().length < 20) {
+    return res.status(400).json({ error: 'rationale required, min 20 chars — every release must document why' });
+  }
+
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, case_id, requested_by_user_id, status FROM legal_hold_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) {
+      auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASE_DENIED',
+        'id=' + req.params.id + ' reason=not_found', req.ip, 'warning');
+      return res.status(404).json({ error: 'legal hold not found' });
+    }
+    if (row.status !== 'active') {
+      auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASE_DENIED',
+        'id=' + row.id + ' reason=not_active status=' + row.status, req.ip, 'warning');
+      return res.status(409).json({ error: 'hold not active (current status: ' + row.status + ')' });
+    }
+    if (row.requested_by_user_id === req.user.id) {
+      auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASE_DENIED',
+        'id=' + row.id + ' case=' + row.case_id + ' reason=same_actor', req.ip, 'warning');
+      return res.status(403).json({
+        error: 'separate-actor violation: the CISO performing the release must be a different user from the original requester',
+        requested_by_user_id: row.requested_by_user_id,
+        releaser_user_id: req.user.id,
+      });
+    }
+
+    const result = legalHoldExport.releaseLegalHold(db, row.id, req.user.id, rationale.trim());
+
+    auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASED',
+      'id=' + row.id + ' case=' + row.case_id +
+      ' requester=' + row.requested_by_user_id + ' releaser=' + req.user.id, req.ip, 'info');
+    res.json(result);
+  } catch (err) {
+    if (err.name === 'SeparateActorViolation') {
+      auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASE_DENIED',
+        'id=' + req.params.id + ' reason=same_actor_orchestrator', req.ip, 'warning');
+      return res.status(403).json({ error: err.message });
+    }
+    if (err.code === 'SQLITE_CONSTRAINT_CHECK' || /CHECK constraint failed/i.test(err.message || '')) {
+      auditLogLegalHold(req.user.id, 'LEGAL_HOLD_RELEASE_DENIED',
+        'id=' + req.params.id + ' reason=schema_check', req.ip, 'warning');
+      return res.status(403).json({ error: 'separate-actor violation: schema CHECK constraint refused the UPDATE' });
+    }
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('legal hold release failed:', err.message);
+    res.status(500).json({ error: 'release failed', message: err.message });
   }
 });
 

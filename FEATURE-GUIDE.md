@@ -688,14 +688,46 @@ The external mode is for compromise recovery. If an AC, MC, or GD has been compr
 4. From now on: a German-tagged client can't be logged into from China — IP-based block, lead notified
 
 ### Legal Hold
-**What it's for:** Export data for legal hold / e-discovery requirements. Hashes data for integrity verification, formats for ESI repositories, generates chain of custody automatically.
+**What it's for:** Litigation-grade evidence preservation for e-discovery, regulatory inquiries, and internal investigations. Bundles selected platform data into one or more of eight e-discovery formats (EDRM XML, EML/mbox, PST-equivalent ZIP, Concordance DAT, Relativity load bundle, JSON tarball, PDF with Bates numbering, TIFF with Bates load file), signs the manifest with Ed25519 from a signing key set DISTINCT from the forensic-export keys, holds the archive indefinitely until a separate CISO issues a release with rationale. Triple-layer separate-actor enforcement at the route, orchestrator, and SQL CHECK constraint levels makes the release workflow structurally admissible in court.
 
-**Workflow:**
-1. Lead receives legal hold request from counsel
+**Distinct from forensic export:** forensic exports are operational (an admin generates an archive for an incident response and may delete it later). Legal holds preserve evidence indefinitely until a release authority decides the matter is closed. Three lifecycle differences: indefinite retention by default, NO deletion only release, separate-actor enforced at three layers (not two).
+
+**Workflow — create a hold:**
+1. Admin or CISO receives a litigation hold notice, regulatory inquiry, or internal-investigation request from counsel
 2. Opens Legal Hold tab
-3. Configures ESI repository path, hash algorithm, export format
-4. Triggers export — system produces hashed export with chain-of-custody documentation
-5. Hands export to counsel, retention is enforced indefinitely until hold is released
+3. Fills the Create form/modal:
+   - **Case ID** (required) — references the litigation matter, regulatory case number, or internal investigation ID
+   - **Rationale** (required, min 20 chars) — court order ref, regulatory request, investigation context
+   - **Time window** (optional) — restricts evidence to a specific date range
+   - **Custodian filter** (optional, API only currently) — restricts evidence to a specific user's activity (so a hold for "Jane Doe's actions Q3" doesn't sweep up other employees' audit records)
+   - **Output formats** — pick 1+ of the 8 (defaults to edrm-xml + eml-mime, the two most universal). Each selected format produces one file inside the archive.
+   - **Indefinite retention** (default checked) — uncheck only for time-bounded preservation orders
+4. Submit. System fetches the data slices, runs each format serializer, signs the manifest, optionally co-signs with sigstore Cosign, writes the tar.gz archive, and appends HOLD_CREATED + HOLD_COMPLETED chain entries.
+5. The hold appears in the Existing Legal Holds list with status='active'. The retention job will skip this hold forever (until released).
+
+**Workflow — hand to counsel:**
+1. From the holds list, click Download → tar.gz archive streams to the browser
+2. Transfer the archive to opposing counsel or the receiving e-discovery vendor via the case-specific secure channel (encrypted SFTP, vendor upload portal — external to FireAlive)
+3. Counsel extracts the outer tar.gz, finds manifest.json + manifest.sig + per-format files
+4. Counsel verifies the Ed25519 manifest signature using the public key from /api/legal-hold-exports/chain
+5. Counsel imports the per-format file into their review platform per the ESI compatibility matrix in docs/legal-hold-export.md (e.g., Relativity ingests the relativity.zip; Concordance ingests the concordance.dat; in-house Python pipelines ingest the json-tarball.tar.gz)
+6. Each event in every format carries its canonical SHA-256, allowing per-event integrity verification end-to-end
+
+**Workflow — release a hold (CISO only):**
+1. When the matter closes (case resolved, regulatory inquiry closed, court order lifted), a CISO different from the original requester opens the Legal Hold tab
+2. Clicks Release on the active hold
+3. Confirms in the release modal with a rationale ≥ 20 chars
+4. If the CISO IS the original requester, the release is rejected at THREE layers (route, orchestrator, schema CHECK) with HOLD_RELEASE_DENIED chain entry recording which layer caught the violation
+5. On successful release, the hold transitions to status='released' with hold_released_at, hold_released_by_user_id, and hold_release_rationale stamped atomically. HOLD_RELEASED chain entry appended. The archive remains downloadable for post-litigation audit.
+
+**Why three layers of separate-actor enforcement:**
+- **Layer 1 (route handler):** cleanest UX — caught immediately with a precise error, no DB write attempted
+- **Layer 2 (orchestrator):** defense-in-depth if a future route bypass exists; throws SeparateActorViolation
+- **Layer 3 (SQL CHECK constraint):** structurally impossible to bypass — lives in the database file itself. Opposing counsel cannot argue "the application could have been compromised" because the constraint is in the schema.
+
+All three must agree. The schema is the final backstop and the reason this workflow is admissible in court.
+
+**Cryptographic isolation:** legal hold signing keys are DISTINCT from forensic-export signing keys on each server. Plus MC and GD each maintain their own Tier-1 KEK and their own legal hold signing keys. Four independent key sets across the platform (MC forensic, MC legal-hold, GD forensic, GD legal-hold), each rotatable independently. Compromise of any one key does not taint the others.
 
 ---
 

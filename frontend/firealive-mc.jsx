@@ -2627,6 +2627,39 @@ function ManagementConsole() {
   // (ttxScenario state removed in Phase 1.4d — TTX is now a download-only flow)
   // Legal hold backup
   const [legalHoldCfg, setLegalHoldCfg] = useState({enabled:false,repository:"",hashAlgorithm:"sha256",format:"eml_pst",indefiniteRetention:true});
+  const [lhCreate, setLhCreate] = useState({open:false, caseId:"", rationale:"", outputFormats:["edrm-xml","eml-mime"], indefiniteRetention:true, submitting:false, error:""});
+  const [lhExports, setLhExports] = useState([]);
+  const [lhLoadState, setLhLoadState] = useState({loaded:false, loading:false, error:null});
+  const [lhReleaseModal, setLhReleaseModal] = useState({open:false, holdId:"", caseId:"", requestedBy:"", rationale:"", submitting:false, error:""});
+  const refreshLhList = async () => {
+    setLhLoadState({loaded:false, loading:true, error:null});
+    const r = await api.get('/api/legal-hold-exports');
+    if (!r || r.error) {
+      setLhLoadState({loaded:false, loading:false, error:(r && r.error) || 'request_failed'});
+      setLhExports([]);
+    } else {
+      setLhExports(Array.isArray(r.holds) ? r.holds : []);
+      setLhLoadState({loaded:true, loading:false, error:null});
+    }
+  };
+  useEffect(() => {
+    if (tab !== 'legal_hold') return;
+    let cancelled = false;
+    (async () => {
+      const r = await api.get('/api/legal-hold-exports');
+      if (cancelled) return;
+      if (!r || r.error) {
+        setLhLoadState({loaded:false, loading:false, error:(r && r.error) || 'request_failed'});
+        return;
+      }
+      setLhExports(Array.isArray(r.holds) ? r.holds : []);
+      setLhLoadState({loaded:true, loading:false, error:null});
+    })();
+    return () => { cancelled = true; };
+  }, [tab]);
+  const downloadLegalHold = async (id) => {
+    await api.download('/api/legal-hold-exports/' + encodeURIComponent(id) + '/download', 'firealive-legal-hold-' + id + '.tar.gz');
+  };
   // Risk register asset
   const [riskRegisterOutput, setRiskRegisterOutput] = useState(null);
   // ── v1.0.0 CONTINUED — Cross-app management state ────────────────────
@@ -6558,7 +6591,166 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <option value="json">JSON (structured)</option><option value="csv">CSV (tabular)</option><option value="eml_pst">EML/PST (email-compatible)</option><option value="native">Native SQLite (forensic)</option>
             </Sel>
           </Card>
-          <Btn primary onClick={()=>addA("LEGAL_HOLD_EXPORT","Legal hold export initiated — hash: "+legalHoldCfg.hashAlgorithm+", format: "+legalHoldCfg.format)}>Execute Legal Hold Export</Btn>
+          <Btn primary onClick={()=>setLhCreate(prev=>({...prev,open:true,error:""}))}>Execute Legal Hold Export</Btn>
+
+          {lhCreate.open && (
+            <Modal title="Create Legal Hold" onClose={()=>setLhCreate(prev=>({...prev,open:false}))} width={620}>
+              <M style={{display:"block",marginBottom:16,color:C.tm,lineHeight:1.5}}>
+                Initiates a litigation-grade evidence preservation hold. Active holds are exempt from scheduled retention. Release requires a CISO different from the requester (separate-actor invariant enforced at three layers — schema CHECK, orchestrator pre-check, and route handler).
+              </M>
+              <Input label="Case ID (required)" value={lhCreate.caseId} onChange={e=>setLhCreate(prev=>({...prev,caseId:e.target.value}))} placeholder="e.g., Smith-v-Acme-2026, GDPR-Inquiry-Q3" maxLength={200}/>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block"}}>Rationale (required, min 20 chars)</M>
+                <textarea value={lhCreate.rationale} onChange={e=>setLhCreate(prev=>({...prev,rationale:e.target.value}))} placeholder="Document why this hold is being placed — court order ref, regulatory request, internal investigation context" style={{width:"100%",minHeight:80,padding:10,fontSize:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontFamily:"inherit",resize:"vertical"}} maxLength={2000}/>
+                <M style={{color:lhCreate.rationale.trim().length<20?C.dd:C.tm,marginTop:4,display:"block"}}>{lhCreate.rationale.trim().length}/20 minimum chars</M>
+              </div>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:6,display:"block"}}>Export formats (select 1+ — all 8 are litigation-tested)</M>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+                  {["edrm-xml","eml-mime","pst","concordance","relativity","json-tarball","pdf-bates","tiff-bates"].map(f=>(
+                    <label key={f} style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:C.t}}>
+                      <input type="checkbox" checked={lhCreate.outputFormats.includes(f)} onChange={e=>{
+                        const checked = e.target.checked;
+                        setLhCreate(prev=>{
+                          const next = checked ? [...prev.outputFormats, f] : prev.outputFormats.filter(x=>x!==f);
+                          return {...prev, outputFormats: next};
+                        });
+                      }} style={{accentColor:C.a}}/>
+                      <span style={{fontFamily:"'IBM Plex Mono',monospace"}}>{f}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}>
+                <input type="checkbox" checked={lhCreate.indefiniteRetention} onChange={e=>setLhCreate(prev=>({...prev,indefiniteRetention:e.target.checked}))} style={{accentColor:C.a}}/>
+                Indefinite retention (default; uncheck for time-bounded preservation orders)
+              </label>
+              {lhCreate.error && (
+                <div style={{padding:10,marginBottom:12,background:"rgba(239,68,68,0.1)",border:`1px solid ${C.dd}`,borderRadius:6,color:C.dd,fontSize:11}}>{lhCreate.error}</div>
+              )}
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+                <Btn onClick={()=>setLhCreate(prev=>({...prev,open:false}))}>Cancel</Btn>
+                <Btn primary disabled={lhCreate.submitting || lhCreate.rationale.trim().length<20 || !lhCreate.caseId.trim() || lhCreate.outputFormats.length===0} onClick={async ()=>{
+                  setLhCreate(prev=>({...prev,submitting:true,error:""}));
+                  const res = await api.post("/api/legal-hold-exports", {
+                    caseId: lhCreate.caseId.trim(),
+                    rationale: lhCreate.rationale.trim(),
+                    outputFormats: lhCreate.outputFormats,
+                    indefiniteRetention: lhCreate.indefiniteRetention
+                  });
+                  if (res && res.error) {
+                    setLhCreate(prev=>({...prev,submitting:false,error:res.error||"Submission failed"}));
+                  } else {
+                    addA("LEGAL_HOLD_CREATED","case="+lhCreate.caseId.trim()+" id="+(res.id||"?")+" formats="+lhCreate.outputFormats.join(","));
+                    setLhCreate({open:false,caseId:"",rationale:"",outputFormats:["edrm-xml","eml-mime"],indefiniteRetention:true,submitting:false,error:""});
+                    refreshLhList();
+                  }
+                }}>{lhCreate.submitting?"Submitting...":"Create Hold"}</Btn>
+              </div>
+            </Modal>
+          )}
+
+          {/* Existing holds list */}
+          {lhLoadState.loading && (
+            <M style={{display:"block",marginTop:16,color:C.tm,fontStyle:"italic"}}>Loading holds...</M>
+          )}
+          {lhLoadState.error && (
+            <Card style={{marginTop:16,background:"rgba(239,68,68,0.05)",border:`1px solid ${C.dd}`}}>
+              <M style={{color:C.dd}}>Failed to load legal holds: {lhLoadState.error}</M>
+            </Card>
+          )}
+          {lhLoadState.loaded && lhExports.length===0 && (
+            <Card style={{marginTop:16}}>
+              <M style={{color:C.tm,fontStyle:"italic"}}>No legal holds yet. Use the Execute button above to create one.</M>
+            </Card>
+          )}
+          {lhLoadState.loaded && lhExports.length>0 && (
+            <div style={{marginTop:16}}>
+              <L>Existing Legal Holds</L>
+              <Card style={{padding:0,overflow:"hidden"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                  <thead>
+                    <tr style={{background:"rgba(255,255,255,0.02)"}}>
+                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Case ID / Hold ID</th>
+                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Requested</th>
+                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
+                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Manifest Key</th>
+                      <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {lhExports.map(h=>{
+                      const statusColor = h.status==="active"?C.a:h.status==="released"?C.tm:h.status==="failed"?C.d:h.status==="in_progress"?C.i:C.w;
+                      return (
+                        <tr key={h.id} style={{borderBottom:`1px solid ${C.b}`}}>
+                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                            <M style={{color:C.t,wordBreak:"break-all"}}>{h.case_id}</M>
+                            <M style={{color:C.td,display:"block",fontSize:10,marginTop:2,fontFamily:"'IBM Plex Mono',monospace",wordBreak:"break-all"}}>{h.id}</M>
+                            {h.indefinite_retention?(<M style={{color:C.a,display:"block",fontSize:10,marginTop:2}}>indefinite retention</M>):null}
+                          </td>
+                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                            <M style={{color:C.tm}}>{h.requested_at||"—"}</M>
+                            <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>by: {h.requested_by_user_id}</M>
+                            {h.rationale&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4,maxWidth:240,wordBreak:"break-word"}}>{h.rationale}</M>)}
+                          </td>
+                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                            <Badge color={statusColor}>{h.status}</Badge>
+                            {h.hold_released_at&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4}}>released {h.hold_released_at}<br/>by {h.hold_released_by_user_id}</M>)}
+                            {h.error_message&&(<M style={{color:C.d,display:"block",fontSize:10,marginTop:4,maxWidth:200,wordBreak:"break-word"}}>{h.error_message}</M>)}
+                          </td>
+                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                            <M style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{(h.manifest_signing_key_fingerprint||"—").slice(0,16)}{h.manifest_signing_key_fingerprint&&h.manifest_signing_key_fingerprint.length>16?"…":""}</M>
+                          </td>
+                          <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
+                            <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                              {(h.status==="active"||h.status==="released")&&(<button onClick={()=>downloadLegalHold(h.id)} style={{padding:"4px 8px",background:C.a,border:"none",borderRadius:4,color:"#000",fontSize:10,fontWeight:500,cursor:"pointer"}}>Download</button>)}
+                              {h.status==="active"&&(<button onClick={()=>setLhReleaseModal({open:true,holdId:h.id,caseId:h.case_id,requestedBy:h.requested_by_user_id||"",rationale:"",submitting:false,error:""})} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.w}`,borderRadius:4,color:C.w,fontSize:10,fontWeight:500,cursor:"pointer"}}>Release</button>)}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </Card>
+            </div>
+          )}
+
+          {/* Release modal */}
+          {lhReleaseModal.open && (
+            <Modal title="Release Legal Hold" onClose={()=>setLhReleaseModal(prev=>({...prev,open:false}))} width={580}>
+              <M style={{display:"block",marginBottom:12,color:C.tm,lineHeight:1.5}}>
+                Releasing case <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.caseId}</span> (hold ID <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.holdId}</span>).
+              </M>
+              <Card style={{marginBottom:14,background:"rgba(239,179,68,0.08)",border:`1px solid ${C.w}`}}>
+                <M style={{color:C.w,display:"block",lineHeight:1.5}}>
+                  ⚠ Separate-actor invariant: the CISO performing this release must be a DIFFERENT user from the original requester ({lhReleaseModal.requestedBy||"unknown"}). If you are the requester, this release will be denied at THREE layers — route handler, orchestrator, and schema CHECK constraint.
+                </M>
+              </Card>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block"}}>Release rationale (required, min 20 chars)</M>
+                <textarea value={lhReleaseModal.rationale} onChange={e=>setLhReleaseModal(prev=>({...prev,rationale:e.target.value}))} placeholder="Document why this hold is being released — case resolved, regulatory inquiry closed, court order lifted" style={{width:"100%",minHeight:80,padding:10,fontSize:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontFamily:"inherit",resize:"vertical"}} maxLength={2000}/>
+                <M style={{color:lhReleaseModal.rationale.trim().length<20?C.dd:C.tm,marginTop:4,display:"block"}}>{lhReleaseModal.rationale.trim().length}/20 minimum chars</M>
+              </div>
+              {lhReleaseModal.error && (
+                <div style={{padding:10,marginBottom:12,background:"rgba(239,68,68,0.1)",border:`1px solid ${C.dd}`,borderRadius:6,color:C.dd,fontSize:11}}>{lhReleaseModal.error}</div>
+              )}
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+                <Btn onClick={()=>setLhReleaseModal(prev=>({...prev,open:false}))}>Cancel</Btn>
+                <Btn primary danger disabled={lhReleaseModal.submitting || lhReleaseModal.rationale.trim().length<20} onClick={async ()=>{
+                  setLhReleaseModal(prev=>({...prev,submitting:true,error:""}));
+                  const r = await api.post("/api/legal-hold-exports/"+encodeURIComponent(lhReleaseModal.holdId)+"/release", {rationale:lhReleaseModal.rationale.trim()});
+                  if (r && r.error) {
+                    setLhReleaseModal(prev=>({...prev,submitting:false,error:r.error||"Release failed"}));
+                  } else {
+                    addA("LEGAL_HOLD_RELEASED","case="+lhReleaseModal.caseId+" id="+lhReleaseModal.holdId);
+                    setLhReleaseModal({open:false,holdId:"",caseId:"",requestedBy:"",rationale:"",submitting:false,error:""});
+                    refreshLhList();
+                  }
+                }}>{lhReleaseModal.submitting?"Releasing…":"Confirm Release"}</Btn>
+              </div>
+            </Modal>
+          )}
         </div>)}
 
         {/* ══════════ v1.0.0 — RISK REGISTER ASSET ══════════ */}
