@@ -35,7 +35,7 @@
     "@google-cloud/storage": "^7.0.0",
     "@mongodb-js/zstd": "^7.0.0",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^12.9.0",
+    "better-sqlite3": "^12.10.0",
     "compression": "^1.8.1",
     "cors": "^2.8.6",
     "docx": "^9.0.0",
