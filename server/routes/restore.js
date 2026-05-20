@@ -119,6 +119,8 @@ const signingKeysSvc = require('../services/backup-signing-keys');
 const chainSvc = require('../services/backup-chain');
 const approvalsSvc = require('../services/restore-approvals');
 const approvalPolicy = require('../services/restore-approval-policy');
+// R3l C66: chain walker/validator/replayer for incremental + differential restores
+const restoreChainSvc = require('../services/restore-chain');
 const { IntegrationManager } = require('../services/integration-manager');
 
 // ── Approval-gate helpers ────────────────────────────────────────────────────
@@ -583,6 +585,35 @@ router.post('/execute/:id', async (req, res) => {
       return res.status(400).json({
         error: 'Confirmation required. Send { confirmHash: "<first 8 chars of backup hash>" }',
         hint: backup.sha256_hash?.slice(0, 8),
+      });
+    }
+
+    // ── R3l C66: chain restore redirect ───────────────────────────────────
+    //
+    // Incremental and differential backups can't be restored standalone
+    // by this endpoint — they need their parent chain walked, validated,
+    // and replayed in order. The new POST /api/restore/execute-chain/:id
+    // endpoint handles that case end-to-end with the same approval gate
+    // and audit log semantics as this endpoint, but uses
+    // services/restore-chain.js (walkChain + validateChain + replayChain)
+    // instead of the single-archive flow below.
+    //
+    // Returning 400 here with a structured pointer (rather than transparently
+    // proxying to the chain endpoint) keeps the API contract honest:
+    // clients calling /execute/:id with a chain backup are expressing an
+    // incorrect assumption about how the backup is structured. The
+    // response includes the strategy + parent_backup_id so a UI can
+    // automatically retry against /execute-chain/:id if appropriate.
+    if (backup.format_version === 2
+        && (backup.backup_strategy === 'incremental' || backup.backup_strategy === 'differential')) {
+      db.close();
+      return res.status(400).json({
+        error: 'chain restore required for this backup',
+        code: 'CHAIN_RESTORE_REQUIRED',
+        strategy: backup.backup_strategy,
+        parent_backup_id: backup.parent_backup_id,
+        parent_full_backup_id: backup.parent_full_backup_id,
+        hint: `Use POST /api/restore/execute-chain/${req.params.id} with the same { confirmHash, approval_id? } body to restore the full chain.`,
       });
     }
 
@@ -1250,6 +1281,274 @@ router.post('/execute/:id', async (req, res) => {
   } catch (err) {
     logger.error('Execute restore error', { error: err.message });
     res.status(500).json({ error: 'Failed to execute restore', message: err.message });
+  }
+});
+
+// ── R3l C66: Chain Restore (incremental + differential) ───────────────
+//
+// POST /api/restore/execute-chain/:id
+//
+// Restore from an incremental or differential backup by walking the
+// parent chain back to the anchor full backup, validating every link,
+// then replaying the entire chain onto the live DB file. Goes through
+// the SAME approval-gate machinery as POST /execute/:id but uses
+// services/restore-chain.js for the actual restore mechanics.
+//
+// Request body:
+//   { confirmHash, approval_id? }
+// Same shape as /execute/:id. confirmHash MUST match the first 8 chars
+// of the LEAF backup's sha256_hash (the one in the URL path), not the
+// anchor's; the approval_id (if required by policy) must be issued
+// against the leaf as well.
+//
+// Steps:
+//   1. Auth check
+//   2. Backup lookup; reject if strategy is not incremental/differential
+//   3. Walk the chain
+//   4. Confirm hash gate
+//   5. Approval pre-validation
+//   6. File existence check for every chain link
+//   7. validateChain (manifest hashes, signatures, per-page sha256)
+//   8. Approval consume (Phase 2)
+//   9. Pre-restore snapshot of current DB
+//  10. replayChain to live DB path
+//  11. Audit log
+//  12. Return success response with chain summary
+router.post('/execute-chain/:id', async (req, res) => {
+  const { confirmHash } = req.body;
+  const userId = req.user && typeof req.user.id === 'string' ? req.user.id : null;
+  if (!userId) {
+    return res.status(401).json({ error: 'authentication required for restore', code: 'AUTH_REQUIRED' });
+  }
+
+  let db;
+  try {
+    db = getDb();
+    const leaf = db.prepare('SELECT * FROM backups WHERE id = ?').get(req.params.id);
+    if (!leaf) { db.close(); return res.status(404).json({ error: 'Backup not found' }); }
+    if (leaf.status !== 'verified') { db.close(); return res.status(400).json({ error: 'Backup not verified' }); }
+    if (leaf.format_version !== 2) {
+      db.close();
+      return res.status(400).json({ error: 'execute-chain requires format_version=2', strategy: leaf.backup_strategy });
+    }
+    const strategy = leaf.backup_strategy || 'full';
+    if (strategy !== 'incremental' && strategy !== 'differential') {
+      db.close();
+      return res.status(400).json({
+        error: 'execute-chain only supports incremental or differential backups',
+        strategy,
+        hint: `Use POST /api/restore/execute/${req.params.id} for full or snapshot backups.`,
+      });
+    }
+
+    // Confirm hash gate (against the LEAF, not the anchor)
+    if (confirmHash !== leaf.sha256_hash?.slice(0, 8)) {
+      db.close();
+      return res.status(400).json({
+        error: 'Confirmation required. Send { confirmHash: "<first 8 chars of LEAF backup hash>" }',
+        hint: leaf.sha256_hash?.slice(0, 8),
+      });
+    }
+
+    // Walk the chain
+    let chain;
+    try {
+      chain = restoreChainSvc.walkChain(db, leaf.id);
+    } catch (walkErr) {
+      db.close();
+      return res.status(400).json({
+        error: 'cannot walk restore chain',
+        detail: walkErr.message,
+        code: 'CHAIN_WALK_FAILED',
+      });
+    }
+
+    // Approval gate pre-validation (uses leaf as the gated backup)
+    const policyMode = approvalPolicy.getMode(db);
+    const preValidate = preValidateApproval(db, {
+      backup: leaf,
+      userId,
+      body: req.body,
+      mode: policyMode,
+      ip: req.ip,
+    });
+    if (!preValidate.ok) {
+      db.close();
+      return res.status(preValidate.status).json(preValidate.body);
+    }
+
+    // Verify every chain link's files exist on disk
+    for (const link of chain) {
+      const paths = {
+        manifest:   link.manifest_path,
+        archive:    link.archive_path,
+        signature:  link.manifest_sig_path,
+        wrappedKey: link.wrapped_key_path,
+      };
+      for (const [label, p] of Object.entries(paths)) {
+        if (!p || !fs.existsSync(p)) {
+          db.close();
+          return res.status(400).json({
+            error: `chain link ${link.id} ${label} file missing on disk`,
+            chainLinkId: link.id,
+            chainLinkStrategy: link.backup_strategy || 'full',
+            missing: label,
+            expectedPath: p,
+          });
+        }
+      }
+    }
+
+    // Validate the entire chain end-to-end before any destructive work
+    let validation;
+    try {
+      validation = await restoreChainSvc.validateChain(db, chain);
+    } catch (validateErr) {
+      db.close();
+      return res.status(500).json({
+        error: 'chain validation crashed',
+        detail: validateErr.message,
+      });
+    }
+    if (!validation.ok) {
+      db.close();
+      return res.status(400).json({
+        error: 'chain validation failed',
+        code: 'CHAIN_VALIDATION_FAILED',
+        validation,
+      });
+    }
+
+    // Approval consume (Phase 2) — same helper as /execute/:id
+    let approvalConsumeResult;
+    let approvalRowFinal;
+    try {
+      const consumed = consumeApprovalGated(db, {
+        backup: leaf,
+        userId,
+        body: req.body,
+        mode: policyMode,
+        ip: req.ip,
+      });
+      approvalConsumeResult = consumed.consume_result;
+      approvalRowFinal = consumed.approval_row;
+    } catch (approvalErr) {
+      db.close();
+      const status = approvalCodeToHttpStatus(approvalErr.code);
+      return res.status(status).json({
+        error: approvalErr.message,
+        code: approvalErr.code,
+        detail: approvalErr.detail || null,
+      });
+    }
+
+    // Pre-restore snapshot of current DB to backup dir
+    const { DB_PATH } = require('../db/init');
+    const preRestoreTs = new Date().toISOString().replace(/[:.]/g, '-');
+    const preRestoreDir = path.dirname(DB_PATH);
+    const preRestorePath = path.join(preRestoreDir, `pre-restore-chain-${preRestoreTs}.db`);
+    try {
+      fs.copyFileSync(DB_PATH, preRestorePath);
+    } catch (preErr) {
+      db.close();
+      return res.status(500).json({
+        error: 'pre-restore snapshot failed; refusing to proceed',
+        detail: preErr.message,
+      });
+    }
+
+    // Close the management DB before we write to its file (better-sqlite3
+    // holds the file open; replay writes raw page bytes).
+    // We reopen for the audit log after.
+    db.close();
+
+    // Replay the chain. Skip validation since we already ran it.
+    let replay;
+    try {
+      replay = await restoreChainSvc.replayChain(getDb(), chain, DB_PATH, { skipValidation: true });
+    } catch (replayErr) {
+      // Reopen db just for audit logging the failure
+      const auditDb = getDb();
+      auditLog(
+        userId,
+        'DATABASE_RESTORE_FAILED',
+        `chain leaf=${leaf.id} strategy=${strategy} crashed=true detail=${replayErr.message.slice(0, 120)}`,
+        req.ip,
+      );
+      auditDb.close();
+      return res.status(500).json({
+        error: 'chain replay crashed',
+        detail: replayErr.message,
+        preRestorePath: path.basename(preRestorePath),
+      });
+    }
+
+    if (!replay.ok) {
+      const auditDb = getDb();
+      auditLog(
+        userId,
+        'DATABASE_RESTORE_FAILED',
+        `chain leaf=${leaf.id} strategy=${strategy} reason=${(replay.error || 'unknown').slice(0, 120)} linksReplayed=${replay.linksReplayed}`,
+        req.ip,
+      );
+      auditDb.close();
+      return res.status(500).json({
+        error: 'chain replay failed; DB may be in inconsistent state',
+        detail: replay.error,
+        linksReplayed: replay.linksReplayed,
+        framesApplied: replay.framesApplied,
+        preRestorePath: path.basename(preRestorePath),
+        recoveryHint: `Restore the pre-restore snapshot at ${path.basename(preRestorePath)} to recover the prior database state.`,
+      });
+    }
+
+    // Success — re-open DB for audit log
+    const auditDb = getDb();
+    auditLog(
+      userId,
+      'DATABASE_RESTORED',
+      `chain leaf=${leaf.id} anchor=${replay.anchorBackupId} strategy=${strategy} links=${replay.linksReplayed} frames=${replay.framesApplied} pre-restore=${path.basename(preRestorePath)} approval=${approvalRowFinal.id} method=${approvalRowFinal.approval_method || 'unknown'}`,
+      req.ip,
+    );
+    logger.warn('DATABASE RESTORED (chain)', {
+      leafBackupId: leaf.id,
+      anchorBackupId: replay.anchorBackupId,
+      strategy,
+      linksReplayed: replay.linksReplayed,
+      framesApplied: replay.framesApplied,
+      approvalId: approvalRowFinal.id,
+    });
+    auditDb.close();
+
+    return res.json({
+      ok: true,
+      format_version: 2,
+      restore_kind: 'chain',
+      message: 'Database restored successfully from chain. A pre-restore snapshot was saved.',
+      preRestorePath: path.basename(preRestorePath),
+      leafBackupId: leaf.id,
+      anchorBackupId: replay.anchorBackupId,
+      strategy,
+      chain: chain.map(b => ({
+        id: b.id,
+        strategy: b.backup_strategy || 'full',
+        created_at: b.created_at,
+        page_count: b.page_count,
+      })),
+      linksReplayed: replay.linksReplayed,
+      framesApplied: replay.framesApplied,
+      approval: {
+        id: approvalRowFinal.id,
+        method: approvalRowFinal.approval_method || approvalConsumeResult.approval_method || null,
+        mode_at_creation: approvalRowFinal.approval_mode_at_creation,
+        consumed_at: approvalConsumeResult.consumed_at,
+      },
+      note: 'The server should be restarted to ensure all in-memory state reflects the restored database.',
+    });
+  } catch (err) {
+    try { if (db) db.close(); } catch (_) {}
+    logger.error('execute-chain handler crashed', { error: err.message, stack: err.stack });
+    return res.status(500).json({ error: 'internal error during chain restore', detail: err.message });
   }
 });
 

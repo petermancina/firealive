@@ -1290,7 +1290,12 @@ function ManagementConsole() {
     Promise.all([
       api.get("/api/backup-schedules"),
       api.get("/api/backup-schedules/presets"),
-    ]).then(([sRes, pRes])=>{
+      // R3l C59: fetch backup_destinations so the Add Schedule form's
+      // destination_filter summary panel can show which destinations
+      // match the operator's current filter. Failures here are
+      // non-fatal — the form still works without the panel.
+      api.get("/api/backup-destinations").catch(() => null),
+    ]).then(([sRes, pRes, dRes])=>{
       if (sRes?.error) {
         setSchedulesError(sRes.message || "Could not load schedules.");
         setSchedules([]);
@@ -1302,10 +1307,15 @@ function ManagementConsole() {
       } else {
         setPresets(Array.isArray(pRes?.presets) ? pRes.presets : []);
       }
+      // R3l C59: destinations list — keep only enabled ones; the summary
+      // panel surfaces "X of Y enabled destinations match this filter"
+      const destList = (dRes && Array.isArray(dRes.destinations)) ? dRes.destinations : [];
+      setEnabledDestinations(destList.filter(d => d.enabled === 1 || d.enabled === true));
     }).catch(()=>{
       setSchedulesError("Could not reach the server.");
       setSchedules([]);
       setPresets([]);
+      setEnabledDestinations([]);
     }).finally(()=>setSchedulesLoading(false));
   }, [tab]);
 
@@ -1386,6 +1396,14 @@ function ManagementConsole() {
   const submitNewSchedule = async (forceQueue = false) => {
     setAddBusy(true);
     setAddError(null);
+    // R3l C59: parse destination_filter from the comma-separated text
+    // input into an array of trimmed non-empty tags. Empty string and
+    // "no tags entered" both become null so the schema column receives
+    // NULL ("no filter" / push to all enabled destinations).
+    const filterTags = (newSchedule.destination_filter || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
     const body = {
       name: newSchedule.name || null,
       type: newSchedule.type,
@@ -1400,6 +1418,20 @@ function ManagementConsole() {
       encrypted: !!newSchedule.encrypted,
       regulatory_preset_id: newSchedule.regulatory_preset_id || null,
       active: newSchedule.active !== false,
+      // R3l C59: Workstream 3 fields. Service-layer validation enforces
+      // enum membership and array shape; the route returns 400 with the
+      // precise error code on invalid values (see C57 routes change).
+      backup_kind: newSchedule.backup_kind,
+      backup_strategy: newSchedule.backup_strategy,
+      destination_filter: filterTags.length > 0 ? filterTags : null,
+      // R3l C74: max_chain_depth as positive integer or null. Empty
+      // string from the form means null (= use global default).
+      max_chain_depth: (()=>{
+        const v = newSchedule.max_chain_depth;
+        if (v === "" || v == null) return null;
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      })(),
     };
     if (forceQueue) body.force_queue = true;
     try {
@@ -1427,6 +1459,10 @@ function ManagementConsole() {
         day_of_week: 0, day_of_month: 1, destination: "local",
         retention_days: 30, encrypted: true, regulatory_preset_id: null,
         active: true,
+        // R3l C59: reset Workstream 3 fields to safe defaults
+        backup_kind: "full-suite", backup_strategy: "full", destination_filter: "",
+        // R3l C74: reset max_chain_depth back to empty (= use global)
+        max_chain_depth: "",
       });
     } catch (e) {
       setAddError("Could not reach the server.");
@@ -1510,7 +1546,28 @@ function ManagementConsole() {
     ovhcloud: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
     exoscale: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
   };
-  const [backups, setBackups] = useState([{id:1,ts:"2026-03-27 02:00",type:"daily-auto",size:"2.4 GB",status:"verified",hash:"sha256:a3f8c…"},{id:2,ts:"2026-03-26 02:00",type:"daily-auto",size:"2.3 GB",status:"verified",hash:"sha256:b7e2d…"}]);
+  // R3l C69: mock backups now include backup_strategy + parent chain
+  // fields so demo mode shows the new strategy badges and a 2-link chain
+  // example. Real backups loaded from /api/backup carry these fields
+  // when format_version=2 (set by C53/C55 schema columns).
+  const [backups, setBackups] = useState([{id:1,ts:"2026-03-27 02:00",type:"daily-auto",backup_strategy:"full",size:"2.4 GB",status:"verified",hash:"sha256:a3f8c…"},{id:2,ts:"2026-03-26 02:00",type:"daily-auto",backup_strategy:"incremental",parent_backup_id:1,parent_full_backup_id:1,page_count:48,wal_start_position:"32:0",wal_end_position:"196640:48",size:"12 MB",status:"verified",hash:"sha256:b7e2d…"}]);
+  // R3l C70: expandable chain view. expandedChains tracks which row's
+  // chain panel is open; chainData caches the response from
+  // GET /api/backup/:id/chain (the C68 endpoint); chainLoading tracks
+  // in-flight fetches so the UI can show a spinner-equivalent.
+  // Cache key is the leaf backup id; once fetched, the chain panel
+  // expands instantly on subsequent toggles.
+  const [expandedChains, setExpandedChains] = useState({});
+  const [chainData, setChainData] = useState({});
+  const [chainLoading, setChainLoading] = useState({});
+  // R3l C71: restore-preview modal. null when closed; when open:
+  //   { backupId, confirmInput, restoring, error, result }
+  // The modal reuses chainData (populated by C70 expansion or fetched
+  // when the modal opens) to render the chain preview, then surfaces a
+  // confirmation gate (first 8 chars of leaf hash) before calling
+  // POST /api/restore/execute-chain/:id for chain backups, or
+  // POST /api/restore/execute/:id for full/snapshot backups.
+  const [restoreModal, setRestoreModal] = useState(null);
   const [snapshots, setSnapshots] = useState([]);
   const [forensicExports, setFE] = useState([]);
   const [appVersion, setAppVersion] = useState("");
@@ -1796,7 +1853,30 @@ function ManagementConsole() {
     day_of_week: 0, day_of_month: 1, destination: "local",
     retention_days: 30, encrypted: true, regulatory_preset_id: null,
     active: true,
+    // R3l C59: Workstream 3 schema fields with safe defaults
+    backup_kind: "full-suite", backup_strategy: "full", destination_filter: "",
+    // R3l C74: max_chain_depth empty string means "use global default
+    // (system_meta.max_chain_depth, seeded to 100 by the C73 migration)".
+    // Operators who want per-schedule control enter a positive integer
+    // ≤1000. Service-layer validation in backup-schedules.js rejects
+    // out-of-bounds values with INVALID_MAX_CHAIN_DEPTH.
+    max_chain_depth: "",
   });
+  // R3l C59: enabled backup_destinations cache for the destination_filter
+  // summary panel. Fetched lazily when the Backup Schedules tab opens
+  // (same effect that loads schedules + presets) so an operator can see
+  // which destinations their filter actually matches before saving.
+  const [enabledDestinations, setEnabledDestinations] = useState([]);
+  // R3l C60: quick-form state for the Backup & Storage Routing tab's
+  // inline "Backup Scheduler" card. Pre-R3l, that card's selectors were
+  // cosmetic and the Save button posted hardcoded values; C60 adds three
+  // wired selectors so kind/strategy/filter chosen here actually reach
+  // the server. Existing legacy fields on that card remain cosmetic for
+  // backward-compat; the Add Schedule form in the Backup Schedules tab
+  // (C59) is the canonical full-fidelity entry point.
+  const [qkBackupKind, setQkBackupKind] = useState("full-suite");
+  const [qkBackupStrategy, setQkBackupStrategy] = useState("full");
+  const [qkDestinationFilter, setQkDestinationFilter] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState(null);
   const [overlapConfirm, setOverlapConfirm] = useState(null);
@@ -3935,7 +4015,47 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* BACKUP */}
         {tab==="backup"&&(<div>
           <L>Backup, Recovery & Storage Routing</L>
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Backup Scheduler</div><Sel label="Type"><option>Full</option><option>DB only</option><option>Configs</option><option>Audit</option></Sel><Sel label="Interval"><option>Every 4hr</option><option>Every 8hr</option><option>Daily 02:00</option><option>Weekly Sun</option></Sel><Sel label="Retention"><option>7 days</option><option>30 days</option><option>90 days</option><option>1 year</option></Sel><Input label="Destination" placeholder="smb://backup/"/><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Encrypt (AES-256)</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/backup-schedules",{name:"Backup tab quick-save",type:"full",frequency:"daily",time:"02:00",destination:"local",retention_days:30,encrypted:true,active:true}).then(r=>addA("BK","Backup schedule saved (id="+(r&&r.schedule?r.schedule.id:"?")+")")).catch(e=>addA("BK_FAIL",e.message||"Failed to save schedule"))}>Save</Btn></Card>
+          <Card style={{marginBottom:16,borderColor:C.i+"30"}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Backup Scheduler</div>
+            <Sel label="Type"><option>Full</option><option>DB only</option><option>Configs</option><option>Audit</option></Sel>
+            <Sel label="Interval"><option>Every 4hr</option><option>Every 8hr</option><option>Daily 02:00</option><option>Weekly Sun</option></Sel>
+            <Sel label="Retention"><option>7 days</option><option>30 days</option><option>90 days</option><option>1 year</option></Sel>
+            <Input label="Destination" placeholder="smb://backup/"/>
+            {/* R3l C60: kind/strategy/filter wired through the qk* state declared above. */}
+            <Sel label="Data scope" value={qkBackupKind} onChange={e=>setQkBackupKind(e.target.value)}>
+              <option value="full-suite">Full suite (configs + audit + keys + DB)</option>
+              <option value="single-db">Database file only</option>
+            </Sel>
+            <Sel label="Strategy" value={qkBackupStrategy} onChange={e=>setQkBackupStrategy(e.target.value)}>
+              <option value="full">Full</option>
+              <option value="incremental">Incremental (WAL-based)</option>
+              <option value="differential">Differential (since anchor)</option>
+              <option value="snapshot">Snapshot (point-in-time)</option>
+            </Sel>
+            <Input label="Destination filter (comma-separated tags; empty = all)" value={qkDestinationFilter} onChange={e=>setQkDestinationFilter(e.target.value)} placeholder="e.g. offsite, encrypted"/>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}>
+              <input type="checkbox" defaultChecked/>
+              <M style={{color:C.t}}>Encrypt (AES-256)</M>
+            </label>
+            <Btn primary style={{marginTop:8}} onClick={()=>{
+              const tags = (qkDestinationFilter || "").split(",").map(s=>s.trim()).filter(Boolean);
+              api.post("/api/backup-schedules", {
+                name: "Backup tab quick-save",
+                type: "full",
+                frequency: "daily",
+                time: "02:00",
+                destination: "local",
+                retention_days: 30,
+                encrypted: true,
+                active: true,
+                // R3l C60: kind/strategy/filter parity with the full Add Schedule form
+                backup_kind: qkBackupKind,
+                backup_strategy: qkBackupStrategy,
+                destination_filter: tags.length > 0 ? tags : null,
+              }).then(r=>addA("BK","Backup schedule saved (id="+(r&&r.schedule?r.schedule.id:"?")+")"))
+                .catch(e=>addA("BK_FAIL",e.message||"Failed to save schedule"));
+            }}>Save</Btn>
+          </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:C.i,marginBottom:12}}>Storage Destination Configuration</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Route each data type to its appropriate storage destination. Each type can target a different system — backups to one location, audit logs to another, forensic exports to a third.</M>
@@ -3970,18 +4090,275 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
             <Btn primary onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),type:"full-suite",size:"...",status:"running",hash:"generating..."};setBackups(prev=>[placeholder,...prev]);addA("FULL_SUITE_BACKUP_TRIGGERED","Full-suite backup requested");try{const r=await api.post("/api/backup/full-suite",{});setBackups(prev=>prev.map(b=>b.id===localId?{id:r.id||localId,ts:new Date().toISOString(),type:"full-suite",size:r.size_bytes?(r.size_bytes/1024/1024).toFixed(1)+" MB":"?",status:"verified",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(no manifest)"}:b));addA("FULL_SUITE_BACKUP_CREATED","id="+r.id+" size="+r.size_bytes);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"backup failed";setBackups(prev=>prev.map(b=>b.id===localId?{...b,status:"failed",hash:msg.slice(0,40)}:b));addA("FULL_SUITE_BACKUP_FAILED",msg);}}}>Trigger Full Backup Now</Btn>
+            {/* R3l C72: ad-hoc strategy buttons. Both call POST /api/backup
+                with ?strategy= (the C67 endpoint). Server may escalate to
+                full when no anchor/parent exists; the response carries
+                actual_strategy and escalation_reason which we surface in
+                the activity log and the placeholder row's backup_strategy
+                field so the post-success row reflects what was actually
+                produced (not what was requested). */}
+            <Btn onClick={async()=>{
+              const localId=Date.now();
+              const placeholder={id:localId,ts:new Date().toISOString(),type:"on-demand",backup_strategy:"incremental",size:"...",status:"running",hash:"generating..."};
+              setBackups(prev=>[placeholder,...prev]);
+              addA("BACKUP_TRIGGERED","strategy=incremental");
+              try{
+                const r=await api.post("/api/backup?strategy=incremental",{});
+                const actual=r.actual_strategy||"incremental";
+                const escalated=!!r.escalated;
+                setBackups(prev=>prev.map(x=>x.id===localId?{id:r.id||localId,ts:new Date().toISOString(),type:"on-demand",backup_strategy:actual,parent_backup_id:r.parent_backup_id,parent_full_backup_id:r.parent_full_backup_id,page_count:r.page_count,wal_start_position:r.wal_start_position,wal_end_position:r.wal_end_position,size:r.size_bytes?(r.size_bytes/1024/1024).toFixed(1)+" MB":"?",status:"verified",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(no manifest)"}:x));
+                addA("BACKUP_CREATED","id="+r.id+" strategy="+actual+(escalated?" (escalated from incremental: "+(r.escalation_reason||"no reason")+")":""));
+              }catch(err){
+                const msg=(err.response&&err.response.data&&(err.response.data.error||err.response.data.message))||err.message||"backup failed";
+                setBackups(prev=>prev.map(x=>x.id===localId?{...x,status:"failed",hash:msg.slice(0,40)}:x));
+                addA("BACKUP_FAILED","strategy=incremental error="+msg.slice(0,80));
+              }
+            }}>Take Incremental Now</Btn>
+            <Btn onClick={async()=>{
+              const localId=Date.now();
+              const placeholder={id:localId,ts:new Date().toISOString(),type:"on-demand",backup_strategy:"differential",size:"...",status:"running",hash:"generating..."};
+              setBackups(prev=>[placeholder,...prev]);
+              addA("BACKUP_TRIGGERED","strategy=differential");
+              try{
+                const r=await api.post("/api/backup?strategy=differential",{});
+                const actual=r.actual_strategy||"differential";
+                const escalated=!!r.escalated;
+                setBackups(prev=>prev.map(x=>x.id===localId?{id:r.id||localId,ts:new Date().toISOString(),type:"on-demand",backup_strategy:actual,parent_backup_id:r.parent_backup_id,parent_full_backup_id:r.parent_full_backup_id,page_count:r.page_count,wal_start_position:r.wal_start_position,wal_end_position:r.wal_end_position,size:r.size_bytes?(r.size_bytes/1024/1024).toFixed(1)+" MB":"?",status:"verified",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(no manifest)"}:x));
+                addA("BACKUP_CREATED","id="+r.id+" strategy="+actual+(escalated?" (escalated from differential: "+(r.escalation_reason||"no reason")+")":""));
+              }catch(err){
+                const msg=(err.response&&err.response.data&&(err.response.data.error||err.response.data.message))||err.message||"backup failed";
+                setBackups(prev=>prev.map(x=>x.id===localId?{...x,status:"failed",hash:msg.slice(0,40)}:x));
+                addA("BACKUP_FAILED","strategy=differential error="+msg.slice(0,80));
+              }
+            }}>Take Differential Now</Btn>
             <Btn onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"capturing",hash:"..."};setSnapshots(prev=>[placeholder,...prev]);try{const r=await api.post("/api/backup",{});setSnapshots(prev=>prev.map(s=>s.id===localId?{id:r.id||localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"captured",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(captured)"}:s));addA("SNAPSHOT","id="+r.id);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"snapshot failed";setSnapshots(prev=>prev.map(s=>s.id===localId?{...s,status:"failed",hash:msg.slice(0,40)}:s));addA("SNAPSHOT_FAILED",msg);}}}>Capture Snapshot Now</Btn>
             <Btn danger onClick={()=>{const exp={id:Date.now(),ts:new Date().toISOString(),status:"generating",format:"forensic-archive"};setFE(prev=>[exp,...prev]);api.post("/api/v1/audit/log",{event:"FORENSIC_EXPORT",detail:"Initiated"}).then(()=>addA("FORENSIC_EXPORT","Initiated"));setTimeout(()=>setFE(prev=>prev.map(e=>e.id===exp.id?{...e,status:"ready",size:"3.1 GB",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:e)),2500);}}>Export for Forensics</Btn>
           </div>
           {snapshots.length>0&&<><L>Snapshots</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{snapshots.map(s=><div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{s.label}</M><br/><M style={{color:C.td}}>{new Date(s.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={C.a}>{s.status}</Badge><br/><M style={{color:C.td,fontSize:8}}>{s.hash}</M></div></div>)}</div></>}
           {forensicExports.length>0&&<><L>Forensic Exports</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{forensicExports.map(e=><div key={e.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{e.format}</M><br/><M style={{color:C.td}}>{new Date(e.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={e.status==="ready"?C.a:C.w}>{e.status}</Badge>{e.size&&<><br/><M style={{color:C.td}}>{e.size} · {e.hash}</M></>}</div></div>)}</div></>}
           <L>Backup History</L>
-          <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{backups.map(b=>(
-            <div key={b.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <div><M style={{color:C.t}}>{b.ts}</M><br/><M style={{color:C.td}}>{b.type} · {b.size}</M></div>
-              <div style={{textAlign:"right"}}><Badge color={b.status==="verified"?C.a:b.status==="running"?C.w:C.d}>{b.status}</Badge><br/><M style={{color:C.td,fontSize:8}}>{b.hash}</M></div>
+          <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{backups.map(b=>{
+            // R3l C69: strategy color helper. Full=green, snapshot=blue,
+            // incremental=amber, differential=purple. Picked to give
+            // operators a quick visual scan of chain composition without
+            // having to read each badge text.
+            const strategyColor=(s)=>{if(s==="full")return C.a;if(s==="snapshot")return C.i;if(s==="incremental")return C.w;if(s==="differential")return"#9F7AEA";return C.td;};
+            const isChainLink=b.backup_strategy==="incremental"||b.backup_strategy==="differential";
+            const jumpToRow=(id)=>{const el=document.getElementById("backup-row-"+id);if(el)el.scrollIntoView({behavior:"smooth",block:"center"});};
+            // R3l C70: chain expand/collapse + lazy fetch
+            const isExpanded=!!expandedChains[b.id];
+            const deriveLocalChain=(leafId)=>{
+              // Demo-mode fallback when /api/backup/:id/chain isn't reachable.
+              // Mirrors the server-side walkChain semantics (R3l C65):
+              // walks parent_backup_id backwards from the leaf to the
+              // anchor full backup. Stops at MAX_CHAIN_DEPTH=1000.
+              const findById=(id)=>backups.find(x=>x.id===id);
+              const leaf=findById(leafId);
+              if(!leaf)return{ok:false,error:"backup not found in local list"};
+              const strategy=leaf.backup_strategy||"full";
+              if(strategy==="full"||strategy==="snapshot"){
+                return{ok:true,leafBackupId:leafId,anchorBackupId:leafId,chainLength:1,totalPageCount:leaf.page_count||0,restorable:true,chain:[{...leaf,filesPresent:true,missingFiles:[]}]};
+              }
+              if(strategy==="differential"){
+                const anchor=findById(leaf.parent_backup_id);
+                if(!anchor)return{ok:false,error:"differential anchor not found in local list"};
+                return{ok:true,leafBackupId:leafId,anchorBackupId:anchor.id,chainLength:2,totalPageCount:(anchor.page_count||0)+(leaf.page_count||0),restorable:true,chain:[{...anchor,filesPresent:true,missingFiles:[]},{...leaf,filesPresent:true,missingFiles:[]}]};
+              }
+              // incremental: walk back
+              const reversed=[leaf];
+              let cur=leaf;
+              let depth=0;
+              while((cur.backup_strategy||"full")==="incremental"&&depth<1000){
+                const parent=findById(cur.parent_backup_id);
+                if(!parent)return{ok:false,error:"chain broken: parent "+cur.parent_backup_id+" missing"};
+                reversed.push(parent);
+                cur=parent;
+                depth+=1;
+              }
+              const chain=reversed.reverse();
+              const total=chain.reduce((s,x)=>s+(x.page_count||0),0);
+              return{ok:true,leafBackupId:leafId,anchorBackupId:chain[0].id,chainLength:chain.length,totalPageCount:total,restorable:true,chain:chain.map(x=>({...x,filesPresent:true,missingFiles:[]}))};
+            };
+            const toggleChainExpand=async()=>{
+              const wasOpen=isExpanded;
+              setExpandedChains(prev=>({...prev,[b.id]:!wasOpen}));
+              if(wasOpen||chainData[b.id])return;
+              setChainLoading(prev=>({...prev,[b.id]:true}));
+              try{
+                const resp=await api.get("/api/backup/"+b.id+"/chain");
+                setChainData(prev=>({...prev,[b.id]:resp}));
+              }catch(_e){
+                // Demo-mode / offline fallback: derive from local backups list
+                setChainData(prev=>({...prev,[b.id]:deriveLocalChain(b.id)}));
+              }finally{
+                setChainLoading(prev=>({...prev,[b.id]:false}));
+              }
+            };
+            return (
+            <div key={b.id} id={"backup-row-"+b.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <M style={{color:C.t}}>{b.ts}</M>
+                  {b.backup_strategy&&<Badge color={strategyColor(b.backup_strategy)} style={{marginLeft:6,fontSize:9}}>{b.backup_strategy}</Badge>}
+                  <br/>
+                  <M style={{color:C.td}}>{b.type} · {b.size}</M>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <Badge color={b.status==="verified"?C.a:b.status==="running"?C.w:C.d}>{b.status}</Badge>
+                  <br/>
+                  <M style={{color:C.td,fontSize:8}}>{b.hash}</M>
+                  <br/>
+                  {/* R3l C71: per-row Restore button. Opens the restore-preview
+                      modal which surfaces the chain (for inc/diff) or single
+                      manifest (for full/snapshot) plus a confirmation gate.
+                      The chain fetch is triggered here (not in the modal's
+                      render) so we don't risk setState-during-render loops. */}
+                  <button onClick={(e)=>{
+                    e.stopPropagation();
+                    setRestoreModal({backupId:b.id,confirmInput:"",restoring:false,error:null,result:null});
+                    if(isChainLink&&!chainData[b.id]&&!chainLoading[b.id]){
+                      setChainLoading(prev=>({...prev,[b.id]:true}));
+                      api.get("/api/backup/"+b.id+"/chain").then(r=>{
+                        setChainData(prev=>({...prev,[b.id]:r}));
+                      }).catch(()=>{
+                        setChainData(prev=>({...prev,[b.id]:deriveLocalChain(b.id)}));
+                      }).finally(()=>setChainLoading(prev=>({...prev,[b.id]:false})));
+                    }
+                  }} style={{marginTop:4,padding:"2px 8px",background:"transparent",border:`1px solid ${C.i}`,borderRadius:4,color:C.i,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Restore</button>
+                </div>
+              </div>
+              {isChainLink&&(
+                <div onClick={toggleChainExpand} style={{cursor:"pointer",marginTop:6,paddingTop:6,borderTop:`1px dashed ${C.b}`,display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:6,fontSize:10,color:C.td}}>
+                  <span>
+                    <span style={{color:C.i,marginRight:6}}>{isExpanded?"▼":"▶"}</span>
+                    ↳ parent:&nbsp;
+                    <span style={{cursor:"pointer",color:C.i,textDecoration:"underline"}} onClick={(e)=>{e.stopPropagation();jumpToRow(b.parent_backup_id);}}>{String(b.parent_backup_id||"").slice(0,12)}</span>
+                    {b.parent_full_backup_id&&b.parent_full_backup_id!==b.parent_backup_id&&(<>&nbsp;·&nbsp;anchor:&nbsp;<span style={{cursor:"pointer",color:C.i,textDecoration:"underline"}} onClick={(e)=>{e.stopPropagation();jumpToRow(b.parent_full_backup_id);}}>{String(b.parent_full_backup_id).slice(0,12)}</span></>)}
+                    {b.page_count!=null&&<>&nbsp;·&nbsp;{b.page_count} pages</>}
+                  </span>
+                  {b.wal_end_position&&<span>WAL {String(b.wal_start_position||"0:0").split(":")[1]||"?"}→{String(b.wal_end_position).split(":")[1]||"?"}</span>}
+                </div>
+              )}
+              {isChainLink&&isExpanded&&(
+                <div style={{marginTop:8,padding:"8px 10px",background:C.b,borderRadius:8}}>
+                  {chainLoading[b.id]&&<M style={{color:C.td}}>Loading chain…</M>}
+                  {chainData[b.id]&&!chainData[b.id].ok&&(
+                    <M style={{color:C.d}}>Chain walk failed: {chainData[b.id].error||"unknown"}</M>
+                  )}
+                  {chainData[b.id]&&chainData[b.id].ok&&(
+                    <>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                        <M style={{color:C.t,fontWeight:600}}>Restore chain · {chainData[b.id].chainLength} link{chainData[b.id].chainLength===1?"":"s"} · {chainData[b.id].totalPageCount||0} pages</M>
+                        <Badge color={chainData[b.id].restorable?C.a:C.d}>{chainData[b.id].restorable?"restorable":"incomplete"}</Badge>
+                      </div>
+                      {chainData[b.id].chain.map((link,idx,arr)=>(
+                        <div key={link.id} style={{display:"flex",alignItems:"center",padding:"4px 0",borderTop:idx>0?`1px dotted ${C.b}`:"none"}}>
+                          <div style={{width:18,color:C.td,fontSize:11,fontFamily:"monospace"}}>{arr.length===1?"●":idx===0?"┌":idx===arr.length-1?"└":"├"}</div>
+                          <Badge color={strategyColor(link.backup_strategy)} style={{fontSize:8,marginRight:8}}>{link.backup_strategy||"full"}</Badge>
+                          <div style={{flex:1,fontSize:10,color:C.td}}>
+                            <span style={{cursor:"pointer",color:C.i,textDecoration:"underline"}} onClick={(e)=>{e.stopPropagation();jumpToRow(link.id);}}>{String(link.id).slice(0,12)}</span>
+                            &nbsp;·&nbsp;{link.created_at||link.ts}
+                            {link.page_count!=null&&<>&nbsp;·&nbsp;{link.page_count} pages</>}
+                            {link.filesPresent===false&&<span style={{color:C.d}}>&nbsp;·&nbsp;missing: {(link.missingFiles||[]).join(", ")}</span>}
+                          </div>
+                          {link.id===b.id&&<Badge color={C.i} style={{fontSize:8,marginLeft:6}}>leaf</Badge>}
+                          {link.id===chainData[b.id].anchorBackupId&&link.id!==b.id&&<Badge color={C.a} style={{fontSize:8,marginLeft:6}}>anchor</Badge>}
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
-          ))}</div>
+            );
+          })}</div>
+
+          {/* ── R3l C71: Restore-Preview Modal ─────────────────────── */}
+          {restoreModal&&(()=>{
+            const b=backups.find(x=>x.id===restoreModal.backupId);
+            if(!b)return null;
+            const isChain=b.backup_strategy==="incremental"||b.backup_strategy==="differential";
+            const strategyColor=(s)=>{if(s==="full")return C.a;if(s==="snapshot")return C.i;if(s==="incremental")return C.w;if(s==="differential")return"#9F7AEA";return C.td;};
+            const expectedConfirm=(b.hash||"").replace(/^sha256:/,"").slice(0,8);
+            const canConfirm=restoreModal.confirmInput===expectedConfirm&&expectedConfirm.length>=4;
+            const chain=chainData[b.id];
+            const chainOk=chain&&chain.ok;
+            const restorable=!isChain||(chainOk&&chain.restorable);
+            const doRestore=async()=>{
+              setRestoreModal(prev=>({...prev,restoring:true,error:null}));
+              try{
+                const endpoint=isChain?"/api/restore/execute-chain/"+b.id:"/api/restore/execute/"+b.id;
+                const r=await api.post(endpoint,{confirmHash:restoreModal.confirmInput});
+                addA("RESTORE_INITIATED","id="+b.id+" kind="+(isChain?"chain":"single")+" ok=true");
+                setRestoreModal(prev=>({...prev,restoring:false,result:r}));
+              }catch(err){
+                const msg=(err.response&&err.response.data&&(err.response.data.error||err.response.data.message))||err.message||"restore failed";
+                addA("RESTORE_FAILED","id="+b.id+" reason="+msg.slice(0,80));
+                setRestoreModal(prev=>({...prev,restoring:false,error:msg}));
+              }
+            };
+            return (
+              <Modal title="Restore from backup" onClose={()=>setRestoreModal(null)} width={560}>
+                <div style={{marginBottom:14,padding:"10px 12px",background:C.b,borderRadius:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <M style={{color:C.t}}>{b.ts}</M>
+                    {b.backup_strategy&&<Badge color={strategyColor(b.backup_strategy)} style={{fontSize:9}}>{b.backup_strategy}</Badge>}
+                  </div>
+                  <M style={{color:C.td}}>{b.type} · {b.size}</M>
+                  <br/>
+                  <M style={{color:C.td,fontSize:9}}>{b.hash}</M>
+                </div>
+
+                {isChain&&(
+                  <div style={{marginBottom:14}}>
+                    <L>Restore chain</L>
+                    {chainLoading[b.id]&&<M style={{color:C.td}}>Loading chain…</M>}
+                    {chain&&!chain.ok&&<M style={{color:C.d}}>Chain walk failed: {chain.error||"unknown"}</M>}
+                    {chainOk&&(
+                      <div style={{padding:"8px 10px",background:C.b,borderRadius:8}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                          <M style={{color:C.t,fontWeight:600}}>{chain.chainLength} link{chain.chainLength===1?"":"s"} · {chain.totalPageCount||0} pages</M>
+                          <Badge color={chain.restorable?C.a:C.d}>{chain.restorable?"restorable":"incomplete"}</Badge>
+                        </div>
+                        {chain.chain.map((link,idx,arr)=>(
+                          <div key={link.id} style={{display:"flex",alignItems:"center",padding:"4px 0",borderTop:idx>0?`1px dotted ${C.b}`:"none"}}>
+                            <div style={{width:18,color:C.td,fontSize:11,fontFamily:"monospace"}}>{arr.length===1?"●":idx===0?"┌":idx===arr.length-1?"└":"├"}</div>
+                            <Badge color={strategyColor(link.backup_strategy)} style={{fontSize:8,marginRight:8}}>{link.backup_strategy||"full"}</Badge>
+                            <div style={{flex:1,fontSize:10,color:C.td}}>
+                              <span>{String(link.id).slice(0,12)}</span>
+                              {link.created_at&&<>&nbsp;·&nbsp;{link.created_at}</>}
+                              {link.page_count!=null&&<>&nbsp;·&nbsp;{link.page_count} pages</>}
+                              {link.filesPresent===false&&<span style={{color:C.d}}>&nbsp;·&nbsp;missing: {(link.missingFiles||[]).join(", ")}</span>}
+                            </div>
+                            {link.id===b.id&&<Badge color={C.i} style={{fontSize:8,marginLeft:6}}>leaf</Badge>}
+                            {link.id===chain.anchorBackupId&&link.id!==b.id&&<Badge color={C.a} style={{fontSize:8,marginLeft:6}}>anchor</Badge>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{marginBottom:14}}>
+                  <L>Confirmation</L>
+                  <M style={{color:C.td,display:"block",marginBottom:6}}>
+                    Type the first 8 characters of the backup hash to confirm:&nbsp;
+                    <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",background:C.b,padding:"2px 6px",borderRadius:4}}>{expectedConfirm}</span>
+                  </M>
+                  <Input value={restoreModal.confirmInput} onChange={e=>setRestoreModal(prev=>({...prev,confirmInput:e.target.value}))} placeholder="e.g. a3f8c1d2" disabled={restoreModal.restoring||!!restoreModal.result}/>
+                </div>
+
+                {restoreModal.restoring&&<M style={{color:C.w,display:"block",marginBottom:10}}>Restoring… do not navigate away.</M>}
+                {restoreModal.error&&<M style={{color:C.d,display:"block",marginBottom:10}}>Error: {restoreModal.error}</M>}
+                {restoreModal.result&&restoreModal.result.ok&&<M style={{color:C.a,display:"block",marginBottom:10}}>Success. {restoreModal.result.message||"Restore complete."} A pre-restore snapshot was saved.</M>}
+
+                <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                  <Btn onClick={()=>setRestoreModal(null)}>{restoreModal.result?"Close":"Cancel"}</Btn>
+                  {!restoreModal.result&&<Btn primary disabled={!canConfirm||!restorable||restoreModal.restoring} onClick={doRestore}>Restore</Btn>}
+                </div>
+              </Modal>
+            );
+          })()}
         </div>)}
 
         {/* SYSTEM */}
@@ -6187,6 +6564,89 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <M style={{color:C.d,display:"block",fontSize:11,marginTop:4}}>Below {activePreset.name} minimum of {formatRetention(activePreset.min_retention_days)}. Server will reject.</M>
               )}
             </div>
+            {/* R3l C59: data scope (backup_kind) + strategy (backup_strategy) + destination filter */}
+            <div style={{marginTop:12,padding:"10px 12px",background:"#181B1F",border:"1px solid "+C.i+"30",borderRadius:6}}>
+              <div style={{fontSize:11,fontWeight:600,color:C.i,marginBottom:6}}>Data scope and strategy</div>
+              <div style={{fontSize:11,color:C.td,marginBottom:8,lineHeight:1.5}}>
+                Data scope selects what's backed up (full FireAlive deploy vs. database file only); strategy selects how the backup is taken (full vs. WAL-based incremental/differential vs. point-in-time snapshot). Defaults match the operator-intended behavior documented in the feature guide.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                <Sel label="Data scope" value={newSchedule.backup_kind} onChange={e=>setNewSchedule(p=>({...p,backup_kind:e.target.value}))}>
+                  <option value="full-suite">Full suite (configs + audit + keys + DB)</option>
+                  <option value="single-db">Database file only</option>
+                </Sel>
+                <Sel label="Strategy" value={newSchedule.backup_strategy} onChange={e=>setNewSchedule(p=>({...p,backup_strategy:e.target.value}))}>
+                  <option value="full">Full</option>
+                  <option value="incremental">Incremental (WAL-based)</option>
+                  <option value="differential">Differential (since anchor)</option>
+                  <option value="snapshot">Snapshot (point-in-time)</option>
+                </Sel>
+              </div>
+              <div style={{marginTop:8}}>
+                <Input
+                  label="Destination filter — required tags (comma-separated; empty = all enabled destinations)"
+                  value={newSchedule.destination_filter}
+                  onChange={e=>setNewSchedule(p=>({...p,destination_filter:e.target.value}))}
+                  placeholder="e.g. offsite, encrypted"
+                />
+              </div>
+              {(() => {
+                // Summary panel: previews which destinations the current
+                // filter selects. Mirrors the server-side matcher logic
+                // in services/backup-push.js destinationMatchesFilter so
+                // the operator sees push outcome before saving.
+                const filterTags = (newSchedule.destination_filter || "").split(",").map(s=>s.trim()).filter(Boolean);
+                const matchedDests = enabledDestinations.filter(d => {
+                  if (filterTags.length === 0) return true;
+                  let tags = [];
+                  if (d.tags) {
+                    try {
+                      const parsed = JSON.parse(d.tags);
+                      if (Array.isArray(parsed)) tags = parsed.filter(t => typeof t === "string");
+                    } catch (_) { /* malformed JSON → no tags */ }
+                  }
+                  return filterTags.some(f => tags.includes(f));
+                });
+                const enabledCount = enabledDestinations.length;
+                const matchedCount = matchedDests.length;
+                const noFilter = filterTags.length === 0;
+                const noMatch = !noFilter && matchedCount === 0;
+                return (
+                  <div style={{marginTop:8,padding:"8px 10px",background:noMatch?"#3a1e1e":"#1A1F25",borderRadius:4,fontSize:11}}>
+                    <div style={{color:noMatch?C.d:C.tm,marginBottom:(matchedCount>0&&!noFilter)?4:0,lineHeight:1.5}}>
+                      {enabledCount === 0
+                        ? "No enabled backup destinations are configured. Backups will stay on-host only regardless of filter."
+                        : noFilter
+                          ? `No filter active — backups push to all ${enabledCount} enabled destination${enabledCount===1?"":"s"}.`
+                          : noMatch
+                            ? `Filter [${filterTags.join(", ")}] excludes all ${enabledCount} enabled destinations. Backups will stay on-host only. Tag a destination or expand the filter to enable remote pushes.`
+                            : `Filter [${filterTags.join(", ")}] matches ${matchedCount} of ${enabledCount} enabled destination${enabledCount===1?"":"s"}.`}
+                    </div>
+                    {matchedCount > 0 && !noFilter && (
+                      <div style={{color:C.t,fontSize:11}}>
+                        Matching: {matchedDests.map(d => d.name).join(", ")}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+            {/* R3l C74: chain-depth override input. Sits between the data-
+                scope-and-strategy sub-card and the encrypt checkbox so it
+                reads as part of the strategy decisions. Empty = inherit
+                the global default (system_meta.max_chain_depth, seeded
+                to 100 by the C73 migration). Service-layer validation
+                rejects non-positive integers and values >1000 with the
+                INVALID_MAX_CHAIN_DEPTH error code. */}
+            <Input
+              label="Max chain depth (incrementals before forcing a full; empty = use global default 100)"
+              type="number"
+              min={1}
+              max={1000}
+              value={newSchedule.max_chain_depth}
+              onChange={e=>setNewSchedule(p=>({...p,max_chain_depth:e.target.value}))}
+              placeholder="leave empty for global default"
+            />
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"10px 0"}}>
               <input
                 type="checkbox"

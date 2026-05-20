@@ -100,6 +100,13 @@ const OVERLAP_WINDOW_MIN = 5;        // minutes between fire times to consider o
 const OVERLAP_LOOKAHEAD = 10;        // number of future fires to compute per schedule for overlap check
 const VALID_FREQUENCIES = ['hourly', 'daily', 'weekly', 'monthly'];
 
+// R3l C57: per-schedule kind + strategy enums, mirror of the schema CHECK
+// constraints landed by R3l C53 and R3l C55. Kept in sync with init.js
+// (Workstream 3 schema layer). Exported so route layers and tests can
+// reference the canonical sets without re-declaring them.
+const VALID_BACKUP_KINDS = ['single-db', 'full-suite'];
+const VALID_BACKUP_STRATEGIES = ['full', 'incremental', 'differential', 'snapshot'];
+
 // ── Error helper ─────────────────────────────────────────────────────
 
 function makeError(code, message) {
@@ -386,8 +393,9 @@ function create(data) {
     INSERT INTO backup_schedules
       (type, interval, retention, destination, encrypted, active,
        last_run, created_at, name, regulatory_preset_id,
-       time, day_of_week, day_of_month, next_run, last_status, last_error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       time, day_of_week, day_of_month, next_run, last_status, last_error,
+       backup_kind, backup_strategy, destination_filter, max_chain_depth)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.type || 'full',
     data.frequency || data.interval || null,
@@ -405,6 +413,17 @@ function create(data) {
     null,
     null,
     null,
+    // R3l C57: explicit defaults match the schema's NOT NULL DEFAULT
+    // declarations from R3l C53 + R3l C55. Passing NULL here would
+    // violate NOT NULL; passing the same string the schema would
+    // default to keeps INSERT and ALTER-with-DEFAULT in sync.
+    data.backup_kind || 'full-suite',
+    data.backup_strategy || 'full',
+    data.destination_filter ? JSON.stringify(data.destination_filter) : null,
+    // R3l C74: max_chain_depth NULL = use system_meta global default.
+    // The C73 schema migration added this column as nullable INTEGER
+    // (no default), so INSERT with NULL is valid and means "fall through".
+    data.max_chain_depth == null ? null : data.max_chain_depth,
   );
 
   const id = result.lastInsertRowid;
@@ -442,7 +461,11 @@ function update(id, data) {
         regulatory_preset_id = COALESCE(?, regulatory_preset_id),
         time = COALESCE(?, time),
         day_of_week = COALESCE(?, day_of_week),
-        day_of_month = COALESCE(?, day_of_month)
+        day_of_month = COALESCE(?, day_of_month),
+        backup_kind = COALESCE(?, backup_kind),
+        backup_strategy = COALESCE(?, backup_strategy),
+        destination_filter = COALESCE(?, destination_filter),
+        max_chain_depth = COALESCE(?, max_chain_depth)
     WHERE id = ?
   `).run(
     data.type || null,
@@ -456,6 +479,18 @@ function update(id, data) {
     data.time || null,
     data.day_of_week == null ? null : data.day_of_week,
     data.day_of_month == null ? null : data.day_of_month,
+    // R3l C57: COALESCE preserves existing values when these are NULL.
+    // To clear destination_filter back to NULL after setting it,
+    // operators currently must DELETE and re-create the schedule;
+    // explicit-clear support is out of scope for this commit.
+    data.backup_kind || null,
+    data.backup_strategy || null,
+    data.destination_filter ? JSON.stringify(data.destination_filter) : null,
+    // R3l C74: same COALESCE pattern. To clear back to NULL (revert
+    // schedule from override to global default), the same DELETE+re-
+    // create workflow applies. PUT with max_chain_depth=null is
+    // semantically "leave unchanged", not "clear override".
+    data.max_chain_depth == null ? null : data.max_chain_depth,
     id,
   );
 
@@ -540,6 +575,51 @@ function _validateScheduleFields(data) {
         'day_of_month must be an integer in 1..31');
     }
   }
+  // R3l C57: backup_kind / backup_strategy / destination_filter validation.
+  // Each is optional on the request (POST defaults to 'full-suite'/'full'/
+  // null; PUT leaves unchanged when absent). Validation here mirrors the
+  // SQLite CHECK constraints from C53/C55 so a 400 is returned with a
+  // helpful message rather than letting the request reach the DB and fail
+  // with SQLITE_CONSTRAINT_CHECK.
+  if (data.backup_kind !== undefined && data.backup_kind !== null) {
+    if (!VALID_BACKUP_KINDS.includes(data.backup_kind)) {
+      throw makeError('INVALID_BACKUP_KIND',
+        `backup_kind must be one of: ${VALID_BACKUP_KINDS.join(', ')}`);
+    }
+  }
+  if (data.backup_strategy !== undefined && data.backup_strategy !== null) {
+    if (!VALID_BACKUP_STRATEGIES.includes(data.backup_strategy)) {
+      throw makeError('INVALID_BACKUP_STRATEGY',
+        `backup_strategy must be one of: ${VALID_BACKUP_STRATEGIES.join(', ')}`);
+    }
+  }
+  if (data.destination_filter !== undefined && data.destination_filter !== null) {
+    if (!Array.isArray(data.destination_filter)) {
+      throw makeError('INVALID_DESTINATION_FILTER',
+        'destination_filter must be an array of tag strings (or null for no filter)');
+    }
+    if (!data.destination_filter.every(t => typeof t === 'string')) {
+      throw makeError('INVALID_DESTINATION_FILTER',
+        'destination_filter entries must all be strings');
+    }
+  }
+  // R3l C74: max_chain_depth validation. Per-schedule override for the
+  // depth limit enforced by backup-incremental.js (C73). Must be a
+  // positive integer, or null to fall back to the system_meta global
+  // default ('100' as seeded by the C73 migration). The hard cap from
+  // C65 restore-chain.js (MAX_CHAIN_DEPTH=1000) is the upper bound on
+  // any per-schedule value since the chain walker won't follow chains
+  // longer than that regardless of what the schedule says.
+  if (data.max_chain_depth !== undefined && data.max_chain_depth !== null) {
+    if (!Number.isInteger(data.max_chain_depth) || data.max_chain_depth <= 0) {
+      throw makeError('INVALID_MAX_CHAIN_DEPTH',
+        'max_chain_depth must be a positive integer (or null to use the global default)');
+    }
+    if (data.max_chain_depth > 1000) {
+      throw makeError('INVALID_MAX_CHAIN_DEPTH',
+        'max_chain_depth must be at most 1000 (the hard cap enforced by restore-chain.js)');
+    }
+  }
 }
 
 // ── Module exports ───────────────────────────────────────────────────
@@ -559,4 +639,8 @@ module.exports = {
   OVERLAP_WINDOW_MIN,
   OVERLAP_LOOKAHEAD,
   VALID_FREQUENCIES,
+  // R3l C57: kind + strategy enum constants exported for route layers,
+  // tests, and any future API contract documentation generators.
+  VALID_BACKUP_KINDS,
+  VALID_BACKUP_STRATEGIES,
 };

@@ -157,6 +157,59 @@ function calculateNextRetryAt(justCompletedAttempt) {
 }
 
 /**
+ * R3l C58: matcher for per-schedule destination subset filtering.
+ *
+ * The schedule may carry a destination_filter array (e.g.
+ * ["offsite","encrypted"]) added in C54. Each destination may carry
+ * a tags array (e.g. ["offsite","geo-redundant"]) also added in C54.
+ *
+ * Semantic: a backup pushes to a destination if AND ONLY IF
+ *   filter is null                                         (no filter active)
+ *   OR
+ *   the intersection of filter and destination.tags is non-empty
+ *
+ * NULL on the schedule side or NULL/missing on the destination side
+ * are handled per the contract documented in init.js around the C54
+ * migration block. Malformed JSON in destination.tags is treated as
+ * "no tags" (the destination fails the match if a filter is active)
+ * so that schedules with explicit filters never silently push to
+ * untaggable legacy destinations.
+ *
+ * Inputs:
+ *   filter:         array of tag strings, or null
+ *   destinationTags: raw TEXT from backup_destinations.tags column
+ *                    (JSON-encoded array of strings, or null)
+ *
+ * Returns: true if the destination matches; false otherwise.
+ */
+function destinationMatchesFilter(filter, destinationTags) {
+  // Null filter means "no filter active" — every destination matches.
+  if (filter == null) return true;
+  // Defensive: filter must be an array. Anything else => no match.
+  if (!Array.isArray(filter)) return false;
+  // Empty filter array means "match nothing" — explicit operator choice
+  // to pause pushes on this schedule without disabling it entirely.
+  if (filter.length === 0) return false;
+
+  // Parse destination tags. Malformed JSON => treat as no tags.
+  let tags = [];
+  if (destinationTags != null && destinationTags !== '') {
+    try {
+      const parsed = JSON.parse(destinationTags);
+      if (Array.isArray(parsed)) {
+        tags = parsed.filter(t => typeof t === 'string');
+      }
+    } catch (_) {
+      // malformed JSON in tags column — treat as no tags
+      tags = [];
+    }
+  }
+
+  // Set-intersection: at least one tag in common.
+  return filter.some(f => tags.includes(f));
+}
+
+/**
  * Build the backupContext object that adapters consume. Reads the
  * four backup files (v2 format) from disk, hashes each, returns
  * the assembled context.
@@ -399,6 +452,32 @@ async function pushBackup(db, backupId, options = {}) {
     return { ok: true, destinations: [] };
   }
 
+  // R3l C58: apply schedule's destination_filter if present.
+  // options.destinationFilter is either an array (filter) or null/undefined
+  // (no filter). The caller (services/backup.js performBackup) resolves
+  // this from the originating schedule's destination_filter column.
+  // Unfiltered callers (manual API pushes, retry paths) pass null and get
+  // the pre-R3l behavior of pushing to all enabled destinations.
+  const destinationFilter = options.destinationFilter == null ? null : options.destinationFilter;
+  const matchingDestinations = destinationFilter == null
+    ? enabledDestinations
+    : enabledDestinations.filter(d => destinationMatchesFilter(destinationFilter, d.tags));
+
+  if (destinationFilter != null) {
+    const filteredOut = enabledDestinations.length - matchingDestinations.length;
+    logger.info(
+      `backup-push: schedule destination_filter applied for backup ${backupId} ` +
+      `(filter=${JSON.stringify(destinationFilter)}, matched=${matchingDestinations.length}, filtered_out=${filteredOut})`
+    );
+    if (matchingDestinations.length === 0) {
+      logger.warn(
+        `backup-push: schedule destination_filter excludes all enabled destinations; ` +
+        `backup ${backupId} not pushed to any remote (on-host copy retained)`
+      );
+      return { ok: true, destinations: [], filter: destinationFilter, filtered_out: filteredOut };
+    }
+  }
+
   const ctxResult = buildBackupContext(backup);
   if (!ctxResult.ok) {
     logger.error(`backup-push: cannot build context for backup ${backupId}: ${ctxResult.error}`);
@@ -407,7 +486,7 @@ async function pushBackup(db, backupId, options = {}) {
   const backupContext = ctxResult.context;
 
   const results = [];
-  for (const destination of enabledDestinations) {
+  for (const destination of matchingDestinations) {
     // Insert a fresh row in queued state
     const insert = db.prepare(`
       INSERT INTO backup_pushes (backup_id, destination_id, status, attempt_count)

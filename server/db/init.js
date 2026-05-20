@@ -4065,6 +4065,319 @@ function initDb() {
     console.error('The server will start, but multi-schedule backup will not function until investigated.');
   }
 
+  // ── R3l C53: backup_schedules.backup_kind column for Workstream 3 ─────
+  //
+  // Workstream 3 introduces real incremental + differential backups with
+  // per-schedule strategy and destination-subset support. The first step
+  // is splitting `backup_kind` from `backup_strategy` at the schema layer:
+  //
+  //   backup_kind     — what is being backed up: 'full-suite' (entire
+  //                     FireAlive deploy including configs, audit, signing
+  //                     keys, integrations) vs 'single-db' (just the SQLite
+  //                     file). Plan default is 'full-suite' because
+  //                     FEATURE-GUIDE line 605 documents full-suite as the
+  //                     operator-intended default; pre-R3l scheduler
+  //                     dispatch unconditionally called performBackup
+  //                     (DB-only), silently defaulting to single-db
+  //                     regardless of operator intent (R3l plan decision
+  //                     #6).
+  //
+  //   backup_strategy — how the backup is taken: 'full' / 'incremental' /
+  //                     'differential' / 'snapshot'. Added in C55.
+  //
+  // This commit (C53) adds backup_kind only. The DEFAULT 'full-suite'
+  // clause populates all existing rows automatically per SQLite's ALTER
+  // TABLE ADD COLUMN semantics. The audit-log backfill below emits one
+  // BACKUP_KIND_MIGRATION_v24 entry per migrated row so operators have
+  // visibility into exactly which schedules the upgrade touched.
+  //
+  // The CHECK constraint enforces enum semantics at the schema layer —
+  // backup_kind must be 'single-db' or 'full-suite'. Future kinds would
+  // require a table rebuild (covered in a future C if/when needed).
+  //
+  // Idempotent — PRAGMA table_info gate detects column presence before
+  // ALTER. The audit-log backfill only emits entries on the first run
+  // (when the column is being added); subsequent runs find the column
+  // present and skip both the ALTER and the backfill.
+  try {
+    const r3lC53Cols = db.prepare("PRAGMA table_info(backup_schedules)").all().map(c => c.name);
+    if (!r3lC53Cols.includes('backup_kind')) {
+      db.exec(`
+        ALTER TABLE backup_schedules ADD COLUMN backup_kind TEXT NOT NULL DEFAULT 'full-suite'
+          CHECK (backup_kind IN ('single-db','full-suite'))
+      `);
+      console.log('R3l C53 migration: added backup_schedules.backup_kind column with full-suite default');
+
+      // Backfill audit-log entries — one per existing schedule. The
+      // DEFAULT clause already populated each row's backup_kind to
+      // 'full-suite'; these audit entries record that the migration
+      // touched each row so operators can see in the audit log which
+      // schedules were affected by the v1.0.38 upgrade.
+      const existingSchedules = db.prepare('SELECT id, name FROM backup_schedules').all();
+      const insertAuditEntry = db.prepare(
+        "INSERT INTO audit_log (event_type, detail) VALUES (?, ?)"
+      );
+      for (const row of existingSchedules) {
+        insertAuditEntry.run(
+          'BACKUP_KIND_MIGRATION_v24',
+          'backup_schedules.id=' + row.id + ' name=' + (row.name || '(unnamed)') + ' backup_kind=full-suite'
+        );
+      }
+      console.log(`R3l C53 migration: emitted ${existingSchedules.length} BACKUP_KIND_MIGRATION_v24 audit log entries`);
+    } else {
+      console.log('R3l C53 migration: backup_schedules.backup_kind column already present, skipping');
+    }
+  } catch (r3lC53MigrationErr) {
+    console.error('R3l C53 backup_kind migration FAILED:', r3lC53MigrationErr.message);
+    console.error('The server will start, but Workstream 3 scheduler dispatch will not work until investigated.');
+  }
+
+  // ── R3l C54: per-schedule destination subset (Workstream 3 decision #5) ──
+  //
+  // C54 adds two complementary columns enabling per-schedule destination
+  // subset filtering by tag — operator UX improvement covered in the
+  // Workstream 3 plan decision #5:
+  //
+  //   backup_schedules.destination_filter   JSON array of REQUIRED tags
+  //                                         that a destination must carry
+  //                                         to receive this schedule's
+  //                                         backups. NULL = no filter (push
+  //                                         to all enabled destinations,
+  //                                         which is the pre-R3l behavior
+  //                                         and the legacy default).
+  //                                         Example: ["offsite","encrypted"]
+  //
+  //   backup_destinations.tags              JSON array of tags this
+  //                                         destination carries. NULL =
+  //                                         no tags (passes no filters).
+  //                                         Example: ["offsite","geo-redundant"]
+  //
+  // Semantic: at push time (C58 will implement this), a backup created
+  // for schedule S pushes to destination D if AND ONLY IF
+  // S.destination_filter is NULL OR S.destination_filter has at least one
+  // tag matching D.tags. NULL on either side means "no filter" — backward-
+  // compatible legacy behavior preserved.
+  //
+  // Stored as TEXT (raw JSON) rather than separate normalized tables for
+  // schema simplicity. Route-layer code validates JSON shape on POST/PUT;
+  // the schema accepts any TEXT so a malformed JSON string at write time
+  // is the route layer's concern, not the schema's. The push-time matcher
+  // (C58) uses JSON_EXTRACT for tag-set intersection — also a route/service
+  // layer concern, not schema.
+  //
+  // Both columns nullable, no DEFAULT — existing schedules and destinations
+  // remain unchanged; new schedules/destinations default to NULL (no
+  // filter / no tags). No audit-log backfill needed because NULL is the
+  // semantically correct legacy value, not a placeholder requiring
+  // operator visibility.
+  //
+  // Idempotent — PRAGMA table_info gate per table detects column presence
+  // before ALTER. Two independent gates so partial failures (e.g., one
+  // column added but the other failed in a prior run) can be reconciled
+  // on the next start.
+  try {
+    const r3lC54SchedCols = db.prepare("PRAGMA table_info(backup_schedules)").all().map(c => c.name);
+    if (!r3lC54SchedCols.includes('destination_filter')) {
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN destination_filter TEXT`);
+      console.log('R3l C54 migration: added backup_schedules.destination_filter column (NULL = no filter)');
+    } else {
+      console.log('R3l C54 migration: backup_schedules.destination_filter column already present, skipping');
+    }
+
+    const r3lC54DestCols = db.prepare("PRAGMA table_info(backup_destinations)").all().map(c => c.name);
+    if (!r3lC54DestCols.includes('tags')) {
+      db.exec(`ALTER TABLE backup_destinations ADD COLUMN tags TEXT`);
+      console.log('R3l C54 migration: added backup_destinations.tags column (NULL = no tags)');
+    } else {
+      console.log('R3l C54 migration: backup_destinations.tags column already present, skipping');
+    }
+  } catch (r3lC54MigrationErr) {
+    console.error('R3l C54 destination subset migration FAILED:', r3lC54MigrationErr.message);
+    console.error('The server will start, but per-schedule destination filtering will not work until investigated.');
+  }
+
+  // ── R3l C55: incremental/differential support columns (Workstream 3) ──
+  //
+  // C55 closes out the Workstream 3 schema layer. Adds 7 columns across
+  // two tables to support real WAL-based incremental + differential
+  // backups with parent-chain linkage and page-level integrity:
+  //
+  //   backup_schedules.backup_strategy   Enum: 'full' / 'incremental' /
+  //                                      'differential' / 'snapshot'. Default
+  //                                      'full' preserves pre-R3l behavior
+  //                                      for any schedule the operator
+  //                                      hasn't explicitly opted into a
+  //                                      different strategy. NOT NULL with
+  //                                      DEFAULT means SQLite backfills
+  //                                      existing rows automatically.
+  //
+  //   backups.backup_strategy            Same enum on the per-backup row.
+  //                                      The scheduler dispatches off the
+  //                                      schedule's strategy (C56) and the
+  //                                      created backup row records its
+  //                                      actual strategy here. Schedule and
+  //                                      backup can diverge if an operator
+  //                                      takes a manual override or if a
+  //                                      chain-depth limit (C74) forces a
+  //                                      scheduled incremental to a full.
+  //
+  //   backups.parent_backup_id           Self-referential FK pointing to
+  //                                      the immediate predecessor in the
+  //                                      chain. NULL for 'full' rows (no
+  //                                      parent). For 'incremental': points
+  //                                      to the previous backup of any kind.
+  //                                      For 'differential': points to the
+  //                                      anchor full backup.
+  //
+  //   backups.parent_full_backup_id      Self-referential FK pointing to
+  //                                      the most-recent full anchor in
+  //                                      the chain. NULL for 'full' rows.
+  //                                      Allows the restore-chain walker
+  //                                      (C65) to short-circuit to the
+  //                                      anchor in O(1) instead of walking
+  //                                      parent_backup_id N times.
+  //
+  //   backups.wal_start_position         TEXT — serialized
+  //                                      {wal_file_offset, frame_no} as
+  //                                      e.g. "0:1234". The WAL extractor
+  //                                      (C61) records the start point of
+  //                                      the WAL frames included in this
+  //                                      backup. NULL for 'full' / 'snapshot'.
+  //
+  //   backups.wal_end_position           TEXT — same shape. The WAL frame
+  //                                      position immediately after the
+  //                                      last frame included; equals the
+  //                                      next backup's wal_start_position
+  //                                      for contiguous chains.
+  //
+  //   backups.page_count                 INTEGER — total page count
+  //                                      included in the backup's archive.
+  //                                      Used by the chain validator (C65)
+  //                                      to verify all pages from manifest
+  //                                      are present before any restore.
+  //
+  // ALTER TABLE ADD COLUMN constraints we navigate around in SQLite:
+  //   - REFERENCES columns added via ALTER must have NULL default; both
+  //     parent_*_id columns have no DEFAULT clause so they're NULL.
+  //   - NOT NULL added via ALTER must have a non-NULL DEFAULT; backup_
+  //     strategy uses DEFAULT 'full' to satisfy this.
+  //   - CHECK constraints are allowed on ADD COLUMN in SQLite 3.31+
+  //     (better-sqlite3 ships ≥ 3.40); the enum CHECK fires as expected.
+  //
+  // Idempotent — each column gated independently by PRAGMA table_info so
+  // partial failures (one column added, another failed) reconcile on the
+  // next start. Logs both "added" and "already present" cases per column.
+
+  try {
+    // Helper for per-table PRAGMA-gated ALTER TABLE ADD COLUMN
+    const addColIfMissing = (table, colName, ddl) => {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+      if (!cols.includes(colName)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+        console.log(`R3l C55 migration: added ${table}.${colName}`);
+      } else {
+        console.log(`R3l C55 migration: ${table}.${colName} already present, skipping`);
+      }
+    };
+
+    // backup_schedules.backup_strategy (the schedule's intended strategy)
+    addColIfMissing(
+      'backup_schedules', 'backup_strategy',
+      `backup_strategy TEXT NOT NULL DEFAULT 'full' CHECK (backup_strategy IN ('full','incremental','differential','snapshot'))`
+    );
+
+    // backups.backup_strategy (the actual strategy used for this backup row)
+    addColIfMissing(
+      'backups', 'backup_strategy',
+      `backup_strategy TEXT NOT NULL DEFAULT 'full' CHECK (backup_strategy IN ('full','incremental','differential','snapshot'))`
+    );
+
+    // backups.parent_backup_id (immediate predecessor in chain)
+    addColIfMissing(
+      'backups', 'parent_backup_id',
+      `parent_backup_id TEXT REFERENCES backups(id)`
+    );
+
+    // backups.parent_full_backup_id (anchor full backup; O(1) short-circuit)
+    addColIfMissing(
+      'backups', 'parent_full_backup_id',
+      `parent_full_backup_id TEXT REFERENCES backups(id)`
+    );
+
+    // backups.wal_start_position / wal_end_position (TEXT — serialized frame ref)
+    addColIfMissing('backups', 'wal_start_position', 'wal_start_position TEXT');
+    addColIfMissing('backups', 'wal_end_position', 'wal_end_position TEXT');
+
+    // backups.page_count (integrity verification anchor)
+    addColIfMissing('backups', 'page_count', 'page_count INTEGER');
+  } catch (r3lC55MigrationErr) {
+    console.error('R3l C55 incremental/differential columns migration FAILED:', r3lC55MigrationErr.message);
+    console.error('The server will start, but Workstream 3 strategy dispatch and chain restore will not work until investigated.');
+  }
+
+  // ── R3l C73: chain-depth limit ───────────────────────────────────────
+  //
+  // Long incremental chains have two failure modes:
+  //   1. Restore cost grows linearly with chain length — a 1000-link
+  //      chain takes ~1000x longer to restore than a 1-link chain
+  //      because every intermediate has to be decrypted, parsed, and
+  //      replayed in order.
+  //   2. Chain fragility grows linearly too — if ANY link is corrupted,
+  //      missing, or unverifiable, the entire chain past that point is
+  //      unrecoverable. A 1000-link chain has ~1000x more single points
+  //      of failure than a 1-link chain.
+  //
+  // C73 adds a configurable depth limit so the system forces a full
+  // backup once a chain reaches some operator-defined length. Two
+  // sources of truth:
+  //
+  //   1. backup_schedules.max_chain_depth (INTEGER, nullable per row)
+  //      Per-schedule override. NULL = use the global default.
+  //
+  //   2. system_meta.max_chain_depth (TEXT, default '100')
+  //      Global default applied when a schedule doesn't override.
+  //
+  // The enforcement logic lives in backup-incremental.js (C73 follow-up
+  // commit) and counts the existing chain depth before producing a new
+  // incremental. If the would-be chain length would exceed the limit,
+  // the function escalates to a full backup with reason='depth-limit'.
+  //
+  // Default of 100 is a defensible starting point: long enough to
+  // amortize the daily-cost-of-fulls benefit of incremental, short
+  // enough to bound restore time and single-points-of-failure to a
+  // tolerable level. Operators with stricter SLAs can lower it; those
+  // running very tight storage budgets can raise it (at their own risk).
+  try {
+    // Per-schedule override column. ALTER COLUMN with no default keeps
+    // existing rows at NULL, which the enforcement reads as "use the
+    // global default" — zero-disruption migration.
+    const r3lC73SchedCols = db.prepare("PRAGMA table_info(backup_schedules)").all().map(c => c.name);
+    if (!r3lC73SchedCols.includes('max_chain_depth')) {
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN max_chain_depth INTEGER`);
+      console.log('R3l C73 migration: added backup_schedules.max_chain_depth column (NULL = use global default)');
+    } else {
+      console.log('R3l C73 migration: backup_schedules.max_chain_depth column already present, skipping');
+    }
+
+    // Global default in system_meta. Same ensureMeta pattern used for
+    // restore_approval_mode defaults earlier in this file (idempotent;
+    // existing operators with their own value are not overwritten).
+    const ensureMetaForChainDepth = (key, defaultValue) => {
+      const existing = db.prepare("SELECT value FROM system_meta WHERE key = ?").get(key);
+      if (!existing) {
+        db.prepare("INSERT INTO system_meta (key, value) VALUES (?, ?)").run(key, defaultValue);
+        console.log(`R3l C73 migration: seeded system_meta.${key} = ${defaultValue}`);
+      } else {
+        console.log(`R3l C73 migration: system_meta.${key} already set to ${existing.value}, leaving as-is`);
+      }
+    };
+    ensureMetaForChainDepth('max_chain_depth', '100');
+  } catch (r3lC73MigrationErr) {
+    console.error('R3l C73 chain-depth limit migration FAILED:', r3lC73MigrationErr.message);
+    console.error('The server will start, but per-schedule depth overrides will not work until investigated.');
+    console.error('The hard-coded MAX_CHAIN_DEPTH=1000 in restore-chain.js still protects against runaway walks.');
+  }
+
   // ── R3i C11: legacy backup_config singleton backfill ─────────────────
   //
   // Pre-R3i installs stored a single backup config as a JSON blob in

@@ -196,6 +196,15 @@ router.post('/', (req, res) => {
       destination: schedule.destination,
       encrypted: schedule.encrypted,
       retentionDays: body.retention_days,
+      // R3l C57: kind + strategy + destination subset visibility
+      backupKind: schedule.backup_kind,
+      backupStrategy: schedule.backup_strategy,
+      destinationFilter: schedule.destination_filter
+        ? JSON.parse(schedule.destination_filter)
+        : null,
+      // R3l C74: per-schedule chain-depth override visibility.
+      // null in audit means "this schedule inherits the global default".
+      maxChainDepth: schedule.max_chain_depth == null ? null : schedule.max_chain_depth,
     });
     return res.status(201).json({ schedule });
   } catch (err) {
@@ -218,7 +227,11 @@ router.post('/', (req, res) => {
       || err.code === 'INVALID_FREQUENCY'
       || err.code === 'INVALID_TIME'
       || err.code === 'INVALID_DAY_OF_WEEK'
-      || err.code === 'INVALID_DAY_OF_MONTH') {
+      || err.code === 'INVALID_DAY_OF_MONTH'
+      || err.code === 'INVALID_BACKUP_KIND'
+      || err.code === 'INVALID_BACKUP_STRATEGY'
+      || err.code === 'INVALID_DESTINATION_FILTER'
+      || err.code === 'INVALID_MAX_CHAIN_DEPTH') {
       return res.status(400).json({ error: err.code, message: err.message });
     }
     logger.error('POST /api/backup-schedules failed', { error: err.message });
@@ -289,7 +302,11 @@ router.put('/:id', (req, res) => {
       || err.code === 'INVALID_FREQUENCY'
       || err.code === 'INVALID_TIME'
       || err.code === 'INVALID_DAY_OF_WEEK'
-      || err.code === 'INVALID_DAY_OF_MONTH') {
+      || err.code === 'INVALID_DAY_OF_MONTH'
+      || err.code === 'INVALID_BACKUP_KIND'
+      || err.code === 'INVALID_BACKUP_STRATEGY'
+      || err.code === 'INVALID_DESTINATION_FILTER'
+      || err.code === 'INVALID_MAX_CHAIN_DEPTH') {
       return res.status(400).json({ error: err.code, message: err.message });
     }
     logger.error('PUT /api/backup-schedules/:id failed', {

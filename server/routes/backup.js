@@ -16,6 +16,11 @@ const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { performBackup } = require('../services/backup');
 const { performFullSuiteBackup } = require('../services/backup-full-suite');
+// R3l C67: per-strategy on-demand dispatch
+const { performIncrementalBackup } = require('../services/backup-incremental');
+const { performDifferentialBackup } = require('../services/backup-differential');
+// R3l C68: chain preview endpoint reuses the walker from the restore-chain service
+const restoreChainSvc = require('../services/restore-chain');
 const manifestSvc = require('../services/backup-manifest');
 const signingKeysSvc = require('../services/backup-signing-keys');
 
@@ -60,19 +65,117 @@ router.get('/', (req, res) => {
 // the same engine the scheduler uses for daily-auto backups. Both
 // triggers produce v2 backups in v1.0.30+.
 router.post('/', async (req, res) => {
+  // R3l C67: per-strategy on-demand dispatch. Strategy comes from the
+  // query string (?strategy=incremental) or body ({strategy:"differential"}).
+  // Default 'full' preserves pre-R3l behavior for clients that don't
+  // specify a strategy.
+  //
+  // Dispatch table:
+  //   full         -> performBackup('on-demand')                       (existing path)
+  //   snapshot     -> performBackup('snapshot')                        (existing variant)
+  //   incremental  -> performIncrementalBackup({type:'on-demand'})    (R3l C63)
+  //   differential -> performDifferentialBackup({type:'on-demand'})   (R3l C64)
+  //
+  // Incremental and differential return either:
+  //   - a normal-shape result (ok:true, escalated:false, backupId, ...) OR
+  //   - an escalated result (ok:true, escalated:true, reason, fullBackupResult)
+  //     which means no eligible parent existed and a full backup was taken instead.
+  //
+  // The audit log records the requested strategy AND the actual strategy
+  // produced (they differ on escalation), so post-hoc analysis can
+  // distinguish "operator requested differential, system produced full
+  // because no anchor existed" from "operator requested full directly".
+  const VALID_STRATEGIES = ['full', 'incremental', 'differential', 'snapshot'];
+  const requestedStrategy = (req.query.strategy || req.body.strategy || 'full').toLowerCase();
+  if (!VALID_STRATEGIES.includes(requestedStrategy)) {
+    return res.status(400).json({
+      error: 'invalid strategy',
+      code: 'INVALID_BACKUP_STRATEGY',
+      hint: `strategy must be one of: ${VALID_STRATEGIES.join(', ')}`,
+    });
+  }
+
   try {
-    const result = await performBackup('on-demand');
+    let result;
+    let actualStrategy = requestedStrategy;
+    let escalationReason = null;
+
+    if (requestedStrategy === 'full') {
+      result = await performBackup('on-demand');
+    } else if (requestedStrategy === 'snapshot') {
+      result = await performBackup('snapshot');
+      actualStrategy = 'snapshot';
+    } else if (requestedStrategy === 'incremental') {
+      const incResult = await performIncrementalBackup({ type: 'on-demand' });
+      if (incResult.escalated) {
+        // Escalated to a full backup. The fullBackupResult is the
+        // performBackup() return; surface it as the canonical result
+        // and record the escalation in the response + audit.
+        result = incResult.fullBackupResult;
+        actualStrategy = 'full';
+        escalationReason = incResult.reason;
+      } else if (!incResult.ok) {
+        throw new Error(incResult.error || 'incremental backup failed');
+      } else {
+        // Translate incremental result shape into the canonical fields
+        // that the rest of this handler + audit log expects.
+        result = {
+          id: incResult.backupId,
+          format_version: 2,
+          size_bytes: 0,  // archive size not reported; manifest covers it
+          manifest_sha256: incResult.manifestSha256,
+          backup_strategy: 'incremental',
+          parent_backup_id: incResult.parentBackupId,
+          parent_full_backup_id: incResult.parentFullBackupId,
+          page_count: incResult.pageCount,
+          wal_start_position: incResult.walStartPosition,
+          wal_end_position: incResult.walEndPosition,
+        };
+      }
+    } else if (requestedStrategy === 'differential') {
+      const diffResult = await performDifferentialBackup({ type: 'on-demand' });
+      if (diffResult.escalated) {
+        result = diffResult.fullBackupResult;
+        actualStrategy = 'full';
+        escalationReason = diffResult.reason;
+      } else if (!diffResult.ok) {
+        throw new Error(diffResult.error || 'differential backup failed');
+      } else {
+        result = {
+          id: diffResult.backupId,
+          format_version: 2,
+          size_bytes: 0,
+          manifest_sha256: diffResult.manifestSha256,
+          backup_strategy: 'differential',
+          parent_backup_id: diffResult.anchorBackupId,
+          parent_full_backup_id: diffResult.anchorBackupId,
+          page_count: diffResult.pageCount,
+          wal_start_position: diffResult.walStartPosition,
+          wal_end_position: diffResult.walEndPosition,
+        };
+      }
+    }
+
+    const escalationSuffix = escalationReason ? ` escalated_from=${requestedStrategy} reason=${escalationReason}` : '';
     auditLog(
       req.user.id,
       'BACKUP_CREATED',
-      `id=${result.id} format=v${result.format_version} size=${result.size_bytes} manifestSha=${result.manifest_sha256.slice(0, 16)}`,
+      `id=${result.id} format=v${result.format_version} strategy=${actualStrategy} requested=${requestedStrategy}${escalationSuffix} size=${result.size_bytes} manifestSha=${(result.manifest_sha256 || '').slice(0, 16)}`,
       req.ip,
     );
-    res.json(result);
+
+    // Return shape extended with strategy + escalation fields
+    res.json({
+      ...result,
+      requested_strategy: requestedStrategy,
+      actual_strategy: actualStrategy,
+      escalated: escalationReason !== null,
+      escalation_reason: escalationReason,
+    });
   } catch (err) {
-    logger.error('Trigger backup error', { error: err.message });
-    auditLog(req.user.id, 'BACKUP_FAILED', `error=${err.message.slice(0, 200)}`, req.ip);
-    res.status(500).json({ error: 'Backup failed', message: err.message });
+    logger.error('Trigger backup error', { strategy: requestedStrategy, error: err.message });
+    auditLog(req.user.id, 'BACKUP_FAILED', `requested_strategy=${requestedStrategy} error=${err.message.slice(0, 200)}`, req.ip);
+    res.status(500).json({ error: 'Backup failed', strategy: requestedStrategy, message: err.message });
   }
 });
 
@@ -271,6 +374,119 @@ router.get('/:id/verify', async (req, res) => {
   } catch (err) {
     logger.error('Verify backup error', { error: err.message });
     res.status(500).json({ error: 'Failed to verify backup', message: err.message });
+  }
+});
+
+// ── R3l C68: Restore Chain Preview ───────────────────────────────────────────
+//
+// GET /api/backup/:id/chain
+//
+// Returns the ordered list of backups that would be walked to restore
+// from the given backup id. For full and snapshot backups the chain is
+// just [the backup itself]. For differentials it's [anchor, leaf]. For
+// incrementals it can be arbitrarily long.
+//
+// This endpoint is read-only. It does NOT validate per-file hashes or
+// signatures (that's what /execute-chain does internally via
+// validateChain). It DOES check that every chain link's files exist on
+// disk and flag any missing files in the response, which lets a UI
+// show a "chain incomplete" warning before the operator attempts a
+// restore.
+//
+// Response:
+//   {
+//     ok: true,
+//     leafBackupId,
+//     anchorBackupId,
+//     chainLength,
+//     totalPageCount,         sum of page_count across all links
+//     restorable,             true iff every link's files exist and
+//                             every link's status === 'verified'
+//     chain: [
+//       {
+//         id, backup_strategy, created_at, page_count, size_bytes,
+//         parent_backup_id, parent_full_backup_id, status,
+//         filesPresent,       boolean (manifest + archive + sig + key all exist)
+//         missingFiles,       array of label strings if any are missing
+//       },
+//       ...
+//     ]
+//   }
+router.get('/:id/chain', (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const leaf = db.prepare('SELECT * FROM backups WHERE id = ?').get(req.params.id);
+    if (!leaf) { db.close(); return res.status(404).json({ error: 'Backup not found' }); }
+
+    let chain;
+    try {
+      chain = restoreChainSvc.walkChain(db, req.params.id);
+    } catch (walkErr) {
+      db.close();
+      return res.status(400).json({
+        error: 'cannot walk restore chain',
+        code: 'CHAIN_WALK_FAILED',
+        detail: walkErr.message,
+      });
+    }
+
+    // Per-link file-existence check (cheap; no hash recompute).
+    let allRestorable = true;
+    let totalPageCount = 0;
+    const chainSummary = chain.map(link => {
+      const strategy = link.backup_strategy || 'full';
+      const pageCount = link.page_count || 0;
+      totalPageCount += pageCount;
+
+      // Files to check vary by format. v1 backups have file_path only;
+      // v2 has the four-file layout. Pre-R3l v2 fulls and post-R3l
+      // inc/diff all use the four-file layout.
+      const filesToCheck = [];
+      if (link.format_version === 1) {
+        filesToCheck.push({ label: 'file', path: link.file_path });
+      } else if (link.format_version === 2) {
+        filesToCheck.push({ label: 'manifest', path: link.manifest_path });
+        filesToCheck.push({ label: 'archive', path: link.archive_path });
+        filesToCheck.push({ label: 'signature', path: link.manifest_sig_path });
+        filesToCheck.push({ label: 'wrappedKey', path: link.wrapped_key_path });
+      }
+
+      const missingFiles = filesToCheck.filter(f => !f.path || !fs.existsSync(f.path)).map(f => f.label);
+      const filesPresent = missingFiles.length === 0;
+      const linkRestorable = filesPresent && link.status === 'verified';
+      if (!linkRestorable) allRestorable = false;
+
+      return {
+        id: link.id,
+        backup_strategy: strategy,
+        created_at: link.created_at,
+        page_count: pageCount,
+        size_bytes: link.size_bytes,
+        parent_backup_id: link.parent_backup_id,
+        parent_full_backup_id: link.parent_full_backup_id,
+        status: link.status,
+        filesPresent,
+        missingFiles,
+        wal_start_position: link.wal_start_position,
+        wal_end_position: link.wal_end_position,
+      };
+    });
+
+    db.close();
+    return res.json({
+      ok: true,
+      leafBackupId: leaf.id,
+      anchorBackupId: chain[0].id,
+      chainLength: chain.length,
+      totalPageCount,
+      restorable: allRestorable,
+      chain: chainSummary,
+    });
+  } catch (err) {
+    try { if (db) db.close(); } catch (_) {}
+    logger.error('GET /api/backup/:id/chain crashed', { error: err.message });
+    return res.status(500).json({ error: 'internal error', detail: err.message });
   }
 });
 

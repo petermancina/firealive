@@ -583,23 +583,106 @@ const schedulerService = {
         'UPDATE backup_schedules SET last_status = ?, next_run = ? WHERE id = ?'
       ).run('running', next, scheduleId);
 
-      // performBackup accepts a limited type enum:
-      // 'daily-auto' | 'on-demand' | 'snapshot'. The schedule.type
-      // column stores a broader vocabulary ('full' | 'incremental' |
-      // 'differential' | 'snapshot') that this layer collapses for
-      // execution. Future cleanup can broaden performBackup; for now
-      // snapshot maps to snapshot, everything else to daily-auto.
-      const backupType = schedule.type === 'snapshot' ? 'snapshot' : 'daily-auto';
+      // ── R3l C56: dispatch by (backup_kind, backup_strategy) tuple ──
+      //
+      // Pre-R3l, this layer unconditionally called performBackup (DB-only)
+      // regardless of the operator's intent. backup_full_suite.js
+      // existed and was complete but never invoked from the scheduler —
+      // every scheduled run silently produced a DB-only backup even
+      // though FEATURE-GUIDE line 605 documents full-suite as the
+      // operator-intended default.
+      //
+      // C53/C54/C55 added schema columns making intent explicit:
+      // backup_schedules.backup_kind and backup_schedules.backup_strategy.
+      // C56 here makes the dispatch honor that intent.
+      //
+      // Dispatch table (kind, strategy) -> target function:
+      //   (full-suite, full)        -> performFullSuiteBackup
+      //   (single-db,  full)        -> performBackup
+      //   (any,        incremental) -> performIncrementalBackup     (C63)
+      //   (any,        differential)-> performDifferentialBackup    (C64)
+      //   (full-suite, snapshot)    -> performFullSuiteBackup with type='snapshot'
+      //   (single-db,  snapshot)    -> performBackup with type='snapshot'
+      //
+      // The legacy schedule.type column ('daily-auto'/'on-demand'/'snapshot')
+      // is still passed as the underlying TYPE parameter to whichever
+      // function is dispatched. kind+strategy are the dispatch axes;
+      // type is the parameter the dispatched function takes.
+      //
+      // tryLoad guard for incremental/differential: those modules
+      // don't ship until C63/C64. A schedule with strategy='incremental'
+      // on a pre-C63 deploy will fail loud with a clear error pointing
+      // to the missing module rather than silently falling back.
+      //
+      // Defensive null-coercion on kind/strategy: post-C53/C55 the
+      // schema enforces NOT NULL DEFAULT 'full-suite'/'full' on these
+      // columns so NULL shouldn't be reachable, but coercion is cheap
+      // and survives any schema-skew edge case during in-place upgrades.
+      const kind = schedule.backup_kind || 'full-suite';
+      const strategy = schedule.backup_strategy || 'full';
+      const legacyType = schedule.type === 'snapshot' ? 'snapshot' : 'daily-auto';
+      const backupType = strategy === 'snapshot' ? 'snapshot' : legacyType;
       const startedAt = new Date().toISOString();
+
+      const tryLoad = (moduleId) => {
+        try {
+          return require(moduleId);
+        } catch (loadErr) {
+          if (loadErr && loadErr.code === 'MODULE_NOT_FOUND') return null;
+          throw loadErr;
+        }
+      };
+
+      let backupPromise;
+      let dispatchTarget;
+
+      if (strategy === 'incremental') {
+        const incModule = tryLoad('./backup-incremental');
+        if (!incModule || typeof incModule.performIncrementalBackup !== 'function') {
+          throw new Error(
+            `Scheduler: schedule '${schedule.name}' requests strategy='incremental' ` +
+            `but backup-incremental.js is not available on this deploy (added in R3l C63)`
+          );
+        }
+        dispatchTarget = 'performIncrementalBackup';
+        backupPromise = Promise.resolve(
+          incModule.performIncrementalBackup({ type: backupType, scheduleId, backupKind: kind })
+        );
+      } else if (strategy === 'differential') {
+        const diffModule = tryLoad('./backup-differential');
+        if (!diffModule || typeof diffModule.performDifferentialBackup !== 'function') {
+          throw new Error(
+            `Scheduler: schedule '${schedule.name}' requests strategy='differential' ` +
+            `but backup-differential.js is not available on this deploy (added in R3l C64)`
+          );
+        }
+        dispatchTarget = 'performDifferentialBackup';
+        backupPromise = Promise.resolve(
+          diffModule.performDifferentialBackup({ type: backupType, scheduleId, backupKind: kind })
+        );
+      } else if (kind === 'full-suite') {
+        // strategy='full' or 'snapshot' both go through the full-suite
+        // path; the type parameter chooses the flavor inside that function.
+        const { performFullSuiteBackup } = require('./backup-full-suite');
+        dispatchTarget = 'performFullSuiteBackup';
+        backupPromise = Promise.resolve(performFullSuiteBackup({ type: backupType }));
+      } else {
+        // kind='single-db'; strategy='full' or 'snapshot'
+        const { performBackup } = require('./backup');
+        dispatchTarget = 'performBackup';
+        backupPromise = Promise.resolve(performBackup(backupType, { scheduleId }));
+      }
 
       logger.info('Scheduler: starting scheduled backup', {
         scheduleId,
         name: schedule.name,
+        kind,
+        strategy,
         type: backupType,
+        dispatchTarget,
       });
 
-      const { performBackup } = require('./backup');
-      Promise.resolve(performBackup(backupType)).then(() => {
+      backupPromise.then(() => {
         try {
           const successDb = getDb();
           successDb.prepare(

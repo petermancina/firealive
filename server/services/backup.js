@@ -255,6 +255,38 @@ async function performBackup(type = 'on-demand', options = {}) {
   // tying transactions together.
   const db = getDb();
 
+  // R3l C58: resolve schedule's destination_filter if a scheduleId was
+  // passed via options. The scheduler (services/scheduler.js _runBackupJob)
+  // passes scheduleId; manual API pushes leave it undefined and get the
+  // pre-R3l behavior (push to every enabled destination).
+  // Resolved here once and threaded into both pushBackup callsites
+  // (synchronous awaitPush path and background async push path) so the
+  // filter applies regardless of which dispatch mode the caller chose.
+  let scheduleDestinationFilter = null;
+  if (options.scheduleId != null) {
+    try {
+      const sched = db.prepare(
+        'SELECT destination_filter FROM backup_schedules WHERE id = ?'
+      ).get(options.scheduleId);
+      if (sched && sched.destination_filter) {
+        try {
+          const parsed = JSON.parse(sched.destination_filter);
+          if (Array.isArray(parsed)) {
+            scheduleDestinationFilter = parsed;
+          }
+        } catch (parseErr) {
+          logger.warn('backup: malformed destination_filter JSON on schedule; treating as no filter', {
+            scheduleId: options.scheduleId, error: parseErr.message,
+          });
+        }
+      }
+    } catch (lookupErr) {
+      logger.warn('backup: failed to resolve destination_filter for schedule; treating as no filter', {
+        scheduleId: options.scheduleId, error: lookupErr.message,
+      });
+    }
+  }
+
   // Insert the running row up front so partial failures are auditable.
   // The signing key id is needed up front too -- we want the row to
   // record which key signs this backup even if the actual signing fails
@@ -458,7 +490,12 @@ async function performBackup(type = 'on-demand', options = {}) {
     let pushScheduled = false;
     if (options.awaitPush) {
       try {
-        pushResult = await backupPushSvc.pushBackup(db, backupId, { logger });
+        pushResult = await backupPushSvc.pushBackup(db, backupId, {
+          logger,
+          // R3l C58: respect schedule destination_filter when this backup
+          // run was triggered by a scheduled job (scheduleId passed in options).
+          destinationFilter: scheduleDestinationFilter,
+        });
       } catch (pushErr) {
         logger.error('backup: synchronous push orchestration crashed', { id: backupId, error: pushErr.message });
         pushResult = { ok: false, error: pushErr.message, crashed: true };
@@ -468,7 +505,11 @@ async function performBackup(type = 'on-demand', options = {}) {
         let pushDb;
         try {
           pushDb = getDb();
-          const r = await backupPushSvc.pushBackup(pushDb, backupId, { logger });
+          const r = await backupPushSvc.pushBackup(pushDb, backupId, {
+            logger,
+            // R3l C58: same destination_filter on background dispatch
+            destinationFilter: scheduleDestinationFilter,
+          });
           logger.info('backup: background push completed', {
             id: backupId,
             destinations: r.destinations ? r.destinations.length : 0,

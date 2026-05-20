@@ -655,6 +655,89 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 
 **MC orchestrating AC backups** is a separate concern from this feature and out of scope for v1.0.35. The "Backup All Clients" button on the Client Provisioning tab remains a placeholder pending a future phase that builds AC-side backup orchestration.
 
+### Incremental and differential backups
+**What they're for:** Two strategies for capturing the database between full backups, each making a different tradeoff between archive size and restore complexity. Both are point-in-time captures of the SQLite WAL frames written since a reference backup. Both use the same v2 four-file on-disk layout (manifest.json + manifest.sig + archive.bin + wrapped-key.bin) and the same encryption + signing pipeline as full backups; only the archive payload format and the parent linkage differ.
+
+**Strategy comparison:**
+
+| Strategy | Captures | Parent | Restore needs | Archive size over time |
+|----------|----------|--------|---------------|------------------------|
+| Full | Entire DB | none | [this backup] | constant per cycle |
+| Snapshot | Entire DB (point-in-time) | none | [this backup] | constant per cycle |
+| Incremental | WAL frames since immediate predecessor | most recent backup of any kind | [anchor full + ALL intermediate incrementals + this] | small per archive |
+| Differential | WAL frames since anchor full | anchor full backup | [anchor full + this] | grows each cycle |
+
+**When to use which:**
+- **Full:** Baseline. Always available as the anchor.
+- **Snapshot:** Point-in-time capture you might want to restore to later. Not part of any chain.
+- **Incremental:** Small archives, frequent runs. Best when storage cost is critical and operators are comfortable maintaining longer chains. Restore complexity grows linearly with chain length.
+- **Differential:** Larger archives, simpler restore. Best when restore-time predictability matters more than storage cost. Each differential is independently restorable alongside the anchor.
+
+**Schema (R3l C53/C55/C73):**
+- `backup_schedules.backup_kind` — `single-db` or `full-suite`
+- `backup_schedules.backup_strategy` — `full` / `incremental` / `differential` / `snapshot`
+- `backup_schedules.destination_filter` — JSON array of required destination tags (or NULL for all)
+- `backup_schedules.max_chain_depth` — INTEGER, per-schedule override (NULL = use global)
+- `backups.backup_strategy` — same enum, per-backup row
+- `backups.parent_backup_id` — immediate predecessor in chain
+- `backups.parent_full_backup_id` — anchor full backup (O(1) shortcut for chain walks)
+- `backups.wal_start_position` / `wal_end_position` — TEXT "byteOffset:frameNo" position descriptors
+- `backups.page_count` — frame count archived
+- `system_meta.max_chain_depth` — global default depth limit (seeded to '100')
+
+**Dispatch (R3l C56):** The scheduler dispatches on `(backup_kind, backup_strategy)`:
+- `(full-suite, full)` → `performFullSuiteBackup` (existing R3k)
+- `(single-db, full)` → `performBackup` (existing)
+- `(any, incremental)` → `performIncrementalBackup` (R3l C63)
+- `(any, differential)` → `performDifferentialBackup` (R3l C64)
+- `(any, snapshot)` → `performBackup` with type='snapshot'
+
+**INCR-v1 archive payload format:** Incremental and differential archives wrap the WAL frames in a custom binary format inside the standard v2 archive.bin (which is still zstd-compressed and AES-256-GCM-encrypted). Header (16 bytes): magic 'INCR' + format_version + frame_count + page_size. Per frame (44 + page_size bytes): frame_no + page_no + db_size_after_commit + sha256_of_page_data (raw 32 bytes) + page_data. The per-page SHA-256 lets restore verify each page's integrity before applying.
+
+**Six escalation reasons:** Both `performIncrementalBackup` and `performDifferentialBackup` can escalate to a full backup when their conditions aren't met. The caller (scheduler, `POST /api/backup?strategy=...`) sees `escalated: true` and the reason string in the response:
+- `no-parent` — no eligible parent backup exists
+- `incompatible-parent` — parent has no wal_end_position (pre-R3l backup, or full-suite)
+- `no-wal-file` — DB has no WAL file on disk (journal_mode != WAL)
+- `no-anchor` — can't resolve parent_full_backup_id from chain walk
+- `salt-change` — WAL was checkpointed since parent was taken (re-salted)
+- `depth-limit` — chain length would exceed configured maximum (R3l C73)
+
+Escalated backups become the new anchor for future incrementals/differentials. The audit log records both the requested strategy and the actual strategy produced.
+
+**Restore chain (R3l C65-C68):** Chain restore is mechanically different from single-backup restore:
+- `walkChain(db, leafBackupId)` — assembles `[anchor, ...intermediates, leaf]` by walking parent_backup_id backwards. Cycle detection. Hard cap at MAX_CHAIN_DEPTH=1000.
+- `validateChain(db, chain)` — for every link: manifest sha256 match, Ed25519 signature verify, archive sha256 match, wrapped-key sha256 match. For inc/diff links additionally: unwrap key, decrypt+decompress, parse INCR-v1 bundle, re-compute per-page sha256, cross-check against manifest's frames descriptor.
+- `replayChain(db, chain, targetDbPath, options)` — extracts anchor full to targetDbPath, then for each subsequent link applies INCR-v1 frames at offset (page_no - 1) × page_size. Truncates target on commit frames (dbSizeAfterCommit nonzero).
+
+**Endpoints:**
+- `GET /api/backup/:id/chain` (C68) — read-only chain preview. Returns the ordered chain, per-link file existence, total page count, restorable flag. No locks, no audit, no validation overhead. Used by the frontend chain panel and restore-preview modal.
+- `POST /api/restore/execute-chain/:id` (C66) — restore from a chain. Goes through the same approval gate, IP allowlist, and audit log machinery as `/execute/:id`. Confirms against the LEAF backup's hash (not anchor). Creates a pre-restore snapshot with prefix `pre-restore-chain-<ts>.db` before destructive work.
+- `POST /api/backup?strategy=<full|incremental|differential|snapshot>` (C67) — on-demand backup with strategy selection. Mirrors the scheduler's dispatch table.
+
+**Depth limits (R3l C73):** Long chains have linearly-growing restore cost and linearly-growing single-point-of-failure exposure. The configurable max-chain-depth limit forces a full backup once the chain would exceed it. Two sources of truth:
+1. `backup_schedules.max_chain_depth` — per-schedule override (NULL = use global)
+2. `system_meta.max_chain_depth` — global default ('100')
+
+The C65 hard cap `MAX_CHAIN_DEPTH=1000` in restore-chain.js is a runaway-walk safety; the configurable limit sits well below it (defaulting to 100). Operators with stricter SLAs can lower; those with tight storage budgets can raise (at their own risk). Differentials are NOT subject to the depth limit since each is independently restorable.
+
+**Workflow (operator perspective):**
+1. In Backup Schedules, create a schedule with `backup_strategy=incremental` (or differential)
+2. The scheduler creates a full backup on the first run (escalation: `no-parent`)
+3. Subsequent runs produce incremental archives chained to the anchor (each adding ~M of WAL frames)
+4. After ~100 incrementals (default), the next run escalates to a new full backup (escalation: `depth-limit`)
+5. The chain restarts under the new anchor
+6. Restore via the Backup History panel → Restore button. The modal shows chain shape + per-link integrity before the operator confirms.
+
+**Operator decision matrix:**
+
+| Need | Recommended strategy |
+|------|----------------------|
+| Predictable hourly snapshots of compliance-relevant tables | snapshot |
+| Cheap nightly captures, occasional restore (developer reset) | incremental + small depth limit |
+| Cheap nightly captures, frequent restore (test env reset) | differential |
+| Long-retention frozen archives (no restore expected) | full + retention policy |
+| Just-in-case before a risky change | snapshot |
+
 ### Restore
 **What it's for:** Restore from backup or revert configuration. Two modes: internal (revert to a recent FireAlive backup of this same install) and external (restore from a backup stored on a network share, NAS, S3, Azure, SFTP).
 
