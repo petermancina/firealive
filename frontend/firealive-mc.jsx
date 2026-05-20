@@ -1808,7 +1808,291 @@ function ManagementConsole() {
   const [complianceFw, setCompFw] = useState("nist_csf");
   const [complianceReport, setCompReport] = useState(null);
   // Monitoring
-  const [monMetrics, setMonMetrics] = useState({cpu:12,memMB:145,heapMB:89,uptime:86400,dbReadsPerMin:42,fileCount:48,loadAvg:[0.3,0.2,0.1],freeMemMB:3200,totalMemMB:8192});
+  // R3l C14: monMetrics wired to /api/system/version (extended in C8 with runtime.cpu and database subtrees).
+  // Defaults stay as zeros until first fetch resolves; periodic refresh every 30s while the component is mounted.
+  const [monMetrics, setMonMetrics] = useState({cpu:0,memMB:0,heapMB:0,dbSizeMB:0,uptime:0,loadAvg:[0,0,0],cores:0,freeMemMB:0,totalMemMB:0,fileCount:0});
+  const [monMetricsLoadState, setMonMetricsLoadState] = useState({loaded:false, error:null});
+  useEffect(() => {
+    let cancelled = false;
+    const parseMB = (s) => { if (typeof s === 'number') return s; if (typeof s !== 'string') return 0; const n = parseInt(s.replace(/[^0-9]/g,''), 10); return Number.isFinite(n) ? n : 0; };
+    const fetchMetrics = () => {
+      api.get('/api/system/version').then((r) => {
+        if (cancelled) return;
+        if (!r || r.error) { setMonMetricsLoadState({loaded:false, error: r?.error || 'request_failed'}); return; }
+        setMonMetrics((prev) => ({
+          ...prev,
+          cpu: typeof r.runtime?.cpu?.percent1m === 'number' ? r.runtime.cpu.percent1m : prev.cpu,
+          memMB: parseMB(r.runtime?.memory?.rss),
+          heapMB: parseMB(r.runtime?.memory?.heap),
+          dbSizeMB: typeof r.database?.sizeMB === 'number' ? r.database.sizeMB : prev.dbSizeMB,
+          uptime: typeof r.runtime?.uptime === 'number' ? r.runtime.uptime : prev.uptime,
+          loadAvg: [r.runtime?.cpu?.loadAvg1m ?? prev.loadAvg[0], r.runtime?.cpu?.loadAvg5m ?? prev.loadAvg[1], r.runtime?.cpu?.loadAvg15m ?? prev.loadAvg[2]],
+          cores: typeof r.runtime?.cpu?.cores === 'number' ? r.runtime.cpu.cores : prev.cores,
+        }));
+        setMonMetricsLoadState({loaded:true, error:null});
+      }).catch((e) => { if (cancelled) return; setMonMetricsLoadState({loaded:false, error: e?.message || 'request_failed'}); });
+    };
+    fetchMetrics();
+    const interval = setInterval(fetchMetrics, 30000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+
+  // R3l C15: Connected Sessions wired to /api/system/connected-clients (introduced in C9).
+  // Privacy-conscious shape: only userId/role/isAlive — no IP, no UA, no per-client cpu/mem.
+  // Periodic refresh every 15s while the component is mounted.
+  const [connectedClients, setConnectedClients] = useState({initialized:false, count:0, alive:0, stale:0, by_role:{}, clients:[]});
+  const [connectedClientsLoadState, setConnectedClientsLoadState] = useState({loaded:false, error:null});
+  useEffect(() => {
+    let cancelled = false;
+    const fetchClients = () => {
+      api.get('/api/system/connected-clients').then((r) => {
+        if (cancelled) return;
+        if (!r || r.error) { setConnectedClientsLoadState({loaded:false, error: r?.error || 'request_failed'}); return; }
+        setConnectedClients({
+          initialized: r.initialized === true,
+          count: typeof r.count === 'number' ? r.count : 0,
+          alive: typeof r.alive === 'number' ? r.alive : 0,
+          stale: typeof r.stale === 'number' ? r.stale : 0,
+          by_role: r.by_role && typeof r.by_role === 'object' ? r.by_role : {},
+          clients: Array.isArray(r.clients) ? r.clients : [],
+        });
+        setConnectedClientsLoadState({loaded:true, error:null});
+      }).catch((e) => { if (cancelled) return; setConnectedClientsLoadState({loaded:false, error: e?.message || 'request_failed'}); });
+    };
+    fetchClients();
+    const interval = setInterval(fetchClients, 15000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+  // R3l C16: Training Completions Review (lead/admin).
+  // State for the filtered queue, the active status filter, the load state,
+  // a separate badge poll (so the navGroup count stays roughly fresh while
+  // the tab is closed), and per-row in-flight tracking for PATCH actions.
+  // The server enforces only pending -> verified|rejected transitions, so
+  // verify/reject buttons render only for rows whose status is "pending".
+  const [trainingReviewStatusFilter, setTrainingReviewStatusFilter] = useState('pending');
+  const [trainingReviewQueue, setTrainingReviewQueue] = useState({ completions: [], counts: { pending: 0, verified: 0, rejected: 0, total: 0 } });
+  const [trainingReviewLoadState, setTrainingReviewLoadState] = useState({ loaded: false, error: null });
+  const [trainingReviewPendingCount, setTrainingReviewPendingCount] = useState(0);
+  const [trainingReviewPatchInFlight, setTrainingReviewPatchInFlight] = useState({});
+  const [trainingReviewPatchError, setTrainingReviewPatchError] = useState(null);
+  // Always-on lightweight badge poll. Fetches just the counts subtree every
+  // 60s so the navGroup badge surfaces the pending workload even when the
+  // tab is not open. Best-effort: errors are silently swallowed.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchBadge = () => {
+      api.get('/api/training/completions-review?status=pending&limit=1').then((r) => {
+        if (cancelled) return;
+        if (r && !r.error && r.counts && typeof r.counts.pending === 'number') {
+          setTrainingReviewPendingCount(r.counts.pending);
+        }
+      }).catch(() => { /* badge poll is best-effort */ });
+    };
+    fetchBadge();
+    const interval = setInterval(fetchBadge, 60000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+  // Tab-gated detail fetch. Runs when training_reviews is open, refetches
+  // on status filter change, and polls every 30s while the tab stays open.
+  useEffect(() => {
+    if (tab !== 'training_reviews') return;
+    let cancelled = false;
+    const fetchQueue = () => {
+      const path = '/api/training/completions-review?status=' + encodeURIComponent(trainingReviewStatusFilter) + '&limit=50';
+      api.get(path).then((r) => {
+        if (cancelled) return;
+        if (!r || r.error) {
+          setTrainingReviewLoadState({ loaded: false, error: (r && r.error) || 'request_failed' });
+          return;
+        }
+        setTrainingReviewQueue({
+          completions: Array.isArray(r.completions) ? r.completions : [],
+          counts: r.counts && typeof r.counts === 'object' ? r.counts : { pending: 0, verified: 0, rejected: 0, total: 0 },
+        });
+        if (r.counts && typeof r.counts.pending === 'number') {
+          setTrainingReviewPendingCount(r.counts.pending);
+        }
+        setTrainingReviewLoadState({ loaded: true, error: null });
+      }).catch((e) => {
+        if (cancelled) return;
+        setTrainingReviewLoadState({ loaded: false, error: (e && e.message) || 'request_failed' });
+      });
+    };
+    fetchQueue();
+    const interval = setInterval(fetchQueue, 30000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [tab, trainingReviewStatusFilter]);
+  // PATCH handler: transition a pending completion to verified or rejected.
+  // The server returns 409 on non-pending transitions; we surface that as a
+  // banner error rather than failing silently. On success we refetch the
+  // queue (keeping the current status filter) and update the badge count.
+  const patchTrainingCompletion = async (completionId, newStatus) => {
+    if (!completionId || !newStatus) return;
+    setTrainingReviewPatchInFlight((prev) => ({ ...prev, [completionId]: newStatus }));
+    setTrainingReviewPatchError(null);
+    try {
+      const r = await api.patch('/api/training/completions-review/' + encodeURIComponent(completionId), { status: newStatus });
+      if (!r || r.error) {
+        setTrainingReviewPatchError((r && r.error) || 'request_failed');
+      } else {
+        const path = '/api/training/completions-review?status=' + encodeURIComponent(trainingReviewStatusFilter) + '&limit=50';
+        const refresh = await api.get(path);
+        if (refresh && !refresh.error) {
+          setTrainingReviewQueue({
+            completions: Array.isArray(refresh.completions) ? refresh.completions : [],
+            counts: refresh.counts && typeof refresh.counts === 'object' ? refresh.counts : { pending: 0, verified: 0, rejected: 0, total: 0 },
+          });
+          if (refresh.counts && typeof refresh.counts.pending === 'number') {
+            setTrainingReviewPendingCount(refresh.counts.pending);
+          }
+        }
+      }
+    } catch (e) {
+      setTrainingReviewPatchError((e && e.message) || 'request_failed');
+    } finally {
+      setTrainingReviewPatchInFlight((prev) => {
+        const next = { ...prev };
+        delete next[completionId];
+        return next;
+      });
+    }
+  };
+  // R3l C33: Forensic Export — admin creates via POST; ciso (separate-actor)
+  // deletes via DELETE. Server returns 403 to non-admin POST and to non-ciso
+  // or same-actor DELETE; UI surfaces those errors verbatim. Read endpoints
+  // (list, manifest, chain) admit either role.
+  const [forensicForm, setForensicForm] = useState({
+    rationale: '',
+    timeWindowStart: '',
+    timeWindowEnd: '',
+    eventTypeFilter: '',
+    outputFormats: ['json-lines', 'csv'],
+    includeAuditLog: true,
+    includeBackupChain: true,
+    includeIncidentRecords: true,
+    includeAuthenticationLogs: true,
+    includeUserAccessLogs: true,
+  });
+  const [forensicCreateInFlight, setForensicCreateInFlight] = useState(false);
+  const [forensicCreateError, setForensicCreateError] = useState(null);
+  const [forensicCreateResult, setForensicCreateResult] = useState(null);
+  const [forensicExports, setForensicExports] = useState([]);
+  const [forensicLoadState, setForensicLoadState] = useState({ loaded: false, error: null });
+  const [forensicChain, setForensicChain] = useState(null);
+  const [forensicChainOpen, setForensicChainOpen] = useState(false);
+  const [forensicManifest, setForensicManifest] = useState(null);
+  const [forensicManifestOpen, setForensicManifestOpen] = useState(false);
+  const [forensicDeleteInFlight, setForensicDeleteInFlight] = useState({});
+  const [forensicDeleteError, setForensicDeleteError] = useState(null);
+  // Tab-gated list fetch — runs when the forensic_exports tab is open.
+  useEffect(() => {
+    if (tab !== 'forensic_exports') return;
+    let cancelled = false;
+    const fetchList = () => {
+      api.get('/api/forensic-exports').then((r) => {
+        if (cancelled) return;
+        if (!r || r.error) {
+          setForensicLoadState({ loaded: false, error: (r && r.error) || 'request_failed' });
+          return;
+        }
+        setForensicExports(Array.isArray(r.exports) ? r.exports : []);
+        setForensicLoadState({ loaded: true, error: null });
+      }).catch((e) => {
+        if (cancelled) return;
+        setForensicLoadState({ loaded: false, error: (e && e.message) || 'request_failed' });
+      });
+    };
+    fetchList();
+    return () => { cancelled = true; };
+  }, [tab]);
+  const ALL_FORENSIC_FORMATS = [
+    'sleuth-kit-bodyfile', 'json-lines', 'plaso-l2t-csv',
+    'cef', 'evtx-xml', 'stix-21', 'dfxml', 'csv',
+  ];
+  const toggleForensicFormat = (fmt) => {
+    setForensicForm((prev) => {
+      const has = prev.outputFormats.includes(fmt);
+      return { ...prev, outputFormats: has ? prev.outputFormats.filter((f) => f !== fmt) : [...prev.outputFormats, fmt] };
+    });
+  };
+  const submitForensicExport = async () => {
+    if (forensicCreateInFlight) return;
+    if (!forensicForm.outputFormats || forensicForm.outputFormats.length === 0) {
+      setForensicCreateError('Select at least one output format');
+      return;
+    }
+    setForensicCreateInFlight(true);
+    setForensicCreateError(null);
+    setForensicCreateResult(null);
+    try {
+      const body = {
+        rationale: forensicForm.rationale || null,
+        timeWindowStart: forensicForm.timeWindowStart || null,
+        timeWindowEnd: forensicForm.timeWindowEnd || null,
+        eventTypeFilter: forensicForm.eventTypeFilter || null,
+        outputFormats: forensicForm.outputFormats,
+        includeAuditLog: forensicForm.includeAuditLog,
+        includeBackupChain: forensicForm.includeBackupChain,
+        includeIncidentRecords: forensicForm.includeIncidentRecords,
+        includeAuthenticationLogs: forensicForm.includeAuthenticationLogs,
+        includeUserAccessLogs: forensicForm.includeUserAccessLogs,
+      };
+      const r = await api.post('/api/forensic-exports', body);
+      if (!r || r.error) {
+        setForensicCreateError((r && r.error) || 'request_failed');
+      } else {
+        setForensicCreateResult(r);
+        const refresh = await api.get('/api/forensic-exports');
+        if (refresh && !refresh.error && Array.isArray(refresh.exports)) {
+          setForensicExports(refresh.exports);
+        }
+      }
+    } catch (e) {
+      setForensicCreateError((e && e.message) || 'request_failed');
+    } finally {
+      setForensicCreateInFlight(false);
+    }
+  };
+  const downloadForensicArchive = async (id) => {
+    await api.download('/api/forensic-exports/' + encodeURIComponent(id) + '/download', 'firealive-forensic-' + id + '.tar.gz');
+  };
+  const viewForensicManifest = async (id) => {
+    setForensicManifest(null);
+    setForensicManifestOpen(true);
+    const r = await api.get('/api/forensic-exports/' + encodeURIComponent(id) + '/manifest');
+    setForensicManifest(r);
+  };
+  const viewForensicChain = async () => {
+    setForensicChain(null);
+    setForensicChainOpen(true);
+    const r = await api.get('/api/forensic-exports/chain');
+    setForensicChain(r);
+  };
+  const deleteForensicExport = async (id) => {
+    if (forensicDeleteInFlight[id]) return;
+    if (!window.confirm('Delete forensic export ' + id + '? This is irreversible (the chain entry is preserved). CISO role required and you must NOT be the original requester (separate-actor enforcement).')) return;
+    setForensicDeleteInFlight((prev) => ({ ...prev, [id]: true }));
+    setForensicDeleteError(null);
+    try {
+      const r = await api.del('/api/forensic-exports/' + encodeURIComponent(id));
+      if (!r || r.error) {
+        setForensicDeleteError((r && r.error) || 'request_failed');
+      } else {
+        const refresh = await api.get('/api/forensic-exports');
+        if (refresh && !refresh.error && Array.isArray(refresh.exports)) {
+          setForensicExports(refresh.exports);
+        }
+      }
+    } catch (e) {
+      setForensicDeleteError((e && e.message) || 'request_failed');
+    } finally {
+      setForensicDeleteInFlight((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  };
   // OODA
   const [oodaPolicies, setOodaPolicies] = useState([]);
   const [oodaNewPolicy, setOodaNewPolicy] = useState({title:"",type:"incident_response",content:""});
@@ -2062,7 +2346,7 @@ function ManagementConsole() {
       {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing"},{id:"soar",label:"SOAR & Ticketing"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
-      {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
+      {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"training_reviews",label:"Training Reviews",badge:trainingReviewPendingCount},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
     ]},
     {cat:"integrations",label:"Integrations",items:[
       {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"ai_integrations",label:"AI/ML Integrations"},
@@ -2086,7 +2370,7 @@ function ManagementConsole() {
       {id:"monitoring",label:"System Health"},{id:"vulnscan",label:"Vulnerability Scan"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},
     ]},
     {cat:"audit_cat",label:"Audit",items:[
-      {id:"audit",label:"Audit Log"},
+      {id:"audit",label:"Audit Log"},{id:"forensic_exports",label:"Forensic Exports"},
     ]},
   ];
   // Flat list for tab rendering compatibility
@@ -4650,7 +4934,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Card style={{textAlign:"center",borderColor:monMetrics.cpu>80?C.d+"60":C.b}}><div style={{fontSize:24,fontWeight:600,color:monMetrics.cpu>80?C.d:C.a}}>{monMetrics.cpu}%</div><M style={{color:C.td}}>CPU</M></Card>
             <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.i}}>{monMetrics.memMB}</div><M style={{color:C.td}}>Memory (MB)</M></Card>
             <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.p}}>{monMetrics.heapMB}</div><M style={{color:C.td}}>Heap (MB)</M></Card>
-            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.w}}>{monMetrics.dbReadsPerMin}</div><M style={{color:C.td}}>DB Reads/min</M></Card>
+            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.w}}>{monMetrics.dbSizeMB}</div><M style={{color:C.td}}>DB Size (MB)</M></Card>
           </div>
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><M style={{color:"#E8EDF5",fontWeight:500}}>System Status</M><Badge color={C.a}>Healthy</Badge></div>
@@ -4669,6 +4953,32 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               ))}
             </div>
             <Btn small primary style={{marginTop:10}} onClick={()=>api.post("/api/v1/audit/log",{event:"THRESHOLDS_SAVED",detail:"Alert thresholds updated"}).then(()=>addA("THRESHOLDS_SAVED","Alert thresholds updated"))}>Save Thresholds</Btn>
+          </Card>
+          {/* R3l C15: Connected Sessions card, wired to /api/system/connected-clients */}
+          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Sessions (WebSocket)</div>
+          <Card style={{marginBottom:16}}>
+            {!connectedClientsLoadState.loaded && !connectedClientsLoadState.error && <M style={{color:C.tm,fontStyle:"italic"}}>Loading connected sessions…</M>}
+            {connectedClientsLoadState.error && <M style={{color:C.w}}>Could not load connected sessions: {connectedClientsLoadState.error}</M>}
+            {connectedClientsLoadState.loaded && !connectedClients.initialized && <M style={{color:C.tm,fontStyle:"italic"}}>WebSocket server not initialized (real-time sessions unavailable).</M>}
+            {connectedClientsLoadState.loaded && connectedClients.initialized && <div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:12}}>
+                <Card style={{textAlign:"center",borderColor:C.b}}><div style={{fontSize:22,fontWeight:600,color:C.a}}>{connectedClients.alive}</div><M style={{color:C.td}}>Alive</M></Card>
+                <Card style={{textAlign:"center",borderColor:C.b}}><div style={{fontSize:22,fontWeight:600,color:C.w}}>{connectedClients.stale}</div><M style={{color:C.td}}>Stale</M></Card>
+                <Card style={{textAlign:"center",borderColor:C.b}}><div style={{fontSize:22,fontWeight:600,color:C.i}}>{connectedClients.count}</div><M style={{color:C.td}}>Total</M></Card>
+                <Card style={{textAlign:"center",borderColor:C.b}}><div style={{fontSize:11,fontWeight:600,color:C.p,paddingTop:6,lineHeight:1.4}}>{(()=>{const r=connectedClients.by_role||{};const entries=Object.entries(r);return entries.length>0?entries.map(([k,v])=>`${k}: ${v}`).join(" · "):"—";})()}</div><M style={{color:C.td,marginTop:6}}>By Role</M></Card>
+              </div>
+              {connectedClients.clients.length>0 && <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
+                  <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>{["User","Role","Heartbeat"].map(h=><th key={h} style={{padding:"6px",textAlign:"left",color:C.td,fontWeight:500}}>{h}</th>)}</tr></thead>
+                  <tbody>{connectedClients.clients.map((c,i)=>(<tr key={i} style={{borderBottom:`1px solid ${C.b}`}}>
+                    <td style={{padding:"6px",color:C.t}}>{c.userId||"—"}</td>
+                    <td style={{padding:"6px",color:C.tm}}>{c.role||"—"}</td>
+                    <td style={{padding:"6px"}}><Badge color={c.isAlive?C.a:C.d}>{c.isAlive?"alive":"stale"}</Badge></td>
+                  </tr>))}</tbody>
+                </table>
+              </div>}
+              {connectedClients.clients.length===0 && <M style={{color:C.tm,fontStyle:"italic"}}>No clients connected.</M>}
+            </div>}
           </Card>
           <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Client Metrics</div>
           <Card>
@@ -5477,6 +5787,80 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </Sel>
             <Btn primary style={{marginTop:12}} disabled={!newCert.name||!newCert.analyst} onClick={()=>{setGeneralCerts(prev=>[...prev,{id:"gc"+Date.now(),name:newCert.name,issuer:newCert.issuer,earned:newCert.earned,expires:newCert.expires,analyst:newCert.analyst}]);setNewCert({name:"",issuer:"",earned:"",expires:"",analyst:""});addA("CERT_ADDED","Certification added: "+newCert.name);}}>Add Certification</Btn>
           </Card>
+        </div>)}
+
+        {/* R3l C16: Training Completions Review — lead/admin verify or reject analyst-submitted training completions */}
+        {tab==="training_reviews"&&(<div>
+          <L>Training Completions Review</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Verify or reject training completions that analysts have self-submitted through the Analyst Client. Each row shows the analyst, platform, module URL, submission timestamp, and current status. The server only allows pending submissions to be transitioned — verify confirms the completion is genuine and credits it to the analyst's skill record; reject marks it as not credited. Verified and rejected rows are terminal and shown for audit reference.</M>
+          {trainingReviewPatchError&&(<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>Last action failed: {trainingReviewPatchError}</M></Card>)}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.w}}>{trainingReviewQueue.counts.pending}</div><M style={{color:C.td}}>Pending</M></Card>
+            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.a}}>{trainingReviewQueue.counts.verified}</div><M style={{color:C.td}}>Verified</M></Card>
+            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.d}}>{trainingReviewQueue.counts.rejected}</div><M style={{color:C.td}}>Rejected</M></Card>
+            <Card style={{textAlign:"center"}}><div style={{fontSize:24,fontWeight:600,color:C.i}}>{trainingReviewQueue.counts.total}</div><M style={{color:C.td}}>Total</M></Card>
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+            {[{k:"pending",l:"Pending"},{k:"verified",l:"Verified"},{k:"rejected",l:"Rejected"},{k:"all",l:"All"}].map(f=>(
+              <button key={f.k} onClick={()=>setTrainingReviewStatusFilter(f.k)} style={{padding:"6px 14px",background:trainingReviewStatusFilter===f.k?C.a:"rgba(255,255,255,0.03)",border:`1px solid ${trainingReviewStatusFilter===f.k?C.a:C.b}`,borderRadius:6,color:trainingReviewStatusFilter===f.k?"#000":C.t,fontSize:11,fontWeight:500,cursor:"pointer"}}>{f.l}</button>
+            ))}
+          </div>
+          {!trainingReviewLoadState.loaded&&!trainingReviewLoadState.error&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading training completions…</M>)}
+          {trainingReviewLoadState.error&&(<Card style={{borderColor:C.w+"60"}}><M style={{color:C.w}}>Could not load training completions: {trainingReviewLoadState.error}</M></Card>)}
+          {trainingReviewLoadState.loaded&&trainingReviewQueue.completions.length===0&&(<Card><M style={{color:C.tm,fontStyle:"italic"}}>No training completions match the current filter.</M></Card>)}
+          {trainingReviewLoadState.loaded&&trainingReviewQueue.completions.length>0&&(
+            <Card style={{padding:0,overflow:"hidden"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr style={{background:"rgba(255,255,255,0.02)"}}>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Analyst</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Platform / Module</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Submitted</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
+                    <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trainingReviewQueue.completions.map(c=>{
+                    const inFlight = trainingReviewPatchInFlight[c.id];
+                    const statusColor = c.status==="pending"?C.w:c.status==="verified"?C.a:c.status==="rejected"?C.d:C.tm;
+                    return (
+                      <tr key={c.id} style={{borderBottom:`1px solid ${C.b}`}}>
+                        <td style={{padding:"10px 12px",color:C.t,verticalAlign:"top"}}>
+                          <M style={{color:C.t,fontWeight:500}}>{c.user_name||"(unknown user)"}</M>
+                          <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>id: {c.user_id}</M>
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <M style={{color:C.t,fontWeight:500}}>{c.platform||"(no platform)"}</M>
+                          <M style={{color:C.tm,display:"block",marginTop:2}}>{c.module||"(no module name)"}</M>
+                          {c.url&&(<a href={c.url} target="_blank" rel="noopener noreferrer" style={{color:C.i,fontSize:10,wordBreak:"break-all",textDecoration:"none",display:"block",marginTop:4}}>{c.url}</a>)}
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <M style={{color:C.tm}}>{c.submitted_at||"—"}</M>
+                          {c.completion_date&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>Completed: {c.completion_date}</M>)}
+                          {c.score!==null&&c.score!==undefined&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>Score: {c.score}</M>)}
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <Badge color={statusColor}>{c.status}</Badge>
+                          {c.verified_at&&c.status!=="pending"&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4}}>{c.status==="verified"?"Verified":"Rejected"}: {c.verified_at}</M>)}
+                        </td>
+                        <td style={{padding:"10px 12px",textAlign:"right",verticalAlign:"top"}}>
+                          {c.status==="pending"?(
+                            <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                              <button onClick={()=>patchTrainingCompletion(c.id,"verified")} disabled={!!inFlight} style={{padding:"5px 10px",background:inFlight==="verified"?C.tm:C.a,border:"none",borderRadius:4,color:"#000",fontSize:11,fontWeight:500,cursor:inFlight?"not-allowed":"pointer",opacity:inFlight?0.6:1}}>{inFlight==="verified"?"Verifying…":"Verify"}</button>
+                              <button onClick={()=>patchTrainingCompletion(c.id,"rejected")} disabled={!!inFlight} style={{padding:"5px 10px",background:"transparent",border:`1px solid ${C.d}`,borderRadius:4,color:C.d,fontSize:11,fontWeight:500,cursor:inFlight?"not-allowed":"pointer",opacity:inFlight?0.6:1}}>{inFlight==="rejected"?"Rejecting…":"Reject"}</button>
+                            </div>
+                          ):(
+                            <M style={{color:C.td,fontStyle:"italic",fontSize:10}}>—</M>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </Card>
+          )}
         </div>)}
 
         {/* ══════════ v1.0.0 — PSEUDONYM SYSTEM ══════════ */}
@@ -6515,6 +6899,164 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Btn small disabled={page>=totalPages-1} onClick={()=>setAuditPage(page+1)}>Next →</Btn>
           </div>}
         </div>);})()}
+
+        {/* R3l C33: Forensic Export — admin creates / ciso (separate-actor) deletes */}
+        {tab==="forensic_exports"&&(<div>
+          <L>Forensic Export</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>SOC-grade forensic exports of platform audit data. Each export bundles selected data slices (audit log, backup chain, incident records, authentication logs, user access logs) into the chosen forensic formats, signs the manifest with Ed25519, and (optionally) attests with Cosign. The full chain of operations (create, download, delete) is recorded in the append-only forensic_export_chain.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}><b style={{color:C.t}}>Separate-actor enforcement:</b> exports are created by admin; deletion requires the CISO role AND a different user than the original requester. The chain entry survives any deletion.</M>
+
+          {/* Create form */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:12}}>New Forensic Export</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+              <div>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window start (ISO 8601, optional)</M>
+                <input type="text" value={forensicForm.timeWindowStart} onChange={e=>setForensicForm({...forensicForm,timeWindowStart:e.target.value})} placeholder="2026-01-01T00:00:00Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+              </div>
+              <div>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window end (ISO 8601, optional)</M>
+                <input type="text" value={forensicForm.timeWindowEnd} onChange={e=>setForensicForm({...forensicForm,timeWindowEnd:e.target.value})} placeholder="2026-12-31T23:59:59Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+              </div>
+            </div>
+            <div style={{marginBottom:12}}>
+              <M style={{color:C.tm,display:"block",marginBottom:4}}>Event type filter (comma-separated, optional, audit_log + backup_chain only)</M>
+              <input type="text" value={forensicForm.eventTypeFilter} onChange={e=>setForensicForm({...forensicForm,eventTypeFilter:e.target.value})} placeholder="LOGIN_FAILED,DELETE_DENIED,EXPORT_CREATED" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+            </div>
+            <div style={{marginBottom:12}}>
+              <M style={{color:C.tm,display:"block",marginBottom:6}}>Rationale (recorded in audit log; optional but recommended for compliance)</M>
+              <textarea value={forensicForm.rationale} onChange={e=>setForensicForm({...forensicForm,rationale:e.target.value})} placeholder="Reason for this forensic export (incident ID, audit ticket, regulator request…)" rows={2} style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"inherit",resize:"vertical"}}/>
+            </div>
+            <div style={{marginBottom:12}}>
+              <M style={{color:C.tm,display:"block",marginBottom:6}}>Output formats (one file per format inside the archive)</M>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {ALL_FORENSIC_FORMATS.map(fmt=>(
+                  <button key={fmt} onClick={()=>toggleForensicFormat(fmt)} style={{padding:"5px 10px",background:forensicForm.outputFormats.includes(fmt)?C.a:"rgba(255,255,255,0.03)",border:`1px solid ${forensicForm.outputFormats.includes(fmt)?C.a:C.b}`,borderRadius:4,color:forensicForm.outputFormats.includes(fmt)?"#000":C.t,fontSize:11,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{fmt}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{marginBottom:12}}>
+              <M style={{color:C.tm,display:"block",marginBottom:6}}>Slices to include</M>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
+                {[
+                  ["includeAuditLog","Audit log"],
+                  ["includeBackupChain","Backup chain"],
+                  ["includeIncidentRecords","Incident retros"],
+                  ["includeAuthenticationLogs","Auth log"],
+                  ["includeUserAccessLogs","Session log"],
+                ].map(([key,lbl])=>(
+                  <label key={key} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",color:C.t,fontSize:12}}>
+                    <input type="checkbox" checked={forensicForm[key]} onChange={e=>setForensicForm({...forensicForm,[key]:e.target.checked})}/>
+                    {lbl}
+                  </label>
+                ))}
+              </div>
+            </div>
+            {forensicCreateError&&(<Card style={{marginBottom:12,borderColor:C.d+"60"}}><M style={{color:C.d}}>Create failed: {forensicCreateError}</M></Card>)}
+            {forensicCreateResult&&(<Card style={{marginBottom:12,borderColor:C.a+"60"}}><M style={{color:C.a}}>Created export <code>{forensicCreateResult.id}</code> ({forensicCreateResult.sizeBytes} bytes, sha256 {(forensicCreateResult.archiveSha256||"").slice(0,16)}…)</M></Card>)}
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={submitForensicExport} disabled={forensicCreateInFlight} style={{padding:"8px 16px",background:forensicCreateInFlight?C.tm:C.a,border:"none",borderRadius:4,color:"#000",fontSize:12,fontWeight:600,cursor:forensicCreateInFlight?"not-allowed":"pointer",opacity:forensicCreateInFlight?0.6:1}}>{forensicCreateInFlight?"Creating…":"Create Forensic Export"}</button>
+              <button onClick={viewForensicChain} style={{padding:"8px 16px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontWeight:500,cursor:"pointer"}}>View Chain</button>
+            </div>
+          </Card>
+
+          {/* Chain modal */}
+          {forensicChainOpen&&(<Card style={{marginBottom:16,borderColor:C.i+"60"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.t}}>Forensic Export Chain</div>
+              <button onClick={()=>setForensicChainOpen(false)} style={{background:"transparent",border:"none",color:C.tm,fontSize:14,cursor:"pointer"}}>✕</button>
+            </div>
+            {!forensicChain&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading chain…</M>)}
+            {forensicChain&&forensicChain.error&&(<M style={{color:C.d}}>Error: {forensicChain.error}</M>)}
+            {forensicChain&&!forensicChain.error&&(<div>
+              {forensicChain.active_signing_key&&(<div style={{marginBottom:10,padding:8,background:"rgba(255,255,255,0.02)",border:`1px solid ${C.b}`,borderRadius:4}}>
+                <M style={{color:C.td,display:"block"}}>Active signing key</M>
+                <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>id: {forensicChain.active_signing_key.id}</M>
+                <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>fingerprint: {forensicChain.active_signing_key.fingerprint}</M>
+              </div>)}
+              <div style={{maxHeight:300,overflowY:"auto",fontFamily:"'IBM Plex Mono',monospace",fontSize:10}}>
+                {(forensicChain.chain||[]).map(c=>(
+                  <div key={c.id} style={{padding:"6px 8px",borderBottom:`1px solid ${C.b}`,display:"flex",gap:10}}>
+                    <span style={{color:C.td,minWidth:50}}>#{c.id}</span>
+                    <span style={{color:C.a,minWidth:160}}>{c.event_type}</span>
+                    <span style={{color:C.tm,minWidth:90}}>{c.created_at}</span>
+                    <span style={{color:C.t,wordBreak:"break-all"}}>{c.export_ref} / actor:{c.actor_user_id} / hash:{(c.this_hash||"").slice(0,12)}…</span>
+                  </div>
+                ))}
+                {(forensicChain.chain||[]).length===0&&(<M style={{color:C.tm,fontStyle:"italic",padding:8,display:"block"}}>No chain entries yet.</M>)}
+              </div>
+            </div>)}
+          </Card>)}
+
+          {/* Manifest modal */}
+          {forensicManifestOpen&&(<Card style={{marginBottom:16,borderColor:C.i+"60"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.t}}>Export Manifest</div>
+              <button onClick={()=>setForensicManifestOpen(false)} style={{background:"transparent",border:"none",color:C.tm,fontSize:14,cursor:"pointer"}}>✕</button>
+            </div>
+            {!forensicManifest&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading manifest…</M>)}
+            {forensicManifest&&forensicManifest.error&&(<M style={{color:C.d}}>Error: {forensicManifest.error}</M>)}
+            {forensicManifest&&!forensicManifest.error&&(<pre style={{maxHeight:400,overflow:"auto",fontFamily:"'IBM Plex Mono',monospace",fontSize:10,color:C.t,background:"rgba(0,0,0,0.3)",padding:10,borderRadius:4,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{JSON.stringify(forensicManifest,null,2)}</pre>)}
+          </Card>)}
+
+          {/* Delete error banner */}
+          {forensicDeleteError&&(<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>Last delete failed: {forensicDeleteError}</M></Card>)}
+
+          {/* Exports table */}
+          {!forensicLoadState.loaded&&!forensicLoadState.error&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading exports…</M>)}
+          {forensicLoadState.error&&(<Card style={{borderColor:C.w+"60"}}><M style={{color:C.w}}>Could not load exports: {forensicLoadState.error}</M></Card>)}
+          {forensicLoadState.loaded&&forensicExports.length===0&&(<Card><M style={{color:C.tm,fontStyle:"italic"}}>No forensic exports yet. Use the form above to create one.</M></Card>)}
+          {forensicLoadState.loaded&&forensicExports.length>0&&(<Card style={{padding:0,overflow:"hidden"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{background:"rgba(255,255,255,0.02)"}}>
+                  <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Export ID</th>
+                  <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Requested</th>
+                  <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
+                  <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Formats</th>
+                  <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Size</th>
+                  <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {forensicExports.map(e=>{
+                  const statusColor = e.status==="complete"?C.a:e.status==="failed"?C.d:e.status==="in_progress"?C.i:C.w;
+                  const inFlight = forensicDeleteInFlight[e.id];
+                  return (
+                    <tr key={e.id} style={{borderBottom:`1px solid ${C.b}`}}>
+                      <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                        <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{e.id}</M>
+                        {e.rationale&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>{e.rationale}</M>)}
+                      </td>
+                      <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                        <M style={{color:C.tm}}>{e.requested_at||"—"}</M>
+                        <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>by: {e.requested_by_user_id}</M>
+                      </td>
+                      <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                        <Badge color={statusColor}>{e.status}</Badge>
+                        {e.error_message&&(<M style={{color:C.d,display:"block",fontSize:10,marginTop:4,maxWidth:200,wordBreak:"break-word"}}>{e.error_message}</M>)}
+                      </td>
+                      <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                        <M style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{e.output_formats||"—"}</M>
+                      </td>
+                      <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
+                        <M style={{color:C.tm}}>{e.size_bytes?e.size_bytes.toLocaleString()+" B":"—"}</M>
+                        {e.archive_sha256&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2,fontFamily:"'IBM Plex Mono',monospace"}}>{(e.archive_sha256||"").slice(0,12)}…</M>)}
+                      </td>
+                      <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
+                        <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                          {e.status==="complete"&&(<button onClick={()=>downloadForensicArchive(e.id)} style={{padding:"4px 8px",background:C.a,border:"none",borderRadius:4,color:"#000",fontSize:10,fontWeight:500,cursor:"pointer"}}>Download</button>)}
+                          {e.status==="complete"&&(<button onClick={()=>viewForensicManifest(e.id)} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:10,fontWeight:500,cursor:"pointer"}}>Manifest</button>)}
+                          <button onClick={()=>deleteForensicExport(e.id)} disabled={!!inFlight} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.d}`,borderRadius:4,color:C.d,fontSize:10,fontWeight:500,cursor:inFlight?"not-allowed":"pointer",opacity:inFlight?0.6:1}}>{inFlight?"Deleting…":"Delete"}</button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </Card>)}
+        </div>)}
           </div>{/* end content area */}
         </div>{/* end sidebar flex container */}
       </div>{/* end main flex */}

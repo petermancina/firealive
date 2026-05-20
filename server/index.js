@@ -101,6 +101,9 @@ app.get('/api/system/health', require('./routes/system')); // health check is pu
 // Authenticated routes
 app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team'));
 app.use('/api/analysts', authMiddleware(['analyst']), require('./routes/analysts'));
+app.use('/api/signals', authMiddleware(['analyst']), require('./routes/signals'));
+app.use('/api/impacts', authMiddleware(['analyst']), require('./routes/impacts'));
+app.use('/api/training-recommendations', authMiddleware(['analyst']), require('./routes/training-recommendations'));
 app.use('/api/routing', authMiddleware(['lead', 'admin']), require('./routes/routing'));
 app.use('/api/handoffs', authMiddleware(['lead', 'admin']), require('./routes/handoffs'));
 app.use('/api/retro', authMiddleware(['lead', 'admin']), require('./routes/retro'));
@@ -118,6 +121,7 @@ app.use('/api/backup-schedules', authMiddleware(['admin']), configLockGate(), re
 app.use('/api/gd-config', authMiddleware(['admin']), configLockGate(), require('./routes/gd-config'));
 app.use('/api/gd-signing-key', authMiddleware(['admin']), configLockGate(), require('./routes/gd-signing-key'));
 app.use('/api/scheduling', authMiddleware(['admin', 'lead']), configLockGate(), require('./routes/scheduling-platform'));
+app.use('/api/audit/event', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/audit-event'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/audit'));
 app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
@@ -127,6 +131,7 @@ app.use('/api/messages', authMiddleware(['analyst']), require('./routes/messages
 app.use('/api/peers', authMiddleware(['analyst']), require('./routes/peers'));
 app.use('/api/peer-support', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-support'));
 app.use('/api/peer/flags', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-flags'));
+app.use('/api/training/completions-review', authMiddleware(['lead', 'admin']), require('./routes/training-completions-review'));
 app.use('/api/training', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/training'));
 app.use('/api/features', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/features'));
 app.use('/api/query', authMiddleware(['lead', 'admin']), require('./routes/query'));
@@ -156,11 +161,13 @@ app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v027-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/v030-features'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-monitoring'));
+app.use('/api/system/connected-clients', authMiddleware(['admin']), require('./routes/system-connected-clients'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
+app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -248,6 +255,7 @@ async function start() {
     let wsServer = null;
     try {
       wsServer = new FireAliveWebSocket(server, getDb());
+      app.locals.wsServer = wsServer;
       wsServer.startHeartbeatCheck();
       logger.info('WebSocket server started on /ws');
     } catch (e) {

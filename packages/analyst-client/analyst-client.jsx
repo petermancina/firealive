@@ -966,7 +966,120 @@ export default function AnalystClientApp() {
   ];
 
   // ── Signals ──
-  const signals = {investigationTime:{base:20,cur:26,u:"min",label:"Avg time per alert"},dismissRate:{base:15,cur:19,u:"%",label:"Closed without notes"},ticketQuality:{base:82,cur:76,u:"%",label:"Documentation quality",hib:true},escalationRate:{base:11,cur:14,u:"%",label:"Escalation rate"}};
+  // ── Signals (R3l C10): DEFAULT preserves UI metadata; cur/base populated from /api/signals/me on mount ──
+  const DEFAULT_SIGNALS = {
+    investigationTime: {base:20, cur:26, u:"min", label:"Avg time per alert"},
+    dismissRate:       {base:15, cur:19, u:"%",   label:"Closed without notes"},
+    ticketQuality:     {base:82, cur:76, u:"%",   label:"Documentation quality", hib:true},
+    escalationRate:    {base:11, cur:14, u:"%",   label:"Escalation rate"},
+  };
+  const [signals, setSignals] = useState(DEFAULT_SIGNALS);
+  const [signalsLoadState, setSignalsLoadState] = useState({loaded:false, error:null, riskTier:null, recordedAt:null});
+  useEffect(() => {
+    let cancelled = false;
+    Api.get('/api/signals/me').then((data) => {
+      if (cancelled) return;
+      if (data.error) {
+        setSignalsLoadState({loaded:false, error:data.error, riskTier:null, recordedAt:null});
+        return;
+      }
+      const cur = data.current || {};
+      const decryptOk = !cur.error;
+      setSignals((prev) => {
+        const next = {};
+        for (const key of Object.keys(prev)) {
+          const merged = {...prev[key]};
+          if (decryptOk && typeof cur[key] === 'number') merged.cur = cur[key];
+          next[key] = merged;
+        }
+        if (Array.isArray(data.readings) && data.readings.length > 0) {
+          const byKey = {};
+          for (const r of data.readings) {
+            if (typeof r.signal === 'string' && typeof r.value === 'number') {
+              (byKey[r.signal] = byKey[r.signal] || []).push(r.value);
+            }
+          }
+          for (const key of Object.keys(next)) {
+            const arr = byKey[key];
+            if (arr && arr.length > 0) {
+              const sorted = [...arr].sort((a,b) => a-b);
+              next[key].base = Math.round(sorted[Math.floor(sorted.length/2)]);
+            }
+          }
+        }
+        return next;
+      });
+      setSignalsLoadState({
+        loaded: true,
+        error: cur.error || null,
+        riskTier: cur.riskTier || null,
+        recordedAt: cur.recordedAt || null,
+      });
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Training Recommendations (R3l C11): from /api/training-recommendations/me ──
+  const [trainingRecs, setTrainingRecs] = useState({recommendations: [], meta: null});
+  const [trainingRecsLoadState, setTrainingRecsLoadState] = useState({loaded:false, error:null});
+  useEffect(() => {
+    let cancelled = false;
+    Api.get('/api/training-recommendations/me').then((data) => {
+      if (cancelled) return;
+      if (data.error) {
+        setTrainingRecsLoadState({loaded:false, error:data.error});
+        return;
+      }
+      setTrainingRecs({
+        recommendations: Array.isArray(data.recommendations) ? data.recommendations : [],
+        meta: data.meta || null,
+      });
+      setTrainingRecsLoadState({loaded:true, error:null});
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Skills Assessment Results (R3l C12): from /api/assessments/analyst/me ──
+  const [skillResults, setSkillResults] = useState({results: [], gaps: [], strengths: [], gapThreshold: 70});
+  const [skillResultsLoadState, setSkillResultsLoadState] = useState({loaded:false, error:null});
+  useEffect(() => {
+    let cancelled = false;
+    Api.get('/api/assessments/analyst/me').then((data) => {
+      if (cancelled) return;
+      if (data.error) {
+        setSkillResultsLoadState({loaded:false, error:data.error});
+        return;
+      }
+      setSkillResults({
+        results: Array.isArray(data.results) ? data.results : [],
+        gaps: Array.isArray(data.gaps) ? data.gaps : [],
+        strengths: Array.isArray(data.strengths) ? data.strengths : [],
+        gapThreshold: typeof data.gapThreshold === 'number' ? data.gapThreshold : 70,
+      });
+      setSkillResultsLoadState({loaded:true, error:null});
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Training Completion Submission (R3l C13): POST to /api/training/submit-completion ──
+  const [completionForm, setCompletionForm] = useState({module:"", platform:"", url:"", completionDate:""});
+  const [completionState, setCompletionState] = useState({submitting:false, success:null, error:null});
+  const submitCompletion = async () => {
+    setCompletionState({submitting:true, success:null, error:null});
+    const body = {
+      module: completionForm.module,
+      platform: completionForm.platform,
+    };
+    if (completionForm.url) body.url = completionForm.url;
+    if (completionForm.completionDate) body.completionDate = completionForm.completionDate;
+    const resp = await Api.post('/api/training/submit-completion', body);
+    if (resp.error) {
+      setCompletionState({submitting:false, success:null, error:resp.error});
+    } else {
+      setCompletionState({submitting:false, success:resp.id || "submitted", error:null});
+      setCompletionForm({module:"", platform:"", url:"", completionDate:""});
+    }
+  };
 
 
   // ── Log integrity ──
@@ -2110,12 +2223,46 @@ export default function AnalystClientApp() {
             <M style={{color:C.tm,lineHeight:1.6}}>Your queue is paused. Use this time for training, peer skill-share, or certification study. A content filter is active — only training platforms, peer chat, and certification sites are accessible during this hour. Social media and non-work sites are temporarily restricted.</M>
           </Card>}
           {scheduled.length>0&&<div style={{marginBottom:16}}><M style={{color:C.a,display:"block",marginBottom:8}}>Scheduled ({scheduled.length})</M>{scheduled.map(s=><Card key={s.id} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${C.a}`}}><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:12}}>{s.title}</span><Badge color={C.a}>{s.date}</Badge></div><M style={{color:C.td}}>Reminder: {s.reminder} before · {s.platform}</M></Card>)}</div>}
-          <Card style={{marginBottom:8}}><div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>SIEM Queries (65%)</div>{[{m:"SOC Level 1",url:"https://tryhackme.com/room/introtosoc"},{m:"Alert Correlation",url:"https://app.letsdefend.io/training/lessons/alert-correlation"}].map((t,idx)=>(<div key={idx} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t,fontWeight:500}}>{t.m}</M><M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M></div>))}</Card>
-          <Card style={{marginBottom:8}}><div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>Investigation (62%)</div>{[{m:"SOC Analyst Path",url:"https://academy.hackthebox.com/path/preview/soc-analyst"},{m:"Incident Investigation",url:"https://app.letsdefend.io/training/lessons/incident-investigation"}].map((t,idx)=>(<div key={idx} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t,fontWeight:500}}>{t.m}</M><M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M></div>))}</Card>
-          <Card style={{marginBottom:8}}><div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>Escalation (55%)</div>{[{m:"GCIH",url:"https://www.sans.org/cyber-security-courses/hacker-techniques-incident-handling/"},{m:"Escalation Practice",url:"https://app.letsdefend.io/training/lessons/escalation-practice"}].map((t,idx)=>(<div key={idx} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t,fontWeight:500}}>{t.m}</M><M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M></div>))}</Card>
-          <Card style={{marginBottom:8}}><div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>Threat Hunting (28%)</div>{[{m:"Threat Hunter",url:"https://academy.hackthebox.com/path/preview/soc-analyst"},{m:"Threat Hunting Splunk",url:"https://cyberdefenders.org/blueteam-ctf-challenges/threat-hunting-splunk/"}].map((t,idx)=>(<div key={idx} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t,fontWeight:500}}>{t.m}</M><M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M></div>))}</Card>
-          <Card style={{marginBottom:8}}><div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>Malware Analysis (15%)</div>{[{m:"MalDoc101",url:"https://cyberdefenders.org/blueteam-ctf-challenges/maldoc101/"},{m:"Reverse Engineering",url:"https://www.immersivelabs.com/resources/reverse-engineering/"}].map((t,idx)=>(<div key={idx} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}><M style={{color:C.t,fontWeight:500}}>{t.m}</M><M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M></div>))}</Card>
-          <Card style={{marginBottom:10,borderColor:C.a+"30"}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Submit Completion</div><Input label="Module" maxLength={256}/><Input label="Platform"/><Input label="URL" maxLength={500}/><Input label="Date" type="date"/><Btn primary onClick={()=>logC("TR","Submitted")} style={{marginTop:8}}>Submit</Btn></Card>
+          {/* R3l C11: state-driven recommendations from /api/training-recommendations/me */}
+          {!trainingRecsLoadState.loaded && !trainingRecsLoadState.error && (
+            <M style={{color:C.tm,fontStyle:"italic",display:"block",marginBottom:8}}>Loading recommendations…</M>
+          )}
+          {trainingRecsLoadState.error && (
+            <Card style={{marginBottom:8,borderColor:C.w+"40"}}><M style={{color:C.w}}>Could not load recommendations: {trainingRecsLoadState.error}</M></Card>
+          )}
+          {trainingRecsLoadState.loaded && trainingRecs.recommendations.length===0 && (
+            <Card style={{marginBottom:8}}><M style={{color:C.tm,fontStyle:"italic"}}>No skill gaps identified — your assessment scores are above threshold. Keep up the work.</M></Card>
+          )}
+          {trainingRecs.recommendations.map((rec)=>(
+            <Card key={rec.skill_id} style={{marginBottom:8}}>
+              <div style={{fontSize:12,fontWeight:600,color:C.w,marginBottom:6}}>{rec.skill_name} ({rec.current_score}%)</div>
+              {(!rec.modules||rec.modules.length===0)?(
+                <M style={{color:C.td,fontStyle:"italic",fontSize:11}}>No training modules available for this skill yet — flag to your lead so the maintainers can add some.</M>
+              ):(rec.modules.map((t)=>(
+                <div key={t.id} style={{padding:"5px 0",borderBottom:"1px solid "+C.b}}>
+                  <M style={{color:C.t,fontWeight:500}}>{t.title}</M>
+                  <div style={{display:"flex",gap:8,marginTop:2,fontSize:10,color:C.td,flexWrap:"wrap"}}>
+                    {t.platform_name&&<span>{t.platform_name}</span>}
+                    {t.difficulty&&<span>· {t.difficulty}</span>}
+                    {t.free_or_paid&&<span>· {t.free_or_paid}</span>}
+                    {typeof t.estimated_hours==="number"&&<span>· {t.estimated_hours}h</span>}
+                  </div>
+                  <M style={{color:C.a,display:"block",fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}} onClick={()=>navigator.clipboard?.writeText(t.url)}>{t.url} (copy)</M>
+                </div>
+              )))}
+            </Card>
+          ))}
+          {/* R3l C13: wired to POST /api/training/submit-completion */}
+          <Card style={{marginBottom:10,borderColor:C.a+"30"}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Submit Completion</div>
+            <Input label="Module" maxLength={256} value={completionForm.module} onChange={(e)=>setCompletionForm(f=>({...f,module:e.target.value}))}/>
+            <Input label="Platform" maxLength={64} value={completionForm.platform} onChange={(e)=>setCompletionForm(f=>({...f,platform:e.target.value}))}/>
+            <Input label="URL" maxLength={2048} value={completionForm.url} onChange={(e)=>setCompletionForm(f=>({...f,url:e.target.value}))}/>
+            <Input label="Date" type="date" value={completionForm.completionDate} onChange={(e)=>setCompletionForm(f=>({...f,completionDate:e.target.value}))}/>
+            {completionState.error&&<M style={{color:C.d,display:"block",marginBottom:6}}>Error: {completionState.error}</M>}
+            {completionState.success&&<M style={{color:C.a,display:"block",marginBottom:6}}>Submitted — pending lead review.</M>}
+            <Btn primary disabled={completionState.submitting||!completionForm.module.trim()||!completionForm.platform.trim()} onClick={submitCompletion} style={{marginTop:8}}>{completionState.submitting?"Submitting…":"Submit"}</Btn>
+          </Card>
           <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Register Cert</div><Sel label="Cert"><option value="">Select...</option><optgroup label="CompTIA"><option>Security+</option><option>CySA+</option></optgroup><optgroup label="ISC2"><option>CISSP</option></optgroup><optgroup label="ISACA"><option>CISA</option></optgroup></Sel><Input label="Code"/><Input label="Earned" type="date"/><Btn primary onClick={()=>logC("CE","Submitted")} style={{marginTop:8}}>Submit</Btn></Card>
         </div>)}
 
@@ -2152,25 +2299,51 @@ export default function AnalystClientApp() {
             ))}
           </Card>
 
-          {/* Current Skill Levels from Assessment Results */}
+          {/* Current Skill Levels from Assessment Results (R3l C12: wired to /api/assessments/analyst/me) */}
           <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Your Skill Levels (from Assessments + On-Shift)</div>
-            {[{skill:"Alert Triage",pct:85,tier:"L1→L2",src:"L1 Assessment + on-shift metrics",gap:false},{skill:"Documentation",pct:91,tier:"L1→L2",src:"L1 Assessment + on-shift quality scores",gap:false},{skill:"Phishing Analysis",pct:78,tier:"L2 ready",src:"L1 Assessment + CyberDefenders",gap:false},{skill:"Log Analysis",pct:70,tier:"L1",src:"L1 Assessment",gap:false},{skill:"SIEM Queries",pct:65,tier:"L1",src:"L1 Assessment",gap:true},{skill:"Investigation",pct:62,tier:"L1",src:"HTB + TryHackMe (L2 assessment pending)",gap:true},{skill:"Escalation Judgment",pct:55,tier:"L1",src:"SANS GCIH (enrolled)",gap:true},{skill:"Threat Hunting",pct:28,tier:"L2 prep",src:"CyberDefenders",gap:true},{skill:"Malware Analysis",pct:15,tier:"L2 prep",src:"Not yet assessed",gap:true}].map((s,i)=>(
-              <div key={i} style={{padding:"10px 0",borderBottom:i<8?`1px solid ${C.b}`:"none"}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-                  <span style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{s.skill}</span>
-                  <div style={{display:"flex",gap:6}}>
-                    <Badge color={s.pct>=80?C.a:s.pct>=60?C.w:C.tm}>{s.pct}%</Badge>
-                    <Badge color={C.p}>{s.tier}</Badge>
-                    {s.gap&&<Badge color={C.d}>gap</Badge>}
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Your Skill Levels (from Assessments)</div>
+            {!skillResultsLoadState.loaded && !skillResultsLoadState.error && (
+              <M style={{color:C.tm,fontStyle:"italic"}}>Loading skill results…</M>
+            )}
+            {skillResultsLoadState.error && (
+              <M style={{color:C.w}}>Could not load skill results: {skillResultsLoadState.error}</M>
+            )}
+            {(()=>{
+              if (!skillResultsLoadState.loaded) return null;
+              const latestBySkill = {};
+              for (const r of skillResults.results) {
+                if (!latestBySkill[r.skill_id] || r.completed_at > latestBySkill[r.skill_id].completed_at) {
+                  latestBySkill[r.skill_id] = r;
+                }
+              }
+              const skillLevels = Object.values(latestBySkill)
+                .map((r)=>({
+                  skillId: r.skill_id,
+                  skill: r.skill_name,
+                  pct: r.score,
+                  gap: r.score < skillResults.gapThreshold,
+                  src: r.assessment_name || "Assessment",
+                }))
+                .sort((a,b)=>b.pct-a.pct);
+              if (skillLevels.length === 0) {
+                return <M style={{color:C.tm,fontStyle:"italic"}}>No assessment results yet — complete assignments to populate your skill baseline.</M>;
+              }
+              return skillLevels.map((s,i)=>(
+                <div key={s.skillId} style={{padding:"10px 0",borderBottom:i<skillLevels.length-1?`1px solid ${C.b}`:"none"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                    <span style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{s.skill}</span>
+                    <div style={{display:"flex",gap:6}}>
+                      <Badge color={s.pct>=80?C.a:s.pct>=60?C.w:C.tm}>{s.pct}%</Badge>
+                      {s.gap&&<Badge color={C.d}>gap</Badge>}
+                    </div>
                   </div>
+                  <div style={{height:4,background:"rgba(255,255,255,0.04)",borderRadius:2,overflow:"hidden",marginBottom:4}}>
+                    <div style={{width:`${s.pct}%`,height:"100%",background:s.pct>=80?C.a:s.pct>=60?C.w:s.pct>=40?"#F97316":C.d,borderRadius:2,transition:"width 0.5s ease"}}/>
+                  </div>
+                  <M style={{color:C.td}}>Source: {s.src}</M>
                 </div>
-                <div style={{height:4,background:"rgba(255,255,255,0.04)",borderRadius:2,overflow:"hidden",marginBottom:4}}>
-                  <div style={{width:`${s.pct}%`,height:"100%",background:s.pct>=80?C.a:s.pct>=60?C.w:s.pct>=40?"#F97316":C.d,borderRadius:2,transition:"width 0.5s ease"}}/>
-                </div>
-                <M style={{color:C.td}}>Source: {s.src}</M>
-              </div>
-            ))}
+              ));
+            })()}
           </Card>
 
           {/* Gap-Driven Training Recommendations */}
@@ -2391,6 +2564,35 @@ export default function AnalystClientApp() {
                 <M style={{color:C.tm}}>{e.dt}</M>
               </div>
             ))}
+          </Card>
+          {/* R3l C35: Forensic Export Transparency — read-only informational card.
+              Analysts do not have role permission on /api/forensic-exports endpoints
+              (those gate to admin / ciso). This card explains what server-side
+              forensic exports are, how the analyst's data may be included, and what
+              cryptographic + procedural safeguards apply. No API calls, no leaked
+              operational data — just transparency. */}
+          <Card style={{marginTop:12,borderColor:C.i+"40"}}>
+            <div style={{fontSize:12,fontWeight:500,color:C.i,marginBottom:8}}>SOC-Grade Forensic Export Transparency</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Your Team Lead (admin role) and CISO can create cryptographically-signed forensic exports of platform audit data for compliance, incident response, or regulator requests. Your pseudonymized events may be included in these exports. You do not initiate or download forensic exports from this client — they are an admin/CISO workflow on the management console.</M>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+              <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
+                <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Pseudonymized</M>
+                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Events in exports carry your analyst pseudonym (e.g., &quot;Analyst-Falcon&quot;), not your real name. The pseudonym map exists only in an offline-stored encrypted file your Team Lead controls.</M>
+              </div>
+              <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
+                <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Tamper-Evident</M>
+                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Every export is Ed25519-signed and recorded in an append-only chain. Modifying or deleting an export entry after the fact would break the chain&apos;s hash continuity — the tampering would be visible to any reviewer.</M>
+              </div>
+              <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
+                <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Separate Actors</M>
+                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Creating an export and deleting an export require two different people (admin creates, CISO deletes). Per ISO 27001 A.9.4.5 separation-of-duties — no single user can both produce and erase forensic evidence.</M>
+              </div>
+              <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
+                <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Rationale Logged</M>
+                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Every export records a free-text rationale (incident ID, audit ticket, regulator request) in the audit log alongside the export entry. Your CISO and compliance officer can review the rationale for any export at any time.</M>
+              </div>
+            </div>
+            <M style={{color:C.td,display:"block",fontStyle:"italic",fontSize:10,lineHeight:1.5}}>If you have concerns about how your data is being used, speak with your Team Lead or CISO. The forensic export chain is fully auditable by your organization&apos;s compliance officer — they can inspect the chain entries, verify the Ed25519 signatures, and review the rationale for every export without needing access to the export contents themselves.</M>
           </Card>
           <div style={{display:"flex",gap:8,marginTop:12}}>
             <Btn primary onClick={()=>{const data=JSON.stringify({exportType:"analyst_client_audit",version:appVersion||"unknown",clientPseudonym:"Analyst-Falcon",exportedAt:new Date().toISOString(),logIntegrity,eventCount:auditLog.length,events:auditLog},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="analyst-audit-"+new Date().toISOString().slice(0,10)+".json";a.click();logC("AUDIT_EXPORTED","Audit log downloaded — also auto-sent to MC");}}>Download Audit Log</Btn>

@@ -8,6 +8,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
+const fs = require('fs');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -20,6 +21,9 @@ const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
 const cloudIacBundle = require('./services/cloud-iac-bundle');
 const cicdBundle = require('./services/cicd-bundle');
+const forensicExport = require('./services/forensic-export');
+const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
+const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 
 const app = express();
 const PORT = process.env.GD_PORT || 4001;
@@ -3888,6 +3892,291 @@ app.get('/api/leaderboard/mc/:id',
   } catch (err) {
     console.error('Per-MC leaderboard read error:', err);
     res.status(500).json({ error: 'Failed to load per-MC leaderboard' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORENSIC EXPORT ROUTES (R3l C32)
+//
+// GD-side HTTP surface for the forensic export orchestrator (C31b).
+// Mirrors MC C29a with these GD-specific adaptations:
+//
+//   - vp creates / ciso deletes (separate-actor invariant); MC was admin/ciso
+//   - inline audit_log INSERT with severity column (GD has no auditLog helper)
+//   - require ./services/gd-encryption (GD's own Tier-1 KEK; not MC's encryption)
+//   - inlined into index.js to match GD's existing routes convention (no
+//     routes/ subdirectory pattern on the GD-server)
+//
+// Six endpoints:
+//
+//   POST   /api/forensic-exports                create + run the export
+//   GET    /api/forensic-exports                list 100 most recent rows
+//   GET    /api/forensic-exports/:id/download   stream the tar.gz archive
+//   GET    /api/forensic-exports/:id/manifest   stream the manifest.json
+//   DELETE /api/forensic-exports/:id            separate-actor delete
+//   GET    /api/forensic-exports/chain          chain inspection for verifiers
+//
+// Per-handler role gates inside each handler (rather than at mount time) since
+// GD applies authMiddleware per-route by convention. The chosen role for each
+// endpoint is documented inline with the route declaration.
+
+function auditLogForensic(userId, eventType, detail, ip, severity) {
+  let db;
+  try {
+    db = getDb();
+    db.prepare(
+      "INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, ?, ?, ?, ?)"
+    ).run(userId || 'anonymous', eventType, detail || '', ip || null, severity || 'info');
+  } catch (e) {
+    // Silent — audit failures must not crash handlers (matches the request-
+    // logging middleware pattern at the top of this file).
+  } finally {
+    if (db) try { db.close(); } catch (_e) { /* ignore */ }
+  }
+}
+
+function appendForensicChainEntry(db, opts) {
+  // Mirrors the C32 GD-side helper for chain entries written from the route
+  // layer (POST goes through the orchestrator which appends EXPORT_CREATED
+  // internally; download and delete append from here).
+  const { exportId, actorUserId, eventType } = opts;
+  const keyRow = db
+    .prepare(
+      'SELECT id, public_key, private_key_encrypted, fingerprint FROM forensic_export_chain_signing_keys WHERE active = 1 LIMIT 1'
+    )
+    .get();
+  if (!keyRow) throw new Error('No active forensic export signing key found');
+  const { pem } = decryptForensicConfig(keyRow.private_key_encrypted);
+  const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
+
+  const prevRow = db
+    .prepare('SELECT this_hash FROM forensic_export_chain ORDER BY id DESC LIMIT 1')
+    .get();
+  const prevHash = prevRow ? prevRow.this_hash : null;
+
+  const payload = {
+    event_type: eventType,
+    export_ref: exportId,
+    actor_user_id: actorUserId,
+    timestamp: new Date().toISOString(),
+  };
+  const payloadBytes = canonicalSerialize(payload);
+  const linkInput = prevHash
+    ? Buffer.concat([Buffer.from(prevHash, 'hex'), payloadBytes])
+    : payloadBytes;
+  const thisHash = crypto.createHash('sha256').update(linkInput).digest('hex');
+  const signature = crypto.sign(null, Buffer.from(thisHash, 'hex'), privateKey).toString('hex');
+
+  db.prepare(
+    'INSERT INTO forensic_export_chain (prev_hash, this_hash, signature, event_type, export_ref, actor_user_id) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(prevHash, thisHash, signature, eventType, exportId, actorUserId);
+
+  return { prevHash, thisHash, signature };
+}
+
+// ── POST /api/forensic-exports — create + run ─────────────────────────────
+// VP only (creator role for the separate-actor pair)
+
+app.post('/api/forensic-exports', authMiddleware(['vp']), (req, res) => {
+  const {
+    rationale,
+    timeWindowStart, timeWindowEnd,
+    eventTypeFilter,
+    outputFormats,
+    includeAuditLog, includeBackupChain, includeIncidentRecords,
+    includeAuthenticationLogs, includeUserAccessLogs,
+  } = req.body || {};
+
+  if (!Array.isArray(outputFormats) || outputFormats.length === 0) {
+    return res.status(400).json({ error: 'outputFormats (non-empty array) required' });
+  }
+
+  try {
+    const db = getDb();
+    const result = forensicExport.createForensicExport(db, {
+      requestedByUserId: req.user.id,
+      rationale: rationale || null,
+      timeWindowStart: timeWindowStart || null,
+      timeWindowEnd: timeWindowEnd || null,
+      eventTypeFilter: eventTypeFilter || null,
+      outputFormats,
+      includeAuditLog: includeAuditLog !== false,
+      includeBackupChain: includeBackupChain !== false,
+      includeIncidentRecords: includeIncidentRecords !== false,
+      includeAuthenticationLogs: includeAuthenticationLogs !== false,
+      includeUserAccessLogs: includeUserAccessLogs !== false,
+    });
+    auditLogForensic(
+      req.user.id, 'FORENSIC_EXPORT_CREATED',
+      'id=' + result.id + ' formats=' + outputFormats.join(',') +
+      ' size=' + result.sizeBytes + ' sha256=' + (result.archiveSha256 || '').slice(0, 16),
+      req.ip, 'info'
+    );
+    res.json(result);
+  } catch (err) {
+    console.error('forensic export creation failed:', err.message);
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_FAILED',
+      'error=' + (err.message || '').slice(0, 200), req.ip, 'error');
+    if (/format not registered/i.test(err.message)) return res.status(400).json({ error: err.message });
+    if (/at least one output format required|requestedByUserId required/i.test(err.message)) {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Forensic export creation failed', message: err.message });
+  }
+});
+
+// ── GET /api/forensic-exports — list 100 most recent ──────────────────────
+// VP or CISO (non-destructive read)
+
+app.get('/api/forensic-exports', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, requested_by_user_id, requested_at, rationale,' +
+      ' time_window_start, time_window_end, event_type_filter, output_formats,' +
+      ' status, archive_sha256, size_bytes, completed_at, error_message,' +
+      ' manifest_signing_key_fingerprint, cosign_signature_path,' +
+      ' downloaded_at, downloaded_by_user_id' +
+      ' FROM forensic_exports ORDER BY requested_at DESC LIMIT 100'
+    ).all();
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_LISTED', 'count=' + rows.length, req.ip, 'info');
+    res.json({ exports: rows });
+  } catch (err) {
+    console.error('forensic export list failed:', err.message);
+    res.status(500).json({ error: 'list failed', message: err.message });
+  }
+});
+
+// ── GET /api/forensic-exports/chain — chain inspection ────────────────────
+// VP or CISO (non-destructive read). Declared BEFORE /:id routes to avoid
+// any future ambiguity, though path-segment-count mismatch already prevents
+// shadowing (/chain is 1 segment; /:id/download is 2).
+
+app.get('/api/forensic-exports/chain', authMiddleware(['vp', 'ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, prev_hash, this_hash, signature, event_type, export_ref,' +
+      ' actor_user_id, created_at FROM forensic_export_chain' +
+      ' ORDER BY id DESC LIMIT 1000'
+    ).all();
+    const keyRow = db.prepare(
+      'SELECT id, public_key, fingerprint FROM forensic_export_chain_signing_keys WHERE active = 1 LIMIT 1'
+    ).get();
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_CHAIN_VIEWED', 'count=' + rows.length, req.ip, 'info');
+    res.json({
+      chain: rows,
+      active_signing_key: keyRow ? {
+        id: keyRow.id,
+        public_key_pem: keyRow.public_key,
+        fingerprint: keyRow.fingerprint,
+      } : null,
+    });
+  } catch (err) {
+    console.error('forensic export chain inspection failed:', err.message);
+    res.status(500).json({ error: 'chain inspection failed', message: err.message });
+  }
+});
+
+// ── GET /api/forensic-exports/:id/download — stream tar.gz ────────────────
+// VP only (initiator can retrieve; ciso reads chain/manifest for verification
+// instead of downloading the archive)
+
+app.get('/api/forensic-exports/:id/download', authMiddleware(['vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, archive_path, requested_by_user_id, status FROM forensic_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) {
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DOWNLOAD_DENIED',
+        'id=' + req.params.id + ' reason=not_found', req.ip, 'warning');
+      return res.status(404).json({ error: 'forensic export not found' });
+    }
+    if (row.status !== 'complete') {
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DOWNLOAD_DENIED',
+        'id=' + req.params.id + ' reason=status_' + row.status, req.ip, 'warning');
+      return res.status(409).json({ error: 'export not complete', status: row.status });
+    }
+    if (!row.archive_path || !fs.existsSync(row.archive_path)) {
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DOWNLOAD_DENIED',
+        'id=' + req.params.id + ' reason=archive_missing', req.ip, 'warning');
+      return res.status(410).json({ error: 'archive no longer on disk' });
+    }
+    appendForensicChainEntry(db, {
+      exportId: row.id, actorUserId: req.user.id, eventType: 'EXPORT_DOWNLOADED',
+    });
+    db.prepare(
+      "UPDATE forensic_exports SET downloaded_at = datetime('now'), downloaded_by_user_id = ? WHERE id = ?"
+    ).run(req.user.id, row.id);
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DOWNLOADED', 'id=' + row.id, req.ip, 'info');
+    const downloadName = 'firealive-forensic-' + row.id + '.tar.gz';
+    res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
+    res.setHeader('Content-Type', 'application/gzip');
+    fs.createReadStream(row.archive_path).pipe(res);
+  } catch (err) {
+    console.error('forensic export download failed:', err.message);
+    res.status(500).json({ error: 'download failed', message: err.message });
+  }
+});
+
+// ── GET /api/forensic-exports/:id/manifest — fetch manifest JSON ──────────
+// VP only
+
+app.get('/api/forensic-exports/:id/manifest', authMiddleware(['vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, manifest_path, status FROM forensic_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'forensic export not found' });
+    if (row.status !== 'complete') return res.status(409).json({ error: 'export not complete', status: row.status });
+    if (!row.manifest_path || !fs.existsSync(row.manifest_path)) {
+      return res.status(410).json({ error: 'manifest no longer on disk' });
+    }
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_MANIFEST_READ', 'id=' + row.id, req.ip, 'info');
+    res.setHeader('Content-Type', 'application/json');
+    fs.createReadStream(row.manifest_path).pipe(res);
+  } catch (err) {
+    console.error('forensic export manifest fetch failed:', err.message);
+    res.status(500).json({ error: 'manifest fetch failed', message: err.message });
+  }
+});
+
+// ── DELETE /api/forensic-exports/:id — separate-actor delete ──────────────
+// CISO only (must be a different user than the requesting vp)
+
+app.delete('/api/forensic-exports/:id', authMiddleware(['ciso']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT id, requested_by_user_id, archive_path, manifest_path, manifest_sig_path FROM forensic_exports WHERE id = ?'
+    ).get(req.params.id);
+    if (!row) {
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DELETE_DENIED',
+        'id=' + req.params.id + ' reason=not_found', req.ip, 'warning');
+      return res.status(404).json({ error: 'forensic export not found' });
+    }
+    if (row.requested_by_user_id === req.user.id) {
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DELETE_DENIED',
+        'id=' + row.id + ' reason=same_actor', req.ip, 'warning');
+      return res.status(403).json({
+        error: 'separate-actor violation: the actor performing DELETE must be a different person from the requesting vp',
+      });
+    }
+    appendForensicChainEntry(db, {
+      exportId: row.id, actorUserId: req.user.id, eventType: 'EXPORT_DELETED',
+    });
+    for (const p of [row.archive_path, row.manifest_path, row.manifest_sig_path]) {
+      if (p) try { fs.unlinkSync(p); } catch (_e) { /* ignore */ }
+    }
+    db.prepare('DELETE FROM forensic_exports WHERE id = ?').run(row.id);
+    auditLogForensic(req.user.id, 'FORENSIC_EXPORT_DELETED',
+      'id=' + row.id + ' creator=' + row.requested_by_user_id, req.ip, 'info');
+    res.json({ deleted: true, id: row.id });
+  } catch (err) {
+    console.error('forensic export delete failed:', err.message);
+    res.status(500).json({ error: 'delete failed', message: err.message });
   }
 });
 

@@ -455,6 +455,94 @@ CREATE TABLE IF NOT EXISTS system_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- ── Forensic Export (R3l C30 — GD parity of MC C20) ────────────────────────
+--
+-- GD-side forensic export tables. Mirrors the MC schema verbatim so a CISO
+-- operating the GD console can produce SOC-grade forensic export bundles
+-- from the GD's own audit_log and other slice sources. The export bundle
+-- is signed with Ed25519 (and optionally Cosign), with archive SHA-256
+-- captured.
+--
+-- The forensic_export_chain is an append-only hash chain of every operation
+-- against an export (CREATE, COMPLETE, DOWNLOAD, DELETE, VERIFY). Triggers
+-- enforce append-only at the engine level — UPDATE and DELETE both throw.
+-- DELETE on a forensic_export row requires a separate actor from the
+-- requester (enforced at the route layer in C32; the chain records who
+-- acted). On GD, the natural separate-actor mapping is vp (creator) vs
+-- ciso (deletor), but the schema is role-agnostic — the route layer
+-- enforces the role policy.
+--
+-- forensic_export_chain_signing_keys stores Ed25519 keypairs used to sign
+-- chain entries. private_key_encrypted is encrypted at rest (Tier-1 KMS).
+
+CREATE TABLE IF NOT EXISTS forensic_exports (
+  id TEXT PRIMARY KEY,
+  requested_by_user_id TEXT NOT NULL REFERENCES users(id),
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rationale TEXT,
+  time_window_start TEXT,
+  time_window_end TEXT,
+  event_type_filter TEXT,
+  output_formats TEXT NOT NULL,
+  include_audit_log INTEGER DEFAULT 1,
+  include_backup_chain INTEGER DEFAULT 1,
+  include_incident_records INTEGER DEFAULT 1,
+  include_authentication_logs INTEGER DEFAULT 1,
+  include_user_access_logs INTEGER DEFAULT 1,
+  manifest_path TEXT,
+  archive_path TEXT,
+  manifest_sig_path TEXT,
+  manifest_signing_key_id TEXT,
+  manifest_signing_key_fingerprint TEXT,
+  cosign_signature_path TEXT,
+  archive_sha256 TEXT,
+  size_bytes INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_progress','complete','failed')),
+  error_message TEXT,
+  completed_at TEXT,
+  downloaded_at TEXT,
+  downloaded_by_user_id TEXT REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_requested_by ON forensic_exports(requested_by_user_id);
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_status ON forensic_exports(status);
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_requested_at ON forensic_exports(requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS forensic_export_chain (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('EXPORT_CREATED','EXPORT_COMPLETED','EXPORT_DOWNLOADED','EXPORT_DELETED','CHAIN_VERIFIED')),
+  export_ref TEXT NOT NULL REFERENCES forensic_exports(id),
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_export_ref ON forensic_export_chain(export_ref);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_created_at ON forensic_export_chain(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_event_type ON forensic_export_chain(event_type);
+
+CREATE TRIGGER IF NOT EXISTS forensic_export_chain_no_update
+  BEFORE UPDATE ON forensic_export_chain
+  BEGIN SELECT RAISE(ABORT, 'forensic_export_chain is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS forensic_export_chain_no_delete
+  BEFORE DELETE ON forensic_export_chain
+  BEGIN SELECT RAISE(ABORT, 'forensic_export_chain is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS forensic_export_chain_signing_keys (
+  id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_signing_keys_active ON forensic_export_chain_signing_keys(active) WHERE active = 1;
 `;
 
 function getDb() {

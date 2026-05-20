@@ -204,6 +204,20 @@ The actual assessment module is hosted on an external platform — HackTheBox, T
 3. Picks the analyst, enters cert details, uploads scanned copy
 4. Cert is recorded against that analyst's profile
 
+### Training Reviews
+**What it's for:** Lead-side queue for verifying or rejecting training completions that analysts have self-submitted through the Submit Completion form in their AC. Each row shows the analyst, the platform and module URL they submitted, the timestamp, and the current status. The lead validates that the analyst genuinely completed the training and either credits it (verify) or marks it not credited (reject). Pre-existing certificate uploads with file proof go through the Certifications tab instead — Training Reviews is specifically for lightweight URL-based completion claims tied to modules surfaced by the gap-driven recommender.
+
+**Workflow:**
+1. Analyst finishes a training module recommended by FireAlive (or any other module they want to log)
+2. Analyst opens their AC's Training tab and uses the Submit Completion form: platform name, module URL, optional completion date, optional score
+3. Submission lands in the pending queue with `status = "pending"`
+4. Lead opens Training Reviews tab in MC; navGroup badge shows the pending count
+5. Lead filters by Pending (default), Verified, Rejected, or All
+6. For each pending row, lead clicks Verify (credits the completion to the analyst's skill record) or Reject (marks it not credited)
+7. Verified and rejected rows are terminal — to reverse, the analyst must resubmit, which creates a new pending row preserving the original audit trail
+
+**State machine and audit:** The server enforces only `pending → verified` and `pending → rejected` transitions; anything else is rejected with 409. Every list view emits a `TRAINING_COMPLETIONS_REVIEW_VIEWED` audit event; every transition emits `TRAINING_COMPLETION_VERIFIED` or `TRAINING_COMPLETION_REJECTED` with the completion ID and the acting user's ID. See `docs/training-library.md` for the full schema, seed catalog provenance rules, and the recommender flow.
+
 ### CISM Retro (Incident Retrospectives)
 **What it's for:** Structured post-incident support based on Critical Incident Stress Management research. After major incidents — ransomware, breaches, active intrusions — analysts experience acute stress comparable to emergency services responders. This module activates a recovery protocol: lighter queues for affected analysts, peer support availability, automated follow-up check-ins at 24hr / 72hr / 2 weeks.
 

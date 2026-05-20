@@ -191,6 +191,147 @@ CREATE TABLE IF NOT EXISTS assessment_results (
   completed_at TEXT DEFAULT (datetime('now'))
 );
 
+-- ── Curated Training Library (R3l) ───────────────────────────────────────
+-- ANALYST EDUCATION PIPELINE — curated, read-only at runtime
+--
+-- These tables hold the curated training library that drives the AC's
+-- Training tab + the canonical /api/training-recommendations/me endpoint.
+-- The library is seeded at install time from data/training-modules-seed.json
+-- via server/db/seed-training-library.js. The tables are READ-ONLY at
+-- runtime:
+--   • No POST/PUT/DELETE API endpoints write to these tables.
+--   • The seed loader at boot is the only writer.
+--   • New training modules ship via canonical FireAlive version upgrades
+--     (PR review of the seed file by upstream maintainers, who verify each
+--     URL's legitimacy against the target platform's official course
+--     catalog before merge).
+--   • Organizations needing internal/org-specific training URLs fork the
+--     AGPL-3.0 repository and customize their fork's seed file.
+--
+-- The URL legitimacy CHECK constraint on training_modules.url is
+-- defense-in-depth, NOT the primary control. The primary control is
+-- "no write paths exist." See docs/training-library.md (R3l C18) for
+-- the full design rationale.
+
+CREATE TABLE IF NOT EXISTS training_platforms (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  domain_pattern TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS training_modules (
+  id TEXT PRIMARY KEY,
+  platform_id TEXT NOT NULL REFERENCES training_platforms(id),
+  skill_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  url TEXT NOT NULL,
+  difficulty TEXT CHECK (difficulty IN ('beginner', 'intermediate', 'advanced', 'expert')),
+  free_or_paid TEXT CHECK (free_or_paid IN ('free', 'paid', 'subscription', 'enterprise')),
+  estimated_hours INTEGER,
+  description TEXT,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CONSTRAINT url_legitimacy CHECK (
+    url LIKE 'https://tryhackme.com/%'
+    OR url LIKE 'https://academy.hackthebox.com/%'
+    OR url LIKE 'https://app.letsdefend.io/%'
+    OR url LIKE 'https://cyberdefenders.org/%'
+    OR url LIKE 'https://www.sans.org/cyber-security-courses/%'
+    OR url LIKE 'https://www.immersivelabs.com/%'
+    OR url LIKE '/training/internal/%'
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_modules_skill ON training_modules(skill_id) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_training_modules_platform ON training_modules(platform_id);
+
+-- ── R3l Workstream 2a: Forensic Export ──────────────────────────────────
+--
+-- SOC-grade forensic export package generator. Operators (admin role) request
+-- a time-windowed export of platform audit records across multiple structured
+-- forensic formats (Sleuth Kit bodyfile, JSON Lines, plaso L2T CSV, CEF, EVTX,
+-- STIX 2.1, DFXML, CSV). Each export produces a tar.gz archive plus a manifest
+-- signed with Ed25519 (and optionally Cosign), with archive SHA-256 captured.
+--
+-- The forensic_export_chain is an append-only hash chain of every operation
+-- against an export (CREATE, COMPLETE, DOWNLOAD, DELETE, VERIFY). Triggers
+-- enforce append-only at the engine level — UPDATE and DELETE both throw.
+-- DELETE on a forensic_export row requires the ciso role (separate-actor
+-- enforcement is checked at the route layer; the chain records who acted).
+--
+-- forensic_export_chain_signing_keys stores Ed25519 keypairs used to sign
+-- chain entries. private_key_encrypted is encrypted at rest (Tier-1 KMS).
+
+CREATE TABLE IF NOT EXISTS forensic_exports (
+  id TEXT PRIMARY KEY,
+  requested_by_user_id TEXT NOT NULL REFERENCES users(id),
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rationale TEXT,
+  time_window_start TEXT,
+  time_window_end TEXT,
+  event_type_filter TEXT,
+  output_formats TEXT NOT NULL,
+  include_audit_log INTEGER DEFAULT 1,
+  include_backup_chain INTEGER DEFAULT 1,
+  include_incident_records INTEGER DEFAULT 1,
+  include_authentication_logs INTEGER DEFAULT 1,
+  include_user_access_logs INTEGER DEFAULT 1,
+  manifest_path TEXT,
+  archive_path TEXT,
+  manifest_sig_path TEXT,
+  manifest_signing_key_id TEXT,
+  manifest_signing_key_fingerprint TEXT,
+  cosign_signature_path TEXT,
+  archive_sha256 TEXT,
+  size_bytes INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_progress','complete','failed')),
+  error_message TEXT,
+  completed_at TEXT,
+  downloaded_at TEXT,
+  downloaded_by_user_id TEXT REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_requested_by ON forensic_exports(requested_by_user_id);
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_status ON forensic_exports(status);
+CREATE INDEX IF NOT EXISTS idx_forensic_exports_requested_at ON forensic_exports(requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS forensic_export_chain (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('EXPORT_CREATED','EXPORT_COMPLETED','EXPORT_DOWNLOADED','EXPORT_DELETED','CHAIN_VERIFIED')),
+  export_ref TEXT NOT NULL REFERENCES forensic_exports(id),
+  actor_user_id TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_export_ref ON forensic_export_chain(export_ref);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_created_at ON forensic_export_chain(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_event_type ON forensic_export_chain(event_type);
+
+CREATE TRIGGER IF NOT EXISTS forensic_export_chain_no_update
+  BEFORE UPDATE ON forensic_export_chain
+  BEGIN SELECT RAISE(ABORT, 'forensic_export_chain is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS forensic_export_chain_no_delete
+  BEFORE DELETE ON forensic_export_chain
+  BEGIN SELECT RAISE(ABORT, 'forensic_export_chain is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS forensic_export_chain_signing_keys (
+  id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_signing_keys_active ON forensic_export_chain_signing_keys(active) WHERE active = 1;
+
 -- ── Custom Recovery Resources ────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS custom_resources (
@@ -4688,6 +4829,7 @@ function initDb() {
   }
 
   console.log('Database initialized at', DB_PATH);
+  require('./seed-training-library').seedTrainingLibrary(db);
   db.close();
 }
 

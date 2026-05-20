@@ -9,7 +9,8 @@
 
 const router = require('express').Router();
 const os = require('os');
-const { getDb } = require('../db/init');
+const fs = require('fs');
+const { getDb, DB_PATH } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 
@@ -58,6 +59,27 @@ router.get('/version', (req, res) => {
 
     db.close();
 
+    // R3l C8: CPU load and DB size observability.
+    // os.loadavg() returns [1min, 5min, 15min] run-queue averages. Normalising
+    // by core count yields a per-core utilisation figure; capped at 100% so
+    // bursty loads above 1.0/core don't render as misleadingly high values.
+    // os.loadavg() returns [0, 0, 0] on Windows; cpu metrics will read 0 there
+    // which is intentional (the field is documented as advisory, not exact).
+    const loadAvg = os.loadavg();
+    const cpuCores = os.cpus().length || 1;
+    const cpuPercent = (n) => Math.min(100, Math.max(0, Math.round((n / cpuCores) * 100)));
+
+    // DB size — fs.statSync on the SQLite file. If WAL mode is active there is
+    // also a -wal companion file; we report just the main file for stability of
+    // the metric across checkpoints. Failures (missing path, permission) return
+    // null rather than crashing the version endpoint.
+    let dbSizeBytes = null;
+    try {
+      dbSizeBytes = fs.statSync(DB_PATH).size;
+    } catch (statErr) {
+      logger.warn('Version endpoint could not stat DB file', { path: DB_PATH, error: statErr.message });
+    }
+
     res.json({
       version: APP_VERSION,
       buildId: BUILD_ID,
@@ -79,6 +101,20 @@ router.get('/version', (req, res) => {
           rss: Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB',
           heap: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
         },
+        cpu: {
+          cores: cpuCores,
+          loadAvg1m: loadAvg[0],
+          loadAvg5m: loadAvg[1],
+          loadAvg15m: loadAvg[2],
+          percent1m: cpuPercent(loadAvg[0]),
+          percent5m: cpuPercent(loadAvg[1]),
+          percent15m: cpuPercent(loadAvg[2]),
+        },
+      },
+      database: {
+        path: DB_PATH,
+        sizeBytes: dbSizeBytes,
+        sizeMB: dbSizeBytes === null ? null : Math.round((dbSizeBytes / 1024 / 1024) * 100) / 100,
       },
     });
   } catch (err) {

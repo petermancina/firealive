@@ -430,6 +430,31 @@ export default function GlobalDashboard() {
   // Audit list (separate from gdAudit which holds local-display events)
   const [auditList, setAuditList] = useState([]);
   const [auditLoading, setAuditLoading] = useState(false);
+  // R3l C34: Forensic Export — vp creates, ciso (separate-actor) deletes.
+  // Server returns 403 to non-vp POST and to non-ciso or same-actor DELETE.
+  const [forensicForm, setForensicForm] = useState({
+    rationale: '',
+    timeWindowStart: '',
+    timeWindowEnd: '',
+    eventTypeFilter: '',
+    outputFormats: ['json-lines', 'csv'],
+    includeAuditLog: true,
+    includeBackupChain: true,
+    includeIncidentRecords: true,
+    includeAuthenticationLogs: true,
+    includeUserAccessLogs: true,
+  });
+  const [forensicCreateInFlight, setForensicCreateInFlight] = useState(false);
+  const [forensicCreateError, setForensicCreateError] = useState(null);
+  const [forensicCreateResult, setForensicCreateResult] = useState(null);
+  const [forensicExports, setForensicExports] = useState([]);
+  const [forensicLoadState, setForensicLoadState] = useState({ loaded: false, error: null });
+  const [forensicChain, setForensicChain] = useState(null);
+  const [forensicChainOpen, setForensicChainOpen] = useState(false);
+  const [forensicManifest, setForensicManifest] = useState(null);
+  const [forensicManifestOpen, setForensicManifestOpen] = useState(false);
+  const [forensicDeleteInFlight, setForensicDeleteInFlight] = useState({});
+  const [forensicDeleteError, setForensicDeleteError] = useState(null);
   // Compromise scan + regression test results
   const [compromiseResult, setCompromiseResult] = useState(null);
   const [compromiseRunning, setCompromiseRunning] = useState(false);
@@ -765,6 +790,114 @@ export default function GlobalDashboard() {
     }).finally(() => setAuditLoading(false));
   }, [stage, tab]);
 
+  // R3l C34: Tab-gated forensic-export list fetch.
+  useEffect(() => {
+    if (stage !== "app" || tab !== "forensic_exports") return;
+    let cancelled = false;
+    api.get('/api/forensic-exports').then((r) => {
+      if (cancelled) return;
+      if (!r || r.error) {
+        setForensicLoadState({ loaded: false, error: (r && r.error) || 'request_failed' });
+        return;
+      }
+      setForensicExports(Array.isArray(r.exports) ? r.exports : []);
+      setForensicLoadState({ loaded: true, error: null });
+    }).catch((e) => {
+      if (cancelled) return;
+      setForensicLoadState({ loaded: false, error: (e && e.message) || 'request_failed' });
+    });
+    return () => { cancelled = true; };
+  }, [stage, tab]);
+
+  const ALL_FORENSIC_FORMATS = [
+    'sleuth-kit-bodyfile', 'json-lines', 'plaso-l2t-csv',
+    'cef', 'evtx-xml', 'stix-21', 'dfxml', 'csv',
+  ];
+  const toggleForensicFormat = (fmt) => {
+    setForensicForm((prev) => {
+      const has = prev.outputFormats.includes(fmt);
+      return { ...prev, outputFormats: has ? prev.outputFormats.filter((f) => f !== fmt) : [...prev.outputFormats, fmt] };
+    });
+  };
+  const submitForensicExport = async () => {
+    if (forensicCreateInFlight) return;
+    if (!forensicForm.outputFormats || forensicForm.outputFormats.length === 0) {
+      setForensicCreateError('Select at least one output format');
+      return;
+    }
+    setForensicCreateInFlight(true);
+    setForensicCreateError(null);
+    setForensicCreateResult(null);
+    try {
+      const body = {
+        rationale: forensicForm.rationale || null,
+        timeWindowStart: forensicForm.timeWindowStart || null,
+        timeWindowEnd: forensicForm.timeWindowEnd || null,
+        eventTypeFilter: forensicForm.eventTypeFilter || null,
+        outputFormats: forensicForm.outputFormats,
+        includeAuditLog: forensicForm.includeAuditLog,
+        includeBackupChain: forensicForm.includeBackupChain,
+        includeIncidentRecords: forensicForm.includeIncidentRecords,
+        includeAuthenticationLogs: forensicForm.includeAuthenticationLogs,
+        includeUserAccessLogs: forensicForm.includeUserAccessLogs,
+      };
+      const r = await api.post('/api/forensic-exports', body);
+      if (!r || r.error) {
+        setForensicCreateError((r && r.error) || 'request_failed');
+      } else {
+        setForensicCreateResult(r);
+        const refresh = await api.get('/api/forensic-exports');
+        if (refresh && !refresh.error && Array.isArray(refresh.exports)) {
+          setForensicExports(refresh.exports);
+        }
+      }
+    } catch (e) {
+      setForensicCreateError((e && e.message) || 'request_failed');
+    } finally {
+      setForensicCreateInFlight(false);
+    }
+  };
+  const downloadForensicArchive = async (id) => {
+    await api.download('/api/forensic-exports/' + encodeURIComponent(id) + '/download', 'firealive-gd-forensic-' + id + '.tar.gz');
+  };
+  const viewForensicManifest = async (id) => {
+    setForensicManifest(null);
+    setForensicManifestOpen(true);
+    const r = await api.get('/api/forensic-exports/' + encodeURIComponent(id) + '/manifest');
+    setForensicManifest(r);
+  };
+  const viewForensicChain = async () => {
+    setForensicChain(null);
+    setForensicChainOpen(true);
+    const r = await api.get('/api/forensic-exports/chain');
+    setForensicChain(r);
+  };
+  const deleteForensicExport = async (id) => {
+    if (forensicDeleteInFlight[id]) return;
+    if (!window.confirm('Delete forensic export ' + id + '? This is irreversible (the chain entry is preserved). CISO role required and you must NOT be the original VP requester (separate-actor enforcement).')) return;
+    setForensicDeleteInFlight((prev) => ({ ...prev, [id]: true }));
+    setForensicDeleteError(null);
+    try {
+      const r = await api.del('/api/forensic-exports/' + encodeURIComponent(id));
+      if (!r || r.error) {
+        setForensicDeleteError((r && r.error) || 'request_failed');
+      } else {
+        const refresh = await api.get('/api/forensic-exports');
+        if (refresh && !refresh.error && Array.isArray(refresh.exports)) {
+          setForensicExports(refresh.exports);
+        }
+      }
+    } catch (e) {
+      setForensicDeleteError((e && e.message) || 'request_failed');
+    } finally {
+      setForensicDeleteInFlight((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
   // Load region drilldown history whenever drilldownMcId changes.
   useEffect(() => {
     if (stage !== "app" || !drilldownMcId) return;
@@ -1017,7 +1150,7 @@ export default function GlobalDashboard() {
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
     {id:"helper_recognition",label:"Helper Recognition"},
     {id:"troubleshooter",label:"Troubleshooter"},{id:"app_updates",label:"App Updates"},
-    {id:"audit_dash",label:"Audit & Forensics"},
+    {id:"audit_dash",label:"Audit & Forensics"},{id:"forensic_exports",label:"Forensic Exports"},
   ];
 
   // LOGIN
@@ -1623,6 +1756,159 @@ export default function GlobalDashboard() {
                 <Btn small onClick={async()=>{const r=await api.get("/api/audit-logs?limit=10000");const forensics={exportType:"global_dashboard_forensics",version:"0.0.31",exportedAt:new Date().toISOString(),logIntegrity,eventCount:r?.logs?.length||0,events:r?.logs||[],regions};const blob=new Blob([JSON.stringify(forensics,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="gd-forensics.json";a.click();}}>Forensics</Btn>
               </div>
             </Card>
+          </div>)}
+
+          {/* R3l C34: Forensic Export — vp creates / ciso (separate-actor) deletes */}
+          {tab==="forensic_exports"&&(<div>
+            <L>Forensic Export</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>SOC-grade forensic exports of the GD-server's audit data. Each export bundles selected data slices into the chosen forensic formats (8 supported), signs the manifest with Ed25519 from the GD's own Tier-1 KEK, and (optionally) attests with Cosign. The full chain of operations is recorded in the append-only forensic_export_chain.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}><b style={{color:C.t}}>Separate-actor enforcement:</b> exports are created by the VP; deletion requires the CISO role AND a different user than the original requester. The chain entry survives any deletion. This is a stricter workflow than the legacy &quot;Forensics&quot; button on the Audit &amp; Forensics tab, which just dumps the current audit log as JSON.</M>
+
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>New Forensic Export</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+                <div>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window start (ISO 8601, optional)</M>
+                  <input type="text" value={forensicForm.timeWindowStart} onChange={e=>setForensicForm({...forensicForm,timeWindowStart:e.target.value})} placeholder="2026-01-01T00:00:00Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+                </div>
+                <div>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window end (ISO 8601, optional)</M>
+                  <input type="text" value={forensicForm.timeWindowEnd} onChange={e=>setForensicForm({...forensicForm,timeWindowEnd:e.target.value})} placeholder="2026-12-31T23:59:59Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+                </div>
+              </div>
+              <div style={{marginBottom:12}}>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Event type filter (comma-separated, optional)</M>
+                <input type="text" value={forensicForm.eventTypeFilter} onChange={e=>setForensicForm({...forensicForm,eventTypeFilter:e.target.value})} placeholder="LOGIN_FAILED,FORENSIC_EXPORT_CREATED,FORENSIC_EXPORT_DELETED" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
+              </div>
+              <div style={{marginBottom:12}}>
+                <M style={{color:C.tm,display:"block",marginBottom:6}}>Rationale (recorded in audit log; recommended for compliance)</M>
+                <textarea value={forensicForm.rationale} onChange={e=>setForensicForm({...forensicForm,rationale:e.target.value})} placeholder="Reason for this forensic export (incident ID, audit ticket, regulator request…)" rows={2} style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"inherit",resize:"vertical"}}/>
+              </div>
+              <div style={{marginBottom:12}}>
+                <M style={{color:C.tm,display:"block",marginBottom:6}}>Output formats (one file per format inside the archive)</M>
+                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                  {ALL_FORENSIC_FORMATS.map(fmt=>(
+                    <button key={fmt} onClick={()=>toggleForensicFormat(fmt)} style={{padding:"5px 10px",background:forensicForm.outputFormats.includes(fmt)?C.a:"rgba(255,255,255,0.03)",border:`1px solid ${forensicForm.outputFormats.includes(fmt)?C.a:C.b}`,borderRadius:4,color:forensicForm.outputFormats.includes(fmt)?"#000":C.t,fontSize:11,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{fmt}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{marginBottom:12}}>
+                <M style={{color:C.tm,display:"block",marginBottom:6}}>Slices to include</M>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
+                  {[
+                    ["includeAuditLog","Audit log"],
+                    ["includeBackupChain","Backup chain"],
+                    ["includeIncidentRecords","Incident retros"],
+                    ["includeAuthenticationLogs","Auth log"],
+                    ["includeUserAccessLogs","Session log"],
+                  ].map(([key,lbl])=>(
+                    <label key={key} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",color:C.t,fontSize:12}}>
+                      <input type="checkbox" checked={forensicForm[key]} onChange={e=>setForensicForm({...forensicForm,[key]:e.target.checked})}/>
+                      {lbl}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              {forensicCreateError&&(<Card style={{marginBottom:12,borderColor:C.d+"60"}}><M style={{color:C.d}}>Create failed: {forensicCreateError}</M></Card>)}
+              {forensicCreateResult&&(<Card style={{marginBottom:12,borderColor:C.a+"60"}}><M style={{color:C.a}}>Created export <code>{forensicCreateResult.id}</code> ({forensicCreateResult.sizeBytes} bytes, sha256 {(forensicCreateResult.archiveSha256||"").slice(0,16)}…)</M></Card>)}
+              <div style={{display:"flex",gap:8}}>
+                <Btn small primary onClick={submitForensicExport} disabled={forensicCreateInFlight}>{forensicCreateInFlight?"Creating…":"Create Forensic Export"}</Btn>
+                <Btn small onClick={viewForensicChain}>View Chain</Btn>
+              </div>
+            </Card>
+
+            {forensicChainOpen&&(<Card style={{marginBottom:16,borderColor:C.i+"60"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>Forensic Export Chain</div>
+                <button onClick={()=>setForensicChainOpen(false)} style={{background:"transparent",border:"none",color:C.tm,fontSize:14,cursor:"pointer"}}>✕</button>
+              </div>
+              {!forensicChain&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading chain…</M>)}
+              {forensicChain&&forensicChain.error&&(<M style={{color:C.d}}>Error: {forensicChain.error}</M>)}
+              {forensicChain&&!forensicChain.error&&(<div>
+                {forensicChain.active_signing_key&&(<div style={{marginBottom:10,padding:8,background:"rgba(255,255,255,0.02)",border:`1px solid ${C.b}`,borderRadius:4}}>
+                  <M style={{color:C.td,display:"block"}}>Active signing key</M>
+                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>id: {forensicChain.active_signing_key.id}</M>
+                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>fingerprint: {forensicChain.active_signing_key.fingerprint}</M>
+                </div>)}
+                <div style={{maxHeight:300,overflowY:"auto",fontFamily:"'IBM Plex Mono',monospace",fontSize:10}}>
+                  {(forensicChain.chain||[]).map(c=>(
+                    <div key={c.id} style={{padding:"6px 8px",borderBottom:`1px solid ${C.b}`,display:"flex",gap:10}}>
+                      <span style={{color:C.td,minWidth:50}}>#{c.id}</span>
+                      <span style={{color:C.a,minWidth:160}}>{c.event_type}</span>
+                      <span style={{color:C.tm,minWidth:90}}>{c.created_at}</span>
+                      <span style={{color:C.t,wordBreak:"break-all"}}>{c.export_ref} / actor:{c.actor_user_id} / hash:{(c.this_hash||"").slice(0,12)}…</span>
+                    </div>
+                  ))}
+                  {(forensicChain.chain||[]).length===0&&(<M style={{color:C.tm,fontStyle:"italic",padding:8,display:"block"}}>No chain entries yet.</M>)}
+                </div>
+              </div>)}
+            </Card>)}
+
+            {forensicManifestOpen&&(<Card style={{marginBottom:16,borderColor:C.i+"60"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>Export Manifest</div>
+                <button onClick={()=>setForensicManifestOpen(false)} style={{background:"transparent",border:"none",color:C.tm,fontSize:14,cursor:"pointer"}}>✕</button>
+              </div>
+              {!forensicManifest&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading manifest…</M>)}
+              {forensicManifest&&forensicManifest.error&&(<M style={{color:C.d}}>Error: {forensicManifest.error}</M>)}
+              {forensicManifest&&!forensicManifest.error&&(<pre style={{maxHeight:400,overflow:"auto",fontFamily:"'IBM Plex Mono',monospace",fontSize:10,color:C.t,background:"rgba(0,0,0,0.3)",padding:10,borderRadius:4,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{JSON.stringify(forensicManifest,null,2)}</pre>)}
+            </Card>)}
+
+            {forensicDeleteError&&(<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>Last delete failed: {forensicDeleteError}</M></Card>)}
+
+            {!forensicLoadState.loaded&&!forensicLoadState.error&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading exports…</M>)}
+            {forensicLoadState.error&&(<Card style={{borderColor:C.w+"60"}}><M style={{color:C.w}}>Could not load exports: {forensicLoadState.error}</M></Card>)}
+            {forensicLoadState.loaded&&forensicExports.length===0&&(<Card><M style={{color:C.tm,fontStyle:"italic"}}>No forensic exports yet. Use the form above to create one.</M></Card>)}
+            {forensicLoadState.loaded&&forensicExports.length>0&&(<Card style={{padding:0,overflow:"hidden"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr style={{background:"rgba(255,255,255,0.02)"}}>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Export ID</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Requested</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
+                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Formats</th>
+                    <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Size</th>
+                    <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {forensicExports.map(e=>{
+                    const statusColor = e.status==="complete"?C.a:e.status==="failed"?C.d:e.status==="in_progress"?C.i:C.w;
+                    const inFlight = forensicDeleteInFlight[e.id];
+                    return (
+                      <tr key={e.id} style={{borderBottom:`1px solid ${C.b}`}}>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{e.id}</M>
+                          {e.rationale&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>{e.rationale}</M>)}
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <M style={{color:C.tm}}>{e.requested_at||"—"}</M>
+                          <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>by: {e.requested_by_user_id}</M>
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <Badge color={statusColor}>{e.status}</Badge>
+                          {e.error_message&&(<M style={{color:C.d,display:"block",fontSize:10,marginTop:4,maxWidth:200,wordBreak:"break-word"}}>{e.error_message}</M>)}
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
+                          <M style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{e.output_formats||"—"}</M>
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
+                          <M style={{color:C.tm}}>{e.size_bytes?e.size_bytes.toLocaleString()+" B":"—"}</M>
+                          {e.archive_sha256&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:2,fontFamily:"'IBM Plex Mono',monospace"}}>{(e.archive_sha256||"").slice(0,12)}…</M>)}
+                        </td>
+                        <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
+                          <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                            {e.status==="complete"&&(<Btn small primary onClick={()=>downloadForensicArchive(e.id)}>Download</Btn>)}
+                            {e.status==="complete"&&(<Btn small onClick={()=>viewForensicManifest(e.id)}>Manifest</Btn>)}
+                            <button onClick={()=>deleteForensicExport(e.id)} disabled={!!inFlight} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.d}`,borderRadius:4,color:C.d,fontSize:10,fontWeight:500,cursor:inFlight?"not-allowed":"pointer",opacity:inFlight?0.6:1}}>{inFlight?"Deleting…":"Delete"}</button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </Card>)}
           </div>)}
 
           {/* ══════════ SYSTEM HEALTH ══════════ */}
