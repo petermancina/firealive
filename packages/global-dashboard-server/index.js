@@ -10,6 +10,7 @@
 const express = require('express');
 const fs = require('fs');
 const rateLimit = require('express-rate-limit');
+const { isIP } = require('net');
 const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
@@ -31,6 +32,26 @@ const PORT = process.env.GD_PORT || 4001;
 const JWT_SECRET = process.env.GD_JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
+//
+// TRUST_PROXY env var: configures Express's req.ip resolution for deployments
+// behind a reverse proxy. Without this, req.ip is the proxy's IP and the
+// rate limiter buckets every client together. Must be set BEFORE any
+// middleware that reads req.ip.
+//
+//   false (default) — direct internet exposure, no proxy in front
+//   "loopback"      — trust 127.0.0.1 / ::1 only (typical local proxy)
+//   "1"             — trust exactly one hop (typical single-proxy setup)
+//   "2"             — trust exactly two hops (e.g. Cloudflare + NGINX)
+//   "uniquelocal"   — trust private + loopback IPs (typical k8s ingress)
+//
+// Setting this too permissively in a deployment without a real proxy lets
+// attackers spoof X-Forwarded-For and bypass IP-based rate limiting.
+// See https://expressjs.com/en/guide/behind-proxies.html for full semantics.
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY;
+  app.set('trust proxy', /^\d+$/.test(tp) ? parseInt(tp, 10) : tp);
+}
+
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(compression());
@@ -55,13 +76,34 @@ app.use(express.json({
 // on error) while still blocking the kind of tight-loop hammering that could
 // exhaust the SQLite connection pool. Public /api/health is exempt so
 // health-check probes from a load balancer never burn limit budget.
+//
+// keyGenerator does explicit IPv6 /64 aggregation. An IPv6 client can rotate
+// /128 addresses within their /64 trivially; aggregating at the /64 boundary
+// blocks that bypass. ::ffff:1.2.3.4 IPv4-mapped addresses are unwrapped so
+// a client connecting via IPv6-mapped doesn't get a separate bucket from
+// the same client connecting via plain IPv4. Inlined rather than delegated
+// to the library's internal IPv6 logic so behavior stays stable across
+// express-rate-limit upgrades. Mirrors MC server/index.js.
+const rateLimitKeyGenerator = (req) => {
+  const ip = req.ip;
+  if (!ip) return 'unknown';
+  if (isIP(ip) === 4) return ip;
+  if (isIP(ip) === 6) {
+    if (ip.startsWith('::ffff:')) return ip.slice(7);
+    const parts = ip.split(':');
+    return parts.slice(0, 4).join(':') + '::/64';
+  }
+  return ip;
+};
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   message: { error: 'Too many requests, please try again later.' },
-  standardHeaders: true,
+  standardHeaders: 'draft-7',
   legacyHeaders: false,
   skip: (req) => req.path === '/api/health',
+  keyGenerator: rateLimitKeyGenerator,
+  validate: true,
 });
 app.use('/api/', apiLimiter);
 

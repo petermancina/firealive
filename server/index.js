@@ -16,6 +16,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const { isIP } = require('net');
 const path = require('path');
 const { initDb, getDb } = require('./db/init');
 const { logger } = require('./services/logger');
@@ -58,6 +59,27 @@ if (process.env.SKIP_INTEGRITY_CHECK !== 'true') {
 }
 
 // ── Security Middleware ──────────────────────────────────────────────────────
+//
+// TRUST_PROXY env var: configures Express's req.ip resolution for deployments
+// behind a reverse proxy. Without this, req.ip is the proxy's IP and the
+// rate limiter buckets every client together. Must be set BEFORE any
+// middleware that reads req.ip (which is most security middleware).
+//
+//   false (default) — direct internet exposure, no proxy in front
+//   "loopback"      — trust 127.0.0.1 / ::1 only (typical local proxy)
+//   "1"             — trust exactly one hop (typical single-proxy setup)
+//   "2"             — trust exactly two hops (e.g. Cloudflare + NGINX)
+//   "uniquelocal"   — trust private + loopback IPs (typical k8s ingress)
+//
+// Setting this too permissively in a deployment without a real proxy lets
+// attackers spoof X-Forwarded-For and bypass IP-based rate limiting.
+// See https://expressjs.com/en/guide/behind-proxies.html for full semantics.
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY;
+  // Numeric strings parse to integers; non-numeric pass through as strings.
+  app.set('trust proxy', /^\d+$/.test(tp) ? parseInt(tp, 10) : tp);
+}
+
 app.use(networkHardening());
 app.use(antiEnumerationErrors());
 app.use(bandwidthMonitor.middleware());
@@ -83,10 +105,43 @@ app.use(compression());
 app.use(express.json({ limit: '5mb' }));
 
 // Rate limiting
+//
+// Three hardening notes vs the bare-minimum config:
+// 1. trust proxy is set above via the TRUST_PROXY env var so req.ip
+//    resolves to the actual client IP behind reverse proxies. Without
+//    that, every client would bucket under the proxy's IP and the
+//    limiter would be effectively disabled.
+// 2. keyGenerator does explicit IPv6 /64 aggregation. An IPv6 client
+//    can trivially rotate /128 addresses within their assigned /64
+//    subnet; aggregating at the /64 boundary prevents that bypass.
+//    Inlined (not delegated to the library's internal IPv6 logic) so
+//    behavior stays stable across express-rate-limit upgrades.
+// 3. validate: true enables the library's startup misconfiguration
+//    detector — warns if trust proxy is set inconsistently with the
+//    X-Forwarded-For headers seen at runtime, if duplicate header
+//    handling collides, etc.
+const rateLimitKeyGenerator = (req) => {
+  const ip = req.ip;
+  if (!ip) return 'unknown';
+  if (isIP(ip) === 4) return ip;
+  if (isIP(ip) === 6) {
+    // IPv4-mapped IPv6 (::ffff:1.2.3.4) — treat as the underlying IPv4
+    if (ip.startsWith('::ffff:')) return ip.slice(7);
+    // Otherwise aggregate by /64 prefix (first 4 hextets of the address)
+    const parts = ip.split(':');
+    return parts.slice(0, 4).join(':') + '::/64';
+  }
+  return ip;
+};
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: (req) => req.path === '/api/system/health',
+  keyGenerator: rateLimitKeyGenerator,
+  validate: true,
 });
 app.use('/api/', apiLimiter);
 
