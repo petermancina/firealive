@@ -1,4 +1,4 @@
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /app
 RUN addgroup -g 1001 firealive && adduser -u 1001 -G firealive -s /bin/sh -D firealive
 COPY package.json ./
@@ -6,7 +6,7 @@ RUN npm ci --production && npm cache clean --force
 COPY server/ ./server/
 COPY .env.example .env
 RUN find server/ -name "*.js" -exec sha256sum {} \; > /app/integrity-manifest.sha256
-FROM node:20-alpine
+FROM node:24-alpine
 WORKDIR /app
 RUN addgroup -g 1001 firealive && adduser -u 1001 -G firealive -s /bin/sh -D firealive
 COPY --from=builder /app /app
