@@ -670,7 +670,7 @@ const schedulerService = {
         // kind='single-db'; strategy='full' or 'snapshot'
         const { performBackup } = require('./backup');
         dispatchTarget = 'performBackup';
-        backupPromise = Promise.resolve(performBackup(backupType));
+        backupPromise = Promise.resolve(performBackup(backupType, { scheduleId }));
       }
 
       logger.info('Scheduler: starting scheduled backup', {
