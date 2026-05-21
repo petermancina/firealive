@@ -7,9 +7,9 @@
 // Dashboard) calls this endpoint on a fixed interval (typically every 30s) so
 // the server can track which clients are actively connected. The
 // users.last_heartbeat column was added in R0 schema reconciliation; the
-// system-health service (services/system-health.js) consumes it to compute
-// connected-client status with a 90-second threshold (line 31:
-// `Date.now() - new Date(u.last_heartbeat).getTime() < 90000`).
+// the /api/system/connected-clients endpoint (R3l C9) consumes it to compute
+// connected-client status with a 90-second window:
+// `Date.now() - new Date(u.last_heartbeat).getTime() < 90000`.
 //
 // The websocket-server.js service ALSO updates last_heartbeat on WS connect
 // and disconnect events, providing a complementary realtime path for clients

@@ -112,7 +112,7 @@ module.exports = (checks) => ({
       id: 'CC7.2',
       name: 'System Monitoring',
       check: checks.checkAuditControls,
-      mapping: 'Request-logging middleware (inline in packages/global-dashboard-server/index.js) records every /api request (except /api/health) to audit_log; SIEM streaming for external correlation lands when integration_config + B3 SIEM/SOAR wiring (v1.0.48) ship. /api/health and /api/system-health endpoints provide operational visibility.',
+      mapping: 'Request-logging middleware (inline in packages/global-dashboard-server/index.js) records every /api request (except /api/health) to audit_log; SIEM streaming for external correlation lands when integration_config + B3 SIEM/SOAR wiring (v1.0.48) ship. /api/health, /api/system/version (R3l C8) and /api/system/connected-clients (R3l C9) endpoints provide operational visibility.',
     },
     {
       id: 'CC7.3',

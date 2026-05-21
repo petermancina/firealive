@@ -92,8 +92,8 @@
 //
 // Backwards compatibility: the top-level fields (total, passed, failed,
 // results, ranAt, version, fuse) are preserved from the pre-R3k shape
-// so existing callers (the v059-features.js stub and any test
-// harnesses) don't break. The new fields (category on each result,
+// so existing callers (test harnesses; the v059-features.js stub
+// router was removed in R3m C2) don't break.
 // summary, failures) are additive.
 // ═══════════════════════════════════════════════════════════════════════════════
 

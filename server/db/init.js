@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS users (
   available INTEGER DEFAULT 1,
   active INTEGER DEFAULT 1,  -- R0: account active flag (distinct from the available shift status); offboarding sets to 0
   capacity_score INTEGER DEFAULT 50,  -- R0: 0-100, higher = more capacity for new tickets; consumed by routing/SOAR feature
-  last_heartbeat TEXT,  -- R0: last AC heartbeat ping timestamp; consumed by system-health monitor
+  last_heartbeat TEXT,  -- R0: last AC heartbeat ping timestamp; consumed by /api/system/connected-clients (R3l C9)
   last_iam_check TEXT,  -- R0: last time IAM offboarding detector saw this user in the IdP
   offboarded_at TEXT,  -- R0: timestamp of offboarding; pairs with active=0
   auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
@@ -2652,12 +2652,13 @@ function initDb() {
   //   active                 — soft-delete flag for offboarding workflow
   //                            (FEATURE-GUIDE Offboarding step 4); referenced
   //                            by signal-collector, metrics-collector,
-  //                            system-health, iam.js
+  //                            /api/system/version + /api/system/connected-clients,
+  //                            iam.js
   //   capacity_score         — 0-100 capacity rating consumed by
   //                            Routing & SOAR; referenced by metrics-
   //                            collector and the routing distribute endpoint
   //   last_heartbeat         — last AC heartbeat ping; referenced by
-  //                            system-health for connected-clients view
+  //                            /api/system/connected-clients for the connected-clients view
   //   last_iam_check         — IAM offboarding detector watermark;
   //                            referenced by iam.js
   //   offboarded_at          — timestamp of offboarding; pairs with active=0
@@ -2732,7 +2733,7 @@ function initDb() {
     addCol('email', 'email TEXT');  // R3c: HR scheduling sync silent join key (see note above)
   } catch (r0MigrationErr) {
     console.error('users R0 migration FAILED:', r0MigrationErr.message);
-    console.error('The server will start, but routing, IAM offboarding detection, system-health, and pseudonym rotation may misbehave until the migration is investigated.');
+    console.error('The server will start, but routing, IAM offboarding detection, system observability endpoints, and pseudonym rotation may misbehave until the migration is investigated.');
   }
 
 
@@ -3874,15 +3875,16 @@ function initDb() {
   // ── R3i schema additions (v1.0.35) — backup_schedules promotion + extend ──
   //
   // Phase R3i second schema commit (C2). Promotes the existing
-  // backup_schedules table from server/services/backup-service.js
-  // (where it was lazily created in BackupService._initTables() on
-  // class construction) into init.js migration discipline, and
+  // backup_schedules table from the legacy BackupService class
+  // (server/services/backup-service.js, removed in R3m C5, where it
+  // was lazily created in BackupService._initTables() on class
+  // construction) into init.js migration discipline, and
   // extends with eight new columns to support multi-schedule
   // backup with regulatory framework presets.
   //
   // The legacy lazy-create pattern was an artifact of the v1.0.0
-  // baseline (server/routes/v100-features.js POST /api/v1/backup/
-  // schedule/add path). It worked but lived outside the
+  // baseline (the v100 stub router, removed in R3m C3, POST
+  // /api/v1/backup/schedule/add path). It worked but lived outside the
   // canonical init-time migration discipline: schema changes
   // happened on first BackupService construction, with no
   // guaranteed ordering relative to other init steps and no
@@ -3899,20 +3901,22 @@ function initDb() {
   // left in place for now. Its CREATE TABLE IF NOT EXISTS is a
   // no-op after this migration runs (init.js owns the schema).
   // C10 (BackupService.addSchedule delegation) is the commit that
-  // removes the lazy _initTables call and migrates the v100 stub
+  // removes the lazy _initTables call and migrates the legacy v100-shape
   // route to use the new persistence layer.
   //
   // Column inventory:
   //
   //   LEGACY (preserved from BackupService._initTables, original
-  //   v1.0.0 shape — backwards-compatible with v100 stub callers):
+  //   v1.0.0 shape — preserved for any existing rows from the
+  //   pre-R3i v100-shape callers; the v100 stub router itself was
+  //   removed in R3m C3):
   //
   //     id              INTEGER PRIMARY KEY AUTOINCREMENT
   //     type            TEXT          'full' | 'incremental' |
   //                                   'differential' | 'snapshot'
   //     interval        TEXT          legacy free-form string
   //                                   e.g. 'Every 4hr' — preserved
-  //                                   for v100 callers; new rows
+  //                                   for legacy v100-shape rows; new rows
   //                                   created via the modern
   //                                   service leave this NULL
   //     retention       TEXT          legacy free-form string
@@ -4407,7 +4411,8 @@ function initDb() {
   //
   //   - Only runs when backup_schedules has zero rows. An install
   //     that has been editing schedules via the new UI (or the
-  //     v100 stub route via BackupService.addSchedule) is left
+  //     legacy v100-shape callers, now removed in R3m, via
+  //     BackupService.addSchedule) is left
   //     alone — the operator has already moved past the singleton
   //     and any backfill could create a confusing duplicate.
   //
@@ -4498,8 +4503,8 @@ function initDb() {
               new Date().toISOString(),
               time,
             );
-            // Update frequency column separately since the v100
-            // shape uses interval, not frequency. The modern
+            // Update frequency column separately since the legacy
+            // v100-shape rows use interval, not frequency. The modern
             // service reads frequency first when present.
             const lastInsertedId = db.prepare(
               'SELECT id FROM backup_schedules ORDER BY id DESC LIMIT 1'

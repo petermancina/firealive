@@ -18,11 +18,11 @@
 //                      without requiring a second round trip)
 //   • meta           — pagination + filter echo
 //
-// This is the new canonical analyst-self endpoint. The pre-existing
-// GET /api/v100-features/impacts/:analystId takes an analyst id as a URL
-// parameter and has weaker scoping; it stays in place for backward
-// compatibility until the AC frontend is fully wired (C10 wires My Signals,
-// future commits wire the wellness tabs).
+// This is the canonical analyst-self endpoint shipped in R3l. The historical
+// weakly-scoped GET /impacts/:analystId variant in server/routes/v100-features.js
+// (removed in R3m C3) took analyst id as a URL parameter rather than the
+// JWT-self scope this endpoint enforces. The AC frontend wiring of this
+// endpoint shipped in R3l C10-C13.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
