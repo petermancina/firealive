@@ -249,7 +249,7 @@ const schedulerService = {
       : '* * * * *';
     this.jobs.push(cron.schedule(emailCronExpr, async () => {
       try {
-        const { processQueue } = require('./notifications-email');
+        const { processQueue } = require('./notifications-pipeline');
         const stats = await processQueue();
         if (stats.processed > 0 || stats.skipped > 0) {
           logger.info('Notifications email pipeline cycle', stats);
