@@ -54,6 +54,7 @@ const helperPay = require('../services/helper-pay');
 const { notify } = require('../services/notifications');
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
+const { auditLog } = require('../middleware/audit');
 
 // ── Inline role helpers ─────────────────────────────────────────────────────
 // Mounting middleware already enforces analyst|lead|admin; these helpers
@@ -110,6 +111,108 @@ function safeNotify(payload) {
     logger.warn('Helper Pay notify failed', { eventType: payload.eventType, error: err.message });
   }
 }
+
+// ── Config (lead/admin) ─────────────────────────────────────────────────────
+// R3n: Helper Pay system config — 4 fields stored in team_config key-value
+// row keyed 'helper_pay_config'. Distinct from the feature toggle (the
+// future Features tab controls whether this subsystem is available at all);
+// these settings govern its runtime behavior when enabled.
+//
+//   enabled:                   boolean — whether sessions accrue points
+//   pointsThreshold:           int >= 1 — points required for redemption
+//   payDifferentialPct:        number 0-100 — bonus pay percentage
+//   designatedHelperThreshold: int >= pointsThreshold — qualifies the
+//                              analyst as "designated helper" tier
+//
+// The MC's Helper Pay Configuration card (firealive-mc.jsx) reads via GET
+// and saves via PUT. Audit-logged as MC_HELPER_PAY_CONFIG_SAVED on save.
+
+const HELPER_PAY_CONFIG_DEFAULTS = {
+  enabled: true,
+  pointsThreshold: 50,
+  payDifferentialPct: 5,
+  designatedHelperThreshold: 100,
+};
+
+router.get('/config', (req, res) => {
+  if (!isLeadOrAdmin(req)) {
+    return res.status(403).json({ error: 'lead or admin role required' });
+  }
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value, updated_by, updated_at FROM team_config WHERE key = 'helper_pay_config'").get();
+    db.close();
+    if (!row) {
+      return res.json({ ...HELPER_PAY_CONFIG_DEFAULTS, _source: 'default' });
+    }
+    try {
+      const parsed = JSON.parse(row.value);
+      return res.json({
+        ...HELPER_PAY_CONFIG_DEFAULTS,
+        ...parsed,
+        updatedAt: row.updated_at,
+        updatedBy: row.updated_by,
+        _source: 'stored',
+      });
+    } catch (parseErr) {
+      logger.error('helper-pay config row JSON parse failed; returning defaults', { error: parseErr.message });
+      return res.json({ ...HELPER_PAY_CONFIG_DEFAULTS, _source: 'default-fallback' });
+    }
+  } catch (err) {
+    logger.error('helper-pay config read failed', { error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
+
+router.put('/config', (req, res) => {
+  if (!isLeadOrAdmin(req)) {
+    return res.status(403).json({ error: 'lead or admin role required' });
+  }
+
+  const { enabled, pointsThreshold, payDifferentialPct, designatedHelperThreshold } = req.body || {};
+
+  // Field-level validation (each error 400s with a specific message so
+  // the MC can surface the exact problem to the operator)
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be boolean' });
+  }
+  if (!Number.isInteger(pointsThreshold) || pointsThreshold < 1) {
+    return res.status(400).json({ error: 'pointsThreshold must be a positive integer' });
+  }
+  if (typeof payDifferentialPct !== 'number' || payDifferentialPct < 0 || payDifferentialPct > 100 || !Number.isFinite(payDifferentialPct)) {
+    return res.status(400).json({ error: 'payDifferentialPct must be a number between 0 and 100' });
+  }
+  if (!Number.isInteger(designatedHelperThreshold) || designatedHelperThreshold < pointsThreshold) {
+    return res.status(400).json({ error: 'designatedHelperThreshold must be an integer >= pointsThreshold' });
+  }
+
+  const config = { enabled, pointsThreshold, payDifferentialPct, designatedHelperThreshold };
+
+  try {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO team_config (key, value, updated_by, updated_at)
+      VALUES ('helper_pay_config', ?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_by = excluded.updated_by,
+        updated_at = datetime('now')
+    `).run(JSON.stringify(config), req.user.id);
+    db.close();
+
+    auditLog(
+      req.user.id,
+      'MC_HELPER_PAY_CONFIG_SAVED',
+      `enabled=${enabled} pointsThreshold=${pointsThreshold} payDifferentialPct=${payDifferentialPct} designatedHelperThreshold=${designatedHelperThreshold}`,
+      req.ip
+    );
+
+    res.json({ ok: true, config });
+  } catch (err) {
+    logger.error('helper-pay config save failed', { error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  }
+});
 
 // ── Analyst self-service ────────────────────────────────────────────────────
 

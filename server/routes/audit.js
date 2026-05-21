@@ -2,6 +2,8 @@
 // FIREALIVE — Audit Routes
 // GET  /api/audit            — query audit log with filters
 // GET  /api/audit/export     — export audit log (CSV, JSON, or CEF)
+//                              R3n: optional source filter — all / mc / ac /
+//                              ac-analyst (with analyst_id param) / server
 // GET  /api/audit/stats      — aggregated event counts
 // GET  /api/audit/integrity  — verify the SHA-256 chain across the audit log
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -52,13 +54,37 @@ router.get('/', (req, res) => {
 // ── Export ────────────────────────────────────────────────────────────────────
 router.get('/export', (req, res) => {
   try {
-    const { format = 'json', startDate, endDate } = req.query;
+    const { format = 'json', startDate, endDate, source = 'all', analyst_id } = req.query;
     const db = getDb();
 
     let sql = 'SELECT al.*, u.name AS user_name FROM audit_log al LEFT JOIN users u ON u.id = al.user_id WHERE 1=1';
     const params = [];
     if (startDate) { sql += ' AND al.timestamp >= ?'; params.push(startDate); }
     if (endDate) { sql += ' AND al.timestamp <= ?'; params.push(endDate); }
+
+    // R3n: source filter — operator can request MC-only / AC-only /
+    // server-middleware-only / per-analyst slices. Single physical
+    // audit_log table holds all event sources distinguished by
+    // event_type prefix (MC_* / AC_* / no-prefix for server-middleware).
+    // See server/routes/audit-mc-event.js header for the prefix taxonomy.
+    if (source === 'mc') {
+      sql += " AND al.event_type LIKE 'MC\\_%' ESCAPE '\\'";
+    } else if (source === 'ac') {
+      sql += " AND al.event_type LIKE 'AC\\_%' ESCAPE '\\'";
+    } else if (source === 'ac-analyst') {
+      if (!analyst_id || typeof analyst_id !== 'string') {
+        db.close();
+        return res.status(400).json({ error: 'ac-analyst source requires analyst_id query param' });
+      }
+      sql += " AND al.event_type LIKE 'AC\\_%' ESCAPE '\\' AND al.user_id = ?";
+      params.push(analyst_id);
+    } else if (source === 'server') {
+      sql += " AND al.event_type NOT LIKE 'AC\\_%' ESCAPE '\\' AND al.event_type NOT LIKE 'MC\\_%' ESCAPE '\\'";
+    } else if (source !== 'all') {
+      db.close();
+      return res.status(400).json({ error: `Invalid source: ${source}`, allowed: ['all', 'mc', 'ac', 'ac-analyst', 'server'] });
+    }
+
     sql += ' ORDER BY al.timestamp ASC';
 
     const rows = db.prepare(sql).all(...params);

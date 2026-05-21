@@ -5235,6 +5235,69 @@ function initDb() {
     );
   }
 
+  // ── R3n: default config rows for helper_pay_config + peer_share_exclusion_cap ─
+  //
+  // Both rows live in the team_config key-value store (PRIMARY KEY = key).
+  // Idempotent INSERT OR IGNORE pattern matches the R3j routing_enabled
+  // backfill above: re-running this migration against an already-seeded
+  // database is a no-op; if the lead has already saved a non-default
+  // value via the MC UI, the existing row is preserved.
+  //
+  // Fault isolation: separate try/catch from R3k cloud_packages. A
+  // failure here does not mask preceding migrations.
+  try {
+    const helperPayDefaults = JSON.stringify({
+      enabled: true,
+      pointsThreshold: 50,
+      payDifferentialPct: 5,
+      designatedHelperThreshold: 100,
+    });
+    const insertResult = db
+      .prepare(
+        "INSERT OR IGNORE INTO team_config (key, value, updated_by) VALUES ('helper_pay_config', ?, NULL)"
+      )
+      .run(helperPayDefaults);
+
+    if (insertResult.changes > 0) {
+      console.log('R3n migration: seeded helper_pay_config defaults in team_config');
+    } else {
+      console.log('R3n migration: helper_pay_config row already present in team_config');
+    }
+  } catch (r3nHelperPayConfigMigrationErr) {
+    console.error(
+      'R3n helper_pay_config migration FAILED:',
+      r3nHelperPayConfigMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Helper Pay Configuration card in the MC will fall back to defaults via the GET /api/helper-pay/config _source:"default" path. Saving from the MC will succeed and create the row via UPSERT.'
+    );
+  }
+
+  try {
+    const peerCapDefaults = JSON.stringify({
+      maxExcludedFraction: 0.5,
+    });
+    const insertResult = db
+      .prepare(
+        "INSERT OR IGNORE INTO team_config (key, value, updated_by) VALUES ('peer_share_exclusion_cap', ?, NULL)"
+      )
+      .run(peerCapDefaults);
+
+    if (insertResult.changes > 0) {
+      console.log('R3n migration: seeded peer_share_exclusion_cap default in team_config');
+    } else {
+      console.log('R3n migration: peer_share_exclusion_cap row already present in team_config');
+    }
+  } catch (r3nPeerCapMigrationErr) {
+    console.error(
+      'R3n peer_share_exclusion_cap migration FAILED:',
+      r3nPeerCapMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the peer-share submission endpoint (POST /api/peers/requests) hardcodes 0.5 as the cap in C10 — the team_config row is informational at v1.0.40 and only consulted by a future UI for cap-editing. No functional impact.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

@@ -1,7 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE — Routing Routes
 // GET  /api/routing               — get all routing caps
-// PUT  /api/routing/:analystId    — update routing cap for an analyst
+// PUT  /api/routing/:analystId    — update routing cap for an analyst (single)
+// POST /api/routing/bulk          — bulk-update routing caps (R3n; MC Apply button)
 // POST /api/routing/equity        — run equity analysis
 // GET  /api/routing/soar          — get SOAR routing variables (lead/admin UI)
 // PUT  /api/routing/soar          — update SOAR routing variables
@@ -405,6 +406,127 @@ router.put('/:analystId', (req, res) => {
   } catch (err) {
     logger.error('Update routing cap error', { error: err.message });
     res.status(500).json({ error: 'Failed to update routing cap' });
+  }
+});
+
+// ── R3n: Bulk Routing Cap Update ─────────────────────────────────────────────
+// POST /api/routing/bulk
+// Accepts: {caps: [{analystId, maxComplexity}, ...]}
+//
+// Diffs the incoming caps against current values, applies only the changed
+// rows, audit-logs each change individually (MC_ROUTING_CAP_CHANGED with
+// per-row detail), and returns per-analyst result so the MC can surface
+// partial failures to the operator.
+//
+// Replaces the legacy per-analyst PUT loop in the MC Routing tab Apply
+// button (which previously sent one PUT per analyst, even when caps were
+// unchanged). After R3n the Apply button sends ONE bulk PUT; server diffs
+// against current state; only changed rows produce database writes and
+// audit rows.
+//
+// The single-resource PUT /:analystId stays mounted for any other callers
+// (none in MC at v1.0.39 but preserved for SOAR-event-driven future use
+// and the existing API contract surface).
+router.post('/bulk', (req, res) => {
+  const { caps } = req.body;
+  if (!Array.isArray(caps)) {
+    return res.status(400).json({ error: 'caps must be an array' });
+  }
+  if (caps.length === 0) {
+    return res.json({ updated: [], unchanged: [], errors: [], summary: 'no caps in request' });
+  }
+  if (caps.length > 200) {
+    return res.status(400).json({ error: 'Bulk cap update limited to 200 analysts per request' });
+  }
+
+  const updated = [];
+  const unchanged = [];
+  const errors = [];
+
+  try {
+    const db = getDb();
+
+    // Fetch existing rows for all analysts in one query (avoids N+1)
+    const analystIds = caps.map(c => c.analystId).filter(id => typeof id === 'string' && id);
+    let byId = new Map();
+    if (analystIds.length > 0) {
+      const placeholders = analystIds.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT u.id, u.name, u.tier, u.role, u.active,
+               rc.max_complexity AS current_cap
+        FROM users u
+        LEFT JOIN routing_caps rc ON rc.analyst_id = u.id
+        WHERE u.id IN (${placeholders})
+      `).all(...analystIds);
+      for (const row of rows) byId.set(row.id, row);
+    }
+
+    const upsertStmt = db.prepare(`
+      INSERT INTO routing_caps (analyst_id, max_complexity, is_override, override_reason, override_by, updated_at)
+      VALUES (?, ?, 0, NULL, ?, datetime('now'))
+      ON CONFLICT(analyst_id) DO UPDATE SET
+        max_complexity = excluded.max_complexity,
+        override_by = excluded.override_by,
+        updated_at = datetime('now')
+    `);
+
+    for (const cap of caps) {
+      const { analystId, maxComplexity } = cap || {};
+      if (typeof analystId !== 'string' || !analystId) {
+        errors.push({ analystId: (cap && cap.analystId) || null, error: 'analystId must be a non-empty string' });
+        continue;
+      }
+      if (!Number.isInteger(maxComplexity) || maxComplexity < 0 || maxComplexity > 5) {
+        errors.push({ analystId, error: 'maxComplexity must be an integer 0-5' });
+        continue;
+      }
+      const analyst = byId.get(analystId);
+      if (!analyst) {
+        errors.push({ analystId, error: 'Analyst not found' });
+        continue;
+      }
+      if (analyst.role !== 'analyst') {
+        errors.push({ analystId, error: 'User is not an analyst' });
+        continue;
+      }
+      if (!analyst.active) {
+        errors.push({ analystId, error: 'Analyst is inactive (offboarded)' });
+        continue;
+      }
+
+      // Resolve "current" cap: prefer explicit routing_caps row, else fall
+      // back to user.tier (the legacy default in PUT /:analystId).
+      const currentCap = analyst.current_cap != null ? analyst.current_cap : analyst.tier;
+      if (currentCap === maxComplexity) {
+        unchanged.push(analystId);
+        continue;
+      }
+
+      upsertStmt.run(analystId, maxComplexity, req.user.id);
+      updated.push(analystId);
+
+      // Per-change audit row. Operator identity (req.user.id) recorded via
+      // auditLog's first arg; old + new values logged for threat-hunting
+      // visibility into who changed which cap when.
+      auditLog(
+        req.user.id,
+        'MC_ROUTING_CAP_CHANGED',
+        `analyst=${analystId} name=${analyst.name} old=${currentCap} new=${maxComplexity}`,
+        req.ip
+      );
+    }
+
+    db.close();
+
+    res.json({
+      updated,
+      unchanged,
+      errors,
+      summary: `${updated.length} updated, ${unchanged.length} unchanged, ${errors.length} error${errors.length === 1 ? '' : 's'}`,
+    });
+  } catch (err) {
+    logger.error('Bulk routing update error', { error: err.message });
+    res.status(500).json({ error: 'Failed to apply bulk routing update', detail: err.message });
   }
 });
 

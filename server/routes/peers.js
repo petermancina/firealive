@@ -12,6 +12,18 @@
 // POST /api/peers/sessions/:id/consent — signal willingness to reveal identity
 // GET  /api/peers/sessions/:id      — get session status (incl. mutual consent state)
 // POST /api/peers/sessions/:id/close — close session
+//
+// R3n: exclusion list now uses pseudonyms (excludePseudonyms in request body),
+// not user UUIDs. The AC never sees user UUIDs; it fetches the pseudonym
+// list from /api/pseudonyms and submits pseudonyms here. Server resolves
+// pseudonyms → user IDs internally. Resolution is anonymity-preserving:
+// the server already holds the pseudonym↔UUID mapping in users.pseudonym;
+// no NEW privacy surface is created by this resolution.
+//
+// 50% exclusion cap: at least half the active analyst pool (rounded up
+// via ceil) must remain as potential helpers after the exclusion list is
+// applied. This prevents triangulation — a help-seeker cannot narrow the
+// helper pool to a single identifiable person by excluding everyone else.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -27,16 +39,59 @@ const MAX_MESSAGE_LENGTH = 4096; // 4KB text max
 
 // ── Create Support Request ───────────────────────────────────────────────────
 router.post('/requests', (req, res) => {
-  const { topic, excludeAnalystIds, willingToMeetInPerson } = req.body;
+  const { topic, excludePseudonyms, willingToMeetInPerson } = req.body;
 
   if (!topic || typeof topic !== 'string' || topic.length > 500) {
     return res.status(400).json({ error: 'topic required (max 500 chars)' });
   }
 
+  // R3n: exclusion list is now pseudonyms (strings), not UUIDs. The AC
+  // sees pseudonyms only via /api/pseudonyms and never sees user IDs.
+  const requestedPseudonyms = Array.isArray(excludePseudonyms)
+    ? excludePseudonyms.filter(p => typeof p === 'string' && p.length > 0).slice(0, 200)
+    : [];
+
   try {
     const db = getDb();
     const id = crypto.randomBytes(16).toString('hex');
-    const excludeIds = Array.isArray(excludeAnalystIds) ? excludeAnalystIds : [];
+
+    // Resolve pseudonyms → user IDs (server-side; AC never sees IDs).
+    // Pseudonyms not matching any active analyst are silently dropped
+    // (e.g., the analyst was offboarded between the AC's last /api/pseudonyms
+    // fetch and now).
+    let resolvedExcludeIds = [];
+    if (requestedPseudonyms.length > 0) {
+      const placeholders = requestedPseudonyms.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT id FROM users
+        WHERE pseudonym IN (${placeholders})
+          AND role = 'analyst'
+          AND active = 1
+      `).all(...requestedPseudonyms);
+      resolvedExcludeIds = rows.map(r => r.id);
+    }
+
+    // Enforce 50% exclusion cap: at least half (ceil) of the active analyst
+    // pool must remain available as potential helpers after exclusions.
+    // Prevents triangulation by narrowing the helper pool to a single person.
+    const activeRow = db.prepare(
+      "SELECT COUNT(*) AS n FROM users WHERE role = 'analyst' AND active = 1"
+    ).get();
+    const activeCount = activeRow.n;
+    const minRemaining = Math.ceil(activeCount * 0.5);
+    const maxExcluded = activeCount - minRemaining;
+    if (resolvedExcludeIds.length > maxExcluded) {
+      db.close();
+      return res.status(400).json({
+        error: 'Exclusion list too large',
+        detail: `At least ${minRemaining} active analyst${minRemaining === 1 ? '' : 's'} must remain as potential helpers after exclusion. With ${activeCount} active analyst${activeCount === 1 ? '' : 's'} in the pool, you may exclude at most ${maxExcluded}. Resolved exclusion count: ${resolvedExcludeIds.length}.`,
+        activeAnalystCount: activeCount,
+        maxExcluded,
+        attemptedExcluded: resolvedExcludeIds.length,
+      });
+    }
+
+    const excludeIds = resolvedExcludeIds;
 
     // Store request — requester identity is encrypted (server knows for routing
     // but never exposes to other analysts)

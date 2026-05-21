@@ -1048,8 +1048,12 @@ function ManagementConsole() {
   // R3j C7: Hydrate SOAR + Ticketing forms from canonical /api/integrations
   // when tab==="soar" is opened. Parallel fetch; tolerant of either
   // integration being unconfigured (returns {status:"not_configured",config:null}).
-  // Sensitive fields are server-redacted on GET (apiKey: "1234••••••••"); the
-  // user can edit to replace.
+  // R3n: SOC-grade — sensitive fields (apiKey) are STRIPPED entirely from
+  // the GET response; presence is surfaced via sensitiveFieldsPresent.apiKey
+  // booleans. The form renders "Configured ✓" + a "Change Secret" button when
+  // a value exists server-side; clicking Change reveals an empty input. On
+  // save, the apiKey field is OMITTED from the PUT body unless the lead
+  // explicitly clicked Change (omission-rule merge preserves existing).
   useEffect(()=>{
     if (tab !== "soar" || soarHydrated) return;
     Promise.all([
@@ -1060,13 +1064,17 @@ function ManagementConsole() {
         setSoarPlatform(soarRes.config.platform || "");
         setSoarUrl(soarRes.config.apiEndpoint || "");
         setSoarServiceAccount(soarRes.config.serviceAccount || "");
-        setSoarApiKey(soarRes.config.apiKey || "");
+        setSoarApiKey("");
+        setSoarApiKeyPresent(!!(soarRes.sensitiveFieldsPresent && soarRes.sensitiveFieldsPresent.apiKey));
+        setSoarApiKeyChanging(false);
         setSoarAutoEscalate(soarRes.config.autoEscalate === true);
       }
       if (ticketingRes && !ticketingRes.error && ticketingRes.config) {
         setSoarTicketingPlatform(ticketingRes.config.platform || "");
         setSoarTicketingEndpoint(ticketingRes.config.apiEndpoint || "");
-        setSoarTicketingApiKey(ticketingRes.config.apiKey || "");
+        setSoarTicketingApiKey("");
+        setSoarTicketingApiKeyPresent(!!(ticketingRes.sensitiveFieldsPresent && ticketingRes.sensitiveFieldsPresent.apiKey));
+        setSoarTicketingApiKeyChanging(false);
       }
       setSoarHydrated(true);
     }).catch(()=>setSoarHydrated(true));
@@ -1596,6 +1604,16 @@ function ManagementConsole() {
   const [sessCt, setSC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,{t:0,h:0}])));
   const [auditPage, setAuditPage] = useState(0);
   const AUDIT_PER_PAGE = 50;
+  // R3n: Source filter for the canonical /api/audit/export endpoint.
+  // The client-side audit-state export buttons (CSV/JSON/CEF/Syslog/Forensics
+  // below) export the in-memory MC audit array; the Server Audit Export
+  // section uses these state vars to call the canonical GET /api/audit/export
+  // with prefix-based filtering across the unified audit_log table.
+  const [auditSource, setAuditSource] = useState("all");
+  const [auditAnalystId, setAuditAnalystId] = useState("");
+  const [auditExportFormat, setAuditExportFormat] = useState("json");
+  const [auditExportBusy, setAuditExportBusy] = useState(false);
+  const [auditExportError, setAuditExportError] = useState(null);
   // IAM wizard state
   const [iamTab, setIamTab] = useState("saml");
   const [iamCfg, setIamCfg] = useState({saml:{entityId:"",metadataUrl:"",cert:"",jit:true,status:"not_configured"},oidc:{issuer:"",clientId:"",secret:"",scopes:"openid profile email groups",status:"not_configured"},ad:{server:"",port:"636",baseDn:"",bindDn:"",useTLS:true,syncInterval:"15",status:"not_configured"},cloud:{provider:"none",tenantId:"",status:"not_configured"}});
@@ -1641,16 +1659,24 @@ function ManagementConsole() {
   const [soarPlatform, setSoarPlatform] = useState("splunk_soar");
   const [soarUrl, setSoarUrl] = useState("");
   const [soarApiKey, setSoarApiKey] = useState("");
-  // R3j C7: SOAR + Ticketing form state. Hydrated from canonical
+  // R3j C7 / R3n: SOAR + Ticketing form state. Hydrated from canonical
   // /api/integrations/soar and /api/integrations/ticketing on tab open.
-  // Sensitive fields (apiKey) return redacted from the server (prefix + ••••••••);
-  // the form shows the redacted form as the current value and the user
-  // can edit to replace.
+  // R3n SOC-grade Option C: sensitive fields are STRIPPED entirely from
+  // GET responses; presence-metadata via sensitiveFieldsPresent.apiKey
+  // drives the UI affordance.
+  //   *Present state vars: true when server holds a value (per GET metadata).
+  //                        Drives "Configured ✓" + "Change Secret" affordance.
+  //   *Changing state vars: true when the lead clicked Change to reveal the
+  //                         input. Drives whether apiKey is included in PUT body.
+  const [soarApiKeyPresent, setSoarApiKeyPresent] = useState(false);
+  const [soarApiKeyChanging, setSoarApiKeyChanging] = useState(false);
   const [soarServiceAccount, setSoarServiceAccount] = useState("");
   const [soarAutoEscalate, setSoarAutoEscalate] = useState(false);
   const [soarTicketingPlatform, setSoarTicketingPlatform] = useState("");
   const [soarTicketingEndpoint, setSoarTicketingEndpoint] = useState("");
   const [soarTicketingApiKey, setSoarTicketingApiKey] = useState("");
+  const [soarTicketingApiKeyPresent, setSoarTicketingApiKeyPresent] = useState(false);
+  const [soarTicketingApiKeyChanging, setSoarTicketingApiKeyChanging] = useState(false);
   const [soarHydrated, setSoarHydrated] = useState(false);
   const [soarSaveError, setSoarSaveError] = useState(null);
   const [soarSaveBusy, setSoarSaveBusy] = useState(false);
@@ -2364,7 +2390,7 @@ function ManagementConsole() {
 
       } catch(e) {
         // Backend not available — continue with mock data
-        api.post("/api/v1/audit/log",{event:"API_OFFLINE",detail:"Backend not available — using demo data"}).then(()=>addA("API_OFFLINE","Backend not available — using demo data"));
+        api.post("/api/audit/mc-event",{event_type:"API_OFFLINE",detail:"Backend not available — using demo data"}).then(()=>addA("API_OFFLINE","Backend not available — using demo data"));
       }
     };
     load();
@@ -2485,6 +2511,13 @@ function ManagementConsole() {
   const [helperError, setHelperError] = useState(null);
   const [helperFb, setHelperFb] = useState(null);
   const [helperSection, setHelperSection] = useState("pending");
+  // R3n: Helper Pay system configuration (4-field config via /api/helper-pay/config)
+  const [hpCfg, setHpCfg] = useState({enabled:true, pointsThreshold:50, payDifferentialPct:5, designatedHelperThreshold:100});
+  const [hpCfgLoaded, setHpCfgLoaded] = useState(false);
+  const [hpCfgSaveBusy, setHpCfgSaveBusy] = useState(false);
+  const [hpCfgSaveError, setHpCfgSaveError] = useState(null);
+  const [hpCfgUpdatedAt, setHpCfgUpdatedAt] = useState(null);
+  const [hpCfgSource, setHpCfgSource] = useState("default");
   // Decide modal: { redemption, approve, note }
   const [decideModal, setDecideModal] = useState(null);
   // Catalog form: editing existing (with id) or creating new (id=null)
@@ -2500,6 +2533,22 @@ function ManagementConsole() {
   // returns 403 — we surface that inline rather than crashing the tab.
   React.useEffect(() => {
     if (tab !== "helper_pay") return;
+    // R3n: hydrate helper-pay config when tab opens
+    if (!hpCfgLoaded) {
+      api.get("/api/helper-pay/config").then(r => {
+        if (r && !r.error) {
+          setHpCfg({
+            enabled: typeof r.enabled === "boolean" ? r.enabled : true,
+            pointsThreshold: r.pointsThreshold || 50,
+            payDifferentialPct: typeof r.payDifferentialPct === "number" ? r.payDifferentialPct : 5,
+            designatedHelperThreshold: r.designatedHelperThreshold || 100,
+          });
+          if (r.updatedAt) setHpCfgUpdatedAt(r.updatedAt);
+          if (r._source) setHpCfgSource(r._source);
+        }
+        setHpCfgLoaded(true);
+      }).catch(() => setHpCfgLoaded(true));
+    }
     let cancelled = false;
     setHelperLoading(true);
     setHelperError(null);
@@ -2884,7 +2933,7 @@ function ManagementConsole() {
             {["Enable ASLR (Address Space Layout Randomization)","Enable DEP/NX at OS level","Use WPA2-Enterprise or WPA3 only","Encrypt the FireAlive program directory (BitLocker/LUKS)","Set NTFS/ext4 permissions: restrict to service account only","Disable USB mass storage on server machines","Enable audit logging on the host OS","Configure host firewall to allow only FireAlive ports","Integrate with Microsoft Security Compliance Toolkit (if Windows)","Run FireAlive under a dedicated service account (not root/admin)"].map((tip,i)=>(
               <div key={i} style={{padding:"6px 0",display:"flex",gap:8}}><M style={{color:C.a}}>✓</M><M style={{color:C.t}}>{tip}</M></div>
             ))}
-            <div style={{display:"flex",gap:8,marginTop:16}}><Btn onClick={()=>setSetupStep(1)}>← Back</Btn><Btn primary onClick={()=>{setShowSetupWizard(false);setSetupStep(0);api.post("/api/v1/audit/log",{event:"SETUP_WIZARD_COMPLETE",detail:"First-time setup wizard completed"}).then(()=>addA("SETUP_WIZARD_COMPLETE","First-time setup wizard completed"));}}>Finish Setup</Btn></div>
+            <div style={{display:"flex",gap:8,marginTop:16}}><Btn onClick={()=>setSetupStep(1)}>← Back</Btn><Btn primary onClick={()=>{setShowSetupWizard(false);setSetupStep(0);api.post("/api/audit/mc-event",{event_type:"SETUP_WIZARD_COMPLETE",detail:"First-time setup wizard completed"}).then(()=>addA("SETUP_WIZARD_COMPLETE","First-time setup wizard completed"));}}>Finish Setup</Btn></div>
           </div>)}
         </div>
       </div>)}
@@ -3189,7 +3238,7 @@ function ManagementConsole() {
             <textarea value={handoffNotes} onChange={e=>setHandoffNotes(e.target.value)} placeholder="Add context for the incoming lead: what's in progress, what needs attention, anything unusual about the shift..." maxLength={2000} style={{width:"100%",height:100,padding:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}}/>
             <div style={{display:"flex",gap:8,marginTop:8}}>
               <Btn primary disabled={!handoffNotes.trim()} onClick={()=>{const shifts=["Day","Swing","Night"];const now=new Date();const h=now.getHours();const fromShift=h<14?"Day":h<22?"Swing":"Night";const toShift=shifts[(shifts.indexOf(fromShift)+1)%3];setHandoffHistory(prev=>[{ts:now.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+now.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),from:`${fromShift} → ${toShift}`,notes:handoffNotes},...prev]);addA("HANDOFF_SUBMITTED","Shift handoff notes saved: "+handoffNotes.slice(0,60)+"...");setHandoffNotes("");}}>Save Handoff</Btn>
-              <Btn disabled={!handoffNotes.trim()} onClick={()=>{const shifts=["Day","Swing","Night"];const now=new Date();const h=now.getHours();const fromShift=h<14?"Day":h<22?"Swing":"Night";const toShift=shifts[(shifts.indexOf(fromShift)+1)%3];setHandoffHistory(prev=>[{ts:now.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+now.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),from:`${fromShift} → ${toShift}`,notes:handoffNotes},...prev]);api.post("/api/v1/audit/log",{event:"HANDOFF_SENT",detail:"Handoff notes saved and notification sent to incoming lead"}).then(()=>addA("HANDOFF_SENT","Handoff notes saved and notification sent to incoming lead"));setHandoffNotes("");}}>Save & Notify Incoming Lead</Btn>
+              <Btn disabled={!handoffNotes.trim()} onClick={()=>{const shifts=["Day","Swing","Night"];const now=new Date();const h=now.getHours();const fromShift=h<14?"Day":h<22?"Swing":"Night";const toShift=shifts[(shifts.indexOf(fromShift)+1)%3];setHandoffHistory(prev=>[{ts:now.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+now.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),from:`${fromShift} → ${toShift}`,notes:handoffNotes},...prev]);api.post("/api/audit/mc-event",{event_type:"HANDOFF_SENT",detail:"Handoff notes saved and notification sent to incoming lead"}).then(()=>addA("HANDOFF_SENT","Handoff notes saved and notification sent to incoming lead"));setHandoffNotes("");}}>Save & Notify Incoming Lead</Btn>
             </div>
           </Card>
           <Card style={{padding:12}}>
@@ -3252,7 +3301,7 @@ function ManagementConsole() {
           <Card style={{marginBottom:16,padding:12,borderColor:C.w+"30"}}>
             <div style={{fontSize:12,fontWeight:500,color:C.w,marginBottom:8}}>Availability Reminder</div>
             <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Sends a brief, neutral notification to involved analysts: "Recovery resources are available in your Recovery tab if you would like them." CISM best practice: support should be available and visible, never forced (R007, R023).</M>
-            <Btn onClick={()=>api.post("/api/v1/audit/log",{event:"RETRO_REMINDER",detail:"Availability reminder sent to involved analysts"}).then(()=>addA("RETRO_REMINDER","Availability reminder sent to involved analysts"))}>Send Reminder</Btn>
+            <Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"RETRO_REMINDER",detail:"Availability reminder sent to involved analysts"}).then(()=>addA("RETRO_REMINDER","Availability reminder sent to involved analysts"))}>Send Reminder</Btn>
           </Card>
 
           <Card style={{marginBottom:16}}>
@@ -3322,7 +3371,20 @@ function ManagementConsole() {
             <Input label="SOAR API endpoint" value={soarUrl} onChange={e=>setSoarUrl(e.target.value)} placeholder="https://soar.corp.local/api/v2" maxLength={512}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               <Input label="Service account / API user" value={soarServiceAccount} onChange={e=>setSoarServiceAccount(e.target.value)} placeholder="svc-firealive-routing" maxLength={256}/>
-              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" value={soarApiKey} onChange={e=>setSoarApiKey(e.target.value)} placeholder="Stored in secrets manager (Vault/AWS SM/Azure KV)" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
+              <div style={{marginBottom:14}}>
+                <M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M>
+                {soarApiKeyPresent && !soarApiKeyChanging ? (
+                  <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:"rgba(110,231,183,0.06)",border:`1px solid ${C.a}30`,borderRadius:8}}>
+                    <M style={{color:C.a,fontWeight:500,fontSize:11,flex:1}}>Configured ✓ (secret stored server-side)</M>
+                    <Btn small onClick={()=>{setSoarApiKey("");setSoarApiKeyChanging(true);}}>Change Secret</Btn>
+                  </div>
+                ) : (
+                  <div style={{display:"flex",gap:6}}>
+                    <input type="password" value={soarApiKey} onChange={e=>setSoarApiKey(e.target.value)} placeholder={soarApiKeyPresent?"New value (or leave blank to clear)":"Stored in secrets manager (Vault/AWS SM/Azure KV)"} maxLength={512} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                    {soarApiKeyPresent && <Btn small onClick={()=>{setSoarApiKey("");setSoarApiKeyChanging(false);}}>Cancel</Btn>}
+                  </div>
+                )}
+              </div>
             </div>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",fontSize:12,color:C.t,cursor:"pointer"}}>
               <input type="checkbox" checked={soarAutoEscalate} onChange={e=>setSoarAutoEscalate(e.target.checked)} style={{accentColor:C.a}}/>
@@ -3347,7 +3409,20 @@ function ManagementConsole() {
             <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>FireAlive also reads from your ticketing system (ServiceNow, Jira, TheHive, etc.) for metrics — MTTA/MTTR, ticket counts, resolution times. This is a read-only integration separate from the SOAR write channel. The read-only invariant is enforced server-side; the ticketing integration cannot be configured for write access from this UI or any other.</M>
             <Sel label="Ticketing platform" value={soarTicketingPlatform} onChange={e=>setSoarTicketingPlatform(e.target.value)}><option value="">Select...</option><option value="servicenow">ServiceNow</option><option value="jira">Jira Service Management</option><option value="thehive">TheHive</option><option value="pagerduty">PagerDuty</option><option value="freshservice">Freshservice</option><option value="custom">Custom REST API</option></Sel>
             <Input label="Read-only API endpoint" value={soarTicketingEndpoint} onChange={e=>setSoarTicketingEndpoint(e.target.value)} placeholder="https://corp.service-now.com/api/now/table/incident" maxLength={512}/>
-            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" value={soarTicketingApiKey} onChange={e=>setSoarTicketingApiKey(e.target.value)} placeholder="Read-only credentials" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
+            <div style={{marginBottom:14}}>
+              <M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M>
+              {soarTicketingApiKeyPresent && !soarTicketingApiKeyChanging ? (
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:"rgba(110,231,183,0.06)",border:`1px solid ${C.a}30`,borderRadius:8}}>
+                  <M style={{color:C.a,fontWeight:500,fontSize:11,flex:1}}>Configured ✓ (secret stored server-side)</M>
+                  <Btn small onClick={()=>{setSoarTicketingApiKey("");setSoarTicketingApiKeyChanging(true);}}>Change Secret</Btn>
+                </div>
+              ) : (
+                <div style={{display:"flex",gap:6}}>
+                  <input type="password" value={soarTicketingApiKey} onChange={e=>setSoarTicketingApiKey(e.target.value)} placeholder={soarTicketingApiKeyPresent?"New value (or leave blank to clear)":"Read-only credentials"} maxLength={512} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                  {soarTicketingApiKeyPresent && <Btn small onClick={()=>{setSoarTicketingApiKey("");setSoarTicketingApiKeyChanging(false);}}>Cancel</Btn>}
+                </div>
+              )}
+            </div>
           </Card>
 
           <Card style={{padding:12,borderColor:C.a+"30",marginBottom:16}}>
@@ -3389,13 +3464,19 @@ function ManagementConsole() {
               setSoarSaveError(null);
               setSoarSaveBusy(true);
               try {
-                const soarConfig = {platform:soarPlatform, apiEndpoint:soarUrl, serviceAccount:soarServiceAccount, apiKey:soarApiKey, autoEscalate:soarAutoEscalate};
+                // R3n: omit apiKey from PUT body unless the lead explicitly
+                // clicked "Change Secret" (server preserves existing on omission).
+                const soarConfig = {platform:soarPlatform, apiEndpoint:soarUrl, serviceAccount:soarServiceAccount, autoEscalate:soarAutoEscalate};
+                if (!soarApiKeyPresent || soarApiKeyChanging) soarConfig.apiKey = soarApiKey;
                 const soarRes = await api.put("/api/integrations/soar", {config:soarConfig});
                 if (soarRes?.error) { setSoarSaveError("SOAR save failed: "+soarRes.error); return; }
-                const ticketingConfig = {platform:soarTicketingPlatform, apiEndpoint:soarTicketingEndpoint, apiKey:soarTicketingApiKey};
+                const ticketingConfig = {platform:soarTicketingPlatform, apiEndpoint:soarTicketingEndpoint};
+                if (!soarTicketingApiKeyPresent || soarTicketingApiKeyChanging) ticketingConfig.apiKey = soarTicketingApiKey;
                 const tkRes = await api.put("/api/integrations/ticketing", {config:ticketingConfig});
                 if (tkRes?.error) { setSoarSaveError("Ticketing save failed: "+tkRes.error); return; }
                 addA("SOAR_CONFIG_SAVED","SOAR + Ticketing integrations saved");
+                // Re-hydrate from server so the form reflects post-save state
+                setSoarHydrated(false);
               } finally { setSoarSaveBusy(false); }
             }}>{soarSaveBusy?"Saving...":"Save SOAR Config"}</Btn>
             <Btn disabled={soarTestBusy} onClick={async()=>{
@@ -3443,25 +3524,30 @@ function ManagementConsole() {
             setRoutingSaveError(null);
             setRoutingSaveBusy(true);
             try {
-              const failures = [];
-              for (const a of dayAnalysts) {
-                const cap = routingCaps[a.id];
-                if (cap == null) continue;
-                const r = await api.put("/api/routing/"+a.id, {maxComplexity:cap});
-                // Tolerate "Analyst not found" 404 silently — happens in mock
-                // mode where dayAnalysts comes from ANALYSTS_INIT (short IDs)
-                // and the server's users table has different IDs. Real
-                // failures (500s, validation errors) get surfaced.
-                if (r?.error && !/not found/i.test(r.error)) {
-                  failures.push(a.name+": "+r.error);
-                }
+              // R3n C7: single bulk PUT replaces the per-analyst loop. Server
+              // diffs against current values and audit-logs each MC_ROUTING_
+              // CAP_CHANGED individually; unchanged caps produce no DB writes
+              // and no audit rows.
+              const caps = dayAnalysts
+                .map(a => ({analystId:a.id, maxComplexity:routingCaps[a.id]}))
+                .filter(c => Number.isInteger(c.maxComplexity));
+              const r = await api.post("/api/routing/bulk", {caps});
+              if (r?.error) {
+                setRoutingSaveError(r.error);
+                return;
               }
-              if (failures.length > 0) {
-                setRoutingSaveError(failures.join("; "));
+              // Tolerate "Analyst not found" errors silently in mock mode
+              // (dayAnalysts from ANALYSTS_INIT has short IDs that don't
+              // match server's users table). Real failures get surfaced.
+              const realFailures = (r?.errors||[]).filter(e => !/not found/i.test(e.error || ""));
+              if (realFailures.length > 0) {
+                setRoutingSaveError(realFailures.map(e => e.analystId+": "+e.error).join("; "));
                 return;
               }
               setUnsaved(false);
-              addA("ROUTING_APPLIED","Caps updated ("+dayAnalysts.length+" analyst(s))");
+              const updatedCount = (r?.updated||[]).length;
+              const unchangedCount = (r?.unchanged||[]).length;
+              addA("ROUTING_APPLIED", `Caps applied (${updatedCount} changed, ${unchangedCount} unchanged)`);
             } finally { setRoutingSaveBusy(false); }
           }}>{routingSaveBusy?"Saving...":"Apply"}</Btn>}</div>
           {routingSaveError&&<Card style={{padding:10,marginBottom:14,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Save error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{routingSaveError}</M></Card>}
@@ -3616,7 +3702,7 @@ function ManagementConsole() {
             <Input label="IdP Metadata URL" value={iamCfg.saml.metadataUrl} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,metadataUrl:e.target.value}}))} placeholder="https://idp.corp.com/metadata.xml" maxLength={512}/>
             <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>IdP Signing Certificate (PEM)</M><textarea value={iamCfg.saml.cert} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,cert:e.target.value}}))} placeholder="-----BEGIN CERTIFICATE-----" style={{width:"100%",height:60,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical"}} maxLength={5000}/></div>
             <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={iamCfg.saml.jit} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,jit:e.target.checked}}))} style={{accentColor:C.a}}/>Enable JIT user provisioning</label>
-            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,saml:{...prev.saml,status:"configured"}}));api.post("/api/v1/audit/log",{event:"IAM_CONFIGURED",detail:"SAML 2.0"}).then(()=>addA("IAM_CONFIGURED","SAML 2.0"));}}>Save SAML</Btn>
+            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,saml:{...prev.saml,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"SAML 2.0"}).then(()=>addA("IAM_CONFIGURED","SAML 2.0"));}}>Save SAML</Btn>
           </Card>)}
           {iamTab==="oidc"&&(<Card>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>OpenID Connect</div>
@@ -3626,7 +3712,7 @@ function ManagementConsole() {
               <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Client Secret</M><input type="password" value={iamCfg.oidc.secret} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,secret:e.target.value}}))} placeholder="••••••••" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} maxLength={256}/></div>
             </div>
             <Input label="Scopes" value={iamCfg.oidc.scopes} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,scopes:e.target.value}}))} maxLength={256}/>
-            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,oidc:{...prev.oidc,status:"configured"}}));api.post("/api/v1/audit/log",{event:"IAM_CONFIGURED",detail:"OIDC"}).then(()=>addA("IAM_CONFIGURED","OIDC"));}}>Save OIDC</Btn>
+            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,oidc:{...prev.oidc,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"OIDC"}).then(()=>addA("IAM_CONFIGURED","OIDC"));}}>Save OIDC</Btn>
           </Card>)}
           {iamTab==="ad"&&(<Card>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>Active Directory / LDAP</div>
@@ -3640,7 +3726,7 @@ function ManagementConsole() {
               <Input label="Sync interval (min)" value={iamCfg.ad.syncInterval} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,syncInterval:String(Math.max(1,Math.min(1440,Number(e.target.value)||15)))}}))} type="number" min={1} max={1440}/>
               <div style={{paddingTop:22}}><label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t}}><input type="checkbox" checked={iamCfg.ad.useTLS} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,useTLS:e.target.checked}}))} style={{accentColor:C.a}}/>LDAPS</label></div>
             </div>
-            <div style={{display:"flex",gap:8}}><Btn primary onClick={()=>{setIamCfg(prev=>({...prev,ad:{...prev.ad,status:"configured"}}));api.post("/api/v1/audit/log",{event:"IAM_CONFIGURED",detail:"Active Directory LDAPS"}).then(()=>addA("IAM_CONFIGURED","Active Directory LDAPS"));}}>Save AD</Btn><Btn onClick={()=>api.post("/api/v1/audit/log",{event:"AD_TEST",detail:"Testing LDAPS..."}).then(()=>addA("AD_TEST","Testing LDAPS..."))}>Test Connection</Btn></div>
+            <div style={{display:"flex",gap:8}}><Btn primary onClick={()=>{setIamCfg(prev=>({...prev,ad:{...prev.ad,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"Active Directory LDAPS"}).then(()=>addA("IAM_CONFIGURED","Active Directory LDAPS"));}}>Save AD</Btn><Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"AD_TEST",detail:"Testing LDAPS..."}).then(()=>addA("AD_TEST","Testing LDAPS..."))}>Test Connection</Btn></div>
           </Card>)}
           {iamTab==="cloud"&&(<Card>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>Cloud IAM</div>
@@ -3677,14 +3763,14 @@ function ManagementConsole() {
             {!devAuth?(<div>
               <Card style={{marginBottom:16,borderColor:C.d+"30",padding:12}}><M style={{color:C.d,fontWeight:500,display:"block",marginBottom:6}}>Restricted Access</M><M style={{color:C.tm,lineHeight:1.8}}>Exclusively for platform developers. Requires API key with kb:write scope.</M></Card>
               <Input label="Developer API Key" value={devKey} onChange={e=>setDevKey(e.target.value)} placeholder="swp-dev-xxxxxxxx" type="password" maxLength={256}/>
-              <Btn primary style={{width:"100%"}} onClick={()=>{if(devKey.length>8){setDevAuth(true);api.post("/api/v1/audit/log",{event:"KB_DEV_AUTH",detail:"Developer authenticated"}).then(()=>addA("KB_DEV_AUTH","Developer authenticated"));}}} disabled={devKey.length<8}>Authenticate</Btn>
+              <Btn primary style={{width:"100%"}} onClick={()=>{if(devKey.length>8){setDevAuth(true);api.post("/api/audit/mc-event",{event_type:"KB_DEV_AUTH",detail:"Developer authenticated"}).then(()=>addA("KB_DEV_AUTH","Developer authenticated"));}}} disabled={devKey.length<8}>Authenticate</Btn>
             </div>):(<div>
               <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
                 <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:6}}>Ingestion Workflow</M>
                 <M style={{color:C.tm,lineHeight:2}}>1. AI searches PubMed, PsycINFO, IEEE, ACM, USENIX, Scholar<br/>2. Quality filter: peer-reviewed only<br/>3. Structured extraction to KB schema<br/>4. Human review: approve/edit/reject<br/>5. KB version bump, prompts regenerated<br/>6. Signed deployment, anti-rollback counter incremented</M>
               </Card>
               <Card style={{padding:12,marginBottom:16}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Stats</M><M style={{color:C.tm,lineHeight:1.8}}>Entries: {KB_ENTRY_COUNT} · Version: {KB_VERSION} · Topics: {[...new Set(RESEARCH_KB.map(r=>r.topic))].length} · Strong: {RESEARCH_KB.filter(r=>r.strength==="strong").length} · Moderate: {RESEARCH_KB.filter(r=>r.strength==="moderate").length} · Years: {Math.min(...RESEARCH_KB.map(r=>r.year))}–{Math.max(...RESEARCH_KB.map(r=>r.year))}</M></Card>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"KB_SEARCH",detail:"AI research review initiated"}).then(()=>addA("KB_SEARCH","AI research review initiated"))}>Run AI Research Review</Btn><Btn onClick={()=>{const data=JSON.stringify({version:KB_VERSION,entryCount:KB_ENTRY_COUNT,exportedAt:new Date().toISOString(),entries:RESEARCH_KB},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-kb-${KB_VERSION}.json`;a.click();URL.revokeObjectURL(url);addA("KB_EXPORT","KB exported as JSON ("+data.length+" bytes, "+KB_ENTRY_COUNT+" entries)");}}>Export KB JSON</Btn></div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"KB_SEARCH",detail:"AI research review initiated"}).then(()=>addA("KB_SEARCH","AI research review initiated"))}>Run AI Research Review</Btn><Btn onClick={()=>{const data=JSON.stringify({version:KB_VERSION,entryCount:KB_ENTRY_COUNT,exportedAt:new Date().toISOString(),entries:RESEARCH_KB},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-kb-${KB_VERSION}.json`;a.click();URL.revokeObjectURL(url);addA("KB_EXPORT","KB exported as JSON ("+data.length+" bytes, "+KB_ENTRY_COUNT+" entries)");}}>Export KB JSON</Btn></div>
             </div>)}
           </Modal>}
         </div>)}
@@ -3775,8 +3861,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginTop:12}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Client Management Actions</div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"CLIENT_RESTORE_BACKUP",detail:"Select client to restore from known-good backup"}).then(()=>addA("CLIENT_RESTORE_BACKUP","Select client to restore from known-good backup"))}>Restore Client from Backup</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"CLIENT_REVERT_CONFIG",detail:"Select client to revert to previous config"}).then(()=>addA("CLIENT_REVERT_CONFIG","Select client to revert to previous config"))}>Revert Client Config</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_RESTORE_BACKUP",detail:"Select client to restore from known-good backup"}).then(()=>addA("CLIENT_RESTORE_BACKUP","Select client to restore from known-good backup"))}>Restore Client from Backup</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_REVERT_CONFIG",detail:"Select client to revert to previous config"}).then(()=>addA("CLIENT_REVERT_CONFIG","Select client to revert to previous config"))}>Revert Client Config</Btn>
             </div>
           </Card>
           {provisionedClients.length>0&&<>
@@ -3977,7 +4063,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Input label="Primary site CIDR" placeholder="10.0.0.0/16" maxLength={18}/>
             <Input label="Secondary site CIDR" placeholder="10.1.0.0/16" maxLength={18}/>
             <Input label="SD-WAN overlay network" placeholder="172.16.0.0/12" maxLength={18}/>
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"SDN_CONFIGURED",detail:"SDN integration configured"}).then(()=>addA("SDN_CONFIGURED","SDN integration configured"))}>Save SDN Configuration</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"SDN_CONFIGURED",detail:"SDN integration configured"}).then(()=>addA("SDN_CONFIGURED","SDN integration configured"))}>Save SDN Configuration</Btn>
           </Card>
         </div>)}
 
@@ -4008,7 +4094,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Compatibility Notes</M>
               <M style={{color:C.tm,lineHeight:1.8}}>Platform runs as distroless containers (no shell, no package manager). Compatible with any OCI-compliant runtime. vTPM support required for anti-rollback attestation on VMs. Nested virtualization supported but not required. GPU not required. Minimum: 2 vCPU, 4GB RAM, 20GB storage per service pod.</M>
             </Card>
-            <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/v1/audit/log",{event:"VIRT_CONFIGURED",detail:"Virtualization target configured"}).then(()=>addA("VIRT_CONFIGURED","Virtualization target configured"))}>Save Configuration</Btn>
+            <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"VIRT_CONFIGURED",detail:"Virtualization target configured"}).then(()=>addA("VIRT_CONFIGURED","Virtualization target configured"))}>Save Configuration</Btn>
           </Card>
         </div>)}
 
@@ -4074,7 +4160,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 </div>
               </Card>
             ))}
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"STORAGE_ROUTES_SAVED",detail:"Backup/log storage destinations configured"}).then(()=>addA("STORAGE_ROUTES_SAVED","Backup/log storage destinations configured"))}>Save Storage Routes</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"STORAGE_ROUTES_SAVED",detail:"Backup/log storage destinations configured"}).then(()=>addA("STORAGE_ROUTES_SAVED","Backup/log storage destinations configured"))}>Save Storage Routes</Btn>
           </Card>
           <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.a,marginBottom:10}}>Encryption at Rest</div>
@@ -4132,7 +4218,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               }
             }}>Take Differential Now</Btn>
             <Btn onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"capturing",hash:"..."};setSnapshots(prev=>[placeholder,...prev]);try{const r=await api.post("/api/backup",{});setSnapshots(prev=>prev.map(s=>s.id===localId?{id:r.id||localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"captured",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(captured)"}:s));addA("SNAPSHOT","id="+r.id);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"snapshot failed";setSnapshots(prev=>prev.map(s=>s.id===localId?{...s,status:"failed",hash:msg.slice(0,40)}:s));addA("SNAPSHOT_FAILED",msg);}}}>Capture Snapshot Now</Btn>
-            <Btn danger onClick={()=>{const exp={id:Date.now(),ts:new Date().toISOString(),status:"generating",format:"forensic-archive"};setFE(prev=>[exp,...prev]);api.post("/api/v1/audit/log",{event:"FORENSIC_EXPORT",detail:"Initiated"}).then(()=>addA("FORENSIC_EXPORT","Initiated"));setTimeout(()=>setFE(prev=>prev.map(e=>e.id===exp.id?{...e,status:"ready",size:"3.1 GB",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:e)),2500);}}>Export for Forensics</Btn>
+            <Btn danger onClick={()=>{const exp={id:Date.now(),ts:new Date().toISOString(),status:"generating",format:"forensic-archive"};setFE(prev=>[exp,...prev]);api.post("/api/audit/mc-event",{event_type:"FORENSIC_EXPORT",detail:"Initiated"}).then(()=>addA("FORENSIC_EXPORT","Initiated"));setTimeout(()=>setFE(prev=>prev.map(e=>e.id===exp.id?{...e,status:"ready",size:"3.1 GB",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:e)),2500);}}>Export for Forensics</Btn>
           </div>
           {snapshots.length>0&&<><L>Snapshots</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{snapshots.map(s=><div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{s.label}</M><br/><M style={{color:C.td}}>{new Date(s.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={C.a}>{s.status}</Badge><br/><M style={{color:C.td,fontSize:8}}>{s.hash}</M></div></div>)}</div></>}
           {forensicExports.length>0&&<><L>Forensic Exports</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{forensicExports.map(e=><div key={e.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{e.format}</M><br/><M style={{color:C.td}}>{new Date(e.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={e.status==="ready"?C.a:C.w}>{e.status}</Badge>{e.size&&<><br/><M style={{color:C.td}}>{e.size} · {e.hash}</M></>}</div></div>)}</div></>}
@@ -4395,21 +4481,21 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Sel label="On update found"><option value="notify">Notify lead only</option><option value="lab">Send to testing lab automatically</option><option value="lab_auto">Send to lab + auto-deploy on approval</option></Sel>
               <Sel label="Notification channel"><option value="console">Console alert only</option><option value="email">Email</option><option value="slack">Slack/Teams webhook</option><option value="all">All channels</option></Sel>
             </div>
-            <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/v1/audit/log",{event:"AUTO_UPDATE_SCHEDULE",detail:"Auto-update schedule configured"}).then(()=>addA("AUTO_UPDATE_SCHEDULE","Auto-update schedule configured"))}>Save Schedule</Btn>
+            <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTO_UPDATE_SCHEDULE",detail:"Auto-update schedule configured"}).then(()=>addA("AUTO_UPDATE_SCHEDULE","Auto-update schedule configured"))}>Save Schedule</Btn>
           </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Testing Lab Integration</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Configure your enterprise testing/staging environment. Signed artifacts are delivered for validation before production deployment.</M>
-            <Input label="Lab staging API endpoint" placeholder="https://cyber-lab.corp.local/api/v1/staging/upload" maxLength={512}/>
+            <Input label="Lab staging API endpoint" placeholder="https://lab.example.com/staging/upload" maxLength={512}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               <Input label="Lab API key / service account" placeholder="svc-soc-updates" maxLength={256}/>
               <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Lab API secret</M><input type="password" placeholder="Stored in secrets manager" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
             </div>
-            <Input label="Approval webhook" placeholder="https://soc-wellbeing.corp.local/api/v1/updates/approve" maxLength={512}/>
-            <Input label="Rejection webhook" placeholder="https://soc-wellbeing.corp.local/api/v1/updates/reject" maxLength={512}/>
+            <Input label="Approval webhook" placeholder="https://updates.example.com/webhooks/approve" maxLength={512}/>
+            <Input label="Rejection webhook" placeholder="https://updates.example.com/webhooks/reject" maxLength={512}/>
             <Sel label="Lab protocol"><option value="rest">REST API (push artifact)</option><option value="s3">S3/GCS/Blob</option><option value="artifactory">JFrog Artifactory</option><option value="nexus">Sonatype Nexus</option><option value="ghcr">GitHub Container Registry</option></Sel>
             <Card style={{padding:10,marginTop:8,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Pipeline Flow</M><M style={{color:C.tm,lineHeight:1.8}}>Check for update → Verify Ed25519 signature → Push to lab → Functional + security + compatibility tests → Lab approval webhook → Deploy → Increment anti-rollback fuse → Notify lead</M></Card>
-            <div style={{display:"flex",gap:8,marginTop:12}}><Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"LAB_CONFIG_SAVED",detail:"Testing lab integration configured"}).then(()=>addA("LAB_CONFIG_SAVED","Testing lab integration configured"))}>Save Lab Config</Btn><Btn onClick={()=>api.post("/api/v1/audit/log",{event:"LAB_TEST_CONNECTION",detail:"Testing connection to lab endpoint..."}).then(()=>addA("LAB_TEST_CONNECTION","Testing connection to lab endpoint..."))}>Test Connection</Btn></div>
+            <div style={{display:"flex",gap:8,marginTop:12}}><Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"LAB_CONFIG_SAVED",detail:"Testing lab integration configured"}).then(()=>addA("LAB_CONFIG_SAVED","Testing lab integration configured"))}>Save Lab Config</Btn><Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"LAB_TEST_CONNECTION",detail:"Testing connection to lab endpoint..."}).then(()=>addA("LAB_TEST_CONNECTION","Testing connection to lab endpoint..."))}>Test Connection</Btn></div>
           </Card>
           <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Version & Anti-Rollback Status</div>
@@ -4499,7 +4585,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Startup Configuration (Admin/Provisioning)</M>
             <M style={{color:C.tm,lineHeight:1.8}}>The FireAlive client must run at system startup for notifications to work. This should be configured by administrators during workstation provisioning — not by analysts (who typically lack admin privileges). Deploy via Group Policy (Windows), MDM profile (macOS), systemd user service (Linux), or include in the SOC workstation image. See the Onboard tab and README for provisioning instructions.</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"CLIENT_NOTIF_CONFIG",detail:"Client notification configuration saved"}).then(()=>addA("CLIENT_NOTIF_CONFIG","Client notification configuration saved"))}>Save Notification Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_NOTIF_CONFIG",detail:"Client notification configuration saved"}).then(()=>addA("CLIENT_NOTIF_CONFIG","Client notification configuration saved"))}>Save Notification Config</Btn>
         </div>)}
 
         {/* ══════════ CLOUD VULN SCAN ══════════ */}
@@ -4519,7 +4605,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Sel label="Target environment" value={cloudVulnCfg.targetEnvironment||""} onChange={e=>setCloudVulnCfg(prev=>({...prev,targetEnvironment:e.target.value}))}><option value="">Select...</option><option value="aws">AWS</option><option value="azure">Azure</option><option value="gcp">GCP</option><option value="multi">Multi-cloud</option></Sel>
             <Sel label="Schedule" value={cloudVulnCfg.schedule} onChange={e=>setCloudVulnCfg(prev=>({...prev,schedule:e.target.value}))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="manual">Manual only</option></Sel>
           </div>
-          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/v1/audit/log",{event:"CLOUD_VULNSCAN_CONFIG",detail:"Cloud vulnerability scan configuration saved"}).then(()=>addA("CLOUD_VULNSCAN_CONFIG","Cloud vulnerability scan configuration saved"))}>Save Config</Btn>
+          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLOUD_VULNSCAN_CONFIG",detail:"Cloud vulnerability scan configuration saved"}).then(()=>addA("CLOUD_VULNSCAN_CONFIG","Cloud vulnerability scan configuration saved"))}>Save Config</Btn>
         </div>)}
 
         {/* ══════════ REGRESSION TEST ══════════ */}
@@ -5116,7 +5202,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </div>
             )}
           </Card>
-          <Card style={{marginBottom:16,borderColor:C.p+"30"}}><div style={{fontSize:13,fontWeight:600,color:C.p,marginBottom:10}}>Helper Pay (Quality-Based)</div><M style={{color:C.tm,display:"block",marginBottom:12}}>Points from 4-5 star ratings. Pseudonymized leaderboard.</M><label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Enable</M></label><Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/integrations/save",{type:"helper_pay",platform:"internal"}).then(()=>addA("HP","Helper pay config saved"))}>Save</Btn></Card>
+          <Card style={{marginBottom:16,borderColor:C.p+"30"}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.p,marginBottom:10}}>Helper Pay (Quality-Based)</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Points from 4-5 star ratings. Pseudonymized leaderboard. The 4-field system config (enabled, points threshold, pay differential, designated helper threshold) lives in the dedicated <strong style={{color:C.t}}>Helper Pay tab → Config</strong> section.</M>
+            <Btn onClick={()=>setTab("helper_pay")}>Open Helper Pay Configuration →</Btn>
+          </Card>
           <Card><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Chat Disclaimer</div>
             <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>The peer skill-share disclaimer is persistent and applies uniformly to all participants. It covers purpose, anonymity, conduct rules, abuse policy (including flag misuse warning), the not-counseling notice, and the 5-minute post-session retention window for rating and abuse review. Management cannot edit this text — this is the analysts' space. If you do not want analysts using peer skill-share, disable it in Feature Toggles.</M>
           </Card>
@@ -5138,6 +5228,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {id:"pending",label:"Pending Queue",badge:helperPending.length},
               {id:"catalog",label:"Catalog"},
               {id:"tools",label:"Audit Tools"},
+              {id:"config",label:"Config"},
             ].map(s=>(
               <button key={s.id} onClick={()=>setHelperSection(s.id)} style={{padding:"8px 14px",background:helperSection===s.id?C.ad:"transparent",border:`1px solid ${helperSection===s.id?C.a+"50":C.b}`,borderRadius:8,color:helperSection===s.id?C.a:C.tm,fontSize:11,fontWeight:500,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
                 {s.label}
@@ -5221,6 +5312,70 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <Btn onClick={()=>downloadCsv("ledger")}>Download Ledger CSV</Btn>
                 <Btn onClick={()=>downloadCsv("redemptions")}>Download Redemptions CSV</Btn>
               </div>
+            </Card>
+          </div>)}
+
+          {helperSection==="config"&&(<div>
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Helper Pay System Configuration</div>
+              <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Runtime configuration for the Helper Pay subsystem. These settings govern how points are awarded and redeemed when the feature is enabled; the future Features tab will control whether the entire subsystem is available.</M>
+              {(() => {
+                if (!hpCfgLoaded && tab === "helper_pay" && helperSection === "config") {
+                  // Trigger lazy hydration on first view of this section
+                  // (We use a setTimeout-style "fire once" via the loaded flag.)
+                }
+                return null;
+              })()}
+              {!hpCfgLoaded ? (
+                <M style={{color:C.td,fontStyle:"italic"}}>Loading config...</M>
+              ) : (
+                <div>
+                  <label style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:hpCfg.enabled?"rgba(110,231,183,0.06)":"rgba(255,255,255,0.02)",border:`1px solid ${hpCfg.enabled?C.a+"40":C.b}`,borderRadius:8,cursor:"pointer",marginBottom:14}}>
+                    <input type="checkbox" checked={hpCfg.enabled} onChange={e=>setHpCfg(prev=>({...prev, enabled:e.target.checked}))} style={{accentColor:C.a}}/>
+                    <div>
+                      <div style={{fontSize:12,color:C.t,fontWeight:500}}>Helper Pay enabled</div>
+                      <M style={{color:C.tm,marginTop:2}}>When disabled, peer-help sessions do not accrue points and redemption is gated. Existing balances are preserved.</M>
+                    </div>
+                  </label>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+                    <div>
+                      <M style={{color:C.tm,marginBottom:4,display:"block"}}>Points threshold (min to redeem)</M>
+                      <input type="number" min={1} value={hpCfg.pointsThreshold} onChange={e=>setHpCfg(prev=>({...prev, pointsThreshold:parseInt(e.target.value,10)||0}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                    </div>
+                    <div>
+                      <M style={{color:C.tm,marginBottom:4,display:"block"}}>Pay differential (%)</M>
+                      <input type="number" min={0} max={100} step={0.5} value={hpCfg.payDifferentialPct} onChange={e=>setHpCfg(prev=>({...prev, payDifferentialPct:parseFloat(e.target.value)||0}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                    </div>
+                  </div>
+                  <div style={{marginBottom:14}}>
+                    <M style={{color:C.tm,marginBottom:4,display:"block"}}>Designated helper threshold (points to qualify as designated helper)</M>
+                    <input type="number" min={hpCfg.pointsThreshold||1} value={hpCfg.designatedHelperThreshold} onChange={e=>setHpCfg(prev=>({...prev, designatedHelperThreshold:parseInt(e.target.value,10)||0}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                    <M style={{color:C.td,display:"block",marginTop:4}}>Must be ≥ points threshold above.</M>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <Btn primary disabled={hpCfgSaveBusy} onClick={async()=>{
+                      setHpCfgSaveError(null);
+                      setHpCfgSaveBusy(true);
+                      try {
+                        const r = await api.put("/api/helper-pay/config", hpCfg);
+                        if (r?.error) {
+                          setHpCfgSaveError(r.error);
+                          return;
+                        }
+                        setHpCfgUpdatedAt(new Date().toISOString());
+                        setHpCfgSource("stored");
+                        api.post("/api/audit/mc-event",{event_type:"HELPER_PAY_CONFIG_SAVED",detail:"enabled="+hpCfg.enabled+" pt="+hpCfg.pointsThreshold+" pct="+hpCfg.payDifferentialPct+" dh="+hpCfg.designatedHelperThreshold}).then(()=>addA("HELPER_PAY_CONFIG_SAVED","Helper Pay config saved"));
+                      } catch (err) {
+                        setHpCfgSaveError(err?.message || "Save failed");
+                      } finally {
+                        setHpCfgSaveBusy(false);
+                      }
+                    }}>{hpCfgSaveBusy?"Saving...":"Save Configuration"}</Btn>
+                    <M style={{color:C.td,fontSize:10}}>{hpCfgSource==="stored" && hpCfgUpdatedAt ? ("Saved at "+new Date(hpCfgUpdatedAt).toLocaleString()) : "Using defaults"}</M>
+                  </div>
+                  {hpCfgSaveError && <Card style={{padding:10,marginTop:10,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Save error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{hpCfgSaveError}</M></Card>}
+                </div>
+              )}
             </Card>
           </div>)}
 
@@ -5362,7 +5517,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 </div>
               ))}
             </div>
-            <Btn small primary style={{marginTop:10}} onClick={()=>api.post("/api/v1/audit/log",{event:"THRESHOLDS_SAVED",detail:"Alert thresholds updated"}).then(()=>addA("THRESHOLDS_SAVED","Alert thresholds updated"))}>Save Thresholds</Btn>
+            <Btn small primary style={{marginTop:10}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"THRESHOLDS_SAVED",detail:"Alert thresholds updated"}).then(()=>addA("THRESHOLDS_SAVED","Alert thresholds updated"))}>Save Thresholds</Btn>
           </Card>
           {/* R3l C15: Connected Sessions card, wired to /api/system/connected-clients */}
           <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Sessions (WebSocket)</div>
@@ -5408,11 +5563,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </table>
             </div>
             <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
-              <Btn small primary onClick={()=>api.post("/api/v1/audit/log",{event:"CLIENT_METRICS_REFRESH",detail:"Refreshed metrics from all clients"}).then(()=>addA("CLIENT_METRICS_REFRESH","Refreshed metrics from all clients"))}>Refresh All</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"LOG_INTEGRITY_ALL",detail:"Log integrity check triggered on all clients"}).then(()=>addA("LOG_INTEGRITY_ALL","Log integrity check triggered on all clients"))}>Log Integrity Check</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"REGRESSION_ALL_CLIENTS",detail:"Regression tests triggered on all clients"}).then(()=>addA("REGRESSION_ALL_CLIENTS","Regression tests triggered on all clients"))}>Regression Test (All)</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"VULN_SCAN_ALL_CLIENTS",detail:"Vulnerability scan triggered on all clients"}).then(()=>addA("VULN_SCAN_ALL_CLIENTS","Vulnerability scan triggered on all clients"))}>Vuln Scan (All)</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"BACKUP_ALL_CLIENTS",detail:"Backup triggered on all clients"}).then(()=>addA("BACKUP_ALL_CLIENTS","Backup triggered on all clients"))}>Backup All Clients</Btn>
+              <Btn small primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_METRICS_REFRESH",detail:"Refreshed metrics from all clients"}).then(()=>addA("CLIENT_METRICS_REFRESH","Refreshed metrics from all clients"))}>Refresh All</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"LOG_INTEGRITY_ALL",detail:"Log integrity check triggered on all clients"}).then(()=>addA("LOG_INTEGRITY_ALL","Log integrity check triggered on all clients"))}>Log Integrity Check</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"REGRESSION_ALL_CLIENTS",detail:"Regression tests triggered on all clients"}).then(()=>addA("REGRESSION_ALL_CLIENTS","Regression tests triggered on all clients"))}>Regression Test (All)</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"VULN_SCAN_ALL_CLIENTS",detail:"Vulnerability scan triggered on all clients"}).then(()=>addA("VULN_SCAN_ALL_CLIENTS","Vulnerability scan triggered on all clients"))}>Vuln Scan (All)</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"BACKUP_ALL_CLIENTS",detail:"Backup triggered on all clients"}).then(()=>addA("BACKUP_ALL_CLIENTS","Backup triggered on all clients"))}>Backup All Clients</Btn>
             </div>
           </Card>
           <Card style={{marginTop:12}}>
@@ -5424,7 +5579,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </Sel>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}><input type="checkbox" checked={updatePushCfg.requireLabTest} onChange={e=>setUpdatePushCfg(prev=>({...prev,requireLabTest:e.target.checked}))}/><M style={{color:C.t}}>Require lab testing before production push</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}><input type="checkbox" checked={updatePushCfg.rollbackOnFail} onChange={e=>setUpdatePushCfg(prev=>({...prev,rollbackOnFail:e.target.checked}))}/><M style={{color:C.t}}>Auto-rollback if health check fails post-update</M></label>
-            <Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/v1/audit/log",{event:"UPDATE_PUSH",detail:"Update push initiated to all clients — staggered deployment"}).then(()=>addA("UPDATE_PUSH","Update push initiated to all clients — staggered deployment"))}>Push Update to All Clients</Btn>
+            <Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"UPDATE_PUSH",detail:"Update push initiated to all clients — staggered deployment"}).then(()=>addA("UPDATE_PUSH","Update push initiated to all clients — staggered deployment"))}>Push Update to All Clients</Btn>
           </Card>
         </div>)}
 
@@ -5444,7 +5599,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Btn primary onClick={()=>{const q=siemQuerySiem==="splunk"?`index=firealive sourcetype=firealive:${siemQueryType} earliest="-7d" latest="now"\n| stats count by risk_tier\n| sort -count`:siemQuerySiem==="qradar"?`SELECT risk_tier, COUNT(*) as count FROM events WHERE LOGSOURCENAME(logsourceid) = 'FireAlive' GROUP BY risk_tier LAST 7 DAYS`:siemQuerySiem==="elastic"?`GET firealive-*/_search\n{\n  "query": { "range": { "@timestamp": { "gte": "now-7d" } } },\n  "aggs": { "by_tier": { "terms": { "field": "risk_tier" } } }\n}`:`FireAlive_CL\n| where TimeGenerated > ago(7d)\n| summarize count() by risk_tier\n| sort by count_ desc`;setSiemQueryOutput(q);addA("SIEM_QUERY_GENERATED",`${siemQueryType} for ${siemQuerySiem}`);}}>Generate Query</Btn>
           </Card>
           {siemQueryOutput&&(<Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><M style={{color:"#E8EDF5",fontWeight:500}}>{siemQuerySiem.charAt(0).toUpperCase()+siemQuerySiem.slice(1)} Query</M><Btn small onClick={()=>{navigator.clipboard?.writeText(siemQueryOutput);api.post("/api/v1/audit/log",{event:"SIEM_QUERY_COPIED",detail:"Query copied to clipboard"}).then(()=>addA("SIEM_QUERY_COPIED","Query copied to clipboard"));}}>Copy</Btn></div>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><M style={{color:"#E8EDF5",fontWeight:500}}>{siemQuerySiem.charAt(0).toUpperCase()+siemQuerySiem.slice(1)} Query</M><Btn small onClick={()=>{navigator.clipboard?.writeText(siemQueryOutput);api.post("/api/audit/mc-event",{event_type:"SIEM_QUERY_COPIED",detail:"Query copied to clipboard"}).then(()=>addA("SIEM_QUERY_COPIED","Query copied to clipboard"));}}>Copy</Btn></div>
             <pre style={{padding:12,background:"rgba(0,0,0,0.3)",borderRadius:8,color:C.a,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",whiteSpace:"pre-wrap",overflowX:"auto"}}>{siemQueryOutput}</pre>
           </Card>)}
           <L style={{marginTop:20}}>Internal App Query Tool</L>
@@ -5519,7 +5674,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>{const name=window.prompt("Snapshot name:");if(name){setConfigSnaps(prev=>[{id:"cs-"+Date.now(),name,createdAt:new Date().toISOString()},...prev]);addA("CONFIG_SNAPSHOT_SAVED",`"${name}"`);}}}>Save Current</Btn><Btn small onClick={()=>{const data=JSON.stringify({exportType:"firealive_config",version:appVersion||"unknown",exportedAt:new Date().toISOString()},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-config-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);api.post("/api/v1/audit/log",{event:"CONFIG_EXPORTED",detail:"Configuration file downloaded"}).then(()=>addA("CONFIG_EXPORTED","Configuration file downloaded"));}}>Export Config</Btn><Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"CHANGE_REPORT",detail:"Configuration change report generated"}).then(()=>addA("CHANGE_REPORT","Configuration change report generated"))}>Change Report</Btn></div></div>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>{const name=window.prompt("Snapshot name:");if(name){setConfigSnaps(prev=>[{id:"cs-"+Date.now(),name,createdAt:new Date().toISOString()},...prev]);addA("CONFIG_SNAPSHOT_SAVED",`"${name}"`);}}}>Save Current</Btn><Btn small onClick={()=>{const data=JSON.stringify({exportType:"firealive_config",version:appVersion||"unknown",exportedAt:new Date().toISOString()},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-config-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);api.post("/api/audit/mc-event",{event_type:"CONFIG_EXPORTED",detail:"Configuration file downloaded"}).then(()=>addA("CONFIG_EXPORTED","Configuration file downloaded"));}}>Export Config</Btn><Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"CHANGE_REPORT",detail:"Configuration change report generated"}).then(()=>addA("CHANGE_REPORT","Configuration change report generated"))}>Change Report</Btn></div></div>
             {configSnapshots.map(s=>(
               <div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                 <div><M style={{color:C.t}}>{s.name}</M><br/><M style={{color:C.td}}>{s.createdAt}</M></div>
@@ -5542,12 +5697,12 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Card style={{textAlign:"center",padding:12}}><div style={{fontSize:20,fontWeight:600,color:C.w}}>{assessments.length}</div><M style={{color:C.td}}>Assessments</M></Card>
             </div>
             <div style={{display:"flex",gap:8}}>
-              <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"RECERT_COMPLETED",detail:"Recertification review completed"}).then(()=>addA("RECERT_COMPLETED","Recertification review completed"))}>Mark Recertification Complete</Btn>
-              <Btn onClick={()=>api.post("/api/v1/audit/log",{event:"RECERT_REPORT",detail:"Recertification report generated"}).then(()=>addA("RECERT_REPORT","Recertification report generated"))}>Generate Report</Btn>
+              <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_COMPLETED",detail:"Recertification review completed"}).then(()=>addA("RECERT_COMPLETED","Recertification review completed"))}>Mark Recertification Complete</Btn>
+              <Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_REPORT",detail:"Recertification report generated"}).then(()=>addA("RECERT_REPORT","Recertification report generated"))}>Generate Report</Btn>
             </div>
           </Card>
           <Card><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Schedule</div>
-            <Sel label="Review interval" value="90" onChange={()=>api.post("/api/v1/audit/log",{event:"RECERT_INTERVAL",detail:"Interval updated"}).then(()=>addA("RECERT_INTERVAL","Interval updated"))}>
+            <Sel label="Review interval" value="90" onChange={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_INTERVAL",detail:"Interval updated"}).then(()=>addA("RECERT_INTERVAL","Interval updated"))}>
               <option value="30">Monthly (30 days)</option><option value="90">Quarterly (90 days)</option><option value="180">Semi-annual (180 days)</option><option value="365">Annual (365 days)</option>
             </Sel>
           </Card>
@@ -5566,7 +5721,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginBottom:16}}>
             <Input label="Allowed Scanner IPs (one per line)" placeholder="10.0.1.50&#10;10.0.1.51"/>
             <Sel label="Scan Schedule"><option value="weekly">Weekly</option><option value="daily">Daily</option><option value="monthly">Monthly</option><option value="manual">Manual Only</option></Sel>
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"VULNSCAN_CONFIG_SAVED",detail:"Vulnerability scanner config saved"}).then(()=>addA("VULNSCAN_CONFIG_SAVED","Vulnerability scanner config saved"))}>Save Config</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"VULNSCAN_CONFIG_SAVED",detail:"Vulnerability scanner config saved"}).then(()=>addA("VULNSCAN_CONFIG_SAVED","Vulnerability scanner config saved"))}>Save Config</Btn>
           </Card>
         </div>)}
 
@@ -5590,7 +5745,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </div>
             <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Require MFA for admin actions</M></label>
             <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Bind sessions to IP + user agent</M></label>
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"ACCESS_CTRL_SAVED",detail:"Access control config saved"}).then(()=>addA("ACCESS_CTRL_SAVED","Access control config saved"))}>Save</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"ACCESS_CTRL_SAVED",detail:"Access control config saved"}).then(()=>addA("ACCESS_CTRL_SAVED","Access control config saved"))}>Save</Btn>
           </Card>
         </div>)}
 
@@ -5607,7 +5762,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox"/><M style={{color:C.t}}>Enable SWG policy enforcement</M></label>
             <Input label="FWaaS Policy ID" placeholder="Policy identifier"/>
             <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox"/><M style={{color:C.t}}>Deploy FireAlive as SECaaS within SASE</M></label>
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"SASE_CONFIG_SAVED",detail:"SASE integration configured"}).then(()=>addA("SASE_CONFIG_SAVED","SASE integration configured"))}>Save SASE Config</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"SASE_CONFIG_SAVED",detail:"SASE integration configured"}).then(()=>addA("SASE_CONFIG_SAVED","SASE integration configured"))}>Save SASE Config</Btn>
           </Card>
         </div>)}
 
@@ -5623,7 +5778,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>0</div><M style={{color:C.td}}>ID Gaps</M></Card>
               <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>0</div><M style={{color:C.td}}>Time Gaps</M></Card>
             </div>
-            <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"LOG_INTEGRITY_CHECK",detail:"Manual integrity check — passed"}).then(()=>addA("LOG_INTEGRITY_CHECK","Manual integrity check — passed"))}>Run Check Now</Btn>
+            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"LOG_INTEGRITY_CHECK",detail:"Manual integrity check — passed"}).then(()=>addA("LOG_INTEGRITY_CHECK","Manual integrity check — passed"))}>Run Check Now</Btn>
           </Card>
           <Card>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Protection Mechanisms</div>
@@ -5635,7 +5790,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {tab==="risk_report"&&(<div>
           <L>Human Impact Risk Report</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate a report linking incident types to analyst burnout metrics, quantified for enterprise risk registers. Includes annualized human capital costs (turnover, training replacement), incident-to-burnout correlation data, and risk register entries with mitigations.</M>
-          <Btn primary disabled={hirLoading} onClick={()=>{setHirLoading(true);setTimeout(()=>{setHIR({totalCost:228650,churnCost:178500,entries:[{id:"HR-BURN-001",type:"Ransomware",impact:"severe",cost:61200,exit:"+18%",recovery:"14 days",mitigations:["Post-incident wellness protocol","Mandatory 24hr reduced queue","CISM retrospective within 72hr"]},{id:"HR-BURN-002",type:"APT",impact:"severe",cost:93500,exit:"+22%",recovery:"21 days",mitigations:["Analyst rotation during sustained investigations","Shift handoff with full context transfer"]},{id:"HR-BURN-003",type:"Phishing (high vol)",impact:"moderate",cost:12750,exit:"+5%",recovery:"5 days",mitigations:["Automated phishing triage","Pattern-based auto-close"]},{id:"HR-BURN-004",type:"Data Exfiltration",impact:"high",cost:30600,exit:"+12%",recovery:"10 days",mitigations:["Automated DLP correlation","Dedicated forensics handoff"]},{id:"HR-BURN-005",type:"Insider Threat",impact:"high",cost:25500,exit:"+15%",recovery:"12 days",mitigations:["Anonymize investigation subjects","Limit to 2 analysts"]},{id:"HR-BURN-006",type:"DDoS",impact:"low",cost:5100,exit:"+3%",recovery:"3 days",mitigations:["Automated DDoS triage","Runbook-driven response"]}]});setHirLoading(false);api.post("/api/v1/audit/log",{event:"HUMAN_IMPACT_REPORT",detail:"Human impact risk report generated — total annualized cost: $228,650"}).then(()=>addA("HUMAN_IMPACT_REPORT","Human impact risk report generated — total annualized cost: $228,650"));},1500);}}>{hirLoading?"Generating...":"Generate Report"}</Btn>
+          <Btn primary disabled={hirLoading} onClick={()=>{setHirLoading(true);setTimeout(()=>{setHIR({totalCost:228650,churnCost:178500,entries:[{id:"HR-BURN-001",type:"Ransomware",impact:"severe",cost:61200,exit:"+18%",recovery:"14 days",mitigations:["Post-incident wellness protocol","Mandatory 24hr reduced queue","CISM retrospective within 72hr"]},{id:"HR-BURN-002",type:"APT",impact:"severe",cost:93500,exit:"+22%",recovery:"21 days",mitigations:["Analyst rotation during sustained investigations","Shift handoff with full context transfer"]},{id:"HR-BURN-003",type:"Phishing (high vol)",impact:"moderate",cost:12750,exit:"+5%",recovery:"5 days",mitigations:["Automated phishing triage","Pattern-based auto-close"]},{id:"HR-BURN-004",type:"Data Exfiltration",impact:"high",cost:30600,exit:"+12%",recovery:"10 days",mitigations:["Automated DLP correlation","Dedicated forensics handoff"]},{id:"HR-BURN-005",type:"Insider Threat",impact:"high",cost:25500,exit:"+15%",recovery:"12 days",mitigations:["Anonymize investigation subjects","Limit to 2 analysts"]},{id:"HR-BURN-006",type:"DDoS",impact:"low",cost:5100,exit:"+3%",recovery:"3 days",mitigations:["Automated DDoS triage","Runbook-driven response"]}]});setHirLoading(false);api.post("/api/audit/mc-event",{event_type:"HUMAN_IMPACT_REPORT",detail:"Human impact risk report generated — total annualized cost: $228,650"}).then(()=>addA("HUMAN_IMPACT_REPORT","Human impact risk report generated — total annualized cost: $228,650"));},1500);}}>{hirLoading?"Generating...":"Generate Report"}</Btn>
           {humanImpactReport&&(<div style={{marginTop:16}}>
             <div style={{display:"flex",gap:12,marginBottom:16}}>
               <Card style={{flex:1,padding:12,borderColor:C.d+"30",textAlign:"center"}}><div style={{fontSize:20,fontWeight:700,color:C.d}}>${humanImpactReport.totalCost.toLocaleString()}</div><M style={{color:C.tm}}>Annualized Human Impact Cost</M></Card>
@@ -5674,7 +5829,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={edrCfg.blockOnThreat} onChange={e=>setEdrCfg(prev=>({...prev,blockOnThreat:e.target.checked}))}/><M style={{color:C.d}}>Block processing if threat detected</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={edrCfg.quarantineOnSuspicious} onChange={e=>setEdrCfg(prev=>({...prev,quarantineOnSuspicious:e.target.checked}))}/><M style={{color:C.w}}>Quarantine suspicious files for manual review</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"EDR_CONFIG_SAVED",detail:"EDR file inspection configuration saved"}).then(()=>addA("EDR_CONFIG_SAVED","EDR file inspection configuration saved"))}>Save EDR Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"EDR_CONFIG_SAVED",detail:"EDR file inspection configuration saved"}).then(()=>addA("EDR_CONFIG_SAVED","EDR file inspection configuration saved"))}>Save EDR Config</Btn>
         </div>)}
 
         {/* ══════════ MALWARE SCANNER INTEGRATION (Phase F4c) ══════════ */}
@@ -5860,7 +6015,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <label key={u.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={kmsCfg.keyUsage[u.k]} onChange={e=>setKmsCfg(prev=>({...prev,keyUsage:{...prev.keyUsage,[u.k]:e.target.checked}}))}/><M style={{color:C.t}}>{u.l}</M></label>
             ))}
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"KMS_CONFIG_SAVED",detail:"Enterprise KMS configuration saved"}).then(()=>addA("KMS_CONFIG_SAVED","Enterprise KMS configuration saved"))}>Save KMS Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"KMS_CONFIG_SAVED",detail:"Enterprise KMS configuration saved"}).then(()=>addA("KMS_CONFIG_SAVED","Enterprise KMS configuration saved"))}>Save KMS Config</Btn>
         </div>)}
 
         {/* ══════════ WIFI SECURITY POLICY ══════════ */}
@@ -5880,7 +6035,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={wifiPolicy.warnOnInsecure} onChange={e=>setWifiPolicy(prev=>({...prev,warnOnInsecure:e.target.checked}))}/><M style={{color:C.w}}>Warn analyst when WiFi is below policy</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={wifiPolicy.disconnectOnInsecure} onChange={e=>setWifiPolicy(prev=>({...prev,disconnectOnInsecure:e.target.checked}))}/><M style={{color:C.d}}>Disconnect client if WiFi is below policy (strict mode)</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"WIFI_POLICY_SAVED",detail:"WiFi security policy saved"}).then(()=>addA("WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"WIFI_POLICY_SAVED",detail:"WiFi security policy saved"}).then(()=>addA("WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
         </div>)}
 
         {/* ══════════ MSP MULTI-TENANCY ══════════ */}
@@ -5904,7 +6059,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             mspCfg.tenants.map(t=><Card key={t.id} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${C.a}`}}><div style={{display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t,fontWeight:500}}>{t.name}</M><br/><M style={{color:C.td}}>{t.domain} · Key: {t.encryptionKeyId?.slice(0,8)}…</M></div><Badge color={C.a}>{t.status}</Badge></div></Card>)}
             <div style={{display:"flex",gap:8,marginTop:10}}><Input label="New tenant name" value={newTenantName} onChange={e=>setNewTenantName(e.target.value)} placeholder="Client org name" maxLength={128}/><Btn primary disabled={!newTenantName.trim()} style={{marginTop:16}} onClick={()=>{const t={id:Math.random().toString(36).slice(2,10),name:newTenantName,domain:"",encryptionKeyId:Math.random().toString(36).slice(2,18),createdAt:new Date().toISOString(),status:"active"};setMspCfg(prev=>({...prev,tenants:[...prev.tenants,t]}));setNewTenantName("");addA("MSP_TENANT_CREATED","Tenant created: "+t.name);}}>Add Tenant</Btn></div>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"MSP_CONFIG_SAVED",detail:"MSP multi-tenancy configuration saved"}).then(()=>addA("MSP_CONFIG_SAVED","MSP multi-tenancy configuration saved"))}>Save MSP Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"MSP_CONFIG_SAVED",detail:"MSP multi-tenancy configuration saved"}).then(()=>addA("MSP_CONFIG_SAVED","MSP multi-tenancy configuration saved"))}>Save MSP Config</Btn>
         </div>)}
 
         {/* ══════════ R3f — MFA SELF-SERVICE + ADMIN POLICY ══════════ */}
@@ -5960,7 +6115,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>What These Integrations Inspect</M>
             <M style={{color:C.tm,lineHeight:1.8}}>Uploaded files (analyst attachments, config imports) · App update packages (before installation) · Application behavior patterns (API call frequency, memory usage, DB access patterns) · Resource consumption metrics (CPU, memory, network I/O anomalies) · All scanning integrations use read-only API tokens scoped to the specific inspection function</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"THREAT_HUNT_CONFIG_SAVED",detail:"Threat hunting integrations saved"}).then(()=>addA("THREAT_HUNT_CONFIG_SAVED","Threat hunting integrations saved"))}>Save All Threat Hunting Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"THREAT_HUNT_CONFIG_SAVED",detail:"Threat hunting integrations saved"}).then(()=>addA("THREAT_HUNT_CONFIG_SAVED","Threat hunting integrations saved"))}>Save All Threat Hunting Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — TRIPWIRE ══════════ */}
@@ -5979,8 +6134,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           {tripwireTriggered&&<Card style={{padding:14,borderColor:C.d,marginBottom:16,animation:"pulse 1.5s infinite"}}><M style={{color:C.d,fontWeight:700,fontSize:14}}>⚠ TRIPWIRE TRIGGERED</M><M style={{color:C.tm,display:"block",marginTop:6}}>Routing DISABLED. Training CANCELLED. Filter OFF.</M></Card>}
           <div style={{display:"flex",gap:8}}>
             <Btn primary onClick={()=>addA("TRIPWIRE_CONFIG_SAVED","Tripwire config saved — threshold: "+tripwireCfg.thresholdPct+"%")}>Save Tripwire Config</Btn>
-            <Btn onClick={()=>{setTripwireTriggered(true);setPanicMode(true);api.post("/api/v1/audit/log",{event:"TRIPWIRE_MANUAL_TEST",detail:"Tripwire triggered"}).then(()=>addA("TRIPWIRE_MANUAL_TEST","Tripwire triggered"));}}>Test Tripwire</Btn>
-            {tripwireTriggered&&<Btn onClick={()=>{setTripwireTriggered(false);api.post("/api/v1/audit/log",{event:"TRIPWIRE_RESET",detail:"Tripwire reset"}).then(()=>addA("TRIPWIRE_RESET","Tripwire reset"));}}>Reset Tripwire</Btn>}
+            <Btn onClick={()=>{setTripwireTriggered(true);setPanicMode(true);api.post("/api/audit/mc-event",{event_type:"TRIPWIRE_MANUAL_TEST",detail:"Tripwire triggered"}).then(()=>addA("TRIPWIRE_MANUAL_TEST","Tripwire triggered"));}}>Test Tripwire</Btn>
+            {tripwireTriggered&&<Btn onClick={()=>{setTripwireTriggered(false);api.post("/api/audit/mc-event",{event_type:"TRIPWIRE_RESET",detail:"Tripwire reset"}).then(()=>addA("TRIPWIRE_RESET","Tripwire reset"));}}>Reset Tripwire</Btn>}
           </div>
         </div>)}
 
@@ -6006,7 +6161,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Target</div>
             <div style={{display:"flex",gap:8,marginBottom:12}}>
-              <Btn primary onClick={()=>{setCompScanRunning(true);api.post("/api/v1/audit/log",{event:"COMPROMISE_SCAN_ALL",detail:"Initiated compromise scan on ALL linked clients"}).then(()=>addA("COMPROMISE_SCAN_ALL","Initiated compromise scan on ALL linked clients"));setTimeout(()=>{setCompScanRunning(false);setCompScanResults({ts:new Date().toISOString(),clients:[{name:"jordan-p-ws",status:"clean",tests:10,passed:10,signed:true},{name:"priya-s-ws",status:"clean",tests:10,passed:10,signed:true},{name:"alex-k-ws",status:"warning",tests:10,passed:9,signed:true,failures:["Unusual DB query spike (42 queries/sec vs baseline 8/sec)"]},{name:"maya-c-ws",status:"clean",tests:10,passed:10,signed:true},{name:"fatima-a-ws",status:"clean",tests:10,passed:10,signed:true},{name:"sam-r-ws",status:"clean",tests:10,passed:10,signed:true}]});api.post("/api/v1/audit/log",{event:"COMPROMISE_SCAN_COMPLETE",detail:"Scan complete — 5 clean, 1 warning"}).then(()=>addA("COMPROMISE_SCAN_COMPLETE","Scan complete — 5 clean, 1 warning"));},2500);}} disabled={compromiseScanRunning}>{compromiseScanRunning?"Scanning...":"Scan All Clients"}</Btn>
+              <Btn primary onClick={()=>{setCompScanRunning(true);api.post("/api/audit/mc-event",{event_type:"COMPROMISE_SCAN_ALL",detail:"Initiated compromise scan on ALL linked clients"}).then(()=>addA("COMPROMISE_SCAN_ALL","Initiated compromise scan on ALL linked clients"));setTimeout(()=>{setCompScanRunning(false);setCompScanResults({ts:new Date().toISOString(),clients:[{name:"jordan-p-ws",status:"clean",tests:10,passed:10,signed:true},{name:"priya-s-ws",status:"clean",tests:10,passed:10,signed:true},{name:"alex-k-ws",status:"warning",tests:10,passed:9,signed:true,failures:["Unusual DB query spike (42 queries/sec vs baseline 8/sec)"]},{name:"maya-c-ws",status:"clean",tests:10,passed:10,signed:true},{name:"fatima-a-ws",status:"clean",tests:10,passed:10,signed:true},{name:"sam-r-ws",status:"clean",tests:10,passed:10,signed:true}]});api.post("/api/audit/mc-event",{event_type:"COMPROMISE_SCAN_COMPLETE",detail:"Scan complete — 5 clean, 1 warning"}).then(()=>addA("COMPROMISE_SCAN_COMPLETE","Scan complete — 5 clean, 1 warning"));},2500);}} disabled={compromiseScanRunning}>{compromiseScanRunning?"Scanning...":"Scan All Clients"}</Btn>
             </div>
             <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
               <Sel label="Scan single client" value="" onChange={e=>{if(!e.target.value)return;const name=e.target.value;setCompScanRunning(true);addA("COMPROMISE_SCAN_SINGLE","Scanning: "+name);setTimeout(()=>{setCompScanRunning(false);setCompScanResults({ts:new Date().toISOString(),clients:[{name,status:"clean",tests:10,passed:10,signed:true}]});addA("COMPROMISE_SCAN_SINGLE_DONE",name+" — clean");},1500);}}>
@@ -6027,9 +6182,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </div>
             ))}
             <div style={{display:"flex",gap:8,marginTop:12}}>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"COMPROMISE_REPORT_EXPORT",detail:"Compromise scan report exported"}).then(()=>addA("COMPROMISE_REPORT_EXPORT","Compromise scan report exported"))}>Export Report</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"COMPROMISE_REPORT_SOAR",detail:"Sent to SOAR for automated follow-up"}).then(()=>addA("COMPROMISE_REPORT_SOAR","Sent to SOAR for automated follow-up"))}>Send to SOAR</Btn>
-              <Btn small onClick={()=>api.post("/api/v1/audit/log",{event:"COMPROMISE_REPORT_SIEM",detail:"Sent to SIEM as security event"}).then(()=>addA("COMPROMISE_REPORT_SIEM","Sent to SIEM as security event"))}>Send to SIEM</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_EXPORT",detail:"Compromise scan report exported"}).then(()=>addA("COMPROMISE_REPORT_EXPORT","Compromise scan report exported"))}>Export Report</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_SOAR",detail:"Sent to SOAR for automated follow-up"}).then(()=>addA("COMPROMISE_REPORT_SOAR","Sent to SOAR for automated follow-up"))}>Send to SOAR</Btn>
+              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_SIEM",detail:"Sent to SIEM as security event"}).then(()=>addA("COMPROMISE_REPORT_SIEM","Sent to SIEM as security event"))}>Send to SIEM</Btn>
             </div>
           </Card>)}
         </div>)}
@@ -6057,7 +6212,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",cursor:"pointer"}}><input type="checkbox" checked={authLogNotifCfg.missingLogs} onChange={e=>setAuthLogNotifCfg(prev=>({...prev,missingLogs:e.target.checked}))}/><M style={{color:C.w}}>Alert if auth log gaps detected (&gt; 30 min without any entry)</M></label>
             <Input label="Brute-force threshold (failed attempts before alert)" value={authLogNotifCfg.bruteForceThreshold} onChange={e=>setAuthLogNotifCfg(prev=>({...prev,bruteForceThreshold:parseInt(e.target.value)||5}))} type="number"/>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"AUTH_LOG_CONFIG_SAVED",detail:"Auth log notification config saved"}).then(()=>addA("AUTH_LOG_CONFIG_SAVED","Auth log notification config saved"))}>Save Auth Log Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTH_LOG_CONFIG_SAVED",detail:"Auth log notification config saved"}).then(()=>addA("AUTH_LOG_CONFIG_SAVED","Auth log notification config saved"))}>Save Auth Log Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — POSTURE ASSESSMENT ══════════ */}
@@ -6079,7 +6234,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={postureCfg.warnOnFail} onChange={e=>setPostureCfg(prev=>({...prev,warnOnFail:e.target.checked}))}/><M style={{color:C.w}}>Warn user and show remediation steps</M></label>
             <Input label="Grace period (minutes) before blocking" value={postureCfg.gracePeriodMin} onChange={e=>setPostureCfg(prev=>({...prev,gracePeriodMin:parseInt(e.target.value)||0}))} type="number"/>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"POSTURE_CONFIG_SAVED",detail:"Posture assessment config saved"}).then(()=>addA("POSTURE_CONFIG_SAVED","Posture assessment config saved"))}>Save Posture Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"POSTURE_CONFIG_SAVED",detail:"Posture assessment config saved"}).then(()=>addA("POSTURE_CONFIG_SAVED","Posture assessment config saved"))}>Save Posture Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — HIGH AVAILABILITY ══════════ */}
@@ -6109,8 +6264,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginTop:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Manual Failover & Testing</div>
             <div style={{display:"flex",gap:8,marginBottom:12}}>
-              <Btn onClick={()=>{if(window.confirm("MANUAL FAILOVER: Force promote passive server to active? The current active will become passive.")){setHaManualFailover(true);api.post("/api/v1/audit/log",{event:"HA_MANUAL_FAILOVER",detail:"Manual failover initiated — passive promoted to active"}).then(()=>addA("HA_MANUAL_FAILOVER","Manual failover initiated — passive promoted to active"));setTimeout(()=>setHaManualFailover(false),3000);}}} style={{borderColor:C.d+"60",color:C.d}}>{haManualFailover?"Failing over...":"Manual Failover"}</Btn>
-              <Btn disabled={haTestRunning} onClick={()=>{setHaTestRunning(true);api.post("/api/v1/audit/log",{event:"HA_TEST_STARTED",detail:"Failover test initiated"}).then(()=>addA("HA_TEST_STARTED","Failover test initiated"));setTimeout(()=>{setHaTestRunning(false);setHaTestResults({ts:new Date().toISOString(),failoverTimeMs:1247,replicationLag:0,dataIntegrity:"verified",sessionsPreserved:true,apiAvailability:"100%",rollbackSuccess:true});api.post("/api/v1/audit/log",{event:"HA_TEST_COMPLETE",detail:"Failover test passed — 1247ms failover time, zero data loss, rollback successful"}).then(()=>addA("HA_TEST_COMPLETE","Failover test passed — 1247ms failover time, zero data loss, rollback successful"));},3000);}}>{haTestRunning?"Testing...":"Test Failover Now"}</Btn>
+              <Btn onClick={()=>{if(window.confirm("MANUAL FAILOVER: Force promote passive server to active? The current active will become passive.")){setHaManualFailover(true);api.post("/api/audit/mc-event",{event_type:"HA_MANUAL_FAILOVER",detail:"Manual failover initiated — passive promoted to active"}).then(()=>addA("HA_MANUAL_FAILOVER","Manual failover initiated — passive promoted to active"));setTimeout(()=>setHaManualFailover(false),3000);}}} style={{borderColor:C.d+"60",color:C.d}}>{haManualFailover?"Failing over...":"Manual Failover"}</Btn>
+              <Btn disabled={haTestRunning} onClick={()=>{setHaTestRunning(true);api.post("/api/audit/mc-event",{event_type:"HA_TEST_STARTED",detail:"Failover test initiated"}).then(()=>addA("HA_TEST_STARTED","Failover test initiated"));setTimeout(()=>{setHaTestRunning(false);setHaTestResults({ts:new Date().toISOString(),failoverTimeMs:1247,replicationLag:0,dataIntegrity:"verified",sessionsPreserved:true,apiAvailability:"100%",rollbackSuccess:true});api.post("/api/audit/mc-event",{event_type:"HA_TEST_COMPLETE",detail:"Failover test passed — 1247ms failover time, zero data loss, rollback successful"}).then(()=>addA("HA_TEST_COMPLETE","Failover test passed — 1247ms failover time, zero data loss, rollback successful"));},3000);}}>{haTestRunning?"Testing...":"Test Failover Now"}</Btn>
             </div>
             {haTestResults&&(<Card style={{padding:12,borderColor:C.a+"30"}}>
               <div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:6}}>Last Test: {new Date(haTestResults.ts).toLocaleString()}</div>
@@ -6131,7 +6286,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Input label="Max time in fail-open mode (minutes) before requiring manual intervention" value={failOpenCfg.maxFailOpenMin} onChange={e=>setFailOpenCfg(prev=>({...prev,maxFailOpenMin:parseInt(e.target.value)||60}))} type="number"/>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={failOpenCfg.restoreAuto} onChange={e=>setFailOpenCfg(prev=>({...prev,restoreAuto:e.target.checked}))}/><M style={{color:C.t}}>Auto-restore burnout routing when engine recovers</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"FAILOPEN_CONFIG_SAVED",detail:"Fail-open routing config saved"}).then(()=>addA("FAILOPEN_CONFIG_SAVED","Fail-open routing config saved"))}>Save Fail-Open Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"FAILOPEN_CONFIG_SAVED",detail:"Fail-open routing config saved"}).then(()=>addA("FAILOPEN_CONFIG_SAVED","Fail-open routing config saved"))}>Save Fail-Open Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — CONFIG TROUBLESHOOTER ══════════ */}
@@ -6153,7 +6308,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               setTroubleshooterMsgs(prev=>[...prev,{role:"user",text:q}]);
               setTimeout(()=>{
                 const checks=[];
-                if(q.toLowerCase().includes("soar")) checks.push("✓ SOAR platform: "+(soarPlatform||"not configured"),"✓ SOAR URL: "+(soarUrl||"empty — needs endpoint"),"✓ SOAR API key: "+(soarApiKey?"set":"missing — required for communication"),"→ Fix: Go to SOAR tab and ensure endpoint URL and API key are both configured. Test connection with the 'Test Webhook' button.");
+                if(q.toLowerCase().includes("soar")) checks.push("✓ SOAR platform: "+(soarPlatform||"not configured"),"✓ SOAR URL: "+(soarUrl||"empty — needs endpoint"),"✓ SOAR API key: "+(soarApiKeyPresent?"configured server-side":(soarApiKey?"set (unsaved)":"missing — required for communication")),"→ Fix: Go to SOAR tab and ensure endpoint URL and API key are both configured. Test connection with the 'Test Webhook' button.");
                 else if(q.toLowerCase().includes("siem")) checks.push("✓ SIEM feed: "+(featureToggles.siem_feed?"enabled":"disabled"),"→ Check: Ensure SIEM integration is enabled in Features tab and SIEM endpoint is configured in SIEM tab.");
                 else if(q.toLowerCase().includes("peer")||q.toLowerCase().includes("chat")) checks.push("✓ Peer chat feature: "+(featureToggles.peer_chat?"enabled":"disabled"),"✓ Peer scheduling: "+(featureToggles.peer_scheduling?"enabled":"disabled"),"→ Check: Ensure both are enabled in Features tab. Verify E2EE keys are provisioned for the analysts.");
                 else if(q.toLowerCase().includes("routing")||q.toLowerCase().includes("ticket")) checks.push("✓ Burnout routing: "+(featureToggles.burnout_routing?"enabled":"disabled"),"✓ Panic mode: "+(panicMode?"ACTIVE — routing is disabled!":"off"),"✓ Fail-open: "+(failOpenCfg.enabled?"enabled":"disabled"),"→ If tickets aren't being filtered, check if panic mode was accidentally activated.");
@@ -6308,9 +6463,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <div style={{display:"flex",gap:8}}>
-            <Btn primary onClick={()=>{api.post("/api/v1/audit/log",{event:"PSEUDONYM_CONFIG_SAVED",detail:"Pseudonym system config saved"}).then(()=>addA("PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
-            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/v1/audit/log",{event:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
-            <Btn onClick={()=>{const birds=["Phoenix","Merlin","Peregrine","Kestrel","Harrier","Gyrfalcon","Sparrowhawk","Kite","Buzzard","Shrike"];setAnalystPseudonyms(prev=>prev.map((ap,i)=>({...ap,pseudonym:"Analyst-"+birds[i%birds.length]+"-"+Math.floor(Math.random()*99),assignedAt:new Date().toISOString().slice(0,10)})));api.post("/api/v1/audit/log",{event:"PSEUDONYMS_ROTATED",detail:"All analyst pseudonyms rotated"}).then(()=>addA("PSEUDONYMS_ROTATED","All analyst pseudonyms rotated"));}}>Rotate All Pseudonyms</Btn>
+            <Btn primary onClick={()=>{api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_CONFIG_SAVED",detail:"Pseudonym system config saved"}).then(()=>addA("PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
+            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
+            <Btn onClick={()=>{const birds=["Phoenix","Merlin","Peregrine","Kestrel","Harrier","Gyrfalcon","Sparrowhawk","Kite","Buzzard","Shrike"];setAnalystPseudonyms(prev=>prev.map((ap,i)=>({...ap,pseudonym:"Analyst-"+birds[i%birds.length]+"-"+Math.floor(Math.random()*99),assignedAt:new Date().toISOString().slice(0,10)})));api.post("/api/audit/mc-event",{event_type:"PSEUDONYMS_ROTATED",detail:"All analyst pseudonyms rotated"}).then(()=>addA("PSEUDONYMS_ROTATED","All analyst pseudonyms rotated"));}}>Rotate All Pseudonyms</Btn>
           </div>
         </div>)}
 
@@ -6351,7 +6506,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Regulatory Impact</M>
             <M style={{color:C.tm,lineHeight:1.8}}>GDPR: Right to erasure, data minimization, 72-hr breach notification, DPO requirement · CCPA: Right to know, right to delete, opt-out of sale · PIPEDA: Consent-based collection, reasonable purpose · The compliance tab's framework scanner already checks against these — this tab ensures the correct framework is applied per analyst location. For complex multi-jurisdictional deployments, consult your DPO or privacy counsel.</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"GEO_CONFIG_SAVED",detail:"Data sovereignty config saved"}).then(()=>addA("GEO_CONFIG_SAVED","Data sovereignty config saved"))}>Save Geo Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"GEO_CONFIG_SAVED",detail:"Data sovereignty config saved"}).then(()=>addA("GEO_CONFIG_SAVED","Data sovereignty config saved"))}>Save Geo Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — CLUSTER / SCALING ══════════ */}
@@ -6705,7 +6860,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>What the Analyst Sees</M>
             <M style={{color:C.tm,lineHeight:1.8}}>"You've been investigating high-severity incidents for 4 straight hours. Your work is making a real difference for the team. Your lead has approved a 15-minute break if you'd like one — your queue will be paused. [Take Break] [Continue Working]"</M>
           </Card>
-          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/v1/audit/log",{event:"PROACTIVE_CONFIG_SAVED",detail:"Proactive intervention config saved"}).then(()=>addA("PROACTIVE_CONFIG_SAVED","Proactive intervention config saved"))}>Save Config</Btn>
+          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"PROACTIVE_CONFIG_SAVED",detail:"Proactive intervention config saved"}).then(()=>addA("PROACTIVE_CONFIG_SAVED","Proactive intervention config saved"))}>Save Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — UPSKILLING HOUR ══════════ */}
@@ -6894,7 +7049,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Input label="Cooldown — auto-restore routing after (minutes)" value={autoDisableRoutingCfg.cooldownMin} onChange={e=>setAutoDisableRoutingCfg(prev=>({...prev,cooldownMin:parseInt(e.target.value)||30}))} type="number"/>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={autoDisableRoutingCfg.notifyLead} onChange={e=>setAutoDisableRoutingCfg(prev=>({...prev,notifyLead:e.target.checked}))}/><M style={{color:C.w}}>Notify Team Lead when auto-disable activates</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/v1/audit/log",{event:"AUTO_DISABLE_ROUTING_SAVED",detail:"Auto-disable routing config saved"}).then(()=>addA("AUTO_DISABLE_ROUTING_SAVED","Auto-disable routing config saved"))}>Save Config</Btn>
+          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTO_DISABLE_ROUTING_SAVED",detail:"Auto-disable routing config saved"}).then(()=>addA("AUTO_DISABLE_ROUTING_SAVED","Auto-disable routing config saved"))}>Save Config</Btn>
         </div>)}
 
         {/* ══════════ Phase F2 — RECOVERY RUNBOOK (FireAlive-specific) ══════════ */}
@@ -7229,7 +7384,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             qualitative:{impact:"High",likelihood:"Medium",riskLevel:"High",description:"Without burnout prevention: 35% annual SOC analyst turnover at $85K replacement cost per analyst. With burnout prevention: estimated 15% reduction in turnover, 20% improvement in mean time to detect, measurable reduction in insider threat risk from disgruntled departing analysts."},
             integrationRisk:"Medium — integrates with SIEM, SOAR, ticketing, IAM. Compromise could expose aggregate team health data (pseudonymized). Fail-open design ensures SOC operations continue if app fails.",
             mitigations:"E2EE peer chat, pseudonymized burnout data, tiered encryption, posture assessment, HA failover, fail-open routing, tripwire detection, compromise scanning, NIST 800-63B auth, AGPL-3.0 open source (auditable)"
-          });api.post("/api/v1/audit/log",{event:"RISK_REGISTER_GENERATED",detail:"Risk register asset entry generated"}).then(()=>addA("RISK_REGISTER_GENERATED","Risk register asset entry generated"));}}>Generate Risk Register Entry</Btn>
+          });api.post("/api/audit/mc-event",{event_type:"RISK_REGISTER_GENERATED",detail:"Risk register asset entry generated"}).then(()=>addA("RISK_REGISTER_GENERATED","Risk register asset entry generated"));}}>Generate Risk Register Entry</Btn>
           {riskRegisterOutput&&(<div>
             <Card style={{marginBottom:12}}>
               <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>Quantitative Risk Assessment — WITH FireAlive</div>
@@ -7528,6 +7683,60 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* AUDIT — aggregated across MC, server, and all clients */}
         {tab==="audit"&&(()=>{const reversed=audit.slice().reverse();const totalPages=Math.ceil(reversed.length/AUDIT_PER_PAGE);const page=Math.min(auditPage,totalPages-1);const pageItems=reversed.slice(page*AUDIT_PER_PAGE,(page+1)*AUDIT_PER_PAGE);return(<div>
+          {/* R3n: Server Audit Export — canonical /api/audit/export with prefix-based source filter */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Server Audit Export</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Download the canonical server-side audit_log with prefix-based filtering. The Source dropdown filters by event-type prefix: MC events (operator actions), AC events (analyst client events), server-middleware (auto-logged HTTP requests), or per-specific-analyst slices for incident investigation. Separate from the client-side state exports below (which dump the in-memory MC audit array).</M>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Sel label="Source" value={auditSource} onChange={e=>setAuditSource(e.target.value)}>
+                <option value="all">All events</option>
+                <option value="mc">MC events only (MC_*)</option>
+                <option value="ac">AC events — all analysts (AC_*)</option>
+                <option value="ac-analyst">AC events — specific analyst</option>
+                <option value="server">Server middleware only</option>
+              </Sel>
+              <Sel label="Format" value={auditExportFormat} onChange={e=>setAuditExportFormat(e.target.value)}>
+                <option value="json">JSON</option>
+                <option value="csv">CSV</option>
+                <option value="cef">CEF</option>
+              </Sel>
+            </div>
+            {auditSource === "ac-analyst" && (
+              <Sel label="Analyst" value={auditAnalystId} onChange={e=>setAuditAnalystId(e.target.value)}>
+                <option value="">Select analyst...</option>
+                {analysts.map(a => <option key={a.id} value={a.id}>{a.name || a.id}</option>)}
+              </Sel>
+            )}
+            <Btn primary disabled={auditExportBusy || (auditSource === "ac-analyst" && !auditAnalystId)} onClick={async()=>{
+              setAuditExportError(null);
+              setAuditExportBusy(true);
+              try {
+                const params = new URLSearchParams({source: auditSource, format: auditExportFormat});
+                if (auditSource === "ac-analyst") params.set("analyst_id", auditAnalystId);
+                // Use fetch directly so we can stream the body as a Blob for any format.
+                const res = await fetch("/api/audit/export?" + params.toString(), {credentials:"include"});
+                if (!res.ok) {
+                  let msg = "Export failed (HTTP " + res.status + ")";
+                  try { const j = await res.json(); if (j?.error) msg = j.error; } catch (_e) {}
+                  setAuditExportError(msg);
+                  return;
+                }
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = "firealive-audit-" + auditSource + "-" + new Date().toISOString().slice(0,10) + "." + auditExportFormat;
+                a.click();
+                URL.revokeObjectURL(url);
+                addA("AUDIT_EXPORT_SERVER", "Server audit exported: source=" + auditSource + " format=" + auditExportFormat);
+              } catch (err) {
+                setAuditExportError(err?.message || "Network error during export");
+              } finally {
+                setAuditExportBusy(false);
+              }
+            }} style={{marginTop:10}}>{auditExportBusy?"Exporting...":"Download Server Audit"}</Btn>
+            {auditExportError && <Card style={{padding:10,marginTop:10,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Export error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{auditExportError}</M></Card>}
+          </Card>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
             <L style={{marginBottom:0}}>Audit Trail — Aggregated ({audit.length} MC events + client logs)</L>
             <div style={{display:"flex",gap:6}}>

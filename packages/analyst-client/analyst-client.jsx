@@ -139,26 +139,13 @@ const SKILLS_TAXONOMY = [
 ];
 
 // ── Data ─────────────────────────────────────────────────────────────────────
-const ANALYSTS_INIT = [
-  {id:"maya-c",name:"Maya C.",tier:2,shift:"day",days:312,available:true},
-  {id:"jordan-p",name:"Jordan P.",tier:1,shift:"day",days:89,available:true},
-  {id:"sam-r",name:"Sam R.",tier:3,shift:"day",days:1847,available:true},
-  {id:"alex-k",name:"Alex K.",tier:1,shift:"day",days:204,available:true},
-  {id:"dana-o",name:"Dana O.",tier:2,shift:"day",days:580,available:true},
-  {id:"priya-s",name:"Priya S.",tier:1,shift:"day",days:42,available:true},
-  {id:"carlos-m",name:"Carlos M.",tier:3,shift:"swing",days:2103,available:true},
-  {id:"li-w",name:"Li W.",tier:2,shift:"swing",days:445,available:true},
-  {id:"aisha-b",name:"Aisha B.",tier:1,shift:"swing",days:167,available:true},
-  {id:"tom-h",name:"Tom H.",tier:1,shift:"swing",days:301,available:true},
-  {id:"nina-v",name:"Nina V.",tier:2,shift:"swing",days:623,available:true},
-  {id:"jake-f",name:"Jake F.",tier:1,shift:"swing",days:55,available:true},
-  {id:"kenji-t",name:"Kenji T.",tier:3,shift:"night",days:1540,available:true},
-  {id:"rosa-d",name:"Rosa D.",tier:2,shift:"night",days:390,available:true},
-  {id:"marcus-j",name:"Marcus J.",tier:1,shift:"night",days:112,available:true},
-  {id:"elena-p",name:"Elena P.",tier:1,shift:"night",days:276,available:true},
-  {id:"ben-s",name:"Ben S.",tier:2,shift:"night",days:510,available:true},
-  {id:"fatima-a",name:"Fatima A.",tier:1,shift:"night",days:73,available:true},
-];
+// R3n: ANALYSTS_INIT (the hardcoded 18 mock analysts with real names) has
+// been removed. The AC never sees real analyst names through any system
+// surface — the Peer Skill-Share exclude UI now fetches pseudonyms from
+// the canonical GET /api/pseudonyms endpoint instead. See pseudonymList
+// state + the useEffect that hydrates it (further down in the component).
+// The real-name ↔ pseudonym mapping lives only in the lead's exported file
+// and is NOT stored in the FireAlive system.
 const AUTO_SYS_INIT = [
   {id:"cs-edr",name:"CrowdStrike Falcon",type:"EDR/XDR",l1:true,l2:true,l3:false,cap:{max:800,cur:612,u:"alerts/hr"},status:"operational",resolved:1847,fp:0.04},
   {id:"pa-ids",name:"Palo Alto IDS/IPS",type:"IDS/IPS",l1:true,l2:false,l3:false,cap:{max:2000,cur:1340,u:"events/hr"},status:"operational",resolved:4210,fp:0.02},
@@ -675,6 +662,18 @@ export default function AnalystClientApp() {
   // rows joined against oodaScenarioList. Best-effort — empty history
   // simply means every scenario shows "not yet" until the analyst
   // starts one.
+  // R3n: hydrate the pseudonym list for the Peer Skill-Share exclude UI.
+  // GET /api/pseudonyms returns {pseudonyms: [{pseudonym, tier, shift}, ...]}
+  // sorted by shift/tier/pseudonym. No real names, no user IDs in the
+  // response (privacy-preserving — the AC never sees identity info beyond
+  // the canonical pseudonym handle).
+  useEffect(()=>{
+    api.get("/api/pseudonyms").then(r=>{
+      if (Array.isArray(r?.pseudonyms)) setPseudonymList(r.pseudonyms);
+      setPseudonymsLoaded(true);
+    }).catch(()=>setPseudonymsLoaded(true));
+  }, []);
+
   useEffect(()=>{
     api.get("/api/ooda/history").then(r=>{
       if (Array.isArray(r?.history)) setOodaHistory(r.history);
@@ -1105,7 +1104,14 @@ export default function AnalystClientApp() {
   const [newPM, setNewPM] = useState("");
   const [peerDiscAccepted, setPeerDiscAccepted] = useState(false);
   const [peerTopic, setPeerTopic] = useState("");
+  // R3n: peerExclude now stores PSEUDONYMS (strings like "Analyst-Phoenix-23"),
+  // not user IDs. The AC submits this list as excludePseudonyms in POST
+  // /api/peers/requests; server resolves pseudonyms → user IDs internally.
   const [peerExclude, setPeerExclude] = useState([]);
+  const [pseudonymList, setPseudonymList] = useState([]);
+  const [pseudonymsLoaded, setPseudonymsLoaded] = useState(false);
+  const [peerSubmitError, setPeerSubmitError] = useState(null);
+  const [peerSubmitBusy, setPeerSubmitBusy] = useState(false);
   const [peerWillingMeet, setPeerWillingMeet] = useState(false);
   const [peerSession, setPeerSession] = useState(null);
   const [peerTimeout] = useState(5);
@@ -1666,16 +1672,58 @@ export default function AnalystClientApp() {
               </label>
               <div style={{marginBottom:14}}>
                 <M style={{color:C.tm,marginBottom:6,display:"block"}}>Exclude analysts (optional)</M>
-                <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-                  {ANALYSTS_INIT.map(a=>(
-                    <label key={a.id} style={{display:"flex",alignItems:"center",gap:4,padding:"4px 8px",background:peerExclude.includes(a.id)?"rgba(239,68,68,0.1)":"rgba(255,255,255,0.02)",border:`1px solid ${peerExclude.includes(a.id)?C.d+"40":C.b}`,borderRadius:6,cursor:"pointer",fontSize:10}}>
-                      <input type="checkbox" checked={peerExclude.includes(a.id)} onChange={e=>{if(e.target.checked)setPeerExclude(p=>[...p,a.id]);else setPeerExclude(p=>p.filter(x=>x!==a.id));}}/>
-                      <span style={{color:peerExclude.includes(a.id)?C.d:C.tm}}>{a.name}</span>
-                    </label>
-                  ))}
-                </div>
+                {/* R3n: pseudonym-based exclude list. Click pseudonyms you'd
+                    prefer not to receive help from. Server enforces a 50%
+                    exclusion cap to prevent triangulation. */}
+                {!pseudonymsLoaded ? (
+                  <M style={{color:C.td,fontStyle:"italic"}}>Loading pseudonyms...</M>
+                ) : pseudonymList.length === 0 ? (
+                  <M style={{color:C.td,fontStyle:"italic"}}>No analyst pseudonyms available.</M>
+                ) : (() => {
+                  const maxExcl = pseudonymList.length - Math.ceil(pseudonymList.length * 0.5);
+                  return (<div>
+                    <M style={{color:C.td,display:"block",marginBottom:6,fontSize:10}}>
+                      Excluded {peerExclude.length} of {pseudonymList.length} pseudonyms (max {maxExcl} — at least half the pool must remain available as helpers).
+                    </M>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                      {pseudonymList.map(p=>(
+                        <label key={p.pseudonym} style={{display:"flex",alignItems:"center",gap:4,padding:"4px 8px",background:peerExclude.includes(p.pseudonym)?"rgba(239,68,68,0.1)":"rgba(255,255,255,0.02)",border:`1px solid ${peerExclude.includes(p.pseudonym)?C.d+"40":C.b}`,borderRadius:6,cursor:"pointer",fontSize:10}}>
+                          <input type="checkbox" checked={peerExclude.includes(p.pseudonym)} onChange={e=>{if(e.target.checked)setPeerExclude(prev=>[...prev,p.pseudonym]);else setPeerExclude(prev=>prev.filter(x=>x!==p.pseudonym));}}/>
+                          <span style={{color:peerExclude.includes(p.pseudonym)?C.d:C.tm}}>{p.pseudonym}</span>
+                          <span style={{color:C.td,fontSize:9}}>T{p.tier}·{p.shift}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>);
+                })()}
               </div>
-              <Btn primary disabled={!peerTopic.trim()} onClick={()=>{setPeerSession({id:Date.now(),topic:peerTopic,status:"waiting",myConsent:false,peerConsent:false,timeSlot:peerTimeSlot});logC("peer_request_created","Skill-share request submitted ("+peerTimeSlot+")");setPeerTopic("");}}>Submit Request</Btn>
+              <Btn primary disabled={!peerTopic.trim() || peerSubmitBusy} onClick={async()=>{
+                setPeerSubmitError(null);
+                setPeerSubmitBusy(true);
+                try {
+                  // R3n: real submission to canonical /api/peers/requests with
+                  // pseudonym-based excludePseudonyms. Server enforces 50% cap
+                  // and resolves pseudonyms → user IDs internally.
+                  const r = await api.post("/api/peers/requests", {
+                    topic: peerTopic,
+                    excludePseudonyms: peerExclude,
+                    willingToMeetInPerson: peerWillingMeet,
+                  });
+                  if (r?.error) {
+                    setPeerSubmitError(r.detail || r.error);
+                    return;
+                  }
+                  setPeerSession({id:r.id||Date.now(),topic:peerTopic,status:"waiting",myConsent:false,peerConsent:false,timeSlot:peerTimeSlot});
+                  logC("peer_request_created","Skill-share request submitted ("+peerTimeSlot+", "+peerExclude.length+" excluded)");
+                  setPeerTopic("");
+                  setPeerExclude([]);
+                } catch (err) {
+                  setPeerSubmitError(err?.message || "Failed to submit request");
+                } finally {
+                  setPeerSubmitBusy(false);
+                }
+              }}>{peerSubmitBusy?"Submitting...":"Submit Request"}</Btn>
+              {peerSubmitError && <Card style={{padding:10,marginTop:10,borderColor:C.d+"60",background:C.d+"14"}}><M style={{color:C.d,fontWeight:500}}>Submit error:</M><M style={{color:C.t,display:"block",marginTop:4}}>{peerSubmitError}</M></Card>}
             </Card>
 
             {/* Queue — available requests from others */}

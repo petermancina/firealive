@@ -80,7 +80,7 @@ The whole thing is built on three privacy commitments:
 
 **SOAR Polling Contract.** Once the SOAR is configured, it polls `GET /api/routing/variables` on its own cadence (typical 30–60 seconds) with an api-key authenticated against the `routing:read` scope. FireAlive returns the current state: per-analyst capacity context (keyed by pseudonym, never by user ID), panic mode state, the silent-pause toggle state, and the six SOAR variables (`analyst_capacity`, `complexity_cap`, `equity_weights`, `skill_matrix`, `burnout_risk_tier`, `shift_handoff`). The SOAR uses these values in its own playbook logic to make routing decisions; FireAlive never distributes tickets directly. When the SOAR completes a routing decision, it posts the decision back via `POST /api/routing/soar-events` (api-key + `routing:events` scope), and FireAlive persists the event for the capacity-feedback loop. See `docs/integrations-privacy.md` for the full contract including the pseudonym-only privacy invariant.
 
-**Ticketing read-only invariant.** The ticketing integration is enforced read-only server-side: whatever the lead supplies for the `readOnly` flag (or omits) is overwritten with `true` before the configuration is encrypted to disk. The MC's SOAR & Ticketing tab doesn't expose a `readOnly` toggle at all. This is a defense-in-depth measure: even an attacker who bypasses the UI cannot reconfigure ticketing for write access. The integration in v1.0.36 ships with the contract established and a mock-shape queue-metadata endpoint (`GET /api/integrations/ticketing/queue`). Per-platform adapters (ServiceNow, Jira, TheHive, PagerDuty, Freshservice) are tracked as separate backlog items rather than against a vague future phase — operators with a specific platform need can file an issue against `pmancina/firealive` referencing the adapter contract documented in `docs/integrations-privacy.md`.
+**Ticketing read-only invariant.** The ticketing integration is enforced read-only server-side: whatever the lead supplies for the `readOnly` flag (or omits) is overwritten with `true` before the configuration is encrypted to disk. The MC's SOAR & Ticketing tab doesn't expose a `readOnly` toggle at all. This is a defense-in-depth measure: even an attacker who bypasses the UI cannot reconfigure ticketing for write access. The integration ships with the contract established and a mock-shape queue-metadata endpoint (`GET /api/integrations/ticketing/queue`). Per-platform adapters (ServiceNow, Jira, TheHive, PagerDuty, Freshservice) are tracked as separate backlog items rather than against a vague future phase — operators with a specific platform need can file an issue against `pmancina/firealive` referencing the adapter contract documented in `docs/integrations-privacy.md`.
 
 ### Shift Handoff
 **What it's for:** Structured shift-to-shift handoffs to prevent the information loss that causes errors during transitions. Research shows handoff errors peak in the last two hours of shifts when analysts are most fatigued. This formalizes the handoff so context doesn't get dropped.
@@ -517,7 +517,7 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 **Workflow:**
 1. After applying an update or making major config changes
 2. Lead opens Regression Test, clicks Run
-3. Server runs the canonical regression-runner via `POST /api/regression/run` (R3k canonicalized — replaces the v1.0.35 setTimeout-based client-side fake). Checks span auth flows, encryption round-trips, KMS round-trips, FK integrity, fuse counter, audit chain, peer-share E2E, IAM offboarding, backups v2-aware schema check, and the cloud / cicd / full-suite signing infrastructure.
+3. Server runs the canonical regression-runner via `POST /api/regression/run` (replaces an earlier setTimeout-based client-side fake). Checks span auth flows, encryption round-trips, KMS round-trips, FK integrity, fuse counter, audit chain, peer-share E2E, IAM offboarding, backups v2-aware schema check, and the cloud / cicd / full-suite signing infrastructure.
 4. Pass/fail report — lead investigates failures. Failure causes are written to `audit_log` as `REGRESSION_RUN_FAILED` for post-hoc analysis.
 
 ### TTX Generator
@@ -624,7 +624,7 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 3. Backups run on schedule, encrypted, hashed for integrity
 4. Lead can trigger manual backups or restore from any backup
 
-**Full-suite backup (R3k).** A separate `POST /api/backup/full-suite` endpoint captures the entire instance — database, configuration rows, signing-key material, and a version manifest — into one tar.gz archive. The Backup tab's **Trigger Full Backup Now** button calls this endpoint; the resulting archive is suitable for disaster-recovery restoration of the full instance (vs. the standard `POST /api/backup` which captures only the database). MC-side bundles use the v2 four-file layout (manifest + archive + Cosign signature + KEK-wrapped key); GD-side bundles use a v1-shape single-archive layout with SHA-256 tamper-detect. See `docs/full-suite-backup.md` for the full architecture, manifest schemas, and restoration semantics.
+**Full-suite backup.** A separate `POST /api/backup/full-suite` endpoint captures the entire instance — database, configuration rows, signing-key material, and a version manifest — into one tar.gz archive. The Backup tab's **Trigger Full Backup Now** button calls this endpoint; the resulting archive is suitable for disaster-recovery restoration of the full instance (vs. the standard `POST /api/backup` which captures only the database). MC-side bundles use the v2 four-file layout (manifest + archive + Cosign signature + KEK-wrapped key); GD-side bundles use a v1-shape single-archive layout with SHA-256 tamper-detect. See `docs/full-suite-backup.md` for the full architecture, manifest schemas, and restoration semantics.
 
 ### Backup Schedules
 **What it's for:** Configure multiple backup schedules with optional regulatory-framework presets. Each schedule fires independently on its own cadence (hourly / daily / weekly / monthly) at a configured time, to a configured destination, with a configured retention. Picking a regulatory preset (HIPAA, SOX, PCI-DSS, GDPR, NIST CSF, ISO 27001, SOC 2) applies that framework's compliance floor — minimum retention and required encryption — to the schedule. The operator can set retention HIGHER than the floor (legal-hold scenarios, longer compliance windows) but cannot reduce below the floor. Schedules without a preset have full operator flexibility.
@@ -651,9 +651,9 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 
 **Multi-schedule semantics:** Each schedule fires independently. The scheduler maintains a separate cron registration per active schedule. When two schedules' fire times collide (within ±5 minutes), the overlap detection surfaces a 409 at create / update time so operators can adjust timing. Operators who explicitly want overlapping schedules (e.g. daily + monthly on the same day-of-month) can confirm-to-queue via the modal. The 5-minute window protects against I/O contention on the source DB and the destination — backup operations have variable execution duration and starting two backups at the same moment risks read locking and destination push throttling.
 
-**Legacy compatibility:** Pre-v1.0.35 installs that configured a single backup schedule via /api/backup/config (the singleton-only legacy endpoint) get their singleton automatically migrated to a "Legacy default" row in backup_schedules on first boot post-upgrade. The /api/backup/config endpoint stays live as a deprecated read/write shim over the first row of backup_schedules for one version of deprecation grace — external tooling that still calls it sees a deprecated:true response with a replacement: '/api/backup-schedules' hint. Operators should migrate clients to the modern endpoint when convenient. The v100 stub route POST /api/v1/backup/schedule/add also remains live and now delegates to the canonical service via BackupService.addSchedule (changed in R3i; preserves the v100 public contract).
+**Legacy compatibility:** Legacy single-schedule installs that configured a single backup schedule via /api/backup/config (the singleton-only legacy endpoint) get their singleton automatically migrated to a "Legacy default" row in backup_schedules on first boot post-upgrade. The /api/backup/config endpoint stays live as a deprecated read/write shim over the first row of backup_schedules for one version of deprecation grace — external tooling that still calls it sees a deprecated:true response with a replacement: '/api/backup-schedules' hint. Operators should migrate clients to the modern endpoint when convenient. The v100 stub route POST /api/v1/backup/schedule/add also remains live and now delegates to the canonical service via BackupService.addSchedule (preserves the v100 public contract).
 
-**MC orchestrating AC backups** is a separate concern from this feature and out of scope for v1.0.35. The "Backup All Clients" button on the Client Provisioning tab remains a placeholder pending a future phase that builds AC-side backup orchestration.
+**MC orchestrating AC backups** is a separate concern from this feature and out of scope for the current release. The "Backup All Clients" button on the Client Provisioning tab remains a placeholder pending a future phase that builds AC-side backup orchestration.
 
 ### Incremental and differential backups
 **What they're for:** Two strategies for capturing the database between full backups, each making a different tradeoff between archive size and restore complexity. Both are point-in-time captures of the SQLite WAL frames written since a reference backup. Both use the same v2 four-file on-disk layout (manifest.json + manifest.sig + archive.bin + wrapped-key.bin) and the same encryption + signing pipeline as full backups; only the archive payload format and the parent linkage differ.
@@ -673,7 +673,7 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 - **Incremental:** Small archives, frequent runs. Best when storage cost is critical and operators are comfortable maintaining longer chains. Restore complexity grows linearly with chain length.
 - **Differential:** Larger archives, simpler restore. Best when restore-time predictability matters more than storage cost. Each differential is independently restorable alongside the anchor.
 
-**Schema (R3l C53/C55/C73):**
+**Schema:**
 - `backup_schedules.backup_kind` — `single-db` or `full-suite`
 - `backup_schedules.backup_strategy` — `full` / `incremental` / `differential` / `snapshot`
 - `backup_schedules.destination_filter` — JSON array of required destination tags (or NULL for all)
@@ -685,26 +685,26 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 - `backups.page_count` — frame count archived
 - `system_meta.max_chain_depth` — global default depth limit (seeded to '100')
 
-**Dispatch (R3l C56):** The scheduler dispatches on `(backup_kind, backup_strategy)`:
-- `(full-suite, full)` → `performFullSuiteBackup` (existing R3k)
+**Dispatch:** The scheduler dispatches on `(backup_kind, backup_strategy)`:
+- `(full-suite, full)` → `performFullSuiteBackup`
 - `(single-db, full)` → `performBackup` (existing)
-- `(any, incremental)` → `performIncrementalBackup` (R3l C63)
-- `(any, differential)` → `performDifferentialBackup` (R3l C64)
+- `(any, incremental)` → `performIncrementalBackup`
+- `(any, differential)` → `performDifferentialBackup`
 - `(any, snapshot)` → `performBackup` with type='snapshot'
 
 **INCR-v1 archive payload format:** Incremental and differential archives wrap the WAL frames in a custom binary format inside the standard v2 archive.bin (which is still zstd-compressed and AES-256-GCM-encrypted). Header (16 bytes): magic 'INCR' + format_version + frame_count + page_size. Per frame (44 + page_size bytes): frame_no + page_no + db_size_after_commit + sha256_of_page_data (raw 32 bytes) + page_data. The per-page SHA-256 lets restore verify each page's integrity before applying.
 
 **Six escalation reasons:** Both `performIncrementalBackup` and `performDifferentialBackup` can escalate to a full backup when their conditions aren't met. The caller (scheduler, `POST /api/backup?strategy=...`) sees `escalated: true` and the reason string in the response:
 - `no-parent` — no eligible parent backup exists
-- `incompatible-parent` — parent has no wal_end_position (pre-R3l backup, or full-suite)
+- `incompatible-parent` — parent has no wal_end_position (legacy backup without chain support, or full-suite)
 - `no-wal-file` — DB has no WAL file on disk (journal_mode != WAL)
 - `no-anchor` — can't resolve parent_full_backup_id from chain walk
 - `salt-change` — WAL was checkpointed since parent was taken (re-salted)
-- `depth-limit` — chain length would exceed configured maximum (R3l C73)
+- `depth-limit` — chain length would exceed configured maximum
 
 Escalated backups become the new anchor for future incrementals/differentials. The audit log records both the requested strategy and the actual strategy produced.
 
-**Restore chain (R3l C65-C68):** Chain restore is mechanically different from single-backup restore:
+**Restore chain:** Chain restore is mechanically different from single-backup restore:
 - `walkChain(db, leafBackupId)` — assembles `[anchor, ...intermediates, leaf]` by walking parent_backup_id backwards. Cycle detection. Hard cap at MAX_CHAIN_DEPTH=1000.
 - `validateChain(db, chain)` — for every link: manifest sha256 match, Ed25519 signature verify, archive sha256 match, wrapped-key sha256 match. For inc/diff links additionally: unwrap key, decrypt+decompress, parse INCR-v1 bundle, re-compute per-page sha256, cross-check against manifest's frames descriptor.
 - `replayChain(db, chain, targetDbPath, options)` — extracts anchor full to targetDbPath, then for each subsequent link applies INCR-v1 frames at offset (page_no - 1) × page_size. Truncates target on commit frames (dbSizeAfterCommit nonzero).
@@ -714,7 +714,7 @@ Escalated backups become the new anchor for future incrementals/differentials. T
 - `POST /api/restore/execute-chain/:id` (C66) — restore from a chain. Goes through the same approval gate, IP allowlist, and audit log machinery as `/execute/:id`. Confirms against the LEAF backup's hash (not anchor). Creates a pre-restore snapshot with prefix `pre-restore-chain-<ts>.db` before destructive work.
 - `POST /api/backup?strategy=<full|incremental|differential|snapshot>` (C67) — on-demand backup with strategy selection. Mirrors the scheduler's dispatch table.
 
-**Depth limits (R3l C73):** Long chains have linearly-growing restore cost and linearly-growing single-point-of-failure exposure. The configurable max-chain-depth limit forces a full backup once the chain would exceed it. Two sources of truth:
+**Depth limits:** Long chains have linearly-growing restore cost and linearly-growing single-point-of-failure exposure. The configurable max-chain-depth limit forces a full backup once the chain would exceed it. Two sources of truth:
 1. `backup_schedules.max_chain_depth` — per-schedule override (NULL = use global)
 2. `system_meta.max_chain_depth` — global default ('100')
 

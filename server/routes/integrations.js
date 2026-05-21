@@ -7,12 +7,26 @@
 // POST   /api/integrations/:type/test    — test integration connectivity
 // DELETE /api/integrations/:type         — remove integration config
 //
-// R3j (v1.0.36) absorbs v054 SOAR/ticketing capabilities into canonical:
+// R3j absorbs v054 SOAR/ticketing capabilities into canonical:
 //   - soar config gains optional autoEscalate boolean (persisted verbatim)
 //   - ticketing config has readOnly:true enforced server-side (invariant)
 //   - new GET /ticketing/queue surfaces aggregate queue metadata
 //   - runConnectivityTest echoes autoEscalatePolicyDetected on soar tests
 //     for UI round-trip confirmation
+//
+// R3n introduces SOC-grade sensitive-field handling:
+//   - GET /:type strips sensitive fields entirely from the response config
+//     (no slice(0,4) leak); surfaces presence-metadata via
+//     sensitiveFieldsPresent so the MC can render "Configured ✓" + "Change
+//     Secret" affordances per field
+//   - PUT /:type merges sensitive fields via omission-rule: keys absent
+//     from the incoming body are preserved from existing config; present
+//     keys (even empty string) take precedence. The MC frontend OMITS
+//     sensitive fields by default and includes them only when the lead has
+//     explicitly clicked "Change Secret"
+//   - Per-field audit markers MC_INTEGRATION_SECRET_PRESERVED / _CHANGED /
+//     _CLEARED for fine-grained threat-hunting visibility (field names
+//     logged; values NEVER logged)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -67,18 +81,32 @@ router.get('/:type', (req, res) => {
     // Decrypt the config
     const config = decryptConfig(row.config_encrypted);
 
-    // Redact sensitive fields for display
-    const redacted = { ...config };
-    for (const key of Object.keys(redacted)) {
-      if (/secret|password|key|token|cert/i.test(key) && redacted[key]) {
-        redacted[key] = redacted[key].slice(0, 4) + '••••••••';
+    // SOC-grade: never expose sensitive field values, not even partially-
+    // redacted (the earlier slice(0,4)+'••••••••' pattern still leaked the
+    // first four characters and the existence of the value). Strip sensitive
+    // fields entirely from the response config; surface only presence-
+    // metadata via sensitiveFieldsPresent so the MC frontend can render a
+    // "Configured ✓" + "Change Secret" affordance per field.
+    //
+    // The sensitive-key matcher (/secret|password|key|token|cert/i on the
+    // KEY name) is preserved verbatim from the prior implementation so
+    // existing integration shapes (soar.apiToken, ticketing.apiKey,
+    // iam_saml.cert, kms_provider.password etc.) are all covered.
+    const safeConfig = {};
+    const sensitiveFieldsPresent = {};
+    for (const key of Object.keys(config)) {
+      if (/secret|password|key|token|cert/i.test(key)) {
+        sensitiveFieldsPresent[key] = config[key] != null && config[key] !== '';
+      } else {
+        safeConfig[key] = config[key];
       }
     }
 
     res.json({
       type: req.params.type,
       status: row.status,
-      config: redacted,
+      config: safeConfig,
+      sensitiveFieldsPresent,
       lastTest: row.last_test_at,
       lastTestResult: row.last_test_result,
     });
@@ -144,24 +172,81 @@ router.put('/:type', (req, res) => {
     return res.status(400).json({ error: 'Invalid integration type' });
   }
 
-  const { config } = req.body;
-  if (!config || typeof config !== 'object') {
+  const { config: incomingConfig } = req.body;
+  if (!incomingConfig || typeof incomingConfig !== 'object') {
     return res.status(400).json({ error: 'config object required' });
   }
 
-  // R3j: per-type normalization runs BEFORE encryption. The function
-  // returns a possibly-modified copy of config along with audit-log
-  // marker strings for any invariants enforced. See normalizeConfigForType
-  // at the bottom of this file.
-  const { normalized, auditMarkers } = normalizeConfigForType(req.params.type, config);
-
   try {
-    const encrypted = encryptConfig(normalized);
+    // ── Omission-based merge for sensitive fields ──────────────────────────
+    // SOC-grade contract: the MC frontend OMITS sensitive field keys
+    // (apiToken, password, secret, key, cert) from the PUT body unless
+    // the lead has explicitly clicked "Change Secret" and entered a new
+    // value. The server's job is to preserve existing values when keys
+    // are absent from the incoming body.
+    //
+    // Three cases per sensitive key:
+    //   (a) key omitted from incomingConfig → preserve existing value
+    //       (emit MC_INTEGRATION_SECRET_PRESERVED audit marker)
+    //   (b) key present with non-empty value → use new value
+    //       (emit MC_INTEGRATION_SECRET_CHANGED audit marker)
+    //   (c) key present with empty string → explicit clear
+    //       (emit MC_INTEGRATION_SECRET_CLEARED audit marker)
+    //
+    // For brand-new integrations (no existing config), only case (b)/(c)
+    // apply since there's nothing to preserve.
     const db = getDb();
+    const existingRow = db.prepare('SELECT id, config_encrypted FROM integration_config WHERE integration_type = ?').get(req.params.type);
+    const existingConfig = existingRow ? decryptConfig(existingRow.config_encrypted) : null;
 
-    const existing = db.prepare('SELECT id FROM integration_config WHERE integration_type = ?').get(req.params.type);
+    const mergedConfig = { ...incomingConfig };
+    const preservedFields = [];
+    const changedFields = [];
+    const clearedFields = [];
 
-    if (existing) {
+    if (existingConfig) {
+      // For each sensitive field key in existing config that is omitted
+      // from incomingConfig, copy existing value into merged result
+      for (const key of Object.keys(existingConfig)) {
+        if (/secret|password|key|token|cert/i.test(key)) {
+          if (!(key in incomingConfig)) {
+            mergedConfig[key] = existingConfig[key];
+            preservedFields.push(key);
+          } else if (incomingConfig[key] === '' || incomingConfig[key] === null) {
+            clearedFields.push(key);
+          } else if (incomingConfig[key] !== existingConfig[key]) {
+            changedFields.push(key);
+          }
+          // else: incoming value equals existing — no-op (no audit row)
+        }
+      }
+      // Also catch sensitive fields in incomingConfig that AREN'T in
+      // existing (e.g., adding apiToken to an integration that had none)
+      for (const key of Object.keys(incomingConfig)) {
+        if (/secret|password|key|token|cert/i.test(key) && !(key in existingConfig)) {
+          if (incomingConfig[key] && incomingConfig[key] !== '') {
+            changedFields.push(key);
+          }
+        }
+      }
+    } else {
+      // New integration: any sensitive field with a non-empty value counts
+      // as a "change" (first set) for audit purposes
+      for (const key of Object.keys(incomingConfig)) {
+        if (/secret|password|key|token|cert/i.test(key) && incomingConfig[key] && incomingConfig[key] !== '') {
+          changedFields.push(key);
+        }
+      }
+    }
+
+    // R3j: per-type normalization runs BEFORE encryption on the merged
+    // config. The function returns a possibly-modified copy along with
+    // audit-log marker strings for any invariants enforced.
+    const { normalized, auditMarkers } = normalizeConfigForType(req.params.type, mergedConfig);
+
+    const encrypted = encryptConfig(normalized);
+
+    if (existingRow) {
       db.prepare(`
         UPDATE integration_config SET config_encrypted = ?, status = 'configured', updated_at = datetime('now'), created_by = ?
         WHERE integration_type = ?
@@ -174,11 +259,35 @@ router.put('/:type', (req, res) => {
     }
 
     db.close();
+
+    // ── Audit logging (operator identity recorded; NEVER field values) ─────
+    // One INTEGRATION_CONFIGURED row per save (overall marker), plus per-
+    // field MC_INTEGRATION_SECRET_* rows for fine-grained threat-hunting
+    // visibility. The detail strings include the field key name (e.g.,
+    // "apiToken") but NEVER the value.
     const detail = auditMarkers.length > 0
       ? `type=${req.params.type} (${auditMarkers.join('; ')})`
       : `type=${req.params.type}`;
     auditLog(req.user.id, 'INTEGRATION_CONFIGURED', detail, req.ip);
-    res.json({ ok: true, type: req.params.type, status: 'configured' });
+
+    for (const field of preservedFields) {
+      auditLog(req.user.id, 'MC_INTEGRATION_SECRET_PRESERVED', `type=${req.params.type} field=${field}`, req.ip);
+    }
+    for (const field of changedFields) {
+      auditLog(req.user.id, 'MC_INTEGRATION_SECRET_CHANGED', `type=${req.params.type} field=${field}`, req.ip);
+    }
+    for (const field of clearedFields) {
+      auditLog(req.user.id, 'MC_INTEGRATION_SECRET_CLEARED', `type=${req.params.type} field=${field}`, req.ip);
+    }
+
+    res.json({
+      ok: true,
+      type: req.params.type,
+      status: 'configured',
+      secretFieldsPreserved: preservedFields.length,
+      secretFieldsChanged: changedFields.length,
+      secretFieldsCleared: clearedFields.length,
+    });
   } catch (err) {
     logger.error('Configure integration error', { error: err.message });
     res.status(500).json({ error: 'Failed to save integration config' });
