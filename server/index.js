@@ -208,6 +208,7 @@ app.use('/api/runbook', authMiddleware(['lead', 'admin']), require('./routes/run
 app.use('/api/ttx', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ttx'));
 app.use('/api/inbox', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/notifications-inapp'));
 app.use('/api/inbox/admin', authMiddleware(['admin']), require('./routes/notifications-admin'));
+app.use('/api/users/me/lead-contacts', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/lead-contacts'));
 app.use('/api/helper-pay', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/helper-pay'));
 app.use('/api/heartbeat', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/heartbeat'));
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/v021-features'));
