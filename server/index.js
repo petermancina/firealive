@@ -165,6 +165,7 @@ app.use('/api/retro', authMiddleware(['lead', 'admin']), require('./routes/retro
 app.use('/api/assessments', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/assessments'));
 app.use('/api/reports', authMiddleware(['lead', 'admin']), require('./routes/reports'));
 app.use('/api/delegations', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/delegations'));
+app.use('/api/pseudonyms', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/pseudonyms'));
 app.use('/api/integrations', authMiddleware(['admin']), configLockGate(), require('./routes/integrations'));
 app.use('/api/v1/malware-scanners', authMiddleware(['admin']), configLockGate(), require('./routes/malware-scanners'));
 app.use('/api/apikeys', authMiddleware(['admin']), configLockGate(), require('./routes/apikeys'));
