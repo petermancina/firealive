@@ -7,8 +7,8 @@
 // currently hold an active WebSocket session. Fills the gap left by the
 // services/system-health.js getConnectedClients() capability that was
 // identified during the R3l pre-flight audit as NOT being in canonical
-// FireAlive — once C9 ships, system-health.js can be safely removed in R3m
-// without losing this observability.
+// FireAlive — system-health.js was removed in R3m C8 after this endpoint
+// (R3l C9) took over its getConnectedClients role.
 //
 // Response shape
 //   {
