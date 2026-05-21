@@ -108,6 +108,8 @@ const ALLOWED_EVENT_TYPES = new Set([
   'GEO_CONFIG_SAVED',
   // Handoffs + shift transitions
   'HANDOFF_SENT',
+  // Helper Pay configuration (C18)
+  'HELPER_PAY_CONFIG_SAVED',
   // Compliance / reporting
   'HUMAN_IMPACT_REPORT',
   'PROACTIVE_CONFIG_SAVED',
