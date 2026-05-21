@@ -9,6 +9,7 @@ const ALLOWED_CHANNELS = [
   'training:submit', 'assessment:submit',
   'config:get', 'config:set',
   'audit:log', 'audit:export',
+  'notify:desktop',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
