@@ -57,7 +57,7 @@ function isContactSafeRole(role) {
 // permissive) — strikes a balance between false-rejects on legitimate addresses
 // and false-accepts on garbage. Production deployments may want to layer on
 // a verification email round-trip for true validation.
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s.@]+(?:\.[^\s.@]+)+$/; // linear-safe; do NOT revert to [^\s@]+\.[^\s@]+ (ReDoS, CWE-1333)
 
 // E.164 international format: + followed by 1-15 digits, first digit non-zero.
 // Matches Twilio + AWS SNS expected input format. Examples: +15551234567,
