@@ -921,6 +921,24 @@ function ManagementConsole() {
   const [showAddAuto, setShowAddAuto] = useState(false);
   const [newAuto, setNewAuto] = useState({name:"",type:"EDR/XDR",l1:true,l2:false,l3:false,max:500,u:"alerts/hr"});
   const [notifCfg, setNotifCfg] = useState({thresh:"watch",email:true,sms:false,voip:false,lambda:false,addr:"",phone:"",arn:""});
+  // N1a C23: SMS Provider Configuration state. Hydrated from /api/notifications/config
+  // when the notif tab opens. R3n sensitive-field pattern: sms_auth_token is never
+  // returned from GET; presence surfaced via sms_auth_token_present boolean. The
+  // "Change Secret" affordance reveals an input only when explicitly invoked;
+  // PUT omits smsAuthToken from body unless changing (omission-rule preserves
+  // existing encrypted value server-side).
+  const [smsProvider, setSmsProvider] = useState("");
+  const [smsAccountSid, setSmsAccountSid] = useState("");
+  const [smsAuthToken, setSmsAuthToken] = useState("");
+  const [smsAuthTokenPresent, setSmsAuthTokenPresent] = useState(false);
+  const [smsAuthTokenChanging, setSmsAuthTokenChanging] = useState(false);
+  const [smsFromNumber, setSmsFromNumber] = useState("");
+  const [smsConfigHydrated, setSmsConfigHydrated] = useState(false);
+  const [smsConfigSaving, setSmsConfigSaving] = useState(false);
+  const [smsConfigSaved, setSmsConfigSaved] = useState(false);
+  const [smsConfigError, setSmsConfigError] = useState(null);
+  const [smsTestSending, setSmsTestSending] = useState(false);
+  const [smsTestResult, setSmsTestResult] = useState(null);
   // ── Inbox state (Phase 1.4a) ──────────────────────────────────────────
   const [inboxItems, setInboxItems] = useState([]);
   const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
@@ -929,6 +947,18 @@ function ManagementConsole() {
   const [inboxView, setInboxView] = useState("list"); // list | preferences
   const [inboxPrefs, setInboxPrefs] = useState(null);
   const [inboxPrefsLoading, setInboxPrefsLoading] = useState(false);
+  // N1a C21: Lead Notification Contact Info Card state. Stores the lead's
+  // registered email + phone for SMS / email notification dispatch. Loaded
+  // from /api/users/me/lead-contacts when the preferences view opens; saved
+  // via PUT to the same endpoint. Field-level errors come from the route's
+  // VALIDATION_FAILED 422 response (lead-contacts.js). leadContactRestricted
+  // is set to true if the route returns 403 ANALYST_CONTACT_STORAGE_BLOCKED,
+  // which would only happen if a non-lead role somehow reached this UI.
+  const [leadContact, setLeadContact] = useState({ email: "", phone: "", updated_at: null });
+  const [leadContactSaving, setLeadContactSaving] = useState(false);
+  const [leadContactSaved, setLeadContactSaved] = useState(false);
+  const [leadContactErrors, setLeadContactErrors] = useState(null);
+  const [leadContactRestricted, setLeadContactRestricted] = useState(false);
 
   // Poll unread count every 60s; load list when entering inbox tab.
   useEffect(()=>{
@@ -954,6 +984,27 @@ function ManagementConsole() {
       api.get("/api/inbox/preferences").then(r=>{
         setInboxPrefs(r?.preferences||null);
       }).catch(()=>{}).finally(()=>setInboxPrefsLoading(false));
+      // N1a C21: also fetch the lead's registered contact info. Uses raw
+      // fetch (not api.get) so we can inspect status to detect 403 ANALYST_
+      // CONTACT_STORAGE_BLOCKED separately from network errors.
+      (async () => {
+        try {
+          const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+          const r = await fetch(API_BASE + '/api/users/me/lead-contacts', { headers });
+          const json = await r.json().catch(() => null);
+          if (r.ok) {
+            setLeadContact({
+              email: (json && json.email) || "",
+              phone: (json && json.phone) || "",
+              updated_at: (json && json.updated_at) || null,
+            });
+            setLeadContactRestricted(false);
+            setLeadContactErrors(null);
+          } else if (r.status === 403 && json && json.code === 'ANALYST_CONTACT_STORAGE_BLOCKED') {
+            setLeadContactRestricted(true);
+          }
+        } catch {}
+      })();
     }
   }, [tab, inboxView, inboxIncludeRead]);
 
@@ -1079,6 +1130,88 @@ function ManagementConsole() {
       setSoarHydrated(true);
     }).catch(()=>setSoarHydrated(true));
   }, [tab, soarHydrated]);
+
+  // N1a C23: Hydrate SMS Provider Config from /api/notifications/config when
+  // the notif tab opens. The route returns sms_provider / sms_account_sid /
+  // sms_from_number plainly and the sensitive sms_auth_token via the
+  // sms_auth_token_present boolean (N1a C22 backend).
+  useEffect(()=>{
+    if (tab !== "notif" || smsConfigHydrated) return;
+    api.get("/api/notifications/config").then(r=>{
+      if (r && !r.error) {
+        setSmsProvider(r.sms_provider || "");
+        setSmsAccountSid(r.sms_account_sid || "");
+        setSmsFromNumber(r.sms_from_number || "");
+        setSmsAuthTokenPresent(!!r.sms_auth_token_present);
+        setSmsAuthToken("");
+        setSmsAuthTokenChanging(false);
+      }
+      setSmsConfigHydrated(true);
+    }).catch(()=>setSmsConfigHydrated(true));
+  }, [tab, smsConfigHydrated]);
+
+  // ── N1a C26: Desktop notification WebSocket client ──────────────────────
+  // Mirror of the Analyst Client desktop-notify WS (N1a C25). The MC opens a
+  // WebSocket to the server's /ws endpoint, authenticates with the JWT, and
+  // listens for { type: 'desktop_notify', payload } pushes. Server path:
+  // notify() -> enqueueDesktop -> sendDesktopToUser -> wsServer.
+  // sendDesktopNotification (N1a C24 + C11 + C9). On receipt, the payload is
+  // forwarded to the Electron main process via window.firealive.send(
+  // 'notify:desktop', payload), where the ipcMain handler (C15) renders the
+  // OS Notification. Reconnects with exponential backoff (capped 30s) on drop.
+  // No-op in a plain browser (no window.firealive bridge). ManagementConsole
+  // only mounts after login (App renders it when stage==="app") and unmounts
+  // on sign-out, so a []-deps effect maps to the logged-in lifecycle: connect
+  // on login, clean teardown on sign-out.
+  useEffect(() => {
+    if (!api._token) return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.send !== "function") return; // browser / no Electron shell
+
+    let ws = null;
+    let reconnectTimer = null;
+    let closedByUnmount = false;
+    let backoffMs = 1000;
+    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws";
+
+    const scheduleReconnect = () => {
+      if (closedByUnmount) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+    };
+
+    function connect() {
+      if (closedByUnmount) return;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (_e) {
+        scheduleReconnect();
+        return;
+      }
+      ws.onopen = () => {
+        backoffMs = 1000;
+        try { ws.send(JSON.stringify({ type: "auth", token: api._token })); } catch (_e) {}
+      };
+      ws.onmessage = (evt) => {
+        let msg;
+        try { msg = JSON.parse(evt.data); } catch (_e) { return; }
+        if (msg && msg.type === "desktop_notify" && msg.payload) {
+          try { bridge.send("notify:desktop", msg.payload); } catch (_e) {}
+        }
+      };
+      ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
+      ws.onerror = () => { try { ws.close(); } catch (_e) {} };
+    }
+
+    connect();
+
+    return () => {
+      closedByUnmount = true;
+      clearTimeout(reconnectTimer);
+      if (ws) { try { ws.close(); } catch (_e) {} }
+    };
+  }, []);
 
   // R3j C8: Hydrate routing caps from canonical /api/routing when
   // tab==="routing" is opened. Response shape: {caps: [{analyst_id,
@@ -3817,6 +3950,89 @@ function ManagementConsole() {
               </div>
             ))}
             <Btn primary style={{width:"100%",marginTop:16}} onClick={()=>addA("NOTIF_SAVED",`Thresh:${notifCfg.thresh}, ${["email","sms","voip","lambda"].filter(k=>notifCfg[k]).join(",")}`)}>Save</Btn>
+          </Card>
+
+          {/* N1a C23: SMS Provider Configuration Card — sibling to burnout-alert config above. Configures the team-wide Twilio or AWS SNS credentials used to dispatch SMS notifications to leads opted in to the SMS channel. */}
+          <Card style={{marginBottom:16,borderLeft:`3px solid ${C.i}`}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>SMS Provider Configuration</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Configure the SMS provider used to dispatch notifications to leads opted into the SMS channel. Twilio uses HTTP Basic auth (account SID + auth token); AWS SNS uses IAM credentials (access key + secret access key). The auth token / secret access key is encrypted at rest (AES-256-GCM via TIER1_ENCRYPTION_KEY).</M>
+            <Sel label="SMS Provider" value={smsProvider} onChange={e=>setSmsProvider(e.target.value)}>
+              <option value="">Select...</option>
+              <option value="twilio">Twilio</option>
+              <option value="aws_sns">AWS SNS</option>
+            </Sel>
+            <Input label={smsProvider==="aws_sns"?"AWS Access Key ID":"Twilio Account SID"} value={smsAccountSid} onChange={e=>setSmsAccountSid(e.target.value)} placeholder={smsProvider==="aws_sns"?"AKIAIOSFODNN7EXAMPLE":"AC1234567890abcdef..."} maxLength={256}/>
+            <div style={{marginBottom:14}}>
+              <M style={{color:C.tm,marginBottom:4,display:"block"}}>{smsProvider==="aws_sns"?"AWS Secret Access Key":"Twilio Auth Token"}</M>
+              {smsAuthTokenPresent && !smsAuthTokenChanging ? (
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:"rgba(110,231,183,0.06)",border:`1px solid ${C.a}30`,borderRadius:8}}>
+                  <M style={{color:C.a,fontWeight:500,fontSize:11,flex:1}}>Configured ✓ (secret encrypted server-side)</M>
+                  <Btn small onClick={()=>{setSmsAuthToken("");setSmsAuthTokenChanging(true);}}>Change Secret</Btn>
+                </div>
+              ) : (
+                <div style={{display:"flex",gap:6}}>
+                  <input type="password" value={smsAuthToken} onChange={e=>setSmsAuthToken(e.target.value)} placeholder={smsAuthTokenPresent?"New value (or leave blank to clear)":"Auth token / secret access key"} maxLength={512} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+                  {smsAuthTokenPresent && <Btn small onClick={()=>{setSmsAuthToken("");setSmsAuthTokenChanging(false);}}>Cancel</Btn>}
+                </div>
+              )}
+            </div>
+            <Input label={smsProvider==="aws_sns"?"From Number (unused for AWS SNS at v1.0.41; SenderID is a future enhancement)":"Twilio From Number (E.164)"} value={smsFromNumber} onChange={e=>setSmsFromNumber(e.target.value)} placeholder="+15551234567" maxLength={20}/>
+            {smsConfigError&&<M style={{color:C.d,fontSize:11,display:"block",marginBottom:8}}>{smsConfigError}</M>}
+            <div style={{display:"flex",gap:8,alignItems:"center",marginTop:8,flexWrap:"wrap"}}>
+              <Btn primary disabled={smsConfigSaving} onClick={async()=>{
+                setSmsConfigSaving(true);
+                setSmsConfigError(null);
+                setSmsConfigSaved(false);
+                const body = {
+                  smsProvider: smsProvider || "",
+                  smsAccountSid: smsAccountSid.trim(),
+                  smsFromNumber: smsFromNumber.trim(),
+                };
+                // N1a C23: omit smsAuthToken from PUT body unless the lead explicitly
+                // clicked Change Secret. R3n omission-rule preserves existing encrypted
+                // value server-side when key is absent from body.
+                if (smsAuthTokenChanging) {
+                  body.smsAuthToken = smsAuthToken;
+                }
+                const r = await api.put("/api/notifications/config", body);
+                if (r && !r.error) {
+                  setSmsConfigSaved(true);
+                  // Re-hydrate to pick up updated sms_auth_token_present boolean
+                  const r2 = await api.get("/api/notifications/config");
+                  if (r2 && !r2.error) setSmsAuthTokenPresent(!!r2.sms_auth_token_present);
+                  setSmsAuthTokenChanging(false);
+                  setSmsAuthToken("");
+                  addA("MC_SMS_PROVIDER_CONFIGURED_UI",`provider=${smsProvider} sid_set=${!!smsAccountSid} from_set=${!!smsFromNumber} token_action=${r.smsAuthTokenAction || "n/a"}`);
+                  setTimeout(()=>setSmsConfigSaved(false),3000);
+                } else {
+                  setSmsConfigError((r&&r.error)||"Failed to save SMS provider config");
+                }
+                setSmsConfigSaving(false);
+              }}>{smsConfigSaving?"Saving…":"Save SMS Provider Config"}</Btn>
+              <Btn small disabled={smsTestSending||!smsAuthTokenPresent} onClick={async()=>{
+                setSmsTestSending(true);
+                setSmsTestResult(null);
+                try {
+                  const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+                  const r = await fetch(API_BASE + '/api/notifications/sms/test', { method: 'POST', headers, body: '{}' });
+                  const json = await r.json().catch(()=>null);
+                  if (r.ok) {
+                    setSmsTestResult({ok:true,message:`Test SMS sent via ${(json&&json.provider)||"provider"}${json&&json.providerMessageId?` (id: ${json.providerMessageId})`:""}`});
+                    addA("MC_SMS_TEST_SENT_UI",`provider=${(json&&json.provider)||"unknown"}`);
+                  } else if (r.status === 429) {
+                    setSmsTestResult({ok:false,message:(json&&json.error)||"Rate limit exceeded — wait a minute"});
+                  } else {
+                    setSmsTestResult({ok:false,message:`${(json&&json.error)||"Test SMS failed"}${json&&json.code?` (${json.code})`:""}`});
+                  }
+                } catch (e) {
+                  setSmsTestResult({ok:false,message:e.message||"Network error"});
+                } finally {
+                  setSmsTestSending(false);
+                }
+              }}>{smsTestSending?"Sending…":"Send Test SMS"}</Btn>
+              {smsConfigSaved&&<M style={{color:C.a,fontSize:11}}>✓ Config saved</M>}
+              {smsTestResult&&<M style={{color:smsTestResult.ok?C.a:C.d,fontSize:11}}>{smsTestResult.ok?"✓ ":"✗ "}{smsTestResult.message}</M>}
+            </div>
           </Card>
         </div>)}
 
@@ -7572,18 +7788,82 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </div>)}
           {inboxView==="preferences"&&(<div>
             <L>Notification preferences</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For each event type, choose whether you want to be notified in the inbox, by email, both, or neither. Some critical events (panic mode, tripwire) cannot be disabled in-app — you can still opt out of email for these.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For each event type, choose how you want to be notified: in the inbox, via desktop OS notification, by email, by SMS, any combination, or none. Some critical events (panic mode, tripwire, tier-3 abuse) cannot be disabled in-app — you can still opt out of the other channels for these. Email and SMS dispatch require your contact info registered in the "Your Contact Info" card above — without that, opt-in is honored but dispatch is skipped with an audit-log entry.</M>
+            {/* N1a C21: Your Contact Info Card — lead's personal email + phone for SMS/email dispatch. Hidden if route returned 403 (analyst-role). */}
+            {!leadContactRestricted && (
+              <Card style={{marginBottom:16,borderLeft:`3px solid ${C.a}`}}>
+                <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>Your Contact Info</div>
+                <M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:12}}>Register the email and phone where FireAlive should reach you for email + SMS notifications. Storage is per-lead (lead_notification_contacts table) and isolated from analyst PII. Clear both fields and save to opt out entirely.</M>
+                <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                  <label style={{display:"flex",flexDirection:"column",gap:4}}>
+                    <M style={{color:C.t,fontSize:11}}>Email for notifications</M>
+                    <input type="email" value={leadContact.email} onChange={e=>setLeadContact(prev=>({...prev,email:e.target.value}))} placeholder="name@example.com" style={{padding:"6px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${leadContactErrors&&leadContactErrors.email?C.d:C.b}`,borderRadius:6,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+                    {leadContactErrors&&leadContactErrors.email&&<M style={{color:C.d,fontSize:10}}>{leadContactErrors.email}</M>}
+                  </label>
+                  <label style={{display:"flex",flexDirection:"column",gap:4}}>
+                    <M style={{color:C.t,fontSize:11}}>Phone for SMS notifications (E.164 format)</M>
+                    <input type="tel" value={leadContact.phone} onChange={e=>setLeadContact(prev=>({...prev,phone:e.target.value}))} placeholder="+15551234567" style={{padding:"6px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${leadContactErrors&&leadContactErrors.phone?C.d:C.b}`,borderRadius:6,color:C.t,fontSize:12,fontFamily:"inherit"}}/>
+                    {leadContactErrors&&leadContactErrors.phone&&<M style={{color:C.d,fontSize:10}}>{leadContactErrors.phone}</M>}
+                  </label>
+                </div>
+                {leadContactErrors&&leadContactErrors.general&&<M style={{color:C.d,fontSize:11,display:"block",marginTop:8}}>{leadContactErrors.general}</M>}
+                <div style={{display:"flex",alignItems:"center",gap:12,marginTop:12}}>
+                  <Btn small primary disabled={leadContactSaving} onClick={async()=>{
+                    setLeadContactSaving(true);
+                    setLeadContactErrors(null);
+                    setLeadContactSaved(false);
+                    try {
+                      const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+                      const r = await fetch(API_BASE + '/api/users/me/lead-contacts', {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({
+                          email: leadContact.email ? leadContact.email.trim() : null,
+                          phone: leadContact.phone ? leadContact.phone.trim() : null,
+                        }),
+                      });
+                      const json = await r.json().catch(()=>null);
+                      if (r.ok) {
+                        setLeadContact({
+                          email: (json && json.email) || "",
+                          phone: (json && json.phone) || "",
+                          updated_at: (json && json.updated_at) || null,
+                        });
+                        setLeadContactSaved(true);
+                        addA("MC_LEAD_CONTACT_INFO_UPDATED",`email_set=${!!(json&&json.email)} phone_set=${!!(json&&json.phone)}${json&&json.cleared?" cleared=true":""}`);
+                        setTimeout(()=>setLeadContactSaved(false),3000);
+                      } else if (r.status === 422 && json && json.code === 'VALIDATION_FAILED') {
+                        const errs = {};
+                        for (const f of (json.fields || [])) errs[f.field] = f.message;
+                        setLeadContactErrors(errs);
+                      } else if (r.status === 403 && json && json.code === 'ANALYST_CONTACT_STORAGE_BLOCKED') {
+                        setLeadContactRestricted(true);
+                      } else {
+                        setLeadContactErrors({ general: (json && json.error) || `Failed to save (HTTP ${r.status})` });
+                      }
+                    } catch (e) {
+                      setLeadContactErrors({ general: e.message || 'Network error' });
+                    } finally {
+                      setLeadContactSaving(false);
+                    }
+                  }}>{leadContactSaving?"Saving…":"Save Contact Info"}</Btn>
+                  {leadContactSaved&&<M style={{color:C.a,fontSize:11}}>✓ Saved</M>}
+                  {leadContact.updated_at&&!leadContactSaved&&<M style={{color:C.td,fontSize:10}}>Last saved: {new Date(leadContact.updated_at).toLocaleString()}</M>}
+                </div>
+              </Card>
+            )}
             {inboxPrefsLoading&&<M style={{color:C.td}}>Loading preferences…</M>}
             {!inboxPrefsLoading&&!inboxPrefs&&<Card><M style={{color:C.tm}}>Could not load preferences. The server may be unavailable.</M></Card>}
             {inboxPrefs&&Object.entries(inboxPrefs).map(([eventType,p])=>(
               <Card key={eventType} style={{marginBottom:8}}>
                 <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{p.label}</div>
                 <M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:10}}>{p.description}</M>
-                <div style={{display:"flex",gap:16}}>
-                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
-                    <input type="checkbox" checked={p.in_app} onChange={e=>{
+                <div style={{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}}>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:p.mandatory_in_app?"not-allowed":"pointer",opacity:p.mandatory_in_app?0.7:1}} title={p.mandatory_in_app?"This event is mandatory in-app for all users and cannot be disabled.":""}>
+                    <input type="checkbox" checked={p.in_app} disabled={p.mandatory_in_app} onChange={e=>{
                       const newInApp = e.target.checked;
-                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:newInApp,email:p.email}).then(()=>{
+                      // N1a C18: send all 4 channel fields, preserving the other 3 from current state
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:newInApp,email:p.email,sms:p.sms??false,desktop:p.desktop??false}).then(()=>{
                         setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],in_app:newInApp,is_default:false}}));
                       }).catch(err=>{
                         addA("INBOX_PREF_REJECTED",`${eventType} in_app change rejected (likely mandatory in-app event)`);
@@ -7592,13 +7872,36 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     <M style={{color:C.t}}>In-app</M>
                   </label>
                   <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
-                    <input type="checkbox" checked={p.email} onChange={e=>{
-                      const newEmail = e.target.checked;
-                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:newEmail}).then(()=>{
-                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],email:newEmail,is_default:false}}));
+                    <input type="checkbox" checked={p.desktop??false} onChange={e=>{
+                      const newDesktop = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:p.email,sms:p.sms??false,desktop:newDesktop}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],desktop:newDesktop,is_default:false}}));
                       }).catch(()=>{});
                     }}/>
+                    <M style={{color:C.t}}>Desktop</M>
+                  </label>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                    <input type="checkbox" checked={p.email} onChange={e=>{
+                      const newEmail = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:newEmail,sms:p.sms??false,desktop:p.desktop??false}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],email:newEmail,is_default:false}}));
+                      }).catch(err=>{
+                        // N1a C18: 422 with ANALYST_CHANNEL_RESTRICTED returned if a non-lead role somehow reaches this UI
+                        addA("INBOX_PREF_EMAIL_REJECTED",`${eventType} email change rejected (likely role-restricted)`);
+                      });
+                    }}/>
                     <M style={{color:C.t}}>Email</M>
+                  </label>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                    <input type="checkbox" checked={p.sms??false} onChange={e=>{
+                      const newSms = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:p.email,sms:newSms,desktop:p.desktop??false}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],sms:newSms,is_default:false}}));
+                      }).catch(err=>{
+                        addA("INBOX_PREF_SMS_REJECTED",`${eventType} sms change rejected (likely role-restricted)`);
+                      });
+                    }}/>
+                    <M style={{color:C.t}}>SMS</M>
                   </label>
                   {p.is_default&&<M style={{color:C.td,fontStyle:"italic"}}>(default)</M>}
                 </div>

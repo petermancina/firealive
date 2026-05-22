@@ -3,6 +3,14 @@
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
+// N1a C11: Module-level singleton reference. The FireAliveWebSocket constructor
+// captures `this` here so that other modules (notably notifications-desktop.js
+// for sendDesktopNotification dispatch) can reach the instance via require
+// without going through Express app.locals. The instance is constructed once
+// at server boot in index.js; if no instance has been constructed yet, the
+// forwarder at the bottom of this file returns a safe { sent: false } result.
+let _instance = null;
+
 class FireAliveWebSocket {
   constructor(server, db) {
     this.db = db;
@@ -13,6 +21,9 @@ class FireAliveWebSocket {
     this._signalInterval = setInterval(() => this._collectSignals(), 900000);
     // SIEM push every 60 seconds
     this._siemInterval = setInterval(() => this._pushToSiem(), 60000);
+    // N1a C11: Capture the singleton reference so the module-level forwarder
+    // (used by notifications-desktop.js) can reach this instance.
+    _instance = this;
   }
 
   _onConnection(ws, req) {
@@ -103,6 +114,38 @@ class FireAliveWebSocket {
     }
   }
 
+  // N1a C11: Send a desktop-channel push to a specific user. Used by
+  // notifications-desktop.js sendDesktopToUser() (which itself is called
+  // synchronously by notifications.js enqueueDesktop() — shipping in N1a C24).
+  //
+  // Returns { sent: true } if the user's Electron client is currently connected
+  // and the WebSocket message was queued for send. Returns { sent: false,
+  // reason: 'user_not_connected' } if the user is offline / never logged in /
+  // disconnected. The caller in notifications-desktop.js writes the result to
+  // notifications.desktop_delivery_status + notification_delivery_log.
+  //
+  // Wire format: { type: 'desktop_notify', payload }. The Electron renderer
+  // (AC analyst-client.jsx + MC firealive-mc.jsx, listeners landing in N1a
+  // C25 + C26) recognizes msg.type === 'desktop_notify' and forwards msg.payload
+  // to the Electron main process via IPC channel 'notify:desktop' (preload
+  // whitelist update in C12 + C13; main.js handlers in C14 + C15). The main
+  // process then creates a native OS Notification via Electron's Notification
+  // API.
+  //
+  // Role policy: desktop is available to ALL roles (including analysts) —
+  // the OS notification is rendered locally on the user's machine, so no
+  // identity-exposing data flows server-side. The role check at the dispatch
+  // layer (notifications-desktop.js sendDesktopToUser) is purely defensive
+  // (skip if user record doesn't exist in users table).
+  sendDesktopNotification(userId, payload) {
+    const ws = this.clients.get(userId);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return { sent: false, reason: 'user_not_connected' };
+    }
+    this._send(ws, { type: 'desktop_notify', payload });
+    return { sent: true };
+  }
+
   // Broadcast signal update to MC
   broadcastSignalUpdate(analystId, signals) {
     this.clients.forEach((ws) => {
@@ -169,4 +212,18 @@ class FireAliveWebSocket {
   }
 }
 
-module.exports = { FireAliveWebSocket };
+// N1a C11: Module-level forwarder so notifications-desktop.js can call
+// `require('./websocket-server').sendDesktopNotification(userId, payload)`
+// without needing access to the Express app.locals.wsServer reference. If the
+// FireAliveWebSocket constructor has not yet been invoked (server is booting,
+// or this file was loaded in a non-server context like a unit test), the
+// forwarder returns a safe { sent: false, reason: 'ws_server_not_initialized' }
+// result that notifications-desktop.js treats as a skip with audit log entry.
+function sendDesktopNotification(userId, payload) {
+  if (!_instance) {
+    return { sent: false, reason: 'ws_server_not_initialized' };
+  }
+  return _instance.sendDesktopNotification(userId, payload);
+}
+
+module.exports = { FireAliveWebSocket, sendDesktopNotification };

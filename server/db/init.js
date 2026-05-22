@@ -5298,6 +5298,244 @@ function initDb() {
     );
   }
 
+  // ── N1a: Multi-Channel Notification Delivery schema extensions ──────────────
+  //
+  // Five schema migrations needed before N1a can wire SMS + desktop channels:
+  //   (1) notification_preferences gains sms + desktop columns (per-user opt-in)
+  //   (2) notifications gains sms_delivery_status + desktop_delivery_status
+  //   (3) notification_config gains sms_provider + sms_account_sid +
+  //       sms_auth_token_encrypted + sms_from_number (the SMS provider config
+  //       columns; sms_enabled + sms_number are already present from earlier
+  //       partial staging)
+  //   (4) New notification_delivery_log table for per-attempt audit
+  //   (5) New lead_notification_contacts table — per-lead phone + email storage
+  //       for SMS + email notification channels. Structurally restricted to
+  //       non-anonymous roles (lead, admin, developer) via API role-gating;
+  //       analyst-role users NEVER have rows here. Anonymity-preservation by
+  //       design (see anonymity-preservation note below + N1a C7).
+  //
+  // All five migrations are idempotent. The ALTER TABLE adds use PRAGMA
+  // table_info() to check column presence before adding — avoids the "duplicate
+  // column name" error on re-run. The CREATE TABLE uses IF NOT EXISTS. Each
+  // migration has its own try/catch for fault isolation; one failure does not
+  // mask another or block subsequent migrations.
+  //
+  // Privacy note on notification_delivery_log: recipient handles (email
+  // addresses, phone numbers) are SHA-256 hashed before storage in the
+  // recipient_handle_hash column — never plaintext. Forensic investigations
+  // join via notification_id → notifications.recipient_id to identify the user.
+  // This is consistent with FireAlive's Tier-3 protection principles for
+  // PII-in-audit-logs.
+  //
+  // Anonymity-preservation note on lead_notification_contacts: this table is
+  // structurally restricted to non-anonymous roles (lead, admin, developer).
+  // Analyst-role users NEVER have rows here — three layers of defense:
+  //   (a) AC preference UI hides email + SMS channel checkboxes entirely
+  //   (b) API PUT /api/users/me/lead-contacts rejects analyst-role callers
+  //       with HTTP 403 + code ANALYST_CONTACT_STORAGE_BLOCKED
+  //   (c) Dispatch path resolvePreference() forces email + sms to false for
+  //       analyst-role lookups regardless of stored notification_preferences
+  //       values (see N1a C7 — defense against compromised DB tampering)
+  // The table NAME itself signals "identified users only." ON DELETE CASCADE
+  // on user_id ensures clean offboarding wipes contact info atomically with
+  // user deletion. Storage is plaintext (not encrypted at rest) because these
+  // are identifying info for non-anonymous users — consistent with existing
+  // users.name + users.username plaintext storage. The columns are NOT
+  // credentials (unlike sms_auth_token_encrypted) and do not warrant the
+  // encryption-at-rest treatment applied to provider auth tokens.
+
+  try {
+    const cols = db
+      .prepare("PRAGMA table_info(notification_preferences)")
+      .all()
+      .map((c) => c.name);
+    let added = 0;
+    if (!cols.includes('sms')) {
+      db.prepare(
+        "ALTER TABLE notification_preferences ADD COLUMN sms INTEGER NOT NULL DEFAULT 0"
+      ).run();
+      added++;
+    }
+    if (!cols.includes('desktop')) {
+      db.prepare(
+        "ALTER TABLE notification_preferences ADD COLUMN desktop INTEGER NOT NULL DEFAULT 1"
+      ).run();
+      added++;
+    }
+    if (added > 0) {
+      console.log(
+        `N1a migration: added ${added} column(s) to notification_preferences (sms, desktop)`
+      );
+    } else {
+      console.log(
+        'N1a migration: notification_preferences already has sms + desktop columns'
+      );
+    }
+  } catch (n1aPrefsMigrationErr) {
+    console.error(
+      'N1a notification_preferences migration FAILED:',
+      n1aPrefsMigrationErr.message
+    );
+    console.error(
+      'The server will start, but SMS and desktop notification preferences will not be persisted. Users will see the UI checkboxes but their selections will not save. Email + in-app channels continue to work normally.'
+    );
+  }
+
+  try {
+    const cols = db
+      .prepare("PRAGMA table_info(notifications)")
+      .all()
+      .map((c) => c.name);
+    let added = 0;
+    if (!cols.includes('sms_delivery_status')) {
+      db.prepare(
+        "ALTER TABLE notifications ADD COLUMN sms_delivery_status TEXT"
+      ).run();
+      added++;
+    }
+    if (!cols.includes('desktop_delivery_status')) {
+      db.prepare(
+        "ALTER TABLE notifications ADD COLUMN desktop_delivery_status TEXT"
+      ).run();
+      added++;
+    }
+    if (added > 0) {
+      console.log(
+        `N1a migration: added ${added} column(s) to notifications (sms_delivery_status, desktop_delivery_status)`
+      );
+    } else {
+      console.log(
+        'N1a migration: notifications already has sms_delivery_status + desktop_delivery_status columns'
+      );
+    }
+  } catch (n1aNotifsMigrationErr) {
+    console.error(
+      'N1a notifications migration FAILED:',
+      n1aNotifsMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the SMS and desktop notification pipelines will be unable to track per-row delivery status on this table. New notifications will still be created via the in-app channel; SMS/desktop dispatch will fall back to the notification_delivery_log table for status tracking. Recovery: drop and recreate the notifications table from a fresh DB OR manually run the ALTER TABLE statements once.'
+    );
+  }
+
+  try {
+    const cols = db
+      .prepare("PRAGMA table_info(notification_config)")
+      .all()
+      .map((c) => c.name);
+    let added = 0;
+    if (!cols.includes('sms_provider')) {
+      db.prepare(
+        "ALTER TABLE notification_config ADD COLUMN sms_provider TEXT"
+      ).run();
+      added++;
+    }
+    if (!cols.includes('sms_account_sid')) {
+      db.prepare(
+        "ALTER TABLE notification_config ADD COLUMN sms_account_sid TEXT"
+      ).run();
+      added++;
+    }
+    if (!cols.includes('sms_auth_token_encrypted')) {
+      db.prepare(
+        "ALTER TABLE notification_config ADD COLUMN sms_auth_token_encrypted BLOB"
+      ).run();
+      added++;
+    }
+    if (!cols.includes('sms_from_number')) {
+      db.prepare(
+        "ALTER TABLE notification_config ADD COLUMN sms_from_number TEXT"
+      ).run();
+      added++;
+    }
+    if (added > 0) {
+      console.log(
+        `N1a migration: added ${added} SMS provider column(s) to notification_config (sms_provider, sms_account_sid, sms_auth_token_encrypted, sms_from_number)`
+      );
+    } else {
+      console.log(
+        'N1a migration: notification_config already has all 4 SMS provider columns'
+      );
+    }
+  } catch (n1aConfigMigrationErr) {
+    console.error(
+      'N1a notification_config migration FAILED:',
+      n1aConfigMigrationErr.message
+    );
+    console.error(
+      'The server will start, but SMS provider configuration cannot be persisted. The MC SMS Provider Config Card will fail to save. SMS delivery will be unavailable. Email + webhook + PagerDuty channels continue to work via the existing notification_config columns. Recovery: manually run the four ALTER TABLE statements in a SQLite shell against the production DB.'
+    );
+  }
+
+  try {
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS notification_delivery_log (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL CHECK (channel IN ('in_app', 'email', 'sms', 'desktop', 'webhook', 'pagerduty')),
+        attempt_number INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL CHECK (status IN ('queued', 'sending', 'sent', 'failed', 'bounced', 'timeout', 'skipped')),
+        transport_provider TEXT,
+        transport_message_id TEXT,
+        recipient_handle_hash TEXT,
+        error_message TEXT,
+        latency_ms INTEGER,
+        attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      )`
+    ).run();
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_notification_delivery_log_notification ON notification_delivery_log(notification_id)"
+    ).run();
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_notification_delivery_log_status ON notification_delivery_log(status, attempted_at) WHERE status IN ('failed', 'bounced', 'timeout')"
+    ).run();
+
+    const rowCount = db
+      .prepare("SELECT COUNT(*) as c FROM notification_delivery_log")
+      .get().c;
+    console.log(
+      `N1a migration: notification_delivery_log table ready (${rowCount} row(s) present)`
+    );
+  } catch (n1aDeliveryLogMigrationErr) {
+    console.error(
+      'N1a notification_delivery_log migration FAILED:',
+      n1aDeliveryLogMigrationErr.message
+    );
+    console.error(
+      'The server will start, but per-attempt delivery audit trail (DORA Article 14 compliance) will be unavailable. Notification pipelines will continue to deliver, but each attempt will not be logged with retry metadata, transport provider, or message IDs. Forensic investigation of delivery failures will rely on the per-row *_delivery_status fields on the notifications table only. Recovery: manually run the CREATE TABLE + CREATE INDEX statements in a SQLite shell.'
+    );
+  }
+
+  try {
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS lead_notification_contacts (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        email TEXT,
+        phone TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`
+    ).run();
+    db.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_lead_notification_contacts_updated ON lead_notification_contacts(updated_at)"
+    ).run();
+
+    const rowCount = db
+      .prepare("SELECT COUNT(*) as c FROM lead_notification_contacts")
+      .get().c;
+    console.log(
+      `N1a migration: lead_notification_contacts table ready (${rowCount} row(s) present)`
+    );
+  } catch (n1aLeadContactsMigrationErr) {
+    console.error(
+      'N1a lead_notification_contacts migration FAILED:',
+      n1aLeadContactsMigrationErr.message
+    );
+    console.error(
+      'The server will start, but lead/admin/developer users cannot register personal phone or email for SMS/email notifications. The MC "Your Contact Info" Card (Notification Preferences tab) will fail to save; PUT /api/users/me/lead-contacts will return 500. SMS and email dispatch attempts for lead users will skip with audit reason="no_lead_phone_registered" or "no_lead_email_registered". In-app + desktop channels continue to function normally for all roles. Analyst-role users are unaffected (this table never holds analyst rows by design — anonymity preservation). Recovery: manually run the CREATE TABLE + CREATE INDEX statements in a SQLite shell against the production DB.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

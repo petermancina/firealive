@@ -28,100 +28,100 @@ const { logger } = require('./logger');
 const EVENT_TYPES = {
   assessment_assigned: {
     label: 'New assessment assigned to you',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'A team lead has assigned a skills assessment to you.',
   },
   assessment_completed: {
     label: 'Assessment completed by an analyst',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: '(Leads only) An analyst on your team finished an assessment.',
   },
   retro_scheduled: {
     label: 'Post-incident retrospective scheduled',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'You have been added to a post-incident recovery protocol.',
   },
   retro_followup_sent: {
     label: 'Post-incident recovery check-in',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'A scheduled check-in (24hr, 72hr, or 2-week mark) for one of your active recovery protocols.',
   },
   peer_request_posted: {
     label: 'New peer support request available',
-    default: { in_app: 0, email: 0 },
+    default: { in_app: 0, email: 0, sms: 0, desktop: 0 },
     description: 'An analyst posted a peer support request you are eligible to accept. Default off because volume can be high — opt in if you want to be a fast responder.',
     dailyCap: 5,
   },
   peer_request_accepted: {
     label: 'A peer accepted your support request',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'Someone has accepted your peer support request. A session is now active.',
   },
   peer_consent_mutual: {
     label: 'Identity revealed in peer session',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'Both parties consented to reveal identities in your active peer support session.',
   },
   peer_session_timed_out: {
     label: 'Peer session timed out — request re-queued',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'Your peer support request was accepted but the helper did not show up. Your request has been re-queued for a different helper.',
   },
   iam_recert_due: {
     label: 'IAM recertification is due',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: '(Leads only) One or more analysts need IAM recertification.',
   },
   helper_points_awarded: {
     label: 'Helper Pay points awarded',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'You earned Helper Pay points for a peer-share session.',
   },
   helper_redemption_approved: {
     label: 'Helper Pay redemption approved',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'Your Helper Pay redemption request has been approved.',
   },
   helper_redemption_denied: {
     label: 'Helper Pay redemption denied',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'Your Helper Pay redemption request was denied.',
   },
   delegation_decision: {
     label: 'Automation delegation decision',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'Your delegation request was accepted or rejected.',
   },
   routing_panic_engaged_manual: {
     label: 'Panic-mode routing engaged (manual)',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'A team lead has manually engaged panic mode. Wellness routing is OFF and every analyst is at maximum complexity until panic mode is lifted. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
   routing_panic_engaged_tripwire: {
     label: 'Panic-mode routing engaged (tripwire)',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'The tripwire fired automatically because too many analysts are on reduced routing. Wellness routing is OFF and every analyst is at maximum complexity until the situation is reviewed. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
   routing_panic_lifted: {
     label: 'Panic-mode routing lifted',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'Panic mode has been lifted. Wellness routing is back on and analysts have returned to their previous complexity caps.',
   },
   peer_abuse_flag_tier1: {
     label: 'Peer chat — minor conduct flag (tier 1)',
-    default: { in_app: 1, email: 0 },
+    default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
     description: 'An analyst flagged a peer skill-share session for minor conduct issues — curt tone, dismissiveness, condescension, mild rudeness. No identity reveal. Aggregated for pattern detection. If a single peer accumulates many tier-1 flags from different reporters, consider a coaching conversation rather than disciplinary action.',
   },
   peer_abuse_flag_tier2: {
     label: 'Peer chat — personal attack flag (tier 2)',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'An analyst flagged a peer skill-share session for direct insult, name-calling, mockery, or demeaning language. Per the peer-chat policy, the flagged peer\'s identity is revealed to you. Flagged content is retained in the secure vault for review. No automatic HR loop — your judgment on next steps.',
   },
   peer_abuse_flag_tier3: {
     label: 'Peer chat — urgent conduct flag (tier 3)',
-    default: { in_app: 1, email: 1 },
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
     description: 'An analyst flagged a peer skill-share session for urgent conduct: slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Both the flagged peer\'s identity and the flagger\'s identity are revealed to you. HR intervention is recommended. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
@@ -131,28 +131,153 @@ function isKnownEventType(eventType) {
   return Object.prototype.hasOwnProperty.call(EVENT_TYPES, eventType);
 }
 
-// ── Preference resolution ────────────────────────────────────────────────────
-// Returns {in_app, email} effective for this user/event combination, falling
-// back to EVENT_TYPES[eventType].default when the user has no row.
-function resolvePreference(db, userId, eventType) {
-  const row = db.prepare(`
-    SELECT in_app, email FROM notification_preferences WHERE user_id = ? AND event_type = ?
-  `).get(userId, eventType);
-  if (row) return { in_app: row.in_app === 1, email: row.email === 1 };
-  const fallback = EVENT_TYPES[eventType].default;
-  return { in_app: fallback.in_app === 1, email: fallback.email === 1 };
+// ── Anonymity-preservation role check ────────────────────────────────────────
+// N1a C7: Returns true if the role is a non-anonymous role (lead, admin,
+// developer) and therefore eligible for the email + sms notification channels.
+// Returns false for analyst-role users (anonymity-protected — only in_app +
+// desktop channels are available) and for any unknown role (safe default —
+// treat as anonymity-protected if the user lookup fails).
+//
+// This is the single source of truth for the channel-availability policy
+// across resolvePreference(), setPreference(), and getEligibleRecipients().
+// The same check is also applied by the route handlers at PUT
+// /api/users/me/lead-contacts (ANALYST_CONTACT_STORAGE_BLOCKED, HTTP 403)
+// and PUT /api/inbox/preferences/:eventType (ANALYST_CHANNEL_RESTRICTED,
+// HTTP 422) — those route handlers will ship in N1a C19 + C21.
+//
+// Three-layer defense for analyst anonymity:
+//   (a) UI layer — AC preference UI hides email + SMS checkboxes (N1a C16)
+//   (b) API layer — route handlers reject analyst-role callers (N1a C19, C21)
+//   (c) Dispatch layer — this function gates resolvePreference() +
+//       getEligibleRecipients() so the dispatch path never honors email/sms
+//       for analyst users regardless of stored notification_preferences
+//       values (defense against DB tampering, legacy data, or API bypass)
+function isContactSafeRole(role) {
+  return role === 'lead' || role === 'admin' || role === 'developer';
 }
 
-// ── Email queue (deferred to a later commit) ─────────────────────────────────
-// The email channel uses the existing notification_config row (configured via
-// routes/notifications.js — webhook/PagerDuty/email/SMS for burnout alerts).
-// For Phase 1.4a commit 2, we record that an email was *requested* but defer
-// actual SMTP delivery to commit 4 (email pipeline). Until commit 4 lands,
-// email_delivery_status='queued' is the terminal state.
+// ── Preference resolution ────────────────────────────────────────────────────
+// Returns {in_app, email, sms, desktop} effective for this user/event
+// combination, falling back to EVENT_TYPES[eventType].default when the user
+// has no row. Applies N1a C7 anonymity-preservation gating: email + sms are
+// forced to false for analyst-role users regardless of stored values.
+function resolvePreference(db, userId, eventType, opts = {}) {
+  // N1a: Reads all 4 channel columns (in_app, email, sms, desktop). The sms +
+  // desktop columns were added by the N1a migration in db/init.js. Existing
+  // rows had those columns auto-defaulted at ALTER TIME (sms=0, desktop=1).
+  // Downstream notify() uses these to decide which channels to enqueue per
+  // notification.
+  //
+  // N1a C7: After computing the 4-channel pref object, applies anonymity-
+  // preservation gating — analyst-role users get email + sms forced to false
+  // regardless of stored values. Role can be passed via opts.role to avoid the
+  // extra SELECT (caller already has it); otherwise looked up using the
+  // provided db connection.
+  const row = db.prepare(`
+    SELECT in_app, email, sms, desktop FROM notification_preferences WHERE user_id = ? AND event_type = ?
+  `).get(userId, eventType);
+  let pref;
+  if (row) {
+    pref = {
+      in_app: row.in_app === 1,
+      email: row.email === 1,
+      sms: row.sms === 1,
+      desktop: row.desktop === 1,
+    };
+  } else {
+    const fallback = EVENT_TYPES[eventType].default;
+    pref = {
+      in_app: fallback.in_app === 1,
+      email: fallback.email === 1,
+      // sms + desktop defaults may be undefined on older event-type defs (defensive
+      // fallback: sms off, desktop on — matches the catalog policy for events
+      // that don't override).
+      sms: (fallback.sms ?? 0) === 1,
+      desktop: (fallback.desktop ?? 1) === 1,
+    };
+  }
+
+  // N1a C7: ANALYST ANONYMITY ENFORCEMENT (dispatch-layer defense)
+  // Look up role if not provided. Unknown role → treat as anonymity-protected
+  // (safer default for unknown user). isContactSafeRole() returns false unless
+  // role is lead/admin/developer.
+  let role = opts.role;
+  if (role === undefined) {
+    const userRow = db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+    role = userRow ? userRow.role : undefined;
+  }
+  if (!isContactSafeRole(role)) {
+    // Defense-in-depth: zero email + sms regardless of stored value. If any
+    // analyst row has email=1 or sms=1 (DB tampering, legacy pre-N1a data, or
+    // a future bug bypassing API enforcement), this dispatch-layer check
+    // catches it before any identity-exposing channel fires. Log when we
+    // actually CHANGE a value — silent no-op when stored values were already
+    // 0/0 (the normal case for analyst users post-C7).
+    if (pref.email || pref.sms) {
+      logger.warn(
+        `resolvePreference(): analyst-role user ${userId} has stored email=${pref.email} sms=${pref.sms} for event ${eventType} — forcing both to false (N1a C7 anonymity enforcement). Investigate stored-value source: stale pre-C7 data, DB tampering, or API bypass.`
+      );
+    }
+    pref.email = false;
+    pref.sms = false;
+  }
+  return pref;
+}
+
+// ── Per-channel enqueue helpers ──────────────────────────────────────────────
+// Each helper either flips a *_delivery_status column to 'queued' for the
+// pipeline cron to drain (email, sms) or dispatches synchronously via
+// WebSocket push (desktop). The channel is opt-in per user; resolvePreference
+// (N1a C7 role-gated) decides whether each helper fires for a given
+// notification.
+
+// Email — queued for the email pipeline cron (60s interval, scheduler.js).
+// Drained by notifications-pipeline.js (SMTP / webhook / PagerDuty).
 function enqueueEmail(db, notificationId) {
   db.prepare(`
     UPDATE notifications SET email_delivery_status = 'queued' WHERE id = ?
   `).run(notificationId);
+}
+
+// N1a C24: SMS — queued for the SMS pipeline cron (60s interval, scheduler.js
+// post-C10). Drained by notifications-sms.js (Twilio or AWS SNS dispatch via
+// notification_config sms_provider + lead_notification_contacts.phone lookup).
+// Analyst-role users never reach this helper because resolvePreference (C7)
+// forces pref.sms to false for them.
+function enqueueSms(db, notificationId) {
+  db.prepare(`
+    UPDATE notifications SET sms_delivery_status = 'queued' WHERE id = ?
+  `).run(notificationId);
+}
+
+// N1a C24: Desktop — SYNCHRONOUS push via WebSocket (no polling queue at
+// v1.0.41). Lazy-requires notifications-desktop.js to avoid module-load-time
+// circular dependency. The helper does not update desktop_delivery_status
+// itself — sendDesktopToUser handles the full lifecycle (queued → sent /
+// skipped / failed) including its own notification_delivery_log row write.
+//
+// Desktop is available to ALL roles (including analysts); the OS notification
+// is rendered locally on the user's machine, so no identity-exposing data
+// flows server-side. Anonymity-protected by the local-only render surface,
+// not by the role gate.
+function enqueueDesktop(notificationId, recipientId, payload) {
+  try {
+    const { sendDesktopToUser } = require('./notifications-desktop');
+    sendDesktopToUser(recipientId, {
+      ...payload,
+      notificationId,
+    });
+  } catch (err) {
+    // Lazy-require failed (notifications-desktop.js missing) or sendDesktopToUser
+    // threw an unexpected error. Log + continue — in-app delivery is already
+    // recorded above; desktop is a best-effort augmentation. The in-app inbox
+    // is the offline fallback for any desktop dispatch failure.
+    logger.warn('enqueueDesktop: dispatch error', {
+      notificationId,
+      recipientId,
+      error: err.message,
+    });
+  }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -185,8 +310,28 @@ function notify({ recipientId, eventType, title, body = null, linkTab = null, li
       SELECT id FROM notifications WHERE rowid = ?
     `).get(result.lastInsertRowid)?.id;
 
+    // Channel dispatch order: email (queued), sms (queued), desktop (synchronous).
+    // Desktop fires last because it's the only synchronous channel — keeps the
+    // queue-fill operations close together and lets the synchronous WebSocket
+    // push tail-call notify().
     if (pref.email && notificationId) {
       enqueueEmail(db, notificationId);
+    }
+    // N1a C24: extend dispatch to SMS + desktop channels. resolvePreference
+    // (C7 role-gated) ensures analyst-role users never have pref.sms true
+    // here; defense-in-depth at notifications-sms.js (C8) also skips analyst
+    // recipients if anything bypasses the C7 gate.
+    if (pref.sms && notificationId) {
+      enqueueSms(db, notificationId);
+    }
+    if (pref.desktop && notificationId) {
+      enqueueDesktop(notificationId, recipientId, {
+        title,
+        body,
+        eventType,
+        linkTab,
+        linkParams,
+      });
     }
 
     return notificationId;
@@ -277,20 +422,51 @@ function markAllRead(userId) {
 function getPreferences(userId) {
   const db = getDb();
   try {
+    // N1a C16: Read all 4 channel columns (the sms + desktop columns were
+    // added by the N1a C1 init.js migration).
     const rows = db.prepare(`
-      SELECT event_type, in_app, email FROM notification_preferences WHERE user_id = ?
+      SELECT event_type, in_app, email, sms, desktop FROM notification_preferences WHERE user_id = ?
     `).all(userId);
     const customByType = {};
-    for (const r of rows) customByType[r.event_type] = { in_app: r.in_app === 1, email: r.email === 1 };
+    for (const r of rows) {
+      customByType[r.event_type] = {
+        in_app: r.in_app === 1,
+        email: r.email === 1,
+        sms: r.sms === 1,
+        desktop: r.desktop === 1,
+      };
+    }
+
+    // N1a C16: ANALYST ANONYMITY ENFORCEMENT (mirror of C7 resolvePreference
+    // gating, applied at the read path too). Look up role once; if not contact-
+    // safe, force email + sms to false in every event's returned pref. The UI
+    // will render whatever it gets — gating here ensures analyst clients never
+    // see stored email=true / sms=true values that could mislead them about
+    // their actual channel availability.
+    const userRow = db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+    const role = userRow ? userRow.role : undefined;
+    const contactSafe = isContactSafeRole(role);
 
     const out = {};
     for (const [eventType, meta] of Object.entries(EVENT_TYPES)) {
+      const stored = customByType[eventType];
+      let prefInApp = stored?.in_app ?? meta.default.in_app === 1;
+      let prefEmail = stored?.email ?? meta.default.email === 1;
+      let prefSms = stored?.sms ?? (meta.default.sms ?? 0) === 1;
+      let prefDesktop = stored?.desktop ?? (meta.default.desktop ?? 1) === 1;
+      if (!contactSafe) {
+        prefEmail = false;
+        prefSms = false;
+      }
       out[eventType] = {
         label: meta.label,
         description: meta.description,
-        in_app: customByType[eventType]?.in_app ?? meta.default.in_app === 1,
-        email: customByType[eventType]?.email ?? meta.default.email === 1,
-        is_default: !customByType[eventType],
+        in_app: prefInApp,
+        email: prefEmail,
+        sms: prefSms,
+        desktop: prefDesktop,
+        mandatory_in_app: !!meta.mandatoryInApp,
+        is_default: !stored,
       };
     }
     return out;
@@ -300,25 +476,51 @@ function getPreferences(userId) {
 }
 
 // Update one preference. Throws if eventType is unknown.
-function setPreference(userId, eventType, { in_app, email }) {
+function setPreference(userId, eventType, { in_app, email, sms, desktop }) {
   if (!isKnownEventType(eventType)) {
     throw new Error(`setPreference(): unknown event type "${eventType}"`);
   }
   // Refuse to disable in_app for events flagged mandatoryInApp.
-  // These are critical events (panic mode, tripwire) where every analyst
-  // MUST see the in-app notification regardless of preference. Email
-  // opt-out is still allowed — only in_app is enforced.
+  // These are critical events (panic mode, tripwire, tier-3 abuse) where every
+  // analyst MUST see the in-app notification regardless of preference. The
+  // user can still opt out of email + sms + desktop for these events — only
+  // in_app is enforced.
   if (EVENT_TYPES[eventType].mandatoryInApp && !in_app) {
     throw new Error(`setPreference(): in_app delivery cannot be disabled for "${eventType}" — this event is mandatory in-app for all users`);
   }
+  // N1a: persist all 4 channels. UPSERT updates all 4 columns whenever the
+  // user touches preferences via the UI. Each channel is independent — the
+  // user can mix in_app + desktop for one event, email + sms for another.
   const db = getDb();
   try {
+    // N1a C7: ANALYST ANONYMITY ENFORCEMENT (API-layer defense)
+    // Look up the caller's role to enforce the channel-availability policy.
+    // Analyst-role users cannot persist email=1 or sms=1 — these channels
+    // require identity-exposing contact storage (lead_notification_contacts
+    // table) that is structurally restricted to non-anonymous roles.
+    // The route handler at PUT /api/inbox/preferences/:eventType catches this
+    // throw and converts to HTTP 422 + body {code: 'ANALYST_CHANNEL_RESTRICTED'}
+    // (will ship in N1a C19). Audit event MC_ANALYST_CHANNEL_RESTRICTION_ENFORCED
+    // is emitted by the route handler on the throw.
+    const userRow = db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
+    const role = userRow ? userRow.role : undefined;
+    if (!isContactSafeRole(role) && (email || sms)) {
+      const err = new Error(
+        `setPreference(): email and sms channels are not available for analyst-role users — these channels are restricted to lead/admin/developer roles to preserve analyst anonymity`
+      );
+      err.code = 'ANALYST_CHANNEL_RESTRICTED';
+      throw err;
+    }
     db.prepare(`
-      INSERT INTO notification_preferences (user_id, event_type, in_app, email)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO notification_preferences (user_id, event_type, in_app, email, sms, desktop)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, event_type) DO UPDATE
-        SET in_app = excluded.in_app, email = excluded.email, updated_at = datetime('now')
-    `).run(userId, eventType, in_app ? 1 : 0, email ? 1 : 0);
+        SET in_app = excluded.in_app,
+            email = excluded.email,
+            sms = excluded.sms,
+            desktop = excluded.desktop,
+            updated_at = datetime('now')
+    `).run(userId, eventType, in_app ? 1 : 0, email ? 1 : 0, sms ? 1 : 0, desktop ? 1 : 0);
   } finally {
     db.close();
   }
@@ -361,14 +563,25 @@ function getEligibleRecipients(eventType, opts = {}) {
     }
     if (activeOnly) conditions.push('available = 1');
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const users = db.prepare(`SELECT id FROM users ${whereClause}`).all(...params);
+    // N1a C7: SELECT extended to include role for anonymity-preservation gating.
+    // The role column is read alongside id so we can apply per-recipient
+    // channel-availability policy without an N+1 query.
+    const users = db.prepare(`SELECT id, role FROM users ${whereClause}`).all(...params);
 
-    // Pre-fetch all preferences for this event type in one query
+    // Pre-fetch all preferences for this event type in one query.
+    // N1a: SELECT extended to include sms + desktop columns alongside in_app + email.
     const prefRows = db.prepare(`
-      SELECT user_id, in_app, email FROM notification_preferences WHERE event_type = ?
+      SELECT user_id, in_app, email, sms, desktop FROM notification_preferences WHERE event_type = ?
     `).all(eventType);
     const prefByUser = {};
-    for (const r of prefRows) prefByUser[r.user_id] = { in_app: r.in_app === 1, email: r.email === 1 };
+    for (const r of prefRows) {
+      prefByUser[r.user_id] = {
+        in_app: r.in_app === 1,
+        email: r.email === 1,
+        sms: r.sms === 1,
+        desktop: r.desktop === 1,
+      };
+    }
 
     const excludeSet = new Set(excludeUserIds);
     const isMandatoryInApp = !!EVENT_TYPES[eventType].mandatoryInApp;
@@ -376,12 +589,31 @@ function getEligibleRecipients(eventType, opts = {}) {
     for (const u of users) {
       if (excludeSet.has(u.id)) continue;
       // For mandatoryInApp events, every matching user is eligible regardless
-      // of their stored preference — these events (panic, tripwire) cannot
-      // be silenced in-app. For all other events, the user must have at
-      // least one channel turned on.
+      // of their stored preference — these events (panic, tripwire, tier-3
+      // abuse) cannot be silenced in-app. For all other events, the user must
+      // have at least one channel turned on.
       if (isMandatoryInApp) { eligible.push(u.id); continue; }
-      const pref = prefByUser[u.id] || { in_app: eventDefaults.in_app === 1, email: eventDefaults.email === 1 };
-      if (pref.in_app || pref.email) eligible.push(u.id);
+      // N1a: fallback considers all 4 channel defaults from the event-type catalog.
+      // Defensive ?? handling for events that haven't been extended with sms +
+      // desktop defaults yet (shouldn't happen at v1.0.41 post-C2 but keeps the
+      // fallback safe for any older test fixtures).
+      const pref = prefByUser[u.id] || {
+        in_app: eventDefaults.in_app === 1,
+        email: eventDefaults.email === 1,
+        sms: (eventDefaults.sms ?? 0) === 1,
+        desktop: (eventDefaults.desktop ?? 1) === 1,
+      };
+      // N1a C7: ANALYST ANONYMITY ENFORCEMENT (dispatch-layer defense)
+      // For non-contact-safe roles (analysts + unknown roles), the eligibility
+      // check ignores the email + sms channels — only in_app + desktop are
+      // honored. Defense-in-depth: even if prefByUser[u.id] somehow has
+      // email=true or sms=true for an analyst (legacy data, DB tampering, or
+      // race condition with C7 deployment), the eligibility OR-check below
+      // won't count those channels toward inclusion in the recipient list.
+      const channelsAvailable = isContactSafeRole(u.role)
+        ? (pref.in_app || pref.email || pref.sms || pref.desktop)
+        : (pref.in_app || pref.desktop);
+      if (channelsAvailable) eligible.push(u.id);
     }
     return eligible;
   } finally {

@@ -249,7 +249,7 @@ const schedulerService = {
       : '* * * * *';
     this.jobs.push(cron.schedule(emailCronExpr, async () => {
       try {
-        const { processQueue } = require('./notifications-email');
+        const { processQueue } = require('./notifications-pipeline');
         const stats = await processQueue();
         if (stats.processed > 0 || stats.skipped > 0) {
           logger.info('Notifications email pipeline cycle', stats);
@@ -257,6 +257,37 @@ const schedulerService = {
       } catch (err) {
         logger.error('Scheduler: notifications email pipeline failed', { error: err.message });
       }    
+    }));
+
+    // ── SMS notification pipeline (N1a C10) ──────────────────────────────
+    // Sibling cron to the email pipeline above. Polls notifications WHERE
+    // sms_delivery_status='queued' and dispatches via the team's configured
+    // SMS provider (Twilio or AWS SNS — N1a C8 module notifications-sms.js).
+    // Interval is configurable via NOTIFICATIONS_SMS_INTERVAL_SEC env (default
+    // 60s); shorter intervals supported but cron min granularity is 1 minute
+    // when interval >= 60s, otherwise every-minute. Desktop dispatch does NOT
+    // get a cron job here — desktop is purely push-based via sendDesktopToUser
+    // synchronously from notifications.js enqueueDesktop() (N1a C24).
+    //
+    // Analyst anonymity: notifications-sms.js performs per-row defense-in-
+    // depth role checking (N1a C7) and skips analyst-role rows that somehow
+    // reached the SMS queue. If sms_provider is not configured in
+    // notification_config, the pipeline returns immediately with skipped
+    // count and logs the queue depth — no error spam.
+    const smsIntervalSec = parseInt(process.env.NOTIFICATIONS_SMS_INTERVAL_SEC || '60', 10);
+    const smsCronExpr = smsIntervalSec >= 60
+      ? `*/${Math.floor(smsIntervalSec / 60)} * * * *`
+      : '* * * * *';
+    this.jobs.push(cron.schedule(smsCronExpr, async () => {
+      try {
+        const { processSmsQueue } = require('./notifications-sms');
+        const stats = await processSmsQueue();
+        if (stats.processed > 0 || stats.skipped > 0) {
+          logger.info('Notifications SMS pipeline cycle', stats);
+        }
+      } catch (err) {
+        logger.error('Scheduler: notifications SMS pipeline failed', { error: err.message });
+      }
     }));
 
     // ── IAM recertification daily check ──────────────────────────────────

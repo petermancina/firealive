@@ -896,6 +896,69 @@ export default function AnalystClientApp() {
   const [tab, setTab] = useState("home");
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
+  // ── N1a C25: Desktop notification WebSocket client ──────────────────────
+  // The AC opens a WebSocket to the server's /ws endpoint after login,
+  // authenticates with the JWT, and listens for { type: 'desktop_notify',
+  // payload } pushes. Server path: notify() -> enqueueDesktop ->
+  // sendDesktopToUser -> wsServer.sendDesktopNotification (N1a C24 + C11 + C9).
+  // On receipt, the payload is forwarded to the Electron main process via
+  // window.firealive.send('notify:desktop', payload), where the ipcMain
+  // handler (C14) renders the OS Notification (urgency:'critical' on
+  // routing_panic_* events). Reconnects with exponential backoff (capped at
+  // 30s) on drop. No-op in a plain browser (no window.firealive bridge):
+  // desktop notifications only fire inside the Electron shell. The in-app
+  // inbox remains the fallback for any missed desktop push.
+  React.useEffect(() => {
+    if (stage !== "app" && stage !== "welcome") return;
+    if (!api._token) return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.send !== "function") return; // browser / no Electron shell
+
+    let ws = null;
+    let reconnectTimer = null;
+    let closedByUnmount = false;
+    let backoffMs = 1000;
+    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws";
+
+    const scheduleReconnect = () => {
+      if (closedByUnmount) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+    };
+
+    function connect() {
+      if (closedByUnmount) return;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch (_e) {
+        scheduleReconnect();
+        return;
+      }
+      ws.onopen = () => {
+        backoffMs = 1000;
+        try { ws.send(JSON.stringify({ type: "auth", token: api._token })); } catch (_e) {}
+      };
+      ws.onmessage = (evt) => {
+        let msg;
+        try { msg = JSON.parse(evt.data); } catch (_e) { return; }
+        if (msg && msg.type === "desktop_notify" && msg.payload) {
+          try { bridge.send("notify:desktop", msg.payload); } catch (_e) {}
+        }
+      };
+      ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
+      ws.onerror = () => { try { ws.close(); } catch (_e) {} };
+    }
+
+    connect();
+
+    return () => {
+      closedByUnmount = true;
+      clearTimeout(reconnectTimer);
+      if (ws) { try { ws.close(); } catch (_e) {} }
+    };
+  }, [stage]);
+
   // ── R3j C12: panic banner state + polling ──────────────────────────────
   // The AC polls /api/status/panic (mounted with ['analyst', 'lead', 'admin'])
   // every 30s and renders a top-of-screen banner mirroring the MC banner from
@@ -2555,19 +2618,23 @@ export default function AnalystClientApp() {
           </div>)}
           {inboxView==="preferences"&&(<div>
             <L>Notification preferences</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For each event type, choose whether you want to be notified in the inbox, by email, both, or neither. Some critical events (panic mode, tripwire) cannot be disabled in-app — you can still opt out of email for these.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For each event type, choose whether you want to be notified in the inbox, on your desktop (native OS notification), both, or neither. Some critical events (panic mode, tripwire, tier-3 abuse) cannot be disabled in-app — you can still opt out of desktop for these. Email and SMS are not available to analysts: storing personal contact information would defeat the pseudonym architecture by linking your identity to your activity.</M>
             {inboxPrefsLoading&&<M style={{color:C.td}}>Loading preferences…</M>}
             {!inboxPrefsLoading&&!inboxPrefs&&<Card><M style={{color:C.tm}}>Could not load preferences. The server may be unavailable.</M></Card>}
             {inboxPrefs&&Object.entries(inboxPrefs).map(([eventType,p])=>(
               <Card key={eventType} style={{marginBottom:8}}>
                 <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{p.label}</div>
                 <M style={{color:C.tm,display:"block",lineHeight:1.6,marginBottom:10}}>{p.description}</M>
-                <div style={{display:"flex",gap:16}}>
-                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
-                    <input type="checkbox" checked={p.in_app} onChange={e=>{
+                <div style={{display:"flex",gap:16,alignItems:"center"}}>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:p.mandatory_in_app?"not-allowed":"pointer",opacity:p.mandatory_in_app?0.7:1}} title={p.mandatory_in_app?"This event is mandatory in-app for all users and cannot be disabled.":""}>
+                    <input type="checkbox" checked={p.in_app} disabled={p.mandatory_in_app} onChange={e=>{
                       const newInApp = e.target.checked;
-                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:newInApp,email:p.email}).then(()=>{
-                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],in_app:newInApp,is_default:false}}));
+                      // N1a C17: AC sends all 4 channel fields. Analyst anonymity rule:
+                      // email + sms are always explicitly zero from the AC. Server-side
+                      // role-gating (N1a C7 + C16) enforces this on the persistence layer
+                      // too — defense-in-depth.
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:newInApp,email:false,sms:false,desktop:p.desktop}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],in_app:newInApp,email:false,sms:false,is_default:false}}));
                       }).catch(err=>{
                         logC("INBOX_PREF_REJECTED",`${eventType} in_app change rejected (likely mandatory in-app event)`);
                       });
@@ -2575,13 +2642,13 @@ export default function AnalystClientApp() {
                     <M style={{color:C.t}}>In-app</M>
                   </label>
                   <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
-                    <input type="checkbox" checked={p.email} onChange={e=>{
-                      const newEmail = e.target.checked;
-                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:newEmail}).then(()=>{
-                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],email:newEmail,is_default:false}}));
+                    <input type="checkbox" checked={p.desktop??false} onChange={e=>{
+                      const newDesktop = e.target.checked;
+                      api.put(`/api/inbox/preferences/${eventType}`,{in_app:p.in_app,email:false,sms:false,desktop:newDesktop}).then(()=>{
+                        setInboxPrefs(prev=>({...prev,[eventType]:{...prev[eventType],desktop:newDesktop,email:false,sms:false,is_default:false}}));
                       }).catch(()=>{});
                     }}/>
-                    <M style={{color:C.t}}>Email</M>
+                    <M style={{color:C.t}}>Desktop</M>
                   </label>
                   {p.is_default&&<M style={{color:C.td,fontStyle:"italic"}}>(default)</M>}
                 </div>

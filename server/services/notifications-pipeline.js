@@ -1,11 +1,24 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Notifications Email Pipeline
+// FIREALIVE — Notifications Email-Channel Pipeline
 //
-// Processes queued in-app notifications and delivers them via the team's
-// configured email channel. Invoked periodically by the scheduler service
-// (every 60s; configurable via NOTIFICATIONS_EMAIL_INTERVAL_SEC env var).
+// Processes notifications queued for the EMAIL channel and delivers them via
+// the team's configured email-class transport. Invoked periodically by the
+// scheduler service (every 60s; configurable via NOTIFICATIONS_EMAIL_INTERVAL_SEC
+// env var).
 //
-// DELIVERY CHANNELS (resolved from notification_config row id='default',
+// File-naming note: this file was renamed in N1a (v1.0.41) from
+// notifications-email.js → notifications-pipeline.js to reflect that it
+// processes the EMAIL-CHANNEL queue (rows where notifications.email_delivery_status
+// = 'queued'), but the actual transports it can use are not strictly email —
+// they include webhook POST and PagerDuty events. The "pipeline" naming matches
+// its actual scope: the queue processor for the email-class column.
+//
+// Sibling pipelines (added in N1a):
+//   - notifications-sms.js     — processes notifications.sms_delivery_status='queued'
+//   - notifications-desktop.js — WebSocket push to Electron clients (no polling
+//                                queue; desktop_delivery_status updated synchronously)
+//
+// EMAIL-CHANNEL TRANSPORTS (resolved from notification_config row id='default',
 // which is owned by routes/notifications.js):
 //   - SMTP via Nodemailer (when email_enabled=1 and SMTP env vars set)
 //   - Webhook POST (when webhook_enabled=1 and webhook_url set)
