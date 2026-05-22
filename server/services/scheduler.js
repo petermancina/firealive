@@ -290,6 +290,159 @@ const schedulerService = {
       }
     }));
 
+    // ── AI burnout: analyst interpretation precompute (N1b C8) ───────────
+    // Background-generates the per-analyst signal interpretations the My
+    // Signals tab reads. Runs every AI_BURNOUT_ANALYST_INTERVAL_SEC (default
+    // 300s). Work is bounded per cycle (AI_BURNOUT_ANALYST_MAX_PER_CYCLE,
+    // default 12) and non-overlapping, because internal-LLM inference is
+    // serial -- stale rows simply catch up on the next cycle. Only missing or
+    // expired rows are regenerated; a row stays fresh for 2x the interval.
+    //
+    // Tier-3 throughout: signal values are decrypted from analyst_signals and
+    // the generated text is re-encrypted before storage. On any generator
+    // failure the row is DELETED so the read path shows the honest
+    // AI-unavailable state rather than stale content.
+    const aiaIntervalSec = parseInt(process.env.AI_BURNOUT_ANALYST_INTERVAL_SEC || '300', 10);
+    const aiaCron = aiaIntervalSec >= 60 ? `*/${Math.floor(aiaIntervalSec / 60)} * * * *` : '* * * * *';
+    const aiaMaxPerCycle = parseInt(process.env.AI_BURNOUT_ANALYST_MAX_PER_CYCLE || '12', 10);
+    const aiaFreshnessSec = aiaIntervalSec * 2;
+    const AIA_SIGNALS = ['investigationTime', 'dismissRate', 'ticketQuality', 'escalationRate'];
+    let aiaRunning = false;
+    this.jobs.push(cron.schedule(aiaCron, async () => {
+      if (aiaRunning) return; // internal LLM is serial -- never overlap cycles
+      aiaRunning = true;
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const { decryptTier3, encryptTier3 } = require('./encryption');
+        const { generateAnalystInterpretation } = require('./burnout-message-generator');
+        const analysts = db.prepare("SELECT id FROM users WHERE role='analyst' AND active=1").all();
+        let budget = aiaMaxPerCycle;
+        for (const a of analysts) {
+          if (budget <= 0) break;
+          const latest = db.prepare(
+            'SELECT signals_encrypted, recorded_at FROM analyst_signals WHERE analyst_id=? ORDER BY recorded_at DESC LIMIT 1'
+          ).get(a.id);
+          if (!latest) continue;
+          let current;
+          try { current = decryptTier3(latest.signals_encrypted); } catch { continue; }
+          // Baseline = trailing mean of prior rows (excludes the latest). Each
+          // prior row is decrypted once. With no prior history the baseline is
+          // the current value (no drift).
+          const prior = db.prepare(
+            'SELECT signals_encrypted FROM analyst_signals WHERE analyst_id=? AND recorded_at < ? ORDER BY recorded_at DESC LIMIT 20'
+          ).all(a.id, latest.recorded_at);
+          const sums = {}; const counts = {};
+          for (const sk of AIA_SIGNALS) { sums[sk] = 0; counts[sk] = 0; }
+          for (const row of prior) {
+            let d; try { d = decryptTier3(row.signals_encrypted); } catch { continue; }
+            for (const sk of AIA_SIGNALS) {
+              if (typeof d[sk] === 'number') { sums[sk] += d[sk]; counts[sk] += 1; }
+            }
+          }
+          const baseline = {};
+          for (const sk of AIA_SIGNALS) {
+            baseline[sk] = counts[sk] ? Math.round((sums[sk] / counts[sk]) * 10) / 10 : current[sk];
+          }
+          for (const sk of AIA_SIGNALS) {
+            if (budget <= 0) break;
+            if (typeof current[sk] !== 'number') continue; // partial/corrupt row
+            const fresh = db.prepare(
+              "SELECT 1 FROM analyst_interpretations WHERE analyst_id=? AND signal_key=? AND expires_at > datetime('now')"
+            ).get(a.id, sk);
+            if (fresh) continue; // still fresh -- no regeneration needed
+            budget -= 1;
+            const res = await generateAnalystInterpretation(sk, { baseline: baseline[sk], current: current[sk] }, a.id);
+            if (res.ok) {
+              const enc = encryptTier3({ text: res.text });
+              db.prepare(
+                'INSERT INTO analyst_interpretations (analyst_id, signal_key, interpretation_encrypted, model_name, kb_refs, generated_at, expires_at) ' +
+                "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now', '+' || ? || ' seconds')) " +
+                'ON CONFLICT(analyst_id, signal_key) DO UPDATE SET interpretation_encrypted=excluded.interpretation_encrypted, ' +
+                'model_name=excluded.model_name, kb_refs=excluded.kb_refs, generated_at=excluded.generated_at, expires_at=excluded.expires_at'
+              ).run(a.id, sk, enc, res.model_name, JSON.stringify(res.kb_refs || []), aiaFreshnessSec);
+            } else {
+              db.prepare('DELETE FROM analyst_interpretations WHERE analyst_id=? AND signal_key=?').run(a.id, sk);
+              if (res.reason && res.reason !== 'AI_NOT_CONFIGURED' && res.reason !== 'AI_INTERNAL_UNAVAILABLE') {
+                logger.warn('AI analyst interpretation unavailable', { signal: sk, reason: res.reason });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error('Scheduler: AI analyst interpretation precompute failed', { error: err.message });
+      } finally {
+        db.close();
+        aiaRunning = false;
+      }
+    }));
+
+    // ── AI burnout: team intervention prompt precompute (N1b C9) ───
+    // Sibling to the analyst job above. Computes server-side team health,
+    // determines which team conditions are active, and generates an AI
+    // intervention prompt for each active condition. Tier-1 aggregate only --
+    // team health and the prompts derive from team-level data and never refer
+    // to an individual analyst. Runs every AI_BURNOUT_TEAM_INTERVAL_SEC
+    // (default 300s), non-overlapping and bounded. Only missing/expired prompts
+    // are regenerated; on generator failure the row is DELETED so the Actions
+    // tab shows the detected condition with an AI-unavailable notice rather
+    // than stale guidance. Inactive conditions are simply not served by the
+    // read endpoint (which recomputes active conditions live) and age out via
+    // retention.
+    const aitIntervalSec = parseInt(process.env.AI_BURNOUT_TEAM_INTERVAL_SEC || '300', 10);
+    const aitCron = aitIntervalSec >= 60 ? `*/${Math.floor(aitIntervalSec / 60)} * * * *` : '* * * * *';
+    const aitMaxPerCycle = parseInt(process.env.AI_BURNOUT_TEAM_MAX_PER_CYCLE || '5', 10);
+    const aitFreshnessSec = aitIntervalSec * 2;
+    let aitRunning = false;
+    this.jobs.push(cron.schedule(aitCron, async () => {
+      if (aitRunning) return; // internal LLM is serial -- never overlap cycles
+      aitRunning = true;
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const { computeTeamHealth } = require('./team-health');
+        const teamConditions = require('./team-conditions');
+        const { generateTeamPrompt } = require('./burnout-message-generator');
+        const th = computeTeamHealth(db);
+        const active = teamConditions.getActive(th);
+        let budget = aitMaxPerCycle;
+        for (const cond of active) {
+          if (budget <= 0) break;
+          const fresh = db.prepare(
+            "SELECT 1 FROM team_intervention_prompts WHERE prompt_key=? AND expires_at > datetime('now')"
+          ).get(cond.key);
+          if (fresh) continue; // still fresh -- no regeneration needed
+          budget -= 1;
+          const res = await generateTeamPrompt(
+            { key: cond.key, severity: cond.severity, label: cond.label },
+            th
+          );
+          if (res.ok) {
+            db.prepare(
+              'INSERT INTO team_intervention_prompts (prompt_key, severity, label, content, model_name, kb_refs, generated_at, expires_at) ' +
+              "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now', '+' || ? || ' seconds')) " +
+              'ON CONFLICT(prompt_key) DO UPDATE SET severity=excluded.severity, label=excluded.label, content=excluded.content, ' +
+              'model_name=excluded.model_name, kb_refs=excluded.kb_refs, generated_at=excluded.generated_at, expires_at=excluded.expires_at'
+            ).run(
+              cond.key, cond.severity, cond.label,
+              JSON.stringify(res.content), res.model_name,
+              JSON.stringify(res.kb_refs || []), aitFreshnessSec
+            );
+          } else {
+            db.prepare('DELETE FROM team_intervention_prompts WHERE prompt_key=?').run(cond.key);
+            if (res.reason && res.reason !== 'AI_NOT_CONFIGURED' && res.reason !== 'AI_INTERNAL_UNAVAILABLE') {
+              logger.warn('AI team prompt unavailable', { condition: cond.key, reason: res.reason });
+            }
+          }
+        }
+      } catch (err) {
+        logger.error('Scheduler: AI team prompt precompute failed', { error: err.message });
+      } finally {
+        db.close();
+        aitRunning = false;
+      }
+    }));
+
     // ── IAM recertification daily check ──────────────────────────────────
     // Runs once daily at 09:00 local time. If recertification is due (per
     // the configured interval, default 90 days), notifies every lead and

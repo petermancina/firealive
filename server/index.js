@@ -201,6 +201,7 @@ app.use('/api/config', require('./routes/config-lock'));
 app.use('/api/kms-providers', authMiddleware(['admin']), configLockGate(), require('./routes/kms-providers'));
 app.use('/api/external-restore', authMiddleware(['admin']), configLockGate(), require('./routes/external-restore'));
 app.use('/api/ai-provider', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/ai-provider'));
+app.use('/api/ai-burnout', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ai-burnout'));
 app.use('/api/ooda', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ooda'));
 app.use('/api/iam', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/iam'));
 app.use('/api/upskilling', authMiddleware(['lead', 'admin']), require('./routes/upskilling'));

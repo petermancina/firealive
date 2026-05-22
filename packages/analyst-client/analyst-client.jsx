@@ -1081,6 +1081,21 @@ export default function AnalystClientApp() {
     return () => { cancelled = true; };
   }, []);
 
+  // ── AI signal interpretations (N1b): from /api/ai-burnout/analyst-interpretations.
+  // Precomputed server-side, Tier-3, KB-cited. Refetched whenever the Signals
+  // tab opens so the analyst sees the latest cached interpretation. null until
+  // the first load resolves; {} or a per-signal map afterward.
+  const [aiInterp, setAiInterp] = useState(null);
+  useEffect(() => {
+    if (tab !== "signals") return;
+    let cancelled = false;
+    api.get('/api/ai-burnout/analyst-interpretations').then((data) => {
+      if (cancelled) return;
+      setAiInterp(data && data.interpretations ? data.interpretations : {});
+    });
+    return () => { cancelled = true; };
+  }, [tab]);
+
   // ── Training Recommendations (R3l C11): from /api/training-recommendations/me ──
   const [trainingRecs, setTrainingRecs] = useState({recommendations: [], meta: null});
   const [trainingRecsLoadState, setTrainingRecsLoadState] = useState({loaded:false, error:null});
@@ -1625,10 +1640,25 @@ export default function AnalystClientApp() {
               <div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{s.label}</M><M style={{color:bad?C.w:C.a,fontWeight:600}}>{s.cur}{s.u} <span style={{fontWeight:400,color:C.td}}>(baseline: {s.base}{s.u})</span></M></div>
               {showSig===key&&(<div style={{marginTop:12,padding:"12px 14px",background:"rgba(0,0,0,0.2)",borderRadius:8}}>
                 <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:8}}>What this means & what you can do:</M>
-                {key==="investigationTime"&&<M style={{color:C.tm,lineHeight:1.8}}>Your average investigation time has increased from {s.base}min to {s.cur}min. This can indicate cognitive fatigue — decision quality degrades with cumulative decisions (Danziger et al., 2011). Try: batch similar alert types to reduce context switching (each switch costs 15-25 min recovery — Mark et al., 2008). Take a micro-break every 90 minutes. Consider delegating repetitive patterns to automation.</M>}
-                {key==="dismissRate"&&<M style={{color:C.tm,lineHeight:1.8}}>You're closing {s.cur}% of tickets without notes (baseline: {s.base}%). This can signal alert fatigue — 71% of SOC analysts report burnout (Tines, 2024). Each automated pattern saves ~3,650 interactions/year. Try: flag the most repetitive alert types for delegation. Request a lighter queue if needed. These are not personal failings — they're structural signals.</M>}
-                {key==="ticketQuality"&&<M style={{color:C.tm,lineHeight:1.8}}>Documentation quality has dropped from {s.base}% to {s.cur}%. Sustained attention degrades after 90 min of continuous monitoring (Warm et al., 2008). Research shows 20-minute breaks restore vigilance to near-baseline. Try: use the box breathing exercise in the Wellness tab. Request your upskilling hour early if you need a break from triage.</M>}
-                {key==="escalationRate"&&<M style={{color:C.tm,lineHeight:1.8}}>Your escalation rate is up from {s.base}% to {s.cur}%. This might mean: you're seeing more complex threats (normal during campaign surges), OR cognitive load is making triage harder. Decision fatigue from back-to-back high-complexity alerts accelerates both (Danziger et al., 2011). Try: ask your lead about rotating complexity levels in your queue.</M>}
+                {(() => {
+                  const ai = aiInterp && aiInterp[key];
+                  if (ai && ai.status === "ai") {
+                    return (
+                      <div>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                          <span style={{fontSize:10,fontWeight:700,letterSpacing:0.5,color:C.i,border:"1px solid "+C.i+"55",borderRadius:4,padding:"1px 6px"}}>AI</span>
+                          <M style={{color:C.td,fontSize:11}}>Research-grounded{(ai.kb_refs&&ai.kb_refs.length)?(" · "+ai.kb_refs.join(", ")):""}</M>
+                        </div>
+                        <M style={{color:C.tm,lineHeight:1.8}}>{ai.text}</M>
+                      </div>
+                    );
+                  }
+                  const reason = ai && ai.reason;
+                  const why = reason==="model_not_loaded" ? " The local AI model isn't loaded yet." : reason==="not_configured" ? " No AI provider is configured." : reason==="decryption_failed" ? " The stored interpretation couldn't be read." : "";
+                  return (
+                    <M style={{color:C.td,lineHeight:1.7}}>{aiInterp===null ? "Loading your interpretation..." : ("AI interpretation unavailable right now." + why + " Your signal values above are accurate.")}</M>
+                  );
+                })()}
               </div>)}
             </Card>
           );})}

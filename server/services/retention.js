@@ -19,6 +19,12 @@ const DEFAULT_RETENTION = {
   assessment_results_days: 730, // 2 years
   consent_log_days: 365,
   sessions_days: 30,
+  // AI burnout-message caches (N1b). Freshness is governed by each row's
+  // expires_at (a short window); this 7-day purge is a physical backstop
+  // that removes orphaned rows — departed analysts, conditions that stopped
+  // firing, or rows left behind if the precompute scheduler stops running.
+  analyst_interpretations_days: 7,
+  team_intervention_prompts_days: 7,
 };
 
 function getRetentionConfig() {
@@ -58,6 +64,8 @@ function runRetentionPurge() {
         'signal_readings': 'recorded_at',
         'notifications': 'created_at',
         'peer_sessions': 'created_at',
+        'analyst_interpretations': 'generated_at',
+        'team_intervention_prompts': 'generated_at',
       };
       if (!SAFE_TABLES[table] || SAFE_TABLES[table] !== dateCol) throw new Error('Invalid table');
       const r = db.prepare(`DELETE FROM ${table} WHERE ${dateCol} < ?`).run(cutoff);
@@ -71,6 +79,8 @@ function runRetentionPurge() {
     purge('reports', 'generated_at', config.reports_days, 'reports');
     purge('analyst_consent_log', 'created_at', config.consent_log_days, 'consent');
     purge('sessions', 'expires_at', config.sessions_days, 'sessions');
+    purge('analyst_interpretations', 'generated_at', config.analyst_interpretations_days, 'ai_interpretations');
+    purge('team_intervention_prompts', 'generated_at', config.team_intervention_prompts_days, 'ai_team_prompts');
 
     const totalPurged = Object.values(results).reduce((s, v) => s + v, 0);
     if (totalPurged > 0) {

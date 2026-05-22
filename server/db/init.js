@@ -1621,6 +1621,17 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Seed both internal-LLM features to the internal (local) provider by
+-- default, so the app's own AI is the out-of-box engine. INSERT OR IGNORE
+-- never clobbers an admin's later choice. Switching a feature to an external
+-- provider is a deliberate, audited change made through the config-locked AI
+-- Provider tab — only that path routes data off-box. model_name records the
+-- local default; internal-llm reports the actually-loaded model at runtime.
+INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
+  VALUES ('burnout_messages', 'internal', 'phi-3-mini-4k-instruct-q4');
+INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
+  VALUES ('ir_simulator', 'internal', 'phi-3-mini-4k-instruct-q4');
+
 -- ── AI Inference Log ─────────────────────────────────────────────────────
 -- Audit trail of every model call. Compliance requirement (GDPR + DORA).
 -- Records token counts and metadata only; prompt/response content is NOT
@@ -1648,6 +1659,60 @@ CREATE INDEX IF NOT EXISTS idx_ai_inference_user
 
 CREATE INDEX IF NOT EXISTS idx_ai_inference_status
   ON ai_inference_log(status, created_at DESC);
+
+-- ── AI Burnout-Message Caches (Phase N1b) ────────────────────────────────
+-- Cache tables for background-precomputed AI burnout messages. The scheduler
+-- generates these via aiProvider.generate('burnout_messages', ...) and the
+-- read endpoints serve cached rows only — no inference in the request path.
+-- A failed generation deletes the affected row, so a missing or expired row
+-- is the signal that AI is currently unavailable for that item; the read path
+-- then reports the reason from ai_inference_log. Rows are AI-generated only —
+-- there is no template/source column because no canned content is ever stored.
+
+-- Per-analyst signal interpretations (Tier-3). The interpretation text
+-- describes the analyst's own encrypted signal values, so it is encrypted at
+-- rest with the Tier-3 envelope (encryptTier3) and is readable only by the
+-- owning analyst. The management console can NEVER access these rows.
+CREATE TABLE IF NOT EXISTS analyst_interpretations (
+  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Keyed to the four signals the analyst's My Signals tab displays
+  signal_key TEXT NOT NULL CHECK (signal_key IN (
+    'investigationTime', 'dismissRate', 'ticketQuality', 'escalationRate'
+  )),
+  interpretation_encrypted BLOB NOT NULL,
+  -- The model that produced this row (rows are AI-generated only)
+  model_name TEXT NOT NULL,
+  -- JSON array of cited KB R-refs (a subset of the 42 KB entries)
+  kb_refs TEXT,
+  generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Freshness deadline = generated_at + freshness window. Reads serve a row
+  -- only while datetime('now') < expires_at; otherwise AI-unavailable.
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (analyst_id, signal_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analyst_interp_analyst
+  ON analyst_interpretations(analyst_id, generated_at DESC);
+
+-- Team intervention prompts (Tier-1 aggregate; not encrypted). Keyed by team
+-- condition. Generated from team-level aggregates only — no individual analyst
+-- is named or referenced. Which conditions are currently active is recomputed
+-- live from team-health at read time, not stored here.
+CREATE TABLE IF NOT EXISTS team_intervention_prompts (
+  prompt_key TEXT PRIMARY KEY CHECK (prompt_key IN (
+    'team_stressed', 'equity', 'automation', 'one_on_one', 'sustained_overcap'
+  )),
+  severity TEXT NOT NULL CHECK (severity IN ('high', 'medium', 'low')),
+  -- Factual condition label, e.g. "Team capacity strained"
+  label TEXT NOT NULL,
+  -- AI-generated advice as JSON:
+  -- {full:{title,body,cite}, compact:{title,body,cite}, minimal:{title,body,cite}}
+  content TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  kb_refs TEXT,
+  generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+);
 
 -- ── Helper Pay (Phase F5) ────────────────────────────────────────────────
 -- Recognition system for analysts who help peers via skill-share, mentoring,

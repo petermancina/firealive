@@ -914,6 +914,22 @@ function ManagementConsole() {
   const [gDepth, setGD] = useState(null);
   const [pDepths, setPD] = useState({});
   const [silenced, setSil] = useState([]);
+  // ── AI team intervention prompts (N1b): from
+  // /api/ai-burnout/team-intervention-prompts. Server recomputes team health
+  // and the active conditions live and attaches each condition's cached AI
+  // prompt (or an unavailable notice). Refetched whenever the Actions tab opens.
+  const [aiTeam, setAiTeam] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshMsg, setRefreshMsg] = useState("");
+  useEffect(() => {
+    if (tab !== "actions") return;
+    let cancelled = false;
+    api.get("/api/ai-burnout/team-intervention-prompts").then((data) => {
+      if (cancelled) return;
+      setAiTeam(data && Array.isArray(data.conditions) ? data : { conditions: [] });
+    });
+    return () => { cancelled = true; };
+  }, [tab]);
   // Initial audit entries for first-run demo. In production, populated from server.
   // Audit log populated from real events.
   const [audit, setAudit] = useState([]);
@@ -2483,6 +2499,31 @@ function ManagementConsole() {
   const [siemQueryOutput, setSiemQueryOutput] = useState("");
 
   const addA = (ty,dt) => setAudit(prev=>[...prev,{ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),ty,dt}]);
+  // N1b: lead-triggered refresh of team guidance. POSTs /refresh (which expires
+  // the cached prompts so the next precompute cycle regenerates the active
+  // conditions). A raw fetch is used so the 429 retry-after body is read. The
+  // current cards are left in place with a confirmation banner rather than
+  // blanked, since regeneration completes asynchronously on the scheduler.
+  const doRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true); setRefreshMsg("");
+    try {
+      const r = await fetch(API_BASE + "/api/ai-burnout/refresh", { method: "POST", headers: api._headers() });
+      if (r.status === 429) {
+        let sec = 60; try { const b = await r.json(); if (b && b.retryAfterSec) sec = b.retryAfterSec; } catch (e) {}
+        setRefreshMsg("Please wait " + sec + "s before refreshing again.");
+      } else if (r.ok) {
+        addA("AI_REFRESH", "team intervention prompts");
+        setRefreshMsg("Refresh requested - guidance regenerates shortly; reopen Actions to see it.");
+      } else {
+        setRefreshMsg("Couldn't refresh right now.");
+      }
+    } catch (e) {
+      setRefreshMsg("Couldn't refresh right now.");
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   // ── API Data Loading (falls back to mock data if backend unavailable) ──────
   const [apiReady, setApiReady] = useState(false);
@@ -2554,7 +2595,18 @@ function ManagementConsole() {
   },[routingCaps,sessCt,autoSys,dayAnalysts]);
 
   const getD=k=>gDepth||pDepths[k]||"full";
-  const activeP=Object.entries(PROMPTS).filter(([k,p])=>!silenced.includes(k)&&p.cond(th));
+  // activeP is now driven by the server (team-intervention-prompts), shaped to
+  // the existing render: [key, {sev, status, full/compact/minimal}]. AI content
+  // comes from the cache; an unavailable condition still shows its label as the
+  // title with an honest notice body (never canned advice).
+  const activeP=((aiTeam&&Array.isArray(aiTeam.conditions))?aiTeam.conditions:[])
+    .filter(c=>!silenced.includes(c.key))
+    .map(c=>{
+      if(c.status==="ai"&&c.content){return [c.key,{sev:c.severity,status:"ai",model_name:c.model_name,full:c.content.full,compact:c.content.compact,minimal:c.content.minimal}];}
+      const why=c.reason==="model_not_loaded"?" The local AI model isn't loaded yet.":c.reason==="not_configured"?" No AI provider is configured.":"";
+      const notice={title:c.label,body:"AI guidance unavailable right now."+why+" The detected condition is shown above; check back shortly or use Refresh.",cite:""};
+      return [c.key,{sev:c.severity,status:"unavailable",full:notice,compact:notice,minimal:notice}];
+    });
   const highP=activeP.filter(([,p])=>p.sev==="high");
 
   const handleProvision = () => {
@@ -3120,14 +3172,21 @@ function ManagementConsole() {
 
         {/* ACTIONS */}
         {tab==="actions"&&(<div>
+          <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12,flexWrap:"wrap"}}>
+            <Btn small disabled={refreshing} onClick={doRefresh}>{refreshing?"Refreshing...":"Refresh guidance"}</Btn>
+            {refreshMsg&&<M style={{color:C.td,fontSize:11}}>{refreshMsg}</M>}
+          </div>
           <div style={{padding:"10px 16px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:20,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <M style={{color:C.tm}}>Prompt depth:</M>
             <div style={{display:"flex",gap:4}}>{["full","compact","minimal"].map(d=><button key={d} onClick={()=>{setGD(d===gDepth?null:d);addA("GLOBAL_DEPTH",d);}} style={{padding:"4px 12px",background:gDepth===d?C.ad:"transparent",border:`1px solid ${gDepth===d?C.a+"50":C.b}`,borderRadius:6,color:gDepth===d?C.a:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{d}</button>)}{gDepth&&<button onClick={()=>setGD(null)} style={{padding:"4px 8px",background:"transparent",border:"none",color:C.td,fontSize:10,cursor:"pointer"}}>×</button>}</div>
           </div>
+          {aiTeam&&aiTeam.kbVersion&&<M style={{color:C.td,display:"block",marginBottom:12,fontSize:11,lineHeight:1.6}}>Guidance is AI-generated and grounded only in the research KB (v{aiTeam.kbVersion}). When AI is unavailable, the detected condition is still shown.</M>}
+          {!aiTeam&&<M style={{color:C.td,display:"block"}}>Loading team guidance…</M>}
+          {aiTeam&&activeP.length===0&&<M style={{color:C.td,display:"block"}}>No active team conditions right now.</M>}
           {activeP.map(([key,pr])=>{const dp=getD(key);const ct=pr[dp]||pr.full;return(
             <Card key={key} style={{marginBottom:14,borderLeft:`3px solid ${pr.sev==="high"?C.d:pr.sev==="medium"?C.w:C.tm}`}}>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
-                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",flex:1}}>{ct.title}</div>
+                <div style={{fontSize:14,fontWeight:500,color:"#E8EDF5",flex:1}}>{ct.title} {pr.status==="unavailable"?<span style={{fontSize:9,fontWeight:700,letterSpacing:0.5,color:C.td,border:"1px solid "+C.b,borderRadius:4,padding:"1px 5px",verticalAlign:"middle"}}>AI UNAVAILABLE</span>:<span style={{fontSize:9,fontWeight:700,letterSpacing:0.5,color:C.a,border:"1px solid "+C.a+"55",borderRadius:4,padding:"1px 5px",verticalAlign:"middle"}}>AI</span>}</div>
                 <div style={{display:"flex",gap:3,flexShrink:0,marginLeft:12}}>{["full","compact","minimal"].map(d=><button key={d} onClick={()=>{setPD(prev=>({...prev,[key]:d}));addA("DEPTH",`${key}→${d}`);}} style={{padding:"3px 8px",fontSize:9,fontFamily:"'IBM Plex Mono',monospace",borderRadius:4,cursor:"pointer",background:dp===d?C.ad:"transparent",border:`1px solid ${dp===d?C.a+"50":C.b}`,color:dp===d?C.a:C.td}}>{d}</button>)}</div>
               </div>
               <div style={{fontSize:12,lineHeight:1.7,whiteSpace:"pre-line"}}>{ct.body}</div>
