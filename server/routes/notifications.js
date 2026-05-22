@@ -142,7 +142,7 @@ router.put('/config', (req, res) => {
   const safeThreshold = validThresholds.includes(threshold) ? threshold : 'watch';
 
   // Validate email format (basic)
-  if (emailEnabled && emailAddress && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress)) {
+  if (emailEnabled && emailAddress && !/^[^\s@]+@[^\s.@]+(?:\.[^\s.@]+)+$/.test(emailAddress)) {
     return res.status(400).json({ error: 'Invalid email address format' });
   }
 
