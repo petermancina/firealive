@@ -155,6 +155,18 @@ class FireAliveWebSocket {
     });
   }
 
+  // U1: notify every connected client that the feature-toggle state changed,
+  // so the console and analyst clients grey or restore features live without a
+  // reload. Sent to all authenticated clients (toggles affect everyone),
+  // independent of routing subscription.
+  broadcastFeatureToggles(features) {
+    this.clients.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'feature_toggles_updated', features });
+      }
+    });
+  }
+
   _send(ws, data) {
     try { ws.send(JSON.stringify(data)); } catch {}
   }

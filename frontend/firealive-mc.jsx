@@ -244,6 +244,29 @@ const shiftLbl = s => s==="day"?"Day (06-14)":s==="swing"?"Swing (14-22)":"Night
 const stMeta = {healthy:{c:C.a,l:"Healthy"},watch:{c:C.w,l:"Watch"},stressed:{c:"#F97316",l:"Stressed"},critical:{c:C.d,l:"Critical"}};
 const genId = () => "SWP-"+Math.random().toString(36).substr(2,4).toUpperCase()+"-"+Date.now().toString(36).substr(-4).toUpperCase();
 
+// U1: "Administratively disabled" panel. Shown in place of a feature's UI when
+// its toggle is off. The feature's controls are NOT rendered (the feature is
+// truly deactivated, not merely visually greyed). mode="tab" fills a whole tab
+// body; mode="section" is a compact inline card for a feature that occupies a
+// section within a shared tab.
+const AdminDisabledPanel = ({ name, mode = "tab" }) => {
+  const tab = mode === "tab";
+  return (
+    <div style={{padding: tab?40:14, background:"rgba(255,255,255,0.02)", border:`1px dashed ${C.b}`, borderRadius:12, textAlign:"center", margin: tab?0:"10px 0"}}>
+      <div style={{fontFamily:"'IBM Plex Mono',monospace", fontSize:9, letterSpacing:1.5, color:C.tm, textTransform:"uppercase", marginBottom:8}}>Administratively Disabled</div>
+      {name ? <div style={{fontSize:13, color:C.t, marginBottom:6}}>{name}</div> : null}
+      <M style={{color:C.td, display:"block", maxWidth:430, margin:"0 auto", lineHeight:1.6}}>This feature has been turned off by a team lead. Your data is preserved and nothing is deleted. A lead can re-enable it in Configuration {"\u2192"} Feature Toggles.</M>
+    </div>
+  );
+};
+
+// U1: Gate a feature's UI by its toggle. When disabled, children (the live
+// workflow and its controls) are not mounted at all and the disabled panel is
+// shown instead, so a toggled-off feature is genuinely inert.
+const FeatureGate = ({ disabled, name, mode = "tab", children }) => (
+  disabled ? <AdminDisabledPanel name={name} mode={mode} /> : children
+);
+
 function computeTH(analysts,sd){
   const n=analysts.filter(a=>a.available).length||1;
   const oc=sd.filter(d=>d.util>0.85).length;const ext=sd.filter(d=>d.util>0.85&&d.wo>=2).length;
@@ -1215,6 +1238,10 @@ function ManagementConsole() {
         if (msg && msg.type === "desktop_notify" && msg.payload) {
           try { bridge.send("notify:desktop", msg.payload); } catch (_e) {}
         }
+        // U1: live feature-toggle propagation - adopt the broadcast state.
+        if (msg && msg.type === "feature_toggles_updated" && msg.features) {
+          setFT(msg.features);
+        }
       };
       ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
       ws.onerror = () => { try { ws.close(); } catch (_e) {} };
@@ -2058,7 +2085,27 @@ function ManagementConsole() {
   // Burnout stats sync interval
   const [syncIntervalCfg, setSyncIntervalCfg] = useState({intervalMin:15,adaptiveSync:true,urgentThresholdSec:30,batchMode:true});
   // Feature toggles
-  const [featureToggles, setFT] = useState({peer_chat:true,breathing_exercise:true,lighter_queue:true,lead_messaging:true,delegation:true,skill_assessments:true,training_certs:true,retro_protocol:true,burnout_routing:true,siem_feed:true,report_engine:true,soar_integration:true,ticket_integration:true,signals_display:true,impact_feed:true,network_map:false,query_tool:false,ooda_simulator:true,recertification:true,vuln_scanning:false,sase:false,peer_scheduling:true,lead_chat_identified:true,config_export:true,log_integrity:true,client_notifications:true,peer_board:true,peer_queue_mgmt:true,calendar_integration:true,security_regression:true,soar_playbooks:true,cicd_pipelines:false,cloud_vuln_scan:false,queue_timeout:true,human_impact_risk:true,edr_inspection:true,enterprise_kms:false,wifi_policy:true,msp_multitenancy:false,post_session_rating:true,post_session_flagging:true,mfa_wizard:true,threat_hunting:true,tripwire:true,compromise_scan:true,auth_logs:true,posture_assessment:true,ha_config:false,fail_open_routing:true,config_troubleshooter:true,general_certs:true,auth_log_notifications:true,pseudonyms:true,geo_fencing:false,cluster_mode:false,global_dashboard:false,backup_schedules:true,sync_interval_config:true,inactivity_lock:true,biometrics:false,config_padlocks:true,concurrent_session_block:true,setup_wizard:true,welcome_guide:true,insider_threat_protocol:true,dual_approval:false,proactive_interventions:true,recovery_runbook:true,upskilling_hour:false,auto_routing_disable:false,analyst_offboarding:true,ttx_generator:true,legal_hold:false,risk_register:true});
+  const [featureToggles, setFT] = useState({});
+  const [featureCatalog, setFeatureCatalog] = useState([]);
+  // U1: load the real toggle state and classified catalog from the server. The
+  // backend is the single source of truth; the old hardcoded map is retired.
+  useEffect(() => {
+    api.get("/api/features").then(r => {
+      if (r && r.features) setFT(r.features);
+      if (r && Array.isArray(r.catalog)) setFeatureCatalog(r.catalog);
+    }).catch(() => {});
+  }, []);
+  // U1: persist one toggle change. The server accepts only toggle-class
+  // features and broadcasts the new state to every connected client; we adopt
+  // the authoritative response.
+  const saveFeature = async (id, enabled) => {
+    const r = await api.put("/api/features", { features: { [id]: enabled } });
+    if (r && r.features) {
+      setFT(r.features);
+      addA("FEATURE_TOGGLED", `${id} → ${enabled ? "ON" : "OFF"}`);
+    }
+    return r;
+  };
   // Compliance
   const [complianceFw, setCompFw] = useState("nist_csf");
   const [complianceReport, setCompReport] = useState(null);
@@ -3277,7 +3324,7 @@ function ManagementConsole() {
         </div>)}
 
         {/* SKILLS ASSESSMENT SYSTEM — NEW v1.0.0 */}
-        {tab==="assessments"&&(<div>
+        {tab==="assessments"&&(featureToggles.skill_assessments===false?<AdminDisabledPanel name="Skills & Assessments" mode="tab"/>:<div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
             <div><L style={{marginBottom:0}}>Skills Assessment System</L>
             <M style={{color:C.tm,display:"block",marginTop:4,lineHeight:1.6}}>Create tier-appropriate assessments, assign to analysts, track results. Gaps auto-propagate training recommendations to the analyst's upskilling area. Only you and the analyst see their individual results.</M></div>
@@ -3625,7 +3672,7 @@ function ManagementConsole() {
           {/* R3j C10: Live SOAR Routing State card — read-only display of what
               FireAlive is currently publishing to the SOAR. Polls /api/routing/soar
               every 30s while this tab is open. */}
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}>
+          <FeatureGate disabled={featureToggles.burnout_routing===false} name="Burnout-Aware Routing" mode="section"><Card style={{marginBottom:16,borderColor:C.i+"30"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
               <div style={{fontSize:13,fontWeight:500,color:C.i}}>Live SOAR Routing State</div>
               <M style={{color:C.td,fontSize:10,fontFamily:"'IBM Plex Mono',monospace"}}>{soarLiveLastFetched ? ("Last fetched "+(()=>{const sec=Math.max(0,Math.round((Date.now()-new Date(soarLiveLastFetched).getTime())/1000));return sec<60?(sec+"s ago"):(Math.floor(sec/60)+"m ago");})()) : "Waiting for first fetch..."}</M>
@@ -3649,7 +3696,7 @@ function ManagementConsole() {
                 </div>
               );
             })}
-          </Card>
+          </Card></FeatureGate>
 
           <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
             <Btn primary disabled={soarSaveBusy} onClick={async()=>{
@@ -4954,7 +5001,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ CI/CD ══════════ */}
-        {tab==="cicd"&&(<div>
+        {tab==="cicd"&&(featureToggles.cicd_pipelines===false?<AdminDisabledPanel name="CI/CD Pipelines" mode="tab"/>:<div>
           <L>CI/CD Pipeline Configuration</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate a signed CI/CD pipeline configuration for FireAlive. The server produces a platform-native pipeline file with embedded lint, test, security scan, SBOM, SLSA L3 build, Cosign signing, CVE scan, and fuse-counter check stages.</M>
           <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
@@ -4993,7 +5040,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ IR SIMULATOR (OODA) — MANAGEMENT ══════════ */}
-        {tab==="ooda_mgmt"&&(<div>
+        {tab==="ooda_mgmt"&&(featureToggles.ooda_simulator===false?<AdminDisabledPanel name="IR Simulator" mode="tab"/>:<div>
           <L>Incident Response Simulator — Policy Management</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Upload IR policies, playbooks, and after-action reports. The simulator generates OODA-loop exercises for analysts based on your org's actual procedures.</M>
           {/* ── Scanner-required banner (Phase F4c commit 6) ── */}
@@ -5356,7 +5403,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {tab==="peersupport"&&(<div>
           <L>Peer Skill-Share Configuration</L>
-          <Card style={{marginBottom:16}}>
+          <FeatureGate disabled={featureToggles.peer_chat===false&&featureToggles.peer_scheduling===false} name="Peer Skill-Share Scheduling" mode="section"><Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Scheduling Restrictions</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Control when analysts can use peer chat. Restrict during on-shift hours if needed.</M>
             <div style={{display:"flex",gap:12,marginBottom:12}}>
@@ -5371,8 +5418,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Input label="Inactivity timeout (min)" value={peerScheduleCfg.inactivityTimeoutMinutes} onChange={e=>setPeerSchedCfg(p=>({...p,inactivityTimeoutMinutes:parseInt(e.target.value)||5}))} type="number"/>
             </div>
             <Btn primary onClick={()=>addA("PEER_SCHEDULE_UPDATED",`Allow during shift: ${peerScheduleCfg.allowDuringShift}`)}>Save Schedule Config</Btn>
-          </Card>
-          <Card style={{marginBottom:16}}>
+          </Card></FeatureGate>
+          <FeatureGate disabled={featureToggles.helper_pay===false} name="Helper Pay & Recognition" mode="section"><Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Helper Recognition — Points Leaderboard</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Top opted-in helpers, sorted by Helper Pay points. Analysts who have not opted in via their Analyst Client are absent from this list, regardless of their points balance — opt-in is per-analyst and defaults to off. Points come from 3-5 star peer-session ratings; daily caps and minimum-duration gates limit gaming. Anonymous praise can be sent via the Thank button below — no name reveal to the helper.</M>
             {peerHelpersLoading ? (
@@ -5396,9 +5443,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 </div>
               ))}</div>
             )}
-          </Card>
+          </Card></FeatureGate>
           {/* R3h: Team Helper Scores — full-roster operational view. NOT opt-in-gated. Lead operational surface for payroll, compensation discussions, and team reviews. Privacy invariant I5: bypasses the opt-in filter that gates the leaderboard above; this surface is analogous to how the Helper Pay administrative tab already exposes user-level redemption and ledger data without opt-in gating. The opt-in indicator on each row is purely informational — the lead cannot toggle it on behalf of an analyst (only the analyst can, from their AC). */}
-          <Card style={{marginBottom:16}}>
+          <FeatureGate disabled={featureToggles.helper_pay===false} name="Helper Pay & Recognition" mode="section"><Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Team Helper Scores — Operational View</div>
             <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Full roster of active analysts with their Helper Pay state. Unlike the recognition leaderboard above, this list includes every analyst regardless of their leaderboard opt-in choice — use it for payroll reconciliation, compensation discussions, and quarterly team reviews. The opt-in badge shows each analyst's current leaderboard visibility (informational only; only the analyst can flip it from their AC).</M>
             {teamScoresLoading ? (
@@ -5424,7 +5471,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 );
               })}</div>
             )}
-          </Card>
+          </Card></FeatureGate>
           {/* R3h-pt2: Pending Sock-Puppet Review queue. Detection runs at rating time on POST /sessions/:id/rate — when a new rating's rater IP hash OR device hash matches 2+ other ratings against the same helper within the last 7 days, the rating is flagged. The flagged rating still grants points immediately (the ledger entry is written) but its contribution is excluded from the recognition leaderboard via the adjusted_points CTE in the leaderboard query. The lead reviews each flag here: Confirm Fraud triggers reversePointsForFraud (negative ledger entry, points permanently removed from helper's balance, original rating stays flagged forever as audit evidence); Dismiss clears the flag (points stay, leaderboard re-includes on next cache miss). All decisions write explicit LEADERBOARD_SOCKPUPPET_CONFIRMED / LEADERBOARD_SOCKPUPPET_DISMISSED audit_log events. */}
           <Card style={{marginBottom:16,borderColor:flaggedRatings.length>0?"#FBBF2440":C.b}}>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
@@ -5488,7 +5535,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ HELPER PAY MANAGEMENT (F5 part 2b) ══════════ */}
-        {tab==="helper_pay"&&(<div>
+        {tab==="helper_pay"&&(featureToggles.helper_pay===false?<AdminDisabledPanel name="Helper Pay & Recognition" mode="tab"/>:<div>
           <L>Helper Pay Management</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Approve redemption requests, configure the rewards catalog, and run audit operations on the points ledger. Catalog mutations, fraud reversals, and CSV exports require admin role; if you are a lead, those actions will surface a 403 from the server.</M>
 
@@ -5714,18 +5761,36 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {tab==="features"&&(<div>
           <L>Feature Toggles</L>
           {configLocked&&<Card style={{borderColor:C.d+"40",marginBottom:16,padding:12}}><M style={{color:C.d,fontWeight:500}}>🔒 Configurations are locked. Unlock with MFA using the button in the sidebar to make changes.</M></Card>}
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Enable or disable features for your deployment. Disabled features disappear from both the Management Console and all Analyst Clients. Changes propagate to all connected clients automatically.</M>
-          {[{cat:"Wellbeing",ids:["peer_chat","peer_scheduling","breathing_exercise","lighter_queue","lead_messaging","lead_chat_identified","signals_display","impact_feed","proactive_interventions","upskilling_hour"]},{cat:"Operations",ids:["delegation","burnout_routing","ooda_simulator","auto_routing_disable","fail_open_routing","tripwire"]},{cat:"Development",ids:["skill_assessments","training_certs","general_certs"]},{cat:"Integrations",ids:["soar_integration","ticket_integration","siem_feed","sase","vuln_scanning","edr_inspection","threat_hunting"]},{cat:"Security",ids:["mfa_wizard","posture_assessment","config_padlocks","concurrent_session_block","insider_threat_protocol","pseudonyms","auth_logs","auth_log_notifications"]},{cat:"Management",ids:["report_engine","query_tool","recertification","config_export","log_integrity","ha_config","cluster_mode","global_dashboard","backup_schedules","setup_wizard","welcome_guide","analyst_offboarding","recovery_runbook","ttx_generator","risk_register"]}].map(g=>(
-            <Card key={g.cat} style={{marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{g.cat}</div>
-              {g.ids.map(id=>(
-                <div key={id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
-                  <M style={{color:featureToggles[id]?C.t:C.td}}>{id.replace(/_/g," ")}</M>
-                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:configLocked?"not-allowed":"pointer"}}><input type="checkbox" checked={featureToggles[id]||false} disabled={configLocked} onChange={e=>{if(!configLocked){setFT(p=>({...p,[id]:e.target.checked}));addA("FEATURE_TOGGLED",`${id} → ${e.target.checked?"ON":"OFF"}`);}}} /><M style={{color:featureToggles[id]?C.a:C.td}}>{featureToggles[id]?"On":"Off"}</M></label>
-                </div>
-              ))}
-            </Card>
-          ))}
+          <Card style={{marginBottom:16,borderColor:C.a+"30",background:C.a+"08"}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>Before you turn anything off</div>
+            <M style={{color:C.tm,display:"block",lineHeight:1.7}}>FireAlive is most effective at reducing burnout when every analyst-facing capability is active — peer support, the board, burnout-aware routing, training, recovery, and the rest work as a system, and the research behind FireAlive treats them as mutually reinforcing, not as a menu of extras. These switches exist for one reason: every SOC is different. Some teams adopt everything at once; others introduce capabilities gradually, or run a subset that fits their environment and their people's readiness to try something new. Toggling a feature off tailors FireAlive to your organization — it does not mean the feature is optional to the mission. Nothing is deleted when a feature is off; turning it back on restores it exactly as it was. The optimal configuration is everything on.</M>
+          </Card>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Disabling a feature does not remove it: it greys out and deactivates across the Management Console and the Analyst Clients, with a note that a lead can re-enable it here. All data is preserved, and changes propagate to connected clients automatically. Locked features are required for SOC-grade security or integrity and cannot be turned off.</M>
+          {[["wellbeing","Wellbeing"],["operations","Operations"],["development","Development"],["integrations","Integrations"],["security","Security"],["management","Management"]].map(([catKey,catLabel])=>{
+            const items=featureCatalog.filter(f=>f.category===catKey);
+            if(!items.length) return null;
+            return (
+              <Card key={catKey} style={{marginBottom:12}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>{catLabel}</div>
+                {items.map(f=>{
+                  const on=f.klass==="locked"?true:(featureToggles[f.id]===undefined?f.default:featureToggles[f.id]!==false);
+                  return (
+                    <div key={f.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,padding:"7px 0",borderBottom:`1px solid ${C.b}`}}>
+                      <div style={{flex:1}}>
+                        <M style={{color:on?C.t:C.td}}>{f.name}</M>
+                        {f.klass==="locked"&&f.reason?<M style={{color:C.td,display:"block",fontSize:9,marginTop:2,lineHeight:1.5}}>{f.reason}</M>:null}
+                      </div>
+                      {f.klass==="locked"?(
+                        <M style={{color:C.tm,whiteSpace:"nowrap"}}>🔒 Locked on</M>
+                      ):(
+                        <label style={{display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",cursor:configLocked?"not-allowed":"pointer"}}><input type="checkbox" checked={on} disabled={configLocked} onChange={e=>{if(configLocked)return;if(f.warnOnDisable&&!e.target.checked&&!window.confirm("Turning off "+f.name+" stops FireAlive from publishing routing variables to your SOAR/ticket system. Wellbeing metrics, peer support, and training keep working. Continue?"))return;saveFeature(f.id,e.target.checked);}} /><M style={{color:on?C.a:C.td}}>{on?"On":"Off"}</M></label>
+                      )}
+                    </div>
+                  );
+                })}
+              </Card>
+            );
+          })}
         </div>)}
 
         {/* ══════════ COMPLIANCE ══════════ */}
@@ -6314,7 +6379,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ MSP MULTI-TENANCY ══════════ */}
-        {tab==="msp"&&(<div>
+        {tab==="msp"&&(featureToggles.msp_multitenancy===false?<AdminDisabledPanel name="MSP Multi-Tenancy" mode="tab"/>:<div>
           <L>MSP Multi-Tenancy</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure FireAlive for managed service providers monitoring multiple client organizations. Each tenant gets isolated encryption keys, separate audit trails, and scoped API keys. Cross-tenant data access is blocked by default.</M>
           <Card style={{marginBottom:16}}>
@@ -6600,7 +6665,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — GENERAL CERTS ══════════ */}
-        {tab==="general_certs"&&(<div>
+        {tab==="general_certs"&&(featureToggles.general_certs===false?<AdminDisabledPanel name="Professional Certifications Registry" mode="tab"/>:<div>
           <L>Certification Management</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Beyond training-linked certificates, analysts can upload broader industry certifications (CompTIA, ISACA, ISC², GIAC, etc.) to build a comprehensive team skill profile. Team leads see the aggregate to identify gaps and plan upskilling.</M>
           <Card style={{marginBottom:16}}>
@@ -6630,7 +6695,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* R3l C16: Training Completions Review — lead/admin verify or reject analyst-submitted training completions */}
-        {tab==="training_reviews"&&(<div>
+        {tab==="training_reviews"&&(featureToggles.training_certs===false?<AdminDisabledPanel name="Training Recommendations & Certs" mode="tab"/>:<div>
           <L>Training Completions Review</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Verify or reject training completions that analysts have self-submitted through the Analyst Client. Each row shows the analyst, platform, module URL, submission timestamp, and current status. The server only allows pending submissions to be transitioned — verify confirms the completion is genuine and credits it to the analyst's skill record; reject marks it as not credited. Verified and rejected rows are terminal and shown for audit reference.</M>
           {trainingReviewPatchError&&(<Card style={{marginBottom:16,borderColor:C.d+"60"}}><M style={{color:C.d}}>Last action failed: {trainingReviewPatchError}</M></Card>)}
@@ -7108,7 +7173,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — PROACTIVE BREAK INTERVENTIONS ══════════ */}
-        {tab==="proactive"&&(<div>
+        {tab==="proactive"&&(featureToggles.proactive_interventions===false?<AdminDisabledPanel name="Proactive Break Interventions" mode="tab"/>:<div>
           <L>Proactive Break Interventions</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Based on Sonnentag's recovery research: prolonged high-severity ticket work without breaks accelerates burnout exponentially. This feature monitors analyst workload patterns and suggests Team-Lead-approved breaks before burnout signals appear. The analyst receives an affirming notification — they can opt to take the break or continue.</M>
           <Card style={{marginBottom:16}}>
@@ -7139,7 +7204,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — UPSKILLING HOUR ══════════ */}
-        {tab==="upskilling_hr"&&(<div>
+        {tab==="upskilling_hr"&&(featureToggles.upskilling_hour===false?<AdminDisabledPanel name="Upskilling Hour" mode="tab"/>:<div>
           <L>Upskilling Hour</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Dedicate one hour per shift to analyst professional development — peer skill-sharing, training, certifications. During this hour, burnout routing stops sending tickets to that analyst. Research consistently shows that companies investing in on-the-clock development see lower turnover, higher job satisfaction, and ultimately lower costs than continuous replacement hiring. Analysts shouldn't have to upskill on their own time — that just accelerates burnout.</M>
           <Card style={{marginBottom:16}}>
@@ -7157,7 +7222,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <Btn primary onClick={()=>addA("UPSKILLING_HR_SAVED","Upskilling hour config saved — hour "+upskillingCfg.hourOfShift+" of shift")}>Save Upskilling Config</Btn>
           {/* R3c: HR Scheduling Platform Integration */}
-          <Card style={{marginTop:16,marginBottom:16,borderColor:schedCfg.last_sync_status==="failure"?C.d+"40":(schedCfg.last_sync_status==="success"?C.a+"40":C.b)}}>
+          <FeatureGate disabled={featureToggles.calendar_integration===false} name="Calendar & Scheduling Integration" mode="section"><Card style={{marginTop:16,marginBottom:16,borderColor:schedCfg.last_sync_status==="failure"?C.d+"40":(schedCfg.last_sync_status==="success"?C.a+"40":C.b)}}>
             <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Analyst Scheduling</div>
 
             {/* Status panel */}
@@ -7308,7 +7373,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
             {/* Per-analyst upskilling-slot grid (unchanged — already wired to /api/upskilling/schedule per-row) */}
             <Card style={{padding:14,marginBottom:12}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Schedule (select hour per analyst)</div><div style={{background:C.s,border:"1px solid "+C.b,borderRadius:10,overflow:"hidden"}}>{(analysts.length?analysts:[]).filter(a=>a.shift==="day").slice(0,6).map(a=>({id:a.id,n:a.name,t:"L"+a.tier,h:a.tier===3?"14-15":a.tier===2?"10-11":"16-17"})).map((a,idx)=>(<div key={idx} style={{display:"flex",justifyContent:"space-between",padding:"6px 14px",borderBottom:"1px solid "+C.b,alignItems:"center",gap:8}}><M style={{color:C.t,minWidth:70}}>{a.n}</M><Badge color={a.t==="L3"?C.p:C.i}>{a.t}</Badge><select defaultValue={a.h} style={{flex:1,padding:4,background:"rgba(255,255,255,0.03)",border:"1px solid "+C.b,borderRadius:6,color:C.t,fontSize:11}} onChange={e=>api.post("/api/upskilling/schedule",{analystId:a.id,slot:e.target.value}).then(()=>addA("SCHED",a.n+" -> "+e.target.value))}><option value="06-07">06-07</option><option value="07-08">07-08</option><option value="08-09">08-09</option><option value="09-10">09-10</option><option value="10-11">10-11</option><option value="11-12">11-12</option><option value="12-13">12-13</option><option value="13-14">13-14</option><option value="14-15">14-15</option><option value="15-16">15-16</option><option value="16-17">16-17</option><option value="17-18">17-18</option></select></div>))}</div></Card>
-          </Card>
+          </Card></FeatureGate>
         </div>)}
 
         {/* ══════════ v1.0.0 — AUTO-DISABLE ROUTING ON CRITICAL INCIDENTS ══════════ */}
@@ -7328,7 +7393,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ Phase F2 — RECOVERY RUNBOOK (FireAlive-specific) ══════════ */}
-        {tab==="runbook"&&(<div>
+        {tab==="runbook"&&(featureToggles.recovery_runbook===false?<AdminDisabledPanel name="Recovery Runbook" mode="tab"/>:<div>
           <L>Recovery Runbook Generator</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate runbooks for FireAlive-specific failure and compromise scenarios. The org already has runbooks for general incident response (ransomware on host, generic insider threat); FireAlive doesn't try to replace those. This generator addresses the new attack surface and failure modes that FireAlive's adoption introduces — compromise of FireAlive itself, MC↔AC channel attacks, false signal injection tripping the tripwire, etc.</M>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6,fontStyle:"italic"}}>This runbook is preparation material. Generate scenarios in advance, print or save them, and execute from those copies during a real event when the platform itself may be unavailable.</M>
@@ -7410,7 +7475,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — TTX GENERATOR ══════════ */}
-        {tab==="ttx"&&(<div>
+        {tab==="ttx"&&(featureToggles.ttx_generator===false?<AdminDisabledPanel name="TTX Generator" mode="tab"/>:<div>
           <L>Tabletop Exercise Generator</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Pick a scenario and difficulty, then download a Situation Manual (SitMan) for the lead to bring to the meeting and a blank After-Action Report (AAR) template for the team to fill in afterwards. Both formats are available in PDF (printable) and DOCX (editable). Each generation is logged to the audit trail as compliance evidence.</M>
           <Card style={{marginBottom:16}}>
@@ -7970,7 +8035,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* PEER CONDUCT — tiered abuse flag review */}
-        {tab==="peer_conduct"&&(<div>
+        {tab==="peer_conduct"&&((featureToggles.peer_chat===false&&featureToggles.peer_board===false&&featureToggles.peer_scheduling===false)?<AdminDisabledPanel name="Peer Conduct" mode="tab"/>:<div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
             <L style={{marginBottom:0}}>Peer Conduct — {peerFlagStatus==="open"?"Open Flags":peerFlagStatus==="resolved"?"Resolved Flags":"All Flags"} ({peerFlags.length})</L>
             <div style={{display:"flex",gap:6,alignItems:"center"}}>

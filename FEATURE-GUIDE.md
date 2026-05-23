@@ -919,15 +919,22 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 ## Configuration group
 
 ### Feature Toggles
-**What it's for:** Enable or disable individual features across the platform. Disabling a feature does NOT remove it from the UI — instead, the feature's text becomes greyed out (still visible so users know it exists), all action buttons and config inputs are disabled, and a message appears explaining that the feature is administratively disabled and that to use it requires re-enabling in the Feature Toggles tab. Same behavior in MC and AC.
+**What it's for:** Enable or disable individual features across the platform. Disabling a feature does NOT remove it and never deletes its data — the feature's text greys out (still visible so users know it exists), all action buttons and config inputs deactivate, and an "administratively disabled" message explains that a lead can re-enable it in the Feature Toggles tab. Turning a feature back on restores it exactly as it was. The same behavior applies in the Management Console and the Analyst Client, and a change propagates live to every connected client over the WebSocket channel — no reload needed.
+
+**Not everything is a toggle.** Features are classified:
+- **Toggle** — the 20 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, anonymous lead messaging, identified lead chat, proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, MSP multi-tenancy, CI/CD pipelines). Toggles default on except MSP multi-tenancy and CI/CD, which default off.
+- **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, legal hold, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC's defenses can never be turned off, even by a forged request.
+- **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA and clustering, and so on). These have no switch.
+
+**Before you turn anything off:** FireAlive is most effective at reducing burnout when every analyst-facing capability is active — they reinforce one another, and the research treats them as a system rather than a menu of extras. The switches exist because every SOC is different: some adopt everything at once, others introduce capabilities gradually or run a subset that fits their environment and their people's readiness. Toggling a feature off tailors FireAlive to your organization; it does not mean the feature is optional to the mission. Nothing is deleted when a feature is off. The optimal configuration is everything on.
 
 This way users can still see what FireAlive offers without being confused about why a feature suddenly disappeared.
 
 **Workflow:**
 1. Lead opens Feature Toggles
-2. Sees features grouped by category (Wellbeing, Operations, Development, Integrations, Security, Management)
-3. Toggles a feature off — the feature's tab text greys out, controls disable, an "administratively disabled" message replaces the workflow content
-4. Toggles back on — feature returns to fully active state
+2. Sees features grouped by category (Wellbeing, Operations, Development, Integrations, Security, Management), with toggle features shown as switches and locked features shown permanently on with their lock reason
+3. Toggles a feature off — its tab or section greys out, controls deactivate, and an "administratively disabled" message replaces the workflow content while the data is preserved
+4. Toggles back on — the feature returns to its exact previous state
 
 ### Burnout Alerts
 **What it's for:** Alert thresholds for team-level burnout metrics. When the team's aggregate health drops below a threshold, or capacity overload exceeds a threshold, the lead is alerted via configured channels. Distinct from app performance alerts (CPU, memory) which are in Monitoring.

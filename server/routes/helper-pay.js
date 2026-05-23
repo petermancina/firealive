@@ -280,6 +280,67 @@ router.get('/redemptions', (req, res) => {
   }
 });
 
+// Caller-scoped points statement for the analyst's own records. Returns only
+// the requesting user's pseudonym, balance, ledger, and redemptions - never
+// anyone else's. format=csv downloads a spreadsheet; otherwise JSON is
+// returned. This is for personal record-keeping; it is not an HR or payroll
+// document, and it never exposes another analyst's data.
+router.get('/my-statement', (req, res) => {
+  const db = getDb();
+  try {
+    const userId = req.user.id;
+    const balance = helperPay.getBalance(userId);
+    const ledger = helperPay.getLedger(userId, { limit: 1000 });
+    const redemptions = db.prepare(
+      `SELECT r.id, r.option_id, o.name AS option_name, r.cost_points,
+              r.status, r.requested_at, r.decided_at, r.decision_note,
+              r.fulfilled_at
+         FROM helper_redemptions r
+         JOIN helper_redemption_options o ON o.id = r.option_id
+         WHERE r.user_id = ?
+         ORDER BY r.requested_at DESC`
+    ).all(userId);
+    const u = db.prepare(`SELECT pseudonym FROM users WHERE id = ?`).get(userId);
+    const pseudonym = (u && u.pseudonym) || null;
+    const generatedAt = new Date().toISOString();
+
+    auditLog(userId, 'HELPER_STATEMENT_EXPORTED',
+      `format=${(req.query.format || 'json')}; ledger=${ledger.length}; redemptions=${redemptions.length}`,
+      req.ip);
+
+    if ((req.query.format || '').toString() === 'csv') {
+      const lines = [];
+      lines.push('Helper Pay Statement');
+      lines.push(['Pseudonym', csvEscape(pseudonym)].join(','));
+      lines.push(['Analyst ID', csvEscape(userId)].join(','));
+      lines.push(['Current Balance', csvEscape(balance)].join(','));
+      lines.push(['Generated', csvEscape(generatedAt)].join(','));
+      lines.push('');
+      lines.push('Points Ledger');
+      const lh = ['created_at', 'delta', 'reason', 'ref_type', 'ref_id', 'balance_after', 'notes'];
+      lines.push(lh.join(','));
+      for (const e of ledger) lines.push(lh.map(k => csvEscape(e[k])).join(','));
+      lines.push('');
+      lines.push('Redemptions');
+      const rh = ['requested_at', 'option_name', 'cost_points', 'status', 'decided_at', 'decision_note', 'fulfilled_at'];
+      lines.push(rh.join(','));
+      for (const r of redemptions) lines.push(rh.map(k => csvEscape(r[k])).join(','));
+      const csv = lines.join('\n') + '\n';
+      const filename = `helper-pay-statement-${generatedAt.slice(0, 10)}.csv`;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(csv);
+    }
+
+    res.json({ pseudonym, userId, balance, ledger, redemptions, generatedAt });
+  } catch (err) {
+    logger.error('helper-pay my-statement failed', { userId: req.user.id, error: err.message });
+    res.status(500).json({ error: 'INTERNAL_ERROR' });
+  } finally {
+    db.close();
+  }
+});
+
 // Submit a rating for a peer session. The rater is req.user (the seeker);
 // the helper is derived from the session record by the service.
 router.post('/sessions/:sessionId/rate', (req, res) => {

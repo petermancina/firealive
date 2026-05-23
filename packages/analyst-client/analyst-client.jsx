@@ -229,6 +229,26 @@ const Tabs = ({tabs,active,onTab}) => (
 );
 const Input = ({label,maxLength=512,...p}) => <div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<input maxLength={maxLength} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}/></div>;
 const Sel = ({label,children,...p}) => <div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<select style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}>{children}</select></div>;
+// U1: "Currently unavailable" panel for the analyst client. Shown in place of a
+// feature's UI when a team lead has turned it off. The feature's controls are
+// NOT rendered (truly deactivated, not merely dimmed). mode="tab" fills a tab
+// body; mode="section" is a compact inline card.
+const AdminDisabledPanel = ({ name, mode = "tab" }) => {
+  const tab = mode === "tab";
+  return (
+    <div style={{padding: tab?40:14, background:"rgba(255,255,255,0.02)", border:`1px dashed ${C.b}`, borderRadius:12, textAlign:"center", margin: tab?0:"10px 0"}}>
+      <div style={{fontFamily:"'IBM Plex Mono',monospace", fontSize:9, letterSpacing:1.5, color:C.tm, textTransform:"uppercase", marginBottom:8}}>Currently Unavailable</div>
+      {name ? <div style={{fontSize:13, color:C.t, marginBottom:6}}>{name}</div> : null}
+      <M style={{color:C.td, display:"block", maxWidth:430, margin:"0 auto", lineHeight:1.6}}>Your team lead has turned this feature off. Anything you saved here is preserved and nothing is deleted. Reach out to your team lead if you need it turned back on.</M>
+    </div>
+  );
+};
+
+// U1: Gate an analyst feature by its toggle. When disabled, children (the live
+// workflow and its controls) are not mounted and the panel is shown instead.
+const FeatureGate = ({ disabled, name, mode = "tab", children }) => (
+  disabled ? <AdminDisabledPanel name={name} mode={mode} /> : children
+);
 
 const tierLbl = t => t===1?"L1":t===2?"L2":"L3";
 const tierClr = t => t===1?C.i:t===2?C.p:"#F472B6";
@@ -894,6 +914,10 @@ export default function AnalystClientApp() {
 
   // ── Tab navigation ──
   const [tab, setTab] = useState("home");
+  // U1: load the effective feature-toggle state from the server (read-only;
+  // analysts cannot change toggles) and adopt live broadcasts in the WS handler.
+  const [featureToggles, setFT] = useState({});
+  React.useEffect(() => { api.get("/api/features").then(r => { if (r && r.features) setFT(r.features); }).catch(() => {}); }, []);
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
   // ── N1a C25: Desktop notification WebSocket client ──────────────────────
@@ -944,6 +968,10 @@ export default function AnalystClientApp() {
         try { msg = JSON.parse(evt.data); } catch (_e) { return; }
         if (msg && msg.type === "desktop_notify" && msg.payload) {
           try { bridge.send("notify:desktop", msg.payload); } catch (_e) {}
+        }
+        // U1: live feature-toggle propagation - adopt the broadcast state.
+        if (msg && msg.type === "feature_toggles_updated" && msg.features) {
+          setFT(msg.features);
         }
       };
       ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
@@ -1592,7 +1620,7 @@ export default function AnalystClientApp() {
           <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
         </div>
       </div>
-      {breakPrompt&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>
+      {breakPrompt&&featureToggles.proactive_interventions!==false&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>
         <M style={{color:C.p,fontWeight:500}}>Your lead approved a break for you. You have been doing incredible work. </M>
         <div style={{display:"flex",gap:8,marginTop:8}}>
           <Btn small primary onClick={()=>{setBreakPrompt(null);logC("BREAK_ACCEPTED","Break accepted");}}>Take Break</Btn>
@@ -1623,8 +1651,8 @@ export default function AnalystClientApp() {
             <Card onClick={()=>setTab("scan")} style={{cursor:"pointer"}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>Self-scan</div><M style={{color:C.tm}}>Run a compromise check on this client</M></Card>
           </div>
           <div style={{display:"flex",gap:8,marginBottom:20}}>
-            <Btn onClick={()=>{setShowLQ(true);logC("lighter_queue_opened","Opened lighter queue request");}}>{stageLabel==="healthy"?"Request Reduced Tickets":"Request Reduced Tickets (recommended)"}</Btn>
-            <Btn onClick={()=>{setShowLeadMsg(true);logC("lead_msg_opened","Opened Team Lead message");}}>Message Team Lead</Btn>
+            <Btn disabled={featureToggles.lighter_queue===false} onClick={()=>{setShowLQ(true);logC("lighter_queue_opened","Opened lighter queue request");}}>{stageLabel==="healthy"?"Request Reduced Tickets":"Request Reduced Tickets (recommended)"}</Btn>
+            <Btn disabled={featureToggles.lead_chat_identified===false} onClick={()=>{setShowLeadMsg(true);logC("lead_msg_opened","Opened Team Lead message");}}>Message Team Lead</Btn>
           </div>
           <L>Recent Impact</L>
           {impacts.map((imp,i)=><Card key={i} style={{borderLeft:`3px solid ${imp.v?C.a:C.w}`,marginBottom:8,padding:"12px 16px"}}><div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{imp.e}</M><M style={{color:C.td}}>{imp.d}</M></div><M style={{color:C.a,display:"block",marginTop:4}}>→ {imp.o}</M></Card>)}
@@ -1663,8 +1691,8 @@ export default function AnalystClientApp() {
             </Card>
           );})}
           <div style={{display:"flex",gap:8,marginTop:16}}>
-            <Btn primary onClick={()=>{setShowLQ(true);logC("lighter_queue_opened","Requesting reduced ticket load");}}>{stageLabel==="healthy"?"Request Reduced Tickets":"Request Reduced Tickets (recommended)"}</Btn>
-            <Btn onClick={()=>{setShowLeadMsg(true);logC("lead_1on1_request","Requesting 1-on-1 with Team Lead");}}>Request 1-on-1 with Lead</Btn>
+            <Btn primary disabled={featureToggles.lighter_queue===false} onClick={()=>{setShowLQ(true);logC("lighter_queue_opened","Requesting reduced ticket load");}}>{stageLabel==="healthy"?"Request Reduced Tickets":"Request Reduced Tickets (recommended)"}</Btn>
+            <Btn disabled={featureToggles.lead_chat_identified===false} onClick={()=>{setShowLeadMsg(true);logC("lead_1on1_request","Requesting 1-on-1 with Team Lead");}}>Request 1-on-1 with Lead</Btn>
           </div>
         </div>)}
 
@@ -1723,7 +1751,7 @@ export default function AnalystClientApp() {
           </Card>)}
         </div>)}
 
-        {tab==="peers"&&(<div>
+        {tab==="peers"&&((featureToggles.peer_chat===false&&featureToggles.peer_scheduling===false)?<AdminDisabledPanel name="Peer Skill-Share" mode="tab"/>:<div>
           <L>Peer Skill-Share</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>E2EE skill-sharing chat between analysts. Share knowledge about techniques, tools, and approaches to SOC challenges. Text only, 4KB limit, auto-closes after {peerTimeout} min inactivity, no persistence. Chat opens in a compact window so it blends with your other tools.</M>
 
@@ -1993,7 +2021,7 @@ export default function AnalystClientApp() {
           </div>)}
         </div>)}
 
-        {tab==="helper-pay"&&(<div>
+        {tab==="helper-pay"&&(featureToggles.helper_pay===false?<AdminDisabledPanel name="Helper Pay & Recognition" mode="tab"/>:<div>
           <L>Helper Pay</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Earn points by helping peers in skill-share sessions. Points accrue when an analyst you helped rates the session at 3 stars or higher. Redeem points for rewards from your team's catalog. Anti-gaming protections (minimum session length, daily caps, lazy debit on lead approval) live in the helper-pay service.</M>
 
@@ -2010,6 +2038,12 @@ export default function AnalystClientApp() {
               <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:8,letterSpacing:1.5,textTransform:"uppercase"}}>Your Balance</div>
               <div style={{fontSize:48,fontWeight:600,color:C.a,fontFamily:"'IBM Plex Mono',monospace",lineHeight:1}}>{helperBalance}</div>
               <div style={{fontSize:11,color:C.tm,marginTop:6}}>points</div>
+            </Card>
+
+            <Card style={{marginBottom:16}}>
+              <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:8,letterSpacing:1.5,textTransform:"uppercase"}}>Your Records</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Download a copy of your points statement - your balance, the full points ledger, and your redemptions - to keep for your own records.</M>
+              <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=csv", { headers: api._headers() }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const text = await resp.text(); const blob = new Blob([text], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".csv"; a.click(); logC("helper_statement_exported","Exported points statement (CSV)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Export my points statement</Btn>
             </Card>
 
             {/* R3h: Leaderboard opt-in toggle. Gates whether this analyst's name appears on the Helper Recognition leaderboard the lead reviews. Does NOT gate earning, balance, or redemptions — those continue regardless. Default is opt-out per the schema. */}
@@ -2142,7 +2176,7 @@ export default function AnalystClientApp() {
           )}
         </div>)}
 
-        {tab==="board"&&(<div>
+        {tab==="board"&&(featureToggles.peer_board===false?<AdminDisabledPanel name="Peer Support Board" mode="tab"/>:<div>
           <L>Peer Skill-Share Board</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Share tips, ask questions, and discuss burnout prevention strategies with your team. Messages auto-expire after 7 days. Same conduct rules as peer chat apply — no personal attacks, no abusive language. Management may review posted content.</M>
 
@@ -2178,7 +2212,7 @@ export default function AnalystClientApp() {
           <M style={{color:C.td,display:"block",marginTop:12}}>Messages expire after 7 days. Encrypted at rest. Access-controlled — analysts only. Not exported in backups.</M>
         </div>)}
 
-        {tab==="ooda"&&(<div>
+        {tab==="ooda"&&(featureToggles.ooda_simulator===false?<AdminDisabledPanel name="IR Simulator" mode="tab"/>:<div>
           <L>Incident Response Simulator (OODA Loop)</L>
           <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Practice incident response using your organization's specific IR policies — not generic textbook procedures. This simulator trains you on how YOUR team responds in YOUR SOC, using the policies your Team Lead has uploaded. General certifications teach you frameworks; this teaches you how to execute them here.</M>
           <M style={{color:C.tm,display:"block",marginBottom:16}}><span style={{color:C.a}}>Observe</span> → <span style={{color:C.i}}>Orient</span> → <span style={{color:C.p}}>Decide</span> → <span style={{color:C.w}}>Act</span> → Resolution</M>
@@ -2356,7 +2390,7 @@ export default function AnalystClientApp() {
         </div>)}
 
         {/* ══════════ TRAINING CERTIFICATES ══════════ */}
-        {tab==="training"&&(<div>
+        {tab==="training"&&(<div><FeatureGate disabled={featureToggles.training_certs===false} name="Training Recommendations & Certs" mode="section">
           <L>Training Platform Integrations</L>
           <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>AI-recommended training from assessment gaps.</M>
           {upskillingActive&&<Card style={{borderColor:C.p+"40",marginBottom:16,padding:14}}>
@@ -2404,10 +2438,10 @@ export default function AnalystClientApp() {
             {completionState.success&&<M style={{color:C.a,display:"block",marginBottom:6}}>Submitted — pending lead review.</M>}
             <Btn primary disabled={completionState.submitting||!completionForm.module.trim()||!completionForm.platform.trim()} onClick={submitCompletion} style={{marginTop:8}}>{completionState.submitting?"Submitting…":"Submit"}</Btn>
           </Card>
-          <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Register Cert</div><Sel label="Cert"><option value="">Select...</option><optgroup label="CompTIA"><option>Security+</option><option>CySA+</option></optgroup><optgroup label="ISC2"><option>CISSP</option></optgroup><optgroup label="ISACA"><option>CISA</option></optgroup></Sel><Input label="Code"/><Input label="Earned" type="date"/><Btn primary onClick={()=>logC("CE","Submitted")} style={{marginTop:8}}>Submit</Btn></Card>
+          </FeatureGate><FeatureGate disabled={featureToggles.general_certs===false} name="Professional Certifications" mode="section"><Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Register Cert</div><Sel label="Cert"><option value="">Select...</option><optgroup label="CompTIA"><option>Security+</option><option>CySA+</option></optgroup><optgroup label="ISC2"><option>CISSP</option></optgroup><optgroup label="ISACA"><option>CISA</option></optgroup></Sel><Input label="Code"/><Input label="Earned" type="date"/><Btn primary onClick={()=>logC("CE","Submitted")} style={{marginTop:8}}>Submit</Btn></Card></FeatureGate>
         </div>)}
 
-        {tab==="skills"&&(<div>
+        {tab==="skills"&&(featureToggles.skill_assessments===false?<AdminDisabledPanel name="Skills & Assessments" mode="tab"/>:<div>
           <L>Skill Matrix & Growth Tracker</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Your personal skill development. Assessment results from your team lead populate your baseline. Gaps auto-surface training recommendations below. When you reach proficiency thresholds, your lead receives a growth signal — recognition, not a demand (R037, R040). Only you and your team lead see your individual results.</M>
 
@@ -2497,7 +2531,7 @@ export default function AnalystClientApp() {
         {tab==="recovery"&&(<div>
           <L>Post-Incident Wellness Resources</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Always available — not just after incidents. Everything here is private (Tier-3). Your lead cannot see whether you access these resources. This section is about your personal wellness — distinct from technical incident recovery procedures.</M>
-          <BreathingExercise/>
+          <FeatureGate disabled={featureToggles.breathing_exercise===false} name="Box Breathing Exercise" mode="section"><BreathingExercise/></FeatureGate>
           <Card style={{marginBottom:16,borderColor:C.p+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.p,marginBottom:10}}>Understanding Stress Responses</div>
             <M style={{color:C.t,lineHeight:1.8}}>After intense incidents (ransomware, breaches, active intrusions), it is normal to experience difficulty sleeping, replaying events mentally, hypervigilance, irritability, difficulty concentrating, or emotional numbness. These are normal responses to abnormal situations — not signs of weakness. They typically peak at 24-72 hours and resolve over 1-2 weeks. If they persist beyond 2 weeks or intensify, connect with professional support below.</M>
