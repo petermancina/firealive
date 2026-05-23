@@ -1050,12 +1050,37 @@ function ManagementConsole() {
   // ── Peer Conduct (Phase 1.4b) ──
   const [peerFlags, setPeerFlags] = useState([]);
   const [peerFlagsLoading, setPeerFlagsLoading] = useState(false);
+  const [peerPatterns, setPeerPatterns] = useState([]);
+  const [peerPatternsLoading, setPeerPatternsLoading] = useState(false);
   const [peerFlagStatus, setPeerFlagStatus] = useState("open"); // open | resolved | all
   const [peerFlagTierFilter, setPeerFlagTierFilter] = useState(""); // "" | "1" | "2" | "3"
+  const [peerFlagSourceFilter, setPeerFlagSourceFilter] = useState("all"); // all | peer_session | board_post
   const [peerFlagOpenCount, setPeerFlagOpenCount] = useState(0);
   const [peerFlagUrgentOpenCount, setPeerFlagUrgentOpenCount] = useState(0);
   const [peerFlagResolveTarget, setPeerFlagResolveTarget] = useState(null); // flag id
   const [peerFlagResolveNote, setPeerFlagResolveNote] = useState("");
+  const resolvePeerFlag = (f, action) => {
+    const body = { note: peerFlagResolveNote || null };
+    if (action) body.action = action;
+    api.post(`/api/peer/flags/${f.id}/resolve`, body).then(()=>{
+      addA("PEER_FLAG_RESOLVED", `Tier ${f.tier} ${f.targetType==="board_post"?"board ":""}flag resolved${action?" ("+action+")":""}`);
+      setPeerFlagResolveTarget(null); setPeerFlagResolveNote("");
+      setPeerFlagsLoading(true);
+      const params=new URLSearchParams({status:peerFlagStatus});
+      if(peerFlagTierFilter)params.set("tier",peerFlagTierFilter);
+      api.get(`/api/peer/flags?${params.toString()}`).then(r=>setPeerFlags(r?.flags||[])).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));
+    }).catch(()=>{ addA("PEER_FLAG_RESOLVE_FAILED", `Tier ${f.tier} flag resolve attempt failed`); });
+  };
+  const loadPeerPatterns = () => {
+    setPeerPatternsLoading(true);
+    api.get("/api/peer/flags/patterns?status=open").then(r=>setPeerPatterns(r?.patterns||[])).catch(()=>{}).finally(()=>setPeerPatternsLoading(false));
+  };
+  const acknowledgePattern = (id) => {
+    api.post(`/api/peer/flags/patterns/${id}/acknowledge`, {}).then(()=>{
+      addA("PEER_PATTERN_ACKNOWLEDGED", `Abuse pattern ${id.slice(0,8)} acknowledged`);
+      setPeerPatterns(prev=>prev.filter(pp=>pp.id!==id));
+    }).catch(()=>{ addA("PEER_PATTERN_ACK_FAILED", "Pattern acknowledge attempt failed"); });
+  };
 
   // Poll the open-flag count every 60s for the sidebar badge and the
   // tier-3 dashboard banner. We track total open and urgent open in
@@ -1385,6 +1410,7 @@ function ManagementConsole() {
     api.get(`/api/peer/flags?${params.toString()}`).then(r=>{
       setPeerFlags(r?.flags || []);
     }).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));
+    loadPeerPatterns();
   }, [tab, peerFlagStatus, peerFlagTierFilter]);
 
   // R3h: When peersupport tab opens, fetch the Helper Recognition
@@ -8037,7 +8063,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* PEER CONDUCT — tiered abuse flag review */}
         {tab==="peer_conduct"&&((featureToggles.peer_chat===false&&featureToggles.peer_board===false&&featureToggles.peer_scheduling===false)?<AdminDisabledPanel name="Peer Conduct" mode="tab"/>:<div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <L style={{marginBottom:0}}>Peer Conduct — {peerFlagStatus==="open"?"Open Flags":peerFlagStatus==="resolved"?"Resolved Flags":"All Flags"} ({peerFlags.length})</L>
+            <L style={{marginBottom:0}}>Peer Conduct — {peerFlagStatus==="open"?"Open Flags":peerFlagStatus==="resolved"?"Resolved Flags":"All Flags"} ({peerFlags.filter(f=>peerFlagSourceFilter==="all"||(f.targetType||"peer_session")===peerFlagSourceFilter).length})</L>
             <div style={{display:"flex",gap:6,alignItems:"center"}}>
               <select value={peerFlagStatus} onChange={e=>setPeerFlagStatus(e.target.value)} style={{padding:"5px 10px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:6,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
                 <option value="open">Open</option>
@@ -8050,13 +8076,48 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <option value="2">Tier 2 (attack)</option>
                 <option value="1">Tier 1 (minor)</option>
               </select>
+              <select value={peerFlagSourceFilter} onChange={e=>setPeerFlagSourceFilter(e.target.value)} style={{padding:"5px 10px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:6,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
+                <option value="all">All sources</option>
+                <option value="peer_session">Peer chat</option>
+                <option value="board_post">Board posts</option>
+              </select>
               <Btn small onClick={()=>{setPeerFlagsLoading(true);const params=new URLSearchParams({status:peerFlagStatus});if(peerFlagTierFilter)params.set("tier",peerFlagTierFilter);api.get(`/api/peer/flags?${params.toString()}`).then(r=>setPeerFlags(r?.flags||[])).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));}}>Refresh</Btn>
             </div>
           </div>
-          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Flags submitted by analysts after peer skill-share sessions. Tier 1 (minor) shows aggregate patterns only — both flagger and flagged stay anonymous. Tier 2 (personal attack) reveals the flagged peer's identity. Tier 3 (urgent — slurs, threats, harassment) reveals both identities and warrants HR involvement.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Flags submitted by analysts about peer skill-share sessions and posts on the skill-share board. Tier 1 (minor) shows aggregate patterns only — both flagger and flagged stay anonymous. Tier 2 (personal attack) reveals the flagged peer's identity. Tier 3 (urgent — slurs, threats, harassment) reveals both identities and warrants HR involvement.</M>
+          {peerPatterns.length>0&&(
+            <Card style={{marginBottom:16,borderColor:C.w+"40",background:"rgba(251,191,36,0.04)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>Pattern Alerts ({peerPatterns.length})</div>
+                <Btn small onClick={loadPeerPatterns}>Refresh</Btn>
+              </div>
+              <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Statistical patterns detected across flag history (repeat offenders, escalating severity, retaliation). Identities follow the same tier rules as individual flags. Acknowledge a pattern once you have reviewed it.</M>
+              {peerPatterns.map(pat=>{
+                const sevColor=pat.severity==="urgent"?C.d:pat.severity==="watch"?C.w:C.i;
+                const typeLabel=pat.patternType==="repeat_offender"?"Repeat offender":pat.patternType==="retaliation"?"Retaliation":"Escalating severity";
+                return(
+                  <Card key={pat.id} style={{marginBottom:8,borderLeft:`4px solid ${sevColor}`}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:6}}>
+                      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                        <Badge color={sevColor}>{(pat.severity||"info").toUpperCase()}</Badge>
+                        <Badge color={C.p}>{typeLabel}</Badge>
+                        <M style={{color:C.td}}>{pat.flagCount} flag{pat.flagCount===1?"":"s"} · max tier {pat.maxTier}</M>
+                      </div>
+                      <Btn small primary onClick={()=>acknowledgePattern(pat.id)}>Acknowledge</Btn>
+                    </div>
+                    <div style={{fontSize:11,color:C.tm}}>
+                      <span style={{color:C.t}}>Subject:</span> {pat.subjectDisplay}
+                      {pat.counterpartDisplay&&<span> · <span style={{color:C.t}}>Counterpart:</span> {pat.counterpartDisplay}</span>}
+                    </div>
+                    <M style={{color:C.td,display:"block",marginTop:4}}>Window: {new Date(pat.windowStart).toLocaleDateString()} to {new Date(pat.windowEnd).toLocaleDateString()}</M>
+                  </Card>
+                );
+              })}
+            </Card>
+          )}
           {peerFlagsLoading&&<M style={{color:C.td,display:"block",marginBottom:10}}>Loading…</M>}
-          {!peerFlagsLoading&&peerFlags.length===0&&<Card><M style={{color:C.tm}}>No flags match the current filter. {peerFlagStatus==="open"?"That is good news — it means no peer skill-share sessions have been flagged for review.":""}</M></Card>}
-          {peerFlags.map(f=>{
+          {!peerFlagsLoading&&peerFlags.filter(f=>peerFlagSourceFilter==="all"||(f.targetType||"peer_session")===peerFlagSourceFilter).length===0&&<Card><M style={{color:C.tm}}>No flags match the current filter. {peerFlagStatus==="open"?"That is good news — it means nothing has been flagged for review.":""}</M></Card>}
+          {peerFlags.filter(f=>peerFlagSourceFilter==="all"||(f.targetType||"peer_session")===peerFlagSourceFilter).map(f=>{
             const tierColor=f.tier===3?C.d:f.tier===2?C.w:C.i;
             const tierLabel=f.tier===3?"URGENT":f.tier===2?"ATTACK":"MINOR";
             return(
@@ -8065,6 +8126,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4,flexWrap:"wrap"}}>
                       <Badge color={tierColor}>TIER {f.tier} · {tierLabel}</Badge>
+                      <Badge color={f.targetType==="board_post"?C.p:C.tm}>{f.targetType==="board_post"?"BOARD POST":"PEER CHAT"}</Badge>
                       {f.resolvedAt&&<Badge color={C.a}>RESOLVED</Badge>}
                       <M style={{color:C.td}}>{new Date(f.createdAt).toLocaleString()}</M>
                     </div>
@@ -8074,10 +8136,39 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     </div>
                   </div>
                 </div>
-                <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,marginBottom:f.resolvedAt?0:10}}>
-                  <M style={{color:C.td,display:"block",marginBottom:4}}>Flagged content:</M>
-                  <div style={{fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap",fontFamily:"'IBM Plex Mono',monospace"}}>{f.content}</div>
-                </Card>
+                {f.targetType==="board_post"?(
+                  <div style={{marginBottom:f.resolvedAt?0:10}}>
+                    <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,marginBottom:8}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                        <M style={{color:C.td}}>Flagged post</M>
+                        <Badge color={f.boardStatus==="restored"?C.a:f.boardStatus==="removed_pending_review"?C.w:f.boardStatus==="deleted"?C.d:C.tm}>{(f.boardStatus||"removed_pending_review").replace(/_/g," ")}</Badge>
+                      </div>
+                      <div style={{fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap",fontFamily:"'IBM Plex Mono',monospace"}}>{f.sealedContent||"[no sealed content]"}</div>
+                    </Card>
+                    {Array.isArray(f.context)&&f.context.length>0&&(
+                      <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.2)",border:`1px solid ${C.b}`,marginBottom:8}}>
+                        <M style={{color:C.td,display:"block",marginBottom:6}}>Thread context:</M>
+                        {f.context.map((c,i)=>(
+                          <div key={i} style={{marginBottom:6,paddingLeft:8,borderLeft:c.role==="flagged"?`2px solid ${C.w}`:`2px solid ${C.b}`}}>
+                            <M style={{color:c.role==="flagged"?C.w:C.tm}}>{(c.label||"Anonymous")+" \u00b7 "+(c.role||"post")}</M>
+                            <div style={{fontSize:11,color:C.t,lineHeight:1.5,whiteSpace:"pre-wrap"}}>{c.content}</div>
+                          </div>
+                        ))}
+                      </Card>
+                    )}
+                    {f.content&&(
+                      <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.15)",border:`1px solid ${C.b}`}}>
+                        <M style={{color:C.td,display:"block",marginBottom:4}}>Flagger's note:</M>
+                        <div style={{fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{f.content}</div>
+                      </Card>
+                    )}
+                  </div>
+                ):(
+                  <Card style={{padding:"10px 12px",background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,marginBottom:f.resolvedAt?0:10}}>
+                    <M style={{color:C.td,display:"block",marginBottom:4}}>Flagged content:</M>
+                    <div style={{fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap",fontFamily:"'IBM Plex Mono',monospace"}}>{f.content}</div>
+                  </Card>
+                )}
                 {f.resolvedAt&&(
                   <div style={{marginTop:10,padding:"10px 12px",background:"rgba(110,231,183,0.04)",borderRadius:8,border:`1px solid ${C.a}30`}}>
                     <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Resolved {new Date(f.resolvedAt).toLocaleString()} by {f.resolvedBy||"unknown"}</M>
@@ -8093,13 +8184,16 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     {peerFlagResolveTarget===f.id?(
                       <div>
                         <textarea value={peerFlagResolveNote} onChange={e=>setPeerFlagResolveNote(e.target.value)} rows={3} maxLength={2000} placeholder="Resolution note — what action was taken? (max 2000 chars, optional but recommended)" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical",marginBottom:8}}/>
-                        <div style={{display:"flex",gap:6}}>
-                          <Btn small primary onClick={()=>{api.post(`/api/peer/flags/${f.id}/resolve`,{note:peerFlagResolveNote||null}).then(()=>{addA("PEER_FLAG_RESOLVED",`Tier ${f.tier} flag resolved`);setPeerFlagResolveTarget(null);setPeerFlagResolveNote("");setPeerFlagsLoading(true);const params=new URLSearchParams({status:peerFlagStatus});if(peerFlagTierFilter)params.set("tier",peerFlagTierFilter);api.get(`/api/peer/flags?${params.toString()}`).then(r=>setPeerFlags(r?.flags||[])).catch(()=>{}).finally(()=>setPeerFlagsLoading(false));}).catch(()=>{addA("PEER_FLAG_RESOLVE_FAILED",`Tier ${f.tier} flag resolve attempt failed`);});}}>Submit Resolution</Btn>
+                        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                          {f.targetType==="board_post"&&<Btn small onClick={()=>resolvePeerFlag(f,"dismiss")}>Dismiss & Restore Post</Btn>}
+                          {f.targetType==="board_post"&&<Btn small primary onClick={()=>resolvePeerFlag(f,"uphold")}>Uphold (keep removed)</Btn>}
+                          {f.targetType==="board_post"&&f.tier===3&&<Btn small danger onClick={()=>resolvePeerFlag(f,"escalate")}>Escalate to HR</Btn>}
+                          {f.targetType!=="board_post"&&<Btn small primary onClick={()=>resolvePeerFlag(f,null)}>Submit Resolution</Btn>}
                           <Btn small onClick={()=>{setPeerFlagResolveTarget(null);setPeerFlagResolveNote("");}}>Cancel</Btn>
                         </div>
                       </div>
                     ):(
-                      <Btn small primary onClick={()=>{setPeerFlagResolveTarget(f.id);setPeerFlagResolveNote("");}}>Mark Resolved</Btn>
+                      <Btn small primary onClick={()=>{setPeerFlagResolveTarget(f.id);setPeerFlagResolveNote("");}}>{f.targetType==="board_post"?"Review & Resolve":"Mark Resolved"}</Btn>
                     )}
                   </div>
                 )}

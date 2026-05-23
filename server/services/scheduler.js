@@ -30,6 +30,44 @@ const schedulerService = {
       }
     }));
 
+    // ── Expire peer board threads (U2) ───────────────────────────────────
+    // A board thread is removed once every post in it — the root and all
+    // replies — is past its 7-day window; deleting the root cascades the
+    // replies via the thread_root_id foreign key. A thread is never swept
+    // while any post in it is pending or held under abuse review
+    // (removed_pending_review = 1): the evidence vault keeps an independent
+    // copy of flagged content, so this sweep can never destroy material a
+    // lead still needs. Daily is ample for a 7-day window.
+    this.jobs.push(cron.schedule('30 3 * * *', () => {
+      try {
+        const { getDb } = require('../db/init');
+        const db = getDb();
+        const swept = db.prepare(`
+          DELETE FROM peer_board_messages
+          WHERE id IN (
+            SELECT root.id FROM peer_board_messages root
+            WHERE root.parent_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM peer_board_messages m
+                WHERE (m.id = root.id OR m.thread_root_id = root.id)
+                  AND m.removed_pending_review = 1
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM peer_board_messages m
+                WHERE (m.id = root.id OR m.thread_root_id = root.id)
+                  AND m.expires_at >= datetime('now')
+              )
+          )
+        `).run();
+        if (swept.changes > 0) {
+          logger.info(`Expired ${swept.changes} peer board thread(s)`);
+        }
+        db.close();
+      } catch (err) {
+        logger.error('Scheduler: peer board expiry failed', { error: err.message });
+      }
+    }));
+
     // ── R3d-4 part 2: expire stale restore-approval rows ─────────────────
     //
     // Sweeps three classes of expiry per services/restore-approvals.js:

@@ -1059,6 +1059,10 @@ This is the cloud-specific companion to the Vulnerability Scan feature (which au
 6. For Tier 1: pattern analysis only — no individual action
 7. Lead resolves flag with note, audit log captures the resolution
 
+**Reviewing Board flags.** Board and session flags share one list, filterable by source. A Board flag shows the sealed post body, the surrounding thread context (labeled by pseudonym or Anonymous, never by real name), and the flagger's note. Dismissing a Board flag restores the post to the Board; Uphold leaves it removed; Escalate (Tier 3) routes to HR. The evidence vault retains the sealed record either way — a dismissal does not erase it.
+
+**Pattern Alerts.** Above the flag list, the Peer Conduct tab surfaces statistical patterns detected across flag history: a repeat offender (one analyst flagged repeatedly), escalating severity (flags against one analyst rising in tier over time), or retaliation (two analysts flagging each other). Detection is statistical and metadata-only — because peer messages are end-to-end encrypted, the system keys on flag metadata (who, when, what tier) and never reads message content. Pattern identities follow the same tier reveal as individual flags. A lead acknowledges a pattern once reviewed; if new flags later re-trigger it, a fresh alert appears.
+
 ### Help (MC)
 **What it's for:** In-app help — this Feature Guide accessible by tab. Each tab in the MC has a corresponding mini-article in this Help menu.
 
@@ -1136,21 +1140,21 @@ The leaderboard visibility toggle defaults to OFF (opt-out). Flipping it on adds
 8. On fulfillment, the analyst sees the request status flip to Fulfilled; they receive their PTO or USD per the org's payout method
 
 ### Board
-**What it's for:** Async forum for tips, questions, burnout strategies. Posts auto-expire after 7 days (so it's a current-conversation space, not a permanent record). Each post supports threaded responses so analysts can ask follow-up questions or add comments. The same conduct rules and tiered abuse flagging system from peer chat apply here too.
+**What it's for:** Async forum for tips, questions, burnout strategies. Posts auto-expire after 7 days (so it's a current-conversation space, not a permanent record). Each post supports threaded responses so analysts can ask follow-up questions or add comments, and posts and replies can be marked with lightweight reactions (Helpful, Thanks, Insightful, Same here) for low-effort acknowledgement. The same conduct rules and tiered abuse flagging system from peer chat apply here too.
 
 If a post is flagged, it's temporarily removed from the Board pending Team Lead review. The flagged content is sealed in an evidence vault with no expiration (so it can't disappear before review). Both poster and flagger identities are revealed only to the lead during review. If the lead finds it doesn't violate org abuse policies, they dismiss the flag and the post returns to the Board. If the lead finds it does violate policies, a message pops up suggesting the lead escalate up the management/HR chain — same workflow as the peer chat tier system.
 
 **Workflow:**
 1. Analyst has a tip to share or a question with no time pressure
 2. Posts to Board with a category
-3. Other analysts read async and respond via threaded responses
+3. Other analysts read async, respond via threaded responses, and react to useful posts
 4. Posts age out after 7 days
 
 **Flagging workflow:**
 1. Analyst sees a post or response that's inappropriate
 2. Flags it with a tier (1: minor / 2: personal attack / 3: urgent — slurs, threats, harassment)
 3. Post is removed from Board pending review, stored in evidence vault
-4. Lead opens Peer Conduct in MC, reviews, dismisses or escalates
+4. Lead opens Peer Conduct in MC, reviews the sealed evidence and thread context, then dismisses (post returns to the Board), upholds (stays removed), or escalates a Tier 3 to HR
 
 ### IR Simulator (this is the AI/ML training feature)
 **What it's for:** Train on YOUR organization's IR procedures — not generic textbook ones. Each scenario is generated from a real IR policy the lead uploaded. The analyst walks through OBSERVE → ORIENT → DECIDE → ACT phases, makes choices, gets feedback. Tracks IR Policy Mastery level over time. After completion, shows the actual policy that was used so the analyst can verify they're learning real org procedure.

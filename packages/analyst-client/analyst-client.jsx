@@ -1238,14 +1238,83 @@ export default function AnalystClientApp() {
   const [scheduled, setScheduled] = useState([]);
   const [showPlatform, setShowPlatform] = useState(null);
   // v0.0.23 analyst state
-  const [peerBoardMsgs, setPeerBoardMsgs] = useState([
-    {id:"pb1",content:"Pro tip: If you're getting buried in DNS tunneling alerts, build a baseline of known-good resolver IPs first. Cut my FP rate by 60%.",anonymous:true,category:"technical",createdAt:"2026-04-05T14:00:00Z",reactions:{"(+1)":3,"(*)":1}},
-    {id:"pb2",content:"After a rough ransomware week, I started time-boxing my triage to 45-min blocks with 10-min breaks. Huge difference in how I felt by end of shift.",anonymous:true,category:"burnout_prevention",createdAt:"2026-04-06T09:00:00Z",reactions:{"(+1)":5,"(!)":2}},
-    {id:"pb3",content:"Anyone else's Elastic SIEM choking on the new Zeek JSON format? Here's the ingest pipeline fix I used...",anonymous:false,authorName:"Jordan P.",category:"question",createdAt:"2026-04-07T11:00:00Z",reactions:{"(+1)":1}},
-  ]);
+  const [peerBoardMsgs, setPeerBoardMsgs] = useState([]);
   const [newBoardMsg, setNewBoardMsg] = useState("");
   const [boardMsgAnon, setBoardMsgAnon] = useState(true);
   const [boardMsgCat, setBoardMsgCat] = useState("technical");
+  // ── Peer board: load from the API (U2) ──
+  const loadBoard = () => { api.get("/api/peer-board/messages").then(r => { if (r && Array.isArray(r.messages)) setPeerBoardMsgs(r.messages); }); };
+  useEffect(() => { loadBoard(); }, []);
+  // ── Peer board threading (U2) ──
+  const [expandedThreads, setExpandedThreads] = useState({}); // rootId -> [posts] | "loading"
+  const [replyTo, setReplyTo] = useState(null);               // postId whose composer is open
+  const [replyDraft, setReplyDraft] = useState("");
+  const [replyDraftAnon, setReplyDraftAnon] = useState(true);
+  // ── Peer board: flag a post (U2) ──
+  const [boardFlagPost, setBoardFlagPost] = useState(null); // postId being flagged
+  const [boardFlagTier, setBoardFlagTier] = useState(0);    // 0=unselected, 1/2/3
+  const [boardFlagNote, setBoardFlagNote] = useState("");
+  const openBoardFlag = (postId) => { setBoardFlagPost(postId); setBoardFlagTier(0); setBoardFlagNote(""); };
+  const flagBoardPost = (postId, rootId) => {
+    const note = (boardFlagNote || "").trim();
+    if (!note || !boardFlagTier) return;
+    api.post("/api/peer/flags", { target_type: "board_post", boardPostId: postId, tier: boardFlagTier, content: note }).then(r => {
+      if (r && r.id) {
+        // The post is now removed pending review -- drop it from view.
+        if (rootId == null) {
+          setPeerBoardMsgs(prev => prev.filter(pp => pp.id !== postId));
+          setExpandedThreads(prev => { const n = { ...prev }; delete n[postId]; return n; });
+        } else {
+          loadThread(rootId);
+        }
+        setBoardFlagPost(null); setBoardFlagTier(0); setBoardFlagNote("");
+        logC("board_post_flagged", `Tier ${boardFlagTier} flag submitted on a board post`);
+      }
+    });
+  };
+  const relTime = (iso) => { const h = Math.floor((Date.now() - new Date(iso).getTime()) / 3600000); return h < 1 ? "just now" : h < 24 ? h + "h ago" : Math.floor(h / 24) + "d ago"; };
+  const loadThread = (rootId) => {
+    setExpandedThreads(prev => ({ ...prev, [rootId]: "loading" }));
+    api.get("/api/peer-board/threads/" + rootId).then(r => {
+      setExpandedThreads(prev => ({ ...prev, [rootId]: (r && Array.isArray(r.thread)) ? r.thread : [] }));
+    });
+  };
+  const toggleThread = (rootId) => {
+    if (rootId in expandedThreads) { setExpandedThreads(prev => { const n = { ...prev }; delete n[rootId]; return n; }); }
+    else { loadThread(rootId); }
+  };
+  const openReply = (postId) => { setReplyTo(postId); setReplyDraft(""); setReplyDraftAnon(true); };
+  const submitReply = (rootId, parentId) => {
+    const content = (replyDraft || "").trim();
+    if (!content) return;
+    api.post("/api/peer-board/messages/" + parentId + "/reply", { content, anonymous: replyDraftAnon }).then(r => {
+      if (r && r.message) {
+        loadThread(rootId);
+        setPeerBoardMsgs(prev => prev.map(p => p.id === rootId ? { ...p, replyCount: (p.replyCount || 0) + 1 } : p));
+        setReplyTo(null); setReplyDraft("");
+        logC("board_reply", "Replied on skill-share board");
+      }
+    });
+  };
+  const REACTIONS = [["helpful","Helpful"],["thanks","Thanks"],["insightful","Insightful"],["same","Same here"]];
+  const reactToPost = (postId, reaction, rootId) => {
+    api.post("/api/peer-board/messages/" + postId + "/react", { reaction }).then(r => {
+      if (!r || !r.reactions) return;
+      if (rootId == null) {
+        setPeerBoardMsgs(prev => prev.map(p => p.id === postId ? { ...p, reactions: r.reactions } : p));
+      } else {
+        setExpandedThreads(prev => { const t = prev[rootId]; if (!Array.isArray(t)) return prev; return { ...prev, [rootId]: t.map(p => p.id === postId ? { ...p, reactions: r.reactions } : p) }; });
+      }
+    });
+  };
+  const reactionRow = (post, rootId) => (
+    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
+      {REACTIONS.map(([key,label])=>{
+        const rx = (post.reactions && post.reactions[key]) || {count:0,mine:false};
+        return <button key={key} onClick={()=>reactToPost(post.id,key,rootId)} style={{fontSize:10,fontFamily:"'IBM Plex Mono',monospace",padding:"2px 8px",borderRadius:12,cursor:"pointer",border:`1px solid ${rx.mine?C.a:C.b}`,background:rx.mine?C.a+"18":"transparent",color:rx.mine?C.a:C.tm}}>{label}{rx.count>0?" "+rx.count:""}</button>;
+      })}
+    </div>
+  );
   const [showBoardTab, setShowBoardTab] = useState("board"); // board | my_requests
   const [myPeerRequests, setMyPeerRequests] = useState([
     {id:"req1",topic:"Need help with Sigma rule for DNS tunneling",time:"now",status:"open",createdAt:"2026-04-07T10:00:00Z"},
@@ -2189,24 +2258,95 @@ export default function AnalystClientApp() {
               <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",marginTop:16}}><input type="checkbox" checked={boardMsgAnon} onChange={e=>setBoardMsgAnon(e.target.checked)}/><M style={{color:boardMsgAnon?C.a:C.w}}>{boardMsgAnon?"Anonymous":"Identified"}</M></label>
             </div>
             {!boardMsgAnon&&<Card style={{padding:8,marginBottom:10,borderColor:C.w+"40"}}><M style={{color:C.w}}>Your name will be visible on this post.</M></Card>}
-            <Btn primary disabled={!newBoardMsg.trim()} onClick={()=>{setPeerBoardMsgs(prev=>[{id:"pb-"+Date.now(),content:newBoardMsg,anonymous:boardMsgAnon,authorName:boardMsgAnon?null:"You",category:boardMsgCat,createdAt:new Date().toISOString(),reactions:{}},...prev]);setNewBoardMsg("");logC("board_post","Posted to skill-share board ("+boardMsgCat+", "+(boardMsgAnon?"anonymous":"identified")+")");}}>Post</Btn>
+            <Btn primary disabled={!newBoardMsg.trim()} onClick={async()=>{const r=await api.post("/api/peer-board/messages",{content:newBoardMsg,anonymous:boardMsgAnon,category:boardMsgCat});if(r&&r.message){setPeerBoardMsgs(prev=>[r.message,...prev]);setNewBoardMsg("");logC("board_post","Posted to skill-share board ("+boardMsgCat+", "+(boardMsgAnon?"anonymous":"identified")+")");}else{logC("board_post","Failed to post to board");}}}>Post</Btn>
           </Card>
 
           {/* Messages */}
           {peerBoardMsgs.map(m=>{
             const catColors={technical:C.i,burnout_prevention:C.w,tip:C.a,question:C.p,general:C.tm};
-            const age=Math.floor((Date.now()-new Date(m.createdAt).getTime())/(1000*60*60));
-            const ageStr=age<1?"just now":age<24?age+"h ago":Math.floor(age/24)+"d ago";
+            const ageStr=relTime(m.createdAt);
+            const expanded = m.id in expandedThreads;
+            const thread = expanded ? expandedThreads[m.id] : null;
+            const composer = (rootId, parentId) => (
+              <Card style={{marginTop:8,padding:"10px 12px",borderColor:C.a+"40"}}>
+                <textarea value={replyDraft} onChange={e=>setReplyDraft(e.target.value)} rows={2} maxLength={4096} placeholder="Write a reply..." style={{width:"100%",padding:8,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}}/>
+                <div style={{display:"flex",gap:10,alignItems:"center",marginTop:6}}>
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}><input type="checkbox" checked={replyDraftAnon} onChange={e=>setReplyDraftAnon(e.target.checked)}/><M style={{color:replyDraftAnon?C.a:C.w}}>{replyDraftAnon?"Anonymous":"Identified"}</M></label>
+                  <Btn primary small disabled={!replyDraft.trim()} onClick={()=>submitReply(rootId,parentId)}>Reply</Btn>
+                  <Btn small onClick={()=>setReplyTo(null)}>Cancel</Btn>
+                </div>
+              </Card>
+            );
+            const flagPicker = (postId, rootId) => (
+              <Card style={{marginTop:8,padding:"12px 14px",borderColor:C.d+"40"}}>
+                <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:8}}>Flag this post -- select the severity that matches what was said:</M>
+                <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
+                  <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===1?"rgba(96,165,250,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===1?C.i+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                    <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===1} onChange={()=>setBoardFlagTier(1)} style={{marginTop:3}}/>
+                    <div style={{flex:1}}>
+                      <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 -- Minor</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness. Not a personal attack. Identities stay anonymous; aggregated for pattern detection only.</M>
+                    </div>
+                  </label>
+                  <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                    <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===2} onChange={()=>setBoardFlagTier(2)} style={{marginTop:3}}/>
+                    <div style={{flex:1}}>
+                      <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 -- Personal attack</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language in the post. The author's identity is revealed to your team lead; yours stays anonymous.</M>
+                    </div>
+                  </label>
+                  <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                    <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===3} onChange={()=>setBoardFlagTier(3)} style={{marginTop:3}}/>
+                    <div style={{flex:1}}>
+                      <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 -- Urgent</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Both identities are revealed to your lead and HR is brought in. Use only when warranted; misuse undermines trust.</M>
+                    </div>
+                  </label>
+                </div>
+                <textarea value={boardFlagNote} onChange={e=>setBoardFlagNote(e.target.value)} rows={2} maxLength={10000} placeholder="Briefly describe what's wrong with this post..." style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}}/>
+                <div style={{display:"flex",gap:8,marginTop:8}}>
+                  <Btn danger small disabled={!boardFlagNote.trim()||!boardFlagTier} onClick={()=>flagBoardPost(postId, rootId)}>Submit Flag</Btn>
+                  <Btn small onClick={()=>setBoardFlagPost(null)}>Cancel</Btn>
+                </div>
+              </Card>
+            );
             return(
             <Card key={m.id} style={{marginBottom:8,padding:"14px 16px",borderLeft:`3px solid ${catColors[m.category]||C.tm}`}}>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
                 <div style={{display:"flex",gap:8,alignItems:"center"}}>
                   <Badge color={catColors[m.category]||C.tm}>{(m.category||"general").replace(/_/g," ")}</Badge>
-                  <M style={{color:m.anonymous?C.td:C.a}}>{m.anonymous?"Anonymous":m.authorName}</M>
+                  <M style={{color:m.anonymous?C.td:C.a}}>{m.anonymous?"Anonymous":m.authorLabel}</M>
                 </div>
                 <M style={{color:C.td}}>{ageStr}</M>
               </div>
               <div style={{fontSize:12,color:C.t,lineHeight:1.7,marginBottom:8}}>{m.content}</div>
+              <div style={{display:"flex",gap:14,alignItems:"center"}}>
+                <M onClick={()=>toggleThread(m.id)} style={{color:C.a,cursor:"pointer"}}>{expanded?"Hide":"Show"} {(m.replyCount||0)} {(m.replyCount===1)?"reply":"replies"}</M>
+                <M onClick={()=>openReply(m.id)} style={{color:C.tm,cursor:"pointer"}}>Reply</M>
+                <M onClick={()=>openBoardFlag(m.id)} style={{color:C.d,cursor:"pointer"}}>Flag</M>
+              </div>
+              {reactionRow(m, null)}
+              {replyTo===m.id && composer(m.id, m.id)}
+              {boardFlagPost===m.id && flagPicker(m.id, null)}
+              {expanded && (thread==="loading"
+                ? <M style={{color:C.td,display:"block",marginTop:8}}>Loading thread…</M>
+                : <div style={{marginTop:8}}>
+                    {thread.filter(p=>p.id!==m.id).map(rep=>(
+                      <div key={rep.id} style={{marginLeft:Math.min(rep.depth,4)*14,marginTop:6,paddingLeft:10,borderLeft:`2px solid ${C.b}`}}>
+                        <div style={{display:"flex",justifyContent:"space-between"}}>
+                          <M style={{color:rep.anonymous?C.td:C.a}}>{rep.anonymous?"Anonymous":rep.authorLabel}</M>
+                          <M style={{color:C.td}}>{relTime(rep.createdAt)}</M>
+                        </div>
+                        <div style={{fontSize:12,color:C.t,lineHeight:1.6,margin:"4px 0"}}>{rep.content}</div>
+                        <M onClick={()=>openReply(rep.id)} style={{color:C.tm,cursor:"pointer"}}>Reply</M>
+                        <M onClick={()=>openBoardFlag(rep.id)} style={{color:C.d,cursor:"pointer"}}>Flag</M>
+                        {reactionRow(rep, m.id)}
+                        {replyTo===rep.id && composer(m.id, rep.id)}
+                        {boardFlagPost===rep.id && flagPicker(rep.id, m.id)}
+                      </div>
+                    ))}
+                    {thread.filter(p=>p.id!==m.id).length===0 && <M style={{color:C.td,display:"block",marginLeft:14}}>No replies yet.</M>}
+                  </div>)}
             </Card>);
           })}
           <M style={{color:C.td,display:"block",marginTop:12}}>Messages expire after 7 days. Encrypted at rest. Access-controlled — analysts only. Not exported in backups.</M>

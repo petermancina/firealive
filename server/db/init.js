@@ -1269,7 +1269,11 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
 
 CREATE TABLE IF NOT EXISTS peer_abuse_flags (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  session_id TEXT NOT NULL,
+  -- target_type/target_id make a flag polymorphic (U2): a peer session uses
+  -- session_id, a board post uses target_id, so session_id is now nullable.
+  target_type TEXT NOT NULL DEFAULT 'peer_session' CHECK (target_type IN ('peer_session', 'board_post')),
+  session_id TEXT,
+  target_id TEXT,
   flagger_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   flagged_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
   tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
@@ -1290,6 +1294,119 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagged_user
 
 CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagger
   ON peer_abuse_flags(flagger_user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_target
+  ON peer_abuse_flags(target_type, target_id);
+
+-- Evidence Vault (U2). When a peer session or board post is flagged for abuse,
+-- the flagged content plus surrounding context is sealed here, together with
+-- BOTH parties' UUIDs and their pseudonyms captured at seal time (pseudonyms
+-- rotate). This is the permanent forensic record: it has NO expiry and is not
+-- swept, so it survives the board post being removed, expired, or deleted, and
+-- it survives a flag being resolved. flagger_user_id and accused_user_id are
+-- deliberately plain TEXT, NOT foreign keys, so the snapshot is immune to a
+-- user later being deactivated or deleted. flag_id uses ON DELETE RESTRICT so
+-- a flag that has sealed evidence cannot be deleted out from under it. The
+-- tiered identity-reveal policy is applied at read time in the review API;
+-- the vault itself always retains everything.
+CREATE TABLE IF NOT EXISTS peer_abuse_evidence_vault (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  flag_id TEXT NOT NULL REFERENCES peer_abuse_flags(id) ON DELETE RESTRICT,
+  target_type TEXT NOT NULL CHECK (target_type IN ('peer_session', 'board_post')),
+  target_id TEXT,
+  sealed_content_encrypted BLOB NOT NULL,
+  context_encrypted BLOB,
+  flagger_user_id TEXT NOT NULL,
+  accused_user_id TEXT NOT NULL,
+  flagger_pseudonym_at_seal TEXT,
+  accused_pseudonym_at_seal TEXT,
+  tier_at_seal INTEGER NOT NULL CHECK (tier_at_seal IN (1, 2, 3)),
+  sealed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_vault_flag
+  ON peer_abuse_evidence_vault(flag_id);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_vault_accused
+  ON peer_abuse_evidence_vault(accused_user_id, sealed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_vault_target
+  ON peer_abuse_evidence_vault(target_type, target_id);
+
+-- Abuse pattern detections (U2). The statistical detector writes one row per
+-- detected pattern (repeat offender, retaliation, escalation) over flag
+-- METADATA only: it keys entirely on user UUIDs and flag ids and never reads
+-- decrypted content. subject_user_id and counterpart_user_id are plain TEXT
+-- (not foreign keys) so a detection survives a user being deactivated, and
+-- involved_flag_ids is a JSON array of the flag ids that make up the pattern.
+-- The tiered identity-reveal policy is applied at read time in the review API.
+CREATE TABLE IF NOT EXISTS peer_abuse_patterns (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  pattern_type TEXT NOT NULL CHECK (pattern_type IN ('repeat_offender', 'retaliation', 'escalation')),
+  subject_user_id TEXT NOT NULL,
+  counterpart_user_id TEXT,
+  involved_flag_ids TEXT NOT NULL DEFAULT '[]',
+  flag_count INTEGER NOT NULL DEFAULT 0,
+  max_tier INTEGER NOT NULL CHECK (max_tier IN (1, 2, 3)),
+  window_start TEXT NOT NULL,
+  window_end TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info' CHECK (severity IN ('info', 'watch', 'urgent')),
+  acknowledged_by TEXT,
+  acknowledged_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_subject
+  ON peer_abuse_patterns(subject_user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_type
+  ON peer_abuse_patterns(pattern_type, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_unack
+  ON peer_abuse_patterns(severity, created_at DESC) WHERE acknowledged_at IS NULL;
+
+-- Peer Message Board (U2). Replaces the prototype team_config key-value board.
+-- author_id is ALWAYS stored (the user UUID) even when the post is shown
+-- anonymously — display_anonymous governs the UI only, never what is retained,
+-- so a flagged post can always be attributed on the backend per the tier policy.
+-- content_encrypted holds the post body under Tier-3 AES-256-GCM at rest.
+-- Threading: a top-level post has parent_id IS NULL and thread_root_id IS NULL;
+-- a reply sets parent_id to its immediate parent and thread_root_id to the
+-- top-level ancestor, so a full thread is (id = :root OR thread_root_id = :root).
+-- expires_at is stored (created_at + 7 days); the expiry sweep deletes expired
+-- posts EXCEPT those with removed_pending_review = 1 or a vault seal. Deleting a
+-- root cascades its replies via the thread_root_id self-reference.
+CREATE TABLE IF NOT EXISTS peer_board_messages (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  author_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  display_anonymous INTEGER NOT NULL DEFAULT 1 CHECK (display_anonymous IN (0, 1)),
+  category TEXT,
+  content_encrypted BLOB NOT NULL,
+  parent_id TEXT REFERENCES peer_board_messages(id) ON DELETE CASCADE,
+  thread_root_id TEXT REFERENCES peer_board_messages(id) ON DELETE CASCADE,
+  depth INTEGER NOT NULL DEFAULT 0,
+  reactions TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  removed_pending_review INTEGER NOT NULL DEFAULT 0 CHECK (removed_pending_review IN (0, 1)),
+  removed_at TEXT,
+  restored_at TEXT,
+  deleted_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_board_messages_thread
+  ON peer_board_messages(thread_root_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_peer_board_messages_expiry
+  ON peer_board_messages(expires_at)
+  WHERE removed_pending_review = 0 AND deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_peer_board_messages_author
+  ON peer_board_messages(author_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_peer_board_messages_removed
+  ON peer_board_messages(removed_pending_review)
+  WHERE removed_pending_review = 1;
 
 CREATE TABLE IF NOT EXISTS ir_policies (
   id TEXT PRIMARY KEY,
@@ -2308,6 +2425,148 @@ function initDb() {
 
   // Execute schema
   db.exec(SCHEMA);
+
+  // ── Migration: peer board KV → peer_board_messages (U2) ──────────────────
+  // The prototype board (retired v022-features route) stored each post as a
+  // JSON blob in team_config under keys "peer_board_<id>". U2 introduces the
+  // real peer_board_messages table; this one-time, idempotent backfill moves
+  // existing posts into it (encrypting the body at rest) and removes the KV
+  // rows. Once the rows are gone the block is a no-op on every later startup.
+  //
+  // Legacy posts marked anonymous stored no author id, so they cannot be
+  // attributed if later flagged. To satisfy the NOT NULL author_id foreign key
+  // while preserving the post content, those posts (and any whose recorded
+  // author no longer exists) are assigned to a reserved, inactive
+  // "legacy-anonymous" system account, created lazily only if needed. Only
+  // pre-U2 anonymous posts are affected — every post created through the new
+  // board carries the real UUID. Already-expired posts are dropped rather than
+  // migrated, matching the old board's 7-day visibility window.
+  try {
+    const kvBoardRows = db.prepare("SELECT key, value FROM team_config WHERE key LIKE 'peer_board_%'").all();
+    if (kvBoardRows.length > 0) {
+      const { encryptTier3 } = require('../services/encryption');
+      const SENTINEL_ID = 'legacy-anonymous';
+      let sentinelEnsured = false;
+      const ensureSentinel = () => {
+        if (sentinelEnsured) return;
+        db.prepare(
+          "INSERT OR IGNORE INTO users (id, username, role, name, active, mfa_enrollment_required) " +
+          "VALUES (?, ?, 'developer', 'Legacy Anonymous (system)', 0, 0)"
+        ).run(SENTINEL_ID, SENTINEL_ID);
+        sentinelEnsured = true;
+      };
+      const insertPost = db.prepare(
+        "INSERT OR IGNORE INTO peer_board_messages " +
+        "(id, author_id, display_anonymous, category, content_encrypted, parent_id, thread_root_id, depth, reactions, created_at, expires_at) " +
+        "VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?)"
+      );
+      const deleteKv = db.prepare("DELETE FROM team_config WHERE key = ?");
+      const userExists = db.prepare("SELECT 1 FROM users WHERE id = ?");
+
+      let migrated = 0;
+      const runBoardMigration = db.transaction(() => {
+        for (const row of kvBoardRows) {
+          let msg = null;
+          try { msg = JSON.parse(row.value); } catch (parseErr) { msg = null; }
+          // Drop unreadable or contentless rows — they were never displayable.
+          if (!msg || typeof msg.content !== 'string') { deleteKv.run(row.key); continue; }
+
+          const createdAt = (typeof msg.createdAt === 'string' && msg.createdAt)
+            ? msg.createdAt : new Date().toISOString();
+          const expiresAt = new Date(new Date(createdAt).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+          // Already past its 7-day window — drop like the old board did.
+          if (new Date(expiresAt).getTime() <= Date.now()) { deleteKv.run(row.key); continue; }
+
+          const anon = (msg.anonymous === undefined) ? true : !!msg.anonymous;
+          let authorId = (!anon && typeof msg.authorId === 'string' && msg.authorId) ? msg.authorId : SENTINEL_ID;
+          if (authorId !== SENTINEL_ID && !userExists.get(authorId)) authorId = SENTINEL_ID;
+          if (authorId === SENTINEL_ID) ensureSentinel();
+
+          const id = (typeof msg.id === 'string' && msg.id) ? msg.id : crypto.randomBytes(16).toString('hex');
+          const category = (typeof msg.category === 'string') ? msg.category : null;
+          const reactions = (msg.reactions && typeof msg.reactions === 'object')
+            ? JSON.stringify(msg.reactions) : '{}';
+          const ciphertext = encryptTier3(String(msg.content).slice(0, 4096));
+
+          insertPost.run(id, authorId, anon ? 1 : 0, category, ciphertext, reactions, createdAt, expiresAt);
+          deleteKv.run(row.key);
+          migrated++;
+        }
+      });
+      runBoardMigration();
+      if (migrated > 0) {
+        console.log(`peer board migration: moved ${migrated} KV post(s) into peer_board_messages`);
+      }
+    }
+  } catch (boardMigErr) {
+    // Non-fatal: leave the KV rows in place for a future attempt rather than
+    // losing data. The transaction above rolls back on any error.
+    console.error('peer board KV migration failed (non-fatal):', boardMigErr.message);
+  }
+
+  // ── Migration: peer_abuse_flags polymorphic targets (U2) ──────────
+  // U2 lets a flag target a board post as well as a peer session, which means
+  // adding target_type/target_id and relaxing session_id from NOT NULL (board
+  // flags have no session). SQLite has no ALTER COLUMN, so existing pre-U2
+  // tables are rebuilt: CREATE the canonical shape, copy rows (defaulting
+  // target_type to 'peer_session'), DROP, RENAME, and recreate the indexes.
+  // Foreign keys are toggled OFF for the rebuild and back ON afterward. Gated
+  // on the target_type column being absent, so it is a no-op on fresh installs
+  // (which already get the new shape from SCHEMA) and on migrated databases.
+  try {
+    const flagCols = db.prepare("PRAGMA table_info(peer_abuse_flags)").all();
+    const hasTargetType = flagCols.some(c => c.name === 'target_type');
+    if (!hasTargetType) {
+      console.log('peer_abuse_flags migration (U2): rebuilding for polymorphic targets');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE peer_abuse_flags_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            target_type TEXT NOT NULL DEFAULT 'peer_session' CHECK (target_type IN ('peer_session', 'board_post')),
+            session_id TEXT,
+            target_id TEXT,
+            flagger_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            flagged_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
+            content_encrypted BLOB NOT NULL,
+            flagger_ip TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            resolution_note TEXT
+          )
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM peer_abuse_flags').get().n;
+        db.exec(`
+          INSERT INTO peer_abuse_flags_new
+            (id, target_type, session_id, target_id, flagger_user_id, flagged_user_id,
+             tier, content_encrypted, flagger_ip, created_at, resolved_at, resolved_by, resolution_note)
+          SELECT
+            id, 'peer_session', session_id, NULL, flagger_user_id, flagged_user_id,
+            tier, content_encrypted, flagger_ip, created_at, resolved_at, resolved_by, resolution_note
+          FROM peer_abuse_flags
+        `);
+        db.exec('DROP TABLE peer_abuse_flags');
+        db.exec('ALTER TABLE peer_abuse_flags_new RENAME TO peer_abuse_flags');
+        // Recreate indexes (dropped with the old table), faithful to SCHEMA.
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_unresolved ON peer_abuse_flags(tier, created_at DESC) WHERE resolved_at IS NULL');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagged_user ON peer_abuse_flags(flagged_user_id, created_at DESC)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagger ON peer_abuse_flags(flagger_user_id, created_at DESC)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_target ON peer_abuse_flags(target_type, target_id)');
+        db.exec('COMMIT');
+        console.log(`peer_abuse_flags migration (U2): rebuilt, preserved ${copied} flag(s)`);
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (flagMigErr) {
+    console.error('peer_abuse_flags migration (U2) failed (non-fatal):', flagMigErr.message);
+  }
 
   // ── Migration: ir_policies phantom → canonical (Phase 1.4c precursor) ──
   // The pre-1.4c-precursor codebase had two problems with IR policy storage:

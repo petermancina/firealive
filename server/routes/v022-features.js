@@ -248,65 +248,6 @@ router.post('/calendar/cancel-event', (req, res) => {
   res.send(ics);
 });
 
-// ── Peer Message Board ──────────────────────────────────────────────────────
-// Ephemeral, encrypted, access-controlled message board for skill-sharing.
-// Messages auto-expire after configurable TTL (default 7 days).
-router.get('/peer-board/messages', (req, res) => {
-  try {
-    const db = getDb();
-    const rows = db.prepare("SELECT key, value FROM team_config WHERE key LIKE 'peer_board_%' ORDER BY key DESC").all();
-    db.close();
-    const now = Date.now();
-    const TTL_MS = 7 * 24 * 60 * 60 * 1000;
-    const messages = rows
-      .map(r => { try { return JSON.parse(r.value); } catch { return null; } })
-      .filter(m => m && (now - new Date(m.createdAt).getTime() < TTL_MS));
-    res.json({ messages, ttlDays: 7 });
-  } catch (err) { res.status(500).json({ error: 'Failed to get messages' }); }
-});
-
-router.post('/peer-board/messages', (req, res) => {
-  const { content, anonymous, category } = req.body;
-  if (!content || content.length > 4096) return res.status(400).json({ error: 'content required (max 4096 chars)' });
-  const VALID_CATS = ['technical', 'burnout_prevention', 'general', 'tip', 'question'];
-  try {
-    const db = getDb();
-    const id = crypto.randomBytes(12).toString('hex');
-    const msg = {
-      id, content: content.slice(0, 4096),
-      anonymous: anonymous !== false,
-      authorId: anonymous !== false ? null : req.user.id,
-      authorName: anonymous !== false ? null : req.user.name,
-      category: VALID_CATS.includes(category) ? category : 'general',
-      createdAt: new Date().toISOString(),
-      reactions: {},
-    };
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(`peer_board_${id}`, JSON.stringify(msg), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'PEER_BOARD_POST', `category=${msg.category} anonymous=${msg.anonymous}`, req.ip);
-    res.status(201).json({ ok: true, id });
-  } catch (err) { res.status(500).json({ error: 'Failed to post message' }); }
-});
-
-router.delete('/peer-board/:id', (req, res) => {
-  try {
-    const db = getDb();
-    const key = `peer_board_${req.params.id}`;
-    const row = db.prepare("SELECT value FROM team_config WHERE key = ?").get(key);
-    if (!row) { db.close(); return res.status(404).json({ error: 'Not found' }); }
-    const msg = JSON.parse(row.value);
-    // Only author or leads can delete
-    if (msg.authorId && msg.authorId !== req.user.id && req.user.role !== 'lead') {
-      db.close();
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-    db.prepare("DELETE FROM team_config WHERE key = ?").run(key);
-    db.close();
-    auditLog(req.user.id, 'PEER_BOARD_DELETE', `id=${req.params.id}`, req.ip);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: 'Failed to delete message' }); }
-});
-
 // ── Security Regression Testing ─────────────────────────────────────────────
 // Runs checks against current config to verify all integrations and controls
 // still function after an update. Reports incompatibilities.
