@@ -1,11 +1,11 @@
 #!/bin/bash
-# FireAlive v1.0.0 — Build & Install Script
+# FireAlive — Build & Install Script
 # This script builds all three FireAlive desktop apps from source.
 # Prerequisites: Node.js 20+, npm 10+
 
 set -e
 echo "═══════════════════════════════════════════"
-echo "  FireAlive v1.0.0 — Build & Install"
+echo "  FireAlive — Build & Install"
 echo "  SOC Analyst Wellbeing Platform"  
 echo "═══════════════════════════════════════════"
 echo ""

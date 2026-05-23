@@ -27,7 +27,7 @@ See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for w
 
 ### Quick Start (Development)
 ```bash
-git clone https://github.com/pmancina/firealive.git
+git clone https://github.com/petermancina/firealive.git
 cd firealive && npm install
 node server/index.js                    # Regional Server on :3000
 cd packages/global-dashboard-server && node index.js  # GD Server on :4001

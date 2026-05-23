@@ -26,5 +26,5 @@ contextBridge.exposeInMainWorld('firealive', {
     }
   },
   version: pkg.version,
-  component: 'analyst-client',
+  component: 'management-console',
 });

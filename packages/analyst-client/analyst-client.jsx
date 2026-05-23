@@ -29,7 +29,7 @@ import { useState, useEffect, useRef } from "react";
 // FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
 // for more details: https://www.gnu.org/licenses/agpl-3.0.html
 //
-// Source code: https://github.com/pmancina/soc-wellbeing-platform
+// Source code: https://github.com/petermancina/firealive
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -1067,7 +1067,7 @@ export default function AnalystClientApp() {
   const [signalsLoadState, setSignalsLoadState] = useState({loaded:false, error:null, riskTier:null, recordedAt:null});
   useEffect(() => {
     let cancelled = false;
-    Api.get('/api/signals/me').then((data) => {
+    api.get('/api/signals/me').then((data) => {
       if (cancelled) return;
       if (data.error) {
         setSignalsLoadState({loaded:false, error:data.error, riskTier:null, recordedAt:null});
@@ -1129,7 +1129,7 @@ export default function AnalystClientApp() {
   const [trainingRecsLoadState, setTrainingRecsLoadState] = useState({loaded:false, error:null});
   useEffect(() => {
     let cancelled = false;
-    Api.get('/api/training-recommendations/me').then((data) => {
+    api.get('/api/training-recommendations/me').then((data) => {
       if (cancelled) return;
       if (data.error) {
         setTrainingRecsLoadState({loaded:false, error:data.error});
@@ -1149,7 +1149,7 @@ export default function AnalystClientApp() {
   const [skillResultsLoadState, setSkillResultsLoadState] = useState({loaded:false, error:null});
   useEffect(() => {
     let cancelled = false;
-    Api.get('/api/assessments/analyst/me').then((data) => {
+    api.get('/api/assessments/analyst/me').then((data) => {
       if (cancelled) return;
       if (data.error) {
         setSkillResultsLoadState({loaded:false, error:data.error});
@@ -1177,7 +1177,7 @@ export default function AnalystClientApp() {
     };
     if (completionForm.url) body.url = completionForm.url;
     if (completionForm.completionDate) body.completionDate = completionForm.completionDate;
-    const resp = await Api.post('/api/training/submit-completion', body);
+    const resp = await api.post('/api/training/submit-completion', body);
     if (resp.error) {
       setCompletionState({submitting:false, success:null, error:resp.error});
     } else {

@@ -13,7 +13,7 @@
 // FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
 // for more details: https://www.gnu.org/licenses/agpl-3.0.html
 //
-// Source code: https://github.com/pmancina/firealive
+// Source code: https://github.com/petermancina/firealive
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useRef } from "react";
@@ -297,10 +297,10 @@ const PROMPTS = {
     minimal:{title:"1:1s?",body:"All scheduled?"}},
 };
 
-function generateCEF(th, type) {
+function generateCEF(th, type, version) {
   const ts = new Date().toISOString();
-  if (type === "health") return `CEF:0|FireAlive|TeamCapacity|0.0.20|100|Team Health Update|${th.status==="critical"?9:th.status==="stressed"?7:th.status==="watch"?4:1}|rt=${ts} cs1=${th.score} cs1Label=TeamHealthScore cs2=${th.avgUtil} cs2Label=AvgUtilization cs3=${th.oc} cs3Label=OverCapacity cs4=${th.ext} cs4Label=ExtendedOverCap msg=Team status: ${th.status}`;
-  return `CEF:0|FireAlive|TeamCapacity|0.0.20|200|Report Generated|3|rt=${ts} msg=Scheduled report delivered`;
+  if (type === "health") return `CEF:0|FireAlive|TeamCapacity|${version||"unknown"}|100|Team Health Update|${th.status==="critical"?9:th.status==="stressed"?7:th.status==="watch"?4:1}|rt=${ts} cs1=${th.score} cs1Label=TeamHealthScore cs2=${th.avgUtil} cs2Label=AvgUtilization cs3=${th.oc} cs3Label=OverCapacity cs4=${th.ext} cs4Label=ExtendedOverCap msg=Team status: ${th.status}`;
+  return `CEF:0|FireAlive|TeamCapacity|${version||"unknown"}|200|Report Generated|3|rt=${ts} msg=Scheduled report delivered`;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -3946,7 +3946,7 @@ function ManagementConsole() {
                 if(secs.kbInsights) lines.push("KB INSIGHT","  "+th.avgUtil+"% utilization "+(th.avgUtil>80?"exceeds":"within")+" 70-80% threshold (R012).","");
                 if(secs.skillProgress) lines.push("SKILL PROGRESSION","  L1 cohort: Avg triage 78%, documentation 76%, SIEM 52%","  L2 cohort: Avg investigation 74%, network 69%, malware 48%","  L3 cohort: Avg hunting 82%, IR coordination 77%","");
                 if(secs.upskillingGaps) lines.push("UPSKILLING GAPS","  4/6 L1 below 70% in SIEM Queries (avg 52%)","  3/6 L1 below 70% in Escalation Judgment (avg 58%)","  4/5 L2 below 70% in Malware Analysis (avg 48%)","  12 lab completions, 3 re-takes, 2 level-up signals (30d)","");
-                lines.push("═".repeat(60),"AGPL-3.0 | FireAlive v"+(appVersion||"unknown")+" | github.com/pmancina/firealive");
+                lines.push("═".repeat(60),"AGPL-3.0 | FireAlive v"+(appVersion||"unknown")+" | github.com/petermancina/firealive");
                 content=lines.join("\n");
                 const blob=new Blob([content],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-report-${dateStr}.txt`;a.click();URL.revokeObjectURL(url);
               }
@@ -4188,7 +4188,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <div style={{marginTop:10,padding:"8px 14px",background:panicMode?"rgba(239,68,68,0.08)":"rgba(110,231,183,0.08)",border:"1px solid "+(panicMode?C.d+"40":C.a+"40"),borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}><M style={{color:panicMode?C.d:C.a,fontWeight:600}}>Burnout Prevention Routing</M><Badge color={panicMode?C.d:C.a}>{panicMode?"OFF":"ON"}</Badge></div>
           </Card>
           <Btn small onClick={()=>setShowCEF(!showCEF)}>{showCEF?"Hide":"Show"} CEF</Btn>
-          {showCEF&&<div style={{marginTop:8,padding:14,background:"#000",borderRadius:8,fontFamily:"'IBM Plex Mono',monospace",fontSize:9,color:"#8EC07C",lineHeight:1.8,overflowX:"auto",whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{generateCEF(th,"health")}</div>}
+          {showCEF&&<div style={{marginTop:8,padding:14,background:"#000",borderRadius:8,fontFamily:"'IBM Plex Mono',monospace",fontSize:9,color:"#8EC07C",lineHeight:1.8,overflowX:"auto",whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{generateCEF(th,"health",appVersion)}</div>}
         </div>)}
 
         {/* ONBOARD */}
@@ -4849,7 +4849,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Version & Anti-Rollback Status</div>
             <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · Fuse counter: {appFuse||"…"} · Last increment: {appFuseLastIncrement||"…"} · Signed: Ed25519 ✓</M>
           </Card>
-          <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/pmancina/firealive</M></Card>
+          <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/petermancina/firealive</M></Card>
         </div>)}
 
         {/* ══════════ INTEGRATIONS HEALTH TAB ══════════ */}

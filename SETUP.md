@@ -4,9 +4,9 @@
 
 ### Step 1: Install the Management Console
 1. Download the installer for your OS from the GitHub Releases page:
-   - macOS: `FireAlive-Management-Console-1.0.0-arm64.dmg` or `x64.dmg`
-   - Windows: `FireAlive-Management-Console-1.0.0-Setup.exe`
-   - Linux: `FireAlive-Management-Console-1.0.0.AppImage`
+   - macOS: `FireAlive-Management-Console-<version>-arm64.dmg` or `x64.dmg`
+   - Windows: `FireAlive-Management-Console-<version>-Setup.exe`
+   - Linux: `FireAlive-Management-Console-<version>.AppImage`
 2. Run the installer. The MC includes the embedded Regional Server.
 3. On first launch, the MC starts in **unlocked** mode (no MFA configured yet).
 
@@ -117,7 +117,7 @@ When you present a FireAlive compliance report to an internal auditor or externa
 
 ### Install and Run (Development)
 ```bash
-git clone https://github.com/pmancina/firealive.git
+git clone https://github.com/petermancina/firealive.git
 cd firealive
 
 # Install dependencies
