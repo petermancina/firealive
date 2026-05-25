@@ -188,6 +188,7 @@ app.use('/api/messages', authMiddleware(['analyst']), require('./routes/messages
 app.use('/api/peers', authMiddleware(['analyst']), require('./routes/peers'));
 app.use('/api/e2ee', authMiddleware(['analyst', 'lead']), require('./routes/e2ee-keys'));
 app.use('/api/lead-chat', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/lead-chat'));
+app.use('/api/leads', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/leads'));
 app.use('/api/peer-support', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-support'));
 app.use('/api/peer/flags', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-flags'));
 app.use('/api/peer-board', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-board'));
