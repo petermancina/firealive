@@ -26,6 +26,7 @@
     },
     "files": [
       "main.js",
+      "signal-e2ee.js",
       "preload.js",
       "index.html",
       "firealive-mc.jsx",
