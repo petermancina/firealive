@@ -185,8 +185,8 @@ ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {
   return { plaintext: plaintext.toString('utf8') };
 });
 
-ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId } = {}) =>
-  ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId) }));
+ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
+  ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
