@@ -502,18 +502,77 @@ CREATE TABLE IF NOT EXISTS analyst_consent_log (
 
 -- ── Peer Messaging (E2EE — server stores only ciphertext) ────────────────
 
+-- Phase U3: ordered, session-scoped Signal-protocol ciphertext relay.
+-- The server stores opaque libsignal messages plus routing/ordering metadata
+-- only — it holds no keys and cannot read content. Identities are known to the
+-- server for delivery (the same pairing it already tracks in peer_sessions);
+-- analyst-to-analyst pseudonymity is enforced at the application layer, not by
+-- hiding routing from the relay. The Double Ratchet is order-sensitive, so rows
+-- are sequenced per session by the counter column.
 CREATE TABLE IF NOT EXISTS peer_messages (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  -- Both sender and recipient are stored as encrypted blobs
-  -- The server facilitates delivery but cannot read identities or content
-  sender_encrypted BLOB NOT NULL,
-  recipient_encrypted BLOB NOT NULL,
-  ciphertext BLOB NOT NULL,
-  nonce BLOB NOT NULL,
-  ephemeral_pubkey BLOB,  -- X25519 ephemeral key for forward secrecy
+  session_id TEXT NOT NULL,
+  sender_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recipient_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  message_type INTEGER NOT NULL,  -- libsignal CiphertextMessageType (PreKey=3, Whisper=2)
+  ciphertext BLOB NOT NULL,       -- opaque serialized libsignal message
+  counter INTEGER NOT NULL,       -- per-session ordering
   created_at TEXT DEFAULT (datetime('now')),
+  delivered_at TEXT,
   read_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_peer_messages_session ON peer_messages (session_id, counter);
+CREATE INDEX IF NOT EXISTS idx_peer_messages_recipient ON peer_messages (recipient_user_id);
+CREATE INDEX IF NOT EXISTS idx_peer_messages_created ON peer_messages (created_at);
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Phase U3: Signal-protocol (X3DH/PQXDH) public pre-key store.
+-- Public key material ONLY. Every private key and all Double-Ratchet session
+-- state lives client-side (Electron main, sealed with the OS keychain). Rows
+-- are namespaced by (user_id, domain) with domain IN ('peer','lead') so the two
+-- chat key domains never share key material.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS e2ee_identity_keys (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL CHECK (domain IN ('peer', 'lead')),
+  identity_pubkey BLOB NOT NULL,
+  registration_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, domain)
+);
+
+-- One current EC signed pre-key and one current Kyber (PQXDH) pre-key per
+-- (user_id, domain), distinguished by the kind column. Both carry an
+-- identity-key signature over the public key.
+CREATE TABLE IF NOT EXISTS e2ee_signed_prekeys (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL CHECK (domain IN ('peer', 'lead')),
+  kind TEXT NOT NULL CHECK (kind IN ('signed', 'kyber')),
+  key_id INTEGER NOT NULL,
+  pubkey BLOB NOT NULL,
+  signature BLOB NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, domain, kind)
+);
+
+-- Replenishable batch of one-time EC pre-keys; a bundle fetch consumes one
+-- (sets consumed_at). Anonymity-preserving fetch resolves the peer via the
+-- session record (see peers.js) and returns key material only.
+CREATE TABLE IF NOT EXISTS e2ee_one_time_prekeys (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  domain TEXT NOT NULL CHECK (domain IN ('peer', 'lead')),
+  key_id INTEGER NOT NULL,
+  pubkey BLOB NOT NULL,
+  consumed_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, domain, key_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_e2ee_otp_available
+  ON e2ee_one_time_prekeys (user_id, domain, consumed_at);
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- SHARED: Configuration, audit, integrations

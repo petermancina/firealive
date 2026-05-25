@@ -1,6 +1,7 @@
 // FireAlive Analyst Client — Electron Main Process
-const { app, BrowserWindow, ipcMain, session, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, session, Notification, safeStorage } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 // Security: disable navigation to external URLs
 app.on('web-contents-created', (event, contents) => {
@@ -84,6 +85,111 @@ ipcMain.on('notify:desktop', (event, payload) => {
     // notify() time on the server).
   }
 });
+
+// ---------------------------------------------------------------------------
+// Phase U3: Signal-protocol E2EE custody (main process).
+//
+// All Signal-protocol cryptography runs here, in the main process. Identity
+// private keys and Double-Ratchet session state never cross the IPC bridge:
+// the renderer only ever sends/receives public pre-key bundles, opaque
+// ciphertext envelopes, decrypted plaintext it composed itself, and safety
+// numbers. Secrets are sealed at rest with the OS keychain (safeStorage).
+//
+// The shared wrapper (packages/shared/signal-e2ee.js) is bundled into this app
+// by the CI copy step (build.yml); it lives alongside main.js in a packaged
+// build and under ../shared when run from source — try both.
+let createSignalE2EE;
+try {
+  ({ createSignalE2EE } = require('./signal-e2ee'));
+} catch {
+  ({ createSignalE2EE } = require('../shared/signal-e2ee'));
+}
+
+// libsignal is a native ESM module; load it dynamically and normalize the
+// shape across the ESM-namespace and CJS-default interop cases.
+async function loadLibsignal() {
+  const mod = await import('@signalapp/libsignal-client');
+  return mod && mod.IdentityKeyPair ? mod : (mod && mod.default ? mod.default : mod);
+}
+
+// A small key/value store whose entire contents are sealed at rest with the OS
+// keychain. The wrapper hands us libsignal-serialized bytes as base64 strings;
+// we keep them in memory and persist the whole map as one safeStorage blob.
+function createSealedStore(filePath) {
+  let map = {};
+  try {
+    if (fs.existsSync(filePath)) {
+      const sealed = fs.readFileSync(filePath);
+      map = JSON.parse(safeStorage.decryptString(sealed)) || {};
+    }
+  } catch {
+    map = {};
+  }
+  function persist() {
+    const blob = safeStorage.encryptString(JSON.stringify(map));
+    fs.writeFileSync(filePath, blob, { mode: 0o600 });
+  }
+  return {
+    async get(key) {
+      return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+    },
+    async set(key, value) { map[key] = value; persist(); },
+    async delete(key) { delete map[key]; persist(); },
+    async list(prefix) { return Object.keys(map).filter((k) => k.startsWith(prefix)); },
+  };
+}
+
+// Per-user E2EE state: one wrapper per cryptographic domain (peer vs lead),
+// sharing one sealed store (the wrapper namespaces its keys by domain).
+let e2ee = null;
+
+ipcMain.handle('e2ee:init', async (_event, userId) => {
+  if (!userId) throw new Error('e2ee:init requires a userId');
+  const uid = String(userId);
+  if (e2ee && e2ee.userId === uid) return { ok: true };
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('OS secure storage is unavailable; refusing to store E2EE keys unsealed');
+  }
+  const libsignal = await loadLibsignal();
+  const backend = createSealedStore(path.join(app.getPath('userData'), 'e2ee-store.bin'));
+  const peer = createSignalE2EE({ libsignal, backend, domain: 'peer', selfUserId: uid });
+  const lead = createSignalE2EE({ libsignal, backend, domain: 'lead', selfUserId: uid });
+  await peer.init();
+  await lead.init();
+  e2ee = { userId: uid, peer, lead };
+  return { ok: true };
+});
+
+function domainHandle(domain) {
+  if (!e2ee) throw new Error('e2ee not initialized; call e2ee:init first');
+  if (domain !== 'peer' && domain !== 'lead') throw new Error('invalid e2ee domain');
+  return e2ee[domain];
+}
+
+ipcMain.handle('e2ee:publishBundle', async (_e, { domain, oneTimeCount } = {}) =>
+  domainHandle(domain).buildPublishableBundle({ oneTimeCount }));
+
+ipcMain.handle('e2ee:replenishPrekeys', async (_e, { domain, count } = {}) =>
+  domainHandle(domain).replenishOneTimePreKeys(count));
+
+ipcMain.handle('e2ee:processBundle', async (_e, { domain, remoteUserId, bundle } = {}) => {
+  await domainHandle(domain).processPeerBundle(remoteUserId, bundle);
+  return { ok: true };
+});
+
+ipcMain.handle('e2ee:hasSession', async (_e, { domain, remoteUserId } = {}) =>
+  ({ hasSession: await domainHandle(domain).hasSession(remoteUserId) }));
+
+ipcMain.handle('e2ee:encrypt', async (_e, { domain, remoteUserId, plaintext } = {}) =>
+  domainHandle(domain).encrypt(remoteUserId, plaintext));
+
+ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {}) => {
+  const plaintext = await domainHandle(domain).decrypt(remoteUserId, envelope);
+  return { plaintext: plaintext.toString('utf8') };
+});
+
+ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
+  ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

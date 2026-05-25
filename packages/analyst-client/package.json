@@ -12,6 +12,9 @@
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --mac --win --linux"
   },
+  "dependencies": {
+    "@signalapp/libsignal-client": "^0.94.0"
+  },
   "devDependencies": {
     "electron": "^41.3.0",
     "electron-builder": "^24.0.0"
@@ -24,6 +27,7 @@
     },
     "files": [
       "main.js",
+      "signal-e2ee.js",
       "preload.js",
       "index.html",
       "analyst-client.jsx",

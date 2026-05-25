@@ -55,6 +55,14 @@ const api = {
   setToken(t) { this._token = t; },
 };
 
+// Per-session monotonic counter for relay ordering of outgoing E2EE messages.
+const peerSendCounters = new Map();
+function nextPeerCounter(sessionId) {
+  const c = peerSendCounters.get(sessionId) || 0;
+  peerSendCounters.set(sessionId, c + 1);
+  return c;
+}
+
 const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -894,7 +902,7 @@ export default function AnalystClientApp() {
     ...BURNOUT_PRIMER,
     {title:"Welcome to FireAlive Analyst Client",body:"This app is your personal wellbeing companion. It helps you track your own burnout signals, connect with peers, develop skills, and get support after intense incidents — all while keeping your identity protected behind a pseudonym."},
     {title:"What FireAlive Does NOT Do",body:"FireAlive does NOT surveil you. Your burnout data is stored under a pseudonym (like 'Analyst-Falcon'). Your real name is never in the database. Management sees only aggregate team health — never your individual indicators. If the system is breached, your identity is protected because the pseudonym mapping is stored offline by your team lead, not in the app."},
-    {title:"Peer Skill-Share",body:"Connect anonymously with peers for technical advice, problem-solving, and burnout prevention. All chat is end-to-end encrypted using NaCl box encryption. Management cannot read your messages. You control when to chat, who to exclude, and whether to reveal your identity. After a session, messages are retained for 5 minutes for abuse review, then permanently deleted."},
+    {title:"Peer Skill-Share",body:"Connect anonymously with peers for technical advice, problem-solving, and burnout prevention. All chat is end-to-end encrypted using the Signal protocol (X3DH key agreement and the Double Ratchet). Management cannot read your messages. You control when to chat, who to exclude, and whether to reveal your identity. After a session, messages are retained for 5 minutes for abuse review, then permanently deleted."},
     {title:"Training, IR Simulator & Certificates",body:"Recommended training modules are tailored to your tier level. The IR Simulator lets you practice OODA-loop incident response safely. Your upskilling hour (if enabled by your lead) is paid work time dedicated to professional development — tickets are paused. Upload certifications (CompTIA, ISACA, GIAC, etc.) and your lead can verify them."},
     {title:"Self-Scan, Audit & Wellness",body:"You can run a 10-point compromise check on your own client anytime — results go to you AND your management console automatically. Your audit log is always available for download. Post-incident wellness tools include box breathing, sleep hygiene guidance, emotional processing frameworks, and CISM retrospective access."},
     {title:"Your Signals & Privacy",body:"The Signals tab shows how YOUR work patterns compare to YOUR OWN baseline — not other analysts. You can request reduced tickets, a 1-on-1 with your lead, or delegate patterns to automation. Everything is anonymous by default. You're ready to start."},
@@ -1224,11 +1232,177 @@ export default function AnalystClientApp() {
   const [peerBurnout, setPeerBurnout] = useState(false);
   const [peerTimeSlot, setPeerTimeSlot] = useState("now");
   const [peerPickTime, setPeerPickTime] = useState("");
-  const [peerQueue, setPeerQueue] = useState([
-    {id:1,topic:"Need help building Sigma rules for DNS tunneling detection",time:"now",burnout:false,ts:"2 min ago"},
-    {id:2,topic:"Threat intel feed dedup — how do you handle overlapping IOCs from multiple sources?",time:"after_shift",burnout:false,ts:"18 min ago"},
-    {id:3,topic:"Alert fatigue from noisy WAF rules — looking for tuning advice",time:"tomorrow",burnout:true,ts:"1 hr ago"},
-  ]);
+  const [peerQueue, setPeerQueue] = useState([]);
+  // Phase U3: load the live peer support queue when the Peers tab is open.
+  // The server response is anonymous (no requester identity); map it to the
+  // queue item shape the list renders.
+  useEffect(() => {
+    if (tab !== "peers") return;
+    let cancelled = false;
+    api.get('/api/peers/requests').then((data) => {
+      if (cancelled) return;
+      if (data && Array.isArray(data.requests)) {
+        setPeerQueue(data.requests.map((r) => ({
+          id: r.id,
+          topic: r.topic,
+          willingToMeet: !!r.willingToMeet,
+          ts: relTime(r.createdAt),
+        })));
+      }
+    });
+    return () => { cancelled = true; };
+  }, [tab]);
+  // Phase U3: accept a peer request -> create the real session, then run X3DH
+  // (fetch the counterpart's bundle and establish the libsignal session, keyed by
+  // sessionId so the peer's identity is never exposed) before any messages flow.
+  const acceptPeerRequest = async (q) => {
+    const r = await api.post("/api/peers/requests/" + q.id + "/accept", {});
+    if (!r || r.error || !r.sessionId) {
+      logC("peer_accept_failed", "Could not accept request: " + ((r && r.error) || "unknown"));
+      return;
+    }
+    const sessionId = r.sessionId;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (bridge && bridge.invoke) {
+      try {
+        const br = await api.get("/api/peers/sessions/" + sessionId + "/peer-bundle");
+        if (br && br.bundle && !br.error) {
+          await bridge.invoke("e2ee:processBundle", { domain: "peer", remoteUserId: sessionId, bundle: br.bundle });
+        } else {
+          logC("peer_e2ee_pending", "Peer bundle unavailable; channel encrypts once the peer publishes keys");
+        }
+      } catch (e) {
+        logC("peer_e2ee_failed", "E2EE setup error: " + (e && e.message ? e.message : "unknown"));
+      }
+    }
+    setPeerSession({ id: sessionId, topic: q.topic, status: "active", myConsent: false, peerConsent: false });
+    setPeerSafetyNum(null);
+    setPeerQueue(prev => prev.filter(x => x.id !== q.id));
+    logC("peer_accepted", "Accepted skill-share: " + q.topic);
+  };
+  // Phase U3: ensure a libsignal session exists for this peer session id; if not
+  // (e.g. the requester, who did not accept), establish it lazily via X3DH.
+  const ensurePeerSession = async (sessionId) => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) return;
+    const h = await bridge.invoke("e2ee:hasSession", { domain: "peer", remoteUserId: sessionId });
+    if (h && h.hasSession) return;
+    const br = await api.get("/api/peers/sessions/" + sessionId + "/peer-bundle");
+    if (br && br.bundle && !br.error) {
+      await bridge.invoke("e2ee:processBundle", { domain: "peer", remoteUserId: sessionId, bundle: br.bundle });
+    }
+  };
+  // Phase U3: ratchet-encrypt the message (keyed by sessionId) and relay it. Own
+  // lines render locally because the relay returns only incoming messages (the
+  // sender cannot decrypt its own ratchet output).
+  const sendPeerMessage = async () => {
+    const text = newPM.trim();
+    if (!text || !peerSession || !peerSession.id) return;
+    const sessionId = peerSession.id;
+    const localMsg = { id: Date.now(), from: "You (anonymous)", ts: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), text, enc: true };
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    setNewPM("");
+    if (!bridge || !bridge.invoke) { setPM(prev => [...prev, localMsg]); return; }
+    try {
+      await ensurePeerSession(sessionId);
+      const env = await bridge.invoke("e2ee:encrypt", { domain: "peer", remoteUserId: sessionId, plaintext: text });
+      if (!env || env.error || typeof env.type !== "number") { logC("peer_send_failed", "Encryption failed"); return; }
+      const counter = nextPeerCounter(sessionId);
+      const r = await api.post("/api/messages", { sessionId, messageType: env.type, ciphertext: env.body, counter });
+      if (r && r.error) { logC("peer_send_failed", "Relay rejected: " + r.error); return; }
+      setPM(prev => [...prev, localMsg]);
+    } catch (e) {
+      logC("peer_send_failed", "Send error: " + (e && e.message ? e.message : "unknown"));
+    }
+  };
+  // Phase U3: refresh consent state + revealed identity from the server. The
+  // server resolves which name is the peer's (role-aware) and returns it only on
+  // mutual consent. Returns the same state object when nothing changed to avoid
+  // needless re-renders during polling.
+  const refreshPeerSessionStatus = async (sessionId) => {
+    const r = await api.get("/api/peers/sessions/" + sessionId);
+    if (!r || r.error) return;
+    setPeerSession(p => {
+      if (!p || p.id !== sessionId) return p;
+      const status = r.status || p.status;
+      const peerName = r.peerName || p.peerName;
+      if (p.myConsent === !!r.myConsent && p.peerConsent === !!r.peerConsent && p.status === status && p.peerName === peerName) return p;
+      return { ...p, myConsent: !!r.myConsent, peerConsent: !!r.peerConsent, status, peerName };
+    });
+  };
+  // Phase U3: record this party's identity-reveal consent, then refresh state.
+  const consentReveal = async () => {
+    if (!peerSession || !peerSession.id) return;
+    const sessionId = peerSession.id;
+    const r = await api.post("/api/peers/sessions/" + sessionId + "/consent", {});
+    if (!r || r.error) { logC("peer_consent_failed", "Consent failed: " + ((r && r.error) || "unknown")); return; }
+    logC(r.mutualConsent ? "peer_consent_mutual" : "peer_consent", r.mutualConsent ? "Identities revealed" : "Identity consent given; waiting for peer");
+    await refreshPeerSessionStatus(sessionId);
+  };
+  // Phase U3: close the session server-side (starts the 5-minute retention clock),
+  // then enter the post-session rating/flag window locally.
+  const closePeerSession = () => {
+    if (peerSession && peerSession.id) { api.post("/api/peers/sessions/" + peerSession.id + "/close", {}); }
+    setPostSession({ messages: [...peerMsgs], topic: peerSession.topic, expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    setPeerSession(null); setPeerDiscAccepted(false); setPM([]); setPostRating(0); setPostFlagging(false); setPostFlagText("");
+    logC("peer_session_ended", "Skill-share ended — 5-min retention window for rating/flagging");
+  };
+  // Phase U3: out-of-band safety-number verification. Pass the shared sessionId as
+  // BOTH fingerprint ids so the number is symmetric and matches on both clients
+  // without either learning the other's real identity. Grouped into 5s for reading.
+  const [peerSafetyNum, setPeerSafetyNum] = useState(null);
+  const showPeerSafetyNumber = async () => {
+    if (!peerSession || !peerSession.id) return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setPeerSafetyNum("unavailable outside the desktop app"); return; }
+    try {
+      const sid = peerSession.id;
+      const r = await bridge.invoke("e2ee:safetyNumber", { domain: "peer", remoteUserId: sid, localId: sid, remoteId: sid });
+      const sn = (r && r.safetyNumber && !r.error) ? String(r.safetyNumber) : null;
+      if (!sn) { setPeerSafetyNum("not available until the channel is established"); return; }
+      let grouped = "";
+      for (let i = 0; i < sn.length; i += 5) { grouped += (i ? " " : "") + sn.slice(i, i + 5); }
+      setPeerSafetyNum(grouped);
+    } catch (e) {
+      setPeerSafetyNum("not available until the channel is established");
+    }
+  };
+  // Phase U3: poll the relay for incoming peer ciphertext while a session is
+  // active, decrypt each in counter order via the main process, and append to the
+  // thread. Only incoming messages are returned (own ratchet output is omitted).
+  // Decrypt failures stop the batch and retry from the last good cursor next tick;
+  // appends are deduped by message id against effect re-runs / overlapping polls.
+  const peerPollCursor = useRef(null);
+  useEffect(() => {
+    const sessionId = (peerSession && peerSession.status === "active") ? peerSession.id : null;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!sessionId || !bridge || !bridge.invoke) return;
+    peerPollCursor.current = null;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const since = peerPollCursor.current;
+        const q = "/api/messages?sessionId=" + encodeURIComponent(sessionId) + (since ? "&since=" + encodeURIComponent(since) : "");
+        const data = await api.get(q);
+        if (cancelled || !data || !Array.isArray(data.messages)) return;
+        for (const m of data.messages) {
+          let res;
+          try {
+            res = await bridge.invoke("e2ee:decrypt", { domain: "peer", remoteUserId: sessionId, envelope: { type: m.messageType, body: m.ciphertext } });
+          } catch (e) { logC("peer_decrypt_failed", "Could not decrypt an incoming message"); break; }
+          if (cancelled) return;
+          if (!res || res.error || typeof res.plaintext !== "string") { logC("peer_decrypt_failed", "Could not decrypt an incoming message"); break; }
+          const ts = new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          setPM(prev => prev.some(x => x.id === m.id) ? prev : [...prev, { id: m.id, from: "Peer", ts, text: res.plaintext, enc: true }]);
+          peerPollCursor.current = m.createdAt;
+        }
+        await refreshPeerSessionStatus(sessionId);
+      } catch (e) { /* transient; next tick retries */ }
+    };
+    poll();
+    const iv = setInterval(poll, 3000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [peerSession ? peerSession.id : null, peerSession ? peerSession.status : null]);
   const [showLeadMsg, setShowLeadMsg] = useState(false);
   const [leadMsgs, setLM] = useState([]);
   const [newLM, setNewLM] = useState("");
@@ -1379,6 +1553,42 @@ export default function AnalystClientApp() {
 
   // ── LOGIN SCREEN (R3g: real /api/auth/login + three-path MFA flow) ──
   if (stage === "login") {
+    // Phase U3: bring up Signal-protocol E2EE for this session. Runs init in the
+    // Electron main process, then seeds the peer-domain pre-key bundle exactly
+    // once -- gated on the server's available one-time-prekey count so re-logins
+    // do not regenerate local keys (which would desync from the published public
+    // keys). No-op in a plain browser (no Electron bridge); failures are logged,
+    // never fatal to login.
+    const bootstrapE2EE = async (selfId) => {
+      const bridge = (typeof window !== "undefined") ? window.firealive : null;
+      if (!bridge || !bridge.invoke || !selfId) return;
+      try {
+        await bridge.invoke("e2ee:init", selfId);
+        let needsPublish = true;
+        const c = await api.get("/api/e2ee/count?domain=peer");
+        if (c && typeof c.available === "number" && c.available > 0) needsPublish = false;
+        if (needsPublish) {
+          const bundle = await bridge.invoke("e2ee:publishBundle", { domain: "peer", oneTimeCount: 50 });
+          if (bundle && !bundle.error) {
+            const r = await api.post("/api/e2ee/publish", bundle);
+            if (r && r.error) { logC("E2EE_PUBLISH_FAILED", "Bundle publish rejected: " + r.error); }
+            else { logC("E2EE_PEER_BUNDLE_PUBLISHED", "Published peer-domain pre-key bundle"); }
+          }
+        } else if (c && typeof c.available === "number" && c.available < 10) {
+          // Pool is running low (consumed by incoming sessions) — top up with fresh-id
+          // one-time pre-keys so new sessions keep full initial forward secrecy.
+          const rep = await bridge.invoke("e2ee:replenishPrekeys", { domain: "peer", count: 50 });
+          if (rep && !rep.error && Array.isArray(rep.oneTimePreKeys) && rep.oneTimePreKeys.length) {
+            const r = await api.post("/api/e2ee/prekeys", rep);
+            if (r && r.error) { logC("E2EE_PREKEYS_FAILED", "Pre-key top-up rejected: " + r.error); }
+            else { logC("E2EE_PREKEYS_REPLENISHED", "Replenished peer one-time pre-keys"); }
+          }
+        }
+      } catch (e) {
+        logC("E2EE_INIT_FAILED", "E2EE setup error: " + (e && e.message ? e.message : "unknown"));
+      }
+    };
+
     // Helper: persist the JWT, set the api token, store the refresh token,
     // and advance the AC into welcome (first launch) or app (returning user).
     const finalizeLogin = (loginResponse) => {
@@ -1389,6 +1599,7 @@ export default function AnalystClientApp() {
         try { localStorage.setItem('fa_ac_refresh_token', loginResponse.refreshToken); } catch (_e) {}
       }
       logC("LOGIN_SUCCESS", "Authenticated"+(useRecoveryLogin?" via recovery code":" via TOTP"));
+      bootstrapE2EE(username);
       setStage(firstLaunch ? "welcome" : "app");
     };
 
@@ -1920,16 +2131,15 @@ export default function AnalystClientApp() {
             <L>Available Skill-Share Requests</L>
             {peerQueue.length===0?<Card style={{padding:"12px 14px"}}><M style={{color:C.td}}>No open requests right now. Check back later or submit your own above.</M></Card>:
             peerQueue.map(q=>(
-              <Card key={q.id} style={{marginBottom:8,padding:"12px 14px",borderLeft:`3px solid ${q.burnout?C.w:C.i}`}}>
+              <Card key={q.id} style={{marginBottom:8,padding:"12px 14px",borderLeft:`3px solid ${C.i}`}}>
                 <div style={{fontSize:12,color:"#E8EDF5",marginBottom:6,lineHeight:1.5}}>{q.topic}</div>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                   <div style={{display:"flex",gap:6}}>
-                    <Badge color={q.time==="now"?C.a:q.time==="after_shift"?C.i:C.p}>{q.time==="now"?"Now":q.time==="after_shift"?"After shift":"Tomorrow"}</Badge>
-                    {q.burnout&&<Badge color={C.w}>+ Burnout</Badge>}
+                    {q.willingToMeet&&<Badge color={C.i}>Open to meeting</Badge>}
                     <M style={{color:C.td}}>{q.ts}</M>
                   </div>
                   <div style={{display:"flex",gap:6}}>
-                    <Btn small primary onClick={()=>{setPeerSession({id:q.id,topic:q.topic,status:"active",myConsent:false,peerConsent:false});setPeerQueue(prev=>prev.filter(x=>x.id!==q.id));logC("peer_accepted","Accepted skill-share: "+q.topic);}}>Accept</Btn>
+                    <Btn small primary onClick={()=>{acceptPeerRequest(q);}}>Accept</Btn>
                     <Btn small onClick={()=>{setPeerQueue(prev=>prev.filter(x=>x.id!==q.id));logC("peer_passed","Passed on request");}}>Pass</Btn>
                   </div>
                 </div>
@@ -1971,14 +2181,16 @@ export default function AnalystClientApp() {
           {peerSession&&(<div>
             <Card style={{marginBottom:8,padding:"10px 14px",background:"rgba(110,231,183,0.03)",borderColor:C.a+"30"}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><M style={{color:C.a,fontWeight:500}}>Active Skill-Share</M> <M style={{color:C.td}}>· E2EE · {peerSession.myConsent&&peerSession.peerConsent?"Identities revealed":"Anonymous"}</M></div>
+                <div><M style={{color:C.a,fontWeight:500}}>Active Skill-Share</M> <M style={{color:C.td}}>· E2EE · {peerSession.myConsent&&peerSession.peerConsent?("Identities revealed"+(peerSession.peerName?" · "+peerSession.peerName:"")):"Anonymous"}</M></div>
                 <div style={{display:"flex",gap:6}}>
-                  {!peerSession.myConsent&&<Btn small onClick={()=>{setPeerSession(p=>({...p,myConsent:true}));logC("peer_consent","Identity consent given");}}>Reveal My Identity</Btn>}
+                  {!peerSession.myConsent&&<Btn small onClick={()=>{consentReveal();}}>Reveal My Identity</Btn>}
+                  <Btn small onClick={()=>{showPeerSafetyNumber();}}>Safety #</Btn>
                   <Btn small danger onClick={()=>{logC("peer_flag","Flagged abusive language");}}>Flag Abuse</Btn>
                 </div>
               </div>
               {peerSession.myConsent&&!peerSession.peerConsent&&<M style={{color:C.w,display:"block",marginTop:6}}>Your consent recorded. Waiting for peer to also consent.</M>}
               <M style={{color:C.td,display:"block",marginTop:4}}>Topic: {peerSession.topic}</M>
+              {peerSafetyNum&&<div style={{marginTop:6,padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderRadius:6}}><M style={{color:C.td,display:"block",marginBottom:2}}>Safety number (read aloud to compare; they must match):</M><M style={{color:C.a,fontFamily:"'Courier New',Courier,monospace",wordBreak:"break-all"}}>{peerSafetyNum}</M></div>}
             </Card>
             <Card style={{marginBottom:8,maxHeight:280,overflow:"auto",background:"rgba(0,0,0,0.4)",borderColor:C.b,fontFamily:"'Courier New',Courier,monospace"}}>
               {peerMsgs.length===0&&<M style={{color:C.td,padding:14,display:"block"}}>Session started. Type below to begin skill-sharing.</M>}
@@ -1988,9 +2200,9 @@ export default function AnalystClientApp() {
                 <div style={{fontSize:12,lineHeight:1.5,fontFamily:"inherit",color:C.t}}>{m.text}</div>
               </div>
             ))}</Card>
-            <div style={{display:"flex",gap:8,marginBottom:8}}><input value={newPM} onChange={e=>setNewPM(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newPM.trim()){setPM(prev=>[...prev,{id:Date.now(),from:"You (anonymous)",ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),text:newPM,enc:true}]);setNewPM("");}}} placeholder="E2EE · anonymous · max 4KB..." maxLength={4096} style={{flex:1,padding:10,background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"'Courier New',Courier,monospace"}}/><Btn primary onClick={()=>{if(newPM.trim()){setPM(prev=>[...prev,{id:Date.now(),from:"You (anonymous)",ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),text:newPM,enc:true}]);setNewPM("");}}}>Send</Btn></div>
+            <div style={{display:"flex",gap:8,marginBottom:8}}><input value={newPM} onChange={e=>setNewPM(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){sendPeerMessage();}}} placeholder="E2EE · anonymous · max 4KB..." maxLength={4096} style={{flex:1,padding:10,background:"rgba(0,0,0,0.3)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"'Courier New',Courier,monospace"}}/><Btn primary onClick={()=>{sendPeerMessage();}}>Send</Btn></div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              <Btn danger onClick={()=>{setPostSession({messages:[...peerMsgs],topic:peerSession.topic,expiresAt:new Date(Date.now()+5*60*1000).toISOString()});setPeerSession(null);setPeerDiscAccepted(false);setPM([]);setPostRating(0);setPostFlagging(false);setPostFlagText("");logC("peer_session_ended","Skill-share ended — 5-min retention window for rating/flagging");}}>End Chat</Btn>
+              <Btn danger onClick={()=>{closePeerSession();}}>End Chat</Btn>
               <Btn small onClick={()=>{setPeerQueue(prev=>[{id:Date.now(),topic:peerSession.topic,time:"now",burnout:false,ts:"just now"},...prev]);setPeerSession(null);setPM([]);logC("peer_requeue","Re-queued skill-share topic");}}>Re-queue Topic</Btn>
             </div>
             <M style={{color:C.td,display:"block",marginTop:8}}>Auto-closes after {peerTimeout} min inactivity. When chat ends, messages are retained for 5 minutes for rating and abuse review, then permanently deleted.</M>

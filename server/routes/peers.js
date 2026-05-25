@@ -32,6 +32,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
+const { consumeBundleForUser } = require('./e2ee-keys');
 
 // Anti-C2: max messages per user per hour
 const MAX_MESSAGES_PER_HOUR = 50;
@@ -355,6 +356,38 @@ router.get('/sessions/:id', (req, res) => {
   } catch (err) {
     logger.error('Get session error', { error: err.message });
     res.status(500).json({ error: 'Failed to get session' });
+  }
+});
+
+// ── Peer Pre-Key Bundle (anonymity-preserving) ───────────────────────────────
+// Returns the COUNTERPART's peer-domain bundle for X3DH/PQXDH session setup,
+// resolved from the session so the requester never learns the peer's identity.
+// Consumes one of the counterpart's one-time pre-keys via the shared helper from
+// e2ee-keys.js. The client addresses the libsignal session by sessionId, so no
+// user id is returned here.
+router.get('/sessions/:id/peer-bundle', (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT value FROM team_config WHERE key = ?').get(`peer_session_${req.params.id}`);
+    if (!row) { db.close(); return res.status(404).json({ error: 'Session not found' }); }
+
+    const session = JSON.parse(row.value);
+    if (session.status !== 'active') { db.close(); return res.status(400).json({ error: 'Session is not active' }); }
+
+    let counterpartId;
+    if (req.user.id === session.requesterId) counterpartId = session.accepterId;
+    else if (req.user.id === session.accepterId) counterpartId = session.requesterId;
+    else { db.close(); return res.status(403).json({ error: 'Not a participant in this session' }); }
+
+    const bundle = consumeBundleForUser(db, counterpartId, 'peer');
+    db.close();
+
+    if (!bundle) return res.status(404).json({ error: 'Peer has not published a pre-key bundle' });
+    auditLog(req.user.id, 'E2EE_PEER_BUNDLE_FETCHED', `session ${req.params.id}`, req.ip);
+    res.json({ bundle });
+  } catch (err) {
+    logger.error('Peer bundle fetch error', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch peer bundle' });
   }
 });
 
