@@ -1112,7 +1112,7 @@ Second — and equally important — true positives that are nonetheless low-lev
 6. From now on, that pattern is auto-handled by the chosen system; analyst stops seeing it
 
 ### Peers
-**What it's for:** Peer skill-share — E2EE chat between analysts to share knowledge, ask questions, learn techniques. NOT therapy or emotional support — that has separate channels. This is technical knowledge sharing. Anti-abuse flagging is built in. 4KB per message, auto-closes after inactivity, no persistence (chat ephemeral).
+**What it's for:** Peer skill-share — end-to-end encrypted chat between analysts (Signal protocol: X3DH/PQXDH key agreement and the Double Ratchet, with out-of-band safety-number verification) to share knowledge, ask questions, learn techniques. NOT therapy or emotional support — that has separate channels. This is technical knowledge sharing. Anti-abuse flagging is built in. 4KB per message, auto-closes after inactivity; after a session, ciphertext is retained for 5 minutes for abuse review, then permanently deleted.
 
 **Workflow:**
 1. Analyst stuck on a technique — opens Peers
