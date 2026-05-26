@@ -1,0 +1,74 @@
+{
+  "name": "firealive-abuse-review-console",
+  "version": "1.0.44",
+  "description": "FireAlive \u2014 Abuse Review Console",
+  "main": "main.js",
+  "author": "Peter Mancina",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "@babel/standalone": "7.23.9",
+    "electron": "^41.3.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.firealive.abuse-review-console",
+    "productName": "FireAlive Abuse Review Console",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "abuse-review-console.jsx",
+      "abuse-seal.js",
+      "react.production.min.js",
+      "react-dom.production.min.js",
+      "babel.min.js"
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "icon": "assets/icon.png"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "icon": "assets/icon.png"
+  }
+}
