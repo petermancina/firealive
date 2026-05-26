@@ -18,10 +18,11 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js && cp packages/shared/abuse-seal.js packages/abuse-review-console/abuse-seal.js
       - run: cd packages/analyst-client && npm install && npx electron-builder --mac --publish never || true
       - run: cd packages/global-dashboard && npm install && npx electron-builder --mac --publish never || true
       - run: cd frontend && npm install && npx electron-builder --mac --publish never || true
+      - run: cd packages/abuse-review-console && npm install && cp node_modules/react/umd/react.production.min.js . && cp node_modules/react-dom/umd/react-dom.production.min.js . && cp node_modules/@babel/standalone/babel.min.js . && npx electron-builder --mac --publish never || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -43,13 +44,15 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js && cp packages/shared/abuse-seal.js packages/abuse-review-console/abuse-seal.js
         shell: bash
       - run: cd packages/analyst-client && npm install && npx electron-builder --win --publish never || true
         shell: bash
       - run: cd packages/global-dashboard && npm install && npx electron-builder --win --publish never || true
         shell: bash
       - run: cd frontend && npm install && npx electron-builder --win --publish never || true
+        shell: bash
+      - run: cd packages/abuse-review-console && npm install && cp node_modules/react/umd/react.production.min.js . && cp node_modules/react-dom/umd/react-dom.production.min.js . && cp node_modules/@babel/standalone/babel.min.js . && npx electron-builder --win --publish never || true
         shell: bash
       - uses: actions/upload-artifact@v7
         if: always()
@@ -68,10 +71,11 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js && cp packages/shared/abuse-seal.js packages/abuse-review-console/abuse-seal.js
       - run: cd packages/analyst-client && npm install && npx electron-builder --linux --publish never
       - run: cd packages/global-dashboard && npm install && npx electron-builder --linux --publish never
       - run: cd frontend && npm install && npx electron-builder --linux --publish never
+      - run: cd packages/abuse-review-console && npm install && cp node_modules/react/umd/react.production.min.js . && cp node_modules/react-dom/umd/react-dom.production.min.js . && cp node_modules/@babel/standalone/babel.min.js . && npx electron-builder --linux --publish never
       - uses: actions/upload-artifact@v7
         with:
           name: linux-installers
