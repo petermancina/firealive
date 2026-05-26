@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   email TEXT,  -- R3c: SILENT join key for HR scheduling sync ONLY. Populated by SSO claim at login; never typed by leads, never displayed in MC/AC/GD, never written to burnout/metrics/audit tables. See ANONYMITY MODEL note in migration block below.
   password_hash TEXT,  -- NULL when using SSO (SAML/OIDC/LDAP)
-  role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'developer')),
+  role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'developer', 'abuse_reviewer')),
   name TEXT NOT NULL,
   pseudonym TEXT,  -- v0.0.25: burnout data keyed to this, not name
   pseudonym_rotated_at TEXT,  -- R0: timestamp of last pseudonym rotation
@@ -1519,6 +1519,29 @@ CREATE INDEX IF NOT EXISTS idx_abuse_review_keys_active
   ON abuse_review_keys(created_at DESC)
   WHERE active = 1;
 
+-- Abuse reviewer assignments (U3 PR E). Scopes an abuse_reviewer's authority:
+--   scope='all'  -> every case; team_id and flag_id are NULL.
+--   scope='team' -> one team's cases; team_id set (plain identifier -- there is
+--                   no teams table; teams are referenced by id elsewhere).
+--   scope='case' -> one specific flag; flag_id set.
+-- HARD RULE (enforced in the access service in E3, not by the DB): no party to a
+-- case and no team lead may ever be assigned. This table only records the grant;
+-- canReview() re-checks role + not-a-party + not-a-lead + scope on every read.
+CREATE TABLE IF NOT EXISTS abuse_reviewer_assignments (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  reviewer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL CHECK (scope IN ('all', 'team', 'case')),
+  team_id TEXT,
+  flag_id TEXT REFERENCES peer_abuse_flags(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_abuse_reviewer_assignments_reviewer
+  ON abuse_reviewer_assignments(reviewer_user_id);
+CREATE INDEX IF NOT EXISTS idx_abuse_reviewer_assignments_flag
+  ON abuse_reviewer_assignments(flag_id);
+
 -- Peer Message Board (U2). Replaces the prototype team_config key-value board.
 -- author_id is ALWAYS stored (the user UUID) even when the post is shown
 -- anonymously — display_anonymous governs the UI only, never what is retained,
@@ -2839,6 +2862,58 @@ function initDb() {
     }
   } catch (vaultU3MigErr) {
     console.error('peer_abuse_evidence_vault migration (U3) failed (non-fatal):', vaultU3MigErr.message);
+  }
+
+  // ── Migration: users role CHECK widen for abuse_reviewer (U3 PR E) ──
+  // PR E introduces the independent 'abuse_reviewer' role. SQLite cannot ALTER a
+  // CHECK, so the users table must be rebuilt. users is referenced by many
+  // foreign keys and is ~80 columns wide, so instead of hand-replicating its
+  // definition (which would risk drifting from the canonical SCHEMA above), we
+  // DERIVE the new table DDL from the LIVE users CREATE statement and
+  // string-replace only the role CHECK -- guaranteeing the rebuilt table is
+  // byte-identical to the live one except for the one added enum value, with no
+  // column/constraint drift. Foreign keys toggle OFF for the rebuild and back ON
+  // afterward; INSERT...SELECT * is safe because users_new is derived from
+  // users' own columns in the same order; PRAGMA foreign_key_check verifies no
+  // child rows were orphaned before COMMIT. Gated on the stored users SQL not
+  // yet containing 'abuse_reviewer' -- a no-op on fresh installs (whose SCHEMA
+  // already has it) and on already-migrated databases.
+  try {
+    const uRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+    if (uRow && uRow.sql && !uRow.sql.includes('abuse_reviewer')) {
+      const oldCheck = "role IN ('analyst', 'lead', 'admin', 'developer')";
+      const newCheck = "role IN ('analyst', 'lead', 'admin', 'developer', 'abuse_reviewer')";
+      if (!uRow.sql.includes(oldCheck)) {
+        throw new Error('users role CHECK clause not found in live schema; aborting rebuild to avoid corruption');
+      }
+      let newDdl = uRow.sql.match(/CREATE TABLE IF NOT EXISTS users\b/i)
+        ? uRow.sql.replace(/CREATE TABLE IF NOT EXISTS users\b/i, 'CREATE TABLE users_new')
+        : uRow.sql.replace(/CREATE TABLE users\b/i, 'CREATE TABLE users_new');
+      newDdl = newDdl.replace(oldCheck, newCheck);
+      console.log('users migration (U3 PR E): widening role CHECK to include abuse_reviewer');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(newDdl);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+        db.exec('INSERT INTO users_new SELECT * FROM users');
+        db.exec('DROP TABLE users');
+        db.exec('ALTER TABLE users_new RENAME TO users');
+        const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
+        if (fkViolations.length > 0) {
+          throw new Error(`foreign_key_check reported ${fkViolations.length} violation(s) after users rebuild`);
+        }
+        db.exec('COMMIT');
+        console.log(`users migration (U3 PR E): rebuilt, preserved ${copied} user(s)`);
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (userRoleMigErr) {
+    console.error('users migration (U3 PR E) failed (non-fatal):', userRoleMigErr.message);
   }
 
   // ── Migration: ir_policies phantom → canonical (Phase 1.4c precursor) ──

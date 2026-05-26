@@ -23,6 +23,7 @@ const { logger } = require('../services/logger');
 const { encryptTier3, decryptTier3 } = require('../services/encryption');
 const notifications = require('../services/notifications');
 const patternDetector = require('../services/abuse-pattern-detector');
+const { canReview } = require('../services/abuse-reviewer-access');
 
 const MAX_FLAG_CONTENT_LENGTH = 10000; // 10KB — enough for pasted chat excerpts
 const VALID_TIERS = [1, 2, 3];
@@ -64,6 +65,59 @@ function notifyLeadsOfFlag(flagId, tier, source) {
     }
   } catch (err) {
     logger.error('Failed to enumerate notification recipients', { error: err.message });
+  }
+}
+
+// Notify the assigned reviewer(s) of a new lead-chat abuse case. Unlike the
+// peer/board path (which notifies leads), lead-chat is ABC-only -- a lead may be
+// the accused -- so recipients are the independent abuse_reviewer(s) whose
+// assignment covers this flag AND who are not a party to it (canReview). The
+// notification carries metadata only; the sealed content is decrypted solely in
+// the Abuse Review Console. notify() is synchronous, so each recipient is wrapped
+// individually -- one bad recipient must not abort the rest.
+function notifyReviewersOfFlag(flagId, tier) {
+  const eventType = `abuse_review_case_tier${tier}`;
+  const titleByTier = {
+    1: 'Abuse review \u2014 minor conduct case',
+    2: 'Abuse review \u2014 personal attack case',
+    3: 'Abuse review \u2014 URGENT conduct case',
+  };
+  const bodyByTier = {
+    1: 'A tier-1 abuse case was assigned to you. Review it in the Abuse Review Console when you have a moment.',
+    2: 'A tier-2 abuse case was assigned to you. Open the Abuse Review Console to decrypt and review the sealed evidence.',
+    3: 'A tier-3 abuse case (urgent: slurs, threats, harassment) was assigned to you. Review immediately in the Abuse Review Console.',
+  };
+  try {
+    const db = getDb();
+    const flag = db.prepare('SELECT id, flagger_user_id, flagged_user_id FROM peer_abuse_flags WHERE id = ?').get(flagId);
+    if (!flag) { db.close(); return; }
+    const reviewers = db.prepare("SELECT id, role, active FROM users WHERE role = 'abuse_reviewer'").all();
+    const recipients = [];
+    for (const rv of reviewers) {
+      const assignments = db.prepare(
+        'SELECT scope, team_id, flag_id FROM abuse_reviewer_assignments WHERE reviewer_user_id = ?'
+      ).all(rv.id);
+      if (canReview({ reviewer: rv, flag: { ...flag, teamIds: [] }, assignments }).allowed) {
+        recipients.push(rv.id);
+      }
+    }
+    db.close();
+    for (const rid of recipients) {
+      try {
+        notifications.notify({
+          recipientId: rid,
+          eventType,
+          title: titleByTier[tier],
+          body: bodyByTier[tier],
+          linkTab: 'abuse_review',
+          linkParams: JSON.stringify({ flagId, tier }),
+        });
+      } catch (err) {
+        logger.error('Failed to deliver abuse-review flag notification', { error: err.message, recipientId: rid, tier });
+      }
+    }
+  } catch (err) {
+    logger.error('Failed to enumerate abuse-review recipients', { error: err.message });
   }
 }
 
@@ -252,11 +306,15 @@ function submitLeadChatFlag(req, res) {
     return res.status(500).json({ error: 'failed to submit flag' });
   }
 
-  // No notifyLeadsOfFlag (lead-chat abuse is ABC-only -- a lead may be accused).
+  // Lead-chat abuse is ABC-only -- a lead may be the accused, so leads are never
+  // notified here. Instead notify the assigned independent reviewer(s) whose
+  // scope covers this case and who are not a party to it (canReview).
+  notifyReviewersOfFlag(flagId, tier);
+
   // No pattern-detector call here: the detector writes to peer_abuse_patterns,
   // which the MC reads, so feeding lead_chat now would surface it to leads. The
-  // lead-chat pattern feed lands in PR E/F with the reviewer's pattern view and
-  // the MC pattern removal. Audit records metadata only.
+  // lead-chat pattern feed lands at the PR G cutover, together with the MC
+  // pattern removal. Audit records metadata only.
   auditLog(req.user.id, 'PEER_ABUSE_FLAG_SUBMITTED', `lead_chat ${threadId}, tier ${tier}, flag ${flagId}`, req.ip);
 
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
