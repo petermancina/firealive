@@ -1401,7 +1401,7 @@ CREATE TABLE IF NOT EXISTS peer_abuse_flags (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   -- target_type/target_id make a flag polymorphic (U2): a peer session uses
   -- session_id, a board post uses target_id, so session_id is now nullable.
-  target_type TEXT NOT NULL DEFAULT 'peer_session' CHECK (target_type IN ('peer_session', 'board_post')),
+  target_type TEXT NOT NULL DEFAULT 'peer_session' CHECK (target_type IN ('peer_session', 'board_post', 'lead_chat')),
   session_id TEXT,
   target_id TEXT,
   flagger_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1442,7 +1442,7 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_target
 CREATE TABLE IF NOT EXISTS peer_abuse_evidence_vault (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   flag_id TEXT NOT NULL REFERENCES peer_abuse_flags(id) ON DELETE RESTRICT,
-  target_type TEXT NOT NULL CHECK (target_type IN ('peer_session', 'board_post')),
+  target_type TEXT NOT NULL CHECK (target_type IN ('peer_session', 'board_post', 'lead_chat')),
   target_id TEXT,
   sealed_content_encrypted BLOB NOT NULL,
   context_encrypted BLOB,
@@ -1494,6 +1494,30 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_type
 
 CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_unack
   ON peer_abuse_patterns(severity, created_at DESC) WHERE acknowledged_at IS NULL;
+
+-- Abuse-review public-key registry (U3 PR D, Model B). Holds ONLY the public
+-- key of the org's independent abuse-review keypair. Flag content (peer,
+-- board, lead-chat) is sealed to this public key by the flagger's client
+-- (libsodium crypto_box_seal) before it leaves the device, so the server
+-- stores only opaque ciphertext it cannot open; the matching private key lives
+-- solely in the Abuse Review Console, never here. A registered active row is
+-- the gate that enables flagging across the AC/MC: with no active key there is
+-- no one who could decrypt a flag, so flagging stays disabled. Public material
+-- only -- no secret is ever stored in this table. registered_by is the admin
+-- or reviewer who registered the key (SET NULL if that user is later removed).
+CREATE TABLE IF NOT EXISTS abuse_review_keys (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  public_key BLOB NOT NULL,
+  algo TEXT NOT NULL DEFAULT 'crypto_box_seal',
+  registered_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+
+-- The flagging gate reads the most recent active key, so index for that lookup.
+CREATE INDEX IF NOT EXISTS idx_abuse_review_keys_active
+  ON abuse_review_keys(created_at DESC)
+  WHERE active = 1;
 
 -- Peer Message Board (U2). Replaces the prototype team_config key-value board.
 -- author_id is ALWAYS stored (the user UUID) even when the post is shown
@@ -2696,6 +2720,125 @@ function initDb() {
     }
   } catch (flagMigErr) {
     console.error('peer_abuse_flags migration (U2) failed (non-fatal):', flagMigErr.message);
+  }
+
+  // ── Migration: peer_abuse_flags lead_chat target (U3 PR D) ──────────
+  // U3 lets a flag target a lead-chat message in addition to a peer session or
+  // board post. SQLite cannot ALTER a CHECK constraint, so an existing table is
+  // rebuilt to widen target_type's CHECK to include 'lead_chat'. Gated on the
+  // table's stored SQL already mentioning lead_chat, so it is a no-op on fresh
+  // installs (whose canonical shape from SCHEMA already has it) and on already-
+  // migrated databases. Rows are copied verbatim (their target_type is already
+  // valid). Foreign keys toggle OFF for the rebuild and back ON afterward.
+  try {
+    const fRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='peer_abuse_flags'").get();
+    if (fRow && fRow.sql && !fRow.sql.includes('lead_chat')) {
+      console.log('peer_abuse_flags migration (U3): widening target_type to include lead_chat');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE peer_abuse_flags_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            target_type TEXT NOT NULL DEFAULT 'peer_session' CHECK (target_type IN ('peer_session', 'board_post', 'lead_chat')),
+            session_id TEXT,
+            target_id TEXT,
+            flagger_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            flagged_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
+            content_encrypted BLOB NOT NULL,
+            flagger_ip TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            resolution_note TEXT
+          )
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM peer_abuse_flags').get().n;
+        db.exec(`
+          INSERT INTO peer_abuse_flags_new
+            (id, target_type, session_id, target_id, flagger_user_id, flagged_user_id,
+             tier, content_encrypted, flagger_ip, created_at, resolved_at, resolved_by, resolution_note)
+          SELECT
+            id, target_type, session_id, target_id, flagger_user_id, flagged_user_id,
+            tier, content_encrypted, flagger_ip, created_at, resolved_at, resolved_by, resolution_note
+          FROM peer_abuse_flags
+        `);
+        db.exec('DROP TABLE peer_abuse_flags');
+        db.exec('ALTER TABLE peer_abuse_flags_new RENAME TO peer_abuse_flags');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_unresolved ON peer_abuse_flags(tier, created_at DESC) WHERE resolved_at IS NULL');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagged_user ON peer_abuse_flags(flagged_user_id, created_at DESC)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_flagger ON peer_abuse_flags(flagger_user_id, created_at DESC)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_target ON peer_abuse_flags(target_type, target_id)');
+        db.exec('COMMIT');
+        console.log(`peer_abuse_flags migration (U3): rebuilt, preserved ${copied} flag(s)`);
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (flagU3MigErr) {
+    console.error('peer_abuse_flags migration (U3) failed (non-fatal):', flagU3MigErr.message);
+  }
+
+  // ── Migration: peer_abuse_evidence_vault lead_chat target (U3 PR D) ──
+  // The vault mirrors a flag's target_type, so it must also accept 'lead_chat'
+  // before lead-chat evidence can be sealed. Same widen-the-CHECK rebuild,
+  // gated on the stored SQL already mentioning lead_chat. flag_id keeps its
+  // ON DELETE RESTRICT; rows are copied verbatim; foreign keys toggle OFF.
+  try {
+    const vRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='peer_abuse_evidence_vault'").get();
+    if (vRow && vRow.sql && !vRow.sql.includes('lead_chat')) {
+      console.log('peer_abuse_evidence_vault migration (U3): widening target_type to include lead_chat');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE peer_abuse_evidence_vault_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            flag_id TEXT NOT NULL REFERENCES peer_abuse_flags(id) ON DELETE RESTRICT,
+            target_type TEXT NOT NULL CHECK (target_type IN ('peer_session', 'board_post', 'lead_chat')),
+            target_id TEXT,
+            sealed_content_encrypted BLOB NOT NULL,
+            context_encrypted BLOB,
+            flagger_user_id TEXT NOT NULL,
+            accused_user_id TEXT NOT NULL,
+            flagger_pseudonym_at_seal TEXT,
+            accused_pseudonym_at_seal TEXT,
+            tier_at_seal INTEGER NOT NULL CHECK (tier_at_seal IN (1, 2, 3)),
+            sealed_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )
+        `);
+        const vCopied = db.prepare('SELECT COUNT(*) AS n FROM peer_abuse_evidence_vault').get().n;
+        db.exec(`
+          INSERT INTO peer_abuse_evidence_vault_new
+            (id, flag_id, target_type, target_id, sealed_content_encrypted, context_encrypted,
+             flagger_user_id, accused_user_id, flagger_pseudonym_at_seal, accused_pseudonym_at_seal,
+             tier_at_seal, sealed_at)
+          SELECT
+            id, flag_id, target_type, target_id, sealed_content_encrypted, context_encrypted,
+            flagger_user_id, accused_user_id, flagger_pseudonym_at_seal, accused_pseudonym_at_seal,
+            tier_at_seal, sealed_at
+          FROM peer_abuse_evidence_vault
+        `);
+        db.exec('DROP TABLE peer_abuse_evidence_vault');
+        db.exec('ALTER TABLE peer_abuse_evidence_vault_new RENAME TO peer_abuse_evidence_vault');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_evidence_vault_flag ON peer_abuse_evidence_vault(flag_id)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_evidence_vault_accused ON peer_abuse_evidence_vault(accused_user_id, sealed_at DESC)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_evidence_vault_target ON peer_abuse_evidence_vault(target_type, target_id)');
+        db.exec('COMMIT');
+        console.log(`peer_abuse_evidence_vault migration (U3): rebuilt, preserved ${vCopied} record(s)`);
+      } catch (vRebuildErr) {
+        db.exec('ROLLBACK');
+        throw vRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (vaultU3MigErr) {
+    console.error('peer_abuse_evidence_vault migration (U3) failed (non-fatal):', vaultU3MigErr.message);
   }
 
   // ── Migration: ir_policies phantom → canonical (Phase 1.4c precursor) ──

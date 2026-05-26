@@ -162,6 +162,106 @@ function submitBoardFlag(req, res) {
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
 }
 
+// Submit a flag against a lead-chat message (Model B, reviewer-only). Either
+// party may flag the other, so unlike peer flags the accused is NOT required to
+// be an analyst -- a lead can be accused. Lead chat is E2EE, so the server can't
+// read transport ciphertext; the flagger's client decrypts the offending message
+// locally and seals BOTH it and the flagger's note to the abuse-review PUBLIC key
+// (libsodium sealed box) before sending. The server stores those opaque sealed
+// boxes verbatim and NEVER decrypts them -- only the Abuse Review Console, which
+// holds the private key, can. encryptTier3 is deliberately NOT used here.
+//
+// Reviewed ONLY by the independent Abuse Review Console (U3 PR F), never by team
+// leads (a lead may be the accused): this path does NOT notify leads, and the
+// lead-facing GET /flags excludes lead_chat. Flagging is gated on a registered
+// abuse-review key -- with none, there is no one who could decrypt a flag.
+function submitLeadChatFlag(req, res) {
+  const { threadId, tier, sealedNote, sealedContent } = req.body || {};
+  const MAX_SEALED_B64 = 16384; // sealed box of a <=10KB message, base64, + slack
+  const isSealedB64 = (s) =>
+    typeof s === 'string' && s.length > 0 && s.length <= MAX_SEALED_B64 && /^[A-Za-z0-9+/]+={0,2}$/.test(s);
+
+  if (!threadId || typeof threadId !== 'string') {
+    return res.status(400).json({ error: 'threadId required' });
+  }
+  if (!VALID_TIERS.includes(tier)) {
+    return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
+  }
+  if (!isSealedB64(sealedContent)) {
+    return res.status(400).json({ error: 'sealedContent required (base64 sealed box of the offending message)' });
+  }
+  if (!isSealedB64(sealedNote)) {
+    return res.status(400).json({ error: 'sealedNote required (base64 sealed box of the flagger note)' });
+  }
+
+  let flagId;
+  try {
+    const db = getDb();
+
+    // Gate: a flag can only be reviewed (decrypted) if an abuse-review key is
+    // registered, so refuse to seal one into a void.
+    const activeKey = db.prepare('SELECT id FROM abuse_review_keys WHERE active = 1 LIMIT 1').get();
+    if (!activeKey) {
+      db.close();
+      return res.status(409).json({ error: 'flagging unavailable: no independent reviewer designated' });
+    }
+
+    const thread = db.prepare('SELECT id, analyst_id, lead_id FROM lead_chat_threads WHERE id = ?').get(threadId);
+    if (!thread) { db.close(); return res.status(404).json({ error: 'lead-chat thread not found' }); }
+
+    // The flagger must be a participant; the accused is the counterpart. No
+    // accused-must-be-analyst guard here -- a lead can be the accused.
+    let accusedId = null;
+    if (thread.analyst_id === req.user.id) accusedId = thread.lead_id;
+    else if (thread.lead_id === req.user.id) accusedId = thread.analyst_id;
+    if (!accusedId) { db.close(); return res.status(403).json({ error: 'not a participant in this thread' }); }
+    if (accusedId === req.user.id) { db.close(); return res.status(400).json({ error: 'cannot flag yourself' }); }
+
+    const flaggerU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(req.user.id);
+    const accusedU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(accusedId);
+
+    flagId = crypto.randomBytes(16).toString('hex');
+    const flaggerIp = req.ip || (req.connection && req.connection.remoteAddress) || null;
+
+    // Store the client-sealed boxes verbatim. content_encrypted holds the sealed
+    // note; the vault's sealed_content_encrypted holds the sealed offending text.
+    // Neither is server-decryptable.
+    const noteBox = Buffer.from(sealedNote, 'base64');
+    const contentBox = Buffer.from(sealedContent, 'base64');
+
+    const seal = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO peer_abuse_flags
+          (id, target_type, target_id, session_id, flagger_user_id, flagged_user_id, tier, content_encrypted, flagger_ip)
+        VALUES (?, 'lead_chat', ?, NULL, ?, ?, ?, ?, ?)
+      `).run(flagId, threadId, req.user.id, accusedId, tier, noteBox, flaggerIp);
+
+      db.prepare(`
+        INSERT INTO peer_abuse_evidence_vault
+          (flag_id, target_type, target_id, sealed_content_encrypted, context_encrypted,
+           flagger_user_id, accused_user_id, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, tier_at_seal)
+        VALUES (?, 'lead_chat', ?, ?, NULL, ?, ?, ?, ?, ?)
+      `).run(flagId, threadId, contentBox,
+             req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
+    });
+    seal();
+
+    db.close();
+  } catch (err) {
+    logger.error('Failed to submit lead-chat abuse flag', { error: err.message });
+    return res.status(500).json({ error: 'failed to submit flag' });
+  }
+
+  // No notifyLeadsOfFlag (lead-chat abuse is ABC-only -- a lead may be accused).
+  // No pattern-detector call here: the detector writes to peer_abuse_patterns,
+  // which the MC reads, so feeding lead_chat now would surface it to leads. The
+  // lead-chat pattern feed lands in PR E/F with the reviewer's pattern view and
+  // the MC pattern removal. Audit records metadata only.
+  auditLog(req.user.id, 'PEER_ABUSE_FLAG_SUBMITTED', `lead_chat ${threadId}, tier ${tier}, flag ${flagId}`, req.ip);
+
+  return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
+}
+
 // ── POST /api/peer/flags — submit a flag ────────────────────────────────────
 //
 // Request body:
@@ -183,6 +283,9 @@ router.post('/flags', (req, res) => {
   // server-side) and seal evidence to the vault -- handle them separately.
   if ((req.body || {}).target_type === 'board_post') {
     return submitBoardFlag(req, res);
+  }
+  if ((req.body || {}).target_type === 'lead_chat') {
+    return submitLeadChatFlag(req, res);
   }
 
   const { sessionId, flaggedUserId, tier, content } = req.body || {};
@@ -283,13 +386,17 @@ router.get('/flags', (req, res) => {
   const status = ['open', 'resolved', 'all'].includes(req.query.status) ? req.query.status : 'open';
   const tierFilter = ['1', '2', '3'].includes(req.query.tier) ? parseInt(req.query.tier, 10) : null;
 
-  let where = '';
+  // Lead-chat flags are reviewed only by the independent Abuse Review Console
+  // (U3 PR F), never by leads -- a lead can be the accused. Exclude them from
+  // this lead-facing list, which also keeps them out of the MC open-flag badge
+  // (the MC counts this same response). Start the WHERE with that exclusion and
+  // append the status/tier filters with AND.
+  let where = " WHERE f.target_type != 'lead_chat'";
   const params = [];
-  if (status === 'open') where += ' WHERE f.resolved_at IS NULL';
-  else if (status === 'resolved') where += ' WHERE f.resolved_at IS NOT NULL';
+  if (status === 'open') where += ' AND f.resolved_at IS NULL';
+  else if (status === 'resolved') where += ' AND f.resolved_at IS NOT NULL';
   if (tierFilter !== null) {
-    where += where ? ' AND' : ' WHERE';
-    where += ' f.tier = ?';
+    where += ' AND f.tier = ?';
     params.push(tierFilter);
   }
 

@@ -1133,6 +1133,8 @@ Second — and equally important — true positives that are nonetheless low-lev
 5. Either side can verify the safety number out of band — read it aloud; the numbers must match
 6. Analyst closes the chat; five minutes later the scheduler purges the thread's messages
 
+**Reporting abuse:** Either party can report a message in a lead chat — the analyst can flag a lead's message, and the lead can flag the analyst's. Each incoming message carries a Flag control; reporting it opens a tier picker (Tier 1 minor, Tier 2 personal attack, Tier 3 urgent) and a required note. This is deliberately **not** routed to the team lead: a lead can be the subject of a report, so lead-chat reports go to an **independent abuse reviewer** instead. The reported message and the note are sealed on the reporter's own device to the abuse reviewer's public key (an X25519 sealed box) before they leave the app, so the server stores only opaque ciphertext it can never read, and neither management nor any team lead can decrypt it — only the independent Abuse Review Console, which holds the matching private key, can open it. Reporting is available only once an organization has designated a reviewer (otherwise nothing could be decrypted, and the UI says so). When the reviewer later opens a report, a lead who is a party is shown by real name, while an analyst is shown only by pseudonym.
+
 ### Helper Pay (AC-side)
 **What it's for:** The analyst's own view of their Helper Pay state — points earned from helping peers, current balance, transaction ledger, available rewards, and the leaderboard visibility toggle that controls whether their pseudonym appears on the lead's recognition leaderboard.
 

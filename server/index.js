@@ -191,6 +191,7 @@ app.use('/api/lead-chat', authMiddleware(['analyst', 'lead', 'admin']), require(
 app.use('/api/leads', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/leads'));
 app.use('/api/peer-support', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-support'));
 app.use('/api/peer/flags', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-flags'));
+app.use('/api/abuse-review-key', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/abuse-review-key'));
 app.use('/api/peer-board', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-board'));
 app.use('/api/training/completions-review', authMiddleware(['lead', 'admin']), require('./routes/training-completions-review'));
 app.use('/api/training', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/training'));

@@ -1048,6 +1048,14 @@ function ManagementConsole() {
   const [leadChatMsgs, setLeadChatMsgs] = useState([]);
   const [leadChatInput, setLeadChatInput] = useState("");
   const [leadChatSessionReady, setLeadChatSessionReady] = useState(false);
+  // Phase U3: lead-chat abuse flag (Model B parity). A lead can report an
+  // analyst's message; it is sealed on the client to the independent reviewer's
+  // public key and posted as a lead_chat flag. leadFlagMsg holds the message.
+  const [leadFlagMsg, setLeadFlagMsg] = useState(null);
+  const [leadFlagTier, setLeadFlagTier] = useState(0); // 0=unselected, 1/2/3
+  const [leadFlagNote, setLeadFlagNote] = useState("");
+  const [leadFlagBusy, setLeadFlagBusy] = useState(false);
+  const [leadFlagErr, setLeadFlagErr] = useState("");
   const leadChatPollCursor = useRef(null);
   // Phase U3: threads where the analyst has an unacknowledged in-person 1:1
   // request (drives the global banner and the inbox callout below).
@@ -1080,6 +1088,35 @@ function ManagementConsole() {
       if (r && r.error) return;
       setLeadChatMsgs(prev => [...prev, local]);
     } catch (e) { /* swallow; the analyst can resend if needed */ }
+  };
+  // Phase U3: a lead reports an analyst's lead-chat message (Model B parity).
+  // Fetches the independent reviewer's public key; if none is registered,
+  // reporting is unavailable. Otherwise seals the offending message and the note
+  // to that key via the main-process abuse:seal handler -- the server stores
+  // only the opaque boxes and can never read them -- and posts a lead_chat flag.
+  // The accused analyst is resolved server-side from the thread.
+  const submitLeadChatFlag = async () => {
+    const m = leadFlagMsg;
+    if (!m || !leadFlagTier || !leadFlagNote.trim() || !leadChatSel || !leadChatSel.threadId) return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setLeadFlagErr("Reporting requires the desktop app."); return; }
+    setLeadFlagBusy(true); setLeadFlagErr("");
+    try {
+      const k = await api.get("/api/abuse-review-key");
+      if (!k || !k.active || !k.key || !k.key.publicKey) {
+        setLeadFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
+        setLeadFlagBusy(false); return;
+      }
+      const pub = k.key.publicKey;
+      const sc = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: m.text });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: leadFlagNote.trim() });
+      if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
+      const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadChatSel.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
+      if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
+      setLeadFlagMsg(null); setLeadFlagTier(0); setLeadFlagNote(""); setLeadFlagBusy(false);
+    } catch (e) {
+      setLeadFlagErr("Could not submit the report."); setLeadFlagBusy(false);
+    }
   };
   // Poll the relay for the open thread: decrypt incoming analyst messages (the
   // first pre-key message establishes this side's session), mark each read to
@@ -8236,8 +8273,31 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.td,display:"block",marginBottom:12,lineHeight:1.6}}>End-to-end encrypted. This analyst appears by pseudonym; their real name is never shown. Messages purge five minutes after the chat is closed.</M>
             <Card style={{maxHeight:320,overflow:"auto",marginBottom:12}}>
               {leadChatMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
-              leadChatMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:m.from==="you"?C.i:C.a,fontWeight:500}}>{m.from==="you"?"You":leadChatSel.label}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><M style={{color:C.td}}>E2EE{m.ts?` · ${m.ts}`:""}</M></div><div style={{fontSize:12,lineHeight:1.6,color:C.t}}>{m.text}</div></div>)}
+              leadChatMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:m.from==="you"?C.i:C.a,fontWeight:500}}>{m.from==="you"?"You":leadChatSel.label}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><div style={{display:"flex",gap:8,alignItems:"center"}}><M style={{color:C.td}}>E2EE{m.ts?` · ${m.ts}`:""}</M>{m.from==="analyst"&&<button onClick={()=>{setLeadFlagMsg(m);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}} title="Report this message to the independent reviewer" style={{background:"none",border:"none",color:C.d,cursor:"pointer",fontSize:10,fontFamily:"inherit",padding:0}}>Flag</button>}</div></div><div style={{fontSize:12,lineHeight:1.6,color:C.t}}>{m.text}</div></div>)}
             </Card>
+            {leadFlagMsg&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
+              <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:6}}>Report this message to the independent reviewer</M>
+              <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:8}}>This goes to an independent abuse reviewer -- not you as a reviewer, and not management -- and is encrypted so that only that reviewer can read it. Either party can report a message. Report only genuinely abusive content.</M>
+              <div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,marginBottom:10,fontSize:11,color:C.tm,fontStyle:"italic"}}>{leadFlagMsg.text.slice(0,140)}{leadFlagMsg.text.length>140?"...":""}</div>
+              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===1?"rgba(96,165,250,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===1?C.i+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===1} onChange={()=>setLeadFlagTier(1)} style={{marginTop:3}}/>
+                <div><M style={{color:C.t,fontWeight:500}}>Tier 1 -- Minor</M><M style={{color:C.td,display:"block"}}>Unprofessional or dismissive conduct.</M></div>
+              </label>
+              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===2} onChange={()=>setLeadFlagTier(2)} style={{marginTop:3}}/>
+                <div><M style={{color:C.t,fontWeight:500}}>Tier 2 -- Personal attack</M><M style={{color:C.td,display:"block"}}>Targeted hostility, intimidation, or retaliation.</M></div>
+              </label>
+              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:8,background:leadFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
+                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===3} onChange={()=>setLeadFlagTier(3)} style={{marginTop:3}}/>
+                <div><M style={{color:C.t,fontWeight:500}}>Tier 3 -- Urgent</M><M style={{color:C.td,display:"block"}}>Slurs, threats, or harassment.</M></div>
+              </label>
+              <textarea value={leadFlagNote} onChange={e=>setLeadFlagNote(e.target.value)} placeholder="Briefly describe the problem (required)" maxLength={2000} style={{width:"100%",minHeight:60,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit",boxSizing:"border-box",resize:"vertical"}}/>
+              {leadFlagErr&&<M style={{color:C.d,display:"block",marginTop:6}}>{leadFlagErr}</M>}
+              <div style={{display:"flex",gap:8,marginTop:10}}>
+                <Btn danger small disabled={!leadFlagNote.trim()||!leadFlagTier||leadFlagBusy} onClick={submitLeadChatFlag}>{leadFlagBusy?"Sealing...":"Submit report"}</Btn>
+                <Btn small onClick={()=>{setLeadFlagMsg(null);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}}>Cancel</Btn>
+              </div>
+            </Card>}
             {leadChatSel.status==="closed"?<M style={{color:C.td,fontStyle:"italic"}}>This chat is closed -- read-only, and it will be purged shortly.</M>:
             <div style={{display:"flex",gap:8}}><input value={leadChatInput} onChange={e=>setLeadChatInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&leadChatInput.trim())sendLeadReply();}} placeholder={leadChatSessionReady?"Reply to this analyst...":"Reply unlocks once the analyst's first message arrives..."} maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary disabled={!leadChatInput.trim()||!leadChatSessionReady} onClick={()=>sendLeadReply()}>Send</Btn></div>}
           </div>)}

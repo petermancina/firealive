@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
       - run: cd packages/analyst-client && npm install && npx electron-builder --mac --publish never || true
       - run: cd packages/global-dashboard && npm install && npx electron-builder --mac --publish never || true
       - run: cd frontend && npm install && npx electron-builder --mac --publish never || true
@@ -43,7 +43,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
         shell: bash
       - run: cd packages/analyst-client && npm install && npx electron-builder --win --publish never || true
         shell: bash
@@ -68,7 +68,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
-      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
       - run: cd packages/analyst-client && npm install && npx electron-builder --linux --publish never
       - run: cd packages/global-dashboard && npm install && npx electron-builder --linux --publish never
       - run: cd frontend && npm install && npx electron-builder --linux --publish never

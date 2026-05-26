@@ -113,6 +113,16 @@ try {
   ({ createSignalE2EE } = require('../packages/shared/signal-e2ee'));
 }
 
+// The reviewer-only seal helper (packages/shared/abuse-seal.js) is bundled the
+// same way; load it with the same packaged/source fallback. It needs no native
+// dependency (Node crypto only), so a plain require is enough.
+let sealToReviewer;
+try {
+  ({ sealToReviewer } = require('./abuse-seal'));
+} catch {
+  ({ sealToReviewer } = require('../packages/shared/abuse-seal'));
+}
+
 // libsignal is a native ESM module; load it dynamically and normalize the shape
 // across the ESM-namespace and CJS-default interop cases.
 async function loadLibsignal() {
@@ -195,6 +205,22 @@ ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {
 
 ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
   ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
+
+// Seal abuse-flag content to the independent reviewer's public key (Model B). A
+// lead reports an analyst's message here; the renderer passes the offending text
+// (already decrypted on screen) and the flagger's note, plus the abuse-review
+// public key it fetched, and gets back opaque base64 that only the Abuse Review
+// Console can open. The server stores it and cannot read it; no private key is
+// ever involved here. The renderer calls this once per field.
+ipcMain.handle('abuse:seal', async (_e, { recipientPublicKey, plaintext } = {}) => {
+  if (typeof recipientPublicKey !== 'string' || !recipientPublicKey) {
+    throw new Error('recipientPublicKey (base64) required');
+  }
+  if (typeof plaintext !== 'string') {
+    throw new Error('plaintext (string) required');
+  }
+  return { sealed: sealToReviewer(recipientPublicKey, plaintext) };
+});
 
 app.whenReady().then(() => {
   startServer();
