@@ -73,6 +73,15 @@ const api = {
   setToken(t) { this._token = t; },
 };
 
+// Phase U3: per-thread monotonic counter for relay ordering of the lead's
+// outgoing reply messages (the analyst's stream is counted on the analyst side).
+const leadReplyCounters = new Map();
+function nextLeadReplyCounter(threadId) {
+  const c = leadReplyCounters.get(threadId) || 0;
+  leadReplyCounters.set(threadId, c + 1);
+  return c;
+}
+
 const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -362,6 +371,35 @@ function LoginScreen({role, onLogin, onBack}) {
     }).catch(()=>{});
   },[]);
 
+  // ── Phase U3: provision this lead's Signal pre-key bundle on login ──────────
+  // The management console is the lead-side client. On login we initialize the
+  // lead-domain Signal wrapper in the main process and publish (or top up) the
+  // lead's pre-key bundle, so an analyst can fetch it and establish a session.
+  // Seed once -- gated on the server's available one-time-prekey count so
+  // re-logins do not regenerate local keys (which would desync from the
+  // published public keys). No-op in a plain browser (no Electron bridge);
+  // failures are swallowed, never fatal to login (the MC has no client audit log).
+  const bootstrapLeadE2EE = async (selfId) => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke || !selfId) return;
+    try {
+      await bridge.invoke("e2ee:init", selfId);
+      const c = await api.get("/api/e2ee/count?domain=lead");
+      const available = (c && typeof c.available === "number") ? c.available : 0;
+      if (!(c && typeof c.available === "number" && c.available > 0)) {
+        const bundle = await bridge.invoke("e2ee:publishBundle", { domain: "lead", oneTimeCount: 50 });
+        if (bundle && !bundle.error) { await api.post("/api/e2ee/publish", bundle); }
+      } else if (available < 10) {
+        const rep = await bridge.invoke("e2ee:replenishPrekeys", { domain: "lead", count: 50 });
+        if (rep && !rep.error && Array.isArray(rep.oneTimePreKeys) && rep.oneTimePreKeys.length) {
+          await api.post("/api/e2ee/prekeys", rep);
+        }
+      }
+    } catch (e) {
+      try { console.warn("Lead E2EE provisioning failed:", e && e.message ? e.message : e); } catch (_e) {}
+    }
+  };
+
   // Centralized JWT-issuance handler. Sets the token on the api helper so
   // subsequent calls authenticate correctly, persists the refresh token
   // for /api/auth/refresh, and hands control back to the parent component.
@@ -372,6 +410,7 @@ function LoginScreen({role, onLogin, onBack}) {
     if (loginResponse && loginResponse.refreshToken) {
       try { localStorage.setItem('fa_refresh_token', loginResponse.refreshToken); } catch (_e) {}
     }
+    bootstrapLeadE2EE(user);
     setStage("verify");
     setTimeout(()=>onLogin(),800);
   };
@@ -986,6 +1025,96 @@ function ManagementConsole() {
   const [inboxView, setInboxView] = useState("list"); // list | preferences
   const [inboxPrefs, setInboxPrefs] = useState(null);
   const [inboxPrefsLoading, setInboxPrefsLoading] = useState(false);
+  // Phase U3: lead-chat inbox. Threads are labeled by the analyst's pseudonym
+  // (never a real name); poll the role-aware threads endpoint so the sidebar badge
+  // and the list stay current. Returns empty for non-lead management-console users.
+  const [leadChatThreads, setLeadChatThreads] = useState([]);
+  const [leadChatUnread, setLeadChatUnread] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      api.get("/api/lead-chat/threads").then(r => {
+        if (cancelled || !r || !Array.isArray(r.threads)) return;
+        setLeadChatThreads(r.threads);
+        setLeadChatUnread(r.threads.reduce((n, t) => n + (t.unread || 0), 0));
+      }).catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 45000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, []);
+  // Phase U3: open-thread state for the lead-side conversation panel.
+  const [leadChatSel, setLeadChatSel] = useState(null);
+  const [leadChatMsgs, setLeadChatMsgs] = useState([]);
+  const [leadChatInput, setLeadChatInput] = useState("");
+  const [leadChatSessionReady, setLeadChatSessionReady] = useState(false);
+  const leadChatPollCursor = useRef(null);
+  // Phase U3: threads where the analyst has an unacknowledged in-person 1:1
+  // request (drives the global banner and the inbox callout below).
+  const leadChat1on1 = leadChatThreads.filter(t => t.pending1on1);
+  const openLeadChatThread = (t) => {
+    setLeadChatSel(t);
+    setLeadChatMsgs([]);
+    setLeadChatSessionReady(false);
+    leadChatPollCursor.current = null;
+  };
+  // Reply to the analyst on the established 'lead' Signal session (keyed by
+  // threadId). The lead is always the recipient -- the session is established by
+  // decrypting the analyst's first pre-key message in the poll below -- so replies
+  // send only once a session exists; this side never initiates, which avoids a
+  // conflicting double session. Own lines render locally (the relay returns only
+  // incoming messages).
+  const sendLeadReply = async () => {
+    const text = leadChatInput.trim();
+    if (!text || !leadChatSel || !leadChatSessionReady) return;
+    const threadId = leadChatSel.threadId;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) return;
+    const local = { id: "local-" + Date.now(), from: "you", ts: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), text };
+    setLeadChatInput("");
+    try {
+      const env = await bridge.invoke("e2ee:encrypt", { domain: "lead", remoteUserId: threadId, plaintext: text });
+      if (!env || env.error || typeof env.type !== "number") return;
+      const counter = nextLeadReplyCounter(threadId);
+      const r = await api.post("/api/lead-chat", { threadId, messageType: env.type, ciphertext: env.body, counter, kind: "chat" });
+      if (r && r.error) return;
+      setLeadChatMsgs(prev => [...prev, local]);
+    } catch (e) { /* swallow; the analyst can resend if needed */ }
+  };
+  // Poll the relay for the open thread: decrypt incoming analyst messages (the
+  // first pre-key message establishes this side's session), mark each read to
+  // clear the unread and 1:1 badges, and append. Mirrors the analyst receive loop.
+  useEffect(() => {
+    const threadId = leadChatSel ? leadChatSel.threadId : null;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!threadId || !bridge || !bridge.invoke) return;
+    leadChatPollCursor.current = null;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const since = leadChatPollCursor.current;
+        const q = "/api/lead-chat/thread?threadId=" + encodeURIComponent(threadId) + (since ? "&since=" + encodeURIComponent(since) : "");
+        const data = await api.get(q);
+        if (cancelled || !data || !Array.isArray(data.messages)) return;
+        for (const m of data.messages) {
+          let res;
+          try {
+            res = await bridge.invoke("e2ee:decrypt", { domain: "lead", remoteUserId: threadId, envelope: { type: m.messageType, body: m.ciphertext } });
+          } catch (e) { break; }
+          if (cancelled) return;
+          if (!res || res.error || typeof res.plaintext !== "string") break;
+          setLeadChatSessionReady(true);
+          const ts = new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          setLeadChatMsgs(prev => prev.some(x => x.id === m.id) ? prev : [...prev, { id: m.id, from: "analyst", ts, text: res.plaintext, kind: m.kind }]);
+          leadChatPollCursor.current = m.createdAt;
+          api.put("/api/lead-chat/" + encodeURIComponent(m.id) + "/read", {}).catch(() => {});
+        }
+      } catch (e) { /* transient; next tick retries */ }
+    };
+    poll();
+    const iv = setInterval(poll, 3000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [leadChatSel ? leadChatSel.threadId : null]);
   // N1a C21: Lead Notification Contact Info Card state. Stores the lead's
   // registered email + phone for SMS / email notification dispatch. Loaded
   // from /api/users/me/lead-contacts when the preferences view opens; saved
@@ -2707,7 +2836,7 @@ function ManagementConsole() {
   const toggleNav = (cat) => setNavExpanded(prev=>{const next={};next[cat]=!prev[cat];return next;});
   const navGroups = [
     {cat:"ops",label:"Operations",items:[
-      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing"},{id:"soar",label:"SOAR & Ticketing"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
+      {id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"leadchat",label:"Lead Chat",badge:leadChatUnread},{id:"peer_conduct",label:"Peer Conduct",badge:peerFlagOpenCount},{id:"actions",label:"Actions",badge:highP.length},{id:"overview",label:"Team Overview"},{id:"routing",label:"Routing"},{id:"soar",label:"SOAR & Ticketing"},{id:"handoff",label:"Shift Handoff"},{id:"sla",label:"SLA"},{id:"automation",label:"Automation"},{id:"fail_open",label:"Fail-Open Routing"},{id:"auto_disable",label:"Auto-Disable Routing"},{id:"runbook",label:"Recovery Runbook"},
     ]},
     {cat:"analysts",label:"Analysts & Wellbeing",items:[
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"training_reviews",label:"Training Reviews",badge:trainingReviewPendingCount},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
@@ -3136,6 +3265,16 @@ function ManagementConsole() {
           </div>
         </div>
         <M style={{color:C.d,fontWeight:500,fontSize:11}}>Review →</M>
+      </div>)}
+      {leadChat1on1.length>0&&(<div onClick={()=>setTab("leadchat")} style={{padding:"10px 24px",background:C.w+"1f",borderBottom:`1px solid ${C.w}50`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:C.w,boxShadow:`0 0 8px ${C.w}`,animation:"pulse 1.5s infinite",flexShrink:0}}/>
+          <div>
+            <M style={{color:C.w,fontWeight:600,letterSpacing:1.5,textTransform:"uppercase",fontSize:10,display:"block"}}>In-Person 1:1 Requested</M>
+            <M style={{color:C.t,fontSize:11,display:"block",marginTop:2}}>{leadChat1on1.length} analyst{leadChat1on1.length>1?"s have":" has"} asked to meet face to face. Open Lead Chat to respond.</M>
+          </div>
+        </div>
+        <M style={{color:C.w,fontWeight:500,fontSize:11}}>Open →</M>
       </div>)}
       {/* v1.0.0: Grouped sidebar navigation replaces 57 flat tabs */}
       <div style={{display:"flex",minHeight:"calc(100vh - 120px)"}}>
@@ -8057,6 +8196,50 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 </div>
               </Card>
             ))}
+          </div>)}
+        </div>)}
+
+        {/* PHASE U3: LEAD CHAT — pseudonymous E2EE analyst-to-lead inbox */}
+        {tab==="leadchat"&&(<div>
+          {!leadChatSel?(<div>
+          <L style={{marginBottom:0}}>Lead Chat{leadChatUnread>0?` — ${leadChatUnread} unread`:""}</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>End-to-end encrypted 1:1 messages from analysts. Analysts appear by pseudonym -- their real names are never shown here. Messages are deleted five minutes after a chat is closed.</M>
+          {leadChat1on1.length>0&&(<Card style={{marginBottom:16,borderColor:C.w+"55",background:C.w+"12"}}>
+            <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:6}}>In-person 1:1 requested</M>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>These analysts asked to meet in person. Open a conversation to coordinate a time.</M>
+            {leadChat1on1.map(t=>(
+              <div key={t.threadId} onClick={()=>openLeadChatThread(t)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",cursor:"pointer",borderTop:`1px solid ${C.b}`}}>
+                <span style={{fontSize:12,fontWeight:600,color:C.t}}>{t.label}</span>
+                <M style={{color:C.w}}>Open →</M>
+              </div>
+            ))}
+          </Card>)}
+          {leadChatThreads.length===0?<Card><M style={{color:C.td,fontStyle:"italic"}}>No conversations yet. Analysts start these from their client.</M></Card>:
+          leadChatThreads.map(t=>(
+            <Card key={t.threadId} onClick={()=>openLeadChatThread(t)} style={{marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}>
+              <div style={{minWidth:0}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  <span style={{fontSize:13,fontWeight:600,color:C.t}}>{t.label}</span>
+                  {t.status==="closed"&&<span style={{fontSize:9,color:C.td,border:`1px solid ${C.b}`,borderRadius:8,padding:"1px 6px"}}>closed</span>}
+                  {t.pending1on1&&<span style={{fontSize:9,color:C.w,background:C.w+"18",borderRadius:8,padding:"1px 6px"}}>in-person 1:1 requested</span>}
+                </div>
+                <M style={{color:C.td,display:"block",marginTop:4}}>{t.lastMessageAt?`Last activity ${new Date(t.lastMessageAt).toLocaleString()}`:"No messages yet"}</M>
+              </div>
+              {t.unread>0&&<span style={{fontSize:10,background:C.a+"20",color:C.a,padding:"2px 8px",borderRadius:10,fontWeight:600,whiteSpace:"nowrap"}}>{t.unread} new</span>}
+            </Card>
+          ))}
+          </div>):(<div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <L style={{marginBottom:0}}>{leadChatSel.label}{leadChatSel.status==="closed"?" — closed":""}</L>
+              <button onClick={()=>setLeadChatSel(null)} style={{background:"none",border:"none",color:C.i,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Back to inbox</button>
+            </div>
+            <M style={{color:C.td,display:"block",marginBottom:12,lineHeight:1.6}}>End-to-end encrypted. This analyst appears by pseudonym; their real name is never shown. Messages purge five minutes after the chat is closed.</M>
+            <Card style={{maxHeight:320,overflow:"auto",marginBottom:12}}>
+              {leadChatMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
+              leadChatMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:m.from==="you"?C.i:C.a,fontWeight:500}}>{m.from==="you"?"You":leadChatSel.label}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><M style={{color:C.td}}>E2EE{m.ts?` · ${m.ts}`:""}</M></div><div style={{fontSize:12,lineHeight:1.6,color:C.t}}>{m.text}</div></div>)}
+            </Card>
+            {leadChatSel.status==="closed"?<M style={{color:C.td,fontStyle:"italic"}}>This chat is closed -- read-only, and it will be purged shortly.</M>:
+            <div style={{display:"flex",gap:8}}><input value={leadChatInput} onChange={e=>setLeadChatInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&leadChatInput.trim())sendLeadReply();}} placeholder={leadChatSessionReady?"Reply to this analyst...":"Reply unlocks once the analyst's first message arrives..."} maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary disabled={!leadChatInput.trim()||!leadChatSessionReady} onClick={()=>sendLeadReply()}>Send</Btn></div>}
           </div>)}
         </div>)}
 

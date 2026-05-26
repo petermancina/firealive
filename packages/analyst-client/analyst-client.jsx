@@ -62,6 +62,12 @@ function nextPeerCounter(sessionId) {
   peerSendCounters.set(sessionId, c + 1);
   return c;
 }
+const leadSendCounters = new Map();
+function nextLeadCounter(threadId) {
+  const c = leadSendCounters.get(threadId) || 0;
+  leadSendCounters.set(threadId, c + 1);
+  return c;
+}
 
 const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -1403,9 +1409,157 @@ export default function AnalystClientApp() {
     const iv = setInterval(poll, 3000);
     return () => { cancelled = true; clearInterval(iv); };
   }, [peerSession ? peerSession.id : null, peerSession ? peerSession.status : null]);
+  // Phase U3: lead chat (pseudonymous analyst<->team-lead, separate 'lead' key
+  // domain). Establish the libsignal lead-domain session for a thread via X3DH.
+  // The analyst knows the chosen lead's user id (the lead is not pseudonymous),
+  // so the bundle is fetched by user id; but the session is KEYED BY threadId so
+  // the analyst's local ratchet state never embeds the lead's identity and the
+  // same key drives the out-of-band safety number. Idempotent: a no-op when a
+  // session already exists for this thread.
+  const ensureLeadSession = async (threadId, leadUserId) => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke || !threadId || !leadUserId) return false;
+    const h = await bridge.invoke("e2ee:hasSession", { domain: "lead", remoteUserId: threadId });
+    if (h && h.hasSession) return true;
+    const br = await api.get("/api/e2ee/bundle/" + leadUserId + "?domain=lead");
+    if (br && br.bundle && !br.error) {
+      await bridge.invoke("e2ee:processBundle", { domain: "lead", remoteUserId: threadId, bundle: br.bundle });
+      return true;
+    }
+    logC("lead_e2ee_pending", "Lead bundle unavailable; chat encrypts once the lead publishes keys");
+    return false;
+  };
   const [showLeadMsg, setShowLeadMsg] = useState(false);
   const [leadMsgs, setLM] = useState([]);
   const [newLM, setNewLM] = useState("");
+  // Phase U3: lead-chat session + receive loop. leadThread is set by the on-shift
+  // lead picker (added next); null until a lead is chosen.
+  const [leadThread, setLeadThread] = useState(null);
+  const leadPollCursor = useRef(null);
+  const [leadOptions, setLeadOptions] = useState([]);
+  // Ratchet-encrypt the message (keyed by threadId) and relay it via /api/lead-chat.
+  // Own lines render locally because the relay returns only incoming messages (the
+  // sender cannot decrypt its own ratchet output). kind defaults to 'chat'.
+  const sendLeadMessage = async (kind) => {
+    const k = kind || "chat";
+    const typed = newLM.trim();
+    // A 1:1 request is valid with no typed text; it carries a default body so the
+    // lead always sees an explicit ask. Typed text becomes the request's context.
+    const text = typed || (k === "inperson_1on1_request" ? "Requesting an in-person 1:1 when you have a moment." : "");
+    if (!text || !leadThread || !leadThread.threadId) return;
+    const threadId = leadThread.threadId;
+    const localMsg = { id: Date.now(), from: "You", ts: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), text, enc: true, kind: k };
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    setNewLM("");
+    if (!bridge || !bridge.invoke) { setLM(prev => [...prev, localMsg]); return; }
+    try {
+      await ensureLeadSession(threadId, leadThread.leadId);
+      const env = await bridge.invoke("e2ee:encrypt", { domain: "lead", remoteUserId: threadId, plaintext: text });
+      if (!env || env.error || typeof env.type !== "number") { logC("lead_send_failed", "Encryption failed"); return; }
+      const counter = nextLeadCounter(threadId);
+      const r = await api.post("/api/lead-chat", { threadId, messageType: env.type, ciphertext: env.body, counter, kind: k });
+      if (r && r.error) { logC("lead_send_failed", "Relay rejected: " + r.error); return; }
+      setLM(prev => [...prev, localMsg]);
+    } catch (e) {
+      logC("lead_send_failed", "Send error: " + (e && e.message ? e.message : "unknown"));
+    }
+  };
+  // Poll for incoming lead-chat ciphertext and decrypt it (keyed by threadId),
+  // mirroring the peer receive loop. Runs only while a thread is active.
+  useEffect(() => {
+    const threadId = (leadThread && leadThread.status === "active") ? leadThread.threadId : null;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!threadId || !bridge || !bridge.invoke) return;
+    leadPollCursor.current = null;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const since = leadPollCursor.current;
+        const q = "/api/lead-chat/thread?threadId=" + encodeURIComponent(threadId) + (since ? "&since=" + encodeURIComponent(since) : "");
+        const data = await api.get(q);
+        if (cancelled || !data || !Array.isArray(data.messages)) return;
+        for (const m of data.messages) {
+          let res;
+          try {
+            res = await bridge.invoke("e2ee:decrypt", { domain: "lead", remoteUserId: threadId, envelope: { type: m.messageType, body: m.ciphertext } });
+          } catch (e) { logC("lead_decrypt_failed", "Could not decrypt an incoming message"); break; }
+          if (cancelled) return;
+          if (!res || res.error || typeof res.plaintext !== "string") { logC("lead_decrypt_failed", "Could not decrypt an incoming message"); break; }
+          const ts = new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          const fromLabel = (leadThread && leadThread.leadName) ? leadThread.leadName : "Team Lead";
+          setLM(prev => prev.some(x => x.id === m.id) ? prev : [...prev, { id: m.id, from: fromLabel, ts, text: res.plaintext, enc: true, kind: m.kind }]);
+          leadPollCursor.current = m.createdAt;
+        }
+      } catch (e) { /* transient; next tick retries */ }
+    };
+    poll();
+    const iv = setInterval(poll, 3000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [leadThread ? leadThread.threadId : null, leadThread ? leadThread.status : null]);
+  // Fetch the on-shift lead roster while the picker is open and no thread is set.
+  useEffect(() => {
+    if (!showLeadMsg || leadThread) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await api.get("/api/leads/on-shift");
+        if (!cancelled && data && Array.isArray(data.leads)) setLeadOptions(data.leads);
+      } catch (e) { /* transient; the picker shows an empty list until it loads */ }
+    })();
+    return () => { cancelled = true; };
+  }, [showLeadMsg, leadThread]);
+  // Open (or reopen) the 1:1 thread with the chosen lead, establish the Signal
+  // session keyed by threadId, then activate the thread -- which enables Send and
+  // starts the receive loop. The thread id is stable per (analyst, lead).
+  const openLeadThread = async (lead) => {
+    if (!lead || !lead.id) return;
+    try {
+      const r = await api.post("/api/lead-chat/open", { leadId: lead.id });
+      if (!r || r.error || !r.threadId) { logC("lead_open_failed", "Could not open lead thread"); return; }
+      setLM([]);
+      await ensureLeadSession(r.threadId, lead.id);
+      setLeadThread({ threadId: r.threadId, leadId: lead.id, leadName: lead.name, status: "active" });
+      logC("lead_thread_opened", "Opened lead chat thread");
+    } catch (e) {
+      logC("lead_open_failed", "Open error: " + (e && e.message ? e.message : "unknown"));
+    }
+  };
+  // Phase U3: out-of-band safety number for the lead channel. The threadId is the
+  // shared, pseudonymous session id, passed as both fingerprint ids so the number
+  // is symmetric and matches on the lead's client without either side learning the
+  // other's identity from it. Grouped into 5s for reading aloud.
+  const [leadSafetyNum, setLeadSafetyNum] = useState(null);
+  const showLeadSafetyNumber = async () => {
+    if (!leadThread || !leadThread.threadId) return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setLeadSafetyNum("unavailable outside the desktop app"); return; }
+    try {
+      const tid = leadThread.threadId;
+      const r = await bridge.invoke("e2ee:safetyNumber", { domain: "lead", remoteUserId: tid, localId: tid, remoteId: tid });
+      const sn = (r && r.safetyNumber && !r.error) ? String(r.safetyNumber) : null;
+      if (!sn) { setLeadSafetyNum("not available until the channel is established"); return; }
+      let grouped = "";
+      for (let i = 0; i < sn.length; i += 5) { grouped += (i ? " " : "") + sn.slice(i, i + 5); }
+      setLeadSafetyNum(grouped);
+    } catch (e) {
+      setLeadSafetyNum("not available until the channel is established");
+    }
+  };
+  // Close the thread: the server marks it closed and starts the 5-minute retention
+  // countdown, then we clear local state -- which stops the poll and returns to the
+  // picker. Best-effort: clear locally even if the close call fails.
+  const closeLeadThread = async () => {
+    const t = leadThread;
+    if (t && t.threadId) {
+      try {
+        await api.post("/api/lead-chat/" + encodeURIComponent(t.threadId) + "/close", {});
+        logC("lead_thread_closed", "Closed lead chat; messages purge in 5 minutes");
+      } catch (e) { /* clear locally regardless */ }
+    }
+    setLeadThread(null);
+    setLM([]);
+    setLeadSafetyNum(null);
+  };
   const [showSchedule, setShowSchedule] = useState(null);
   const [schedDate, setSchedDate] = useState("");
   const [schedReminder, setSchedReminder] = useState("1hr");
@@ -1562,28 +1716,38 @@ export default function AnalystClientApp() {
     const bootstrapE2EE = async (selfId) => {
       const bridge = (typeof window !== "undefined") ? window.firealive : null;
       if (!bridge || !bridge.invoke || !selfId) return;
-      try {
-        await bridge.invoke("e2ee:init", selfId);
-        let needsPublish = true;
-        const c = await api.get("/api/e2ee/count?domain=peer");
-        if (c && typeof c.available === "number" && c.available > 0) needsPublish = false;
-        if (needsPublish) {
-          const bundle = await bridge.invoke("e2ee:publishBundle", { domain: "peer", oneTimeCount: 50 });
+
+      // Seed (or top up) the published pre-key bundle for one key domain. Peer
+      // chat and lead chat run as cryptographically separate Signal domains, so
+      // each needs its own published bundle before a counterpart can establish
+      // a session. Seed once when the server holds nothing; replenish one-time
+      // pre-keys when the pool runs low (consumed by incoming sessions) so new
+      // sessions keep full initial forward secrecy. Failures are logged, never
+      // fatal to login.
+      const provisionDomain = async (domain) => {
+        const c = await api.get("/api/e2ee/count?domain=" + domain);
+        const available = (c && typeof c.available === "number") ? c.available : 0;
+        if (!(c && typeof c.available === "number" && c.available > 0)) {
+          const bundle = await bridge.invoke("e2ee:publishBundle", { domain, oneTimeCount: 50 });
           if (bundle && !bundle.error) {
             const r = await api.post("/api/e2ee/publish", bundle);
-            if (r && r.error) { logC("E2EE_PUBLISH_FAILED", "Bundle publish rejected: " + r.error); }
-            else { logC("E2EE_PEER_BUNDLE_PUBLISHED", "Published peer-domain pre-key bundle"); }
+            if (r && r.error) { logC("E2EE_PUBLISH_FAILED", domain + "-domain bundle publish rejected: " + r.error); }
+            else { logC("E2EE_" + domain.toUpperCase() + "_BUNDLE_PUBLISHED", "Published " + domain + "-domain pre-key bundle"); }
           }
-        } else if (c && typeof c.available === "number" && c.available < 10) {
-          // Pool is running low (consumed by incoming sessions) — top up with fresh-id
-          // one-time pre-keys so new sessions keep full initial forward secrecy.
-          const rep = await bridge.invoke("e2ee:replenishPrekeys", { domain: "peer", count: 50 });
+        } else if (available < 10) {
+          const rep = await bridge.invoke("e2ee:replenishPrekeys", { domain, count: 50 });
           if (rep && !rep.error && Array.isArray(rep.oneTimePreKeys) && rep.oneTimePreKeys.length) {
             const r = await api.post("/api/e2ee/prekeys", rep);
-            if (r && r.error) { logC("E2EE_PREKEYS_FAILED", "Pre-key top-up rejected: " + r.error); }
-            else { logC("E2EE_PREKEYS_REPLENISHED", "Replenished peer one-time pre-keys"); }
+            if (r && r.error) { logC("E2EE_PREKEYS_FAILED", domain + " pre-key top-up rejected: " + r.error); }
+            else { logC("E2EE_PREKEYS_REPLENISHED", "Replenished " + domain + " one-time pre-keys"); }
           }
         }
+      };
+
+      try {
+        await bridge.invoke("e2ee:init", selfId);
+        await provisionDomain("peer");
+        await provisionDomain("lead");
       } catch (e) {
         logC("E2EE_INIT_FAILED", "E2EE setup error: " + (e && e.message ? e.message : "unknown"));
       }
@@ -1991,21 +2155,6 @@ export default function AnalystClientApp() {
             <Btn style={{marginTop:8}} onClick={()=>{setShowLQ(false);setLqDone(false);setLqReason("");}}>Close</Btn>
           </div>
         </div>)}
-
-        {/* ── Team Lead Message Modal ── */}
-        {showLeadMsg&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setShowLeadMsg(false)}>
-          <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:16,padding:32,maxWidth:500,width:"90%"}}>
-            <L>Message Team Lead</L>
-            <M style={{color:C.tm,display:"block",marginBottom:12}}>This is an identified message — your Team Lead will know who is writing. Use this for: requesting a 1-on-1, raising concerns about workload, requesting schedule changes, or anything you want to discuss with your lead directly.</M>
-            {leadMsgs.map((m,i)=><div key={i} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:m.from==="me"?C.a:C.i,fontWeight:500}}>{m.from==="me"?"You":"Team Lead"}: </M><M style={{color:C.t}}>{m.text}</M><M style={{color:C.td}}> · {m.ts}</M></div>)}
-            <div style={{display:"flex",gap:8,marginTop:12}}>
-              <input value={newLM} onChange={e=>setNewLM(e.target.value)} placeholder="Type your message..." style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
-              <Btn primary disabled={!newLM.trim()} onClick={()=>{setLM(prev=>[...prev,{from:"me",text:newLM,ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}]);setNewLM("");logC("lead_message_sent","Identified message sent to Team Lead");}}>Send</Btn>
-            </div>
-            <Btn style={{marginTop:8}} onClick={()=>setShowLeadMsg(false)}>Close</Btn>
-          </div>
-        </div>)}
-
 
         {/* ══════════ DELEGATE ══════════ */}
         {tab==="delegate"&&(<div>
@@ -2957,16 +3106,32 @@ export default function AnalystClientApp() {
         <div style={{display:"flex",gap:8}}><Btn primary style={{flex:1}} onClick={()=>{logC("peer_sched",`${schedDate||"ASAP"}`);setShowPeerSched(false);}}>Post to queue</Btn><Btn onClick={()=>setShowPeerSched(false)}>Cancel</Btn></div>
       </Modal>}
 
-      {showLeadMsg&&<Modal title="Message Your Lead (Identified)" onClose={()=>setShowLeadMsg(false)} width={500}>
-        <Card style={{marginBottom:12,borderColor:C.w+"40",padding:12}}>
-          <M style={{color:C.w,display:"block",marginBottom:4,fontWeight:500}}>This chat is not anonymous.</M>
-          <M style={{color:C.tm,lineHeight:1.6}}>Your team lead will see your name. This is for direct support where your lead needs to know who you are to help. If you prefer anonymous support, use Peer Chat instead.</M>
+      {showLeadMsg&&<Modal title="Message Your Lead" onClose={()=>setShowLeadMsg(false)} width={500}>
+        <Card style={{marginBottom:12,borderColor:C.a+"40",padding:12}}>
+          <M style={{color:C.a,display:"block",marginBottom:4,fontWeight:500}}>End-to-end encrypted. You appear by your pseudonym.</M>
+          <M style={{color:C.tm,lineHeight:1.6}}>This chat is end-to-end encrypted (Signal protocol) -- the server only relays ciphertext and cannot read it. Your lead sees your pseudonym, not your real name, and messages are deleted five minutes after the chat closes. For anonymous support between analysts, use Peer Chat instead.</M>
         </Card>
-        <Card style={{maxHeight:200,overflow:"auto",marginBottom:12}}>
-          {leadMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
-          leadMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:C.a,fontWeight:500}}>{m.from}</M><M style={{color:C.td}}>E2EE · {m.ts}</M></div><div style={{fontSize:12,lineHeight:1.6}}>{m.text}</div></div>)}
-        </Card>
-        <div style={{display:"flex",gap:8}}><input value={newLM} onChange={e=>setNewLM(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newLM.trim()){setLM(prev=>[...prev,{id:Date.now(),from:"You (identified)",ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),text:newLM}]);logC("lead_msg","Identified message sent to lead");setNewLM("");}}} placeholder="Message to your lead (they see your name)..." maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary onClick={()=>{if(newLM.trim()){setLM(prev=>[...prev,{id:Date.now(),from:"You (identified)",ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),text:newLM}]);logC("lead_msg","Identified message sent");setNewLM("");}}} >Send</Btn></div>
+        {!leadThread?(<div>
+          <M style={{color:C.tm,display:"block",marginBottom:8}}>Choose a lead to start an encrypted 1:1. Any on-shift lead can be reached.</M>
+          {leadOptions.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No leads on shift right now.</M>:
+          leadOptions.map(l=><button key={l.id} onClick={()=>openLeadThread(l)} style={{width:"100%",textAlign:"left",padding:"10px 14px",marginBottom:6,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,cursor:"pointer",fontFamily:"inherit",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontWeight:500,fontSize:12}}>{l.name}</span>{l.shift?<span style={{color:C.td,fontSize:11}}>{l.shift} shift</span>:null}</button>)}
+        </div>):(<div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <M style={{color:C.t,fontWeight:500}}>Chatting with {leadThread.leadName||"your lead"}</M>
+            <div style={{display:"flex",gap:12,alignItems:"center"}}>
+              <button onClick={()=>{showLeadSafetyNumber();}} style={{background:"none",border:"none",color:C.a,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Safety #</button>
+              <button onClick={()=>{setLeadThread(null);setLM([]);setLeadSafetyNum(null);}} style={{background:"none",border:"none",color:C.i,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Change lead</button>
+              <button onClick={closeLeadThread} style={{background:"none",border:"none",color:C.w,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Close chat</button>
+            </div>
+          </div>
+          {leadSafetyNum&&<div style={{marginBottom:12,padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderRadius:6}}><M style={{color:C.td,display:"block",marginBottom:2}}>Safety number (read aloud to compare; they must match):</M><M style={{color:C.a,fontFamily:"'Courier New',Courier,monospace",wordBreak:"break-all"}}>{leadSafetyNum}</M></div>}
+          <Card style={{maxHeight:200,overflow:"auto",marginBottom:12}}>
+            {leadMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
+            leadMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:C.a,fontWeight:500}}>{m.from}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><M style={{color:C.td}}>E2EE · {m.ts}</M></div><div style={{fontSize:12,lineHeight:1.6}}>{m.text}</div></div>)}
+          </Card>
+          <div style={{display:"flex",gap:8}}><input value={newLM} onChange={e=>setNewLM(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newLM.trim())sendLeadMessage();}} placeholder="Message to your lead..." maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary disabled={!newLM.trim()||!leadThread} onClick={()=>sendLeadMessage()}>Send</Btn></div>
+          <button onClick={()=>sendLeadMessage("inperson_1on1_request")} disabled={!leadThread} title="Asks your lead to meet face to face. Type a note above first for context, or send as-is." style={{marginTop:8,width:"100%",padding:"8px 12px",background:"transparent",border:`1px solid ${C.i}40`,borderRadius:8,color:C.i,cursor:leadThread?"pointer":"default",fontFamily:"inherit",fontSize:11}}>Request an in-person 1:1</button>
+        </div>)}
       </Modal>}
 
       {showPlatform&&<Modal title={(TRAINING_PLATFORMS.find(t=>t.id===showPlatform)||{}).name||""} onClose={()=>setShowPlatform(null)} width={520}>

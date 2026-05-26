@@ -30,6 +30,22 @@ const schedulerService = {
       }
     }));
 
+    // ── Ephemeral chat retention sweep (U3) ──────────────────────────────
+    // Enforces the "retained five minutes after the conversation closes, then
+    // permanently deleted" claim for BOTH peer chat and lead chat. Runs every
+    // minute so a closed conversation's transport ciphertext is gone within
+    // five to six minutes of close. Session/thread records persist (they are
+    // reusable pairing anchors), and any flagged content lives independently in
+    // the abuse evidence vault, so this sweep never destroys material a reviewer
+    // still needs.
+    this.jobs.push(cron.schedule('* * * * *', () => {
+      try {
+        this.sweepEphemeralChatRetention();
+      } catch (err) {
+        logger.error('Scheduler: ephemeral chat retention sweep failed', { error: err.message });
+      }
+    }));
+
     // ── Expire peer board threads (U2) ───────────────────────────────────
     // A board thread is removed once every post in it — the root and all
     // replies — is past its 7-day window; deleting the root cascades the
@@ -668,6 +684,67 @@ const schedulerService = {
     this._lastBackupSignature = null;
     this.jobs = [];
     logger.info('Scheduler stopped');
+  },
+
+  // ── U3: shared ephemeral-chat retention sweep ──────────────────────────
+  //
+  // Peer chat and lead chat both promise "retained five minutes after the
+  // conversation closes, then permanently deleted." This deletes only the
+  // transport ciphertext rows, and only for conversations closed at least five
+  // minutes ago; the session/thread records persist as reusable pairing anchors
+  // and any flagged content is sealed independently in the abuse evidence vault.
+  //
+  // Lead chat keys on lead_chat_threads.closed_at (a SQLite timestamp) and the
+  // thread set stays small (one reused row per analyst/lead pairing), so a plain
+  // subquery is fine. Peer sessions live as team_config JSON (peer_session_<id>)
+  // with an ISO-8601 closedAt, and accumulate per conversation, so the peer side
+  // is anchored on messages that still exist: it inspects only sessions with
+  // surviving ciphertext, point-looks-up each session's record, and also purges
+  // any orphaned rows whose session record is already gone.
+  sweepEphemeralChatRetention() {
+    const { getDb } = require('../db/init');
+    const db = getDb();
+    try {
+      const leadDeleted = db.prepare(`
+        DELETE FROM lead_messages
+        WHERE thread_id IN (
+          SELECT id FROM lead_chat_threads
+          WHERE status = 'closed' AND closed_at IS NOT NULL
+            AND closed_at <= datetime('now', '-5 minutes')
+        )
+      `).run().changes;
+
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      const sessionIds = db.prepare('SELECT DISTINCT session_id FROM peer_messages').all().map(r => r.session_id);
+      const getSession = db.prepare('SELECT value FROM team_config WHERE key = ?');
+      const expired = [];
+      for (const sid of sessionIds) {
+        const row = getSession.get(`peer_session_${sid}`);
+        if (!row) { expired.push(sid); continue; } // orphaned ciphertext: session record gone
+        let s;
+        try { s = JSON.parse(row.value); } catch { continue; }
+        if (s && s.status === 'closed' && s.closedAt) {
+          const t = Date.parse(s.closedAt);
+          if (!Number.isNaN(t) && t <= cutoff) expired.push(sid);
+        }
+      }
+      let peerDeleted = 0;
+      if (expired.length) {
+        const placeholders = expired.map(() => '?').join(',');
+        peerDeleted = db.prepare(
+          `DELETE FROM peer_messages WHERE session_id IN (${placeholders})`
+        ).run(...expired).changes;
+      }
+
+      if (leadDeleted > 0 || peerDeleted > 0) {
+        logger.info('Scheduler: ephemeral chat retention sweep', {
+          leadMessagesDeleted: leadDeleted,
+          peerMessagesDeleted: peerDeleted,
+        });
+      }
+    } finally {
+      db.close();
+    }
   },
 
   // ── R3i: backup job lifecycle ──────────────────────────────────────────

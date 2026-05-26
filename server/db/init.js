@@ -527,6 +527,77 @@ CREATE INDEX IF NOT EXISTS idx_peer_messages_recipient ON peer_messages (recipie
 CREATE INDEX IF NOT EXISTS idx_peer_messages_created ON peer_messages (created_at);
 
 
+-- ── Lead Messaging (E2EE — server stores only ciphertext) ────────────────
+
+-- Phase U3: ordered, thread-scoped Signal-protocol ciphertext relay for the
+-- pseudonymous analyst<->team-lead chat. Mirrors peer_messages exactly: the
+-- server stores opaque libsignal messages plus routing/ordering metadata only,
+-- holds no keys, and cannot read content. The chat uses the separate 'lead'
+-- key domain (see the e2ee_* pre-key store below), so its key material never
+-- mixes with peer chat. A thread is one analyst/lead pairing; rows are
+-- sequenced per thread by the counter column for the order-sensitive Double
+-- Ratchet. analyst_id and lead_id stamp every row so a later abuse flag
+-- attributes to the exact lead. The analyst is pseudonymous to the lead (the
+-- UUID->pseudonym->real-name map lives only in the lead's offline export);
+-- leads are not pseudonymized. sender_role drives display; kind separates
+-- ordinary chat from an in-person 1-on-1 request. The 5-minute-after-close
+-- purge clock lives on the lead-chat thread record (closed_at), not per
+-- message, so there is no retention column here.
+CREATE TABLE IF NOT EXISTS lead_messages (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  thread_id TEXT NOT NULL,
+  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  lead_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sender_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recipient_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sender_role TEXT NOT NULL CHECK (sender_role IN ('analyst', 'lead')),
+  kind TEXT NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat', 'inperson_1on1_request')),
+  message_type INTEGER NOT NULL,  -- libsignal CiphertextMessageType (PreKey=3, Whisper=2)
+  ciphertext BLOB NOT NULL,       -- opaque serialized libsignal message
+  counter INTEGER NOT NULL,       -- per-thread ordering
+  created_at TEXT DEFAULT (datetime('now')),
+  delivered_at TEXT,
+  read_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_lead_messages_thread ON lead_messages (thread_id, counter);
+CREATE INDEX IF NOT EXISTS idx_lead_messages_recipient ON lead_messages (recipient_user_id);
+CREATE INDEX IF NOT EXISTS idx_lead_messages_created ON lead_messages (created_at);
+
+
+-- ── Lead-chat threads (pairing + retention clock) ────────────────────────
+
+-- Phase U3: one persistent thread per (analyst_id, lead_id) pairing for the
+-- pseudonymous analyst<->team-lead chat. The thread id is the stable libsignal
+-- addressing key (stamped on lead_messages.thread_id) and survives across
+-- conversations, so the Double Ratchet session is reused rather than
+-- re-established on each open. A conversation opens (status 'active'); the
+-- analyst closes it (status 'closed', closed_at set); the shared retention
+-- sweep then deletes the thread's lead_messages five minutes after closed_at.
+-- The thread record itself persists as the reusable pairing anchor -- the
+-- messages are gone but the pair can reopen later. UNIQUE (analyst_id,
+-- lead_id) enforces one thread per pairing; a different lead (e.g. a new
+-- shift) is a different pairing and therefore a new thread. Identities are
+-- present for routing only; the analyst stays pseudonymous in the system
+-- (the UUID->pseudonym->real-name map is the lead's offline export, and leads
+-- are not pseudonymized).
+CREATE TABLE IF NOT EXISTS lead_chat_threads (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  lead_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'closed')),
+  message_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  last_message_at TEXT,
+  closed_at TEXT,
+  UNIQUE (analyst_id, lead_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lead_chat_threads_lead ON lead_chat_threads (lead_id, status);
+CREATE INDEX IF NOT EXISTS idx_lead_chat_threads_analyst ON lead_chat_threads (analyst_id, status);
+CREATE INDEX IF NOT EXISTS idx_lead_chat_threads_closed ON lead_chat_threads (closed_at);
+
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Phase U3: Signal-protocol (X3DH/PQXDH) public pre-key store.
 -- Public key material ONLY. Every private key and all Double-Ratchet session

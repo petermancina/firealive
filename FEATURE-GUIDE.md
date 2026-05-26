@@ -922,7 +922,7 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 **What it's for:** Enable or disable individual features across the platform. Disabling a feature does NOT remove it and never deletes its data — the feature's text greys out (still visible so users know it exists), all action buttons and config inputs deactivate, and an "administratively disabled" message explains that a lead can re-enable it in the Feature Toggles tab. Turning a feature back on restores it exactly as it was. The same behavior applies in the Management Console and the Analyst Client, and a change propagates live to every connected client over the WebSocket channel — no reload needed.
 
 **Not everything is a toggle.** Features are classified:
-- **Toggle** — the 20 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, anonymous lead messaging, identified lead chat, proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, MSP multi-tenancy, CI/CD pipelines). Toggles default on except MSP multi-tenancy and CI/CD, which default off.
+- **Toggle** — the 19 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, pseudonymous lead chat (Signal E2EE), proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, MSP multi-tenancy, CI/CD pipelines). Toggles default on except MSP multi-tenancy and CI/CD, which default off.
 - **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, legal hold, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC's defenses can never be turned off, even by a forged request.
 - **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA and clustering, and so on). These have no switch.
 
@@ -1091,7 +1091,7 @@ The "Request Reduced Tickets" button is two-state: when reduced routing is OFF, 
 1. Analyst feels off, opens My Signals
 2. Sees: "Investigation time: 26 min vs your baseline of 20 min — that's 30% longer"
 3. Clicks the signal — gets context on what this typically means and research-backed responses
-4. Optionally requests reduced queue (anonymous) or messages lead (identified)
+4. Optionally requests reduced queue (anonymous) or messages lead (pseudonymous, E2EE)
 
 ### Inbox
 **What it's for:** Same as MC inbox — optional storage of notifications for users who chose inbox as a delivery channel.
@@ -1121,6 +1121,17 @@ Second — and equally important — true positives that are nonetheless low-lev
 4. They work through the problem
 5. Session times out, chat is gone — but the helper earned points (Helper Pay)
 6. Either analyst can post-session flag if conduct was inappropriate
+
+### Lead Chat
+**What it's for:** A pseudonymous, end-to-end-encrypted 1:1 channel between an analyst and a team lead (Signal protocol: X3DH/PQXDH key agreement and the Double Ratchet, with out-of-band safety-number verification). The analyst picks a specific lead — the lead is named to the analyst — and writes under their own pseudonym, so the lead sees "Analyst-Falcon," never the real name, and the server relays only ciphertext it cannot read. This is the channel for reaching a chosen lead directly: workload concerns, schedule changes, or just asking to talk. For anonymous support, analysts use peer chat instead. The analyst can also send an in-person 1:1 request, which the lead sees surfaced both in a banner and at the top of the Lead Chat inbox. Any on-shift lead is reachable — a lead is never hidden by shift. Messages are deleted five minutes after the chat is closed.
+
+**Workflow:**
+1. Analyst opens "Message Your Lead" and picks an on-shift lead from the roster
+2. The Signal session establishes; the analyst types a message or taps "Request an in-person 1:1"
+3. Lead opens Lead Chat in the Management Console — the thread is labeled by the analyst's pseudonym
+4. Lead reads it (clearing the unread and 1:1 indicators) and replies on the same encrypted channel
+5. Either side can verify the safety number out of band — read it aloud; the numbers must match
+6. Analyst closes the chat; five minutes later the scheduler purges the thread's messages
 
 ### Helper Pay (AC-side)
 **What it's for:** The analyst's own view of their Helper Pay state — points earned from helping peers, current balance, transaction ledger, available rewards, and the leaderboard visibility toggle that controls whether their pseudonym appears on the lead's recognition leaderboard.

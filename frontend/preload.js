@@ -10,6 +10,7 @@ const ALLOWED_CHANNELS = [
   'config:get', 'config:set',
   'audit:log', 'audit:export',
   'notify:desktop',
+  'e2ee:init', 'e2ee:publishBundle', 'e2ee:replenishPrekeys', 'e2ee:processBundle', 'e2ee:hasSession', 'e2ee:encrypt', 'e2ee:decrypt', 'e2ee:safetyNumber',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
