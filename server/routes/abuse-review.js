@@ -147,8 +147,8 @@ router.get('/cases/:id', (req, res) => {
         resolutionNote: f.resolved_at ? (f.resolution_note || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
-        // OPAQUE sealed boxes — the server cannot read these. The Abuse Review
-        // Console opens them client-side with the abuse-review private key.
+        // OPAQUE sealed envelopes — the server cannot read these. The Abuse Review
+        // Console opens them client-side with the reviewer's own private key.
         sealedNote: f.content_encrypted ? Buffer.from(f.content_encrypted).toString('base64') : null,
         sealedContent: v && v.sealed_content_encrypted ? Buffer.from(v.sealed_content_encrypted).toString('base64') : null,
         sealedContext: v && v.context_encrypted ? Buffer.from(v.context_encrypted).toString('base64') : null,
