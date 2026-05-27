@@ -6240,7 +6240,6 @@ function initDb() {
   }
 
   console.log('Database initialized at', DB_PATH);
-  try { require('./reseal-abuse-flags').resealAbuseFlags(db, console); } catch (e) { console.error('reseal-abuse-flags failed (non-fatal):', e.message); }
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();
 }
