@@ -201,7 +201,7 @@ ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {
 ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
   ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
 
-// Seal abuse-flag content to the independent reviewer's public key (Model B).
+// Seal abuse-flag content to the active reviewer recipient set.
 // The renderer passes content it already holds (the decrypted offending message,
 // or the flagger's note) plus the active abuse-review public keys it fetched, and
 // gets back opaque base64 that ONLY a designated reviewer can open. The content is
