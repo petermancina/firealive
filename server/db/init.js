@@ -1512,7 +1512,7 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_unack
 CREATE TABLE IF NOT EXISTS abuse_review_keys (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   public_key BLOB NOT NULL,
-  algo TEXT NOT NULL DEFAULT 'crypto_box_seal',
+  algo TEXT NOT NULL DEFAULT 'x25519-hkdf-sha256-aes256gcm',
   label TEXT,
   fingerprint TEXT,
   registered_by TEXT REFERENCES users(id) ON DELETE SET NULL,
