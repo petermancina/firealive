@@ -3,9 +3,10 @@
 // Login, welcome/setup guide, notifications, query, reports, log integrity
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
 
 const C={bg:"#060A10",s:"#0D1117",b:"#1C2333",t:"#E8EDF5",tm:"#8B949E",td:"#6E7681",a:"#6EE7B7",ad:"rgba(110,231,183,0.08)",w:"#F59E0B",d:"#EF4444",p:"#A78BFA",i:"#60A5FA"};
-const CSS=`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:wght@300;600&display=swap');*{margin:0;padding:0;box-sizing:border-box}@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}`;
+const CSS=`*{margin:0;padding:0;box-sizing:border-box}@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}`;
 const M=({children,...p})=><span style={{fontSize:11,fontFamily:"'IBM Plex Mono',monospace",...p.style}}>{children}</span>;
 const L=({children})=><div style={{fontSize:15,fontWeight:600,color:"#E8EDF5",marginBottom:16,fontFamily:"'Fraunces',serif"}}>{children}</div>;
 const Card=({children,style,...p})=><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,padding:"18px 20px",marginBottom:14,...style}} {...p}>{children}</div>;
@@ -3014,4 +3015,16 @@ export default function GlobalDashboard() {
       <div style={{padding:"14px 24px",borderTop:`1px solid ${C.b}`,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace",display:"flex",justifyContent:"space-between"}}><span>GLOBAL DASHBOARD · READ-ONLY · v1.0.0</span><span>{regions.length} regions · {totalAnalysts} analysts</span></div>
     </div>
   );
+}
+
+// Canonical React 18 mount (PR H): explicit, single, defensive root.
+// No reliance on a runtime transpiler's implicit auto-render.
+const _rootEl = document.getElementById("root");
+if (!_rootEl) {
+  const _err = document.createElement("div");
+  _err.textContent = "Fatal: #root element not found. FireAlive cannot start.";
+  _err.style.cssText = "font-family:monospace;color:#EF4444;padding:24px;font-size:14px";
+  document.body.appendChild(_err);
+} else {
+  createRoot(_rootEl).render(<GlobalDashboard />);
 }

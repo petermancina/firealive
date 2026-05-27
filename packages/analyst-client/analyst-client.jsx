@@ -15,6 +15,7 @@
 // Research Knowledge Base (42 entries) and AI synthesis engine included.
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
 // FIREALIVE — SOC Analyst Wellbeing Platform
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
@@ -33,7 +34,6 @@ import { useState, useEffect, useRef } from "react";
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
-const FONTS_URL = "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,400&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&display=swap";
 const C = {
   bg:"#080C14",s:"rgba(255,255,255,0.02)",sh:"rgba(255,255,255,0.04)",
   b:"rgba(255,255,255,0.06)",ba:"rgba(255,255,255,0.14)",
@@ -69,7 +69,7 @@ function nextLeadCounter(threadId) {
   return c;
 }
 
-const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
+const CSS = `*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -3421,4 +3421,16 @@ export default function AnalystClientApp() {
       </div>
     </div>
   );
+}
+
+// Canonical React 18 mount (PR H): explicit, single, defensive root.
+// No reliance on a runtime transpiler's implicit auto-render.
+const _rootEl = document.getElementById("root");
+if (!_rootEl) {
+  const _err = document.createElement("div");
+  _err.textContent = "Fatal: #root element not found. FireAlive cannot start.";
+  _err.style.cssText = "font-family:monospace;color:#EF4444;padding:24px;font-size:14px";
+  document.body.appendChild(_err);
+} else {
+  createRoot(_rootEl).render(<AnalystClientApp />);
 }

@@ -9,6 +9,7 @@
 // patterns land in later commits (F7+); this commit is the shell + login.
 // ═══════════════════════════════════════════════════════════════════════════════
 import { useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
 // FIREALIVE — SOC Analyst Wellbeing Platform
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
@@ -596,6 +597,14 @@ function App() {
   );
 }
 
-// Explicit React 18 mount. ReactDOM is provided globally by the vendored UMD
-// build loaded in index.html.
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+// Canonical React 18 mount (PR H): explicit, single, defensive root.
+// Uses the imported createRoot; no global ReactDOM / vendored UMD.
+const _rootEl = document.getElementById("root");
+if (!_rootEl) {
+  const _err = document.createElement("div");
+  _err.textContent = "Fatal: #root element not found. FireAlive cannot start.";
+  _err.style.cssText = "font-family:monospace;color:#EF4444;padding:24px;font-size:14px";
+  document.body.appendChild(_err);
+} else {
+  createRoot(_rootEl).render(<App />);
+}

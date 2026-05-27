@@ -17,8 +17,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
 
-const FONTS_URL = "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,400&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&display=swap";
 const C = {
   bg:"#080C14",s:"rgba(255,255,255,0.02)",sh:"rgba(255,255,255,0.04)",
   b:"rgba(255,255,255,0.06)",ba:"rgba(255,255,255,0.14)",
@@ -82,7 +82,7 @@ function nextLeadReplyCounter(threadId) {
   return c;
 }
 
-const CSS = `@import url('${FONTS_URL}');*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
+const CSS = `*{box-sizing:border-box;margin:0;padding:0;}button,select,input,textarea{font-family:inherit;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -1901,7 +1901,6 @@ function ManagementConsole() {
   // POST /api/restore/execute/:id for full/snapshot backups.
   const [restoreModal, setRestoreModal] = useState(null);
   const [snapshots, setSnapshots] = useState([]);
-  const [forensicExports, setFE] = useState([]);
   const [appVersion, setAppVersion] = useState("");
   const [appBuild, setAppBuild] = useState("");
   const [appFuse, setAppFuse] = useState("");
@@ -4688,10 +4687,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               }
             }}>Take Differential Now</Btn>
             <Btn onClick={async()=>{const localId=Date.now();const placeholder={id:localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"capturing",hash:"..."};setSnapshots(prev=>[placeholder,...prev]);try{const r=await api.post("/api/backup",{});setSnapshots(prev=>prev.map(s=>s.id===localId?{id:r.id||localId,ts:new Date().toISOString(),label:"Snapshot-"+(snapshots.length+1),status:"captured",hash:r.manifest_sha256?"sha256:"+r.manifest_sha256.slice(0,16):"(captured)"}:s));addA("SNAPSHOT","id="+r.id);}catch(err){const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"snapshot failed";setSnapshots(prev=>prev.map(s=>s.id===localId?{...s,status:"failed",hash:msg.slice(0,40)}:s));addA("SNAPSHOT_FAILED",msg);}}}>Capture Snapshot Now</Btn>
-            <Btn danger onClick={()=>{const exp={id:Date.now(),ts:new Date().toISOString(),status:"generating",format:"forensic-archive"};setFE(prev=>[exp,...prev]);api.post("/api/audit/mc-event",{event_type:"FORENSIC_EXPORT",detail:"Initiated"}).then(()=>addA("FORENSIC_EXPORT","Initiated"));setTimeout(()=>setFE(prev=>prev.map(e=>e.id===exp.id?{...e,status:"ready",size:"3.1 GB",hash:`sha256:${Math.random().toString(36).substr(2,8)}`}:e)),2500);}}>Export for Forensics</Btn>
+            <Btn onClick={()=>setTab("forensic_exports")}>Open Forensic Exports</Btn>
           </div>
           {snapshots.length>0&&<><L>Snapshots</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{snapshots.map(s=><div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{s.label}</M><br/><M style={{color:C.td}}>{new Date(s.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={C.a}>{s.status}</Badge><br/><M style={{color:C.td,fontSize:8}}>{s.hash}</M></div></div>)}</div></>}
-          {forensicExports.length>0&&<><L>Forensic Exports</L><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,marginBottom:16,overflow:"hidden"}}>{forensicExports.map(e=><div key={e.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t}}>{e.format}</M><br/><M style={{color:C.td}}>{new Date(e.ts).toLocaleString()}</M></div><div style={{textAlign:"right"}}><Badge color={e.status==="ready"?C.a:C.w}>{e.status}</Badge>{e.size&&<><br/><M style={{color:C.td}}>{e.size} · {e.hash}</M></>}</div></div>)}</div></>}
           <L>Backup History</L>
           <div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,overflow:"hidden"}}>{backups.map(b=>{
             // R3l C69: strategy color helper. Full=green, snapshot=blue,
@@ -8540,4 +8538,16 @@ export default function App() {
       <ManagementConsole/>
     </div>
   );
+}
+
+// Canonical React 18 mount (PR H): explicit, single, defensive root.
+// No reliance on a runtime transpiler's implicit auto-render.
+const _rootEl = document.getElementById("root");
+if (!_rootEl) {
+  const _err = document.createElement("div");
+  _err.textContent = "Fatal: #root element not found. FireAlive cannot start.";
+  _err.style.cssText = "font-family:monospace;color:#EF4444;padding:24px;font-size:14px";
+  document.body.appendChild(_err);
+} else {
+  createRoot(_rootEl).render(<App />);
 }
