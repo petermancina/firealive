@@ -251,7 +251,7 @@ function CaseRow({ c, onClick }) {
   );
 }
 
-// ── Case detail: fetch metadata + opaque sealed boxes, decrypt locally ────────
+// ── Case detail: fetch metadata + opaque sealed envelopes, decrypt locally ────
 // The server hands back the note/content as opaque base64 it cannot read; this
 // view opens them with the device's reviewer private key via the main process
 // (abuse:open). Plaintext exists only transiently in this renderer, to display.
