@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — reviewer-only "sealed box" for abuse-flag content (multi-reviewer
+// FIREALIVE — reviewer-only sealed envelope for abuse-flag content (multi-reviewer
 // zero-access). Anyone can SEAL to the active reviewer recipient SET (their
 // PUBLIC keys, registered with the server); any one designated reviewer OPENS
 // with their OWN private key on their OWN device. The server stores only the
