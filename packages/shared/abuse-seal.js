@@ -27,7 +27,7 @@
 //
 // Public keys are X25519 in SPKI DER form (44 bytes), base64 in the registry/API.
 // Both ends share THIS module so the seal and open formats can never diverge.
-// This module also exports a passphrase-wrap layer (FAWK) used by the ABC to
+// This module also exports a passphrase-wrap layer (FAWK) used by the ARC to
 // protect the reviewer's private key at rest -- see the section near the bottom.
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -45,7 +45,7 @@ function pubSpki(keyObj) {
   return keyObj.export({ format: 'der', type: 'spki' });
 }
 
-// Generate a reviewer keypair (used by the ABC at first run; PR F). Returns the
+// Generate a reviewer keypair (used by the ARC at first run; PR F). Returns the
 // public key as SPKI-DER base64 (to register via POST /api/abuse-review-key) and
 // the private key as PKCS8-DER base64 (to seal locally via Electron safeStorage).
 function generateReviewerKeypair() {
@@ -186,7 +186,7 @@ function openForReviewer(privateKey, sealedB64) {
 
 // ── Passphrase-wrapped private key (U3 PR I) ────────────────────────────────────
 // Defense in depth for the reviewer's private key at rest. Before the key is sealed
-// with Electron safeStorage, the ABC wraps it under a passphrase only the reviewer
+// with Electron safeStorage, the ARC wraps it under a passphrase only the reviewer
 // knows: scrypt(passphrase, salt) -> AES-256-GCM over the PKCS8 key bytes. So
 // neither device theft nor an OS-keychain compromise alone yields the key -- the
 // reviewer's passphrase is required to unlock it. The KDF params are embedded so a

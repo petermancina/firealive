@@ -1,6 +1,6 @@
 #!/bin/bash
 # FireAlive — Build & Install Script
-# This script builds all three FireAlive desktop apps from source.
+# This script builds all four FireAlive desktop apps from source.
 # Prerequisites: Node.js 20+, npm 10+
 
 set -e
@@ -64,17 +64,27 @@ npm run build:$PLATFORM 2>/dev/null || echo "  (Run 'npm run build:$PLATFORM' ma
 cd ../..
 echo ""
 
+# Build Abuse Review Console
+echo "Building Abuse Review Console..."
+cd packages/abuse-review-console
+npm install
+npm run build:$PLATFORM 2>/dev/null || echo "  (Run 'npm run build:$PLATFORM' manually if electron-builder is not installed)"
+cd ../..
+echo ""
+
 echo "═══════════════════════════════════════════"
 echo "  Build complete!"
 echo ""
 echo "  Installers are in:"
 echo "    MC:  frontend/dist/"
 echo "    AC:  packages/analyst-client/dist/"
+echo "    ARC: packages/abuse-review-console/dist/"
 echo "    GD:  packages/global-dashboard/dist/"
 echo ""
 echo "  To run in development mode:"
 echo "    Server: node server/index.js"
 echo "    MC:     cd frontend && npm start"
 echo "    AC:     cd packages/analyst-client && npm start"
+echo "    ARC:    cd packages/abuse-review-console && npm start"
 echo "    GD:     cd packages/global-dashboard && npm start"
 echo "═══════════════════════════════════════════"

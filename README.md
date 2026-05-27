@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Wellbeing Platform
 
-**Version:** v1.0.44 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 37 (anti-rollback)
+**Version:** v1.0.45 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 38 (anti-rollback)
 
 ---
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.44) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.45) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -34,6 +34,7 @@ cd packages/global-dashboard-server && node index.js  # GD Server on :4001
 cd packages/analyst-client && npm start  # AC Electron app
 cd frontend && npm start                 # MC Electron app
 cd packages/global-dashboard && npm start # GD Electron app
+cd packages/abuse-review-console && npm start # ARC Electron app
 ```
 
 ### Environment Variables (Optional Features)
@@ -64,21 +65,25 @@ To enable GD push:
 cd packages/analyst-client && npm run build:mac   # .dmg
 cd frontend && npm run build:win                   # .exe
 cd packages/global-dashboard && npm run build:linux # .AppImage
+cd packages/abuse-review-console && npm run build:mac # .dmg
 ```
 
 ---
 
 ## Architecture
 
-Five components:
+Six components:
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | **Analyst Client (AC)** | Electron + React | Desktop app for individual SOC analysts |
 | **Management Console (MC)** | Electron + React | Team Lead configuration and management |
+| **Abuse Review Console (ARC)** | Electron + React | Independent abuse reviewer's app (separate from team leadership) — opens abuse flags client-side with the reviewer's own private key; the server cannot decrypt flag content |
 | **Regional Server** | Node.js + Express + SQLite | Backend API, routing engine, all services |
 | **Global Dashboard (GD)** | Electron + React | CISO cross-region oversight |
 | **GD Server** | Node.js + Express + SQLite | Aggregates data from regional servers |
+
+All four Electron apps (AC, MC, ARC, GD) are self-contained: their UI is precompiled in CI via esbuild into one `app.js` per app, React/ReactDOM are bundled in, every `index.html` loads only that single file, both CSP layers (meta tag + response header) are locked to `script-src 'self'`, and there are no runtime CDN fetches and no runtime transpiler. The apps run in restricted and air-gapped networks and make no external network calls for UI code.
 
 ### Backend Services (37 files)
 
@@ -170,7 +175,16 @@ When active (requires SOAR + Ticketing configured):
 - **Tier-1 data** (team aggregates): Team Lead sees averages, never individual data
 - **GD level**: CISO sees regional health only, no individual data
 - Pseudonyms protect analyst identity in all UIs. UUID stays constant across rotations.
-- Peer chat uses NaCl box E2EE — server cannot decrypt
+- **Peer chat** and **lead chat** are both genuinely end-to-end encrypted via the Signal protocol (libsignal), each on its own key domain. Lead chat is pseudonymous-to-the-lead. The server is a content-blind relay and cannot decrypt either channel.
+- **Abuse-flag content** (peer-session, board-post, and lead-chat reports) is sealed on the flagger's device to the active reviewer recipient set — a multi-recipient X25519 envelope — before it leaves the app. The server stores only opaque ciphertext and cannot decrypt it; review and disposition happen only in the independent **Abuse Review Console** (ARC). Neither management, nor any team lead, nor an admin (who handles only public keys) can read flag content. See the mandate below.
+
+### Independent abuse review (mandate)
+
+Every FireAlive deployment must designate at least one **independent abuse reviewer** before abuse reporting can be used. The role `abuse_reviewer` is separate from team leadership: it sits outside the chain of command an analyst reports into, because a lead may be the subject of a report. Where the deployment cannot maintain a true separation — for example, where one person holds both team-lead and platform-admin duties — a reviewer drawn from HR, an ethics committee, or another independent function is required.
+
+**Multi-reviewer, zero-access.** Each designated reviewer generates their own X25519 keypair on their own device, behind a passphrase only they know. The public key is registered with the server via the MC's Audit → Abuse Reviewers panel; the private key never leaves the reviewer's device. Flag content is sealed on the flagger's device to ALL active reviewer public keys at once (a multi-recipient envelope); any one reviewer opens it with their own private key. No private key is ever shared, exported, or transferred between people, and the admin only ever handles public keys — true zero-access, in the sense that the server, the admin, and any DB or key insider cannot decrypt flag content. Adding a reviewer is registering another public key to the set; removing one is revoking it.
+
+**Until at least one reviewer is registered, abuse reporting is disabled** — with no reviewer public key, nothing could be decrypted, and the flagger's app shows an explicit message saying so. The Abuse Review Console enforces a 12-character passphrase minimum on key generation, holds the unlocked private key in main-process memory for the session only (a 5-minute inactivity hard-lock clears it), and never returns the private key to its renderer.
 
 ---
 
@@ -180,7 +194,7 @@ Compliance reports for 16 frameworks: NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, D
 
 Each report follows a **Shared Responsibility** model split into two halves:
 
-- **verifiedControls** — technical controls FireAlive observes by inspecting its own running state. Categories: access control (RBAC), encryption (AES-256-GCM at rest, TLS in transit, NaCl box for E2EE), audit trail (SHA-256-chained immutable log), authentication (JWT + IAM/SSO + MFA), configuration management (e-fuse anti-rollback), incident response infrastructure (CISM retro protocol, routing-disable kill switches), data protection (pseudonymization, Tier-3 isolation), network (SIEM/SOAR), backups, notifications, and AI engine status.
+- **verifiedControls** — technical controls FireAlive observes by inspecting its own running state. Categories: access control (RBAC), encryption (AES-256-GCM at rest, TLS in transit, libsignal for chat E2EE, X25519 multi-recipient envelopes for abuse-flag content), audit trail (SHA-256-chained immutable log), authentication (JWT + IAM/SSO + MFA), configuration management (e-fuse anti-rollback), incident response infrastructure (CISM retro protocol, routing-disable kill switches), data protection (pseudonymization, Tier-3 isolation), network (SIEM/SOAR), backups, notifications, and AI engine status.
 
 - **customerResponsibility** — organizational, procedural, physical, and contractual controls the operating organization must attest separately. Examples: risk-analysis methodology, workforce sanction policy, designated security official, business associate / data processor contracts, physical safeguards on the deployment environment, breach-notification procedures, board-level governance evidence (ISO 27001 management review minutes, internal audit reports), subprocessor agreements and data-transfer impact assessments. For HIPAA, verifiedControls covers 19 controls; customerResponsibility covers 42. The ratio varies by framework but reflects the reality that software handles a minority of any major compliance regime.
 

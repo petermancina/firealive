@@ -12,18 +12,20 @@ If you're new to FireAlive, start with **The Big Picture** below.
 
 FireAlive is a SOC analyst burnout-prevention platform. Security Operations Centers burn out their analysts at brutal rates — turnover, errors, mental health damage. FireAlive sits inside the team's existing SOC tooling stack and intervenes at the points where burnout actually happens: ticket assignment, peer support, training, post-incident recovery, shift transitions.
 
-Three apps make up the suite:
+Four apps make up the suite:
 
 - **Analyst Client (AC)** — runs on each analyst's workstation. Where the analyst sees their own signals, asks for help, takes care of themselves.
 - **Management Console (MC)** — runs on the team lead's workstation. Where the lead sees aggregate team health (no individual burnout data), configures the platform, runs operations.
+- **Abuse Review Console (ARC)** — runs on the independent abuse reviewer's own workstation. A role separate from team leadership; reviews abuse reports that neither the analyst client nor the management console can decrypt. Every deployment must designate at least one reviewer before abuse reporting becomes available.
 - **Global Dashboard (GD)** — runs on the CISO's workstation. Read-only view aggregating across multiple regional MCs. Executive-level visibility without the operational details.
 
-A regional **Server** sits behind the AC/MC. A separate **GD Server** aggregates from regional MCs.
+A regional **Server** sits behind the AC/MC/ARC. A separate **GD Server** aggregates from regional MCs.
 
-The whole thing is built on three privacy commitments:
+The whole thing is built on four privacy commitments:
 - **Tier-3 data** (individual burnout signals) is encrypted on the analyst's client and never seen by the lead
 - **Tier-1 data** (team-level aggregates) is what the lead sees — averages, never individuals
 - **Pseudonyms** decouple analyst identity from burnout data at the database layer
+- **Abuse-report zero-access:** abuse reports (peer-session, board-post, lead-chat) are sealed on the reporter's device to the active reviewer recipient set before they leave the app. The server, management, team leads, and admins (who handle only public keys) cannot decrypt them — only a designated independent reviewer can.
 
 ---
 
@@ -1318,3 +1320,76 @@ Same purposes as MC equivalents but scoped to the GD server (which is independen
 ### Audit & Forensics
 Audit trail visibility for the GD layer — separate audit log from the regional MCs.
 
+---
+
+# ABUSE REVIEW CONSOLE (the independent reviewer's app)
+
+The Abuse Review Console (ARC) is a separate desktop app for the independent abuse reviewer — a role kept **outside team leadership** so that a lead can be the subject of a report without controlling the review. Every FireAlive deployment must designate at least one independent reviewer; abuse reporting in the AC and MC stays disabled until a reviewer's public key is registered. Where one person holds both team-lead and platform-admin duties, the reviewer comes from an independent function (HR, ethics committee, etc.).
+
+The ARC opens abuse-report content **client-side, with the reviewer's own private key**. The server stores only opaque sealed envelopes; the management console cannot decrypt them; an admin who handles only public keys cannot decrypt them. Adding or removing a reviewer is a public-key operation in the MC's Audit → Abuse Reviewers panel — no private key is ever shared, exported, or transferred between people.
+
+### First-Run Setup
+**What it's for:** Generating the reviewer's keypair on the reviewer's own device and handing the public key to the admin so it can be registered with the server.
+
+**Who uses it:** The independent abuse reviewer, once, on a device only they use.
+
+**Workflow:**
+1. Install the ARC (see SETUP.md). On first launch, set a 12-character (or longer) passphrase, entered twice. The passphrase is the only thing that unlocks the private key on future sessions; if forgotten, the key is unrecoverable and a new one must be designated.
+2. The ARC generates an X25519 keypair locally. The private key is wrapped under the passphrase (scrypt → AES-256-GCM) and then sealed to the OS keychain via Electron `safeStorage`. The private key never reaches the renderer and never leaves the device.
+3. The ARC displays the public key and a 16-hex-character fingerprint. Hand both to the platform admin via an out-of-band channel; never share the passphrase or the private key with anyone.
+4. The admin opens the MC → Audit → Abuse Reviewers panel and registers the public key (the server derives and stores the fingerprint, which the admin can confirm against the one you handed over). Once at least one active public key is registered, abuse reporting becomes available in the AC and MC.
+
+### Sign-in (every session)
+**What it's for:** Authenticating the reviewer (credentials + MFA) and unlocking the in-memory private key for the session.
+
+**Workflow:**
+1. Launch the ARC and enter credentials + TOTP MFA code. The reviewer's role is checked against `abuse_reviewer`; every other role (lead, admin, analyst) is rejected.
+2. Enter your passphrase; the ARC `safeStorage`-decrypts the wrapped private-key blob, scrypt-unwraps it, and holds the unwrapped key in main-process memory **for this session only**. The renderer never sees the key.
+3. A persistent banner across the top of the app reminds the reviewer that they hold independent authority and that management cannot read flag content.
+
+### Case List & Case Detail
+**What it's for:** Browsing abuse reports the server has routed to the active reviewer set and opening one to read the sealed content.
+
+**What you see in the list:** Metadata only — case id, target type (peer-session, board-post, lead-chat), tier, time, parties (a lead who is a party is shown by real name; an analyst is shown only by pseudonym), status. No content. The list is scoped to cases the reviewer has access to (per the assignment rules — no party to the case, no team-lead role).
+
+**What you see in the detail:** The sealed note and the sealed message (and for board-post, a small thread-context snippet) are each fetched as opaque base64 from the server. The ARC decrypts them client-side using the in-memory private key. The plaintext exists only in the renderer for the duration of viewing.
+
+**Workflow:**
+1. Open the Case List tab; pick a case.
+2. The detail view renders the metadata; each sealed panel decrypts locally and shows its plaintext (or an error if the reviewer is not in the recipient set — which can happen for a flag sealed before this reviewer was registered).
+3. Move on to resolution.
+
+### Resolving a Case
+**What it's for:** Closing a case with a disposition note (dismiss / uphold / escalate). The disposition is metadata; no content is altered by resolution.
+
+**Workflow:**
+1. From a case detail view, click Resolve, choose a disposition, enter a note.
+2. The case moves to resolved status; the audit log records who resolved it and the note. The disposition flows back to whatever downstream behaviour the target type requires (a board-post flag upheld keeps the post removed; dismissed returns it to the board).
+
+### Patterns
+**What it's for:** Surfacing **metadata-only** signals across the cases the reviewer has access to — repeat-offender (same person flagged 2+ times in 30 days), escalation (tiers increasing across cases), retaliation (a flag against someone who recently flagged the reviewer's own party). The pattern detector reads metadata only; it never decrypts content.
+
+**Where it lives:** Patterns tab. Clickable signal chips jump to the relevant case detail.
+
+### Locking & Auto-lock
+**What it's for:** Defence in depth around the in-memory private key.
+
+**How it works:**
+- A 5-minute inactivity timer hard-locks the session: the in-memory private key is cleared, the app returns to the unlock screen, and the reviewer re-enters their passphrase to continue.
+- A Lock button is in the header at all times; clicking it clears the in-memory key immediately.
+- Closing all windows (window-all-closed) and shutdown (before-quit) also clear the in-memory key.
+- The on-disk passphrase-wrapped, safeStorage-sealed blob is never touched by any of these; it survives across sessions and shutdowns. Only the passphrase brings it back.
+
+### Adding or Removing Reviewers (admin-side)
+**What it's for:** Curating the active recipient set. Every flag is sealed at submission time to ALL reviewer public keys active at that moment.
+
+**Workflow:**
+- **Adding:** the new reviewer installs the ARC on their own device, generates their own keypair (First-Run Setup above), and hands the public key + fingerprint to the admin. The admin registers it via MC → Audit → Abuse Reviewers. From the next flag onward, content is sealed to the expanded recipient set.
+- **Removing:** the admin revokes the reviewer's public key in the same MC panel. New flags omit the revoked slot. Flags already sealed to a set including that key stay openable by every other active reviewer at the time of sealing.
+
+**Boundary:** the recipient set is computed at seal time. A reviewer registered AFTER a flag was sealed cannot open that older flag — their slot does not exist in the envelope. There is no server-side re-seal path; the server never holds plaintext.
+
+### Recovery
+**Forgotten passphrase:** the private key is irrecoverable. Revoke that public key, have the reviewer generate a fresh keypair (a new passphrase, a new fingerprint), and register the new public key. Past flags that were also sealed to other active reviewers stay openable by them; flags sealed when the lost-key reviewer was the sole active reviewer cannot be reopened by anyone — this is the cost of zero-access.
+
+**Lost or compromised device:** revoke the public key in the MC panel immediately so no new flags are sealed to that slot. The device still holds the passphrase-wrapped private-key blob (passphrase-required to unwrap), so the risk depends on passphrase strength and how quickly revocation happens.

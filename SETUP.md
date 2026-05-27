@@ -27,16 +27,61 @@
 2. Click "Provision New Client" for each analyst joining the platform.
 3. Distribute the Analyst Client installer to your analysts (download link from GitHub Releases).
 
-### Step 5: Analysts Install and Connect
+### Step 5: Designate an Independent Abuse Reviewer
+Before abuse reporting in the Analyst Client and Management Console becomes available, at least one independent abuse reviewer must be designated and their public key registered.
+1. Identify the person (or people) who will serve as independent abuse reviewer. The role is **separate from team leadership** — a lead may be the subject of a report, so a lead cannot review their own abuse cases. Where the deployment cannot maintain strict separation (for example, where one person holds both team-lead and platform-admin duties), draw the reviewer from HR, an ethics committee, or another independent function.
+2. Have the reviewer install the **Abuse Review Console** on their own device and generate their keypair — see the dedicated "For Independent Abuse Reviewers" section below.
+3. The reviewer hands you their public key + fingerprint (out of band — never via the system you're configuring). Open the **Audit → Abuse Reviewers** panel in the MC and click Register; paste the public key, add an optional label (e.g. the reviewer's name or designated function), confirm. The server derives the fingerprint from the public key; check it matches what the reviewer gave you.
+4. Once at least one public key is active in the panel, abuse reporting becomes available in the AC and MC. Repeat for every additional reviewer; flag content is sealed to ALL active reviewer public keys at once. Public keys only — the admin never handles or sees a private key.
+
+### Step 6: Analysts Install and Connect
 1. Analyst downloads and installs the Analyst Client for their OS.
 2. On first launch: enter the server address provided by the Team Lead, then log in with their IAM credentials + MFA code.
 3. The first full shift establishes the analyst's burnout signal baseline. After one shift, the AI begins generating personalized recommendations.
 
-### Step 6: Ongoing Configuration
+### Step 7: Ongoing Configuration
 - **Assessments:** Create skill assessments in the Assessments tab and assign them to analysts.
 - **Upskilling:** Configure per-analyst upskilling hours in the Upskilling Hour tab.
 - **Backups:** Set up automated backup schedules in Backup & Schedules tab.
 - **Compliance:** Run compliance reports for your applicable frameworks in Reports & Compliance tab.
+
+---
+
+## For Independent Abuse Reviewers (Abuse Review Console)
+
+The Abuse Review Console (ARC) is the dedicated app for an independent abuse reviewer — a role separate from team leadership. Every FireAlive deployment must designate at least one independent reviewer; abuse reporting in the Analyst Client and Management Console stays disabled until a reviewer's public key is registered. Where one person holds both team-lead and platform-admin duties, the reviewer must come from an independent function (HR, ethics, etc.).
+
+### Step 1: Install the Abuse Review Console
+1. Download the installer for your OS from the GitHub Releases page:
+   - macOS: `FireAlive-Abuse-Review-Console-<version>-arm64.dmg` or `x64.dmg`
+   - Windows: `FireAlive-Abuse-Review-Console-<version>-Setup.exe`
+   - Linux: `FireAlive-Abuse-Review-Console-<version>.AppImage`
+2. Install on your own device — the device only you use. The private key generated next never leaves this machine.
+
+### Step 2: Generate Your Reviewer Keypair (First Run)
+1. On first launch, the ARC asks you to set a **passphrase** (12-character minimum, entered twice). This passphrase is the only way to unlock your private key on future sessions; if you forget it, the key is unrecoverable and a new key must be designated.
+2. The ARC generates an X25519 keypair locally. The private key is passphrase-wrapped (scrypt → AES-256-GCM) and then sealed to the OS keychain via Electron `safeStorage`, written 0600 to your user data directory. The private key never reaches the renderer and never leaves the device.
+3. The ARC displays your **public key** and a 16-hex-character **fingerprint**. Hand both to your platform admin via an out-of-band channel; never share the passphrase or the private key with anyone.
+
+### Step 3: Admin Registers Your Public Key
+1. The admin opens the Management Console → **Audit → Abuse Reviewers** panel.
+2. They paste your public key, add an optional label (e.g. your name or designated function), and click Register. The server derives the fingerprint from the public key; the admin confirms it matches the fingerprint you handed over.
+3. Once at least one public key is active, abuse reporting becomes available in the AC and MC. Every new flag is sealed to ALL active reviewer public keys at once.
+
+### Step 4: Routine Use — Unlock, Review, Lock
+1. On every launch, the ARC asks for your passphrase. Entering it loads your private key into the ARC's main process for the session only.
+2. The case list shows abuse cases the server has routed to the active reviewer set; the ARC decrypts each case client-side with your private key. The server cannot read the content.
+3. The session locks automatically after 5 minutes of inactivity — the unlocked private key is cleared from memory and you re-enter your passphrase to continue. You can also press the Lock button in the header at any time.
+4. Window-all-closed and before-quit also clear the in-memory key.
+
+### Adding or Removing Reviewers
+- **Add:** the new reviewer installs the ARC on their own device, generates their keypair (Steps 1 and 2), and hands their public key + fingerprint to the admin, who registers it via the MC's Audit → Abuse Reviewers panel. From the next flag onward, content is sealed to the expanded recipient set.
+- **Remove:** the admin revokes the reviewer's public key in the same panel. New flags omit the revoked slot. Flags already sealed to a set including the revoked key stay openable by every other active reviewer at the time of sealing.
+- **Boundary:** the active recipient set is computed at seal time. A reviewer registered AFTER a flag was sealed cannot open that older flag — their slot does not exist in that envelope. There is no server-side re-seal path; the server never holds plaintext.
+
+### Recovery
+- A forgotten passphrase makes the private key irrecoverable. Revoke that public key in the MC panel, have the reviewer generate a fresh keypair (a new passphrase, a new fingerprint), and register the new public key. Past flags that were also sealed to other active reviewers remain openable by them; flags sealed when the lost-key reviewer was the only active reviewer cannot be reopened by anyone — this is the cost of zero-access.
+- A lost or compromised device: revoke the public key in the MC panel immediately so no new flags are sealed to that slot. The device still carries the passphrase-wrapped private-key blob (passphrase-required to unwrap), so the risk of unauthorized decryption depends on passphrase strength and how quickly revocation happens.
 
 ---
 
@@ -74,7 +119,7 @@ These are the **technical** controls FireAlive can observe by inspecting its own
 - Authentication and session management (JWT lifetime, MFA enforcement, SSO integration)
 - Access control and role separation (RBAC, multi-MFA-approval gates for sensitive actions)
 - Audit logging (immutable storage, syslog/CEF export, retention)
-- Encryption at rest and in transit (AES-256-GCM for stored data, TLS for transport, NaCl box for E2EE messages)
+- Encryption at rest and in transit (AES-256-GCM for stored data, TLS for transport, libsignal for chat E2EE, X25519 multi-recipient envelopes for abuse-flag content)
 - Anti-rollback and integrity checks (fuse counter, startup integrity verification)
 - Incident response infrastructure (CISM retro protocol, routing-disable kill switches)
 

@@ -277,7 +277,7 @@ function submitLeadChatFlag(req, res) {
     return res.status(500).json({ error: 'failed to submit flag' });
   }
 
-  // Lead-chat abuse is ABC-only -- a lead may be the accused, so leads are never
+  // Lead-chat abuse is ARC-only -- a lead may be the accused, so leads are never
   // notified here. Instead notify the assigned independent reviewer(s) whose
   // scope covers this case and who are not a party to it (canReview).
   notifyReviewersOfFlag(flagId, tier);

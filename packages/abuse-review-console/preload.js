@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const pkg = require('./package.json');
 
-// Minimal, least-privilege IPC surface. The ABC reaches the server's
+// Minimal, least-privilege IPC surface. The ARC reaches the server's
 // reviewer-only API over HTTP (that needs no IPC); IPC is used ONLY for the
 // reviewer-key operations that must stay in the main process: checking for and
 // generating the org reviewer keypair, and opening sealed case content with the
