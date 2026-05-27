@@ -8,11 +8,12 @@
 // POST /api/peer/flags                       — analyst submits a flag
 // GET  /api/peer/flags/review-pending-count  — lead/admin awareness count (no content)
 //
-// All flag content is sealed on the client (Model B) to the abuse-review public
-// key before it leaves the device; the server stores only opaque sealed boxes it
-// cannot read. Review and resolution happen ONLY in the independent Abuse Review
-// Console (server/routes/abuse-review.js), never here and never by team leads --
-// the MC's old list/resolve/pattern endpoints were removed in the PR G cutover.
+// All flag content is sealed on the flagger's device to the active reviewer
+// recipient set (the shared abuse-seal module's multi-recipient envelope) before
+// it leaves the device; the server stores only opaque sealed envelopes it cannot
+// read. Review and resolution happen ONLY in the independent Abuse Review Console
+// (server/routes/abuse-review.js), never here and never by team leads -- the MC's
+// old list/resolve/pattern endpoints were removed in the PR G cutover.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -26,7 +27,7 @@ const { canReview } = require('../services/abuse-reviewer-access');
 
 const VALID_TIERS = [1, 2, 3];
 
-// Model B flags arrive as client-sealed boxes (base64). A single note/message
+// Flags arrive as client-sealed envelopes (base64). A single note/message
 // seals to well under MAX_SEALED_B64; the board context bundles a few messages,
 // so it gets a larger cap. Shared by all three flag-submission paths.
 const MAX_SEALED_B64 = 16384;
@@ -38,7 +39,7 @@ function isSealedB64(s, maxLen = MAX_SEALED_B64) {
 // Notify the assigned reviewer(s) of a new abuse case -- peer session, board
 // post, or lead chat alike. Since the PR G cutover all abuse review is handled
 // by the independent Abuse Review Console (never by leads: a lead may be the
-// accused, and peer/board content is now reviewer-only Model B), so recipients
+// accused, and all flag content is reviewer-only sealed), so recipients
 // are the abuse_reviewer(s) whose assignment covers this flag AND who are not a
 // party to it (canReview). The notification carries metadata only; the sealed
 // content is decrypted solely in the Abuse Review Console. notify() is
@@ -90,15 +91,17 @@ function notifyReviewersOfFlag(flagId, tier) {
   }
 }
 
-// Submit a flag against a board post (Model B, reviewer-only). The flagger's
-// client seals the note, the offending post body, and a small thread-context
-// window to the abuse-review PUBLIC key before sending; the server stores those
-// opaque boxes verbatim and NEVER reads them -- only the Abuse Review Console,
-// which holds the private key, can. The accused is still resolved from the post
-// row server-side (never trusted from the client): the post's author is metadata
-// the flag needs, not content. The post is pulled from the board pending review.
-// Flagging is gated on a registered abuse-review key -- with none, there is no
-// one who could decrypt a flag. encryptTier3 is deliberately NOT used here.
+// Submit a flag against a board post. The flagger's client seals the note, the
+// offending post body, and a small thread-context window to the active reviewer
+// recipient set (the shared abuse-seal module's multi-recipient envelope) before
+// sending; the server stores those opaque sealed envelopes verbatim and NEVER
+// reads them -- only a designated reviewer's Abuse Review Console, which holds
+// the reviewer's own private key, can. The accused is still resolved from the
+// post row server-side (never trusted from the client): the post's author is
+// metadata the flag needs, not content. The post is pulled from the board
+// pending review. Flagging is gated on at least one registered abuse-review key
+// -- with none, there is no one who could decrypt a flag. encryptTier3 is
+// deliberately NOT used here.
 function submitBoardFlag(req, res) {
   const { boardPostId, tier, sealedNote, sealedContent, sealedContext } = req.body || {};
   if (!boardPostId || typeof boardPostId !== 'string') {
@@ -108,15 +111,15 @@ function submitBoardFlag(req, res) {
     return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
   }
   if (!isSealedB64(sealedContent)) {
-    return res.status(400).json({ error: 'sealedContent required (base64 sealed box of the post body)' });
+    return res.status(400).json({ error: 'sealedContent required (base64 sealed envelope of the post body)' });
   }
   if (!isSealedB64(sealedNote)) {
-    return res.status(400).json({ error: 'sealedNote required (base64 sealed box of the flagger note)' });
+    return res.status(400).json({ error: 'sealedNote required (base64 sealed envelope of the flagger note)' });
   }
   // Context is optional (a top-level post has no thread context), but if present
-  // it must be a valid sealed box.
+  // it must be a valid sealed envelope.
   if (sealedContext !== undefined && sealedContext !== null && !isSealedB64(sealedContext, MAX_SEALED_CONTEXT_B64)) {
-    return res.status(400).json({ error: 'sealedContext, if provided, must be a base64 sealed box' });
+    return res.status(400).json({ error: 'sealedContext, if provided, must be a base64 sealed envelope' });
   }
 
   let flagId;
@@ -146,7 +149,7 @@ function submitBoardFlag(req, res) {
     flagId = crypto.randomBytes(16).toString('hex');
     const flaggerIp = req.ip || (req.connection && req.connection.remoteAddress) || null;
 
-    // Store the client-sealed boxes verbatim. content_encrypted holds the sealed
+    // Store the client-sealed envelopes verbatim. content_encrypted holds the sealed
     // note; the vault holds the sealed post body and (if any) the sealed context.
     const noteBox = Buffer.from(sealedNote, 'base64');
     const contentBox = Buffer.from(sealedContent, 'base64');
@@ -186,14 +189,15 @@ function submitBoardFlag(req, res) {
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
 }
 
-// Submit a flag against a lead-chat message (Model B, reviewer-only). Either
+// Submit a flag against a lead-chat message (sealed reviewer-only). Either
 // party may flag the other, so unlike peer flags the accused is NOT required to
 // be an analyst -- a lead can be accused. Lead chat is E2EE, so the server can't
 // read transport ciphertext; the flagger's client decrypts the offending message
-// locally and seals BOTH it and the flagger's note to the abuse-review PUBLIC key
-// (libsodium sealed box) before sending. The server stores those opaque sealed
-// boxes verbatim and NEVER decrypts them -- only the Abuse Review Console, which
-// holds the private key, can. encryptTier3 is deliberately NOT used here.
+// locally and seals BOTH it and the flagger's note to the active reviewer
+// recipient set (the shared abuse-seal module's multi-recipient envelope) before
+// sending. The server stores those opaque sealed envelopes verbatim and NEVER
+// decrypts them -- only a designated reviewer's Abuse Review Console, which holds
+// the reviewer's own private key, can. encryptTier3 is deliberately NOT used here.
 //
 // Reviewed ONLY by the independent Abuse Review Console (U3 PR F), never by team
 // leads (a lead may be the accused): this path does NOT notify leads, and the
@@ -209,10 +213,10 @@ function submitLeadChatFlag(req, res) {
     return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
   }
   if (!isSealedB64(sealedContent)) {
-    return res.status(400).json({ error: 'sealedContent required (base64 sealed box of the offending message)' });
+    return res.status(400).json({ error: 'sealedContent required (base64 sealed envelope of the offending message)' });
   }
   if (!isSealedB64(sealedNote)) {
-    return res.status(400).json({ error: 'sealedNote required (base64 sealed box of the flagger note)' });
+    return res.status(400).json({ error: 'sealedNote required (base64 sealed envelope of the flagger note)' });
   }
 
   let flagId;
@@ -244,7 +248,7 @@ function submitLeadChatFlag(req, res) {
     flagId = crypto.randomBytes(16).toString('hex');
     const flaggerIp = req.ip || (req.connection && req.connection.remoteAddress) || null;
 
-    // Store the client-sealed boxes verbatim. content_encrypted holds the sealed
+    // Store the client-sealed envelopes verbatim. content_encrypted holds the sealed
     // note; the vault's sealed_content_encrypted holds the sealed offending text.
     // Neither is server-decryptable.
     const noteBox = Buffer.from(sealedNote, 'base64');
@@ -289,11 +293,11 @@ function submitLeadChatFlag(req, res) {
 
 // ── POST /api/peer/flags — submit a flag ────────────────────────────────────
 //
-// Request body (peer-session flag; Model B):
+// Request body (peer-session flag):
 //   {
 //     sessionId: string (required)  — the peer skill-share session being flagged
 //     tier: 1 | 2 | 3 (required)
-//     sealedNote: string (required) — base64 sealed box of the flagger's note,
+//     sealedNote: string (required) — base64 sealed envelope of the flagger's note,
 //                                     sealed on-device to the abuse-review key
 //   }
 // The accused is NOT supplied by the client: peer sessions are pseudonymous, so
@@ -325,10 +329,10 @@ router.post('/flags', (req, res) => {
   if (!VALID_TIERS.includes(tier)) {
     return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
   }
-  // Model B: the client seals its note to the abuse-review key before sending;
-  // the server stores the opaque box verbatim and never reads it.
+  // The client seals its note to the active reviewer recipient set before
+  // sending; the server stores the opaque envelope verbatim and never reads it.
   if (!isSealedB64(sealedNote)) {
-    return res.status(400).json({ error: 'sealedNote required (base64 sealed box of the flagger note)' });
+    return res.status(400).json({ error: 'sealedNote required (base64 sealed envelope of the flagger note)' });
   }
 
   let flagId;

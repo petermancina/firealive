@@ -1,20 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Abuse Review API (U3 PR E, Model B) — reviewer-only
+// FIREALIVE — Abuse Review API — reviewer-only
 //
-// Serves abuse cases to the independent abuse_reviewer ONLY. Mounted (E5) behind
+// Serves abuse cases to the independent abuse_reviewer ONLY. Mounted behind
 // authMiddleware(['abuse_reviewer']); every handler ALSO re-checks access with
 // canReview() (role + not-a-party + scope) so no single guard is load-bearing.
 //
-// The server NEVER decrypts flag content. For lead_chat (Model B) the sealed note
-// and the sealed offending message are stored as opaque boxes; this API hands
-// them back as base64 and the Abuse Review Console (PR F) opens them client-side
-// with the abuse-review private key. Identity reveal follows the policy: a lead
-// who is a party is shown by real name; an analyst is ONLY ever a pseudonym.
+// The server NEVER decrypts flag content. Every flag's sealed note and sealed
+// offending message are stored as opaque multi-recipient envelopes (the shared
+// abuse-seal module's FAS2 format); this API hands them back as base64 and the
+// Abuse Review Console opens them client-side with the reviewer's own private
+// key, which never leaves the reviewer's device. Identity reveal follows the
+// policy: a lead who is a party is shown by real name; an analyst is ONLY ever
+// a pseudonym.
 //
-// Reviewable target types are limited to 'lead_chat' for now. Peer/board flags
-// stay under Model A / MC review until the PR G cutover, which re-seals them to
-// Model B and widens REVIEWABLE_TARGET_TYPES here. Serving them before then would
-// hand the console undecryptable bytes and double-surface cases still in the MC.
+// All three flag target types are reviewable: 'lead_chat', 'peer_session',
+// 'board_post'. The management console never reviews abuse content; that
+// authority is exclusively the independent abuse reviewer's.
 //
 //   GET  /cases            — list reviewable cases the reviewer may access (metadata only)
 //   GET  /cases/:id        — one case: metadata + opaque sealed note/content (base64)
@@ -28,10 +29,9 @@ const { logger } = require('../services/logger');
 const { canReview, REVIEWER_ROLE } = require('../services/abuse-reviewer-access');
 
 // All three flag target types are reviewed here, by the independent Abuse Review
-// Console ONLY. lead_chat was Model B from the start (PR D); peer_session and
-// board_post were re-sealed to Model B and removed from MC review in the PR G
-// cutover (see server/db/reseal-abuse-flags.js), so all three are now reviewer-
-// only and the server cannot read any of them.
+// Console ONLY. Each case's sealed content is opaque to the server -- it was
+// sealed on the flagger's device to the active reviewer recipient set, and only
+// a designated reviewer with the matching private key can open it.
 const REVIEWABLE_TARGET_TYPES = ['lead_chat', 'peer_session', 'board_post'];
 const REVIEWABLE_IN = REVIEWABLE_TARGET_TYPES.map(() => '?').join(', ');
 
@@ -147,8 +147,8 @@ router.get('/cases/:id', (req, res) => {
         resolutionNote: f.resolved_at ? (f.resolution_note || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
-        // OPAQUE sealed boxes — the server cannot read these. The Abuse Review
-        // Console opens them client-side with the abuse-review private key.
+        // OPAQUE sealed envelopes — the server cannot read these. The Abuse Review
+        // Console opens them client-side with the reviewer's own private key.
         sealedNote: f.content_encrypted ? Buffer.from(f.content_encrypted).toString('base64') : null,
         sealedContent: v && v.sealed_content_encrypted ? Buffer.from(v.sealed_content_encrypted).toString('base64') : null,
         sealedContext: v && v.context_encrypted ? Buffer.from(v.context_encrypted).toString('base64') : null,

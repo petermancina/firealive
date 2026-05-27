@@ -108,11 +108,11 @@ try {
 // The reviewer-only seal helper (packages/shared/abuse-seal.js) is bundled the
 // same way; load it with the same packaged/source fallback. It needs no native
 // dependency (Node crypto only), so a plain require is enough.
-let sealToReviewer;
+let sealToReviewers;
 try {
-  ({ sealToReviewer } = require('./abuse-seal'));
+  ({ sealToReviewers } = require('./abuse-seal'));
 } catch {
-  ({ sealToReviewer } = require('../shared/abuse-seal'));
+  ({ sealToReviewers } = require('../shared/abuse-seal'));
 }
 
 // libsignal is a native ESM module; load it dynamically and normalize the
@@ -201,20 +201,25 @@ ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {
 ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
   ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
 
-// Seal abuse-flag content to the independent reviewer's public key (Model B).
+// Seal abuse-flag content to the active reviewer recipient set.
 // The renderer passes content it already holds (the decrypted offending message,
-// or the flagger's note) plus the abuse-review public key it fetched, and gets
-// back opaque base64 that ONLY the Abuse Review Console can open. The server
-// stores it and cannot read it; no private key is ever involved here. The
-// renderer calls this once per field (offending text, note).
-ipcMain.handle('abuse:seal', async (_e, { recipientPublicKey, plaintext } = {}) => {
-  if (typeof recipientPublicKey !== 'string' || !recipientPublicKey) {
-    throw new Error('recipientPublicKey (base64) required');
+// or the flagger's note) plus the active abuse-review public keys it fetched, and
+// gets back opaque base64 that ONLY a designated reviewer can open. The content is
+// sealed to ALL active reviewer keys at once (one multi-recipient envelope), so any
+// one reviewer opens it with their own private key. The server stores it and cannot
+// read it; no private key is ever involved here. The renderer calls this once per
+// field (offending text, note).
+ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext } = {}) => {
+  if (!Array.isArray(recipientPublicKeys) || recipientPublicKeys.length === 0) {
+    throw new Error('recipientPublicKeys (non-empty array of base64) required');
+  }
+  if (!recipientPublicKeys.every((k) => typeof k === 'string' && k)) {
+    throw new Error('each recipient public key must be base64');
   }
   if (typeof plaintext !== 'string') {
     throw new Error('plaintext (string) required');
   }
-  return { sealed: sealToReviewer(recipientPublicKey, plaintext) };
+  return { sealed: sealToReviewers(recipientPublicKeys, plaintext) };
 });
 
 app.whenReady().then(createWindow);

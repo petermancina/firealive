@@ -1495,26 +1495,33 @@ CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_type
 CREATE INDEX IF NOT EXISTS idx_peer_abuse_patterns_unack
   ON peer_abuse_patterns(severity, created_at DESC) WHERE acknowledged_at IS NULL;
 
--- Abuse-review public-key registry (U3 PR D, Model B). Holds ONLY the public
--- key of the org's independent abuse-review keypair. Flag content (peer,
--- board, lead-chat) is sealed to this public key by the flagger's client
--- (libsodium crypto_box_seal) before it leaves the device, so the server
--- stores only opaque ciphertext it cannot open; the matching private key lives
--- solely in the Abuse Review Console, never here. A registered active row is
--- the gate that enables flagging across the AC/MC: with no active key there is
--- no one who could decrypt a flag, so flagging stays disabled. Public material
--- only -- no secret is ever stored in this table. registered_by is the admin
--- or reviewer who registered the key (SET NULL if that user is later removed).
+-- Abuse-review public-key registry (U3 PR D, extended for multi-reviewer in
+-- PR I). Holds ONLY public keys. Each ACTIVE row is one independent reviewer's
+-- public key, and together the active rows form the recipient SET: flag content
+-- (peer, board, lead-chat) is sealed to ALL active public keys at once by the
+-- flagger's client before it leaves the device, so the server stores only opaque
+-- ciphertext it cannot open and any one reviewer can open a flag with their own
+-- private key. The matching private keys live solely on each reviewer's device
+-- (in the Abuse Review Console), never here. At least one active row is the gate
+-- that enables flagging across the AC/MC: with no active key there is no one who
+-- could decrypt a flag, so flagging stays disabled. Public material only -- no
+-- secret is ever stored in this table. label is a human name for the key;
+-- fingerprint is the 8-byte public-key fingerprint (hex) used for display and
+-- duplicate rejection. registered_by is the admin or reviewer who registered the
+-- key (SET NULL if that user is later removed).
 CREATE TABLE IF NOT EXISTS abuse_review_keys (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   public_key BLOB NOT NULL,
-  algo TEXT NOT NULL DEFAULT 'crypto_box_seal',
+  algo TEXT NOT NULL DEFAULT 'x25519-hkdf-sha256-aes256gcm',
+  label TEXT,
+  fingerprint TEXT,
   registered_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
--- The flagging gate reads the most recent active key, so index for that lookup.
+-- The flagging gate and seal path read ALL active keys (the recipient set),
+-- ordered newest first; this partial index serves that lookup.
 CREATE INDEX IF NOT EXISTS idx_abuse_review_keys_active
   ON abuse_review_keys(created_at DESC)
   WHERE active = 1;
@@ -3311,6 +3318,30 @@ function initDb() {
   } catch (handshakeMigrationErr) {
     console.error('gd_push_config Phase 5 handshake migration FAILED:', handshakeMigrationErr.message);
     console.error('The server will start, but the GD-push handshake state will be unavailable until the migration is investigated.');
+  }
+
+
+  // ── Migration: abuse_review_keys label + fingerprint (U3 PR I) ─────────────
+  // The single active reviewer key becomes a recipient SET: each active row is
+  // one independent reviewer's public key, and flag content is sealed to all of
+  // them at once. label (a human name for the key) and fingerprint (the 8-byte
+  // public-key fingerprint, hex) identify each key in the admin UI and let the
+  // register endpoint reject duplicates. Both are nullable so rows from the
+  // single-key era migrate cleanly. PRAGMA-guarded, so re-running initDb is a
+  // no-op on fresh installs (which get the columns from SCHEMA) and on migrated
+  // databases.
+  try {
+    const arkCols = db.prepare("PRAGMA table_info(abuse_review_keys)").all().map(c => c.name);
+    const addArkCol = (col, ddl) => {
+      if (!arkCols.includes(col)) {
+        db.exec(`ALTER TABLE abuse_review_keys ADD COLUMN ${ddl}`);
+        console.log(`abuse_review_keys migration (U3 PR I): added ${col} column`);
+      }
+    };
+    addArkCol('label', 'label TEXT');
+    addArkCol('fingerprint', 'fingerprint TEXT');
+  } catch (arkMigErr) {
+    console.error('abuse_review_keys label/fingerprint migration failed (non-fatal):', arkMigErr.message);
   }
 
 
@@ -6209,7 +6240,6 @@ function initDb() {
   }
 
   console.log('Database initialized at', DB_PATH);
-  try { require('./reseal-abuse-flags').resealAbuseFlags(db, console); } catch (e) { console.error('reseal-abuse-flags failed (non-fatal):', e.message); }
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();
 }

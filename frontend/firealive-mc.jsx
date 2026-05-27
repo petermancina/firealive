@@ -973,6 +973,47 @@ function MyMfaSecuritySection() {
 
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
+  // Abuse-reviewer recipient set: list of active reviewer public keys, register
+  // form fields, and a small status state. Public-key operations only (the
+  // private keys live on each reviewer's device behind their passphrase).
+  const [arKeys, setArKeys] = useState(null);   // null=unloaded, [] = loaded empty, [{...}] = present
+  const [arKeysErr, setArKeysErr] = useState("");
+  const [arMsg, setArMsg] = useState("");
+  const [arNewPub, setArNewPub] = useState("");
+  const [arNewLabel, setArNewLabel] = useState("");
+  const [arBusy, setArBusy] = useState(false);
+  async function loadAbuseReviewers() {
+    setArKeysErr(""); setArKeys(null);
+    const r = await api.get("/api/abuse-review-keys");
+    if (r && r.error) { setArKeysErr("Could not load reviewer keys."); setArKeys([]); return; }
+    setArKeys(Array.isArray(r && r.keys) ? r.keys : []);
+  }
+  async function registerReviewerKey() {
+    setArKeysErr(""); setArMsg("");
+    const pub = (arNewPub || "").trim();
+    const label = (arNewLabel || "").trim();
+    if (!pub) { setArKeysErr("Public key (base64) required."); return; }
+    setArBusy(true);
+    const r = await api.post("/api/abuse-review-key", { publicKey: pub, label: label || undefined });
+    setArBusy(false);
+    if (!r) { setArKeysErr("No response from server."); return; }
+    if (r.error) { setArKeysErr(r.error); return; }
+    setArMsg(`Added reviewer${r.fingerprint ? " " + r.fingerprint : ""}.`);
+    setArNewPub(""); setArNewLabel("");
+    loadAbuseReviewers();
+  }
+  async function revokeReviewerKey(id) {
+    setArKeysErr(""); setArMsg("");
+    if (!window.confirm("Revoke this reviewer key? New flags will not seal to it; flags already sealed to other active reviewers stay openable by them.")) return;
+    setArBusy(true);
+    const r = await api.post(`/api/abuse-review-key/${id}/revoke`, {});
+    setArBusy(false);
+    if (!r) { setArKeysErr("No response from server."); return; }
+    if (r.error) { setArKeysErr(r.error); return; }
+    setArMsg("Reviewer revoked.");
+    loadAbuseReviewers();
+  }
+  useEffect(() => { if (tab === "abuse_reviewers" && arKeys === null) loadAbuseReviewers(); }, [tab]);
   const [gDepth, setGD] = useState(null);
   const [pDepths, setPD] = useState({});
   const [silenced, setSil] = useState([]);
@@ -1048,9 +1089,9 @@ function ManagementConsole() {
   const [leadChatMsgs, setLeadChatMsgs] = useState([]);
   const [leadChatInput, setLeadChatInput] = useState("");
   const [leadChatSessionReady, setLeadChatSessionReady] = useState(false);
-  // Phase U3: lead-chat abuse flag (Model B parity). A lead can report an
-  // analyst's message; it is sealed on the client to the independent reviewer's
-  // public key and posted as a lead_chat flag. leadFlagMsg holds the message.
+  // Phase U3: lead-chat abuse flag. A lead can report an analyst's message; it
+  // is sealed on the client to the active reviewer recipient set and posted as
+  // a lead_chat flag. leadFlagMsg holds the message.
   const [leadFlagMsg, setLeadFlagMsg] = useState(null);
   const [leadFlagTier, setLeadFlagTier] = useState(0); // 0=unselected, 1/2/3
   const [leadFlagNote, setLeadFlagNote] = useState("");
@@ -1089,12 +1130,12 @@ function ManagementConsole() {
       setLeadChatMsgs(prev => [...prev, local]);
     } catch (e) { /* swallow; the analyst can resend if needed */ }
   };
-  // Phase U3: a lead reports an analyst's lead-chat message (Model B parity).
-  // Fetches the independent reviewer's public key; if none is registered,
-  // reporting is unavailable. Otherwise seals the offending message and the note
-  // to that key via the main-process abuse:seal handler -- the server stores
-  // only the opaque boxes and can never read them -- and posts a lead_chat flag.
-  // The accused analyst is resolved server-side from the thread.
+  // Phase U3: a lead reports an analyst's lead-chat message. Fetches the active
+  // reviewer recipient set; if none is registered, reporting is unavailable.
+  // Otherwise seals the offending message and the note to every active reviewer
+  // via the main-process abuse:seal handler -- the server stores only the
+  // opaque sealed envelopes and can never read them -- and posts a lead_chat
+  // flag. The accused analyst is resolved server-side from the thread.
   const submitLeadChatFlag = async () => {
     const m = leadFlagMsg;
     if (!m || !leadFlagTier || !leadFlagNote.trim() || !leadChatSel || !leadChatSel.threadId) return;
@@ -1102,14 +1143,14 @@ function ManagementConsole() {
     if (!bridge || !bridge.invoke) { setLeadFlagErr("Reporting requires the desktop app."); return; }
     setLeadFlagBusy(true); setLeadFlagErr("");
     try {
-      const k = await api.get("/api/abuse-review-key");
-      if (!k || !k.active || !k.key || !k.key.publicKey) {
+      const k = await api.get("/api/abuse-review-keys");
+      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
         setLeadFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
         setLeadFlagBusy(false); return;
       }
-      const pub = k.key.publicKey;
-      const sc = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: leadFlagNote.trim() });
+      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
+      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim() });
       if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadChatSel.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
@@ -2855,7 +2896,7 @@ function ManagementConsole() {
       {id:"monitoring",label:"System Health"},{id:"vulnscan",label:"Vulnerability Scan"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},
     ]},
     {cat:"audit_cat",label:"Audit",items:[
-      {id:"audit",label:"Audit Log"},{id:"forensic_exports",label:"Forensic Exports"},
+      {id:"audit",label:"Audit Log"},{id:"forensic_exports",label:"Forensic Exports"},{id:"abuse_reviewers",label:"Abuse Reviewers"},
     ]},
   ];
   // Flat list for tab rendering compatibility
@@ -8501,6 +8542,49 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </tbody>
             </table>
           </Card>)}
+        </div>)}
+        {tab==="abuse_reviewers"&&(<div>
+          <L>Abuse Reviewers — Recipient Set</L>
+          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Each active row below is one independent reviewer's public key. Flag content from analysts and leads is sealed to ALL active keys at once, so any one reviewer can open a flag with their own private key. The private keys never appear here — they live on each reviewer's device behind their passphrase. Adding a reviewer is registering another public key; revoking one removes that reviewer from the active set without affecting other reviewers' ability to open existing flags.</M>
+          {arKeysErr && <Card style={{marginBottom:12,padding:"10px 14px",background:C.dd,border:`1px solid ${C.d}40`}}><M style={{color:C.d}}>{arKeysErr}</M></Card>}
+          {arMsg && !arKeysErr && <Card style={{marginBottom:12,padding:"10px 14px",background:C.ad,border:`1px solid ${C.a}40`}}><M style={{color:C.a}}>{arMsg}</M></Card>}
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>Active reviewers</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10}}>With no active reviewer, flagging is disabled across the platform.</M>
+            {arKeys === null && <M style={{color:C.tm}}>Loading…</M>}
+            {Array.isArray(arKeys) && arKeys.length === 0 && <M style={{color:C.tm}}>No reviewers active. Add one below to enable flagging.</M>}
+            {Array.isArray(arKeys) && arKeys.length > 0 && (
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>
+                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600}}>Label</th>
+                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>Fingerprint</th>
+                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600}}>Algorithm</th>
+                  <th style={{textAlign:"right",padding:"6px 8px",color:C.tm,fontWeight:600}}>Action</th>
+                </tr></thead>
+                <tbody>
+                  {arKeys.map(k => (
+                    <tr key={k.id} style={{borderBottom:`1px solid ${C.b}`}}>
+                      <td style={{padding:"8px",color:C.t}}>{k.label || <span style={{color:C.tm,fontStyle:"italic"}}>unnamed</span>}</td>
+                      <td style={{padding:"8px",color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.fingerprint || <span style={{fontStyle:"italic"}}>—</span>}</td>
+                      <td style={{padding:"8px",color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.algo}</td>
+                      <td style={{padding:"8px",textAlign:"right"}}><Btn small danger disabled={arBusy} onClick={()=>revokeReviewerKey(k.id)}>Revoke</Btn></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Card>
+
+          <Card>
+            <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>Add a reviewer</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Paste the public key the reviewer generated on their device (shown after their first-run key creation in the Abuse Review Console). The fingerprint is derived server-side and a duplicate is rejected.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:4}}>Label (optional)</M>
+            <input type="text" value={arNewLabel} onChange={e=>setArNewLabel(e.target.value)} placeholder="Reviewer A — Jordan" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace",marginBottom:10,boxSizing:"border-box"}}/>
+            <M style={{color:C.tm,display:"block",marginBottom:4}}>Public key (base64 SPKI-DER)</M>
+            <textarea value={arNewPub} onChange={e=>setArNewPub(e.target.value)} rows={3} placeholder="MCowBQYDK2VuAyEA..." style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",marginBottom:10,boxSizing:"border-box",resize:"vertical"}}/>
+            <Btn primary disabled={arBusy || !arNewPub.trim()} onClick={registerReviewerKey}>{arBusy?"Working…":"Register reviewer"}</Btn>
+          </Card>
         </div>)}
           </div>{/* end content area */}
         </div>{/* end sidebar flex container */}

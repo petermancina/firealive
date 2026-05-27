@@ -251,7 +251,7 @@ function CaseRow({ c, onClick }) {
   );
 }
 
-// ── Case detail: fetch metadata + opaque sealed boxes, decrypt locally ────────
+// ── Case detail: fetch metadata + opaque sealed envelopes, decrypt locally ────
 // The server hands back the note/content as opaque base64 it cannot read; this
 // view opens them with the device's reviewer private key via the main process
 // (abuse:open). Plaintext exists only transiently in this renderer, to display.
@@ -426,46 +426,102 @@ function PatternCard({ p, onOpenCase }) {
   );
 }
 
-// ── First-run key bootstrap ───────────────────────────────────────────────────
-// The reviewer private key is generated and sealed ON THIS DEVICE (abuse:generateKey,
-// main process). It never leaves. The matching PUBLIC key must be registered by an
-// ADMIN (POST /api/abuse-review-key is admin-only) -- that registration is what
-// enables abuse reporting across the AC/MC. So this view generates locally and then
-// shows the public key for an admin to register. Additional reviewers must be
-// provisioned the EXISTING key, not generate a new one (key import is later work).
-function KeyBootstrap({ onContinue }) {
-  const [pub, setPub] = useState(null);     // {algo, publicKeyB64} after generate
+// ── First-run key bootstrap (multi-reviewer zero-access) ──────────────────────
+// Each reviewer generates their OWN keypair on their OWN device, behind a
+// passphrase known only to them. The private key is passphrase-wrapped and then
+// sealed with safeStorage in the main process; only this device, with this
+// passphrase, can open flags addressed to this reviewer. Adding a reviewer means
+// adding another public key to the active recipient set on the server -- it
+// does NOT share or copy this key. There is no organisation-wide private key
+// to leak.
+function KeyBootstrap({ onUnlocked }) {
+  const [pass1, setPass1] = useState("");
+  const [pass2, setPass2] = useState("");
+  const [created, setCreated] = useState(null);  // {algo, publicKeyB64, fingerprint} after generate
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const MIN = 12;
 
   async function generate() {
-    setError(""); setBusy(true);
+    setError("");
+    if (pass1.length < MIN) { setError(`Choose a passphrase of at least ${MIN} characters.`); return; }
+    if (pass1 !== pass2) { setError("Passphrases do not match."); return; }
+    setBusy(true);
     try {
-      const r = await window.firealive.invoke("abuse:generateKey");
+      const r = await window.firealive.invoke("abuse:generateKey", pass1);
+      if (!r || !r.publicKeyB64) { setBusy(false); setError("Key generation did not return a public key."); return; }
+      // Unlock the new key right away so the reviewer can use the console without re-entering the passphrase.
+      await window.firealive.invoke("abuse:unlock", pass1);
       setBusy(false);
-      if (!r || !r.publicKeyB64) { setError("Key generation did not return a public key."); return; }
-      setPub(r);
-    } catch (e) { setBusy(false); setError("Could not generate the reviewer key on this device. OS secure storage may be unavailable, or a key already exists."); }
+      setCreated(r);
+    } catch (e) {
+      setBusy(false);
+      setError("Could not generate the reviewer key on this device. OS secure storage may be unavailable, or a key already exists.");
+    }
   }
 
-  if (pub) {
+  if (created) {
     return (
       <div style={{maxWidth:620,animation:"fadeIn .3s ease"}}>
         <div style={{fontSize:15,fontWeight:600,color:C.t,fontFamily:SERIF,marginBottom:8}}>Reviewer key created</div>
-        <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14}}>The private key is sealed on this device and never leaves it. Give the public key below to an administrator to register — registration turns on abuse reporting across the platform, so analysts and leads can seal reports to this key.</div>
-        <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Public key · {pub.algo}</div>
-        <code style={{display:"block",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,padding:14,fontSize:12,color:C.t,wordBreak:"break-all",fontFamily:MONO,userSelect:"all",lineHeight:1.6,marginBottom:16}}>{pub.publicKeyB64}</code>
-        <button onClick={onContinue} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:MONO}}>Continue to console</button>
+        <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14}}>The private key is passphrase-wrapped and sealed on this device; it never leaves. Give the public key and fingerprint below to an administrator -- they add YOUR key to the active recipient set, alongside any other reviewers. Flags are sealed to every active key at once, so any one reviewer opens them with their own private key.</div>
+        <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Fingerprint</div>
+        <code style={{display:"block",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,padding:"10px 14px",fontSize:12,color:C.t,fontFamily:MONO,userSelect:"all",marginBottom:14}}>{created.fingerprint}</code>
+        <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Public key · {created.algo}</div>
+        <code style={{display:"block",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,padding:14,fontSize:12,color:C.t,wordBreak:"break-all",fontFamily:MONO,userSelect:"all",lineHeight:1.6,marginBottom:16}}>{created.publicKeyB64}</code>
+        <button onClick={()=>onUnlocked(created.fingerprint)} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:MONO}}>Continue to console</button>
       </div>
     );
   }
   return (
     <div style={{maxWidth:620,animation:"fadeIn .3s ease"}}>
-      <div style={{fontSize:15,fontWeight:600,color:C.t,fontFamily:SERIF,marginBottom:8}}>Set up the reviewer key</div>
-      <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:6}}>This device has no reviewer key, so reported content cannot be decrypted yet.</div>
-      <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14}}><span style={{color:C.w,fontWeight:600}}>If you are the first reviewer,</span> generate the organization keypair below; the private key is sealed on this device and an administrator registers the public key to enable reporting. <span style={{color:C.w,fontWeight:600}}>If another reviewer already exists,</span> do not generate a new key — ask an administrator to provision you the existing key instead.</div>
+      <div style={{fontSize:15,fontWeight:600,color:C.t,fontFamily:SERIF,marginBottom:8}}>Set up your reviewer key</div>
+      <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14}}>This device has no reviewer key yet. Each reviewer generates their own keypair behind a passphrase known only to them; the private key never leaves this device. An administrator then registers your public key, adding it to the active recipient set so reports seal to your key alongside any other reviewers'.</div>
+      <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14,padding:11,background:C.id,border:`1px solid ${C.i}30`,borderRadius:8}}>Your passphrase is the second factor protecting your private key at rest. Choose at least {MIN} characters; length matters more than mixed cases or symbols. There is no recovery -- forget it and the key on this device is unrecoverable, but you can be re-issued by generating a fresh key.</div>
+      <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Passphrase</div>
+      <input type="password" value={pass1} onChange={e=>setPass1(e.target.value)} autoComplete="new-password" style={{width:"100%",padding:"10px 14px",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,marginBottom:12,boxSizing:"border-box"}} />
+      <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Confirm passphrase</div>
+      <input type="password" value={pass2} onChange={e=>setPass2(e.target.value)} autoComplete="new-password" style={{width:"100%",padding:"10px 14px",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,marginBottom:14,boxSizing:"border-box"}} />
       {error && <div style={{marginBottom:14,padding:11,background:C.dd,border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:12,lineHeight:1.5}}>{error}</div>}
-      <button onClick={generate} disabled={busy} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:busy?"default":"pointer",fontFamily:MONO,opacity:busy?0.6:1}}>{busy?"Generating…":"Generate reviewer key"}</button>
+      <button onClick={generate} disabled={busy} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:busy?"default":"pointer",fontFamily:MONO,opacity:busy?0.6:1}}>{busy?"Generating…":"Generate my reviewer key"}</button>
+    </div>
+  );
+}
+
+// ── Per-session unlock ────────────────────────────────────────────────────────
+// The reviewer's private key is held in main-process memory only while the
+// session is unlocked. The renderer never sees the key -- only the unlock
+// confirmation and the resulting fingerprint, used to show which reviewer
+// identity is active. Locking clears the key from memory; reopening flags
+// then requires another unlock.
+function Unlock({ onUnlocked }) {
+  const [pass, setPass] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit() {
+    setError("");
+    if (!pass) { setError("Enter your passphrase."); return; }
+    setBusy(true);
+    try {
+      const r = await window.firealive.invoke("abuse:unlock", pass);
+      setBusy(false);
+      if (!r || !r.unlocked) { setError("Unlock failed."); return; }
+      onUnlocked(r.fingerprint);
+    } catch (e) {
+      setBusy(false);
+      setError("Incorrect passphrase, or the reviewer key on this device could not be read.");
+    }
+  }
+
+  return (
+    <div style={{maxWidth:520,animation:"fadeIn .3s ease"}}>
+      <div style={{fontSize:15,fontWeight:600,color:C.t,fontFamily:SERIF,marginBottom:8}}>Unlock the reviewer key</div>
+      <div style={{fontSize:12,color:C.tm,lineHeight:1.7,marginBottom:14}}>Enter your passphrase to hold the private key in memory for this session. Reports remain sealed until the key is unlocked, and locking again clears it.</div>
+      <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Passphrase</div>
+      <input type="password" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter") submit(); }} autoComplete="current-password" autoFocus style={{width:"100%",padding:"10px 14px",background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,marginBottom:14,boxSizing:"border-box"}} />
+      {error && <div style={{marginBottom:14,padding:11,background:C.dd,border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:12,lineHeight:1.5}}>{error}</div>}
+      <button onClick={submit} disabled={busy} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:busy?"default":"pointer",fontFamily:MONO,opacity:busy?0.6:1}}>{busy?"Unlocking…":"Unlock"}</button>
     </div>
   );
 }
@@ -478,6 +534,13 @@ function Shell({ user, onSignOut }) {
   const [patterns, setPatterns] = useState(null);
   const [patternsError, setPatternsError] = useState("");
   const [hasKey, setHasKey] = useState(null);   // null=checking, true=on device, false=needs setup
+  const [unlockedFp, setUnlockedFp] = useState(null); // fingerprint of the unlocked key, null = locked
+
+  function handleUnlocked(fp) { setHasKey(true); setUnlockedFp(fp); }
+  async function lock() {
+    try { await window.firealive.invoke("abuse:lock"); } catch (e) {}
+    setUnlockedFp(null);
+  }
 
   async function loadPatterns() {
     setPatternsError(""); setPatterns(null);
@@ -487,9 +550,9 @@ function Shell({ user, onSignOut }) {
   }
 
   async function checkKey() {
-    if (!window.firealive || !window.firealive.invoke) { setHasKey(true); return; }  // non-desktop: don't block (decrypt is guarded)
+    if (!window.firealive || !window.firealive.invoke) { setHasKey(true); setUnlockedFp("-"); return; }  // non-desktop: don't block (decrypt is guarded)
     try { const r = await window.firealive.invoke("abuse:hasKey"); setHasKey(!!r); }
-    catch (e) { setHasKey(true); }
+    catch (e) { setHasKey(true); setUnlockedFp("-"); }
   }
 
   async function load() {
@@ -511,6 +574,8 @@ function Shell({ user, onSignOut }) {
         </div>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
           <span style={{fontSize:11,color:C.tm}}>{user.name} · reviewer</span>
+          {unlockedFp && <span style={{fontSize:10,color:C.tm,fontFamily:MONO,letterSpacing:0.5}} title="Unlocked reviewer fingerprint">· {unlockedFp}</span>}
+          {unlockedFp && unlockedFp !== "-" && <button onClick={lock} title="Clear the reviewer key from memory" style={{padding:"6px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer",fontFamily:MONO}}>Lock</button>}
           <button onClick={onSignOut} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer",fontFamily:MONO}}>Sign out</button>
         </div>
       </header>
@@ -519,8 +584,9 @@ function Shell({ user, onSignOut }) {
           <span style={{color:C.i,fontWeight:600}}>Independent review authority.</span> This console is the sole place abuse reports are reviewed. Team leads and admins never review abuse; analysts appear only as pseudonyms; and reported content is decrypted only on this device with the reviewer key, never by the server.
         </div>
         {hasKey === null && <div style={{color:C.tm,fontSize:12,padding:"24px 0"}}>Checking reviewer key…</div>}
-        {hasKey === false && <KeyBootstrap onContinue={checkKey} />}
-        {hasKey === true && (selectedId ? (
+        {hasKey === false && <KeyBootstrap onUnlocked={handleUnlocked} />}
+        {hasKey === true && !unlockedFp && <Unlock onUnlocked={handleUnlocked} />}
+        {hasKey === true && unlockedFp && (selectedId ? (
           <CaseDetail caseId={selectedId} onBack={()=>setSelectedId(null)} onResolved={load} />
         ) : (
           <div>

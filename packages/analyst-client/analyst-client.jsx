@@ -1432,9 +1432,9 @@ export default function AnalystClientApp() {
   const [showLeadMsg, setShowLeadMsg] = useState(false);
   const [leadMsgs, setLM] = useState([]);
   const [newLM, setNewLM] = useState("");
-  // Phase U3: lead-chat abuse flag (Model B). The flagged message + the note are
-  // sealed on the client to the independent reviewer's public key and posted as
-  // a lead_chat flag. leadFlagMsg holds the message object being reported.
+  // Phase U3: lead-chat abuse flag. The flagged message + the note are sealed
+  // on the client to the active reviewer recipient set and posted as a
+  // lead_chat flag. leadFlagMsg holds the message object being reported.
   const [leadFlagMsg, setLeadFlagMsg] = useState(null);
   const [leadFlagTier, setLeadFlagTier] = useState(0); // 0=unselected, 1/2/3
   const [leadFlagNote, setLeadFlagNote] = useState("");
@@ -1472,12 +1472,12 @@ export default function AnalystClientApp() {
       logC("lead_send_failed", "Send error: " + (e && e.message ? e.message : "unknown"));
     }
   };
-  // Phase U3: submit a lead-chat abuse flag (Model B). Fetches the independent
-  // reviewer's public key; if none is registered, flagging is unavailable (no
-  // one could decrypt it). Otherwise seals the offending message and the note to
-  // that key via the main-process abuse:seal handler -- the server stores only
-  // the opaque sealed boxes and can never read them -- and posts a lead_chat
-  // flag. The accused (the lead) is resolved server-side from the thread.
+  // Phase U3: submit a lead-chat abuse flag. Fetches the active reviewer
+  // recipient set; if none is registered, flagging is unavailable (no one
+  // could decrypt it). Otherwise seals the offending message and the note to
+  // every active reviewer via the main-process abuse:seal handler -- the
+  // server stores only the opaque sealed envelopes and can never read them --
+  // and posts a lead_chat flag. The accused is resolved server-side.
   const submitLeadFlag = async () => {
     const m = leadFlagMsg;
     if (!m || !leadFlagTier || !leadFlagNote.trim() || !leadThread || !leadThread.threadId) return;
@@ -1485,14 +1485,14 @@ export default function AnalystClientApp() {
     if (!bridge || !bridge.invoke) { setLeadFlagErr("Reporting requires the desktop app."); return; }
     setLeadFlagBusy(true); setLeadFlagErr("");
     try {
-      const k = await api.get("/api/abuse-review-key");
-      if (!k || !k.active || !k.key || !k.key.publicKey) {
+      const k = await api.get("/api/abuse-review-keys");
+      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
         setLeadFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
         setLeadFlagBusy(false); return;
       }
-      const pub = k.key.publicKey;
-      const sc = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: leadFlagNote.trim() });
+      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
+      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim() });
       if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadThread.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
@@ -1616,19 +1616,19 @@ export default function AnalystClientApp() {
   const [replyTo, setReplyTo] = useState(null);               // postId whose composer is open
   const [replyDraft, setReplyDraft] = useState("");
   const [replyDraftAnon, setReplyDraftAnon] = useState(true);
-  // ── Peer board: flag a post (Model B, U3 PR G) ──
+  // ── Peer board: flag a post ──
   const [boardFlagPost, setBoardFlagPost] = useState(null); // postId being flagged
   const [boardFlagTier, setBoardFlagTier] = useState(0);    // 0=unselected, 1/2/3
   const [boardFlagNote, setBoardFlagNote] = useState("");
   const [boardFlagErr, setBoardFlagErr] = useState("");
   const [boardFlagBusy, setBoardFlagBusy] = useState(false);
   const openBoardFlag = (postId) => { setBoardFlagPost(postId); setBoardFlagTier(0); setBoardFlagNote(""); setBoardFlagErr(""); };
-  // Seal the note, the offending post body, and a short thread-context snippet to
-  // the independent reviewer's public key on this device (main-process abuse:seal)
-  // before sending -- the server stores only the opaque boxes and can never read
-  // them. Mirrors submitLeadFlag. The accused is resolved server-side from the
-  // post. The context snippet is built from the already-loaded thread so the
-  // reviewer can see the flagged post in situ; identities in it stay pseudonymous.
+  // Seal the note, the offending post body, and a short thread-context snippet
+  // to the active reviewer recipient set on this device (main-process
+  // abuse:seal) -- the server stores only opaque sealed envelopes and never
+  // reads them. Mirrors submitLeadFlag. The accused is resolved server-side;
+  // the context snippet lets the reviewer see the flagged post in situ with
+  // identities still pseudonymous.
   const buildBoardContext = (postId, rootId) => {
     const key = (rootId != null) ? rootId : postId;
     const posts = expandedThreads[key];
@@ -1647,19 +1647,19 @@ export default function AnalystClientApp() {
     if (!bridge || !bridge.invoke) { setBoardFlagErr("Reporting requires the desktop app."); return; }
     setBoardFlagBusy(true); setBoardFlagErr("");
     try {
-      const k = await api.get("/api/abuse-review-key");
-      if (!k || !k.active || !k.key || !k.key.publicKey) {
+      const k = await api.get("/api/abuse-review-keys");
+      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
         setBoardFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
         setBoardFlagBusy(false); return;
       }
-      const pub = k.key.publicKey;
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: note });
-      const sc = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: (body || "") });
+      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note });
+      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: (body || "") });
       if (!sn || !sn.sealed || !sc || !sc.sealed) { setBoardFlagErr("Could not seal the report."); setBoardFlagBusy(false); return; }
       const payload = { target_type: "board_post", boardPostId: postId, tier: boardFlagTier, sealedNote: sn.sealed, sealedContent: sc.sealed };
       const ctxPlain = buildBoardContext(postId, rootId);
       if (ctxPlain) {
-        const cx = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: ctxPlain });
+        const cx = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: ctxPlain });
         if (cx && cx.sealed) payload.sealedContext = cx.sealed;
       }
       const r = await api.post("/api/peer/flags", payload);
@@ -2514,19 +2514,20 @@ export default function AnalystClientApp() {
                 {postFlagErr && <M style={{color:C.d,display:"block",marginBottom:8,lineHeight:1.5}}>{postFlagErr}</M>}
                 <div style={{display:"flex",gap:8}}>
                   <Btn danger disabled={!postFlagText.trim()||!postFlagTier||postFlagBusy} onClick={async()=>{
-                    // Model B: seal the note on-device to the independent reviewer's
-                    // public key and post a peer-session flag. The accused is resolved
-                    // server-side from the session counterpart -- the pseudonymous peer
-                    // identity never leaves the server.
+                    // Seal the note on-device to the active reviewer recipient set
+                    // and post a peer-session flag. The accused is resolved server-side
+                    // from the session counterpart -- the pseudonymous peer identity
+                    // never leaves the server.
                     const note = postFlagText.trim();
                     if (!note || !postFlagTier || !postSession || !postSession.sessionId) return;
                     const bridge = (typeof window!=="undefined") ? window.firealive : null;
                     if (!bridge || !bridge.invoke) { setPostFlagErr("Reporting requires the desktop app."); return; }
                     setPostFlagBusy(true); setPostFlagErr("");
                     try {
-                      const k = await api.get("/api/abuse-review-key");
-                      if (!k || !k.active || !k.key || !k.key.publicKey) { setPostFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer."); setPostFlagBusy(false); return; }
-                      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: k.key.publicKey, plaintext: note });
+                      const k = await api.get("/api/abuse-review-keys");
+                      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) { setPostFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer."); setPostFlagBusy(false); return; }
+                      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
+                      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note });
                       if (!sn || !sn.sealed) { setPostFlagErr("Could not seal the report."); setPostFlagBusy(false); return; }
                       const r = await api.post("/api/peer/flags", { sessionId: postSession.sessionId, tier: postFlagTier, sealedNote: sn.sealed });
                       if (r && r.error) { setPostFlagErr(r.error); setPostFlagBusy(false); return; }
