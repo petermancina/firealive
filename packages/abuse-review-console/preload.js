@@ -7,7 +7,7 @@ const pkg = require('./package.json');
 // generating the org reviewer keypair, and opening sealed case content with the
 // private key. The main-process handlers for these channels land in F5b.
 const ALLOWED_CHANNELS = [
-  'abuse:hasKey', 'abuse:generateKey', 'abuse:open',
+  'abuse:hasKey', 'abuse:generateKey', 'abuse:unlock', 'abuse:lock', 'abuse:open',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
