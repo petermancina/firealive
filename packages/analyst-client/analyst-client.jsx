@@ -1349,7 +1349,7 @@ export default function AnalystClientApp() {
   // then enter the post-session rating/flag window locally.
   const closePeerSession = () => {
     if (peerSession && peerSession.id) { api.post("/api/peers/sessions/" + peerSession.id + "/close", {}); }
-    setPostSession({ messages: [...peerMsgs], topic: peerSession.topic, expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    setPostSession({ sessionId: peerSession.id, messages: [...peerMsgs], topic: peerSession.topic, expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
     setPeerSession(null); setPeerDiscAccepted(false); setPM([]); setPostRating(0); setPostFlagging(false); setPostFlagText("");
     logC("peer_session_ended", "Skill-share ended — 5-min retention window for rating/flagging");
   };
@@ -1616,15 +1616,54 @@ export default function AnalystClientApp() {
   const [replyTo, setReplyTo] = useState(null);               // postId whose composer is open
   const [replyDraft, setReplyDraft] = useState("");
   const [replyDraftAnon, setReplyDraftAnon] = useState(true);
-  // ── Peer board: flag a post (U2) ──
+  // ── Peer board: flag a post (Model B, U3 PR G) ──
   const [boardFlagPost, setBoardFlagPost] = useState(null); // postId being flagged
   const [boardFlagTier, setBoardFlagTier] = useState(0);    // 0=unselected, 1/2/3
   const [boardFlagNote, setBoardFlagNote] = useState("");
-  const openBoardFlag = (postId) => { setBoardFlagPost(postId); setBoardFlagTier(0); setBoardFlagNote(""); };
-  const flagBoardPost = (postId, rootId) => {
+  const [boardFlagErr, setBoardFlagErr] = useState("");
+  const [boardFlagBusy, setBoardFlagBusy] = useState(false);
+  const openBoardFlag = (postId) => { setBoardFlagPost(postId); setBoardFlagTier(0); setBoardFlagNote(""); setBoardFlagErr(""); };
+  // Seal the note, the offending post body, and a short thread-context snippet to
+  // the independent reviewer's public key on this device (main-process abuse:seal)
+  // before sending -- the server stores only the opaque boxes and can never read
+  // them. Mirrors submitLeadFlag. The accused is resolved server-side from the
+  // post. The context snippet is built from the already-loaded thread so the
+  // reviewer can see the flagged post in situ; identities in it stay pseudonymous.
+  const buildBoardContext = (postId, rootId) => {
+    const key = (rootId != null) ? rootId : postId;
+    const posts = expandedThreads[key];
+    if (!Array.isArray(posts) || posts.length === 0) return null;
+    const snippet = posts.slice(0, 20).map(p => ({
+      label: p.anonymous ? "Anonymous" : (p.authorLabel || "Analyst"),
+      content: (p.content || "").slice(0, 600),
+      flagged: p.id === postId,
+    }));
+    return JSON.stringify(snippet);
+  };
+  const flagBoardPost = async (postId, rootId, body) => {
     const note = (boardFlagNote || "").trim();
     if (!note || !boardFlagTier) return;
-    api.post("/api/peer/flags", { target_type: "board_post", boardPostId: postId, tier: boardFlagTier, content: note }).then(r => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setBoardFlagErr("Reporting requires the desktop app."); return; }
+    setBoardFlagBusy(true); setBoardFlagErr("");
+    try {
+      const k = await api.get("/api/abuse-review-key");
+      if (!k || !k.active || !k.key || !k.key.publicKey) {
+        setBoardFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
+        setBoardFlagBusy(false); return;
+      }
+      const pub = k.key.publicKey;
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: note });
+      const sc = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: (body || "") });
+      if (!sn || !sn.sealed || !sc || !sc.sealed) { setBoardFlagErr("Could not seal the report."); setBoardFlagBusy(false); return; }
+      const payload = { target_type: "board_post", boardPostId: postId, tier: boardFlagTier, sealedNote: sn.sealed, sealedContent: sc.sealed };
+      const ctxPlain = buildBoardContext(postId, rootId);
+      if (ctxPlain) {
+        const cx = await bridge.invoke("abuse:seal", { recipientPublicKey: pub, plaintext: ctxPlain });
+        if (cx && cx.sealed) payload.sealedContext = cx.sealed;
+      }
+      const r = await api.post("/api/peer/flags", payload);
+      if (r && r.error) { setBoardFlagErr(r.error); setBoardFlagBusy(false); return; }
       if (r && r.id) {
         // The post is now removed pending review -- drop it from view.
         if (rootId == null) {
@@ -1633,10 +1672,13 @@ export default function AnalystClientApp() {
         } else {
           loadThread(rootId);
         }
-        setBoardFlagPost(null); setBoardFlagTier(0); setBoardFlagNote("");
-        logC("board_post_flagged", `Tier ${boardFlagTier} flag submitted on a board post`);
+        setBoardFlagPost(null); setBoardFlagTier(0); setBoardFlagNote(""); setBoardFlagErr("");
+        logC("board_post_flagged", `Tier ${boardFlagTier} report sealed to the independent reviewer`);
       }
-    });
+      setBoardFlagBusy(false);
+    } catch (e) {
+      setBoardFlagErr("Could not submit the report."); setBoardFlagBusy(false);
+    }
   };
   const relTime = (iso) => { const h = Math.floor((Date.now() - new Date(iso).getTime()) / 3600000); return h < 1 ? "just now" : h < 24 ? h + "h ago" : Math.floor(h / 24) + "d ago"; };
   const loadThread = (rootId) => {
@@ -1689,11 +1731,13 @@ export default function AnalystClientApp() {
   const [peerNotifEnabled, setPeerNotifEnabled] = useState(true);
   const [calendarProvider, setCalendarProvider] = useState("ics");
   // v0.0.23 post-session state
-  const [postSession, setPostSession] = useState(null); // {messages, topic, expiresAt}
+  const [postSession, setPostSession] = useState(null); // {sessionId, messages, topic, expiresAt}
   const [postRating, setPostRating] = useState(0);
   const [postFlagging, setPostFlagging] = useState(false);
   const [postFlagText, setPostFlagText] = useState("");
   const [postFlagTier, setPostFlagTier] = useState(0); // 0=unselected, 1/2/3
+  const [postFlagErr, setPostFlagErr] = useState("");
+  const [postFlagBusy, setPostFlagBusy] = useState(false);
   // (cleaned up in v1.0.0)
 
   // signals defined above
@@ -2442,21 +2486,21 @@ export default function AnalystClientApp() {
                       <input type="radio" name="flagtier" checked={postFlagTier===1} onChange={()=>setPostFlagTier(1)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 — Minor</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness. Not a personal attack — just unprofessional. Identities stay anonymous. Aggregated for pattern detection only.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness -- unprofessional, not a personal attack. Goes to the independent reviewer and feeds anonymous pattern detection. You and the peer stay pseudonymous to the reviewer.</M>
                       </div>
                     </label>
                     <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                       <input type="radio" name="flagtier" checked={postFlagTier===2} onChange={()=>setPostFlagTier(2)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 — Personal attack</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language targeted at you. The peer's identity is revealed to your team lead. Your identity stays anonymous to the lead.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language aimed at you. Goes to the independent reviewer -- not your lead or management. You and the peer stay pseudonymous to the reviewer.</M>
                       </div>
                     </label>
                     <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                       <input type="radio" name="flagtier" checked={postFlagTier===3} onChange={()=>setPostFlagTier(3)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 — Urgent</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Slurs (racial, gender, orientation, religion, disability), explicit threats, sexual harassment, or content suggesting imminent harm. Both identities — yours and the peer's — are revealed to your lead. HR is brought in. Use this only when warranted; misuse undermines trust in the flagging system.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Slurs (racial, gender, orientation, religion, disability), explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for the independent reviewer to handle urgently; identities stay pseudonymous to them. Use only when warranted -- misuse undermines trust in the flagging system.</M>
                       </div>
                     </label>
                   </div>
@@ -2467,22 +2511,33 @@ export default function AnalystClientApp() {
                   <textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={10000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Paste the text in question or describe what happened..."/>
                 </div>
 
+                {postFlagErr && <M style={{color:C.d,display:"block",marginBottom:8,lineHeight:1.5}}>{postFlagErr}</M>}
                 <div style={{display:"flex",gap:8}}>
-                  <Btn danger disabled={!postFlagText.trim()||!postFlagTier} onClick={()=>{
-                    // TODO: when peer chat is backed by a real server session, replace
-                    // this with: api.post("/api/peer/flags", {sessionId, flaggedUserId,
-                    // tier: postFlagTier, content: postFlagText})
-                    // The endpoint exists (commit 3-5 of Phase 1.4b) but the AC peer
-                    // chat itself is still client-side only — there is no server
-                    // session to reference yet. This is recorded in the audit log so
-                    // the flag isn't lost.
-                    logC("peer_abuse_flagged",`Tier ${postFlagTier}: ${postFlagText.slice(0,80)}${postFlagText.length>80?"...":""}`);
-                    setPostFlagging(false);
-                    setPostFlagTier(0);
-                    setPostFlagText("");
-                    setPostSession(null);
-                  }}>Submit Flag</Btn>
-                  <Btn small onClick={()=>{setPostFlagging(false);setPostFlagTier(0);}}>Cancel</Btn>
+                  <Btn danger disabled={!postFlagText.trim()||!postFlagTier||postFlagBusy} onClick={async()=>{
+                    // Model B: seal the note on-device to the independent reviewer's
+                    // public key and post a peer-session flag. The accused is resolved
+                    // server-side from the session counterpart -- the pseudonymous peer
+                    // identity never leaves the server.
+                    const note = postFlagText.trim();
+                    if (!note || !postFlagTier || !postSession || !postSession.sessionId) return;
+                    const bridge = (typeof window!=="undefined") ? window.firealive : null;
+                    if (!bridge || !bridge.invoke) { setPostFlagErr("Reporting requires the desktop app."); return; }
+                    setPostFlagBusy(true); setPostFlagErr("");
+                    try {
+                      const k = await api.get("/api/abuse-review-key");
+                      if (!k || !k.active || !k.key || !k.key.publicKey) { setPostFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer."); setPostFlagBusy(false); return; }
+                      const sn = await bridge.invoke("abuse:seal", { recipientPublicKey: k.key.publicKey, plaintext: note });
+                      if (!sn || !sn.sealed) { setPostFlagErr("Could not seal the report."); setPostFlagBusy(false); return; }
+                      const r = await api.post("/api/peer/flags", { sessionId: postSession.sessionId, tier: postFlagTier, sealedNote: sn.sealed });
+                      if (r && r.error) { setPostFlagErr(r.error); setPostFlagBusy(false); return; }
+                      if (r && r.id) {
+                        logC("peer_abuse_flagged", `Tier ${postFlagTier} report sealed to the independent reviewer`);
+                        setPostFlagging(false); setPostFlagTier(0); setPostFlagText(""); setPostFlagErr(""); setPostSession(null);
+                      }
+                      setPostFlagBusy(false);
+                    } catch (e) { setPostFlagErr("Could not submit the report."); setPostFlagBusy(false); }
+                  }}>{postFlagBusy?"Sealing\u2026":"Submit Flag"}</Btn>
+                  <Btn small onClick={()=>{setPostFlagging(false);setPostFlagTier(0);setPostFlagErr("");}}>Cancel</Btn>
                 </div>
               </div>)}
             </Card>
@@ -2676,7 +2731,7 @@ export default function AnalystClientApp() {
                 </div>
               </Card>
             );
-            const flagPicker = (postId, rootId) => (
+            const flagPicker = (postId, rootId, body) => (
               <Card style={{marginTop:8,padding:"12px 14px",borderColor:C.d+"40"}}>
                 <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:8}}>Flag this post -- select the severity that matches what was said:</M>
                 <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
@@ -2684,27 +2739,28 @@ export default function AnalystClientApp() {
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===1} onChange={()=>setBoardFlagTier(1)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 -- Minor</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness. Not a personal attack. Identities stay anonymous; aggregated for pattern detection only.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness in the post. Goes to the independent reviewer and feeds anonymous pattern detection. Identities stay pseudonymous to the reviewer.</M>
                     </div>
                   </label>
                   <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===2} onChange={()=>setBoardFlagTier(2)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 -- Personal attack</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language in the post. The author's identity is revealed to your team lead; yours stays anonymous.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language in the post. Goes to the independent reviewer -- not your lead or management. The author and you stay pseudonymous to the reviewer.</M>
                     </div>
                   </label>
                   <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===3} onChange={()=>setBoardFlagTier(3)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 -- Urgent</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Both identities are revealed to your lead and HR is brought in. Use only when warranted; misuse undermines trust.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for the independent reviewer to handle urgently; identities stay pseudonymous to them. Use only when warranted; misuse undermines trust.</M>
                     </div>
                   </label>
                 </div>
                 <textarea value={boardFlagNote} onChange={e=>setBoardFlagNote(e.target.value)} rows={2} maxLength={10000} placeholder="Briefly describe what's wrong with this post..." style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}}/>
+                {boardFlagErr && <M style={{color:C.d,display:"block",marginTop:8,lineHeight:1.5}}>{boardFlagErr}</M>}
                 <div style={{display:"flex",gap:8,marginTop:8}}>
-                  <Btn danger small disabled={!boardFlagNote.trim()||!boardFlagTier} onClick={()=>flagBoardPost(postId, rootId)}>Submit Flag</Btn>
+                  <Btn danger small disabled={!boardFlagNote.trim()||!boardFlagTier||boardFlagBusy} onClick={()=>flagBoardPost(postId, rootId, body)}>{boardFlagBusy?"Sealing\u2026":"Submit Flag"}</Btn>
                   <Btn small onClick={()=>setBoardFlagPost(null)}>Cancel</Btn>
                 </div>
               </Card>
@@ -2726,7 +2782,7 @@ export default function AnalystClientApp() {
               </div>
               {reactionRow(m, null)}
               {replyTo===m.id && composer(m.id, m.id)}
-              {boardFlagPost===m.id && flagPicker(m.id, null)}
+              {boardFlagPost===m.id && flagPicker(m.id, null, m.content)}
               {expanded && (thread==="loading"
                 ? <M style={{color:C.td,display:"block",marginTop:8}}>Loading thread…</M>
                 : <div style={{marginTop:8}}>
@@ -2741,7 +2797,7 @@ export default function AnalystClientApp() {
                         <M onClick={()=>openBoardFlag(rep.id)} style={{color:C.d,cursor:"pointer"}}>Flag</M>
                         {reactionRow(rep, m.id)}
                         {replyTo===rep.id && composer(m.id, rep.id)}
-                        {boardFlagPost===rep.id && flagPicker(rep.id, m.id)}
+                        {boardFlagPost===rep.id && flagPicker(rep.id, m.id, rep.content)}
                       </div>
                     ))}
                     {thread.filter(p=>p.id!==m.id).length===0 && <M style={{color:C.td,display:"block",marginLeft:14}}>No replies yet.</M>}

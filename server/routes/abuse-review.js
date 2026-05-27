@@ -27,9 +27,12 @@ const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { canReview, REVIEWER_ROLE } = require('../services/abuse-reviewer-access');
 
-// PR G widens this to 'peer_session','board_post' after their Model-B re-seal and
-// the removal of MC review (G2b/G4). Until then the ABC reviews lead_chat only.
-const REVIEWABLE_TARGET_TYPES = ['lead_chat'];
+// All three flag target types are reviewed here, by the independent Abuse Review
+// Console ONLY. lead_chat was Model B from the start (PR D); peer_session and
+// board_post were re-sealed to Model B and removed from MC review in the PR G
+// cutover (see server/db/reseal-abuse-flags.js), so all three are now reviewer-
+// only and the server cannot read any of them.
+const REVIEWABLE_TARGET_TYPES = ['lead_chat', 'peer_session', 'board_post'];
 const REVIEWABLE_IN = REVIEWABLE_TARGET_TYPES.map(() => '?').join(', ');
 
 const MAX_RESOLUTION_NOTE = 4000;
@@ -128,7 +131,7 @@ router.get('/cases/:id', (req, res) => {
     }
 
     const v = db.prepare(
-      `SELECT sealed_content_encrypted, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, sealed_at
+      `SELECT sealed_content_encrypted, context_encrypted, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, sealed_at
          FROM peer_abuse_evidence_vault WHERE flag_id = ?`
     ).get(f.id);
 
@@ -148,6 +151,7 @@ router.get('/cases/:id', (req, res) => {
         // Console opens them client-side with the abuse-review private key.
         sealedNote: f.content_encrypted ? Buffer.from(f.content_encrypted).toString('base64') : null,
         sealedContent: v && v.sealed_content_encrypted ? Buffer.from(v.sealed_content_encrypted).toString('base64') : null,
+        sealedContext: v && v.context_encrypted ? Buffer.from(v.context_encrypted).toString('base64') : null,
         sealedAt: v ? v.sealed_at : null,
       },
     });
@@ -197,8 +201,8 @@ router.post('/cases/:id/resolve', (req, res) => {
 // / retaliation) the reviewer may see. A pattern surfaces only if the reviewer
 // can access at least one of its involved REVIEWABLE flags; flagCount and maxTier
 // are computed from the accessible flags ALONE, so a reviewer never learns the
-// count/tier of cases outside their scope (e.g. peer/board flags still under MC
-// review, or other teams' cases). Identities follow the reveal policy.
+// count/tier of cases outside their scope (e.g. another team's cases). Identities
+// follow the reveal policy.
 router.get('/patterns', (req, res) => {
   let db;
   try {
@@ -220,7 +224,7 @@ router.get('/patterns', (req, res) => {
           `SELECT id, target_type, flagger_user_id, flagged_user_id, tier
              FROM peer_abuse_flags WHERE id = ? AND target_type IN (${REVIEWABLE_IN})`
         ).get(fid, ...REVIEWABLE_TARGET_TYPES);
-        if (!f) continue; // not a reviewable target type (peer/board until PR G)
+        if (!f) continue; // not a reviewable target type
         if (!canReview({ reviewer, flag: { ...f, teamIds: [] }, assignments }).allowed) continue;
         accessible.push(f.id);
         if (f.tier > maxTier) maxTier = f.tier;

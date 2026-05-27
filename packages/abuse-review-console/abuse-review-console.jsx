@@ -225,9 +225,14 @@ function Party({ p }) {
   );
 }
 
+// Friendly labels for the three reviewable target types. Falls back to the raw
+// value so an unrecognized type still renders something rather than blank.
+const TYPE_LABELS = { lead_chat: "Lead chat", peer_session: "Peer chat", board_post: "Board post" };
+function typeLabelFor(t) { return TYPE_LABELS[t] || t; }
+
 function CaseRow({ c, onClick }) {
   const tierC = c.tier >= 3 ? C.d : c.tier === 2 ? C.w : C.i;
-  const typeLabel = c.targetType === "lead_chat" ? "Lead chat" : c.targetType;
+  const typeLabel = typeLabelFor(c.targetType);
   return (
     <div onClick={onClick} title="Open case" style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,padding:"14px 16px",marginBottom:10,animation:"fadeIn .3s ease",cursor:"pointer"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
@@ -267,6 +272,7 @@ function CaseDetail({ caseId, onBack, onResolved }) {
   const [error, setError] = useState("");
   const [note, setNote] = useState({ state: "loading", text: "" });
   const [content, setContent] = useState({ state: "loading", text: "" });
+  const [context, setContext] = useState({ state: "empty", items: null });  // board thread context (parsed JSON)
   const [decryptError, setDecryptError] = useState("");
   const [resolveNote, setResolveNote] = useState("");
   const [resolving, setResolving] = useState(false);
@@ -280,22 +286,39 @@ function CaseDetail({ caseId, onBack, onResolved }) {
     } catch (e) { set({ state: "empty", text: "" }); setDecryptError("Some content could not be decrypted with this device's reviewer key."); }
   }
 
+  // Board cases may carry a sealed thread-context box: a JSON array of
+  // { label, content, flagged }. Decrypt locally, then parse; on a parse failure
+  // fall back to showing the raw decrypted text so evidence is never silently
+  // dropped.
+  async function openContext(sealedB64) {
+    if (!sealedB64) { setContext({ state: "empty", items: null }); return; }
+    try {
+      const res = await window.firealive.invoke("abuse:open", sealedB64);
+      const txt = res && res.plaintext != null ? res.plaintext : "";
+      let items = null;
+      try { const parsed = JSON.parse(txt); if (Array.isArray(parsed)) items = parsed; } catch (_) {}
+      if (!items) items = [{ label: "", content: txt, flagged: false }];
+      setContext({ state: "ok", items });
+    } catch (e) { setContext({ state: "empty", items: null }); setDecryptError("Some content could not be decrypted with this device's reviewer key."); }
+  }
+
   useEffect(() => {
     let alive = true;
     (async () => {
       setError(""); setData(null); setDecryptError("");
-      setNote({ state: "loading", text: "" }); setContent({ state: "loading", text: "" });
+      setNote({ state: "loading", text: "" }); setContent({ state: "loading", text: "" }); setContext({ state: "empty", items: null });
       const r = await api.get(`/api/abuse-review/cases/${caseId}`);
       if (!alive) return;
       if (!r || r.error || !r.case) { setError("Could not load this case."); return; }
       setData(r.case);
       if (!window.firealive || !window.firealive.invoke) {
         setDecryptError("Run the desktop app to decrypt sealed content.");
-        setNote({ state: "empty", text: "" }); setContent({ state: "empty", text: "" });
+        setNote({ state: "empty", text: "" }); setContent({ state: "empty", text: "" }); setContext({ state: "empty", items: null });
         return;
       }
       openOne(r.case.sealedContent, setContent);
       openOne(r.case.sealedNote, setNote);
+      openContext(r.case.sealedContext);
     })();
     return () => { alive = false; };
   }, [caseId]);
@@ -316,7 +339,7 @@ function CaseDetail({ caseId, onBack, onResolved }) {
 
   const c = data;
   const tierC = c.tier >= 3 ? C.d : c.tier === 2 ? C.w : C.i;
-  const typeLabel = c.targetType === "lead_chat" ? "Lead chat" : c.targetType;
+  const typeLabel = typeLabelFor(c.targetType);
   return (
     <div style={{animation:"fadeIn .3s ease"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
@@ -333,6 +356,21 @@ function CaseDetail({ caseId, onBack, onResolved }) {
       <div style={{fontSize:10,color:C.td,marginBottom:18}}>{new Date(c.createdAt).toLocaleString()}{c.sealedAt ? ` · sealed ${new Date(c.sealedAt).toLocaleString()}` : ""}</div>
       {decryptError && <div style={{marginBottom:14,padding:10,background:C.wd,border:`1px solid ${C.w}40`,borderRadius:8,color:C.w,fontSize:11,lineHeight:1.5}}>{decryptError}</div>}
       <SealedPanel label="Reported content" state={content.state} text={content.text} />
+      {context.state !== "empty" && (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Thread context</div>
+          <div style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:8,padding:14,minHeight:44}}>
+            {context.state === "loading" && <span style={{color:C.tm,fontSize:13}}>Decrypting…</span>}
+            {context.state === "ok" && (!context.items || context.items.length === 0) && <span style={{color:C.td,fontSize:13}}>(none)</span>}
+            {context.state === "ok" && context.items && context.items.map((m, i) => (
+              <div key={i} style={{marginBottom:10,paddingLeft:10,borderLeft:`2px solid ${m.flagged ? C.d : C.b}`}}>
+                <div style={{fontSize:11,color:m.flagged ? C.d : C.tm,fontWeight:m.flagged ? 600 : 400,marginBottom:2,fontFamily:MONO}}>{m.label || "\u2014"}{m.flagged ? " \u00b7 reported" : ""}</div>
+                <div style={{fontSize:13,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{m.content}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <SealedPanel label="Reporter's note" state={note.state} text={note.text} />
       {c.resolved && c.resolutionNote && (
         <div style={{marginTop:6}}>
