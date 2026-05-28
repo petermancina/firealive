@@ -819,7 +819,7 @@ All three must agree. The schema is the final backstop and the reason this workf
 ## Reports & Compliance group
 
 ### Report Engine
-**What it's for:** Scheduled depersonalized team-level reports for management or compliance. NEVER includes individual analyst names — tier/shift aggregates only. AI analysis backed by the platform's research knowledge base, so reports cite peer-reviewed studies behind the recommendations. Output formats: PDF (printable, archival) and DOCX (editable), generated using the same document generator as the TTX feature.
+**What it's for:** Scheduled depersonalized team-level reports for management or compliance. NEVER includes individual analyst names — tier/shift aggregates only. AI analysis backed by the platform's research knowledge base, so reports cite peer-reviewed studies behind the recommendations. Output formats: PDF (printable, archival) and DOCX (editable), generated using the same document generator as the TTX feature. Every generated PDF/DOCX is signed with the instance’s Ed25519 report-signing key and stamped with a verification footer (instance label, generation time, signing-key fingerprint), so a recipient can confirm the report is a genuine, unaltered FireAlive artifact — in-app via the authenticated verify endpoint, or independently with OpenSSL and no FireAlive tooling (see `docs/report-verification.md`). KB citations are reproduced verbatim: the report shows exactly the peer-reviewed references behind each recommendation, never a paraphrase or a fabricated source.
 
 **Workflow:**
 1. Lead opens Report Engine
@@ -831,7 +831,7 @@ All three must agree. The schema is the final backstop and the reason this workf
 5. Recipients see team trends, training needs, capacity issues — but never individual data
 
 ### Compliance
-**What it's for:** Generate framework-specific compliance reports against the running system. Picks a framework (NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA), system runs real checks against actual app state, produces an audit-ready report.
+**What it's for:** Generate framework-specific compliance reports against the running system. Picks a framework (NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, DORA, CCPA, PIPEDA, LGPD, PDPA, APPI, POPIA, NIS2, CPS 234, Cyber Essentials, FISMA), system runs real checks against actual app state, produces an audit-ready report. The report is viewable in-app as JSON; **Download PDF** and **Download DOCX** produce a signed, watermarked document for the selected framework — the same verification model as the Report Engine (Ed25519 instance signature + verification footer, checkable in-app or offline per `docs/report-verification.md`) — suitable for handing directly to an auditor.
 
 Each report has TWO halves per the Shared Responsibility model:
 - **verifiedControls:** technical controls FireAlive observes by inspecting its own running state (status pass / warning / fail / error, with per-control detail, taxonomy mapping, and remediation guidance when not pass)

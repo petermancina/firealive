@@ -13,6 +13,71 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { version } = require('../lib/version');
+const { buildReportPdf, buildReportDocx } = require('../services/report-doc-builder');
+const { signReport, getInstanceLabel } = require('../services/report-signer');
+
+// ── Report model transform (structured sections -> doc-builder model) ────────
+function humanize(key) {
+  return String(key)
+    .replace(/_/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^./, (c) => c.toUpperCase());
+}
+function fmtVal(v) {
+  if (typeof v === 'number' && !Number.isInteger(v)) return v.toFixed(2);
+  return String(v);
+}
+// Flatten one section's structured value into readable bullet lines. Scalars
+// become "Label: value"; arrays of rows become one indented bullet per row;
+// nested objects flatten one level.
+function flattenToBullets(obj) {
+  const bullets = [];
+  for (const [k, val] of Object.entries(obj || {})) {
+    if (val === null || val === undefined) continue;
+    if (Array.isArray(val)) {
+      if (val.length === 0) { bullets.push(`${humanize(k)}: (none)`); continue; }
+      bullets.push(`${humanize(k)}:`);
+      for (const row of val) {
+        if (row && typeof row === 'object') {
+          bullets.push('  ' + Object.entries(row).map(([rk, rv]) => `${humanize(rk)}=${fmtVal(rv)}`).join(', '));
+        } else {
+          bullets.push('  ' + fmtVal(row));
+        }
+      }
+    } else if (typeof val === 'object') {
+      for (const [nk, nv] of Object.entries(val)) {
+        bullets.push(`${humanize(k)} / ${humanize(nk)}: ${fmtVal(nv)}`);
+      }
+    } else {
+      bullets.push(`${humanize(k)}: ${fmtVal(val)}`);
+    }
+  }
+  return bullets;
+}
+// Build the doc-builder model from a generated report. A section's `citations`
+// array (if present) is passed through VERBATIM and excluded from the bullet
+// flattening -- the anti-hallucination invariant: KB-cited synthesis is
+// rendered exactly as produced, never reformatted or invented.
+function reportModel(report) {
+  const sections = Object.entries(report.sections || {}).map(([key, val]) => {
+    const sec = { heading: humanize(key) };
+    let data = val;
+    if (val && typeof val === 'object' && Array.isArray(val.citations)) {
+      sec.citations = val.citations.slice();
+      data = Object.fromEntries(Object.entries(val).filter(([k]) => k !== 'citations'));
+    }
+    sec.bullets = flattenToBullets(data);
+    return sec;
+  });
+  return {
+    title: 'FireAlive Management Report',
+    subtitle: `Generated ${report.generatedAt}`,
+    meta: [['Version', report.version], ['Generated', report.generatedAt], ['Sections', String(sections.length)]],
+    sections,
+  };
+}
 
 // ── List Reports ─────────────────────────────────────────────────────────────
 router.get('/', (req, res) => {
@@ -42,6 +107,16 @@ router.get('/:id', (req, res) => {
 
     if (!report) return res.status(404).json({ error: 'Report not found' });
 
+    // Binary document formats stream the stored signed bytes as a download.
+    if (report.format === 'pdf' || report.format === 'docx') {
+      const ctype = report.format === 'pdf'
+        ? 'application/pdf'
+        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      res.setHeader('Content-Type', ctype);
+      res.setHeader('Content-Disposition', `attachment; filename=firealive-report-${report.id}.${report.format}`);
+      return res.send(report.content);
+    }
+
     const content = report.content.toString('utf-8');
     let parsed;
     try { parsed = JSON.parse(content); } catch { parsed = content; }
@@ -54,7 +129,7 @@ router.get('/:id', (req, res) => {
 });
 
 // ── Generate On-Demand Report ────────────────────────────────────────────────
-router.post('/generate', (req, res) => {
+router.post('/generate', async (req, res) => {
   try {
     const db = getDb();
 
@@ -164,14 +239,47 @@ router.post('/generate', (req, res) => {
 
     // Store report
     const id = crypto.randomBytes(16).toString('hex');
-    const content = Buffer.from(JSON.stringify(report, null, 2));
+
+    let content;
+    let verification = null;
+    if (format === 'pdf' || format === 'docx') {
+      // Render a signed, watermarked document and store its bytes. The footer
+      // is bytes-mode (no hash printed); the signature is taken over the
+      // rendered bytes, so the verify key is the file's own SHA-256.
+      const model = reportModel(report);
+      const keyRow = db.prepare("SELECT public_key_fingerprint FROM report_signing_keys WHERE is_active = 1 LIMIT 1").get();
+      const footer = {
+        instanceLabel: getInstanceLabel(db),
+        keyFingerprint: keyRow ? keyRow.public_key_fingerprint : null,
+        signedAt: new Date().toISOString(),
+      };
+      content = format === 'pdf'
+        ? await buildReportPdf(model, footer)
+        : await buildReportDocx(model, footer);
+      verification = signReport({
+        db,
+        reportType: 'report_engine',
+        subjectRef: id,
+        material: content,
+        metadata: { format, sections: sectionCount, app_version: report.version },
+      });
+    } else {
+      content = Buffer.from(JSON.stringify(report, null, 2));
+    }
+
     db.prepare('INSERT INTO reports (id, type, format, content, sections_count, generated_by) VALUES (?, ?, ?, ?, ?, ?)').run(
       id, 'on-demand', format, content, sectionCount, req.user.id
     );
 
     db.close();
-    auditLog(req.user.id, 'REPORT_GENERATED', `type=on-demand sections=${sectionCount}`, req.ip);
-    res.status(201).json({ id, sections: sectionCount, generatedAt: report.generatedAt });
+    auditLog(req.user.id, 'REPORT_GENERATED', `type=on-demand format=${format} sections=${sectionCount}`, req.ip);
+    res.status(201).json({
+      id,
+      sections: sectionCount,
+      format,
+      generatedAt: report.generatedAt,
+      verificationId: verification ? verification.verificationId : null,
+    });
   } catch (err) {
     logger.error('Generate report error', { error: err.message });
     res.status(500).json({ error: 'Failed to generate report' });
@@ -196,7 +304,7 @@ router.put('/config', (req, res) => {
 
   const validSchedules = ['daily', 'weekly', 'biweekly', 'monthly'];
   const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-  const validFormats = ['json', 'html', 'pdf', 'txt'];
+  const validFormats = ['json', 'html', 'pdf', 'txt', 'docx'];
 
   try {
     const db = getDb();

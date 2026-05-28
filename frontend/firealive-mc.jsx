@@ -4008,7 +4008,7 @@ function ManagementConsole() {
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
               <Sel label="Frequency" value={reportCfg.schedule} onChange={e=>setReportCfg(prev=>({...prev,schedule:e.target.value}))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option><option value="monthly">Monthly</option></Sel>
               <Sel label="Day" value={reportCfg.day} onChange={e=>setReportCfg(prev=>({...prev,day:e.target.value}))}><option value="monday">Monday</option><option value="tuesday">Tuesday</option><option value="wednesday">Wednesday</option><option value="thursday">Thursday</option><option value="friday">Friday</option></Sel>
-              <Sel label="Format" value={reportCfg.format} onChange={e=>setReportCfg(prev=>({...prev,format:e.target.value}))}><option value="pdf">PDF</option><option value="html">HTML</option><option value="json">JSON (SIEM)</option></Sel>
+              <Sel label="Format" value={reportCfg.format} onChange={e=>setReportCfg(prev=>({...prev,format:e.target.value}))}><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="json">JSON (SIEM)</option></Sel>
             </div>
             <Input label="Recipients (email)" value={reportCfg.recipients} onChange={e=>setReportCfg(prev=>({...prev,recipients:e.target.value}))} placeholder="lead@corp.com" maxLength={512}/>
             <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={reportCfg.siemFeed} onChange={e=>setReportCfg(prev=>({...prev,siemFeed:e.target.checked}))} style={{accentColor:C.a}}/>Also send summary to SIEM via CEF</label>
@@ -4087,32 +4087,17 @@ function ManagementConsole() {
                 <span style={{color:C.td}}>Note: All statistics are cohort-level aggregates. No individual analyst is identified in this report. Assessment results remain visible only to the analyst and their direct team lead.</span>
               </M></>}
             </Card>
-            <Btn primary onClick={()=>{
-              const now=new Date();const dateStr=now.toISOString().slice(0,10);
-              const secs=reportCfg.sections;
-              let content="";
-              if(reportCfg.format==="json"){
-                const data={generated:now.toISOString(),platform:"FireAlive v"+(appVersion||"unknown"),type:"team_capacity_report",depersonalized:true,
-                  ...(secs.teamHealth?{teamHealth:{score:th.score,status:th.status,utilization:th.avgUtil,overCapacity:th.oc,dayStaff:dayAnalysts.length}}:{}),
-                  ...(secs.tierBreakdown?{tierBreakdown:{day:{l1:analysts.filter(a=>a.shift==="day"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="day"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="day"&&a.tier===3).length},swing:{l1:analysts.filter(a=>a.shift==="swing"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="swing"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="swing"&&a.tier===3).length},night:{l1:analysts.filter(a=>a.shift==="night"&&a.tier===1).length,l2:analysts.filter(a=>a.shift==="night"&&a.tier===2).length,l3:analysts.filter(a=>a.shift==="night"&&a.tier===3).length}}}:{}),
-                  ...(secs.automationRate?{automation:{systemCount:autoSys.length,resolved24h:autoSys.reduce((s,a)=>s+a.resolved,0),avgFpRate:+(autoSys.reduce((s,a)=>s+a.fp,0)/autoSys.length*100).toFixed(1)}}:{}),
-                  ...(secs.skillProgress?{skillProgress:{l1_cohort:{count:6,avgTriage:78,avgDocumentation:76,avgPhishing:63,avgSiem:52},l2_cohort:{count:5,avgInvestigation:74,avgNetwork:69,avgMalware:48},l3_cohort:{count:3,avgHunting:82,avgIr:77,avgForensics:71}}}:{}),
-                };
-                content=JSON.stringify(data,null,2);
-                const blob=new Blob([content],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-report-${dateStr}.json`;a.click();URL.revokeObjectURL(url);
+            <Btn primary onClick={async()=>{
+              const fmt=reportCfg.format;
+              const dateStr=new Date().toISOString().slice(0,10);
+              const result=await api.post("/api/reports/generate",{format:fmt});
+              if(result && result.id && !result.error){
+                const ext=(fmt==="pdf"||fmt==="docx")?fmt:"json";
+                const ok=await api.download("/api/reports/"+encodeURIComponent(result.id),`firealive-report-${dateStr}.${ext}`);
+                addA("REPORT_DOWNLOADED",ok?("Signed "+ext.toUpperCase()+" report "+result.id+" downloaded"):("Report download failed: "+result.id));
               } else {
-                const lines=["FIREALIVE TEAM CAPACITY REPORT","Generated: "+now.toLocaleString(),"Depersonalized — No individual analyst identifiers","═".repeat(60),""];
-                if(secs.teamHealth) lines.push("TEAM HEALTH","  Score: "+th.score+" ("+th.status+")","  Utilization: "+th.avgUtil+"%","  Over capacity: "+th.oc+" analysts","  Day staff: "+dayAnalysts.length,"");
-                if(secs.tierBreakdown) lines.push("TIER BREAKDOWN","  Day: L1×"+analysts.filter(a=>a.shift==="day"&&a.tier===1).length+" L2×"+analysts.filter(a=>a.shift==="day"&&a.tier===2).length+" L3×"+analysts.filter(a=>a.shift==="day"&&a.tier===3).length,"  Swing: L1×"+analysts.filter(a=>a.shift==="swing"&&a.tier===1).length+" L2×"+analysts.filter(a=>a.shift==="swing"&&a.tier===2).length+" L3×"+analysts.filter(a=>a.shift==="swing"&&a.tier===3).length,"  Night: L1×"+analysts.filter(a=>a.shift==="night"&&a.tier===1).length+" L2×"+analysts.filter(a=>a.shift==="night"&&a.tier===2).length+" L3×"+analysts.filter(a=>a.shift==="night"&&a.tier===3).length,"");
-                if(secs.automationRate) lines.push("AUTOMATION","  Systems: "+autoSys.length,"  24h resolved: "+autoSys.reduce((s,a)=>s+a.resolved,0).toLocaleString(),"  Avg FP rate: "+(autoSys.reduce((s,a)=>s+a.fp,0)/autoSys.length*100).toFixed(1)+"%","");
-                if(secs.kbInsights) lines.push("KB INSIGHT","  "+th.avgUtil+"% utilization "+(th.avgUtil>80?"exceeds":"within")+" 70-80% threshold (R012).","");
-                if(secs.skillProgress) lines.push("SKILL PROGRESSION","  L1 cohort: Avg triage 78%, documentation 76%, SIEM 52%","  L2 cohort: Avg investigation 74%, network 69%, malware 48%","  L3 cohort: Avg hunting 82%, IR coordination 77%","");
-                if(secs.upskillingGaps) lines.push("UPSKILLING GAPS","  4/6 L1 below 70% in SIEM Queries (avg 52%)","  3/6 L1 below 70% in Escalation Judgment (avg 58%)","  4/5 L2 below 70% in Malware Analysis (avg 48%)","  12 lab completions, 3 re-takes, 2 level-up signals (30d)","");
-                lines.push("═".repeat(60),"AGPL-3.0 | FireAlive v"+(appVersion||"unknown")+" | github.com/petermancina/firealive");
-                content=lines.join("\n");
-                const blob=new Blob([content],{type:"text/plain"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-report-${dateStr}.txt`;a.click();URL.revokeObjectURL(url);
+                addA("REPORT_ERROR","Report generation failed: "+((result&&result.error)||"unknown"));
               }
-              addA("REPORT_DOWNLOADED","Report downloaded as "+reportCfg.format.toUpperCase()+" ("+content.length+" bytes)");
             }}>Download as {reportCfg.format.toUpperCase()}</Btn>
           </div>)}
         </div>)}
@@ -5997,6 +5982,16 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 addA("COMP",(fw.toUpperCase())+" report failed: "+(r?.error||"unknown"));
               }
             }}>Generate Report</Btn>
+            <Btn style={{marginTop:8}} onClick={async()=>{
+              const fw=complianceFw;
+              const ok=await api.download("/api/compliance/report/"+encodeURIComponent(fw)+"?format=pdf","firealive-compliance-"+fw+"-"+new Date().toISOString().slice(0,10)+".pdf");
+              addA("COMP",ok?((fw.toUpperCase())+" signed PDF downloaded"):((fw.toUpperCase())+" PDF download failed"));
+            }}>Download PDF</Btn>
+            <Btn style={{marginTop:8}} onClick={async()=>{
+              const fw=complianceFw;
+              const ok=await api.download("/api/compliance/report/"+encodeURIComponent(fw)+"?format=docx","firealive-compliance-"+fw+"-"+new Date().toISOString().slice(0,10)+".docx");
+              addA("COMP",ok?((fw.toUpperCase())+" signed DOCX downloaded"):((fw.toUpperCase())+" DOCX download failed"));
+            }}>Download DOCX</Btn>
           </div>
           {complianceReport&&(<Card>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>

@@ -23,18 +23,121 @@ const { generateComplianceReport, FRAMEWORKS, signLogBatch, toSyslog, getSeverit
 const { runRetentionPurge, getRetentionConfig, DEFAULT_RETENTION } = require('../services/retention');
 const { runtimeMonitor } = require('../services/runtime-monitor');
 const { version } = require('../lib/version');
+const { buildReportPdf, buildReportDocx } = require('../services/report-doc-builder');
+const { signReport, getInstanceLabel } = require('../services/report-signer');
 
 // ── Compliance Reports ───────────────────────────────────────────────────────
-router.get('/compliance/report/:framework', (req, res) => {
+// Transform a generateComplianceReport() result into the report-doc-builder
+// section model. Compliance reports carry no AI synthesis, so no `citations`
+// arrays are used; the framework's own authoritative citation goes in `meta`.
+function complianceModel(report) {
+  const v = report.summary.verified;
+  const meta = [
+    ['Framework', report.framework],
+    report.authority ? ['Authority', report.authority] : null,
+    report.citation ? ['Citation', report.citation] : null,
+    ['Generated', report.generatedAt],
+    ['App version', report.appVersion],
+  ].filter(Boolean);
+
+  const sections = [];
+
+  sections.push({
+    heading: 'Summary',
+    paragraphs: report.note ? [report.note] : [],
+    bullets: [
+      `Verified controls: ${v.passed} passed, ${v.warnings} warning(s), ${v.failed} failed of ${v.total}`,
+      `Customer-responsibility controls (attested separately by the operating organization): ${report.summary.customerResponsibility.total}`,
+    ],
+  });
+
+  sections.push({
+    heading: 'Verified Controls',
+    bullets: report.verifiedControls.map((c) => {
+      let line = `${c.controlId} \u2014 ${c.controlName}: ${String(c.status).toUpperCase()}.`;
+      if (c.detail) line += ` ${c.detail}`;
+      if (c.remediation && c.remediation.summary) line += `  Remediation: ${c.remediation.summary}`;
+      return line;
+    }),
+  });
+
+  sections.push({
+    heading: 'Customer Responsibility (attested separately)',
+    bullets: report.customerResponsibility.map((i) =>
+      `[${i.category}] ${i.id ? i.id + ' \u2014 ' : ''}${i.name || ''}${i.detail ? ': ' + i.detail : ''}`.trim()
+    ),
+  });
+
+  return {
+    title: `Compliance Report \u2014 ${report.framework}`,
+    subtitle: `${v.passed}/${v.total} verified controls passing`,
+    meta,
+    sections,
+  };
+}
+
+router.get('/compliance/report/:framework', async (req, res) => {
   const fw = req.params.framework.toLowerCase();
   if (!FRAMEWORKS[fw]) {
     return res.status(400).json({ error: 'Unknown framework', available: Object.keys(FRAMEWORKS) });
   }
+  const format = String(req.query.format || 'json').toLowerCase();
+  if (!['json', 'pdf', 'docx'].includes(format)) {
+    return res.status(400).json({ error: 'format must be one of: json, pdf, docx' });
+  }
 
   try {
     const report = generateComplianceReport(fw);
-    auditLog(req.user.id, 'COMPLIANCE_REPORT', `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`, req.ip);
-    res.json(report);
+
+    if (format === 'json') {
+      auditLog(req.user.id, 'COMPLIANCE_REPORT', `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`, req.ip);
+      return res.json(report);
+    }
+
+    // Signed document export (pdf | docx).
+    const model = complianceModel(report);
+    const subjectRef = crypto.randomUUID();
+    const db = getDb();
+    let buffer, descriptor;
+    try {
+      const keyRow = db.prepare("SELECT public_key_fingerprint FROM report_signing_keys WHERE is_active = 1 LIMIT 1").get();
+      const footer = {
+        instanceLabel: getInstanceLabel(db),
+        keyFingerprint: keyRow ? keyRow.public_key_fingerprint : null,
+        signedAt: new Date().toISOString(),
+      };
+      buffer = format === 'pdf'
+        ? await buildReportPdf(model, footer)
+        : await buildReportDocx(model, footer);
+      // Sign the rendered file bytes; the verify hash is the file's SHA-256.
+      descriptor = signReport({
+        db,
+        reportType: 'compliance',
+        subjectRef,
+        material: buffer,
+        metadata: {
+          framework: fw,
+          framework_name: report.framework,
+          passed: report.summary.verified.passed,
+          total: report.summary.verified.total,
+          format,
+          app_version: report.appVersion,
+        },
+      });
+    } finally {
+      db.close();
+    }
+
+    const ext = format === 'pdf' ? 'pdf' : 'docx';
+    const ctype = format === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const filename = `firealive-compliance-${fw}-${new Date().toISOString().slice(0, 10)}.${ext}`;
+    auditLog(req.user.id, 'COMPLIANCE_REPORT', `framework=${fw} format=${format} pass=${report.summary.passed}/${report.summary.total} report_id=${subjectRef}`, req.ip);
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.setHeader('X-Report-Verification', descriptor.sha256);
+    res.send(buffer);
   } catch (err) {
     logger.error('Compliance report error', { error: err.message });
     res.status(500).json({ error: 'Failed to generate compliance report' });
