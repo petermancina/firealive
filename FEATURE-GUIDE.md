@@ -1248,7 +1248,17 @@ Cross-region aggregate health.
 Per-region health bars, automation rates, cert coverage.
 
 ### Reports
-Generate executive reports for board presentations.
+**What it's for:** CISO-grade executive reports that aggregate the latest regional metrics pushed in from every connected MC. Five report types are available: Executive Summary (cross-region health, utilization, turnover-risk highlights, recommendations, and FireAlive ROI financials), Global Human Impact Risk Report (per-region churn-cost breakdown), Turnover Forecast, FireAlive ROI, and Compliance by Jurisdiction.
+
+Reports render in three formats: JSON in-app (for the dashboard preview) and signed PDF and DOCX downloads. Every PDF/DOCX is signed with the Global Dashboard's own Ed25519 report-signing key and stamped with a verification footer (instance label, generation time, signing-key fingerprint), so the recipient can confirm the document is a genuine, unaltered FireAlive artifact -- in-app via the authenticated verify endpoint, or independently with OpenSSL per `docs/report-verification.md`. The GD signs its own reports under its own instance key, distinct from any MC's.
+
+**Workflow:**
+1. CISO opens Reports
+2. Picks a report type from the dropdown
+3. Clicks Generate Report -- the GD-Server pulls the latest regional_metrics snapshots from each connected MC and renders the report server-side
+4. The dashboard shows the report in-app
+5. Clicks Download PDF or Download DOCX to save the signed document; or Export Report for a quick client-side JSON copy
+6. Files the PDF/DOCX with board materials or the audit-evidence binder
 
 ### MC Connections
 **What it's for:** Manage which Regional MCs feed data here. Register new MCs, view their connection health, offboard decommissioned ones. The connections tab is also the trust-registry admin surface for signing keys.
@@ -1269,6 +1279,7 @@ Generate executive reports for board presentations.
 4. Sees 4-up summary (Total / Pass / Warn / Fail) plus the verified-control list with status badges, per-control mapping to the framework taxonomy (NIST control id, HIPAA citation, ISO clause), and a remediation pane on any non-pass row describing what the GD operator needs to do to fix the finding
 5. Sees the customer-responsibility list below — the controls the OPERATING ORGANIZATION must attest separately for the GD layer (e.g., subprocessor agreements for the GD's hosting, GD-side personnel access policies)
 6. CISO files the report in the org's audit-evidence binder alongside the corresponding MC reports
+7. Click Download PDF or Download DOCX to export the report as a signed, watermarked document (Ed25519 instance signature + verification footer, checkable in-app or offline per `docs/report-verification.md`); hand the PDF directly to the auditor
 
 ### Cross-Region Compliance
 **What it's for:** Roll up compliance posture across every connected Regional MC. The matrix view shows framework x MC cells with passed/total counts colored by health (green ≥90%, amber ≥70%, red below). Filter by framework, by MC, or by region to narrow the view. Drill into any cell to see that (MC, framework)'s full-report history — past CISO-requested fulfillments with timestamps, signature fingerprints (for forensic verification), and payload sizes. Click any report row to see the parsed report body: framework summary, full verifiedControls list with status badges, and customerResponsibility list.
@@ -1284,6 +1295,8 @@ If a cell's most recent report is stale or there's no full-report history at all
 4. Drills into a specific cell to see the report history
 5. Either reads the most recent full report inline or clicks Request Full Report to get a fresh fulfillment
 6. After fulfillment lands (MC's next tick), refreshes the matrix and reviews the new report body
+
+**Cross-instance signing:** each instance signs its own reports under its own report-signing key. The GD signs reports it generates itself -- the Compliance Posture single-framework report and the Executive Reports above. Upstream MCs sign reports they generate. Each MC's full-report history rows in the matrix record that MC's signature fingerprint; the GD's signing-key fingerprint identifies any GD-generated artifact. A GD-signed report is attributable to the GD instance, an MC-signed report to that MC -- the two key families never overlap.
 
 ### Helper Recognition
 **What it's for:** Cross-MC Helper Pay leaderboard. Each active MC pushes its top opted-in helpers on a configurable cadence (default 15 minutes); this tab displays the aggregated view across every connected MC. Only analysts who have explicitly opted in via their AC's Helper Pay tab appear here, and only their pseudonyms cross the wire — real names, user IDs, and earning details stay on the MC.

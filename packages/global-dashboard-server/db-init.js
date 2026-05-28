@@ -8,6 +8,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
+const { ensureActiveReportKeypair } = require('./services/report-signing-keys');
 
 const DB_PATH = process.env.GD_DB_PATH || path.join(__dirname, 'data', 'global-dashboard.db');
 
@@ -628,6 +629,67 @@ CREATE TABLE IF NOT EXISTS legal_hold_chain_signing_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_signing_keys_active ON legal_hold_chain_signing_keys(active) WHERE active = 1;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- U4: REPORT SIGNING + VERIFICATION (GD-server)
+--
+-- Ports the MC report-signing foundation to the Global Dashboard so the GD's
+-- own compliance and executive reports export as signed, watermarked PDF/DOCX.
+-- The GD's report-signing key is a DISTINCT instance identity from any MC's: a
+-- GD-signed report is attributable to the GD itself, by design. report_type is
+-- limited to the GD's report classes (no helper_pay, no abuse_flag -- those are
+-- MC/AC-only). The schema is intentionally identical to the MC server's
+-- report_signing_keys / report_verifications so the ported services
+-- (report-signing-keys.js, report-signer.js, report-watermark.js,
+-- report-doc-builder.js) run unchanged. report signing keys are a DISTINCT key
+-- family from the GD's forensic / legal-hold / signing_keys families.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS report_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
+  public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER bytes (64 chars)
+  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  is_active INTEGER NOT NULL DEFAULT 0
+    CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
+  ON report_signing_keys(is_active) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
+  ON report_signing_keys(public_key_fingerprint);
+
+CREATE TABLE IF NOT EXISTS report_verifications (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  report_type TEXT NOT NULL
+    CHECK (report_type IN ('compliance', 'report_engine')),
+  subject_ref TEXT NOT NULL,
+  signed_payload_sha256 TEXT NOT NULL,              -- 64-char SHA-256 hex of the signed material
+  signature TEXT NOT NULL,                          -- base64 Ed25519 signature
+  key_fingerprint TEXT NOT NULL,                    -- report_signing_keys.public_key_fingerprint
+  instance_label TEXT NOT NULL,                     -- snapshot of config 'instance_label' at sign time
+  signed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata_json TEXT                                -- content-blind metadata only
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_verifications_hash
+  ON report_verifications(signed_payload_sha256);
+CREATE INDEX IF NOT EXISTS idx_report_verifications_subject
+  ON report_verifications(report_type, subject_ref);
+
+CREATE TRIGGER IF NOT EXISTS report_verifications_no_update
+  BEFORE UPDATE ON report_verifications
+  BEGIN SELECT RAISE(ABORT, 'report_verifications is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS report_verifications_no_delete
+  BEFORE DELETE ON report_verifications
+  BEGIN SELECT RAISE(ABORT, 'report_verifications is permanent (no delete)'); END;
+
+INSERT OR IGNORE INTO config (key, value)
+  VALUES ('instance_label', 'FireAlive Global Dashboard (unconfigured)');
 `;
 
 function getDb() {
@@ -950,6 +1012,22 @@ function initDb() {
     console.error(
       'The GD-server will start, but the Sub-phase-6 routes (/api/cloud/* added in C28, /api/cicd/* added in C29) will return 500 until this migration completes successfully. The existing /api/regression-test (C26) and all v1.0.36 GD surfaces are independent of these tables and continue to function.'
     );
+  }
+
+  // U4: ensure this GD instance has an active Ed25519 report-signing keypair,
+  // so its compliance and executive reports can be signed at generation time.
+  // Idempotent -- only generates when no active key exists. Provisioned here as
+  // part of database setup (`npm run init-db`); the report exporters also call
+  // ensureActiveReportKeypair defensively at request time, since the server
+  // process (index.js) does not run initDb on startup.
+  try {
+    const reportKey = ensureActiveReportKeypair(db);
+    if (reportKey.isNewlyCreated) {
+      console.log('U4: generated GD report-signing keypair (' + reportKey.publicKeyFingerprint.slice(0, 16) + '\u2026)');
+    }
+  } catch (reportKeyErr) {
+    console.error('U4: report-signing keypair init FAILED:', reportKeyErr.message);
+    console.error('Signed report exports (PDF/DOCX) will fail until an active report-signing key exists; re-run `npm run init-db` after setting the Tier-1 encryption key.');
   }
 
   console.log('Global Dashboard database initialized at', DB_PATH);

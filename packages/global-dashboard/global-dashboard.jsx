@@ -1591,6 +1591,14 @@ export default function GlobalDashboard() {
               {generatedReport.recommendations&&generatedReport.recommendations.length>0&&<div style={{marginBottom:16}}><div style={{fontSize:12,fontWeight:500,color:C.i,marginBottom:8}}>Recommendations</div>{generatedReport.recommendations.map((r,i)=><div key={i} style={{padding:"4px 0"}}><M style={{color:C.t}}>{i+1}. {r}</M></div>)}</div>}
               {generatedReport.regions&&generatedReport.regions.length>0&&<Card style={{marginBottom:12,padding:12,borderColor:C.p+"30"}}><div style={{fontSize:12,fontWeight:500,color:C.p,marginBottom:8}}>Regional Breakdown</div>{generatedReport.regions.map((r,i)=><div key={i} style={{padding:"6px 0",borderBottom:i<generatedReport.regions.length-1?"1px solid "+C.b:"none",fontSize:11}}><M style={{color:C.t}}>{r.name}: {r.analysts} analysts · health {r.healthScore} · churn cost ${r.annualChurnCost?.toLocaleString()||"—"}</M></div>)}</Card>}
               {generatedReport.financials&&<Card style={{borderColor:C.a+"30",padding:14}}><div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:8}}>Financial Impact</div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))",gap:8}}>{Object.entries(generatedReport.financials).map(([k,v])=><div key={k} style={{textAlign:"center"}}><div style={{fontSize:14,fontWeight:600,color:k.toLowerCase().includes("without")?C.d:k.toLowerCase().includes("savings")?C.a:C.t}}>{typeof v==="number"?"$"+v.toLocaleString():v}</div><M style={{color:C.td,fontSize:10}}>{k.replace(/([A-Z])/g," $1").trim()}</M></div>)}</div></Card>}
+              <Btn small primary style={{marginTop:12,marginRight:8}} onClick={async()=>{
+                const ok=await api.download("/api/reports/generate","firealive-gd-report-"+generatedReport.type+"-"+new Date().toISOString().slice(0,10)+".pdf",{method:"POST",body:{type:generatedReport.type,format:"pdf"}});
+                showGdToast(ok?"Signed PDF downloaded":"PDF download failed");
+              }}>Download PDF</Btn>
+              <Btn small primary style={{marginTop:12,marginRight:8}} onClick={async()=>{
+                const ok=await api.download("/api/reports/generate","firealive-gd-report-"+generatedReport.type+"-"+new Date().toISOString().slice(0,10)+".docx",{method:"POST",body:{type:generatedReport.type,format:"docx"}});
+                showGdToast(ok?"Signed DOCX downloaded":"DOCX download failed");
+              }}>Download DOCX</Btn>
               <Btn small style={{marginTop:12}} onClick={()=>{const blob=new Blob([JSON.stringify(generatedReport,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="report-"+generatedReport.type+"-"+Date.now()+".json";a.click();}}>Export Report</Btn>
             </Card>}
           </div>)}
@@ -2582,6 +2590,16 @@ export default function GlobalDashboard() {
                 {postureReport.citation&&<M style={{color:C.td,display:"block",marginBottom:6,fontSize:10}}>{postureReport.citation}</M>}
                 <M style={{color:C.td,display:"block",fontSize:10}}>Generated {postureReport.generatedAt?new Date(postureReport.generatedAt).toLocaleString():"—"} · GD v{postureReport.appVersion||"—"}</M>
                 {postureReport.note&&<M style={{color:C.i,display:"block",marginTop:8,fontSize:10,fontStyle:"italic"}}>{postureReport.note}</M>}
+                <div style={{display:"flex",gap:8,marginTop:12}}>
+                  <Btn small primary onClick={async()=>{
+                    const ok=await api.download("/api/compliance/report/"+encodeURIComponent(postureFramework)+"?format=pdf","firealive-gd-compliance-"+postureFramework+"-"+new Date().toISOString().slice(0,10)+".pdf");
+                    showGdToast(ok?"Signed PDF downloaded":"PDF download failed");
+                  }}>Download PDF</Btn>
+                  <Btn small onClick={async()=>{
+                    const ok=await api.download("/api/compliance/report/"+encodeURIComponent(postureFramework)+"?format=docx","firealive-gd-compliance-"+postureFramework+"-"+new Date().toISOString().slice(0,10)+".docx");
+                    showGdToast(ok?"Signed DOCX downloaded":"DOCX download failed");
+                  }}>Download DOCX</Btn>
+                </div>
               </Card>
 
               {/* Summary: 4-up verified counts + customerResponsibility total */}

@@ -2310,17 +2310,92 @@ app.put('/api/notifications/config', authMiddleware(['ciso']), (req, res) => {
 });
 
 // ── Reports ──────────────────────────────────────────────────────────────────
-app.post('/api/reports/generate', authMiddleware(['ciso', 'vp']), (req, res) => {
+// U4: report-model helpers for signed GD report exports. humanize / fmtVal /
+// flattenToBullets are verbatim from the MC reports route. reportModel is
+// GD-specific: the GD's generated reports are flat objects keyed by field
+// (globalMetrics, highlights, concerns, recommendations, financials, regions,
+// data, ...) rather than the MC's { sections: {...} } wrapper, so each
+// top-level field becomes a section. Any `citations` array present on a value
+// would be rendered verbatim by the doc-builder; GD executive reports carry
+// none today, so the verbatim-citation path is structurally preserved but
+// unexercised here.
+function humanize(key) {
+  return String(key)
+    .replace(/_/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^./, (c) => c.toUpperCase());
+}
+function fmtVal(v) {
+  if (typeof v === 'number' && !Number.isInteger(v)) return v.toFixed(2);
+  return String(v);
+}
+function flattenToBullets(obj) {
+  const bullets = [];
+  for (const [k, val] of Object.entries(obj || {})) {
+    if (val === null || val === undefined) continue;
+    if (Array.isArray(val)) {
+      if (val.length === 0) { bullets.push(`${humanize(k)}: (none)`); continue; }
+      bullets.push(`${humanize(k)}:`);
+      for (const row of val) {
+        if (row && typeof row === 'object') {
+          bullets.push('  ' + Object.entries(row).map(([rk, rv]) => `${humanize(rk)}=${fmtVal(rv)}`).join(', '));
+        } else {
+          bullets.push('  ' + fmtVal(row));
+        }
+      }
+    } else if (typeof val === 'object') {
+      for (const [nk, nv] of Object.entries(val)) {
+        bullets.push(`${humanize(k)} / ${humanize(nk)}: ${fmtVal(nv)}`);
+      }
+    } else {
+      bullets.push(`${humanize(k)}: ${fmtVal(val)}`);
+    }
+  }
+  return bullets;
+}
+function reportModel(report) {
+  const skip = new Set(['type', 'title', 'generatedAt']);
+  const sections = [];
+  for (const [key, val] of Object.entries(report)) {
+    if (skip.has(key) || val === null || val === undefined) continue;
+    const sec = { heading: humanize(key) };
+    if (Array.isArray(val)) {
+      sec.bullets = val.length === 0
+        ? ['(none)']
+        : val.map((row) => (row && typeof row === 'object')
+            ? Object.entries(row).map(([rk, rv]) => `${humanize(rk)}=${fmtVal(rv)}`).join(', ')
+            : fmtVal(row));
+    } else if (typeof val === 'object') {
+      sec.bullets = flattenToBullets(val);
+    } else {
+      sec.bullets = [fmtVal(val)];
+    }
+    sections.push(sec);
+  }
+  return {
+    title: report.title || `Report: ${report.type}`,
+    subtitle: `Generated ${report.generatedAt}`,
+    meta: [['Type', report.type], ['Generated', report.generatedAt], ['Sections', String(sections.length)]],
+    sections,
+  };
+}
+
+app.post('/api/reports/generate', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const { type } = req.body;
+  const format = String(req.body.format || 'json').toLowerCase();
+  if (!['json', 'pdf', 'docx'].includes(format)) {
+    return res.status(400).json({ error: 'format must be one of: json, pdf, docx' });
+  }
+  const db = getDb();
   try {
-    const { type } = req.body;
-    const db = getDb();
     const mcs = db.prepare("SELECT * FROM management_consoles WHERE status = 'active'").all();
     const metrics = mcs.map(mc => {
       const latest = db.prepare("SELECT * FROM regional_metrics WHERE mc_id = ? ORDER BY timestamp DESC LIMIT 1").get(mc.id);
       return { ...mc, metrics: latest };
     });
     const totalAnalysts = metrics.reduce((s, m) => s + (m.metrics?.analyst_count || m.analyst_count || 0), 0);
-
     let report;
     if (type === 'executive_summary') {
       const avgHealth = Math.round(metrics.reduce((s, m) => s + (m.metrics?.health_score || 0), 0) / (metrics.length || 1));
@@ -2361,10 +2436,53 @@ app.post('/api/reports/generate', authMiddleware(['ciso', 'vp']), (req, res) => 
 
     const id = crypto.randomBytes(4).toString('hex');
     db.prepare("INSERT INTO reports (id, type, data) VALUES (?, ?, ?)").run(id, type, JSON.stringify(report));
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'REPORT_GENERATED', ?)").run(req.user.id, type);
+
+    if (format === 'json') {
+      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'REPORT_GENERATED', ?)").run(req.user.id, type);
+      return res.json(report);
+    }
+
+    // Signed document export (pdf | docx). The rendered file bytes are signed
+    // (report_type=report_engine, subjectRef=report id) and streamed directly;
+    // the report JSON is still stored in the reports table for the reports list.
+    // report-doc-builder (pdfkit/docx) is required only on this path.
+    const { buildReportPdf, buildReportDocx } = require('./services/report-doc-builder');
+    const { signReport, getInstanceLabel } = require('./services/report-signer');
+    const { ensureActiveReportKeypair } = require('./services/report-signing-keys');
+    const reportKey = ensureActiveReportKeypair(db);
+    const footer = {
+      instanceLabel: getInstanceLabel(db),
+      keyFingerprint: reportKey.publicKeyFingerprint,
+      signedAt: new Date().toISOString(),
+    };
+    const model = reportModel(report);
+    const buffer = format === 'pdf'
+      ? await buildReportPdf(model, footer)
+      : await buildReportDocx(model, footer);
+    const descriptor = signReport({
+      db,
+      reportType: 'report_engine',
+      subjectRef: id,
+      material: buffer,
+      metadata: { report_type: type, format, app_version: report.appVersion || null },
+    });
+    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'REPORT_GENERATED', ?)").run(req.user.id, `${type} format=${format} report_id=${id}`);
+
+    const ext = format === 'pdf' ? 'pdf' : 'docx';
+    const ctype = format === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const filename = `firealive-gd-report-${type}-${new Date().toISOString().slice(0, 10)}.${ext}`;
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.setHeader('X-Report-Verification', descriptor.sha256);
+    return res.send(buffer);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Report generation failed' });
+  } finally {
     db.close();
-    res.json(report);
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Report generation failed' }); }
+  }
 });
 
 // ── Audit Logs ───────────────────────────────────────────────────────────────
@@ -2426,19 +2544,188 @@ app.get('/api/compliance/frameworks', authMiddleware(['ciso', 'vp', 'readonly'])
   } catch (e) { res.status(500).json({ error: 'Failed to list frameworks' }); }
 });
 
-app.get('/api/compliance/report/:framework', authMiddleware(['ciso', 'vp']), (req, res) => {
+// U4: transform a GD compliance report into the generic report document model.
+// Verbatim from the MC server's complianceModel -- the GD compliance report
+// shares the same shape (summary.verified, verifiedControls with optional
+// remediation.summary, customerResponsibility). Control/remediation text is
+// rendered as written.
+function complianceModel(report) {
+  const v = report.summary.verified;
+  const meta = [
+    ['Framework', report.framework],
+    report.authority ? ['Authority', report.authority] : null,
+    report.citation ? ['Citation', report.citation] : null,
+    ['Generated', report.generatedAt],
+    ['App version', report.appVersion],
+  ].filter(Boolean);
+
+  const sections = [];
+
+  sections.push({
+    heading: 'Summary',
+    paragraphs: report.note ? [report.note] : [],
+    bullets: [
+      `Verified controls: ${v.passed} passed, ${v.warnings} warning(s), ${v.failed} failed of ${v.total}`,
+      `Customer-responsibility controls (attested separately by the operating organization): ${report.summary.customerResponsibility.total}`,
+    ],
+  });
+
+  sections.push({
+    heading: 'Verified Controls',
+    bullets: report.verifiedControls.map((c) => {
+      let line = `${c.controlId} \u2014 ${c.controlName}: ${String(c.status).toUpperCase()}.`;
+      if (c.detail) line += ` ${c.detail}`;
+      if (c.remediation && c.remediation.summary) line += `  Remediation: ${c.remediation.summary}`;
+      return line;
+    }),
+  });
+
+  sections.push({
+    heading: 'Customer Responsibility (attested separately)',
+    bullets: report.customerResponsibility.map((i) =>
+      `[${i.category}] ${i.id ? i.id + ' \u2014 ' : ''}${i.name || ''}${i.detail ? ': ' + i.detail : ''}`.trim()
+    ),
+  });
+
+  return {
+    title: `Compliance Report \u2014 ${report.framework}`,
+    subtitle: `${v.passed}/${v.total} verified controls passing`,
+    meta,
+    sections,
+  };
+}
+
+app.get('/api/compliance/report/:framework', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const { generateComplianceReport, FRAMEWORKS } = require('./services/compliance');
+  const fw = req.params.framework.toLowerCase();
+  if (!FRAMEWORKS[fw]) {
+    return res.status(400).json({ error: 'Unknown framework', available: Object.keys(FRAMEWORKS) });
+  }
+  const format = String(req.query.format || 'json').toLowerCase();
+  if (!['json', 'pdf', 'docx'].includes(format)) {
+    return res.status(400).json({ error: 'format must be one of: json, pdf, docx' });
+  }
   try {
-    const { generateComplianceReport, FRAMEWORKS } = require('./services/compliance');
-    const fw = req.params.framework.toLowerCase();
-    if (!FRAMEWORKS[fw]) {
-      return res.status(400).json({ error: 'Unknown framework', available: Object.keys(FRAMEWORKS) });
-    }
     const report = generateComplianceReport(fw);
+
+    if (format === 'json') {
+      const db = getDb();
+      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`);
+      db.close();
+      return res.json(report);
+    }
+
+    // Signed document export (pdf | docx). The rendered file bytes are signed;
+    // the verify hash is the file's own SHA-256 (bytes-mode footer). report-doc-
+    // builder (which pulls pdfkit/docx) is required only on this path so the
+    // json path stays free of those dependencies.
+    const { buildReportPdf, buildReportDocx } = require('./services/report-doc-builder');
+    const { signReport, getInstanceLabel } = require('./services/report-signer');
+    const { ensureActiveReportKeypair } = require('./services/report-signing-keys');
+    const model = complianceModel(report);
+    const subjectRef = crypto.randomUUID();
     const db = getDb();
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`);
-    db.close();
-    res.json(report);
+    let buffer, descriptor;
+    try {
+      const reportKey = ensureActiveReportKeypair(db);
+      const footer = {
+        instanceLabel: getInstanceLabel(db),
+        keyFingerprint: reportKey.publicKeyFingerprint,
+        signedAt: new Date().toISOString(),
+      };
+      buffer = format === 'pdf'
+        ? await buildReportPdf(model, footer)
+        : await buildReportDocx(model, footer);
+      descriptor = signReport({
+        db,
+        reportType: 'compliance',
+        subjectRef,
+        material: buffer,
+        metadata: {
+          framework: fw,
+          framework_name: report.framework,
+          passed: report.summary.verified.passed,
+          total: report.summary.verified.total,
+          format,
+          app_version: report.appVersion,
+        },
+      });
+      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} format=${format} pass=${report.summary.passed}/${report.summary.total} report_id=${subjectRef}`);
+    } finally {
+      db.close();
+    }
+
+    const ext = format === 'pdf' ? 'pdf' : 'docx';
+    const ctype = format === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const filename = `firealive-gd-compliance-${fw}-${new Date().toISOString().slice(0, 10)}.${ext}`;
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.setHeader('X-Report-Verification', descriptor.sha256);
+    res.send(buffer);
   } catch (e) { res.status(500).json({ error: 'Failed to generate compliance report' }); }
+});
+
+// ── U4: Report signing key + signature verification ──────────────────────────
+// Two authenticated endpoints backing signed GD report exports. The GD signs
+// only 'compliance' and 'report_engine' reports; both endpoints are gated to
+// ciso / vp. There is no abuse_flag report type on the GD, so no existence-
+// masking 404 branch is required.
+
+// GET /api/report-signing/key — active Ed25519 public key + instance label, so
+// an authorized verifier can check GD report signatures offline (see
+// docs/report-verification.md). Public key only; the private key is never read.
+app.get('/api/report-signing/key', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const keyRow = db.prepare("SELECT public_key, public_key_fingerprint, created_at FROM report_signing_keys WHERE is_active = 1 LIMIT 1").get();
+    if (!keyRow) { db.close(); return res.status(404).json({ error: 'no active report signing key' }); }
+    const { getInstanceLabel } = require('./services/report-signer');
+    const instanceLabel = getInstanceLabel(db);
+    db.close();
+    res.json({
+      instance_label: instanceLabel,
+      active_signing_key: {
+        algorithm: 'Ed25519',
+        public_key_pem: keyRow.public_key,
+        fingerprint: keyRow.public_key_fingerprint,
+        created_at: keyRow.created_at,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: 'failed to fetch signing key' }); }
+});
+
+// GET /api/verify/report/:hash — content-blind verification. Looks a report up
+// by the SHA-256 of its signed material (the rendered file bytes) and re-
+// verifies the recorded Ed25519 signature. Returns metadata only, never
+// content. The path matches the bytes-mode watermark footer exactly.
+app.get('/api/verify/report/:hash', authMiddleware(['ciso', 'vp']), (req, res) => {
+  const hash = String(req.params.hash || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    return res.status(400).json({ error: 'hash must be a 64-char SHA-256 hex string' });
+  }
+  try {
+    const { verifyReportByHash } = require('./services/report-signer');
+    const db = getDb();
+    const result = verifyReportByHash(db, hash);
+    db.close();
+    if (!result) { return res.status(404).json({ error: 'no report matches that hash' }); }
+    if (result.reportType !== 'compliance' && result.reportType !== 'report_engine') {
+      return res.status(403).json({ error: 'unsupported report type' });
+    }
+    res.json({
+      valid: result.valid,
+      report_type: result.reportType,
+      subject_ref: result.subjectRef,
+      key_fingerprint: result.keyFingerprint,
+      signed_payload_sha256: result.signedPayloadSha256,
+      signature: result.signatureB64,
+      instance_label: result.instanceLabel,
+      signed_at: result.signedAt,
+      metadata: result.metadata || null,
+    });
+  } catch (e) { res.status(500).json({ error: 'verification failed' }); }
 });
 
 // ── System Health (self-monitoring) ──────────────────────────────────────────
