@@ -15,7 +15,29 @@ class FireAliveWebSocket {
   constructor(server, db) {
     this.db = db;
     this.clients = new Map(); // userId -> ws
-    this.wss = new WebSocket.Server({ server, path: '/ws' });
+    // Defense-in-depth limits aligned to FireAlive's actual WS traffic shape
+    // (peer-chat libsignal envelopes, signal readings, notifications, routing
+    // events -- all small JSON, realistic ceiling ~10 KiB per frame, no
+    // fragmentation in normal operation). The ws 8.21.0 security patch
+    // (remote memory-exhaustion DoS via tiny-fragment flooding,
+    // CVE-class library-side fix) is already in place at the library-defaults
+    // level; setting these options explicitly makes the security posture
+    // readable, documents the calibration against known traffic, and
+    // survives any future relaxation of library defaults.
+    //
+    // Calibration vs library defaults (per ws docs, master branch):
+    //   maxPayload:        64 KiB    (default 100 MiB)        -- ~1600x tighter
+    //   maxBufferedChunks: 256       (default 1,048,576)      -- ~4096x tighter
+    //   maxFragments:      1024      (default 131,072)        -- ~128x tighter
+    // FireAlive does not legitimately fragment messages or queue large chunk
+    // backlogs; pathological values from a peer indicate an attack.
+    this.wss = new WebSocket.Server({
+      server,
+      path: '/ws',
+      maxPayload: 65536,
+      maxBufferedChunks: 256,
+      maxFragments: 1024,
+    });
     this.wss.on('connection', (ws, req) => this._onConnection(ws, req));
     // Signal collection every 15 minutes
     this._signalInterval = setInterval(() => this._collectSignals(), 900000);
