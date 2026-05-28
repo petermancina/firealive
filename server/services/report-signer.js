@@ -224,6 +224,8 @@ function verifyReportByHash(db, sha256Hex) {
     reportType: row.report_type,
     subjectRef: row.subject_ref,
     keyFingerprint: row.key_fingerprint,
+    signedPayloadSha256: row.signed_payload_sha256,
+    signatureB64: row.signature,
     instanceLabel: row.instance_label,
     signedAt: row.signed_at,
     metadata,
