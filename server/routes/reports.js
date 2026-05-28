@@ -304,7 +304,7 @@ router.put('/config', (req, res) => {
 
   const validSchedules = ['daily', 'weekly', 'biweekly', 'monthly'];
   const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-  const validFormats = ['json', 'html', 'pdf', 'txt'];
+  const validFormats = ['json', 'html', 'pdf', 'txt', 'docx'];
 
   try {
     const db = getDb();
