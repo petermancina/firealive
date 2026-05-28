@@ -236,6 +236,7 @@ app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
 app.use('/api/legal-hold-exports', authMiddleware(['admin', 'ciso']), require('./routes/legal-hold-exports'));
+app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso', 'abuse_reviewer']), require('./routes/report-verification'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));

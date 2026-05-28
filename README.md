@@ -186,6 +186,14 @@ Every FireAlive deployment must designate at least one **independent abuse revie
 
 **Until at least one reviewer is registered, abuse reporting is disabled** — with no reviewer public key, nothing could be decrypted, and the flagger's app shows an explicit message saying so. The Abuse Review Console enforces a 12-character passphrase minimum on key generation, holds the unlocked private key in main-process memory for the session only (a 5-minute inactivity hard-lock clears it), and never returns the private key to its renderer.
 
+### Signed reports & verification
+
+Every exportable report FireAlive generates — compliance reports, Report Engine output, helper-pay statements, and abuse-flag submission reports — is signed by the instance's Ed25519 **report-signing key**, a key family distinct from the forensic, legal-hold, backup, chain, GD-push, and cloud-IaC signing keys (a compromise of one family taints none of the others). Each report carries a footer with the human-readable instance label, the UTC sign time, a report id, the short signing-key fingerprint, and a verification hash — so a genuine FireAlive report cannot be forged or altered and passed off as legitimate.
+
+Verification is **authenticated only — there is no public endpoint**. A public hash-verify endpoint would let an adversary grind hashes to enumerate or confirm accusations, so abuse-flag reports verify solely for an independent `abuse_reviewer`; compliance and Report Engine reports for admin/CISO; helper-pay statements for the owning analyst or an admin. The appeal path for a dismissed accusation is therefore out-of-band: the accuser presents their exported report to HR or a court, who ask an independent reviewer to confirm it against the system. Because the verification ledger is permanent and append-only, a dismissed accusation stays verifiable indefinitely.
+
+Reports can also be verified **independently, with no FireAlive tooling and no trust in the running system**, using OpenSSL against the instance's published Ed25519 public key — see [`docs/report-verification.md`](docs/report-verification.md). Abuse-flag reports are zero-access end to end: the signature covers a canonical data record containing only a content hash, never the report text, so the server signs and records a verifiable report without ever holding the plaintext.
+
 ---
 
 ## Compliance

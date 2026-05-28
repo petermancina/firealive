@@ -2402,6 +2402,86 @@ CREATE INDEX IF NOT EXISTS idx_gd_push_signing_keys_fingerprint
   ON gd_push_signing_keys(public_key_fingerprint);
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- U4: REPORT SIGNING + VERIFICATION
+--
+-- SOC-grade signing for every FireAlive-generated exportable report
+-- (compliance reports, Report Engine output, helper-pay statements, and
+-- abuse-flag submission reports). One instance-level Ed25519 keypair family
+-- signs all report types: the public-key fingerprint is the cryptographic
+-- instance identity and the config row 'instance_label' is the human-readable
+-- one rendered on the watermark. report_verifications is a PERMANENT,
+-- append-only record that backs the authenticated verify endpoint and the
+-- abuse-report appeal path — an independent reviewer can confirm an accuser's
+-- exported report is genuine and corresponds to a real submission, without the
+-- server ever holding plaintext.
+--
+-- Mirrors the gd_push_signing_keys / chain_signing_keys key-management pattern.
+-- report signing keys are a DISTINCT family from the forensic, legal-hold,
+-- backup, chain, gd-push, and cloud-iac signing keys: a compromise of any one
+-- family taints none of the others.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS report_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
+  public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER bytes (64 chars)
+  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  is_active INTEGER NOT NULL DEFAULT 0
+    CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
+  ON report_signing_keys(is_active) WHERE is_active = 1;
+
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
+  ON report_signing_keys(public_key_fingerprint);
+
+-- Permanent, append-only verification record. One row per signed report.
+-- subject_ref is the report's own id (compliance / report_engine / helper_pay)
+-- or the flag_id (abuse_flag). signed_payload_sha256 is the SHA-256 of the
+-- signed material: the produced PDF/DOCX bytes for server-side reports, or the
+-- canonical data payload for client-side abuse reports (which never contains
+-- plaintext — only a content hash binding the export to the sealed vault
+-- entry). metadata_json holds content-blind metadata only.
+CREATE TABLE IF NOT EXISTS report_verifications (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  report_type TEXT NOT NULL
+    CHECK (report_type IN ('compliance', 'report_engine', 'helper_pay', 'abuse_flag')),
+  subject_ref TEXT NOT NULL,
+  signed_payload_sha256 TEXT NOT NULL,              -- 64-char SHA-256 hex of the signed material
+  signature TEXT NOT NULL,                          -- base64 Ed25519 signature
+  key_fingerprint TEXT NOT NULL,                    -- report_signing_keys.public_key_fingerprint
+  instance_label TEXT NOT NULL,                     -- snapshot of config 'instance_label' at sign time
+  signed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata_json TEXT                                -- content-blind metadata only (never plaintext)
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_verifications_hash
+  ON report_verifications(signed_payload_sha256);
+
+CREATE INDEX IF NOT EXISTS idx_report_verifications_subject
+  ON report_verifications(report_type, subject_ref);
+
+-- report_verifications is PERMANENT and append-only: it backs the abuse-report
+-- appeal/verify path and must outlive every other record. No update, no delete.
+CREATE TRIGGER IF NOT EXISTS report_verifications_no_update
+  BEFORE UPDATE ON report_verifications
+  BEGIN SELECT RAISE(ABORT, 'report_verifications is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS report_verifications_no_delete
+  BEFORE DELETE ON report_verifications
+  BEGIN SELECT RAISE(ABORT, 'report_verifications is permanent (no delete)'); END;
+
+-- Human-readable instance label rendered on report watermarks. Set at
+-- provisioning time; the report-signing public-key fingerprint is the
+-- cryptographic identity, this is the human one.
+INSERT OR IGNORE INTO config (key, value)
+  VALUES ('instance_label', 'FireAlive Instance (unconfigured)');
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- R3c: HR SCHEDULING PLATFORM CONFIGURATION
 -- Stores the configuration this MC uses to sync analyst work-schedule data
 -- with an external HR scheduling platform — UKG/Kronos, Workday, ADP,
@@ -3742,6 +3822,25 @@ function initDb() {
   } catch (chainKeyErr) {
     console.error('chain-signing-keys initialization FAILED:', chainKeyErr.message);
     console.error('The server will start, but backup_chain entries cannot be appended until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
+  }
+
+  // ── U4: report-signing keypair ──────────────────────────────────────────
+  //
+  // Same lifecycle pattern as the chain/backup signing families above.
+  // Distinct keypair family that signs every exportable report (compliance,
+  // Report Engine, helper-pay, abuse-flag). On a fresh instance this
+  // auto-generates the active keypair on first boot; existing instances keep
+  // their key. A failure is non-fatal: the server starts, but reports cannot
+  // be signed until TIER1_ENCRYPTION_KEY is available and this is resolved.
+  try {
+    const { ensureActiveReportKeypair } = require('../services/report-signing-keys');
+    const reportKeyResult = ensureActiveReportKeypair(db);
+    if (reportKeyResult.isNewlyCreated) {
+      console.log(`report-signing-keys: generated new active Ed25519 keypair (id=${reportKeyResult.id}, fp=${reportKeyResult.publicKeyFingerprint.slice(0, 16)}\u2026)`);
+    }
+  } catch (reportKeyErr) {
+    console.error('report-signing-keys initialization FAILED:', reportKeyErr.message);
+    console.error('The server will start, but exportable reports cannot be signed until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
   }
 
   // ── R3d-4: KMS providers + restore approval defaults ────────────────────
