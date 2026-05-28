@@ -252,6 +252,20 @@ function CaseRow({ c, onClick }) {
 }
 
 // ── Case detail: fetch metadata + opaque sealed envelopes, decrypt locally ────
+// ============================================================================
+// SECURITY INVARIANT (regression lock): decrypted abuse evidence is rendered as
+// INERT PLAIN TEXT and must stay that way. The reporter note and the flagged
+// content can contain attacker-influenced bytes. (The note is sanitized on the
+// input side before sealing; the flagged content is authentic and unsanitized
+// by design.) Both are shown only as React text children -- {text} in
+// SealedPanel, {m.content} for context items, {c.resolutionNote} -- inside
+// whiteSpace:"pre-wrap" containers, so React escapes them and no markup runs.
+// DO NOT render any decrypted value via dangerouslySetInnerHTML, a markdown or
+// HTML renderer, or by injecting it into a URL, script, or style sink: that
+// would turn sealed evidence into a code-execution vector in this console. This
+// is the render-side half of the flag-note hardening; the input-side half lives
+// in packages/shared/note-sanitizer.js.
+// ============================================================================
 // The server hands back the note/content as opaque base64 it cannot read; this
 // view opens them with the device's reviewer private key via the main process
 // (abuse:open). Plaintext exists only transiently in this renderer, to display.

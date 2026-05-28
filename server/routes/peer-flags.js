@@ -321,7 +321,7 @@ router.post('/flags', (req, res) => {
     return submitLeadChatFlag(req, res);
   }
 
-  const { sessionId, tier, sealedNote } = req.body || {};
+  const { sessionId, tier, sealedNote, sealedContent } = req.body || {};
 
   if (!sessionId || typeof sessionId !== 'string' || sessionId.length > 200) {
     return res.status(400).json({ error: 'sessionId required (max 200 chars)' });
@@ -329,8 +329,15 @@ router.post('/flags', (req, res) => {
   if (!VALID_TIERS.includes(tier)) {
     return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
   }
-  // The client seals its note to the active reviewer recipient set before
-  // sending; the server stores the opaque envelope verbatim and never reads it.
+  // The client seals the selected peer-chat messages (sealedContent) and the
+  // reporter's note (sealedNote) to the active reviewer recipient set before
+  // sending; the server stores the opaque envelopes verbatim and never reads
+  // them. sealedContent carries the authentic flagged messages the client
+  // copied from the session -- it is required so a peer-session flag can never
+  // be submitted as a note alone (no unverifiable, typed-only accusations).
+  if (!isSealedB64(sealedContent)) {
+    return res.status(400).json({ error: 'sealedContent required (base64 sealed envelope of the selected peer-chat messages)' });
+  }
   if (!isSealedB64(sealedNote)) {
     return res.status(400).json({ error: 'sealedNote required (base64 sealed envelope of the flagger note)' });
   }
@@ -359,17 +366,34 @@ router.post('/flags', (req, res) => {
     if (!accusedId) { db.close(); return res.status(403).json({ error: 'not a participant in this session' }); }
     if (accusedId === req.user.id) { db.close(); return res.status(400).json({ error: 'cannot flag yourself' }); }
 
-    // Store the client-sealed note verbatim (peer flags have no evidence vault).
+    const flaggerU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(req.user.id);
+    const accusedU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(accusedId);
+
+    // Store the client-sealed envelopes verbatim. content_encrypted holds the
+    // sealed note; the vault's sealed_content_encrypted holds the sealed
+    // authentic messages the reporter selected. Neither is server-decryptable.
     const noteBox = Buffer.from(sealedNote, 'base64');
+    const contentBox = Buffer.from(sealedContent, 'base64');
 
     flagId = crypto.randomBytes(16).toString('hex');
     const flaggerIp = req.ip || req.connection?.remoteAddress || null;
 
-    db.prepare(`
-      INSERT INTO peer_abuse_flags
-        (id, session_id, flagger_user_id, flagged_user_id, tier, content_encrypted, flagger_ip)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(flagId, sessionId, req.user.id, accusedId, tier, noteBox, flaggerIp);
+    const seal = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO peer_abuse_flags
+          (id, target_type, target_id, session_id, flagger_user_id, flagged_user_id, tier, content_encrypted, flagger_ip)
+        VALUES (?, 'peer_session', NULL, ?, ?, ?, ?, ?, ?)
+      `).run(flagId, sessionId, req.user.id, accusedId, tier, noteBox, flaggerIp);
+
+      db.prepare(`
+        INSERT INTO peer_abuse_evidence_vault
+          (flag_id, target_type, target_id, sealed_content_encrypted, context_encrypted,
+           flagger_user_id, accused_user_id, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, tier_at_seal)
+        VALUES (?, 'peer_session', ?, ?, NULL, ?, ?, ?, ?, ?)
+      `).run(flagId, sessionId, contentBox,
+             req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
+    });
+    seal();
 
     // Re-evaluate abuse patterns for this pair (advisory; must not block submission).
     try { patternDetector.runForFlag(db, { flaggerId: req.user.id, flaggedId: accusedId }); }

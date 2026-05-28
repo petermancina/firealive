@@ -1150,7 +1150,7 @@ function ManagementConsole() {
       }
       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
       const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim() });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim(), sanitize: true });
       if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadChatSel.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }

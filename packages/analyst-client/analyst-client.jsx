@@ -1350,7 +1350,7 @@ export default function AnalystClientApp() {
   const closePeerSession = () => {
     if (peerSession && peerSession.id) { api.post("/api/peers/sessions/" + peerSession.id + "/close", {}); }
     setPostSession({ sessionId: peerSession.id, messages: [...peerMsgs], topic: peerSession.topic, expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
-    setPeerSession(null); setPeerDiscAccepted(false); setPM([]); setPostRating(0); setPostFlagging(false); setPostFlagText("");
+    setPeerSession(null); setPeerDiscAccepted(false); setPM([]); setPostRating(0); setPostFlagging(false); setPostFlagText(""); setPostFlagSel(new Set()); setPostFlagLastIdx(null);
     logC("peer_session_ended", "Skill-share ended — 5-min retention window for rating/flagging");
   };
   // Phase U3: out-of-band safety-number verification. Pass the shared sessionId as
@@ -1492,7 +1492,7 @@ export default function AnalystClientApp() {
       }
       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
       const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim() });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim(), sanitize: true });
       if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadThread.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
@@ -1653,7 +1653,7 @@ export default function AnalystClientApp() {
         setBoardFlagBusy(false); return;
       }
       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note });
+      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note, sanitize: true });
       const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: (body || "") });
       if (!sn || !sn.sealed || !sc || !sc.sealed) { setBoardFlagErr("Could not seal the report."); setBoardFlagBusy(false); return; }
       const payload = { target_type: "board_post", boardPostId: postId, tier: boardFlagTier, sealedNote: sn.sealed, sealedContent: sc.sealed };
@@ -1738,6 +1738,27 @@ export default function AnalystClientApp() {
   const [postFlagTier, setPostFlagTier] = useState(0); // 0=unselected, 1/2/3
   const [postFlagErr, setPostFlagErr] = useState("");
   const [postFlagBusy, setPostFlagBusy] = useState(false);
+  const [postFlagSel, setPostFlagSel] = useState(() => new Set());
+  const [postFlagLastIdx, setPostFlagLastIdx] = useState(null);
+  // Whole-message selection for peer-chat flagging. The accuser chooses WHICH
+  // authentic messages to report (click to toggle, Shift-click for a contiguous
+  // run, Select all); the system then seals those messages' real text. The
+  // accuser never types or alters the flagged content.
+  const toggleFlagSel = (idx, shift) => {
+    const msgs = (postSession && postSession.messages) || [];
+    setPostFlagSel(prev => {
+      const next = new Set(prev);
+      if (shift && postFlagLastIdx != null) {
+        const a = Math.min(postFlagLastIdx, idx), b = Math.max(postFlagLastIdx, idx);
+        for (let i = a; i <= b; i++) { if (msgs[i]) next.add(msgs[i].id); }
+      } else {
+        const id = msgs[idx] && msgs[idx].id;
+        if (id != null) { if (next.has(id)) next.delete(id); else next.add(id); }
+      }
+      return next;
+    });
+    setPostFlagLastIdx(idx);
+  };
   // (cleaned up in v1.0.0)
 
   // signals defined above
@@ -2469,14 +2490,25 @@ export default function AnalystClientApp() {
               {postFlagging&&(<div>
                 <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:8}}>Review the chat and select the severity that matches what happened:</M>
 
+                <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:6}}>
+                  <M style={{color:C.tm,flex:1,lineHeight:1.4}}>Select the message(s) to report ({postFlagSel.size} selected). Click to toggle, Shift-click for a range.</M>
+                  <Btn small onClick={()=>setPostFlagSel(new Set((postSession.messages||[]).map(m=>m.id)))}>Select all</Btn>
+                  <Btn small onClick={()=>{setPostFlagSel(new Set());setPostFlagLastIdx(null);}}>Clear</Btn>
+                </div>
                 <Card style={{marginBottom:8,maxHeight:200,overflow:"auto",background:"rgba(0,0,0,0.4)",fontFamily:"'Courier New',Courier,monospace"}}>
-                  {postSession.messages.map(m=>(
-                    <div key={m.id} style={{padding:"8px 12px",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
-                      <M style={{color:m.from.includes("You")?C.a:C.p,fontWeight:500,fontFamily:"inherit"}}>{m.from}</M>
-                      <span style={{fontSize:11,color:C.td,marginLeft:8}}>{m.ts}</span>
-                      <div style={{fontSize:12,color:C.t,fontFamily:"inherit",marginTop:2}}>{m.text}</div>
+                  {postSession.messages.map((m,i)=>{
+                    const sel = postFlagSel.has(m.id);
+                    return (
+                    <div key={m.id} onClick={(e)=>toggleFlagSel(i, e.shiftKey)} style={{padding:"8px 12px",borderBottom:"1px solid rgba(255,255,255,0.04)",cursor:"pointer",background:sel?"rgba(239,68,68,0.16)":"transparent",display:"flex",gap:8,alignItems:"flex-start"}}>
+                      <input type="checkbox" readOnly checked={sel} style={{marginTop:3,pointerEvents:"none"}}/>
+                      <div style={{flex:1}}>
+                        <M style={{color:m.from.includes("You")?C.a:C.p,fontWeight:500,fontFamily:"inherit"}}>{m.from}</M>
+                        <span style={{fontSize:11,color:C.td,marginLeft:8}}>{m.ts}</span>
+                        <div style={{fontSize:12,color:C.t,fontFamily:"inherit",marginTop:2}}>{m.text}</div>
+                      </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </Card>
 
                 <div style={{marginBottom:14}}>
@@ -2507,19 +2539,23 @@ export default function AnalystClientApp() {
                 </div>
 
                 <div style={{marginBottom:10}}>
-                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Copy and paste the relevant text, or describe what was said:</M>
-                  <textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={10000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Paste the text in question or describe what happened..."/>
+                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Note for the reviewer \u2014 why is the selected message abusive? (required)</M>
+                  <textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={2000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Explain why the selected text is abusive. The flagged text itself is captured from the chat above -- do not retype it here."/>
                 </div>
 
                 {postFlagErr && <M style={{color:C.d,display:"block",marginBottom:8,lineHeight:1.5}}>{postFlagErr}</M>}
                 <div style={{display:"flex",gap:8}}>
-                  <Btn danger disabled={!postFlagText.trim()||!postFlagTier||postFlagBusy} onClick={async()=>{
-                    // Seal the note on-device to the active reviewer recipient set
-                    // and post a peer-session flag. The accused is resolved server-side
-                    // from the session counterpart -- the pseudonymous peer identity
-                    // never leaves the server.
+                  <Btn danger disabled={postFlagSel.size===0||!postFlagText.trim()||!postFlagTier||postFlagBusy} onClick={async()=>{
+                    // Seal the AUTHENTIC selected messages (sealedContent) and the
+                    // reviewer note (sealedNote) on-device to the active reviewer
+                    // recipient set, then post a peer-session flag. The flagged text
+                    // is copied by the system from the messages the accuser selected
+                    // -- never typed -- so it cannot be altered or fabricated. The
+                    // accused is resolved server-side from the session counterpart.
                     const note = postFlagText.trim();
-                    if (!note || !postFlagTier || !postSession || !postSession.sessionId) return;
+                    const selMsgs = ((postSession && postSession.messages) || []).filter(m => postFlagSel.has(m.id));
+                    if (selMsgs.length === 0 || !note || !postFlagTier || !postSession || !postSession.sessionId) return;
+                    const contentText = selMsgs.map(m => `[${m.ts}] ${m.from}: ${m.text}`).join("\n");
                     const bridge = (typeof window!=="undefined") ? window.firealive : null;
                     if (!bridge || !bridge.invoke) { setPostFlagErr("Reporting requires the desktop app."); return; }
                     setPostFlagBusy(true); setPostFlagErr("");
@@ -2527,18 +2563,19 @@ export default function AnalystClientApp() {
                       const k = await api.get("/api/abuse-review-keys");
                       if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) { setPostFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer."); setPostFlagBusy(false); return; }
                       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
-                      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note });
-                      if (!sn || !sn.sealed) { setPostFlagErr("Could not seal the report."); setPostFlagBusy(false); return; }
-                      const r = await api.post("/api/peer/flags", { sessionId: postSession.sessionId, tier: postFlagTier, sealedNote: sn.sealed });
+                      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: contentText });
+                      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note, sanitize: true });
+                      if (!sc || !sc.sealed || !sn || !sn.sealed) { setPostFlagErr("Could not seal the report."); setPostFlagBusy(false); return; }
+                      const r = await api.post("/api/peer/flags", { sessionId: postSession.sessionId, tier: postFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
                       if (r && r.error) { setPostFlagErr(r.error); setPostFlagBusy(false); return; }
                       if (r && r.id) {
                         logC("peer_abuse_flagged", `Tier ${postFlagTier} report sealed to the independent reviewer`);
-                        setPostFlagging(false); setPostFlagTier(0); setPostFlagText(""); setPostFlagErr(""); setPostSession(null);
+                        setPostFlagging(false); setPostFlagTier(0); setPostFlagText(""); setPostFlagErr(""); setPostFlagSel(new Set()); setPostFlagLastIdx(null); setPostSession(null);
                       }
                       setPostFlagBusy(false);
                     } catch (e) { setPostFlagErr("Could not submit the report."); setPostFlagBusy(false); }
                   }}>{postFlagBusy?"Sealing\u2026":"Submit Flag"}</Btn>
-                  <Btn small onClick={()=>{setPostFlagging(false);setPostFlagTier(0);setPostFlagErr("");}}>Cancel</Btn>
+                  <Btn small onClick={()=>{setPostFlagging(false);setPostFlagTier(0);setPostFlagErr("");setPostFlagSel(new Set());setPostFlagLastIdx(null);}}>Cancel</Btn>
                 </div>
               </div>)}
             </Card>

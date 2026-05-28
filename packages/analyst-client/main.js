@@ -115,6 +115,16 @@ try {
   ({ sealToReviewers } = require('../shared/abuse-seal'));
 }
 
+// The reporter-note sanitizer (packages/shared/note-sanitizer.js) is loaded the
+// same packaged/source way. It hardens the reporter's free-text note before it
+// is sealed; the flagged CONTENT is never passed through it.
+let sanitizeNote;
+try {
+  ({ sanitizeNote } = require('./note-sanitizer'));
+} catch {
+  ({ sanitizeNote } = require('../shared/note-sanitizer'));
+}
+
 // libsignal is a native ESM module; load it dynamically and normalize the
 // shape across the ESM-namespace and CJS-default interop cases.
 async function loadLibsignal() {
@@ -209,7 +219,7 @@ ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, 
 // one reviewer opens it with their own private key. The server stores it and cannot
 // read it; no private key is ever involved here. The renderer calls this once per
 // field (offending text, note).
-ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext } = {}) => {
+ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext, sanitize } = {}) => {
   if (!Array.isArray(recipientPublicKeys) || recipientPublicKeys.length === 0) {
     throw new Error('recipientPublicKeys (non-empty array of base64) required');
   }
@@ -219,7 +229,10 @@ ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext } = {})
   if (typeof plaintext !== 'string') {
     throw new Error('plaintext (string) required');
   }
-  return { sealed: sealToReviewers(recipientPublicKeys, plaintext) };
+  // Only the reporter's note is sanitized (sanitize: true). The flagged content
+  // is system-copied authentic text and must be sealed exactly as captured.
+  const material = sanitize ? sanitizeNote(plaintext) : plaintext;
+  return { sealed: sealToReviewers(recipientPublicKeys, material) };
 });
 
 app.whenReady().then(createWindow);
