@@ -19,8 +19,8 @@
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "esbuild": "0.27.7",
-    "electron": "^41.3.0",
-    "electron-builder": "^24.0.0"
+    "electron": "^42.3.0",
+    "electron-builder": "^26.8.1"
   },
   "build": {
     "appId": "com.firealive.analyst-client",
