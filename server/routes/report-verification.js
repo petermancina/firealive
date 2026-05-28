@@ -130,6 +130,8 @@ router.get('/verify/report/:hash', (req, res) => {
       report_type: result.reportType,
       subject_ref: result.subjectRef,
       key_fingerprint: result.keyFingerprint,
+      signed_payload_sha256: result.signedPayloadSha256,
+      signature: result.signatureB64,
       instance_label: result.instanceLabel,
       signed_at: result.signedAt,
       metadata: result.metadata || null,
