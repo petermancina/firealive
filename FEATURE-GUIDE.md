@@ -1137,6 +1137,8 @@ Points come from 4-5 star peer-session ratings the analyst has received. Each ra
 
 The leaderboard visibility toggle defaults to OFF (opt-out). Flipping it on adds the analyst's pseudonym (or real name if pseudonyms aren't enabled team-wide) to the lead's recognition leaderboard on the MC. Earning, balance, and redemption are NOT affected by this toggle — they continue regardless of leaderboard visibility. Only the public-display surface changes.
 
+The Your Records card exports a personal copy of the statement — balance, full ledger, and redemption history — as a signed PDF, DOCX, or CSV. All three formats are signed with the instance's Ed25519 report-signing key and carry a verification footer (instance label, signed time, key fingerprint, and the SHA-256 verification instruction), so the analyst, or an admin asked to attest to a copy, can confirm a document is genuine via the in-app verify endpoint or OpenSSL per `docs/report-verification.md`. The statement is self-scoped — the server returns only the caller's own data — and is for personal record-keeping, not a payroll or HR artifact.
+
 **Workflow:**
 1. Analyst opens Helper Pay tab in their AC
 2. Sees current balance prominently displayed
@@ -1146,6 +1148,7 @@ The leaderboard visibility toggle defaults to OFF (opt-out). Flipping it on adds
 6. Submits redemption request; appears in their My Redemptions list as Pending
 7. Lead approves/declines (separate MC tab); on approval, points debit from the analyst's balance
 8. On fulfillment, the analyst sees the request status flip to Fulfilled; they receive their PTO or USD per the org's payout method
+9. Optionally downloads a signed PDF, DOCX, or CSV statement from Your Records — a personal copy of the balance, ledger, and redemption history for the analyst's own files
 
 ### Board
 **What it's for:** Async forum for tips, questions, burnout strategies. Posts auto-expire after 7 days (so it's a current-conversation space, not a permanent record). Each post supports threaded responses so analysts can ask follow-up questions or add comments, and posts and replies can be marked with lightweight reactions (Helpful, Thanks, Insightful, Same here) for low-effort acknowledgement. The same conduct rules and tiered abuse flagging system from peer chat apply here too.

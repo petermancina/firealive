@@ -280,12 +280,54 @@ router.get('/redemptions', (req, res) => {
   }
 });
 
+// Build the report-doc-builder model from a helper-pay statement. A
+// statement is fact-only -- no KB synthesis, no citations -- so the model
+// carries pseudonym + balance metadata and two sections of itemized bullets
+// (Points Ledger and Redemptions). Used by the signed PDF/DOCX export path.
+function helperPayModel(stmt) {
+  const meta = [
+    ['Pseudonym', stmt.pseudonym || '(unset)'],
+    ['Analyst ID', stmt.userId],
+    ['Current Balance', String(stmt.balance) + ' points'],
+    ['Generated', stmt.generatedAt],
+  ];
+  const ledgerBullets = stmt.ledger.length === 0
+    ? ['(no ledger entries yet)']
+    : stmt.ledger.map((e) => {
+        const sign = (typeof e.delta === 'number' && e.delta >= 0) ? '+' : '';
+        const notes = e.notes ? `  --  ${e.notes}` : '';
+        const reason = e.reason || e.ref_type || '(unlabeled)';
+        return `${e.created_at}  ·  ${sign}${e.delta} pts  ·  ${reason}  ·  balance ${e.balance_after}${notes}`;
+      });
+  const redemptionBullets = stmt.redemptions.length === 0
+    ? ['(no redemptions yet)']
+    : stmt.redemptions.map((r) => {
+        const decided = r.decided_at ? `, decided ${r.decided_at}` : '';
+        const note = r.decision_note ? ` (${r.decision_note})` : '';
+        const fulfilled = r.fulfilled_at ? `, fulfilled ${r.fulfilled_at}` : '';
+        return `${r.requested_at}  ·  ${r.option_name}  ·  ${r.cost_points} pts  ·  ${r.status}${decided}${note}${fulfilled}`;
+      });
+  return {
+    title: 'Helper Pay Statement',
+    subtitle: `${stmt.pseudonym || 'Analyst'} · current balance ${stmt.balance} points`,
+    meta,
+    sections: [
+      { heading: 'Points Ledger', bullets: ledgerBullets },
+      { heading: 'Redemptions', bullets: redemptionBullets },
+    ],
+  };
+}
+
 // Caller-scoped points statement for the analyst's own records. Returns only
 // the requesting user's pseudonym, balance, ledger, and redemptions - never
-// anyone else's. format=csv downloads a spreadsheet; otherwise JSON is
-// returned. This is for personal record-keeping; it is not an HR or payroll
-// document, and it never exposes another analyst's data.
-router.get('/my-statement', (req, res) => {
+// anyone else's. format chooses the output: json (default), csv, signed pdf,
+// or signed docx. This is for personal record-keeping; it is not an HR or
+// payroll document, and it never exposes another analyst's data.
+router.get('/my-statement', async (req, res) => {
+  const format = String(req.query.format || 'json').toLowerCase();
+  if (!['json', 'csv', 'pdf', 'docx'].includes(format)) {
+    return res.status(400).json({ error: 'format must be one of: json, csv, pdf, docx' });
+  }
   const db = getDb();
   try {
     const userId = req.user.id;
@@ -305,10 +347,10 @@ router.get('/my-statement', (req, res) => {
     const generatedAt = new Date().toISOString();
 
     auditLog(userId, 'HELPER_STATEMENT_EXPORTED',
-      `format=${(req.query.format || 'json')}; ledger=${ledger.length}; redemptions=${redemptions.length}`,
+      `format=${format}; ledger=${ledger.length}; redemptions=${redemptions.length}`,
       req.ip);
 
-    if ((req.query.format || '').toString() === 'csv') {
+    if (format === 'csv') {
       const lines = [];
       lines.push('Helper Pay Statement');
       lines.push(['Pseudonym', csvEscape(pseudonym)].join(','));
@@ -325,11 +367,89 @@ router.get('/my-statement', (req, res) => {
       const rh = ['requested_at', 'option_name', 'cost_points', 'status', 'decided_at', 'decision_note', 'fulfilled_at'];
       lines.push(rh.join(','));
       for (const r of redemptions) lines.push(rh.map(k => csvEscape(r[k])).join(','));
+      // bytes-mode verification footer + sign the resulting CSV bytes, so
+      // the CSV is a signed, verifiable artifact (same report_type and
+      // owner_user_id auth rule as the pdf/docx path). Spreadsheet apps
+      // render the '# '-prefixed lines as text in column A. The verifier
+      // hashes the file bytes and calls /api/verify/report/<sha256>.
+      const { buildWatermarkLines } = require('../services/report-watermark');
+      const { signReport, getInstanceLabel } = require('../services/report-signer');
+      const { ensureActiveReportKeypair } = require('../services/report-signing-keys');
+      const reportKey = ensureActiveReportKeypair(db);
+      const footerLines = buildWatermarkLines({
+        instanceLabel: getInstanceLabel(db),
+        keyFingerprint: reportKey.publicKeyFingerprint,
+        signedAt: new Date().toISOString(),
+      });
+      lines.push('');
+      for (const fl of footerLines) lines.push('# ' + fl);
       const csv = lines.join('\n') + '\n';
+      const csvBytes = Buffer.from(csv, 'utf8');
+      const descriptor = signReport({
+        db,
+        reportType: 'helper_pay',
+        subjectRef: crypto.randomUUID(),
+        material: csvBytes,
+        metadata: {
+          owner_user_id: userId,
+          format: 'csv',
+          balance,
+          ledger_count: ledger.length,
+          redemption_count: redemptions.length,
+        },
+      });
       const filename = `helper-pay-statement-${generatedAt.slice(0, 10)}.csv`;
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      return res.send(csv);
+      res.setHeader('X-Report-Verification', descriptor.sha256);
+      return res.send(csvBytes);
+    }
+
+    if (format === 'pdf' || format === 'docx') {
+      // Signed document export. The rendered file bytes are signed; the
+      // bytes-mode footer instructs the verifier to compute the file's
+      // SHA-256 and call GET /api/verify/report/<sha256>. report-doc-builder
+      // (pdfkit/docx) is required only on this path so the json and csv paths
+      // carry no new runtime dependency.
+      const { buildReportPdf, buildReportDocx } = require('../services/report-doc-builder');
+      const { signReport, getInstanceLabel } = require('../services/report-signer');
+      const { ensureActiveReportKeypair } = require('../services/report-signing-keys');
+      const reportKey = ensureActiveReportKeypair(db);
+      const footer = {
+        instanceLabel: getInstanceLabel(db),
+        keyFingerprint: reportKey.publicKeyFingerprint,
+        signedAt: new Date().toISOString(),
+      };
+      const model = helperPayModel({ pseudonym, userId, balance, ledger, redemptions, generatedAt });
+      const buffer = format === 'pdf'
+        ? await buildReportPdf(model, footer)
+        : await buildReportDocx(model, footer);
+      // owner_user_id in metadata is what the verify endpoint uses to enforce
+      // the self-or-admin auth rule for helper_pay reports (PR 1's
+      // report-verification.js). subject_ref is a per-statement uuid; the
+      // statement itself is not persisted (it is regenerated on demand).
+      const descriptor = signReport({
+        db,
+        reportType: 'helper_pay',
+        subjectRef: crypto.randomUUID(),
+        material: buffer,
+        metadata: {
+          owner_user_id: userId,
+          format,
+          balance,
+          ledger_count: ledger.length,
+          redemption_count: redemptions.length,
+        },
+      });
+      const ext = format === 'pdf' ? 'pdf' : 'docx';
+      const ctype = format === 'pdf'
+        ? 'application/pdf'
+        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      const filename = `helper-pay-statement-${generatedAt.slice(0, 10)}.${ext}`;
+      res.setHeader('Content-Type', ctype);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('X-Report-Verification', descriptor.sha256);
+      return res.send(buffer);
     }
 
     res.json({ pseudonym, userId, balance, ledger, redemptions, generatedAt });
