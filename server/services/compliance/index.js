@@ -114,7 +114,6 @@ const SEVERITY_MAP = {
   'FUSE_VIOLATION': 1,         // alert
   'INTEGRITY_VIOLATION': 1,    // alert
   'BANDWIDTH_ALERT': 2,        // critical
-  'PEER_ABUSE_ESCALATION': 2,  // critical
   'PRIVILEGE_ESCALATION': 2,   // critical
   'LOGIN_FAILED': 3,           // error
   'APIKEY_REVOKED': 3,         // error

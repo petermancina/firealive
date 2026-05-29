@@ -19,7 +19,6 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
-const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 const patternDetector = require('../services/abuse-pattern-detector');
@@ -185,7 +184,6 @@ function submitBoardFlag(req, res) {
   }
 
   notifyReviewersOfFlag(flagId, tier);
-  auditLog(req.user.id, 'PEER_ABUSE_FLAG_SUBMITTED', `board_post ${(req.body || {}).boardPostId}, tier ${tier}, flag ${flagId}`, req.ip);
 
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
 }
@@ -286,8 +284,7 @@ function submitLeadChatFlag(req, res) {
   // No pattern-detector call here: the detector writes to peer_abuse_patterns,
   // which the MC reads, so feeding lead_chat now would surface it to leads. The
   // lead-chat pattern feed lands at the PR G cutover, together with the MC
-  // pattern removal. Audit records metadata only.
-  auditLog(req.user.id, 'PEER_ABUSE_FLAG_SUBMITTED', `lead_chat ${threadId}, tier ${tier}, flag ${flagId}`, req.ip);
+  // pattern removal.
 
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
 }
@@ -409,7 +406,6 @@ router.post('/', (req, res) => {
   // Notify the assigned independent reviewer(s) of the flag.
   notifyReviewersOfFlag(flagId, tier);
 
-  auditLog(req.user.id, 'PEER_ABUSE_FLAG_SUBMITTED', `tier ${tier}, flag ${flagId}`, req.ip);
 
   return res.status(201).json({
     id: flagId,

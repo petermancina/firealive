@@ -135,55 +135,6 @@ router.post('/sessions/:id/rate', (req, res) => {
   }
 });
 
-// ── Flag Abusive Language ────────────────────────────────────────────────────
-router.post('/sessions/:id/flag', (req, res) => {
-  const { reason } = req.body;
-  if (!reason || reason.length > 500) return res.status(400).json({ error: 'reason required (max 500 chars)' });
-
-  try {
-    const db = getDb();
-    const row = db.prepare("SELECT value FROM team_config WHERE key = ?").get(`peer_session_${req.params.id}`);
-    if (!row) { db.close(); return res.status(404).json({ error: 'Session not found' }); }
-
-    const session = JSON.parse(row.value);
-    if (req.user.id !== session.requesterId && req.user.id !== session.accepterId) {
-      db.close(); return res.status(403).json({ error: 'Not a participant' });
-    }
-
-    // Determine who is being flagged (the other party)
-    const flaggedUserId = req.user.id === session.requesterId ? session.accepterId : session.requesterId;
-
-    if (!session.flags) session.flags = [];
-    session.flags.push({
-      by: req.user.id === session.requesterId ? 'requester' : 'accepter', // don't store actual ID in flag
-      reason: reason.slice(0, 500),
-      at: new Date().toISOString(),
-    });
-
-    db.prepare("UPDATE team_config SET value = ? WHERE key = ?").run(JSON.stringify(session), `peer_session_${req.params.id}`);
-
-    // Track flags per user for escalation
-    const flagKey = `peer_flags_${flaggedUserId}`;
-    const flagData = db.prepare("SELECT value FROM team_config WHERE key = ?").get(flagKey);
-    const flags = flagData ? JSON.parse(flagData.value) : { count: 0, sessions: [] };
-    flags.count += 1;
-    flags.sessions.push({ sessionId: session.id, at: new Date().toISOString() });
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(flagKey, JSON.stringify(flags), req.user.id);
-
-    // Auto-alert team lead if 3+ flags
-    if (flags.count >= 3) {
-      auditLog(null, 'PEER_ABUSE_ESCALATION', `User has ${flags.count} abuse flags — review recommended`);
-    }
-
-    db.close();
-    auditLog(req.user.id, 'PEER_FLAGGED', `session=${req.params.id}`, req.ip);
-    res.json({ ok: true, message: 'Flag recorded. The other party will be notified their language was flagged.' });
-  } catch (err) {
-    logger.error('Flag session error', { error: err.message });
-    res.status(500).json({ error: 'Failed to flag session' });
-  }
-});
-
 // ── Timeout/No-Show Tracking ─────────────────────────────────────────────────
 router.post('/sessions/:id/timeout', (req, res) => {
   try {
@@ -277,17 +228,8 @@ router.get('/points', (req, res) => {
       return { userId, name: user?.name, count: data.count };
     }).filter(n => n.count > 0);
 
-    // Abuse flags
-    const flagRows = db.prepare("SELECT key, value FROM team_config WHERE key LIKE 'peer_flags_%'").all();
-    const flags = flagRows.map(r => {
-      const userId = r.key.replace('peer_flags_', '');
-      const data = JSON.parse(r.value);
-      const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
-      return { userId, name: user?.name, count: data.count };
-    }).filter(f => f.count > 0);
-
     db.close();
-    res.json({ helpers: summary, noShows, abuseFlags: flags });
+    res.json({ helpers: summary, noShows });
   } catch (err) {
     logger.error('Points summary error', { error: err.message });
     res.status(500).json({ error: 'Failed to get points summary' });
