@@ -1412,7 +1412,11 @@ CREATE TABLE IF NOT EXISTS peer_abuse_flags (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   resolved_at TEXT,
   resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
-  resolution_note TEXT
+  resolution_note TEXT,
+  -- determination: the reviewer's structured verdict, recorded once at resolve
+  -- alongside the rationale note. One-shot -- the resolve route 409-locks any
+  -- second attempt, and there is no re-determination path by design (U4 PR 5).
+  determination TEXT CHECK (determination IS NULL OR determination IN ('substantiated', 'not_substantiated', 'inconclusive'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_peer_abuse_flags_unresolved
@@ -1462,6 +1466,19 @@ CREATE INDEX IF NOT EXISTS idx_evidence_vault_accused
 
 CREATE INDEX IF NOT EXISTS idx_evidence_vault_target
   ON peer_abuse_evidence_vault(target_type, target_id);
+
+-- peer_abuse_evidence_vault holds the only server-side copy of sealed abuse
+-- evidence and is retained indefinitely. The vault is append-only with no delete
+-- path of any kind, so evidence cannot be erased by any actor. The legal-hold
+-- action exports a copy of a case; it never removes the row. (U4 PR 5: eternal
+-- retention.)
+CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_update
+  BEFORE UPDATE ON peer_abuse_evidence_vault
+  BEGIN SELECT RAISE(ABORT, 'peer_abuse_evidence_vault is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_delete
+  BEFORE DELETE ON peer_abuse_evidence_vault
+  BEGIN SELECT RAISE(ABORT, 'peer_abuse_evidence_vault is retained indefinitely (no delete)'); END;
 
 -- Abuse pattern detections (U2). The statistical detector writes one row per
 -- detected pattern (repeat offender, retaliation, escalation) over flag
@@ -2891,6 +2908,23 @@ function initDb() {
     }
   } catch (flagU3MigErr) {
     console.error('peer_abuse_flags migration (U3) failed (non-fatal):', flagU3MigErr.message);
+  }
+
+  // ── Migration: peer_abuse_flags.determination column (U4 PR 5) ──────
+  // Adds the reviewer's structured verdict to existing databases. ALTER TABLE
+  // ADD COLUMN is idempotent here: it runs only when the column is missing, so
+  // it is a no-op on fresh installs (which get it from SCHEMA) and on already-
+  // migrated databases. The column is nullable (NULL until a case is resolved);
+  // allowed values are enforced by the SCHEMA CHECK on fresh installs and by the
+  // resolve route on every database.
+  try {
+    const flagDetCols = db.prepare("PRAGMA table_info(peer_abuse_flags)").all().map(c => c.name);
+    if (!flagDetCols.includes('determination')) {
+      db.exec("ALTER TABLE peer_abuse_flags ADD COLUMN determination TEXT");
+      console.log('peer_abuse_flags migration (U4): added determination column');
+    }
+  } catch (flagDetMigErr) {
+    console.error('peer_abuse_flags determination migration (U4) failed (non-fatal):', flagDetMigErr.message);
   }
 
   // ── Migration: peer_abuse_evidence_vault lead_chat target (U3 PR D) ──

@@ -1790,6 +1790,25 @@ export default function AnalystClientApp() {
     const t = setTimeout(expire, ms);
     return () => clearTimeout(t);
   }, [exportPrompt, exportExpiresAt, exportDone]);
+  // Post-session retention: the decrypted messages held in postSession are wiped
+  // when the displayed window lapses, honoring the "deleted after 5 minutes"
+  // promise on the client as well -- but only while the reporter is idle on the
+  // review screen. While they are actively composing a flag the purge is deferred
+  // so evidence is never deleted out from under them mid-report; the "I need more
+  // time" control extends the window. (U4 PR 5-B.)
+  const postComposing = !!postSession && (postFlagging || postFlagSel.size > 0 || (postFlagText && postFlagText.length > 0));
+  React.useEffect(() => {
+    if (!postSession || !postSession.expiresAt || postComposing) return undefined;
+    const wipe = () => {
+      setPostSession(null); setPostFlagging(false); setPostFlagTier(0); setPostFlagText("");
+      setPostFlagErr(""); setPostFlagSel(new Set()); setPostFlagLastIdx(null);
+      logC("peer_session_expired", "Post-session review window lapsed -- messages deleted");
+    };
+    const ms = new Date(postSession.expiresAt).getTime() - Date.now();
+    if (ms <= 0) { wipe(); return undefined; }
+    const t = setTimeout(wipe, ms);
+    return () => clearTimeout(t);
+  }, [postSession, postComposing]);
   // Whole-message selection for peer-chat flagging. The accuser chooses WHICH
   // authentic messages to report (click to toggle, Shift-click for a contiguous
   // run, Select all); the system then seals those messages' real text. The
@@ -2530,7 +2549,10 @@ export default function AnalystClientApp() {
             <Card style={{marginBottom:12,borderColor:C.w+"40",padding:16}}>
               <div style={{fontSize:14,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>Skill-Share Ended</div>
               <M style={{color:C.w,display:"block",marginBottom:12,lineHeight:1.6}}>Chat messages are temporarily retained for 5 minutes so you can rate and flag any issues. After that, all messages are permanently deleted.</M>
-              <M style={{color:C.td,display:"block",marginBottom:16}}>Topic: {postSession.topic} · Expires: {new Date(postSession.expiresAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</M>
+              <M style={{color:C.td,display:"block",marginBottom:8}}>Topic: {postSession.topic} · Expires: {new Date(postSession.expiresAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</M>
+              <div style={{marginBottom:16}}>
+                <Btn small onClick={()=>{setPostSession(p => p ? ({...p, expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString()}) : p);logC("peer_session_extended","Extended post-session review window by 5 minutes");}}>I need more time (+5 min)</Btn>
+              </div>
 
               {/* Rating */}
               <div style={{marginBottom:16}}>

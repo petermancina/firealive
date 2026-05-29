@@ -32,6 +32,8 @@ const C = {
   p:"#A78BFA",pd:"rgba(167,139,250,0.1)",
 };
 const MONO = "'IBM Plex Mono',monospace";
+const DET_OPTIONS = [["substantiated", "Substantiated"], ["not_substantiated", "Not substantiated"], ["inconclusive", "Inconclusive"]];
+const DET_LABELS = { substantiated: "Substantiated", not_substantiated: "Not substantiated", inconclusive: "Inconclusive" };
 const SERIF = "'Fraunces',serif";
 
 // Self-contained: NO external font @import (CDN fonts are blocked by this app's
@@ -290,6 +292,7 @@ function CaseDetail({ caseId, onBack, onResolved }) {
   const [context, setContext] = useState({ state: "empty", items: null });  // board thread context (parsed JSON)
   const [decryptError, setDecryptError] = useState("");
   const [resolveNote, setResolveNote] = useState("");
+  const [resolveDet, setResolveDet] = useState("");  // structured verdict: substantiated | not_substantiated | inconclusive
   const [resolving, setResolving] = useState(false);
   const [resolveError, setResolveError] = useState("");
 
@@ -340,10 +343,10 @@ function CaseDetail({ caseId, onBack, onResolved }) {
 
   async function resolve() {
     setResolveError(""); setResolving(true);
-    const r = await api.post(`/api/abuse-review/cases/${caseId}/resolve`, { note: resolveNote });
+    const r = await api.post(`/api/abuse-review/cases/${caseId}/resolve`, { note: resolveNote, determination: resolveDet });
     setResolving(false);
     if (!r || r.error) { setResolveError(r && r.error === "case already resolved" ? "This case was already resolved." : "Could not resolve the case."); return; }
-    setData(d => ({ ...d, resolved: true, resolvedAt: new Date().toISOString(), resolutionNote: resolveNote }));
+    setData(d => ({ ...d, resolved: true, resolvedAt: new Date().toISOString(), resolutionNote: resolveNote, determination: resolveDet }));
     if (onResolved) onResolved();
   }
 
@@ -387,6 +390,12 @@ function CaseDetail({ caseId, onBack, onResolved }) {
         </div>
       )}
       <SealedPanel label="Reporter's note" state={note.state} text={note.text} />
+      {c.resolved && c.determination && (
+        <div style={{marginTop:6}}>
+          <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Determination</div>
+          <div style={{fontSize:13,color:C.t,fontFamily:MONO}}>{DET_LABELS[c.determination] || c.determination}</div>
+        </div>
+      )}
       {c.resolved && c.resolutionNote && (
         <div style={{marginTop:6}}>
           <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Resolution note</div>
@@ -396,9 +405,15 @@ function CaseDetail({ caseId, onBack, onResolved }) {
       {!c.resolved && (
         <div style={{marginTop:8,borderTop:`1px solid ${C.b}`,paddingTop:16}}>
           <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Resolve this case</div>
-          <textarea value={resolveNote} onChange={e=>setResolveNote(e.target.value)} placeholder="Resolution note (optional)" rows={3} style={{width:"100%",padding:"11px 13px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,outline:"none",resize:"vertical",marginBottom:10}} />
+          <div style={{fontSize:11,color:C.tm,marginBottom:6,fontFamily:MONO}}>Determination (required)</div>
+          <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+            {DET_OPTIONS.map(([val,label]) => (
+              <button key={val} onClick={()=>setResolveDet(val)} style={{padding:"8px 14px",background:resolveDet===val?C.ad:C.s,border:`1px solid ${resolveDet===val?C.a+"80":C.b}`,borderRadius:8,color:resolveDet===val?C.a:C.t,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:MONO}}>{label}</button>
+            ))}
+          </div>
+          <textarea value={resolveNote} onChange={e=>setResolveNote(e.target.value)} placeholder="Rationale (required)" rows={3} style={{width:"100%",padding:"11px 13px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,outline:"none",resize:"vertical",marginBottom:10}} />
           {resolveError && <div style={{marginBottom:10,padding:10,background:C.dd,border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:11,lineHeight:1.5}}>{resolveError}</div>}
-          <button onClick={resolve} disabled={resolving} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:resolving?"default":"pointer",fontFamily:MONO,opacity:resolving?0.6:1}}>{resolving?"Resolving…":"Resolve case"}</button>
+          <button onClick={resolve} disabled={resolving || !resolveDet || !resolveNote.trim()} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:(resolving||!resolveDet||!resolveNote.trim())?"default":"pointer",fontFamily:MONO,opacity:(resolving||!resolveDet||!resolveNote.trim())?0.6:1}}>{resolving?"Resolving…":"Resolve case"}</button>
         </div>
       )}
     </div>

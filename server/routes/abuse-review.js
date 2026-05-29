@@ -100,6 +100,7 @@ router.get('/cases', (req, res) => {
         createdAt: f.created_at,
         resolved: !!f.resolved_at,
         resolvedAt: f.resolved_at || null,
+        determination: f.resolved_at ? (f.determination || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
       });
@@ -145,6 +146,7 @@ router.get('/cases/:id', (req, res) => {
         resolved: !!f.resolved_at,
         resolvedAt: f.resolved_at || null,
         resolutionNote: f.resolved_at ? (f.resolution_note || null) : null,
+        determination: f.resolved_at ? (f.determination || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
         // OPAQUE sealed envelopes — the server cannot read these. The Abuse Review
@@ -165,8 +167,7 @@ router.get('/cases/:id', (req, res) => {
 
 // POST /cases/:id/resolve — mark a case resolved with the reviewer's disposition note.
 router.post('/cases/:id/resolve', (req, res) => {
-  const { note } = req.body || {};
-  const noteVal = (typeof note === 'string' && note.length <= MAX_RESOLUTION_NOTE) ? note : '';
+  const { note, determination } = req.body || {};
   let db;
   try {
     db = getDb();
@@ -183,12 +184,24 @@ router.post('/cases/:id/resolve', (req, res) => {
     }
     if (f.resolved_at) return res.status(409).json({ error: 'case already resolved' });
 
+    // A resolution requires a structured verdict and a non-empty rationale note.
+    // The verdict is one-shot: the 409 above blocks any second resolution, and
+    // there is no re-determination path by design (U4 PR 5). The verdict is
+    // stored on the reviewer-only flag row, never written to the audit log.
+    const DETERMINATIONS = ['substantiated', 'not_substantiated', 'inconclusive'];
+    if (!DETERMINATIONS.includes(determination)) {
+      return res.status(400).json({ error: `determination must be one of: ${DETERMINATIONS.join(', ')}` });
+    }
+    const rationale = (typeof note === 'string') ? note.trim() : '';
+    if (!rationale) return res.status(400).json({ error: 'a rationale note is required' });
+    if (rationale.length > MAX_RESOLUTION_NOTE) return res.status(400).json({ error: 'rationale note too long' });
+
     db.prepare(
-      "UPDATE peer_abuse_flags SET resolved_at = datetime('now'), resolved_by = ?, resolution_note = ? WHERE id = ?"
-    ).run(req.user.id, noteVal, f.id);
+      "UPDATE peer_abuse_flags SET resolved_at = datetime('now'), resolved_by = ?, resolution_note = ?, determination = ? WHERE id = ?"
+    ).run(req.user.id, rationale, determination, f.id);
 
     auditLog(req.user.id, 'ABUSE_REVIEW_RESOLVED', `case ${f.id}, tier ${f.tier}`, req.ip);
-    return res.json({ id: f.id, resolved: true });
+    return res.json({ id: f.id, resolved: true, determination });
   } catch (err) {
     logger.error('Abuse review: failed to resolve case', { error: err.message });
     return res.status(500).json({ error: 'failed to resolve case' });
