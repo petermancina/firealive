@@ -178,4 +178,40 @@ router.get('/requests/:id', (req, res) => {
   }
 });
 
+// POST /requests/:id/produced -- record that the reviewer produced the case file
+// AFTER verifying the CISO token and assembling it locally. The server records
+// the lifecycle event only; it cannot itself produce or decrypt anything. The
+// file's own signature is recorded separately via report-signing on the device.
+router.post('/requests/:id/produced', (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const row = db.prepare('SELECT * FROM abuse_vault_export_requests WHERE id = ?').get(req.params.id);
+    if (!row || row.requested_by_user_id !== req.user.id) {
+      return res.status(404).json({ error: 'request not found' });
+    }
+    if (row.status === 'consumed') {
+      return res.status(409).json({ error: 'export already recorded as produced' });
+    }
+    if (row.status !== 'approved' || !row.approval_signature || row.approval_decision !== 'approved') {
+      return res.status(409).json({ error: 'request is not in an approved, signed state' });
+    }
+    db.transaction(() => {
+      db.prepare("UPDATE abuse_vault_export_requests SET status = 'consumed', consumed_at = datetime('now') WHERE id = ? AND status = 'approved'").run(row.id);
+      try {
+        avChain.appendEntry(db, { eventType: 'LEGAL_HOLD_PRODUCED', flagId: row.flag_id, requestRef: String(row.id), actorUserId: req.user.id });
+      } catch (avErr) {
+        logger.warn('abuse-vault-export: LEGAL_HOLD_PRODUCED chain append failed', { error: avErr.message });
+      }
+    })();
+    const updated = db.prepare('SELECT * FROM abuse_vault_export_requests WHERE id = ?').get(row.id);
+    return res.json(serializeRequest(updated));
+  } catch (err) {
+    logger.error('abuse-vault-export: failed to record production', { error: err.message });
+    return res.status(500).json({ error: 'failed to record production' });
+  } finally {
+    if (db) db.close();
+  }
+});
+
 module.exports = router;
