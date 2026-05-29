@@ -74,6 +74,14 @@ The Abuse Review Console (ARC) is the dedicated app for an independent abuse rev
 3. The session locks automatically after 5 minutes of inactivity — the unlocked private key is cleared from memory and you re-enter your passphrase to continue. You can also press the Lock button in the header at any time.
 4. Window-all-closed and before-quit also clear the in-memory key.
 
+### Step 5: Pin the CISO Key for Legal-Hold Export
+Producing a legal-hold export of a vaulted abuse case requires the CISO’s approval public key, pinned once on your device, out of band.
+1. Obtain the CISO approval public key and its SHA-256 fingerprint from the CISO through a trusted channel — not through FireAlive.
+2. In the ARC, on an approved export request, paste the public key and the expected fingerprint. The console recomputes the fingerprint from the key and refuses to pin on a mismatch, so a substituted key cannot be accepted silently. The pin lives only on your device, independent of the server.
+3. When you produce an export, the ARC re-verifies the CISO’s signed token against this pinned key — the signature and the request/case/decision binding — and refuses if anything fails, before assembling the case file.
+
+A produced case file identifies analysts by pseudonym; mapping pseudonyms to real identities is a separate, out-of-band handoff and is never embedded in the file. The reviewer and the CISO must be different people. Full procedure and offline verification: `docs/abuse-vault-legal-hold-export.md`.
+
 ### Adding or Removing Reviewers
 - **Add:** the new reviewer installs the ARC on their own device, generates their keypair (Steps 1 and 2), and hands their public key + fingerprint to the admin, who registers it via the MC's Audit → Abuse Reviewers panel. From the next flag onward, content is sealed to the expanded recipient set.
 - **Remove:** the admin revokes the reviewer's public key in the same panel. New flags omit the revoked slot. Flags already sealed to a set including the revoked key stay openable by every other active reviewer at the time of sealing.
@@ -104,6 +112,14 @@ The Abuse Review Console (ARC) is the dedicated app for an independent abuse rev
 5. **Lock configs:** Lock the master config via sidebar when setup is complete.
 
 ---
+
+### Step 4: Provision the Legal-Hold Export Approval Key
+Two-person legal-hold exports of vaulted abuse cases require a CISO approval. Approving mints an Ed25519-signed decision token; the reviewer’s device verifies that token before producing a case file.
+1. The GD holds a dedicated CISO approval key, separate from the report-signing and trust-registry keys. It is created on first use and stored Tier-1-encrypted; back it with an HSM or hardware key store where available. The private half never leaves the GD.
+2. Publish the approval **public** key and its SHA-256 fingerprint to each abuse reviewer **out of band** (in person, signed message, or a separately verified document — never through the platform). Reviewers pin this key in their console and refuse to produce an export if a token does not verify against it.
+3. **The reviewer and the CISO must be different people.** The platform separates the two roles across realms but cannot detect one human holding both a reviewer account and a CISO account; a deployment that collapses them has no real two-person control.
+
+Pending requests appear on the Global Dashboard’s MC Connections tab (“Pending Legal-Hold Export Approvals”). Full procedure: `docs/abuse-vault-legal-hold-export.md`.
 
 ## Shared Responsibility in Compliance Reports
 

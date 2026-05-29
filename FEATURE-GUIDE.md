@@ -1272,6 +1272,8 @@ Reports render in three formats: JSON in-app (for the dashboard preview) and sig
 
 **Top-of-list summary line:** When any MCs have pending submissions, a one-line summary above the MC list names the distinct count and points the operator at the amber "Review keys" affordance.
 
+**Pending Legal-Hold Export Approvals card:** The connections tab also carries the CISO’s approval queue for two-person legal-hold exports of vaulted abuse cases. When an abuse reviewer requests an export, it appears here (gated to the `ciso` role) with the case and request identifiers and the reviewer’s written rationale. Approving mints an Ed25519-signed decision token over that specific request — bound to the request, case, and decision; denying records a signed denial with a reason. The CISO approval key is distinct from the report-signing and trust-registry keys, and the management console never sees that an export was requested, approved, or produced. The reviewer’s own device verifies the signed token against an independently pinned copy of this CISO key before any case file is produced. Full procedure in `docs/abuse-vault-legal-hold-export.md`.
+
 ### Compliance Posture
 **What it's for:** Generate a compliance report against THIS GD-Server's own running state. Same 16-framework selector as the MC side, same Shared Responsibility two-bucket structure (verifiedControls + customerResponsibility), but the controls checked are GD-specific: cross-region aggregation integrity, signing-key trust registry hygiene, mailbox-pattern fulfillment, GD-side audit log integrity, GD-side encryption, GD-side authentication, GD-side configuration locking. Each report carries the framework name, authority, citation, generation timestamp, and the app version that produced it — useful provenance metadata for audit evidence.
 
@@ -1381,6 +1383,21 @@ The ARC opens abuse-report content **client-side, with the reviewer's own privat
 **Workflow:**
 1. From a case detail view, click Resolve, choose a disposition, enter a note.
 2. The case moves to resolved status; the audit log records who resolved it and the note. The disposition flows back to whatever downstream behaviour the target type requires (a board-post flag upheld keeps the post removed; dismissed returns it to the board).
+
+### Legal-Hold Export
+**What it's for:** Taking a single sealed abuse case out of the eternal-retention vault as a self-contained case file for a legal or HR matter, under a two-person rule. The reviewer requests; a CISO approves with a signed token; the reviewer’s device verifies that token before producing the file. The vault original is never altered — the action exports a copy.
+
+**Who uses it:** The independent reviewer (request and produce) together with a CISO in the Global Dashboard (approve). They must be different people — the software separates the two roles across realms but cannot detect one person holding both accounts.
+
+**One-time setup — pin the CISO key:** Before producing, the ARC must hold the CISO’s approval *public* key, pinned once and out of band. Obtain the key and its SHA-256 fingerprint from the CISO through a trusted channel, paste both into the ARC, and it recomputes the fingerprint and refuses to pin on a mismatch. The pin lives only on the reviewer’s device, independent of the server.
+
+**Workflow:**
+1. From a case detail view, open Legal-Hold Export and submit a request with a written rationale (a minimum length is enforced). One open request per case; it is valid for a fixed approval window.
+2. The request is relayed to the CISO. Its status shows here and updates when the CISO acts.
+3. On approval, click Produce case file. The ARC re-verifies the CISO’s signed token on the device — the signature, and that it binds this exact request, case, and decision — and refuses if anything fails.
+4. The ARC assembles a watermarked “RESTRICTED — Legal/HR” case file from the locally decrypted material, embeds the verified approval token so a recipient can check it independently, downloads it, and records production. The vault row is untouched.
+
+**Framing:** the export is a chain-of-custody and authenticity control, not a way to go over a reviewer’s head or to reopen a locked determination. Once two authorized people hold the file, software cannot control where it then goes; the watermark and recorded rationale are accountability, not destination enforcement. Full architecture, the canonical token payload, and an OpenSSL procedure for verifying a produced file offline are in `docs/abuse-vault-legal-hold-export.md`.
 
 ### Patterns
 **What it's for:** Surfacing **metadata-only** signals across the cases the reviewer has access to — repeat-offender (same person flagged 2+ times in 30 days), escalation (tiers increasing across cases), retaliation (a flag against someone who recently flagged the reviewer's own party). The pattern detector reads metadata only; it never decrypts content.
