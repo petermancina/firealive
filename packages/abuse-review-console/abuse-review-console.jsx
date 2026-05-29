@@ -295,6 +295,17 @@ function CaseDetail({ caseId, onBack, onResolved }) {
   const [resolveDet, setResolveDet] = useState("");  // structured verdict: substantiated | not_substantiated | inconclusive
   const [resolving, setResolving] = useState(false);
   const [resolveError, setResolveError] = useState("");
+  const [exportReq, setExportReq] = useState(null);   // current legal-hold export request for this case, or null
+  const [exportReason, setExportReason] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [cisoPin, setCisoPin] = useState(null);        // {pinned, fingerprint, noDesktop?} | null until checked
+  const [cisoPem, setCisoPem] = useState("");
+  const [cisoFp, setCisoFp] = useState("");
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinError, setPinError] = useState("");
+  const [produceBusy, setProduceBusy] = useState(false);
+  const [produceError, setProduceError] = useState("");
 
   async function openOne(sealedB64, set) {
     if (!sealedB64) { set({ state: "empty", text: "" }); return; }
@@ -341,6 +352,36 @@ function CaseDetail({ caseId, onBack, onResolved }) {
     return () => { alive = false; };
   }, [caseId]);
 
+  // Load any existing legal-hold export request for this case so its status shows.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const r = await api.get('/api/abuse-vault-export/requests');
+      if (!alive || !r || r.error || !Array.isArray(r.requests)) return;
+      const mine = r.requests.filter(x => x.flagId === caseId);
+      setExportReq(mine.length ? mine[0] : null);
+    })();
+    return () => { alive = false; };
+  }, [caseId]);
+
+  // While a request is pending, poll for the CISO's decision (pulled from the GD).
+  useEffect(() => {
+    if (!exportReq || exportReq.status !== 'pending') return undefined;
+    const t = setInterval(async () => {
+      const r = await api.get('/api/abuse-vault-export/requests/' + exportReq.id);
+      if (r && !r.error && r.id) setExportReq(r);
+    }, 20000);
+    return () => clearInterval(t);
+  }, [exportReq && exportReq.id, exportReq && exportReq.status]);
+
+  // When an approved export is in hand, check whether this device has the CISO
+  // approval key pinned -- required to verify the token before producing.
+  useEffect(() => {
+    if (!exportReq || exportReq.status !== 'approved') return;
+    if (!window.firealive || !window.firealive.invoke) { setCisoPin({ pinned: false, noDesktop: true }); return; }
+    window.firealive.invoke('abuse:cisoKeyStatus').then(st => setCisoPin(st || { pinned: false })).catch(() => setCisoPin({ pinned: false }));
+  }, [exportReq && exportReq.id, exportReq && exportReq.status]);
+
   async function resolve() {
     setResolveError(""); setResolving(true);
     const r = await api.post(`/api/abuse-review/cases/${caseId}/resolve`, { note: resolveNote, determination: resolveDet });
@@ -348,6 +389,72 @@ function CaseDetail({ caseId, onBack, onResolved }) {
     if (!r || r.error) { setResolveError(r && r.error === "case already resolved" ? "This case was already resolved." : "Could not resolve the case."); return; }
     setData(d => ({ ...d, resolved: true, resolvedAt: new Date().toISOString(), resolutionNote: resolveNote, determination: resolveDet }));
     if (onResolved) onResolved();
+  }
+
+  async function requestExport() {
+    setExportError(""); setExportBusy(true);
+    const r = await api.post('/api/abuse-vault-export/' + caseId + '/request', { reason: exportReason });
+    setExportBusy(false);
+    if (!r || r.error) { setExportError(r && r.error ? r.error : "Could not create the request."); return; }
+    setExportReq(r); setExportReason("");
+  }
+  async function refreshExport() {
+    if (!exportReq) return;
+    const r = await api.get('/api/abuse-vault-export/requests/' + exportReq.id);
+    if (r && !r.error && r.id) setExportReq(r);
+  }
+
+  async function pinCisoKey() {
+    setPinError(""); setPinBusy(true);
+    try {
+      const r = await window.firealive.invoke('abuse:pinCisoKey', { publicKeyPem: cisoPem, expectedFingerprint: cisoFp });
+      setCisoPin({ pinned: true, fingerprint: r.fingerprint }); setCisoPem(""); setCisoFp("");
+    } catch (e) { setPinError((e && e.message) ? e.message : "Could not pin the key."); }
+    setPinBusy(false);
+  }
+
+  async function produceExport() {
+    setProduceError(""); setProduceBusy(true);
+    try {
+      const ap = exportReq.approval;
+      if (!ap || !ap.signature) { setProduceError("No signed approval is present yet."); setProduceBusy(false); return; }
+      // Authoritative gate: verify the CISO token against THIS device's pinned key.
+      const v = await window.firealive.invoke('abuse:verifyExportToken', {
+        payloadCanonical: ap.payloadCanonical, signature: ap.signature, keyFingerprint: ap.keyFingerprint,
+        expectRequestId: exportReq.id, expectFlagId: caseId, expectDecision: 'approved',
+      });
+      if (!v || !v.ok) { setProduceError("Approval did not verify: " + ((v && v.reason) || "unknown") + ". Export refused."); setProduceBusy(false); return; }
+      const cf = data || {};
+      const caseFile = {
+        document: "FireAlive Legal-Hold Case File",
+        classification: "RESTRICTED \u2014 Legal/HR",
+        generatedAt: new Date().toISOString(),
+        caseId: caseId,
+        targetType: cf.targetType || null,
+        determination: cf.determination || null,
+        resolutionNote: cf.resolutionNote || null,
+        evidence: {
+          content: content.state === "ok" ? content.text : null,
+          reporterNote: note.state === "ok" ? note.text : null,
+          context: context.state === "ok" ? context.items : null,
+        },
+        cisoApproval: {
+          payloadCanonical: ap.payloadCanonical, signature: ap.signature, keyFingerprint: ap.keyFingerprint,
+          verifiedAgainstPinnedKey: true, decidedAt: v.decidedAt || null, nonce: v.nonce || null,
+        },
+        chainReference: { requestId: exportReq.id, flagId: caseId },
+        notice: "Two-person controlled export (reviewer + CISO). Verify cisoApproval.signature against the CISO public key. Software cannot control downstream distribution; this file is for legal/HR use only.",
+      };
+      const blob = new Blob([JSON.stringify(caseFile, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "legal-hold-case-" + caseId + ".json";
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      const rec = await api.post('/api/abuse-vault-export/requests/' + exportReq.id + '/produced', {});
+      if (rec && !rec.error && rec.id) { setExportReq(rec); }
+      else { setProduceError("File produced, but recording it failed: " + ((rec && rec.error) || "unknown") + "."); }
+    } catch (e) { setProduceError((e && e.message) ? e.message : "Production failed."); }
+    setProduceBusy(false);
   }
 
   const back = <button onClick={onBack} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer",fontFamily:MONO}}>← Back to cases</button>;
@@ -416,6 +523,51 @@ function CaseDetail({ caseId, onBack, onResolved }) {
           <button onClick={resolve} disabled={resolving || !resolveDet || !resolveNote.trim()} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:(resolving||!resolveDet||!resolveNote.trim())?"default":"pointer",fontFamily:MONO,opacity:(resolving||!resolveDet||!resolveNote.trim())?0.6:1}}>{resolving?"Resolving…":"Resolve case"}</button>
         </div>
       )}
+      <div style={{marginTop:8,borderTop:`1px solid ${C.b}`,paddingTop:16}}>
+        <div style={{fontSize:10,letterSpacing:1,textTransform:"uppercase",color:C.tm,marginBottom:6,fontFamily:MONO}}>Legal-hold export</div>
+        {!exportReq && (
+          <div>
+            <div style={{fontSize:12,color:C.tm,lineHeight:1.6,marginBottom:10}}>A legal-hold export requires a CISO to approve it in the Global Dashboard before the case file can be produced. State the legal basis below.</div>
+            <textarea value={exportReason} onChange={e=>setExportReason(e.target.value)} placeholder="Legal basis / rationale (required, min 20 chars)" rows={3} style={{width:"100%",padding:"11px 13px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:13,fontFamily:MONO,outline:"none",resize:"vertical",marginBottom:10}} />
+            {exportError && <div style={{marginBottom:10,padding:10,background:C.dd,border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:11,lineHeight:1.5}}>{exportError}</div>}
+            <button onClick={requestExport} disabled={exportBusy || exportReason.trim().length < 20} style={{padding:"10px 18px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontWeight:600,cursor:(exportBusy||exportReason.trim().length<20)?"default":"pointer",fontFamily:MONO,opacity:(exportBusy||exportReason.trim().length<20)?0.6:1}}>{exportBusy?"Requesting\u2026":"Request legal-hold export"}</button>
+          </div>
+        )}
+        {exportReq && (
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+              <Badge color={exportReq.status==="approved"?C.a:exportReq.status==="denied"?C.d:C.t}>{exportReq.status.toUpperCase()}</Badge>
+              {exportReq.status==="pending" && <span style={{fontSize:11,color:C.tm,fontFamily:MONO}}>awaiting CISO approval in the Global Dashboard</span>}
+            </div>
+            {exportReq.reason && <div style={{fontSize:12,color:C.tm,lineHeight:1.6,marginBottom:6,whiteSpace:"pre-wrap"}}>Basis: {exportReq.reason}</div>}
+            {exportReq.status==="denied" && exportReq.denialReason && <div style={{fontSize:12,color:C.d,lineHeight:1.6,marginBottom:6}}>Denied: {exportReq.denialReason}</div>}
+            {exportReq.status==="approved" && (
+              <div>
+                <div style={{fontSize:12,color:C.a,lineHeight:1.6,marginBottom:8}}>Approved by the CISO. Producing assembles the case file on this device after verifying the signed approval; the vault is never modified.</div>
+                {cisoPin && cisoPin.noDesktop && <div style={{fontSize:11,color:C.d,marginBottom:8}}>Run the desktop app to verify the approval and produce the file.</div>}
+                {cisoPin && !cisoPin.pinned && !cisoPin.noDesktop && (
+                  <div style={{marginBottom:10,padding:10,background:C.s,border:`1px solid ${C.b}`,borderRadius:8}}>
+                    <div style={{fontSize:11,color:C.tm,marginBottom:6,fontFamily:MONO}}>Pin the CISO approval key (one-time; verify the fingerprint out of band)</div>
+                    <textarea value={cisoPem} onChange={e=>setCisoPem(e.target.value)} placeholder="CISO approval public key (PEM)" rows={3} style={{width:"100%",padding:"9px 11px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:MONO,outline:"none",resize:"vertical",marginBottom:6}} />
+                    <input value={cisoFp} onChange={e=>setCisoFp(e.target.value)} placeholder="Expected fingerprint (sha256 hex)" style={{width:"100%",padding:"9px 11px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:MONO,outline:"none",marginBottom:6}} />
+                    {pinError && <div style={{fontSize:11,color:C.d,marginBottom:6}}>{pinError}</div>}
+                    <button onClick={pinCisoKey} disabled={pinBusy || !cisoPem.trim() || !cisoFp.trim()} style={{padding:"8px 14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,cursor:(pinBusy||!cisoPem.trim()||!cisoFp.trim())?"default":"pointer",fontFamily:MONO,opacity:(pinBusy||!cisoPem.trim()||!cisoFp.trim())?0.6:1}}>{pinBusy?"Pinning\u2026":"Pin CISO key"}</button>
+                  </div>
+                )}
+                {cisoPin && cisoPin.pinned && (
+                  <div>
+                    <div style={{fontSize:10,color:C.tm,marginBottom:8,fontFamily:MONO}}>CISO key pinned: {cisoPin.fingerprint ? cisoPin.fingerprint.slice(0,16)+"\u2026" : ""}</div>
+                    <button onClick={produceExport} disabled={produceBusy} style={{padding:"10px 18px",background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:600,cursor:produceBusy?"default":"pointer",fontFamily:MONO,opacity:produceBusy?0.6:1}}>{produceBusy?"Producing\u2026":"Produce case file"}</button>
+                  </div>
+                )}
+                {produceError && <div style={{marginTop:8,padding:10,background:C.dd,border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:11,lineHeight:1.5}}>{produceError}</div>}
+              </div>
+            )}
+            {exportReq.status==="consumed" && <div style={{fontSize:12,color:C.tm,lineHeight:1.6,marginBottom:6}}>Case file produced and recorded. The vault record is unchanged and retained.</div>}
+            {exportReq.status==="pending" && <button onClick={refreshExport} style={{padding:"8px 14px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,cursor:"pointer",fontFamily:MONO}}>Refresh status</button>}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

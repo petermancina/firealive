@@ -1480,6 +1480,115 @@ CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_delete
   BEFORE DELETE ON peer_abuse_evidence_vault
   BEGIN SELECT RAISE(ABORT, 'peer_abuse_evidence_vault is retained indefinitely (no delete)'); END;
 
+-- ── Abuse-vault legal-hold export chain + request ledger (U4 PR 5-C) ──────────
+-- A legal-hold export of a vaulted case is a two-person action: an independent
+-- reviewer (ARC) requests it and a CISO (Global Dashboard) approves it. The
+-- Management Console is never involved and the team lead never sees it; these
+-- tables are read only by the reviewer/CISO surfaces, never by an MC route. The
+-- export produces a COPY -- the vault row itself is never modified or deleted
+-- (see the vault's append-only triggers above). Eternal retention holds.
+
+-- Append-only, hash-chained, Ed25519-signed lifecycle ledger for the vault.
+-- Mirrors legal_hold_chain. Refs are plain TEXT (not foreign keys) so a ledger
+-- entry stands independently of the rows it describes, and so a CISO -- a Global
+-- Dashboard identity, not a regional-server users row -- can be recorded as the
+-- actor on an approval or denial.
+CREATE TABLE IF NOT EXISTS abuse_vault_chain (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('VAULT_SEALED','LEGAL_HOLD_REQUESTED','LEGAL_HOLD_APPROVED','LEGAL_HOLD_DENIED','LEGAL_HOLD_PRODUCED','CHAIN_VERIFIED')),
+  flag_id TEXT,
+  request_ref TEXT,
+  actor_user_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_abuse_vault_chain_flag ON abuse_vault_chain(flag_id);
+CREATE INDEX IF NOT EXISTS idx_abuse_vault_chain_request ON abuse_vault_chain(request_ref);
+
+CREATE TRIGGER IF NOT EXISTS abuse_vault_chain_no_update
+  BEFORE UPDATE ON abuse_vault_chain
+  BEGIN SELECT RAISE(ABORT, 'abuse_vault_chain is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS abuse_vault_chain_no_delete
+  BEFORE DELETE ON abuse_vault_chain
+  BEGIN SELECT RAISE(ABORT, 'abuse_vault_chain is append-only'); END;
+
+-- Dedicated Ed25519 signing-key family for the chain (key separation -- distinct
+-- from the report-signing, legal-hold, backup, and forensic families). Mirrors
+-- legal_hold_chain_signing_keys: public stored plaintext, private Tier-1
+-- encrypted and JIT-decrypted at sign time.
+CREATE TABLE IF NOT EXISTS abuse_vault_chain_signing_keys (
+  id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_at TEXT
+);
+
+-- Two-person legal-hold export requests: a mutable state machine (the chain above
+-- is the immutable record). Modeled on restore_approvals. requested_by_user_id is
+-- the ARC reviewer; approved_by/denied_by hold a CISO's Global Dashboard identity
+-- (plain TEXT, no users FK). Separation of duties is structural -- the requester
+-- is an MC-realm reviewer and the approver a GD-realm CISO, necessarily distinct,
+-- and the regional server has no approve path of its own. gd_request_ref
+-- correlates the pushed request with the GD's stored copy for the decision poll.
+CREATE TABLE IF NOT EXISTS abuse_vault_export_requests (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  flag_id TEXT NOT NULL,
+  requested_by_user_id TEXT NOT NULL,
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  request_reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','denied','expired','consumed')),
+  approval_window_hours INTEGER NOT NULL DEFAULT 72,
+  approved_by TEXT,
+  approved_at TEXT,
+  denied_by TEXT,
+  denied_at TEXT,
+  denial_reason TEXT,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  gd_request_ref TEXT,
+  chain_request_entry_id INTEGER,
+  client_ip_at_request TEXT,
+  request_payload_canonical TEXT,
+  request_signature TEXT,
+  request_key_fingerprint TEXT,
+  approval_decision TEXT CHECK (approval_decision IN ('approved','denied')),
+  approval_payload_canonical TEXT,
+  approval_signature TEXT,
+  approval_key_fingerprint TEXT,
+  approval_nonce TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_abuse_vault_export_requests_status ON abuse_vault_export_requests(status);
+CREATE INDEX IF NOT EXISTS idx_abuse_vault_export_requests_flag ON abuse_vault_export_requests(flag_id);
+
+-- U4 PR 5-C: pinned CISO approval public key(s) -- the trust anchor for the
+-- two-person legal-hold export. The CISO's approval is an Ed25519-signed token;
+-- the reviewer's device (and the regional relay, as a sanity check) verifies it
+-- against the key pinned here, whose fingerprint is confirmed OUT-OF-BAND at pin
+-- time. This is a trust root, not a convenience cache: a server compromise that
+-- swaps this key is detectable because the fingerprint no longer matches what the
+-- ARC pinned independently. Public keys only; no private material is stored here.
+CREATE TABLE IF NOT EXISTS abuse_export_ciso_trust (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  public_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  label TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  pinned_by_user_id TEXT,
+  pinned_at TEXT NOT NULL DEFAULT (datetime('now')),
+  retired_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_abuse_export_ciso_trust_active ON abuse_export_ciso_trust(active) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_abuse_export_ciso_trust_fp ON abuse_export_ciso_trust(fingerprint);
+
 -- Abuse pattern detections (U2). The statistical detector writes one row per
 -- detected pattern (repeat offender, retaliation, escalation) over flag
 -- METADATA only: it keys entirely on user UUIDs and flag ids and never reads
@@ -2927,6 +3036,33 @@ function initDb() {
     console.error('peer_abuse_flags determination migration (U4) failed (non-fatal):', flagDetMigErr.message);
   }
 
+  // ── Migration: abuse_vault_export_requests signed-approval columns (U4 PR 5-C) ──
+  // The two-person legal-hold export is cryptographically enforced: the CISO's
+  // approval is an Ed25519-signed token the reviewer's device verifies before
+  // producing an export, and the reviewer's request is itself signed. These
+  // columns hold those signed artifacts; status/approved_by/denied_* remain an
+  // advisory cache of the authoritative signed decision. All nullable, populated
+  // as the request progresses. Idempotent: each ADD COLUMN runs only when missing.
+  try {
+    const exReqCols = db.prepare("PRAGMA table_info(abuse_vault_export_requests)").all().map(c => c.name);
+    const addExReqCol = (name, ddl) => {
+      if (!exReqCols.includes(name)) {
+        db.exec(`ALTER TABLE abuse_vault_export_requests ADD COLUMN ${ddl}`);
+        console.log(`abuse_vault_export_requests migration (U4 PR 5-C): added ${name} column`);
+      }
+    };
+    addExReqCol('request_payload_canonical', 'request_payload_canonical TEXT');
+    addExReqCol('request_signature', 'request_signature TEXT');
+    addExReqCol('request_key_fingerprint', 'request_key_fingerprint TEXT');
+    addExReqCol('approval_decision', "approval_decision TEXT CHECK (approval_decision IN ('approved','denied'))");
+    addExReqCol('approval_payload_canonical', 'approval_payload_canonical TEXT');
+    addExReqCol('approval_signature', 'approval_signature TEXT');
+    addExReqCol('approval_key_fingerprint', 'approval_key_fingerprint TEXT');
+    addExReqCol('approval_nonce', 'approval_nonce TEXT');
+  } catch (exReqMigErr) {
+    console.error('abuse_vault_export_requests signed-approval migration (U4 PR 5-C) failed (non-fatal):', exReqMigErr.message);
+  }
+
   // ── Migration: peer_abuse_evidence_vault lead_chat target (U3 PR D) ──
   // The vault mirrors a flag's target_type, so it must also accept 'lead_chat'
   // before lead-chat evidence can be sealed. Same widen-the-CHECK rebuild,
@@ -3875,6 +4011,44 @@ function initDb() {
   } catch (reportKeyErr) {
     console.error('report-signing-keys initialization FAILED:', reportKeyErr.message);
     console.error('The server will start, but exportable reports cannot be signed until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
+  }
+
+  // ── U4 PR 5-C: abuse-vault chain signing key + VAULT_SEALED backfill ─────
+  //
+  // The abuse-vault ledger has its own Ed25519 signing-key family (key
+  // separation). Generate the active key on first boot; existing instances
+  // keep theirs. Then backfill a VAULT_SEALED entry for every already-sealed
+  // case that lacks one so the ledger is complete on upgrade. The backfill
+  // entry is recorded now (its created_at is this boot, not the original seal
+  // time); the authoritative seal time stays on the vault row the entry points
+  // to. Both steps are idempotent and non-fatal: a failure lets the server
+  // start, but legal-hold export of a case stays unavailable until resolved.
+  try {
+    const avChain = require('../services/abuse-vault-chain');
+    const avKey = avChain.ensureActiveKey(db);
+    if (avKey.isNewlyCreated) {
+      console.log(`abuse-vault-chain: generated new active Ed25519 keypair (fp=${avKey.fingerprint.slice(0, 16)}\u2026)`);
+    }
+    const toBackfill = db.prepare(`
+      SELECT v.flag_id, v.flagger_user_id
+      FROM peer_abuse_evidence_vault v
+      WHERE NOT EXISTS (
+        SELECT 1 FROM abuse_vault_chain c
+        WHERE c.event_type = 'VAULT_SEALED' AND c.flag_id = v.flag_id
+      )
+      ORDER BY v.sealed_at ASC, v.id ASC
+    `).all();
+    let backfilled = 0;
+    for (const row of toBackfill) {
+      avChain.appendEntry(db, { eventType: 'VAULT_SEALED', flagId: row.flag_id, actorUserId: row.flagger_user_id });
+      backfilled++;
+    }
+    if (backfilled > 0) {
+      console.log(`abuse-vault-chain: backfilled ${backfilled} VAULT_SEALED entr${backfilled === 1 ? 'y' : 'ies'}`);
+    }
+  } catch (avErr) {
+    console.error('abuse-vault-chain initialization FAILED:', avErr.message);
+    console.error('The server will start, but legal-hold export of vaulted cases stays unavailable until this is investigated. Check that TIER1_ENCRYPTION_KEY is set.');
   }
 
   // ── R3d-4: KMS providers + restore approval defaults ────────────────────

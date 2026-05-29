@@ -1,6 +1,7 @@
 const { app, BrowserWindow, session, ipcMain, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // The reviewer seal helper (packages/shared/abuse-seal.js) is bundled the same
 // way as in the AC/MC; load it with the same packaged/source fallback. Node
@@ -135,6 +136,74 @@ ipcMain.handle('abuse:open', (_e, sealedB64) => {
     throw new Error('reviewer key is locked; unlock with your passphrase first');
   }
   return { plaintext: openForReviewer(unlockedPrivB64, sealedB64).toString('utf8') };
+});
+
+// ── U4 PR 5-C: pinned CISO approval key + export-token verification ──────────
+// The two-person legal-hold export is gated on THIS device verifying the CISO's
+// signed approval token against a CISO public key pinned here, out of band. The
+// pin is independent of the regional server: a hostile server cannot make a
+// forged token verify (it lacks the CISO private key) and cannot change what
+// this device pinned. Public key only; never any private material.
+const cisoKeyFile = () => path.join(app.getPath('userData'), 'ciso-export-key.pin');
+
+function cisoKeyFingerprint(publicKeyPem) {
+  const der = crypto.createPublicKey(publicKeyPem).export({ type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(der).digest('hex');
+}
+function loadPinnedCiso() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(cisoKeyFile(), 'utf8'));
+    if (!raw || !raw.publicKeyPem || !raw.fingerprint) return null;
+    return raw;
+  } catch { return null; }
+}
+
+// Is a CISO approval key pinned on this device?
+ipcMain.handle('abuse:cisoKeyStatus', () => {
+  const p = loadPinnedCiso();
+  return p ? { pinned: true, fingerprint: p.fingerprint, pinnedAt: p.pinnedAt || null } : { pinned: false };
+});
+
+// Pin (or re-pin) the CISO approval public key. expectedFingerprint MUST be the
+// value the reviewer confirmed OUT OF BAND with the CISO; it is recomputed from
+// the key bytes and a mismatch is refused -- the check is enforced here, not
+// trusted from input. Ed25519 only.
+ipcMain.handle('abuse:pinCisoKey', (_e, args) => {
+  const { publicKeyPem, expectedFingerprint } = args || {};
+  if (typeof publicKeyPem !== 'string' || !publicKeyPem) throw new Error('publicKeyPem is required');
+  if (typeof expectedFingerprint !== 'string' || !expectedFingerprint) throw new Error('expectedFingerprint is required');
+  let key;
+  try { key = crypto.createPublicKey(publicKeyPem); } catch { throw new Error('not a valid PEM public key'); }
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('CISO approval key must be Ed25519');
+  const actual = cisoKeyFingerprint(publicKeyPem);
+  const expected = expectedFingerprint.trim().toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (actual !== expected) throw new Error('fingerprint mismatch: computed ' + actual + ', expected ' + expected);
+  const pemNorm = key.export({ type: 'spki', format: 'pem' }).toString();
+  fs.writeFileSync(cisoKeyFile(), JSON.stringify({ publicKeyPem: pemNorm, fingerprint: actual, pinnedAt: new Date().toISOString() }), { mode: 0o600 });
+  return { pinned: true, fingerprint: actual };
+});
+
+// Verify a CISO export-approval token against the pinned key AND that it binds
+// the expected request/case/decision. Returns { ok, reason? }. This is the
+// authoritative gate the produce step calls before assembling a case file.
+ipcMain.handle('abuse:verifyExportToken', (_e, args) => {
+  const { payloadCanonical, signature, keyFingerprint, expectRequestId, expectFlagId, expectDecision } = args || {};
+  const pinned = loadPinnedCiso();
+  if (!pinned) return { ok: false, reason: 'no CISO key is pinned on this device; pin it out of band first' };
+  if (typeof payloadCanonical !== 'string' || typeof signature !== 'string') return { ok: false, reason: 'malformed token' };
+  if (keyFingerprint && String(keyFingerprint).toLowerCase() !== pinned.fingerprint) return { ok: false, reason: 'token key fingerprint does not match the pinned CISO key' };
+  let sig;
+  try { sig = Buffer.from(signature, 'hex'); } catch { return { ok: false, reason: 'signature not hex' }; }
+  let verified;
+  try { verified = crypto.verify(null, Buffer.from(payloadCanonical, 'utf8'), crypto.createPublicKey(pinned.publicKeyPem), sig); }
+  catch { return { ok: false, reason: 'verification error' }; }
+  if (!verified) return { ok: false, reason: 'signature does not verify against the pinned CISO key' };
+  let parsed;
+  try { parsed = JSON.parse(payloadCanonical); } catch { return { ok: false, reason: 'token payload not JSON' }; }
+  if (expectRequestId != null && parsed.request_id !== String(expectRequestId)) return { ok: false, reason: 'token does not bind this request' };
+  if (expectFlagId != null && parsed.flag_id !== String(expectFlagId)) return { ok: false, reason: 'token does not bind this case' };
+  if (expectDecision != null && parsed.decision !== expectDecision) return { ok: false, reason: 'token decision mismatch' };
+  return { ok: true, decision: parsed.decision, decidedAt: parsed.decided_at, nonce: parsed.nonce };
 });
 
 app.whenReady().then(createWindow);

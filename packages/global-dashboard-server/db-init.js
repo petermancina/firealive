@@ -1014,6 +1014,68 @@ function initDb() {
     );
   }
 
+  // U4 PR 5-C: abuse-export approval key family + incoming requests (GD side).
+  // The CISO's approval of a two-person legal-hold export is an Ed25519-signed
+  // token; abuse_export_approval_keys holds the key that signs it (private half
+  // Tier-1-encrypted, decrypted JIT only by the ciso-gated approve endpoint; in
+  // production it SHOULD be HSM/hardware-backed). abuse_export_incoming_requests
+  // stores requests relayed from a regional server plus the minted signed
+  // decision; the GD never receives vault plaintext, only the request metadata
+  // needed to authorize. Net-new tables; one try/catch suffices.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS abuse_export_approval_keys (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        public_key TEXT NOT NULL,
+        private_key_encrypted TEXT NOT NULL,
+        fingerprint TEXT NOT NULL UNIQUE,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        rotated_out_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_abuse_export_approval_keys_active
+        ON abuse_export_approval_keys (is_active) WHERE is_active = 1;
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS abuse_export_incoming_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mc_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        flag_id TEXT NOT NULL,
+        requested_by TEXT,
+        request_reason TEXT NOT NULL,
+        request_payload_canonical TEXT,
+        request_signature TEXT,
+        request_key_fingerprint TEXT,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'approved', 'denied')),
+        decision_payload_canonical TEXT,
+        decision_signature TEXT,
+        decision_key_fingerprint TEXT,
+        decision_nonce TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        denial_reason TEXT,
+        UNIQUE (mc_id, request_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_abuse_export_incoming_status
+        ON abuse_export_incoming_requests (status);
+
+      CREATE INDEX IF NOT EXISTS idx_abuse_export_incoming_mc
+        ON abuse_export_incoming_requests (mc_id);
+    `);
+
+    const aeReqCount = db.prepare('SELECT COUNT(*) AS n FROM abuse_export_incoming_requests').get().n;
+    console.log(`U4 PR 5-C GD migration: abuse_export_incoming_requests ready (rows=${aeReqCount})`);
+  } catch (abuseExportGdErr) {
+    console.error('U4 PR 5-C GD migration FAILED:', abuseExportGdErr.message);
+    console.error('The GD-server will start, but the legal-hold export approval endpoints are unavailable until this migration completes. All other GD surfaces are unaffected.');
+  }
+
   // U4: ensure this GD instance has an active Ed25519 report-signing keypair,
   // so its compliance and executive reports can be signed at generation time.
   // Idempotent -- only generates when no active key exists. Provisioned here as

@@ -24,6 +24,7 @@ const cloudIacBundle = require('./services/cloud-iac-bundle');
 const cicdBundle = require('./services/cicd-bundle');
 const forensicExport = require('./services/forensic-export');
 const legalHoldExport = require('./services/legal-hold-export');
+const abuseExportApproval = require('./services/abuse-export-approval-keys');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 
@@ -4820,6 +4821,140 @@ app.post('/api/legal-hold-exports/:id/release', authMiddleware(['ciso']), (req, 
     console.error('legal hold release failed:', err.message);
     res.status(500).json({ error: 'release failed', message: err.message });
   }
+});
+
+// ── U4 PR 5-C: two-person legal-hold export — GD approval surface ───────────
+// The CISO approves/denies a relayed export request by MINTING an Ed25519-signed
+// decision token (abuse-export-approval-keys.mintDecision). The regional relay
+// pushes requests here (api_key-authenticated, like metrics) and polls the signed
+// decision back; the reviewer's device verifies that token against the pinned
+// CISO key before producing an export. The GD never receives vault plaintext.
+
+// Relay -> GD: ingest a pending request. api_key resolves the MC (transport auth,
+// same as metrics). Idempotent on (mc_id, request_id). The stored request
+// signature is the regional attestation, kept for the CISO's review and the
+// permanent record.
+app.post('/api/mc/abuse-export/ingest', (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const { apiKey, requestId, flagId, requestedBy, requestReason,
+            requestPayloadCanonical, requestSignature, requestKeyFingerprint } = req.body || {};
+    if (!apiKey || typeof apiKey !== 'string') { db.close(); return res.status(400).json({ error: 'apiKey is required' }); }
+    const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
+    if (!mc) { db.close(); return res.status(403).json({ error: 'invalid api key' }); }
+    if (!requestId || !flagId || !requestReason) { db.close(); return res.status(400).json({ error: 'requestId, flagId and requestReason are required' }); }
+    const existing = db.prepare("SELECT id, status FROM abuse_export_incoming_requests WHERE mc_id = ? AND request_id = ?").get(mc.id, requestId);
+    if (existing) { db.close(); return res.json({ id: existing.id, status: existing.status, action: 'idempotent' }); }
+    const info = db.prepare(`
+      INSERT INTO abuse_export_incoming_requests
+        (mc_id, request_id, flag_id, requested_by, request_reason,
+         request_payload_canonical, request_signature, request_key_fingerprint)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(mc.id, requestId, flagId, requestedBy || null, requestReason,
+           requestPayloadCanonical || null, requestSignature || null, requestKeyFingerprint || null);
+    db.close();
+    return res.status(202).json({ id: info.lastInsertRowid, status: 'pending', action: 'ingested' });
+  } catch (e) { if (db) db.close(); console.error('abuse-export ingest failed:', e.message); return res.status(500).json({ error: 'ingest failed' }); }
+});
+
+// Relay -> GD: poll a request's status + (once decided) the signed decision token.
+app.post('/api/mc/abuse-export/status', (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const { apiKey, requestId } = req.body || {};
+    if (!apiKey || typeof apiKey !== 'string') { db.close(); return res.status(400).json({ error: 'apiKey is required' }); }
+    const mc = db.prepare("SELECT * FROM management_consoles WHERE api_key = ? AND status = 'active'").get(apiKey);
+    if (!mc) { db.close(); return res.status(403).json({ error: 'invalid api key' }); }
+    const row = db.prepare("SELECT * FROM abuse_export_incoming_requests WHERE mc_id = ? AND request_id = ?").get(mc.id, requestId);
+    db.close();
+    if (!row) return res.status(404).json({ error: 'request not found' });
+    const out = { requestId: row.request_id, status: row.status };
+    if (row.status === 'approved' || row.status === 'denied') {
+      out.decision = {
+        decision: row.status,
+        payloadCanonical: row.decision_payload_canonical,
+        signature: row.decision_signature,
+        keyFingerprint: row.decision_key_fingerprint,
+        nonce: row.decision_nonce,
+        decidedAt: row.decided_at,
+        denialReason: row.denial_reason || null,
+      };
+    }
+    return res.json(out);
+  } catch (e) { if (db) db.close(); console.error('abuse-export status failed:', e.message); return res.status(500).json({ error: 'status failed' }); }
+});
+
+// CISO: list pending export approvals (for the GD console card).
+app.get('/api/abuse-export/pending', authMiddleware(['ciso']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const rows = db.prepare(`
+      SELECT id, mc_id, request_id, flag_id, requested_by, request_reason, received_at
+      FROM abuse_export_incoming_requests WHERE status = 'pending' ORDER BY received_at ASC
+    `).all();
+    db.close();
+    return res.json({ pending: rows });
+  } catch (e) { if (db) db.close(); console.error('abuse-export pending failed:', e.message); return res.status(500).json({ error: 'list failed' }); }
+});
+
+// CISO: the active approval public key + fingerprint, for out-of-band pinning.
+app.get('/api/abuse-export/approval-key', authMiddleware(['ciso']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    abuseExportApproval.ensureActiveApprovalKey(db);
+    const k = abuseExportApproval.getApprovalPublicKey(db);
+    db.close();
+    return res.json({ publicKey: k.publicKeyPem, fingerprint: k.fingerprint });
+  } catch (e) { if (db) db.close(); console.error('abuse-export approval-key failed:', e.message); return res.status(500).json({ error: 'key fetch failed' }); }
+});
+
+// CISO: approve a pending request -> MINT a signed approval token and store it.
+app.post('/api/abuse-export/:id/approve', authMiddleware(['ciso']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const row = db.prepare("SELECT * FROM abuse_export_incoming_requests WHERE id = ?").get(parseInt(req.params.id, 10));
+    if (!row) { db.close(); return res.status(404).json({ error: 'request not found' }); }
+    if (row.status !== 'pending') { db.close(); return res.status(409).json({ error: `request already ${row.status}` }); }
+    const token = abuseExportApproval.mintDecision(db, {
+      requestId: row.request_id, flagId: row.flag_id, mcId: row.mc_id, requestedBy: row.requested_by, decision: 'approved',
+    });
+    db.prepare(`
+      UPDATE abuse_export_incoming_requests
+      SET status = 'approved', decision_payload_canonical = ?, decision_signature = ?,
+          decision_key_fingerprint = ?, decision_nonce = ?, decided_by = ?, decided_at = ?
+      WHERE id = ?
+    `).run(token.decisionPayloadCanonical, token.signature, token.keyFingerprint, token.nonce, String(req.user.id), token.decidedAt, row.id);
+    db.close();
+    return res.json({ id: row.id, status: 'approved', decidedAt: token.decidedAt, keyFingerprint: token.keyFingerprint });
+  } catch (e) { if (db) db.close(); console.error('abuse-export approve failed:', e.message); return res.status(500).json({ error: 'approve failed' }); }
+});
+
+// CISO: deny a pending request -> MINT a signed denial token (with reason).
+app.post('/api/abuse-export/:id/deny', authMiddleware(['ciso']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const reason = ((req.body || {}).reason || '').toString().trim();
+    const row = db.prepare("SELECT * FROM abuse_export_incoming_requests WHERE id = ?").get(parseInt(req.params.id, 10));
+    if (!row) { db.close(); return res.status(404).json({ error: 'request not found' }); }
+    if (row.status !== 'pending') { db.close(); return res.status(409).json({ error: `request already ${row.status}` }); }
+    const token = abuseExportApproval.mintDecision(db, {
+      requestId: row.request_id, flagId: row.flag_id, mcId: row.mc_id, requestedBy: row.requested_by, decision: 'denied',
+    });
+    db.prepare(`
+      UPDATE abuse_export_incoming_requests
+      SET status = 'denied', decision_payload_canonical = ?, decision_signature = ?,
+          decision_key_fingerprint = ?, decision_nonce = ?, decided_by = ?, decided_at = ?, denial_reason = ?
+      WHERE id = ?
+    `).run(token.decisionPayloadCanonical, token.signature, token.keyFingerprint, token.nonce, String(req.user.id), token.decidedAt, reason || null, row.id);
+    db.close();
+    return res.json({ id: row.id, status: 'denied', decidedAt: token.decidedAt });
+  } catch (e) { if (db) db.close(); console.error('abuse-export deny failed:', e.message); return res.status(500).json({ error: 'deny failed' }); }
 });
 
 app.listen(PORT, () => {

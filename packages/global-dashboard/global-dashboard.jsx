@@ -611,6 +611,13 @@ export default function GlobalDashboard() {
   // stored value; INVALID_STATE on a duplicate-click race; etc.).
   const [approvingKeyId, setApprovingKeyId] = useState(null);
   const [approveError, setApproveError] = useState(null);
+  // U4 PR 5-C: pending legal-hold export approvals (CISO). Mirrors the signing-
+  // key approval queue: sourced from GET /api/abuse-export/pending, ciso-gated.
+  const [pendingExports, setPendingExports] = useState(null);
+  const [pendingExportsLoading, setPendingExportsLoading] = useState(false);
+  const [pendingExportsError, setPendingExportsError] = useState(null);
+  const [exportActionId, setExportActionId] = useState(null);
+  const [exportActionError, setExportActionError] = useState(null);
 
   // Reject-action modal state (added in C14). Reject is a destructive
   // permanent state transition that captures a free-form rationale —
@@ -730,6 +737,21 @@ export default function GlobalDashboard() {
         setPendingKeysError(r?.error || 'Failed to load pending signing-key approvals');
       }
     }).finally(() => setPendingKeysLoading(false));
+  }, [stage, tab]);
+
+  // U4 PR 5-C: load pending legal-hold export approvals on the connections tab
+  // (server ciso-gated; VP/readonly see the error state by design).
+  useEffect(() => {
+    if (stage !== "app" || tab !== "connections") return;
+    setPendingExportsLoading(true);
+    setPendingExportsError(null);
+    api.get('/api/abuse-export/pending').then(r => {
+      if (r && !r.error && Array.isArray(r.pending)) {
+        setPendingExports(r.pending);
+      } else {
+        setPendingExportsError(r?.error || 'Failed to load pending export approvals');
+      }
+    }).finally(() => setPendingExportsLoading(false));
   }, [stage, tab]);
 
   // Per-MC signing-keys history fetch (PR4 C12). Fires whenever the
@@ -1760,6 +1782,38 @@ export default function GlobalDashboard() {
                 </div>)}
                 {approveError&&<M style={{color:C.d,display:"block",marginTop:8,fontSize:10}}>{approveError}</M>}
                 <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>Verify fingerprint OUT OF BAND before approving; reject with rationale captured for the audit log otherwise.</M>
+              </div>}
+            </Card>
+            {/* U4 PR 5-C: Pending Legal-Hold Export Approvals (CISO two-person gate). */}
+            <Card style={{marginBottom:12,borderColor:(pendingExports&&pendingExports.length>0)?C.w+"40":C.b}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Pending Legal-Hold Export Approvals</div>
+                {pendingExports&&<Badge color={pendingExports.length>0?C.w:C.a}>{pendingExports.length}</Badge>}
+              </div>
+              <M style={{color:C.tm,display:"block",marginBottom:10,fontSize:10,lineHeight:1.5}}>A reviewer has requested a two-person legal-hold export of a vaulted abuse case. Approving MINTS a signed approval that the reviewer's device verifies before producing the case file; the file is assembled and decrypted only on the reviewer's device, never here. Verify the legal basis before approving. This is a separate authority from the reviewer (separation of duties).</M>
+              {pendingExportsLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading approval queue...</M>}
+              {pendingExportsError&&<M style={{color:C.d,display:"block"}}>{pendingExportsError}</M>}
+              {pendingExports&&!pendingExportsLoading&&pendingExports.length===0&&<M style={{color:C.a,fontStyle:"italic",display:"block"}}>No export requests awaiting review.</M>}
+              {pendingExports&&!pendingExportsLoading&&pendingExports.length>0&&<div>
+                {pendingExports.map((x,i)=><div key={x.id} style={{padding:"10px 0",borderBottom:i<pendingExports.length-1?`1px solid ${C.b}`:"none"}}>
+                  <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:4}}>
+                    <Badge color={C.w}>PENDING</Badge>
+                    <div style={{flex:1,minWidth:0}}>
+                      <M style={{color:C.t,fontWeight:500,display:"block"}}>case {x.flag_id}</M>
+                      <M style={{color:C.td,display:"block",fontSize:10}}>mc: {x.mc_id} · request {x.request_id} · received {x.received_at?new Date(x.received_at).toLocaleString():"—"}</M>
+                    </div>
+                  </div>
+                  <div style={{padding:"6px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.w}`,borderRadius:4,marginTop:4}}>
+                    <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>legal basis</M>
+                    <M style={{color:C.t,fontSize:10,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{x.request_reason||"—"}</M>
+                  </div>
+                  <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                    <Btn small primary disabled={exportActionId===x.id} onClick={()=>{ setExportActionId(x.id); setExportActionError(null); api.post('/api/abuse-export/'+x.id+'/approve',{}).then(r=>{ if(r&&!r.error){ api.get('/api/abuse-export/pending').then(p=>{ if(p&&Array.isArray(p.pending)) setPendingExports(p.pending); }); } else { setExportActionError((r&&r.error)||'Approve failed'); } }).finally(()=>setExportActionId(null)); }}>{exportActionId===x.id?"Working...":"Approve"}</Btn>
+                    <Btn small disabled={exportActionId===x.id} onClick={()=>{ const reason=window.prompt('Reason for denying this export request? (recorded)'); if(reason===null) return; setExportActionId(x.id); setExportActionError(null); api.post('/api/abuse-export/'+x.id+'/deny',{reason}).then(r=>{ if(r&&!r.error){ api.get('/api/abuse-export/pending').then(p=>{ if(p&&Array.isArray(p.pending)) setPendingExports(p.pending); }); } else { setExportActionError((r&&r.error)||'Deny failed'); } }).finally(()=>setExportActionId(null)); }}>Deny</Btn>
+                  </div>
+                </div>)}
+                {exportActionError&&<M style={{color:C.d,display:"block",marginTop:8,fontSize:10}}>{exportActionError}</M>}
+                <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>The reviewer cannot produce an export without this signed approval; you cannot produce one without the reviewer. Two-person control.</M>
               </div>}
             </Card>
             {mcsError&&<Card style={{padding:12,borderColor:C.d+"40",marginBottom:12}}><M style={{color:C.d}}>{mcsError}</M></Card>}

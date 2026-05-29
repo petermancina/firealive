@@ -23,6 +23,7 @@ const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 const patternDetector = require('../services/abuse-pattern-detector');
 const { canReview } = require('../services/abuse-reviewer-access');
+const avChain = require('../services/abuse-vault-chain');
 const { signReportCanonical, getInstanceLabel } = require('../services/report-signer');
 
 const VALID_TIERS = [1, 2, 3];
@@ -170,6 +171,9 @@ function submitBoardFlag(req, res) {
       `).run(flagId, boardPostId, contentBox, contextBox,
              req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
 
+      try { avChain.appendEntry(db, { eventType: 'VAULT_SEALED', flagId, actorUserId: req.user.id }); }
+      catch (avErr) { logger.warn('peer-flags: VAULT_SEALED chain append failed; will backfill at next boot', { error: avErr.message }); }
+
       db.prepare("UPDATE peer_board_messages SET removed_pending_review = 1, removed_at = datetime('now') WHERE id = ?").run(boardPostId);
     });
     seal();
@@ -267,6 +271,9 @@ function submitLeadChatFlag(req, res) {
         VALUES (?, 'lead_chat', ?, ?, NULL, ?, ?, ?, ?, ?)
       `).run(flagId, threadId, contentBox,
              req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
+
+      try { avChain.appendEntry(db, { eventType: 'VAULT_SEALED', flagId, actorUserId: req.user.id }); }
+      catch (avErr) { logger.warn('peer-flags: VAULT_SEALED chain append failed; will backfill at next boot', { error: avErr.message }); }
     });
     seal();
 
@@ -390,6 +397,9 @@ router.post('/', (req, res) => {
         VALUES (?, 'peer_session', ?, ?, NULL, ?, ?, ?, ?, ?)
       `).run(flagId, sessionId, contentBox,
              req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
+
+      try { avChain.appendEntry(db, { eventType: 'VAULT_SEALED', flagId, actorUserId: req.user.id }); }
+      catch (avErr) { logger.warn('peer-flags: VAULT_SEALED chain append failed; will backfill at next boot', { error: avErr.message }); }
     });
     seal();
 

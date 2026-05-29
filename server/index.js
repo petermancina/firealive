@@ -194,6 +194,7 @@ app.use('/api/peer/flags', authMiddleware(['analyst', 'lead', 'admin']), require
 app.use('/api/abuse-review-key', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/abuse-review-key'));
 app.use('/api/abuse-review-keys', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/abuse-review-key').keysRouter);
 app.use('/api/abuse-review', authMiddleware(['abuse_reviewer']), require('./routes/abuse-review'));
+app.use('/api/abuse-vault-export', authMiddleware(['abuse_reviewer']), require('./routes/abuse-vault-export'));
 app.use('/api/abuse-reviewer-admin', authMiddleware(['admin']), require('./routes/abuse-reviewer-admin'));
 app.use('/api/peer-board', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-board'));
 app.use('/api/training/completions-review', authMiddleware(['lead', 'admin']), require('./routes/training-completions-review'));
@@ -312,6 +313,21 @@ async function start() {
       if (hour === 9) checkRecertDue();
       detectMissingLogs();
     }, 3600000);
+
+    // Relay the two-person legal-hold export across the regional <-> GD channel:
+    // push pending requests to the GD and poll back the CISO's signed decision.
+    // A few-minute cadence keeps approval latency reasonable without hammering
+    // the GD. Fresh db per tick; runSyncTick is a no-op when GD push is not
+    // configured. Failures are logged and non-fatal. unref() so the timer never
+    // blocks process shutdown.
+    const abuseExportSync = require('./services/abuse-export-sync');
+    const abuseExportRelayTimer = setInterval(() => {
+      const relayDb = getDb();
+      Promise.resolve(abuseExportSync.runSyncTick(relayDb))
+        .catch((e) => logger.warn('abuse-export relay tick failed', { error: e.message }))
+        .finally(() => { try { relayDb.close(); } catch (e) {} });
+    }, 120000);
+    abuseExportRelayTimer.unref();
 
     const server = app.listen(PORT, HOST, () => {
       const pkg = require('../package.json');
