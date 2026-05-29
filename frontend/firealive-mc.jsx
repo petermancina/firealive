@@ -1097,6 +1097,54 @@ function ManagementConsole() {
   const [leadFlagNote, setLeadFlagNote] = useState("");
   const [leadFlagBusy, setLeadFlagBusy] = useState(false);
   const [leadFlagErr, setLeadFlagErr] = useState("");
+  // One-shot abuse-flag export prompt (team-lead-as-victim lead-chat case). After
+  // a flag is submitted, the lead may save a single signed PDF copy as a personal
+  // backup; the authentic plaintext lives only in the main process for a 5-minute
+  // window (see abuse:hold-for-export). Only a content hash is kept here.
+  const [exportPrompt, setExportPrompt] = useState(null);   // { flagId, targetType, contentSha256 }
+  const [exportExpiresAt, setExportExpiresAt] = useState(0);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportMsg, setExportMsg] = useState("");
+  const [exportDone, setExportDone] = useState(false);
+  const beginExportPrompt = async (flagId, targetType, contentText, note) => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke || !flagId || !contentText) return;
+    try {
+      const h = await bridge.invoke("abuse:hold-for-export", { flagId, targetType, contentText, note });
+      setExportPrompt({ flagId, targetType, contentSha256: h && h.contentSha256 });
+      setExportExpiresAt(h && h.expiresAt ? h.expiresAt : Date.now() + 5 * 60 * 1000);
+      setExportMsg(""); setExportDone(false); setExportBusy(false);
+    } catch (e) { /* export unavailable -- the submission still succeeded */ }
+  };
+  const doExport = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!exportPrompt || !bridge || !bridge.invoke) return;
+    setExportBusy(true); setExportMsg("");
+    try {
+      const r = await api.post("/api/peer/flags/" + exportPrompt.flagId + "/sign-record", { content_sha256: exportPrompt.contentSha256 });
+      if (!r || r.error || !r.signatureB64) { setExportMsg("Could not sign the record" + (r && r.error ? ": " + r.error : ".")); setExportBusy(false); return; }
+      const descriptor = { payload: r.payload, canonical: r.canonical, reportSha256: r.reportSha256, signatureB64: r.signatureB64, keyFingerprint: r.keyFingerprint, instanceLabel: r.instanceLabel, signedAt: r.signedAt };
+      const fin = await bridge.invoke("abuse:finalize-export", { descriptor });
+      if (fin && fin.saved) { setExportMsg("Saved. This signed PDF is your only personal copy."); setExportDone(true); }
+      else if (fin && fin.reason === "dialog_canceled") { setExportMsg("Save canceled. You can export again until the window closes."); }
+      else if (fin && fin.reason === "expired") { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); }
+      else { setExportMsg("Could not save the record."); }
+    } catch (e) { setExportMsg("Could not export the record."); }
+    setExportBusy(false);
+  };
+  const declineExport = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    try { if (bridge && bridge.invoke) await bridge.invoke("abuse:cancel-export"); } catch (e) {}
+    setExportPrompt(null); setExportExpiresAt(0); setExportMsg(""); setExportDone(false); setExportBusy(false);
+  };
+  useEffect(() => {
+    if (!exportPrompt || exportDone || !exportExpiresAt) return undefined;
+    const ms = exportExpiresAt - Date.now();
+    const expire = () => { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); };
+    if (ms <= 0) { expire(); return undefined; }
+    const t = setTimeout(expire, ms);
+    return () => clearTimeout(t);
+  }, [exportPrompt, exportExpiresAt, exportDone]);
   const leadChatPollCursor = useRef(null);
   // Phase U3: threads where the analyst has an unacknowledged in-person 1:1
   // request (drives the global banner and the inbox callout below).
@@ -1154,6 +1202,7 @@ function ManagementConsole() {
       if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadChatSel.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
+      if (r && r.id) beginExportPrompt(r.id, "lead_chat", m.text, leadFlagNote.trim());
       setLeadFlagMsg(null); setLeadFlagTier(0); setLeadFlagNote(""); setLeadFlagBusy(false);
     } catch (e) {
       setLeadFlagErr("Could not submit the report."); setLeadFlagBusy(false);
@@ -3234,6 +3283,21 @@ function ManagementConsole() {
   return(
     <div style={{minHeight:"100vh",background:C.bg,color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {exportPrompt && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <Card style={{maxWidth:460,padding:22}}>
+            <M style={{color:C.t,fontWeight:600,fontSize:15,display:"block",marginBottom:8}}>Report submitted to the independent reviewer</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>You have a few minutes to save one personal PDF copy as your own backup -- for example, if the reviewer's record is ever lost. After you export or decline, the text is wiped from this device and only the reviewer's vault holds it. This is your only chance to keep a personal copy.</M>
+            {!exportDone && exportExpiresAt ? <M style={{color:C.td,display:"block",marginBottom:12}}>Window closes at {new Date(exportExpiresAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}.</M> : null}
+            {exportMsg ? <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.5}}>{exportMsg}</M> : null}
+            <div style={{display:"flex",gap:8}}>
+              {!exportDone && <Btn primary disabled={exportBusy} onClick={doExport}>{exportBusy?"Working\u2026":"Export PDF"}</Btn>}
+              {!exportDone && <Btn small disabled={exportBusy} onClick={declineExport}>Don't keep a copy</Btn>}
+              {exportDone && <Btn small onClick={()=>{setExportPrompt(null);setExportExpiresAt(0);setExportMsg("");setExportDone(false);}}>Close</Btn>}
+            </div>
+          </Card>
+        </div>
+      )}
       {/* R3j C9: Top-of-MC panic banner. Red while panic_mode is active; green for
           PANIC_BANNER_LINGER_SECONDS after deactivation; absent otherwise. Recomputes
           age against Date.now() on every render so the green banner vanishes at the

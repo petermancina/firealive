@@ -1,7 +1,8 @@
 // FireAlive Analyst Client — Electron Main Process
-const { app, BrowserWindow, ipcMain, session, Notification, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, session, Notification, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Security: disable navigation to external URLs
 app.on('web-contents-created', (event, contents) => {
@@ -125,6 +126,16 @@ try {
   ({ sanitizeNote } = require('../shared/note-sanitizer'));
 }
 
+// The abuse-flag export PDF builder (packages/shared/abuse-export-pdf.js) is
+// loaded the same packaged/source way. It renders the flagger's one-shot
+// submission record locally; no content leaves the device to build it.
+let buildAbuseExportPdf;
+try {
+  ({ buildAbuseExportPdf } = require('./abuse-export-pdf'));
+} catch {
+  ({ buildAbuseExportPdf } = require('../shared/abuse-export-pdf'));
+}
+
 // libsignal is a native ESM module; load it dynamically and normalize the
 // shape across the ESM-namespace and CJS-default interop cases.
 async function loadLibsignal() {
@@ -233,6 +244,89 @@ ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext, saniti
   // is system-copied authentic text and must be sealed exactly as captured.
   const material = sanitize ? sanitizeNote(plaintext) : plaintext;
   return { sealed: sealToReviewers(recipientPublicKeys, material) };
+});
+
+// ── Abuse-flag export: one-shot, in-memory submission record ─────────────────
+//
+// After a flag is submitted to the independent reviewer, the flagger may export
+// a single local PDF copy as a personal backup. The authentic plaintext is held
+// HERE, in the main process only, for a short window: it is never written to
+// disk, IndexedDB, or renderer state, and is wiped on export, on decline, or on
+// timeout. This is a memory-only protection, not a hardware enclave -- JS
+// strings cannot be reliably zeroed, so the material is held in Buffers that are
+// filled with zeros on wipe as a best effort.
+const ABUSE_EXPORT_WINDOW_MS = 5 * 60 * 1000;
+let abuseExportHold = null;   // { flagId, targetType, content: Buffer, note: Buffer, contentSha256, expiresAt }
+let abuseExportTimer = null;
+
+function wipeAbuseExportHold() {
+  if (abuseExportTimer) { clearTimeout(abuseExportTimer); abuseExportTimer = null; }
+  if (abuseExportHold) {
+    try { if (abuseExportHold.content) abuseExportHold.content.fill(0); } catch (_) {}
+    try { if (abuseExportHold.note) abuseExportHold.note.fill(0); } catch (_) {}
+    abuseExportHold = null;
+  }
+}
+
+// Stash the authentic content (+ sanitized note) for the export window and
+// return the content hash the renderer needs to request a signature. Only one
+// hold exists at a time; a new hold wipes any previous one. The content is the
+// authentic captured text and is never altered; only the note is sanitized.
+ipcMain.handle('abuse:hold-for-export', async (_e, { flagId, targetType, contentText, note } = {}) => {
+  if (typeof flagId !== 'string' || !flagId) throw new Error('flagId (string) required');
+  if (typeof contentText !== 'string' || !contentText) throw new Error('contentText (string) required');
+  wipeAbuseExportHold();
+  const content = Buffer.from(contentText, 'utf8');
+  const noteBuf = Buffer.from(sanitizeNote(typeof note === 'string' ? note : ''), 'utf8');
+  const contentSha256 = crypto.createHash('sha256').update(content).digest('hex');
+  const expiresAt = Date.now() + ABUSE_EXPORT_WINDOW_MS;
+  abuseExportHold = { flagId, targetType: targetType || '', content, note: noteBuf, contentSha256, expiresAt };
+  abuseExportTimer = setTimeout(wipeAbuseExportHold, ABUSE_EXPORT_WINDOW_MS);
+  return { contentSha256, expiresAt, windowMs: ABUSE_EXPORT_WINDOW_MS };
+});
+
+// Build and save the export PDF from the held material plus the server-signed
+// descriptor. The descriptor must match the held flag and content hash. On a
+// successful save the hold is wiped; if the user backs out of the save dialog
+// the hold is kept so they can retry within the window.
+ipcMain.handle('abuse:finalize-export', async (_e, { descriptor } = {}) => {
+  const hold = abuseExportHold;
+  if (!hold) return { saved: false, reason: 'expired' };
+  const payload = (descriptor && descriptor.payload) || {};
+  if (payload.flag_uuid !== hold.flagId || payload.content_sha256 !== hold.contentSha256) {
+    return { saved: false, reason: 'mismatch' };
+  }
+  let pdf;
+  try {
+    pdf = await buildAbuseExportPdf({
+      contentText: hold.content.toString('utf8'),
+      note: hold.note.toString('utf8'),
+      descriptor,
+    });
+  } catch (e) {
+    return { saved: false, reason: 'build_failed' };
+  }
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+  const defaultName = 'firealive-flag-' + hold.flagId.slice(0, 8) + '.pdf';
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: 'Save abuse-flag submission record',
+    defaultPath: defaultName,
+    filters: [{ name: 'PDF', extensions: ['pdf'] }],
+  });
+  if (canceled || !filePath) return { saved: false, reason: 'dialog_canceled' };
+  try {
+    fs.writeFileSync(filePath, pdf);
+  } catch (e) {
+    return { saved: false, reason: 'write_failed' };
+  }
+  wipeAbuseExportHold();
+  return { saved: true };
+});
+
+// Explicit decline ("do not keep a copy") -- wipe the held material immediately.
+ipcMain.handle('abuse:cancel-export', async () => {
+  wipeAbuseExportHold();
+  return { canceled: true };
 });
 
 app.whenReady().then(createWindow);

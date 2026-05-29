@@ -24,6 +24,7 @@ const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 const patternDetector = require('../services/abuse-pattern-detector');
 const { canReview } = require('../services/abuse-reviewer-access');
+const { signReportCanonical, getInstanceLabel } = require('../services/report-signer');
 
 const VALID_TIERS = [1, 2, 3];
 
@@ -311,7 +312,7 @@ function submitLeadChatFlag(req, res) {
 //   - Inserts row into peer_abuse_flags with the client-sealed note
 //   - Notifies the assigned independent reviewer(s) via the tier event type
 //   - Audit logs the flag submission (no content in audit — only metadata)
-router.post('/flags', (req, res) => {
+router.post('/', (req, res) => {
   // Board-post flags take a different shape (no session, accused resolved
   // server-side) and seal evidence to the vault -- handle them separately.
   if ((req.body || {}).target_type === 'board_post') {
@@ -415,6 +416,77 @@ router.post('/flags', (req, res) => {
     tier,
     createdAt: new Date().toISOString(),
   });
+});
+
+// ── POST /api/peer/flags/:id/sign-record — sign a flagger's export record ────
+//
+// After a flag is submitted to the independent reviewer, the flagger's client
+// may build a one-shot, local PDF record of the submission as the flagger's
+// personal backup (for example if the vault is later lost). This endpoint signs
+// a canonical payload describing that submission so an independent reviewer can
+// later confirm an exported record is genuine and corresponds to a real flag --
+// without the server ever seeing the flagged content.
+//
+// The server derives flag_uuid, target_type and submitted_at from the flag row
+// (authoritative); only content_sha256 -- the SHA-256 of the authentic sealed
+// content the client holds -- is supplied by the client. The reviewer later
+// recomputes that hash from the content they decrypt from the vault, so a
+// client cannot forge it undetected.
+//
+// Flagger-only: anyone who is not the flag's flagger gets 404 (not 403), so the
+// existence of a flag is never confirmed by probing. Writes NO MC-readable
+// audit entry -- a flagger-identifying trace would defeat the zero-trace design.
+router.post('/:id/sign-record', (req, res) => {
+  const flagId = req.params.id;
+  const contentSha = (req.body || {}).content_sha256;
+  if (typeof contentSha !== 'string' || !/^[0-9a-f]{64}$/i.test(contentSha)) {
+    return res.status(400).json({ error: 'content_sha256 (64 hex chars) required' });
+  }
+
+  let result;
+  try {
+    const db = getDb();
+    const flag = db.prepare(
+      'SELECT id, target_type, flagger_user_id, created_at FROM peer_abuse_flags WHERE id = ?'
+    ).get(flagId);
+    // Hide existence from everyone but the flagger.
+    if (!flag || flag.flagger_user_id !== req.user.id) {
+      db.close();
+      return res.status(404).json({ error: 'not found' });
+    }
+
+    const payload = {
+      flag_uuid: flag.id,
+      target_type: flag.target_type,
+      submitted_at: flag.created_at,
+      instance_label: getInstanceLabel(db),
+      content_sha256: contentSha.toLowerCase(),
+    };
+    const descriptor = signReportCanonical({
+      db,
+      reportType: 'abuse_flag',
+      subjectRef: flag.id,
+      payload,
+      metadata: null,
+    });
+    db.close();
+
+    result = {
+      payload,
+      canonical: descriptor.canonical,
+      reportSha256: descriptor.sha256,
+      signatureB64: descriptor.signatureB64,
+      keyFingerprint: descriptor.keyFingerprint,
+      instanceLabel: descriptor.instanceLabel,
+      signedAt: descriptor.signedAt,
+    };
+  } catch (err) {
+    logger.error('Failed to sign abuse-flag export record', { error: err.message });
+    return res.status(500).json({ error: 'failed to sign record' });
+  }
+
+  // Deliberately no auditLog: signing an export must leave no flagger-identifying trace.
+  return res.status(200).json(result);
 });
 
 // GET /api/peer/flags/review-pending-count -- awareness-only count for the MC.

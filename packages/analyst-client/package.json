@@ -13,7 +13,8 @@
     "build:all": "electron-builder --mac --win --linux"
   },
   "dependencies": {
-    "@signalapp/libsignal-client": "^0.94.0"
+    "@signalapp/libsignal-client": "^0.94.0",
+    "pdfkit": "^0.18.0"
   },
   "devDependencies": {
     "react": "18.2.0",

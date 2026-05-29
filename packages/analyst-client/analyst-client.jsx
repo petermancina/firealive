@@ -1497,6 +1497,7 @@ export default function AnalystClientApp() {
       const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadThread.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
       if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
       logC("lead_chat_flagged", `Tier ${leadFlagTier} report sealed to the independent reviewer`);
+      if (r && r.id) beginExportPrompt(r.id, "lead_chat", m.text, leadFlagNote.trim());
       setLeadFlagMsg(null); setLeadFlagTier(0); setLeadFlagNote(""); setLeadFlagBusy(false);
     } catch (e) {
       setLeadFlagErr("Could not submit the report."); setLeadFlagBusy(false);
@@ -1665,6 +1666,7 @@ export default function AnalystClientApp() {
       const r = await api.post("/api/peer/flags", payload);
       if (r && r.error) { setBoardFlagErr(r.error); setBoardFlagBusy(false); return; }
       if (r && r.id) {
+        beginExportPrompt(r.id, "board_post", body, note);
         // The post is now removed pending review -- drop it from view.
         if (rootId == null) {
           setPeerBoardMsgs(prev => prev.filter(pp => pp.id !== postId));
@@ -1740,6 +1742,54 @@ export default function AnalystClientApp() {
   const [postFlagBusy, setPostFlagBusy] = useState(false);
   const [postFlagSel, setPostFlagSel] = useState(() => new Set());
   const [postFlagLastIdx, setPostFlagLastIdx] = useState(null);
+  // One-shot abuse-flag export prompt. After a flag is submitted, the flagger may
+  // save a single signed PDF copy as a personal backup; the authentic plaintext
+  // lives only in the main process for a 5-minute window (see abuse:hold-for-export).
+  // Only a content hash -- never plaintext -- is kept in renderer state here.
+  const [exportPrompt, setExportPrompt] = useState(null);   // { flagId, targetType, contentSha256 }
+  const [exportExpiresAt, setExportExpiresAt] = useState(0);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportMsg, setExportMsg] = useState("");
+  const [exportDone, setExportDone] = useState(false);
+  const beginExportPrompt = async (flagId, targetType, contentText, note) => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke || !flagId || !contentText) return;
+    try {
+      const h = await bridge.invoke("abuse:hold-for-export", { flagId, targetType, contentText, note });
+      setExportPrompt({ flagId, targetType, contentSha256: h && h.contentSha256 });
+      setExportExpiresAt(h && h.expiresAt ? h.expiresAt : Date.now() + 5 * 60 * 1000);
+      setExportMsg(""); setExportDone(false); setExportBusy(false);
+    } catch (e) { /* export unavailable -- the submission still succeeded */ }
+  };
+  const doExport = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!exportPrompt || !bridge || !bridge.invoke) return;
+    setExportBusy(true); setExportMsg("");
+    try {
+      const r = await api.post("/api/peer/flags/" + exportPrompt.flagId + "/sign-record", { content_sha256: exportPrompt.contentSha256 });
+      if (!r || r.error || !r.signatureB64) { setExportMsg("Could not sign the record" + (r && r.error ? ": " + r.error : ".")); setExportBusy(false); return; }
+      const descriptor = { payload: r.payload, canonical: r.canonical, reportSha256: r.reportSha256, signatureB64: r.signatureB64, keyFingerprint: r.keyFingerprint, instanceLabel: r.instanceLabel, signedAt: r.signedAt };
+      const fin = await bridge.invoke("abuse:finalize-export", { descriptor });
+      if (fin && fin.saved) { setExportMsg("Saved. This signed PDF is your only personal copy."); setExportDone(true); logC("abuse_export_saved", "Saved a signed submission record"); }
+      else if (fin && fin.reason === "dialog_canceled") { setExportMsg("Save canceled. You can export again until the window closes."); }
+      else if (fin && fin.reason === "expired") { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); }
+      else { setExportMsg("Could not save the record."); }
+    } catch (e) { setExportMsg("Could not export the record."); }
+    setExportBusy(false);
+  };
+  const declineExport = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    try { if (bridge && bridge.invoke) await bridge.invoke("abuse:cancel-export"); } catch (e) {}
+    setExportPrompt(null); setExportExpiresAt(0); setExportMsg(""); setExportDone(false); setExportBusy(false);
+  };
+  useEffect(() => {
+    if (!exportPrompt || exportDone || !exportExpiresAt) return undefined;
+    const ms = exportExpiresAt - Date.now();
+    const expire = () => { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); };
+    if (ms <= 0) { expire(); return undefined; }
+    const t = setTimeout(expire, ms);
+    return () => clearTimeout(t);
+  }, [exportPrompt, exportExpiresAt, exportDone]);
   // Whole-message selection for peer-chat flagging. The accuser chooses WHICH
   // authentic messages to report (click to toggle, Shift-click for a contiguous
   // run, Select all); the system then seals those messages' real text. The
@@ -2137,6 +2187,21 @@ export default function AnalystClientApp() {
   return(
     <div style={{minHeight:"100vh",background:"#060A10",color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {exportPrompt && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
+          <Card style={{maxWidth:460,padding:22}}>
+            <M style={{color:C.t,fontWeight:600,fontSize:15,display:"block",marginBottom:8}}>Report submitted to the independent reviewer</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>You have a few minutes to save one personal PDF copy as your own backup -- for example, if the reviewer's record is ever lost. After you export or decline, the text is wiped from this device and only the reviewer's vault holds it. This is your only chance to keep a personal copy.</M>
+            {!exportDone && exportExpiresAt ? <M style={{color:C.td,display:"block",marginBottom:12}}>Window closes at {new Date(exportExpiresAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}.</M> : null}
+            {exportMsg ? <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.5}}>{exportMsg}</M> : null}
+            <div style={{display:"flex",gap:8}}>
+              {!exportDone && <Btn primary disabled={exportBusy} onClick={doExport}>{exportBusy?"Working\u2026":"Export PDF"}</Btn>}
+              {!exportDone && <Btn small disabled={exportBusy} onClick={declineExport}>Don't keep a copy</Btn>}
+              {exportDone && <Btn small onClick={()=>{setExportPrompt(null);setExportExpiresAt(0);setExportMsg("");setExportDone(false);}}>Close</Btn>}
+            </div>
+          </Card>
+        </div>
+      )}
       {/* R3j C12: Top-of-AC panic banner. Red while panic_mode is active; green for
           PANIC_BANNER_LINGER_SECONDS after deactivation; absent otherwise. Recomputes
           age against Date.now() on every render so the green banner vanishes at the
@@ -2570,6 +2635,7 @@ export default function AnalystClientApp() {
                       if (r && r.error) { setPostFlagErr(r.error); setPostFlagBusy(false); return; }
                       if (r && r.id) {
                         logC("peer_abuse_flagged", `Tier ${postFlagTier} report sealed to the independent reviewer`);
+                        beginExportPrompt(r.id, "peer_session", contentText, note);
                         setPostFlagging(false); setPostFlagTier(0); setPostFlagText(""); setPostFlagErr(""); setPostFlagSel(new Set()); setPostFlagLastIdx(null); setPostSession(null);
                       }
                       setPostFlagBusy(false);
