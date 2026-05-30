@@ -230,6 +230,29 @@ const Btn = ({children,primary,danger,small,disabled,style,...p}) => <button dis
   color:disabled?C.td:danger?C.d:primary?C.a:C.tm,fontSize:small?10:12,fontWeight:500,
   cursor:disabled?"default":"pointer",...style}} {...p}>{children}</button>;
 const Badge = ({children,color=C.tm}) => <span style={{fontSize:9,padding:"2px 8px",background:`${color}18`,border:`1px solid ${color}40`,borderRadius:12,color,fontFamily:"'IBM Plex Mono',monospace"}}>{children}</span>;
+const KBSourceCopy = ({source}) => {
+  const [copied, setCopied] = useState(false);
+  if (!source) return null;
+  const copy = (e) => {
+    if (e) e.stopPropagation();
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(source);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }
+    } catch (_e) {}
+  };
+  // Copy-to-clipboard control — never a live anchor. The analyst copies the DOI/
+  // reference and opens it themselves; the app opens no browser.
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6,flexWrap:"wrap"}}>
+      <span style={{fontSize:9,color:C.tm,fontFamily:"'IBM Plex Mono',monospace",whiteSpace:"nowrap"}}>Source (copy)</span>
+      <span style={{fontSize:9,color:C.tm,fontFamily:"'IBM Plex Mono',monospace",wordBreak:"break-all",userSelect:"all",flex:1,minWidth:120}}>{source}</span>
+      <button onClick={copy} style={{padding:"2px 8px",background:"transparent",border:`1px solid ${copied?C.a:C.b}`,borderRadius:6,color:copied?C.a:C.tm,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",whiteSpace:"nowrap"}}>{copied?"Copied":"Copy"}</button>
+    </div>
+  );
+};
 const Modal = ({children,onClose,title,width=480}) => (
   <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
     <div style={{width,maxWidth:"95vw",maxHeight:"90vh",overflow:"auto",padding:24,background:"#0D1117",border:`1px solid ${C.b}`,borderRadius:14}}>
@@ -1073,7 +1096,7 @@ export default function AnalystClientApp() {
   const tabs=[
     {id:"home",label:"Home"},{id:"signals",label:"My Signals"},{id:"inbox",label:"Inbox",badge:inboxUnreadCount},{id:"delegate",label:"Delegate"},
     {id:"peers",label:"Peers"},{id:"helper-pay",label:"Helper Pay"},{id:"board",label:"Board"},{id:"ooda",label:"IR Simulator"},
-    {id:"skills",label:"Skills & Assessments"},{id:"training",label:"Training & Certs"},{id:"recovery",label:"Post-Incident Wellness"},
+    {id:"skills",label:"Skills & Assessments"},{id:"training",label:"Training & Certs"},{id:"recovery",label:"Post-Incident Wellness"},{id:"kb",label:"Knowledge Base"},
     {id:"scan",label:"Self-Scan"},{id:"audit_tab",label:"Audit"},{id:"privacy",label:"Privacy"},
   ];
 
@@ -1086,6 +1109,8 @@ export default function AnalystClientApp() {
     escalationRate:    {base:11, cur:14, u:"%",   label:"Escalation rate"},
   };
   const [signals, setSignals] = useState(DEFAULT_SIGNALS);
+  const [kbEntry, setKbEntry] = useState(null);
+  const [kbFilter, setKbFilter] = useState("all");
   const [signalsLoadState, setSignalsLoadState] = useState({loaded:false, error:null, riskTier:null, recordedAt:null});
   useEffect(() => {
     let cancelled = false;
@@ -3299,6 +3324,38 @@ export default function AnalystClientApp() {
             ))}
           </Card>
           <Card style={{padding:12}}><M style={{color:C.td,lineHeight:1.8}}>All resources always available. Accessing anything here is logged only in your private Tier-3 consent log.</M></Card>
+        </div>)}
+        {tab==="kb"&&(<div>
+          <div style={{marginBottom:16}}>
+            <L style={{marginBottom:4}}>Research Knowledge Base</L>
+            <M style={{color:C.tm}}>v{KB_VERSION} · {KB_ENTRY_COUNT} peer-reviewed entries · the evidence behind your signals & guidance</M>
+          </div>
+          <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>{["all",...[...new Set(RESEARCH_KB.map(r=>r.topic))]].map(f=>(
+            <button key={f} onClick={()=>setKbFilter(f)} style={{padding:"3px 10px",background:kbFilter===f?C.ad:"transparent",border:`1px solid ${kbFilter===f?C.a+"50":C.b}`,borderRadius:6,color:kbFilter===f?C.a:C.tm,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{f}</button>
+          ))}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {RESEARCH_KB.filter(r=>kbFilter==="all"||r.topic===kbFilter).map(r=>(
+              <Card key={r.id} onClick={()=>setKbEntry(r)} style={{padding:12}}>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}><M style={{color:C.a,fontWeight:600}}>{r.id}</M><Badge color={r.strength==="strong"?C.a:C.w}>{r.strength}</Badge><Badge color={C.i}>{r.topic}</Badge><M style={{color:C.tm}}>{r.year}</M><M style={{color:C.tm,marginLeft:"auto"}}>Open ↗</M></div>
+                <div style={{fontSize:11,color:C.t,lineHeight:1.6,marginBottom:4}}>{r.finding}</div>
+                <div style={{fontSize:10,color:C.p,lineHeight:1.5,marginBottom:4}}>→ {r.implication}</div>
+                {r.summary&&<div style={{fontSize:10,color:C.tm,lineHeight:1.6,marginBottom:4}}>{r.summary}</div>}
+                <M style={{color:C.tm,fontStyle:"italic",lineHeight:1.5,fontSize:9}}>{r.cite}</M>
+                <KBSourceCopy source={r.source}/>
+              </Card>
+            ))}
+          </div>
+          {kbEntry&&<Modal title={(kbEntry.id||"")+" — "+(kbEntry.title||kbEntry.topic||"KB entry")} onClose={()=>setKbEntry(null)} width={620}>
+            <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}><Badge color={kbEntry.strength==="strong"?C.a:C.w}>{kbEntry.strength}</Badge><Badge color={C.i}>{kbEntry.topic}</Badge><M style={{color:C.tm}}>{kbEntry.year}</M></div>
+            <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:4}}>Finding</M>
+            <div style={{fontSize:12,color:C.t,lineHeight:1.6,marginBottom:12}}>{kbEntry.finding}</div>
+            {kbEntry.summary&&<><M style={{color:C.t,fontWeight:600,display:"block",marginBottom:4}}>Summary</M><div style={{fontSize:11,color:C.t,lineHeight:1.7,marginBottom:12}}>{kbEntry.summary}</div></>}
+            <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:4}}>FireAlive implication</M>
+            <div style={{fontSize:11,color:C.p,lineHeight:1.6,marginBottom:12}}>→ {kbEntry.implication}</div>
+            {Array.isArray(kbEntry.tags)&&kbEntry.tags.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:12}}>{kbEntry.tags.map(t=>(<Badge key={t} color={C.tm}>{t}</Badge>))}</div>}
+            <M style={{color:C.tm,fontStyle:"italic",lineHeight:1.5,fontSize:10,display:"block"}}>{kbEntry.cite}</M>
+            <KBSourceCopy source={kbEntry.source}/>
+          </Modal>}
         </div>)}
         {tab==="privacy"&&(<div>
           <L>Data Privacy, Settings & Consent Log</L>
