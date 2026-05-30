@@ -861,15 +861,23 @@ See SETUP.md → "Shared Responsibility in Compliance Reports" for the longer op
 5. System logs the recertification — proof to auditors that periodic review is happening
 
 ### Knowledge Base
-**What it's for:** The research knowledge base behind FireAlive's burnout-prevention features. 50 peer-reviewed entries (R001, R017, R037, etc.) cited throughout the platform — the AI burnout prediction engine, the lead-side intervention prompts, the analyst-side signal interpretations. Visible to leads here so they (and any auditor) can verify that FireAlive's recommendations come from real peer-reviewed scientific research, not from a profit incentive to sell features that just sound like they'd work.
+**What it's for:** The research knowledge base behind FireAlive's burnout-prevention features. 50 peer-reviewed entries (R001–R042, N001–N020) cited throughout the platform — the AI burnout prediction engine, the lead-side intervention prompts, the analyst-side signal interpretations. Each entry is enriched: a plain-language finding, the FireAlive implication, a fuller summary, the full citation, and a copiable source (DOI or stable URL). Leads (and any auditor) can verify that FireAlive's recommendations come from real peer-reviewed science, not from a profit incentive to sell features that merely sound plausible.
+
+The source on every entry is a **copy-to-clipboard** control, never a live link — neither the Management Console nor the Analyst Client opens an external browser on your behalf. You copy the DOI/URL and open it yourself.
 
 The KB is curated. It is not open to anyone to update — that would be an attack vector for malicious actors to inject articles that accelerate burnout rather than prevent it. There's a button to add KB peer-reviewed burnout articles, but for now that's restricted to the upstream maintainer (Peter Mancina). The KB is updated on a quarterly or annual basis with the latest scientific research on burnout prevention, distributed via FireAlive version updates.
 
 **Workflow:**
-1. Lead clicks a citation in a prompt or report
-2. KB opens to the entry, showing full citation, summary, and how it informs the relevant FireAlive feature
-3. Or lead browses categories (burnout, skill development, post-incident recovery)
-4. Or generates an API key for developers building org-specific training content
+1. Lead clicks a citation in a prompt or report (e.g. on the Actions tab) — the KB opens to that entry
+2. The entry shows the finding, summary, FireAlive implication, tags, full citation, and copiable source
+3. Or browse the library by topic — in the Management Console KB tab, and in the Analyst Client Knowledge Base tab
+4. Or generate an API key for developers building org-specific training content
+
+#### KB Assistant (Lead and Analyst)
+A research assistant lets leads and analysts ask the knowledge base questions in plain language. It retrieves the most relevant entries, answers **only** from them, and **cites every claim** — if it cannot produce a fully-cited answer, it withholds the answer rather than guessing. Cited entries appear as chips that open the KB entry (with its copiable source). It is research education — not therapy, diagnosis, or clinical advice — and when the underlying model isn't available it says so honestly instead of inventing an answer.
+
+- **Lead KB Assistant (Management Console):** runs server-side on FireAlive's internal model. The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
+- **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst's device** — a local model with no server round-trip. The analyst's question and their own signals are used only as on-device grounding and **never leave the device**. The model is downloaded once (integrity-verified) to the analyst's machine; an endpoint that can't run it gets an honest "unavailable on this device" rather than any server fallback. A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
 
 ### Playbooks (SOAR Playbook / Runbook Generator)
 **What it's for:** Generate investigation and response playbooks for security incidents involving the FireAlive platform itself. The lead exports these to import into the SOAR system, or prints them as runbooks. Distinct from the Runbook Generator (which produces failure-and-compromise procedures for FireAlive) — these are SOAR-style automation playbooks for ongoing incident response involving FireAlive.
