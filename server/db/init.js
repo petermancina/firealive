@@ -2034,7 +2034,8 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
     'burnout_messages',
     'kb_synthesis',
     'ttx_enhancement',
-    'troubleshooter'
+    'troubleshooter',
+    'kb_chat'
   )),
   provider TEXT NOT NULL DEFAULT 'internal' CHECK (provider IN (
     'internal',
