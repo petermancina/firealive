@@ -4683,8 +4683,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {iacResult&&!iacResult.ok&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
               <div style={{fontSize:12,fontWeight:500,color:C.d,marginBottom:6}}>Generation failed</div>
               <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{iacResult.message}</M>
-              {iacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Syft on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin</code></M>}
-              {iacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Cosign on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
+              {iacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Syft on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0</code></M>}
+              {iacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Cosign on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
             </Card>}
             <Btn primary disabled={!iacProvider||!iacTool||iacBusy} onClick={async()=>{
               setIacBusy(true);setIacResult(null);
