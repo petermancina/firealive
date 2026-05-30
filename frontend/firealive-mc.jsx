@@ -241,6 +241,47 @@ const Modal = ({children,onClose,title,width=480}) => (
     </div>
   </div>
 );
+const KBSourceCopy = ({source}) => {
+  const [copied, setCopied] = useState(false);
+  if (!source) return null;
+  const copy = (e) => {
+    if (e) e.stopPropagation();
+    try {
+      if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(source);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }
+    } catch (_e) {}
+  };
+  // Copy-to-clipboard control — never a live anchor. The user copies the DOI/
+  // publisher reference and opens it themselves; FireAlive never opens a browser.
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6,flexWrap:"wrap"}}>
+      <span style={{fontSize:9,color:C.td,fontFamily:"'IBM Plex Mono',monospace",whiteSpace:"nowrap"}}>Source (copy)</span>
+      <span style={{fontSize:9,color:C.tm,fontFamily:"'IBM Plex Mono',monospace",wordBreak:"break-all",userSelect:"all",flex:1,minWidth:120}}>{source}</span>
+      <button onClick={copy} style={{padding:"2px 8px",background:"transparent",border:`1px solid ${copied?C.a:C.b}`,borderRadius:6,color:copied?C.a:C.td,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",whiteSpace:"nowrap"}}>{copied?"Copied":"Copy"}</button>
+    </div>
+  );
+};
+const Citation = ({text, onOpenRef}) => {
+  if (!text) return null;
+  // Render the citation string, turning each R-/N-ref token that resolves to a
+  // real KB entry into a button that opens that entry. Unknown tokens stay plain
+  // text (anti-hallucination: never link a ref that isn't in the KB).
+  const parts = String(text).split(/(\b[RN]\d{2,3}\b)/g);
+  return (
+    <M style={{color:C.td,display:"block",marginTop:10,fontStyle:"italic"}}>
+      {parts.map((p,i)=>{
+        if (/^[RN]\d{2,3}$/.test(p)) {
+          const entry = RESEARCH_KB.find(e=>e.id===p);
+          if (entry) return <button key={i} onClick={()=>onOpenRef&&onOpenRef(entry)} style={{background:"transparent",border:"none",padding:0,margin:0,color:C.a,font:"inherit",fontStyle:"italic",cursor:"pointer",textDecoration:"underline dotted"}}>{p}</button>;
+        }
+        return <span key={i}>{p}</span>;
+      })}
+    </M>
+  );
+};
 const Tabs = ({tabs,active,onTab}) => (
   <div style={{display:"flex",gap:0,borderBottom:`1px solid ${C.b}`,background:C.s,padding:"0 24px",overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
     {tabs.map(t=>(
@@ -2047,6 +2088,7 @@ function ManagementConsole() {
   const [showKBIngestion, setShowKBIngestion] = useState(false);
   const [devAuth, setDevAuth] = useState(false);
   const [devKey, setDevKey] = useState("");
+  const [kbEntry, setKbEntry] = useState(null);
 
   // Skills Assessment state
   const [assessments, setAssessments] = useState([
@@ -3442,7 +3484,7 @@ function ManagementConsole() {
             {title:"Welcome to FireAlive Management Console",body:"This dashboard gives you team-level visibility into analyst wellbeing — never individual burnout data. You manage routing, integrations, assessments, and team health from here."},
             {title:"What FireAlive Does",body:"Burnout-aware ticket routing, peer skill-sharing with E2EE, post-incident wellness protocols, skills assessments and training, real-time team health monitoring, integration with your SOAR, SIEM, and ticketing systems."},
             {title:"What FireAlive Does NOT Do",body:"It does NOT surveil individual analysts. Burnout data is pseudonymized. Team leads see only aggregate capacity metrics. Analyst privacy is architecturally enforced, not just promised."},
-            {title:"How It's Built on Research",body:"Every feature is grounded in peer-reviewed burnout prevention research (Maslach Burnout Inventory, CISM framework, organizational psychology). The Knowledge Base contains 42 research-backed entries."},
+            {title:"How It's Built on Research",body:"Every feature is grounded in peer-reviewed burnout prevention research (Maslach Burnout Inventory, CISM framework, organizational psychology). The Knowledge Base contains 50 research-backed entries."},
             {title:"You're Ready",body:"Use the sidebar to navigate. Start with Operations → Actions for immediate priorities. Use the Setup Wizard (bottom of sidebar) for first-time configuration."},
           ][welcomeStep]&&(
             <div>
@@ -3461,7 +3503,7 @@ function ManagementConsole() {
                 "This dashboard gives you team-level visibility into analyst wellbeing — never individual burnout data. You manage routing, integrations, assessments, and team health from here.",
                 "Burnout-aware ticket routing, peer skill-sharing with E2EE, post-incident wellness protocols, skills assessments and training, real-time team health monitoring, integration with your SOAR, SIEM, and ticketing systems.",
                 "It does NOT surveil individual analysts. Burnout data is pseudonymized. Team leads see only aggregate capacity metrics. Analyst privacy is architecturally enforced, not just promised.",
-                "Every feature is grounded in peer-reviewed burnout prevention research (Maslach Burnout Inventory, CISM framework, organizational psychology). The Knowledge Base contains 42 research-backed entries.",
+                "Every feature is grounded in peer-reviewed burnout prevention research (Maslach Burnout Inventory, CISM framework, organizational psychology). The Knowledge Base contains 50 research-backed entries.",
                 "Use the sidebar to navigate. Start with Operations → Actions for immediate priorities. Use the Setup Wizard (bottom of sidebar) for first-time configuration."
               ][welcomeStep]}</M>
               <div style={{display:"flex",justifyContent:"space-between"}}>
@@ -3497,7 +3539,7 @@ function ManagementConsole() {
                 <div style={{display:"flex",gap:3,flexShrink:0,marginLeft:12}}>{["full","compact","minimal"].map(d=><button key={d} onClick={()=>{setPD(prev=>({...prev,[key]:d}));addA("DEPTH",`${key}→${d}`);}} style={{padding:"3px 8px",fontSize:9,fontFamily:"'IBM Plex Mono',monospace",borderRadius:4,cursor:"pointer",background:dp===d?C.ad:"transparent",border:`1px solid ${dp===d?C.a+"50":C.b}`,color:dp===d?C.a:C.td}}>{d}</button>)}</div>
               </div>
               <div style={{fontSize:12,lineHeight:1.7,whiteSpace:"pre-line"}}>{ct.body}</div>
-              {ct.cite&&<M style={{color:C.td,display:"block",marginTop:10,fontStyle:"italic"}}>{ct.cite}</M>}
+              {ct.cite&&<Citation text={ct.cite} onOpenRef={setKbEntry}/>}
               <Btn small style={{marginTop:12}} onClick={()=>{setSil(prev=>[...prev,key]);addA("SILENCED",key);}}>Silence</Btn>
             </Card>
           );})}
@@ -4231,11 +4273,13 @@ function ManagementConsole() {
           ))}</div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {RESEARCH_KB.filter(r=>kbFilter==="all"||r.topic===kbFilter).map(r=>(
-              <Card key={r.id} style={{padding:12}}>
-                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}><M style={{color:C.a,fontWeight:600}}>{r.id}</M><Badge color={r.strength==="strong"?C.a:C.w}>{r.strength}</Badge><Badge color={C.i}>{r.topic}</Badge><M style={{color:C.td}}>{r.year}</M></div>
+              <Card key={r.id} onClick={()=>setKbEntry(r)} style={{padding:12}}>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}><M style={{color:C.a,fontWeight:600}}>{r.id}</M><Badge color={r.strength==="strong"?C.a:C.w}>{r.strength}</Badge><Badge color={C.i}>{r.topic}</Badge><M style={{color:C.td}}>{r.year}</M><M style={{color:C.td,marginLeft:"auto"}}>Open ↗</M></div>
                 <div style={{fontSize:11,color:C.t,lineHeight:1.6,marginBottom:4}}>{r.finding}</div>
                 <div style={{fontSize:10,color:C.p,lineHeight:1.5,marginBottom:4}}>→ {r.implication}</div>
+                {r.summary&&<div style={{fontSize:10,color:C.tm,lineHeight:1.6,marginBottom:4}}>{r.summary}</div>}
                 <M style={{color:C.td,fontStyle:"italic",lineHeight:1.5,fontSize:9}}>{r.cite}</M>
+                <KBSourceCopy source={r.source}/>
               </Card>
             ))}
           </div>
@@ -4256,6 +4300,17 @@ function ManagementConsole() {
               <Card style={{padding:12,marginBottom:16}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Stats</M><M style={{color:C.tm,lineHeight:1.8}}>Entries: {KB_ENTRY_COUNT} · Version: {KB_VERSION} · Topics: {[...new Set(RESEARCH_KB.map(r=>r.topic))].length} · Strong: {RESEARCH_KB.filter(r=>r.strength==="strong").length} · Moderate: {RESEARCH_KB.filter(r=>r.strength==="moderate").length} · Years: {Math.min(...RESEARCH_KB.map(r=>r.year))}–{Math.max(...RESEARCH_KB.map(r=>r.year))}</M></Card>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"KB_SEARCH",detail:"AI research review initiated"}).then(()=>addA("KB_SEARCH","AI research review initiated"))}>Run AI Research Review</Btn><Btn onClick={()=>{const data=JSON.stringify({version:KB_VERSION,entryCount:KB_ENTRY_COUNT,exportedAt:new Date().toISOString(),entries:RESEARCH_KB},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`firealive-kb-${KB_VERSION}.json`;a.click();URL.revokeObjectURL(url);addA("KB_EXPORT","KB exported as JSON ("+data.length+" bytes, "+KB_ENTRY_COUNT+" entries)");}}>Export KB JSON</Btn></div>
             </div>)}
+          </Modal>}
+          {kbEntry&&<Modal title={(kbEntry.id||"")+" — "+(kbEntry.title||kbEntry.topic||"KB entry")} onClose={()=>setKbEntry(null)} width={620}>
+            <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}><Badge color={kbEntry.strength==="strong"?C.a:C.w}>{kbEntry.strength}</Badge><Badge color={C.i}>{kbEntry.topic}</Badge><M style={{color:C.td}}>{kbEntry.year}</M></div>
+            <M style={{color:C.tm,fontWeight:600,display:"block",marginBottom:4}}>Finding</M>
+            <div style={{fontSize:12,color:C.t,lineHeight:1.6,marginBottom:12}}>{kbEntry.finding}</div>
+            {kbEntry.summary&&<><M style={{color:C.tm,fontWeight:600,display:"block",marginBottom:4}}>Summary</M><div style={{fontSize:11,color:C.t,lineHeight:1.7,marginBottom:12}}>{kbEntry.summary}</div></>}
+            <M style={{color:C.tm,fontWeight:600,display:"block",marginBottom:4}}>FireAlive implication</M>
+            <div style={{fontSize:11,color:C.p,lineHeight:1.6,marginBottom:12}}>→ {kbEntry.implication}</div>
+            {Array.isArray(kbEntry.tags)&&kbEntry.tags.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:12}}>{kbEntry.tags.map(t=>(<Badge key={t} color={C.td}>{t}</Badge>))}</div>}
+            <M style={{color:C.td,fontStyle:"italic",lineHeight:1.5,fontSize:10,display:"block"}}>{kbEntry.cite}</M>
+            <KBSourceCopy source={kbEntry.source}/>
           </Modal>}
         </div>)}
 
@@ -8109,7 +8164,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
             {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
             {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."},{n:"Legal Hold",d:"Export data for e-discovery with hashing and chain of custody."}]},
-            {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"42 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
+            {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"50 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
           ].map(cat=>(
             <Card key={cat.cat} style={{marginBottom:12}}>
               <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:10}}>{cat.cat}</div>
