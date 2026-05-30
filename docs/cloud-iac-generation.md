@@ -173,7 +173,7 @@ Failure response (503 example):
 ```json
 {
   "error": "Syft not installed",
-  "message": "Install Syft: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin",
+  "message": "Install Syft: curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0",
   "code": "SYFT_NOT_INSTALLED"
 }
 ```

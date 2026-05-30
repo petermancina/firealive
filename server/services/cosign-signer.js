@@ -99,7 +99,7 @@ class CosignNotInstalledError extends Error {
   constructor(message) {
     super(
       message ||
-        'Cosign is not installed on this host. Install via https://github.com/sigstore/cosign (e.g. `curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign`) and ensure it is on PATH. See docs/cloud-iac-supply-chain.md for full prerequisites.',
+        'Cosign is not installed on this host. Install via https://github.com/sigstore/cosign (e.g. `curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign`) and ensure it is on PATH. See docs/cloud-iac-supply-chain.md for full prerequisites.',
     );
     this.name = 'CosignNotInstalledError';
     this.code = 'COSIGN_NOT_INSTALLED';
