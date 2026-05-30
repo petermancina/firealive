@@ -5,31 +5,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Downloads the FireAlive internal LLM model from HuggingFace on first run.
+// Downloads the FireAlive local model files from HuggingFace on first run.
 //
-// Default model: Phi-3-mini-4k-instruct-q4_K_M (~2.4GB, MIT licensed,
-// strong instruction-following + reasoning, 4k context window).
+// Two kinds of model are provisioned:
+//   • chat      — the internal LLM (default: Phi-3-mini-4k-instruct-q4_K_M,
+//                 ~2.4GB, MIT licensed; or the smaller Qwen 1.5B fallback).
+//   • embedding — the KB retrieval embedder (all-MiniLM-L6-v2 Q8_0, ~25MB,
+//                 384-dim, Apache 2.0), used by server/services/kb-embeddings.js
+//                 for semantic search over the Research KB (K1).
+//
+// Both live in the same model directory. The embedder is small enough that the
+// default run fetches it alongside the chat model — semantic retrieval needs it
+// regardless of which chat variant is chosen.
 //
 // Usage:
 //
-//   node scripts/download-model.js                  — download default model
-//   node scripts/download-model.js --check          — verify existing model
-//   node scripts/download-model.js --variant qwen   — download Qwen 1.5B fallback
-//   node scripts/download-model.js --force          — re-download even if present
+//   node scripts/download-model.js                   — download chat default + embedder
+//   node scripts/download-model.js --check           — verify chat default + embedder
+//   node scripts/download-model.js --variant qwen    — download just the Qwen chat fallback
+//   node scripts/download-model.js --variant minilm  — download just the embedder
+//   node scripts/download-model.js --force           — re-download even if present
 //
 // Or programmatically from server code:
 //
-//   const { downloadDefaultModel, isModelPresent } = require('./scripts/download-model');
-//   if (!isModelPresent()) await downloadDefaultModel({ onProgress: ... });
+//   const { downloadDefaultModel, downloadEmbedder, isModelPresent, isEmbedderPresent }
+//     = require('./scripts/download-model');
+//   if (!isModelPresent())  await downloadDefaultModel({ onProgress: ... });  // chat
+//   if (!isEmbedderPresent()) await downloadEmbedder({ onProgress: ... });    // embedder
 //
 // Environment variables:
 //
-//   FIREALIVE_MODEL_PATH   — directory or file path; defaults to
-//                            ~/.firealive/models/
-//   FIREALIVE_MODEL_VARIANT — 'phi3' (default) or 'qwen' (smaller fallback)
+//   FIREALIVE_MODEL_PATH    — directory or file path; defaults to
+//                             ~/.firealive/models/ (both chat + embedder land here)
+//   FIREALIVE_MODEL_VARIANT — 'phi3' (default) or 'qwen' (smaller chat fallback)
 //
-// On success: writes the .gguf model file to disk plus a manifest.json
-// recording { variant, filename, sizeBytes, sha256, downloadedAt, sourceUrl }.
+// On success: writes the .gguf model file(s) to disk plus a manifest.json
+// recording { kind, label, filename, sizeBytes, sha256, downloadedAt, sourceUrl }
+// per file.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
@@ -40,10 +52,13 @@ const https = require('https');
 
 // ── Model variants ──────────────────────────────────────────────────────────
 // Each variant is a fully-specified record so downloads are reproducible
-// across hosts and audited against expected hashes.
+// across hosts and audited against expected hashes. `kind` distinguishes the
+// chat LLM ('chat') from the KB retrieval embedder ('embedding'); both land in
+// the same model directory.
 
 const VARIANTS = {
   phi3: {
+    kind: 'chat',
     label: 'Phi-3-mini-4k-instruct (Microsoft, 3.8B params, MIT licensed)',
     filename: 'phi-3-mini-4k-instruct-q4.gguf',
     sourceUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
@@ -51,6 +66,7 @@ const VARIANTS = {
     sizeBytes: 2393232672,  // ~2.39 GB
   },
   qwen: {
+    kind: 'chat',
     label: 'Qwen-2.5-1.5B-instruct (Alibaba, 1.5B params, Apache 2.0 — smaller fallback)',
     filename: 'qwen2.5-1.5b-instruct-q4_k_m.gguf',
     // Hash and exact URL must be verified before enabling this variant in
@@ -61,9 +77,21 @@ const VARIANTS = {
     sha256: null,  // not pinned — fallback variant, advisory use only
     sizeBytes: null,
   },
+  minilm: {
+    kind: 'embedding',
+    label: 'all-MiniLM-L6-v2 Q8_0 (Second State, 384-dim sentence embeddings, Apache 2.0)',
+    // Filename MUST match DEFAULT_EMBED_FILENAME in server/services/kb-embeddings.js
+    // (and the AC's bundled embedder) — that's where the retrieval service looks.
+    filename: 'all-MiniLM-L6-v2-Q8_0.gguf',
+    sourceUrl: 'https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-Q8_0.gguf',
+    // Verified against the HuggingFace file page (git-LFS SHA-256), 2026-05.
+    sha256: '263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed',
+    sizeBytes: null,  // ~25 MB (Q8_0); exact byte count not published, so not pinned — integrity is enforced by the SHA-256 above
+  },
 };
 
 const DEFAULT_VARIANT = 'phi3';
+const DEFAULT_EMBEDDER = 'minilm';
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -89,6 +117,18 @@ function isModelPresent(variantKey) {
 
 async function downloadDefaultModel(options) {
   return downloadModel(DEFAULT_VARIANT, options);
+}
+
+// Embedder helpers. Kept separate from downloadDefaultModel so the existing
+// chat-model programmatic contract is unchanged: callers that want the
+// retrieval embedder ask for it explicitly.
+
+function isEmbedderPresent() {
+  return isModelPresent(DEFAULT_EMBEDDER);
+}
+
+async function downloadEmbedder(options) {
+  return downloadModel(DEFAULT_EMBEDDER, options);
 }
 
 async function downloadModel(variantKey, options) {
@@ -255,6 +295,7 @@ function writeManifest(dir, variant) {
     try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch (_) { manifest = {}; }
   }
   manifest[variant.filename] = {
+    kind: variant.kind || 'chat',
     label: variant.label,
     sourceUrl: variant.sourceUrl,
     sha256: variant.sha256,
@@ -275,6 +316,7 @@ function report(options, msg) {
 async function cli() {
   const args = process.argv.slice(2);
   let variant = DEFAULT_VARIANT;
+  let variantExplicit = false;
   let force = false;
   let mode = 'download';
 
@@ -284,6 +326,7 @@ async function cli() {
     else if (a === '--force') force = true;
     else if (a === '--variant') {
       variant = args[++i];
+      variantExplicit = true;
       if (!VARIANTS[variant]) {
         console.error(`Unknown variant: ${variant}`);
         console.error(`Available: ${Object.keys(VARIANTS).join(', ')}`);
@@ -291,35 +334,48 @@ async function cli() {
       }
     } else if (a === '--help' || a === '-h') {
       console.log('Usage: node scripts/download-model.js [options]');
-      console.log('  --check               verify existing model');
+      console.log('  --check               verify model files');
       console.log('  --force               re-download even if present');
-      console.log('  --variant <name>      pick a variant (phi3 | qwen)');
+      console.log('  --variant <name>      pick a single variant (phi3 | qwen | minilm)');
       console.log('  --help                show this message');
+      console.log('');
+      console.log('With no --variant, the default action provisions the chat default');
+      console.log(`(${DEFAULT_VARIANT}) plus the KB retrieval embedder (${DEFAULT_EMBEDDER}).`);
       console.log('');
       console.log('Available variants:');
       for (const [key, v] of Object.entries(VARIANTS)) {
-        console.log(`  ${key.padEnd(8)} ${v.label}`);
+        console.log(`  ${key.padEnd(8)} [${(v.kind || 'chat').padEnd(9)}] ${v.label}`);
       }
       process.exit(0);
     }
   }
 
+  // With an explicit --variant, act on exactly that one. Otherwise act on the
+  // chat default AND the embedder — semantic retrieval needs the embedder
+  // regardless of the chat model, and it's only ~25 MB.
+  const targets = variantExplicit ? [variant] : [DEFAULT_VARIANT, DEFAULT_EMBEDDER];
+
   try {
     if (mode === 'check') {
-      const result = await checkModel(variant);
-      if (result.ok) {
-        console.log(`✓ ${variant} model verified at ${result.path}`);
-        console.log(`  size: ${(result.sizeBytes / (1024 * 1024)).toFixed(1)} MB`);
-        process.exit(0);
-      } else {
-        console.error(`✗ ${variant} check failed: ${result.error}`);
-        if (result.path) console.error(`  path: ${result.path}`);
-        if (result.expected) console.error(`  expected SHA-256: ${result.expected}`);
-        if (result.actual) console.error(`  actual SHA-256:   ${result.actual}`);
-        process.exit(1);
+      let allOk = true;
+      for (const v of targets) {
+        const result = await checkModel(v);
+        if (result.ok) {
+          console.log(`✓ ${v} model verified at ${result.path}`);
+          console.log(`  size: ${(result.sizeBytes / (1024 * 1024)).toFixed(1)} MB`);
+        } else {
+          allOk = false;
+          console.error(`✗ ${v} check failed: ${result.error}`);
+          if (result.path) console.error(`  path: ${result.path}`);
+          if (result.expected) console.error(`  expected SHA-256: ${result.expected}`);
+          if (result.actual) console.error(`  actual SHA-256:   ${result.actual}`);
+        }
       }
+      process.exit(allOk ? 0 : 1);
     } else {
-      await downloadModel(variant, { force });
+      for (const v of targets) {
+        await downloadModel(v, { force });
+      }
       process.exit(0);
     }
   } catch (err) {
@@ -335,10 +391,13 @@ if (require.main === module) {
 module.exports = {
   VARIANTS,
   DEFAULT_VARIANT,
+  DEFAULT_EMBEDDER,
   resolveModelDir,
   resolveModelPath,
   isModelPresent,
+  isEmbedderPresent,
   downloadDefaultModel,
+  downloadEmbedder,
   downloadModel,
   checkModel,
 };
