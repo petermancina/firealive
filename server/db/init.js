@@ -1863,7 +1863,7 @@ CREATE INDEX IF NOT EXISTS idx_ooda_progress_completed
 -- Background scenario-generation jobs for the IR Simulator. The lead's
 -- policy upload triggers a multi-scenario generation (5 per difficulty by
 -- default, configurable up to 20). Each LLM call takes 30-90s on the
--- internal Phi-3 model, so a 15-scenario job runs ~15 minutes — too long
+-- internal model (Qwen2.5-14B), so a 15-scenario job runs ~15 minutes — too long
 -- for a foreground HTTP request. Jobs are persisted here so:
 --   - The MC can poll job status to render a progress meter.
 --   - A server restart mid-job recovers the job state and resumes
@@ -2056,9 +2056,9 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
 -- Provider tab — only that path routes data off-box. model_name records the
 -- local default; internal-llm reports the actually-loaded model at runtime.
 INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
-  VALUES ('burnout_messages', 'internal', 'phi-3-mini-4k-instruct-q4');
+  VALUES ('burnout_messages', 'internal', 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf');
 INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
-  VALUES ('ir_simulator', 'internal', 'phi-3-mini-4k-instruct-q4');
+  VALUES ('ir_simulator', 'internal', 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf');
 
 -- ── AI Inference Log ─────────────────────────────────────────────────────
 -- Audit trail of every model call. Compliance requirement (GDPR + DORA).

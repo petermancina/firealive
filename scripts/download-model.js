@@ -230,22 +230,6 @@ function provisioningInstructions(id) {
   return lines.join('\n');
 }
 
-// ── Transitional compat shims (REMOVED once ai-provider moves to verifyModel) ──
-// FireAlive performs no downloads. These exist only so the pre-migration caller
-// (server/routes/ai-provider.js) resolves; they fail closed with no network.
-
-function downloadsDisabledError(id) {
-  const hint = id && MODELS[id]
-    ? '\n\n' + provisioningInstructions(id)
-    : '';
-  return new Error(
-    'FireAlive does not download models (verify-only). Provision the official ' +
-    'file(s) manually, then verify with scripts/download-model.js.' + hint);
-}
-async function downloadModel(id) { throw downloadsDisabledError(id); }
-async function downloadDefaultModel() { throw downloadsDisabledError('chat'); }
-async function downloadEmbedder() { throw downloadsDisabledError('embedding'); }
-
 // ── CLI (verify-only) ─────────────────────────────────────────────────────────
 
 async function cli() {
@@ -324,8 +308,4 @@ module.exports = {
   checkModel,          // alias -> verifyModel
   provisioningInstructions,
   sha256File,
-  // transitional fail-closed shims (no network):
-  downloadModel,
-  downloadDefaultModel,
-  downloadEmbedder,
 };
