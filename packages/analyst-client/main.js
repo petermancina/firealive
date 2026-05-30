@@ -3,6 +3,8 @@ const { app, BrowserWindow, ipcMain, dialog, session, Notification, safeStorage 
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const kbLocal = require('./kb-local');
+const localLlm = require('./local-llm');
 
 // Security: disable navigation to external URLs
 app.on('web-contents-created', (event, contents) => {
@@ -329,6 +331,96 @@ ipcMain.handle('abuse:cancel-export', async () => {
   return { canceled: true };
 });
 
-app.whenReady().then(createWindow);
+
+// ── KB + local AI IPC (PR5) ────────────────────────────────────────
+// All on-device. kbChat:ask makes NO network call (the only network path is the
+// explicit, SHA-256-verified kbChat:downloadModel). Honest "unavailable on this
+// device" with no server fallback — the Tier-3 firewall.
+
+const KB_CHAT_SYSTEM = [
+  "You are the FireAlive Research Assistant, running on the analyst's own device.",
+  "Answer the question using ONLY the numbered research entries below.",
+  "Cite every claim with the entry's identifier in square brackets, e.g. [R024]. Use only the identifiers listed; never invent a study or cite anything not below.",
+  "If the research does not address the question, say so plainly and cite nothing.",
+  "This is research education to understand burnout and wellbeing science — NOT therapy, diagnosis, or clinical advice.",
+].join("\n");
+
+function acEntriesBlock(entries) {
+  return entries.map((e) => `[${e.id}] ${e.title || e.topic} (${e.year}). Finding: ${e.finding} Implication: ${e.implication}`).join("\n\n");
+}
+function buildLocalPrompt(question, entries, signalsContext) {
+  let p = KB_CHAT_SYSTEM + "\n\nRESEARCH ENTRIES:\n" + acEntriesBlock(entries);
+  if (signalsContext) p += "\n\nYOUR OWN SIGNALS (private, on-device background — do NOT cite this; cite only the research entries above):\n" + signalsContext;
+  p += "\n\nQUESTION: " + question;
+  p += "\n\nAnswer (cite every claim with a bracketed identifier from the entries above):";
+  return p;
+}
+function acRetrySuffix(allowed, offending) {
+  return "\n\n[Your previous answer cited identifiers not in the provided entries"
+    + (offending && offending.length ? " (" + offending.join(", ") + ")" : "")
+    + ". Rewrite using ONLY these identifiers: " + allowed.join(", ") + ". Cite only from them.]";
+}
+function acClampK(k, def, max) {
+  return (Number.isInteger(k) && k > 0) ? Math.min(k, max) : def;
+}
+
+ipcMain.handle('kb:search', async (_e, { query, k } = {}) => {
+  const q = (typeof query === 'string' ? query.trim() : '');
+  if (!q) return { error: 'query required' };
+  try {
+    const ranked = await localLlm.search(q, acClampK(k, 5, 20));
+    const byId = new Map(kbLocal.getAll().map((x) => [x.id, x]));
+    return { results: ranked.map((r) => ({ score: r.score, entry: byId.get(r.id) })).filter((r) => r.entry) };
+  } catch (err) {
+    if (err && err.code === 'AC_LOCAL_UNAVAILABLE') return { unavailable: true, reason: 'model_unavailable' };
+    return { error: 'search failed' };
+  }
+});
+
+ipcMain.handle('kb:entry', async (_e, { id } = {}) => {
+  const eid = String(id || '').trim().toUpperCase();
+  const entry = kbLocal.getByRefs([eid])[0];
+  return entry ? { entry } : { error: 'not found' };
+});
+
+ipcMain.handle('kbChat:ask', async (_e, { question, k, signalsContext } = {}) => {
+  const q = (typeof question === 'string' ? question.trim() : '').slice(0, 2000);
+  if (!q) return { error: 'question required' };
+  const ctx = (typeof signalsContext === 'string' ? signalsContext.trim() : '').slice(0, 2000);
+  try {
+    const ranked = await localLlm.search(q, acClampK(k, 6, 12));
+    const byId = new Map(kbLocal.getAll().map((x) => [x.id, x]));
+    const entries = ranked.map((r) => byId.get(r.id)).filter(Boolean);
+    if (entries.length === 0) return { answer: null, citedEntries: [], unavailable: true, reason: 'no_retrieval' };
+    const allowed = entries.map((e) => e.id);
+    const base = buildLocalPrompt(q, entries, ctx);
+    let answer = null, okCheck = null;
+    for (let attempt = 0; attempt < 2 && answer === null; attempt++) {
+      const prompt = attempt === 0 ? base : base + acRetrySuffix(allowed, okCheck ? okCheck.offending : []);
+      const gen = await localLlm.generate(prompt, { maxTokens: 700, temperature: 0.3 });
+      const check = kbLocal.validateCitations(gen.text, allowed);
+      if (check.ok) { answer = gen.text; okCheck = check; } else { okCheck = check; }
+    }
+    if (answer === null) return { answer: null, citedEntries: [], unavailable: true, reason: 'citation_check_failed' };
+    return { answer, citedEntries: kbLocal.getByRefs(okCheck.cited), retrievedIds: allowed, unavailable: false };
+  } catch (err) {
+    if (err && err.code === 'AC_LOCAL_UNAVAILABLE') return { answer: null, citedEntries: [], unavailable: true, reason: 'model_unavailable', detail: (err.message || '').slice(0, 200) };
+    return { error: 'local chat failed' };
+  }
+});
+
+ipcMain.handle('kbChat:modelStatus', async () => {
+  try { return localLlm.getStatus(); } catch (err) { return { error: 'status failed' }; }
+});
+
+ipcMain.handle('kbChat:downloadModel', async (_e, { which } = {}) => {
+  try { return await localLlm.downloadModel(which === 'embed' ? 'embed' : 'chat'); }
+  catch (err) { return { error: (err.message || 'download failed').slice(0, 200), code: err.code || null }; }
+});
+
+app.whenReady().then(() => {
+  try { localLlm.setModelRoot(path.join(app.getPath('userData'), 'models')); } catch (_e) {}
+  createWindow();
+});
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

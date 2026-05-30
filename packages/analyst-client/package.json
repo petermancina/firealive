@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@signalapp/libsignal-client": "^0.94.0",
+    "node-llama-cpp": "^3.18.1",
     "pdfkit": "^0.18.0"
   },
   "devDependencies": {
@@ -36,7 +37,13 @@
       "preload.js",
       "index.html",
       "app.js",
+      "kb-local.js",
+      "local-llm.js",
       "assets/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/node-llama-cpp/**",
+      "node_modules/@node-llama-cpp/**"
     ],
     "mac": {
       "target": [
