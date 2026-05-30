@@ -861,7 +861,7 @@ See SETUP.md → "Shared Responsibility in Compliance Reports" for the longer op
 5. System logs the recertification — proof to auditors that periodic review is happening
 
 ### Knowledge Base
-**What it's for:** The research knowledge base behind FireAlive's burnout-prevention features. 42 peer-reviewed entries (R001, R017, R037, etc.) cited throughout the platform — the AI burnout prediction engine, the lead-side intervention prompts, the analyst-side signal interpretations. Visible to leads here so they (and any auditor) can verify that FireAlive's recommendations come from real peer-reviewed scientific research, not from a profit incentive to sell features that just sound like they'd work.
+**What it's for:** The research knowledge base behind FireAlive's burnout-prevention features. 50 peer-reviewed entries (R001, R017, R037, etc.) cited throughout the platform — the AI burnout prediction engine, the lead-side intervention prompts, the analyst-side signal interpretations. Visible to leads here so they (and any auditor) can verify that FireAlive's recommendations come from real peer-reviewed scientific research, not from a profit incentive to sell features that just sound like they'd work.
 
 The KB is curated. It is not open to anyone to update — that would be an attack vector for malicious actors to inject articles that accelerate burnout rather than prevent it. There's a button to add KB peer-reviewed burnout articles, but for now that's restricted to the upstream maintainer (Peter Mancina). The KB is updated on a quarterly or annual basis with the latest scientific research on burnout prevention, distributed via FireAlive version updates.
 
