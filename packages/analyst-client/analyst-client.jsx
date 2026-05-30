@@ -1111,6 +1111,65 @@ export default function AnalystClientApp() {
   const [signals, setSignals] = useState(DEFAULT_SIGNALS);
   const [kbEntry, setKbEntry] = useState(null);
   const [kbFilter, setKbFilter] = useState("all");
+  const [kbChatMsgs, setKbChatMsgs] = useState([]);
+  const [kbChatInput, setKbChatInput] = useState("");
+  const [kbChatLoading, setKbChatLoading] = useState(false);
+  const [kbModelStatus, setKbModelStatus] = useState(null);
+  const [kbDownloading, setKbDownloading] = useState(false);
+  const kbBridge = () => (typeof window !== "undefined" ? window.firealive : null);
+  // Lightweight, on-device check for acute-distress cues. This assistant is for
+  // research education, not crisis support — on a hit we route to Post-Incident
+  // Wellness instead of sending anything to the model. Conservative first-person
+  // phrase list; no method terms.
+  const detectDistress = (text) => {
+    const t = (text || "").toLowerCase();
+    return ["suicid", "kill myself", "want to die", "end my life", "end it all", "no reason to live", "can't go on", "cant go on", "hurt myself", "harm myself", "self-harm", "self harm"].some((p) => t.includes(p));
+  };
+  // The analyst's own signals, summarized locally and passed ONLY to the on-device
+  // model as private grounding background. Never sent to any server.
+  const buildSignalsContext = () => {
+    try {
+      return Object.keys(signals).map((k) => {
+        const s = signals[k];
+        return `${s.label}: ${s.cur}${s.u} (baseline ${s.base}${s.u})`;
+      }).join("; ");
+    } catch (_e) { return ""; }
+  };
+  const refreshKbModelStatus = async () => {
+    const b = kbBridge();
+    if (!b) { setKbModelStatus({ available: false, noBridge: true }); return; }
+    try { setKbModelStatus(await b.invoke("kbChat:modelStatus", {})); }
+    catch (_e) { setKbModelStatus({ available: false }); }
+  };
+  const downloadKbModels = async () => {
+    const b = kbBridge();
+    if (!b || kbDownloading) return;
+    setKbDownloading(true);
+    try {
+      await b.invoke("kbChat:downloadModel", { which: "embed" });
+      await b.invoke("kbChat:downloadModel", { which: "chat" });
+    } catch (_e) {}
+    await refreshKbModelStatus();
+    setKbDownloading(false);
+  };
+  const sendKbChat = async () => {
+    const q = kbChatInput.trim();
+    if (!q || kbChatLoading) return;
+    const b = kbBridge();
+    setKbChatMsgs((m) => [...m, { role: "user", text: q }]);
+    setKbChatInput("");
+    if (detectDistress(q)) { setKbChatMsgs((m) => [...m, { role: "assistant", distress: true }]); return; }
+    if (!b) { setKbChatMsgs((m) => [...m, { role: "assistant", unavailable: true, reason: "no_bridge" }]); return; }
+    setKbChatLoading(true);
+    let r;
+    try { r = await b.invoke("kbChat:ask", { question: q, signalsContext: buildSignalsContext() }); }
+    catch (_e) { r = { error: "failed" }; }
+    setKbChatLoading(false);
+    if (!r || r.error) setKbChatMsgs((m) => [...m, { role: "assistant", unavailable: true, reason: "error" }]);
+    else if (r.unavailable) setKbChatMsgs((m) => [...m, { role: "assistant", unavailable: true, reason: r.reason || "unavailable" }]);
+    else setKbChatMsgs((m) => [...m, { role: "assistant", text: r.answer, citedEntries: r.citedEntries || [] }]);
+  };
+  useEffect(() => { if (tab === "kb" && kbModelStatus === null) refreshKbModelStatus(); }, [tab]);
   const [signalsLoadState, setSignalsLoadState] = useState({loaded:false, error:null, riskTier:null, recordedAt:null});
   useEffect(() => {
     let cancelled = false;
@@ -3330,6 +3389,37 @@ export default function AnalystClientApp() {
             <L style={{marginBottom:4}}>Research Knowledge Base</L>
             <M style={{color:C.tm}}>v{KB_VERSION} · {KB_ENTRY_COUNT} peer-reviewed entries · the evidence behind your signals & guidance</M>
           </div>
+          <Card style={{padding:14,marginBottom:16,borderColor:C.a+"30"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}><M style={{color:C.a,fontWeight:600,fontSize:12}}>Analyst KB Assistant</M><Badge color={C.a}>on-device</Badge><M style={{color:C.tm,marginLeft:"auto"}}>Runs locally · cites the {KB_ENTRY_COUNT} KB entries</M></div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>Ask the research base about burnout, workload, or recovery. Answers are generated on your device, grounded only in the Knowledge Base, and every claim is cited — unsupported answers are withheld. Your question and your signals never leave this device.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5,fontStyle:"italic"}}>This explains the research — it isn't therapy, diagnosis, or crisis support. If you're carrying something heavy, <span onClick={()=>setTab("recovery")} style={{color:C.a,cursor:"pointer",textDecoration:"underline"}}>Post-Incident Wellness</span> has resources and ways to reach a person.</M>
+            {kbModelStatus && kbModelStatus.noBridge && <M style={{color:C.w,display:"block",marginBottom:8}}>The local assistant runs only in the desktop app.</M>}
+            {kbModelStatus && !kbModelStatus.noBridge && kbModelStatus.available===false && <div style={{padding:10,border:`1px solid ${C.w}40`,borderRadius:8,marginBottom:10}}>
+              <M style={{color:C.w,display:"block",marginBottom:6,lineHeight:1.5}}>The on-device model isn't installed yet. It runs entirely on your machine — no data leaves the device.</M>
+              <Btn small onClick={downloadKbModels} disabled={kbDownloading}>{kbDownloading?"Downloading… (one-time)":"Download on-device model"}</Btn>
+            </div>}
+            {kbChatMsgs.length>0 && <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:10,maxHeight:360,overflowY:"auto"}}>
+              {kbChatMsgs.map((msg,i)=>(
+                <div key={i} style={{alignSelf:msg.role==="user"?"flex-end":"flex-start",maxWidth:"90%"}}>
+                  {msg.role==="user"
+                    ? <div style={{background:C.ad,border:`1px solid ${C.b}`,borderRadius:10,padding:"8px 12px",fontSize:11,color:C.t}}>{msg.text}</div>
+                    : msg.distress
+                      ? <div style={{border:`1px solid ${C.p}40`,borderRadius:10,padding:"10px 12px"}}><M style={{color:C.t,display:"block",marginBottom:8,lineHeight:1.6}}>This assistant explains research — it isn't the right place for what you're carrying right now, and you don't have to handle it alone.</M><Btn small onClick={()=>setTab("recovery")}>Open Post-Incident Wellness</Btn></div>
+                    : msg.unavailable
+                      ? <div style={{border:`1px solid ${C.w}40`,borderRadius:10,padding:"8px 12px"}}><M style={{color:C.w}}>{msg.reason==="citation_check_failed"?"Couldn't produce a fully-cited answer from the Knowledge Base, so it was withheld.":msg.reason==="no_retrieval"?"No relevant Knowledge Base entries were found for that question.":msg.reason==="model_unavailable"?"The on-device model isn't available — install it above to use the assistant.":msg.reason==="no_bridge"?"The local assistant runs only in the desktop app.":"The assistant is unavailable right now."}</M></div>
+                      : <div style={{border:`1px solid ${C.b}`,borderRadius:10,padding:"10px 12px"}}>
+                          <div style={{fontSize:11,color:C.t,lineHeight:1.7,whiteSpace:"pre-wrap"}}>{msg.text}</div>
+                          {Array.isArray(msg.citedEntries)&&msg.citedEntries.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:8}}>{msg.citedEntries.map(e=>(<button key={e.id} onClick={()=>setKbEntry(e)} style={{padding:"2px 8px",background:C.ad,border:`1px solid ${C.a}40`,borderRadius:6,color:C.a,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{e.id} ↗</button>))}</div>}
+                        </div>}
+                </div>
+              ))}
+            </div>}
+            {kbChatLoading&&<M style={{color:C.tm,display:"block",marginBottom:8}}>Thinking… (on-device)</M>}
+            <div style={{display:"flex",gap:8}}>
+              <input value={kbChatInput} onChange={e=>setKbChatInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendKbChat();}}} placeholder="Ask the research base…" maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+              <Btn small onClick={sendKbChat} disabled={kbChatLoading||!kbChatInput.trim()}>Ask</Btn>
+            </div>
+          </Card>
           <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>{["all",...[...new Set(RESEARCH_KB.map(r=>r.topic))]].map(f=>(
             <button key={f} onClick={()=>setKbFilter(f)} style={{padding:"3px 10px",background:kbFilter===f?C.ad:"transparent",border:`1px solid ${kbFilter===f?C.a+"50":C.b}`,borderRadius:6,color:kbFilter===f?C.a:C.tm,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{f}</button>
           ))}</div>
