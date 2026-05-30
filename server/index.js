@@ -88,8 +88,8 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       scriptSrc: ["'self'", "'unsafe-inline'"],  // needed for React in dev
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      styleSrc: ["'self'", "'unsafe-inline'"],  // self-hosted fonts only — no Google Fonts
+      fontSrc: ["'self'"],
       imgSrc: ["'self'", "data:"],
       connectSrc: ["'self'"],
     },

@@ -1,281 +1,188 @@
 #!/usr/bin/env node
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Local LLM Model Bootstrap
+// FIREALIVE — Local Model Provisioning (VERIFY-ONLY)
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Downloads the FireAlive local model files from HuggingFace on first run.
+// FireAlive NEVER downloads AI model weights. This tool VERIFIES that the
+// operator has provisioned the correct, official model files — it makes ZERO
+// network calls. There is no URL on the other end for anyone to poison.
 //
-// Two kinds of model are provisioned:
-//   • chat      — the internal LLM (default: Phi-3-mini-4k-instruct-q4_K_M,
-//                 ~2.4GB, MIT licensed; or the smaller Qwen 1.5B fallback).
-//   • embedding — the KB retrieval embedder (all-MiniLM-L6-v2 Q8_0, ~25MB,
-//                 384-dim, Apache 2.0), used by server/services/kb-embeddings.js
-//                 for semantic search over the Research KB (K1).
+// The operator obtains the official files through their OWN vetted channel
+// (the verified Qwen org on Hugging Face, Alibaba's ModelScope, or an internal
+// mirror), places them in the model directory, and FireAlive verifies each file
+// against a SHA-256 that is PINNED IN THIS SOURCE FILE (reviewed, version-
+// controlled). A file only loads on an exact hash match; anything else is
+// refused. Because the expected hashes live in code — never supplied at runtime
+// — an insider cannot drop in a tampered model plus a matching hash.
 //
-// Both live in the same model directory. The embedder is small enough that the
-// default run fetches it alongside the chat model — semantic retrieval needs it
-// regardless of which chat variant is chosen.
+// Updating a model = a reviewed FireAlive code change (bump pinnedCommit + the
+// per-file sha256 below), never a runtime input.
 //
-// Usage:
+// Two models are provisioned (both land in the same model directory):
+//   • chat      — Qwen2.5-14B-Instruct, q4_K_M (3 split shards, ~9 GB total).
+//                 Used by the MC lead KB chat via server/services/internal-llm.js.
+//   • embedding — Qwen3-Embedding-0.6B, Q8_0 (~639 MB, 1024-dim). Used by
+//                 server/services/kb-embeddings.js for KB semantic retrieval.
 //
-//   node scripts/download-model.js                   — download chat default + embedder
-//   node scripts/download-model.js --check           — verify chat default + embedder
-//   node scripts/download-model.js --variant qwen    — download just the Qwen chat fallback
-//   node scripts/download-model.js --variant minilm  — download just the embedder
-//   node scripts/download-model.js --force           — re-download even if present
+// Usage (no network, ever):
+//   node scripts/download-model.js                 — verify chat + embedder
+//   node scripts/download-model.js --verify        — same (explicit)
+//   node scripts/download-model.js --model chat    — verify just the chat model
+//   node scripts/download-model.js --instructions  — print provisioning guide
 //
-// Or programmatically from server code:
+// Programmatic:
+//   const prov = require('./scripts/download-model');
+//   const r = await prov.verifyModel('embedding');   // { ok, status, files, ... }
+//   if (!r.ok) { /* refuse to load; show prov.provisioningInstructions('embedding') */ }
 //
-//   const { downloadDefaultModel, downloadEmbedder, isModelPresent, isEmbedderPresent }
-//     = require('./scripts/download-model');
-//   if (!isModelPresent())  await downloadDefaultModel({ onProgress: ... });  // chat
-//   if (!isEmbedderPresent()) await downloadEmbedder({ onProgress: ... });    // embedder
-//
-// Environment variables:
-//
-//   FIREALIVE_MODEL_PATH    — directory or file path; defaults to
-//                             ~/.firealive/models/ (both chat + embedder land here)
-//   FIREALIVE_MODEL_VARIANT — 'phi3' (default) or 'qwen' (smaller chat fallback)
-//
-// On success: writes the .gguf model file(s) to disk plus a manifest.json
-// recording { kind, label, filename, sizeBytes, sha256, downloadedAt, sourceUrl }
-// per file.
+// Environment:
+//   FIREALIVE_MODEL_PATH — model directory (or a *.gguf path; its dir is used).
+//                          Defaults to ~/.firealive/models/.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const https = require('https');
 
-// ── Model variants ──────────────────────────────────────────────────────────
-// Each variant is a fully-specified record so downloads are reproducible
-// across hosts and audited against expected hashes. `kind` distinguishes the
-// chat LLM ('chat') from the KB retrieval embedder ('embedding'); both land in
-// the same model directory.
+// ── Pinned model manifest (source of truth) ──────────────────────────────────
+// Every expected SHA-256 below was read from the official Qwen pages and is
+// pinned here. NOTHING here is fetched. To change a model, update pinnedCommit
+// and the per-file sha256 in a reviewed commit.
 
-const VARIANTS = {
-  phi3: {
+const MODELS = {
+  chat: {
+    id: 'chat',
     kind: 'chat',
-    label: 'Phi-3-mini-4k-instruct (Microsoft, 3.8B params, MIT licensed)',
-    filename: 'phi-3-mini-4k-instruct-q4.gguf',
-    sourceUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
-    sha256: '8a83c7fb9049a9b2e92266fa7ad04933bb53aa1e85136b7b30f1b8000ff2edef',
-    sizeBytes: 2393232672,  // ~2.39 GB
+    label: 'Qwen2.5-14B-Instruct q4_K_M (Alibaba Qwen, 14.7B, Apache-2.0)',
+    officialSource: {
+      publisher: 'Qwen (Alibaba Cloud)',
+      huggingFaceRepo: 'Qwen/Qwen2.5-14B-Instruct-GGUF',
+      pinnedCommit: '2b6a96d780143b4e8e3b970394e39e3774551f29',
+      modelScope: 'Qwen/Qwen2.5-14B-Instruct-GGUF (Alibaba ModelScope, first-party)',
+    },
+    // node-llama-cpp loads a split GGUF from the first shard; the siblings must
+    // be present in the same directory. ALL shards are verified before load.
+    loadFile: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf',
+    files: [
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf', sizeApprox: '3.99 GB',
+        sha256: 'a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68' },
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf', sizeApprox: '3.99 GB',
+        sha256: '21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae' },
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf', sizeApprox: '1.01 GB',
+        sha256: 'c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976' },
+    ],
+    endpointFloor: '~9 GB free disk + ~10–12 GB RAM to run the 14B locally.',
   },
-  qwen: {
-    kind: 'chat',
-    label: 'Qwen-2.5-1.5B-instruct (Alibaba, 1.5B params, Apache 2.0 — smaller fallback)',
-    filename: 'qwen2.5-1.5b-instruct-q4_k_m.gguf',
-    // Hash and exact URL must be verified before enabling this variant in
-    // production. The path below is the typical second-state mirror for
-    // Qwen GGUF models; users selecting this variant should confirm the
-    // hash from the source repo card.
-    sourceUrl: 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf',
-    sha256: null,  // not pinned — fallback variant, advisory use only
-    sizeBytes: null,
-  },
-  minilm: {
+  embedding: {
+    id: 'embedding',
     kind: 'embedding',
-    label: 'all-MiniLM-L6-v2 Q8_0 (Second State, 384-dim sentence embeddings, Apache 2.0)',
-    // Filename MUST match DEFAULT_EMBED_FILENAME in server/services/kb-embeddings.js
-    // (and the AC's bundled embedder) — that's where the retrieval service looks.
-    filename: 'all-MiniLM-L6-v2-Q8_0.gguf',
-    sourceUrl: 'https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-Q8_0.gguf',
-    // Verified against the HuggingFace file page (git-LFS SHA-256), 2026-05.
-    sha256: '263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed',
-    sizeBytes: null,  // ~25 MB (Q8_0); exact byte count not published, so not pinned — integrity is enforced by the SHA-256 above
+    label: 'Qwen3-Embedding-0.6B Q8_0 (Alibaba Qwen, 1024-dim, Apache-2.0)',
+    officialSource: {
+      publisher: 'Qwen (Alibaba Cloud)',
+      huggingFaceRepo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
+      pinnedCommit: 'd20cf9c',
+      modelScope: 'Qwen/Qwen3-Embedding-0.6B-GGUF (Alibaba ModelScope, first-party)',
+    },
+    // MUST match DEFAULT_EMBED_FILENAME in server/services/kb-embeddings.js and
+    // the AC bundled embedder — that's where retrieval looks.
+    loadFile: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+    files: [
+      { filename: 'Qwen3-Embedding-0.6B-Q8_0.gguf', sizeApprox: '639 MB',
+        sha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439' },
+    ],
+    endpointFloor: '~640 MB free disk; minimal RAM.',
   },
 };
 
-const DEFAULT_VARIANT = 'phi3';
-const DEFAULT_EMBEDDER = 'minilm';
+// Compat alias: ai-provider.js (until it moves to verifyModel) reads dl.VARIANTS.
+const VARIANTS = MODELS;
+const MODEL_IDS = Object.keys(MODELS);
 
-// ── Public API ──────────────────────────────────────────────────────────────
+// ── Path resolution (shared with the runtime loaders) ────────────────────────
 
 function resolveModelDir() {
   const envPath = process.env.FIREALIVE_MODEL_PATH;
   if (envPath) {
-    if (envPath.endsWith('.gguf')) return path.dirname(envPath);
+    if (envPath.toLowerCase().endsWith('.gguf')) return path.dirname(envPath);
     return envPath;
   }
   return path.join(os.homedir(), '.firealive', 'models');
 }
 
-function resolveModelPath(variantKey) {
-  const variant = VARIANTS[variantKey || DEFAULT_VARIANT];
-  if (!variant) throw new Error('unknown variant: ' + variantKey);
-  return path.join(resolveModelDir(), variant.filename);
+function modelFiles(id) {
+  const m = MODELS[id];
+  if (!m) throw new Error('unknown model: ' + id);
+  const dir = resolveModelDir();
+  return m.files.map(f => ({ ...f, path: path.join(dir, f.filename) }));
 }
 
-function isModelPresent(variantKey) {
-  const target = resolveModelPath(variantKey || DEFAULT_VARIANT);
-  return fs.existsSync(target);
+// Path the loader hands to node-llama-cpp (first shard for split GGUF).
+function resolveModelPath(id) {
+  const m = MODELS[id];
+  if (!m) throw new Error('unknown model: ' + id);
+  return path.join(resolveModelDir(), m.loadFile);
 }
 
-async function downloadDefaultModel(options) {
-  return downloadModel(DEFAULT_VARIANT, options);
+function isModelPresent(id) {
+  return modelFiles(id).every(f => fs.existsSync(f.path));
 }
-
-// Embedder helpers. Kept separate from downloadDefaultModel so the existing
-// chat-model programmatic contract is unchanged: callers that want the
-// retrieval embedder ask for it explicitly.
 
 function isEmbedderPresent() {
-  return isModelPresent(DEFAULT_EMBEDDER);
+  return isModelPresent('embedding');
 }
 
-async function downloadEmbedder(options) {
-  return downloadModel(DEFAULT_EMBEDDER, options);
-}
+// ── Verify (the only integrity gate; NO network) ─────────────────────────────
+// Streams each file, computes SHA-256, compares to the pinned value.
+// status: 'ok' (all present + all match) | 'missing' (≥1 absent) | 'mismatch'.
 
-async function downloadModel(variantKey, options) {
-  options = options || {};
-  const variant = VARIANTS[variantKey];
-  if (!variant) throw new Error('unknown variant: ' + variantKey);
+async function verifyModel(id) {
+  const m = MODELS[id];
+  if (!m) return { ok: false, status: 'unknown-model', id };
 
-  const dir = resolveModelDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const target = path.join(dir, variant.filename);
+  const files = [];
+  let anyMissing = false;
+  let anyMismatch = false;
 
-  // Already present + verified? Skip.
-  if (!options.force && fs.existsSync(target)) {
-    if (variant.sha256) {
-      report(options, 'verifying existing file...');
-      const actualHash = await sha256File(target);
-      if (actualHash === variant.sha256) {
-        report(options, `existing file verified: ${variant.filename}`);
-        writeManifest(dir, variant);
-        return target;
-      }
-      report(options, `existing file hash mismatch (got ${actualHash.slice(0, 16)}…); re-downloading`);
-      fs.unlinkSync(target);
-    } else {
-      report(options, `existing file present; skipping (no hash to verify): ${variant.filename}`);
-      writeManifest(dir, variant);
-      return target;
+  for (const f of modelFiles(id)) {
+    if (!fs.existsSync(f.path)) {
+      anyMissing = true;
+      files.push({ filename: f.filename, path: f.path, present: false, match: false,
+        expected: f.sha256, actual: null });
+      continue;
     }
+    const actual = await sha256File(f.path);
+    const match = actual === f.sha256;
+    if (!match) anyMismatch = true;
+    files.push({ filename: f.filename, path: f.path, present: true, match,
+      expected: f.sha256, actual });
   }
 
-  report(options, `downloading ${variant.label}`);
-  report(options, `from: ${variant.sourceUrl}`);
-  report(options, `to:   ${target}`);
-  report(options, '');
-
-  await downloadWithProgress(variant.sourceUrl, target, options);
-
-  if (variant.sha256) {
-    report(options, '');
-    report(options, 'verifying SHA-256...');
-    const actualHash = await sha256File(target);
-    if (actualHash !== variant.sha256) {
-      fs.unlinkSync(target);
-      throw new Error(`SHA-256 mismatch: expected ${variant.sha256}, got ${actualHash}; downloaded file deleted`);
-    }
-    report(options, '✓ SHA-256 verified');
-  } else {
-    report(options, '⚠ no SHA-256 pinned for this variant; skipping verification');
-  }
-
-  writeManifest(dir, variant);
-  report(options, '');
-  report(options, `✓ model ready at: ${target}`);
-  return target;
-}
-
-async function checkModel(variantKey) {
-  const variant = VARIANTS[variantKey || DEFAULT_VARIANT];
-  if (!variant) return { ok: false, error: 'unknown variant' };
-
-  const target = path.join(resolveModelDir(), variant.filename);
-  if (!fs.existsSync(target)) {
-    return { ok: false, error: 'file not present', path: target };
-  }
-  const stat = fs.statSync(target);
-  if (variant.sha256) {
-    const actualHash = await sha256File(target);
-    if (actualHash !== variant.sha256) {
-      return { ok: false, error: 'SHA-256 mismatch', path: target, expected: variant.sha256, actual: actualHash };
-    }
-  }
+  const status = anyMissing ? 'missing' : (anyMismatch ? 'mismatch' : 'ok');
   return {
-    ok: true,
-    path: target,
-    sizeBytes: stat.size,
-    sha256: variant.sha256,
-    variant: variantKey || DEFAULT_VARIANT,
+    ok: status === 'ok',
+    status,
+    id,
+    kind: m.kind,
+    label: m.label,
+    loadFile: m.loadFile,
+    loadPath: resolveModelPath(id),
+    modelDir: resolveModelDir(),
+    files,
   };
 }
 
-// ── Internal helpers ────────────────────────────────────────────────────────
+async function verifyAll() {
+  const results = {};
+  for (const id of MODEL_IDS) results[id] = await verifyModel(id);
+  return { ok: MODEL_IDS.every(id => results[id].ok), models: results };
+}
 
-function downloadWithProgress(url, destPath, options) {
-  return new Promise((resolve, reject) => {
-    const startedAt = Date.now();
-    const tmpPath = destPath + '.partial';
-    const file = fs.createWriteStream(tmpPath);
-    let downloadedBytes = 0;
-    let totalBytes = 0;
-    let lastReportedPct = -1;
-
-    const req = https.get(url, { headers: { 'User-Agent': 'FireAlive-Model-Bootstrap/1.0' } }, (res) => {
-      // Follow redirects (HuggingFace serves files via 302 to a CDN)
-      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303 || res.statusCode === 307 || res.statusCode === 308) {
-        if (!res.headers.location) {
-          file.close();
-          fs.unlinkSync(tmpPath);
-          return reject(new Error(`redirect ${res.statusCode} without Location header`));
-        }
-        file.close();
-        return downloadWithProgress(res.headers.location, destPath, options).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        file.close();
-        try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-      }
-
-      totalBytes = parseInt(res.headers['content-length'], 10) || 0;
-      res.pipe(file);
-
-      res.on('data', (chunk) => {
-        downloadedBytes += chunk.length;
-        if (totalBytes > 0) {
-          const pct = Math.floor((downloadedBytes / totalBytes) * 100);
-          if (pct !== lastReportedPct && pct % 5 === 0) {
-            lastReportedPct = pct;
-            const mb = (downloadedBytes / (1024 * 1024)).toFixed(1);
-            const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
-            const elapsedSec = (Date.now() - startedAt) / 1000;
-            const speedMbs = elapsedSec > 0 ? (downloadedBytes / (1024 * 1024) / elapsedSec).toFixed(1) : '?';
-            report(options, `  ${pct}% — ${mb} / ${totalMb} MB (${speedMbs} MB/s)`);
-            if (options.onProgress) {
-              options.onProgress({ downloadedBytes, totalBytes, pct });
-            }
-          }
-        }
-      });
-
-      file.on('finish', () => {
-        file.close(() => {
-          fs.renameSync(tmpPath, destPath);
-          resolve();
-        });
-      });
-    });
-
-    req.on('error', (err) => {
-      try { file.close(); fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
-      reject(err);
-    });
-
-    file.on('error', (err) => {
-      try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
-      reject(err);
-    });
-  });
+// Back-compat name some callers used; now just verifyModel.
+function checkModel(id) {
+  return verifyModel(id || 'chat');
 }
 
 function sha256File(filePath) {
@@ -288,100 +195,115 @@ function sha256File(filePath) {
   });
 }
 
-function writeManifest(dir, variant) {
-  const manifestPath = path.join(dir, 'manifest.json');
-  let manifest = {};
-  if (fs.existsSync(manifestPath)) {
-    try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch (_) { manifest = {}; }
+// ── Provisioning instructions (operator-facing; no network performed) ────────
+
+function provisioningInstructions(id) {
+  const m = MODELS[id];
+  if (!m) return 'Unknown model: ' + id;
+  const dir = resolveModelDir();
+  const lines = [];
+  lines.push(`Provision the ${m.kind} model: ${m.label}`);
+  lines.push('');
+  lines.push('FireAlive does not download models. Obtain the official files through');
+  lines.push('your own vetted channel, then place them in the model directory below.');
+  lines.push('');
+  lines.push('Official first-party source:');
+  lines.push(`  • Hugging Face (verified Qwen org): ${m.officialSource.huggingFaceRepo}`);
+  lines.push(`    pinned commit: ${m.officialSource.pinnedCommit}`);
+  lines.push(`  • Alibaba ModelScope (Qwen first-party): ${m.officialSource.modelScope}`);
+  lines.push('');
+  lines.push(`Model directory: ${dir}`);
+  lines.push(`Endpoint floor: ${m.endpointFloor}`);
+  lines.push('');
+  lines.push('Place these file(s) and confirm each SHA-256 matches exactly:');
+  for (const f of m.files) {
+    lines.push(`  ${f.filename}  (${f.sizeApprox})`);
+    lines.push(`    sha256: ${f.sha256}`);
   }
-  manifest[variant.filename] = {
-    kind: variant.kind || 'chat',
-    label: variant.label,
-    sourceUrl: variant.sourceUrl,
-    sha256: variant.sha256,
-    sizeBytes: variant.sizeBytes,
-    downloadedAt: new Date().toISOString(),
-  };
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  if (m.files.length > 1) {
+    lines.push('');
+    lines.push(`  (Split GGUF — keep all ${m.files.length} shards together; FireAlive loads from`);
+    lines.push(`   ${m.loadFile} and verifies every shard before loading.)`);
+  }
+  lines.push('');
+  lines.push('Then verify:  node scripts/download-model.js --model ' + id);
+  return lines.join('\n');
 }
 
-function report(options, msg) {
-  if (options.silent) return;
-  if (options.onLog) options.onLog(msg);
-  else process.stdout.write(msg + '\n');
-}
+// ── Transitional compat shims (REMOVED once ai-provider moves to verifyModel) ──
+// FireAlive performs no downloads. These exist only so the pre-migration caller
+// (server/routes/ai-provider.js) resolves; they fail closed with no network.
 
-// ── CLI ─────────────────────────────────────────────────────────────────────
+function downloadsDisabledError(id) {
+  const hint = id && MODELS[id]
+    ? '\n\n' + provisioningInstructions(id)
+    : '';
+  return new Error(
+    'FireAlive does not download models (verify-only). Provision the official ' +
+    'file(s) manually, then verify with scripts/download-model.js.' + hint);
+}
+async function downloadModel(id) { throw downloadsDisabledError(id); }
+async function downloadDefaultModel() { throw downloadsDisabledError('chat'); }
+async function downloadEmbedder() { throw downloadsDisabledError('embedding'); }
+
+// ── CLI (verify-only) ─────────────────────────────────────────────────────────
 
 async function cli() {
   const args = process.argv.slice(2);
-  let variant = DEFAULT_VARIANT;
-  let variantExplicit = false;
-  let force = false;
-  let mode = 'download';
+  let only = null;
+  let mode = 'verify';
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--check') mode = 'check';
-    else if (a === '--force') force = true;
-    else if (a === '--variant') {
-      variant = args[++i];
-      variantExplicit = true;
-      if (!VARIANTS[variant]) {
-        console.error(`Unknown variant: ${variant}`);
-        console.error(`Available: ${Object.keys(VARIANTS).join(', ')}`);
+    if (a === '--verify' || a === '--check') mode = 'verify';
+    else if (a === '--instructions') mode = 'instructions';
+    else if (a === '--model' || a === '--variant') {
+      only = args[++i];
+      if (!MODELS[only]) {
+        console.error(`Unknown model: ${only}`);
+        console.error(`Available: ${MODEL_IDS.join(', ')}`);
         process.exit(2);
       }
     } else if (a === '--help' || a === '-h') {
+      console.log('FireAlive model provisioning (VERIFY-ONLY — no downloads).');
       console.log('Usage: node scripts/download-model.js [options]');
-      console.log('  --check               verify model files');
-      console.log('  --force               re-download even if present');
-      console.log('  --variant <name>      pick a single variant (phi3 | qwen | minilm)');
+      console.log('  --verify              verify provisioned model files (default)');
+      console.log('  --instructions        print provisioning guide + pinned hashes');
+      console.log('  --model <chat|embedding>  act on a single model');
       console.log('  --help                show this message');
-      console.log('');
-      console.log('With no --variant, the default action provisions the chat default');
-      console.log(`(${DEFAULT_VARIANT}) plus the KB retrieval embedder (${DEFAULT_EMBEDDER}).`);
-      console.log('');
-      console.log('Available variants:');
-      for (const [key, v] of Object.entries(VARIANTS)) {
-        console.log(`  ${key.padEnd(8)} [${(v.kind || 'chat').padEnd(9)}] ${v.label}`);
-      }
       process.exit(0);
     }
   }
 
-  // With an explicit --variant, act on exactly that one. Otherwise act on the
-  // chat default AND the embedder — semantic retrieval needs the embedder
-  // regardless of the chat model, and it's only ~25 MB.
-  const targets = variantExplicit ? [variant] : [DEFAULT_VARIANT, DEFAULT_EMBEDDER];
+  const ids = only ? [only] : MODEL_IDS;
 
-  try {
-    if (mode === 'check') {
-      let allOk = true;
-      for (const v of targets) {
-        const result = await checkModel(v);
-        if (result.ok) {
-          console.log(`✓ ${v} model verified at ${result.path}`);
-          console.log(`  size: ${(result.sizeBytes / (1024 * 1024)).toFixed(1)} MB`);
-        } else {
-          allOk = false;
-          console.error(`✗ ${v} check failed: ${result.error}`);
-          if (result.path) console.error(`  path: ${result.path}`);
-          if (result.expected) console.error(`  expected SHA-256: ${result.expected}`);
-          if (result.actual) console.error(`  actual SHA-256:   ${result.actual}`);
-        }
-      }
-      process.exit(allOk ? 0 : 1);
+  if (mode === 'instructions') {
+    for (const id of ids) {
+      console.log(provisioningInstructions(id));
+      console.log('');
+    }
+    process.exit(0);
+  }
+
+  let allOk = true;
+  for (const id of ids) {
+    const r = await verifyModel(id);
+    if (r.ok) {
+      console.log(`\u2713 ${id} verified (${r.label})`);
+      console.log(`  dir: ${r.modelDir}`);
     } else {
-      for (const v of targets) {
-        await downloadModel(v, { force });
+      allOk = false;
+      console.error(`\u2717 ${id} NOT ready — status: ${r.status}`);
+      for (const f of r.files) {
+        if (!f.present) console.error(`  missing: ${f.filename}`);
+        else if (!f.match) console.error(`  hash mismatch: ${f.filename}\n    expected ${f.expected}\n    actual   ${f.actual}`);
       }
-      process.exit(0);
+      console.error('');
+      console.error(provisioningInstructions(id));
+      console.error('');
     }
-  } catch (err) {
-    console.error('Error:', err.message);
-    process.exit(1);
   }
+  process.exit(allOk ? 0 : 1);
 }
 
 if (require.main === module) {
@@ -389,15 +311,21 @@ if (require.main === module) {
 }
 
 module.exports = {
-  VARIANTS,
-  DEFAULT_VARIANT,
-  DEFAULT_EMBEDDER,
+  MODELS,
+  VARIANTS,            // compat alias (= MODELS)
+  MODEL_IDS,
   resolveModelDir,
   resolveModelPath,
+  modelFiles,
   isModelPresent,
   isEmbedderPresent,
+  verifyModel,
+  verifyAll,
+  checkModel,          // alias -> verifyModel
+  provisioningInstructions,
+  sha256File,
+  // transitional fail-closed shims (no network):
+  downloadModel,
   downloadDefaultModel,
   downloadEmbedder,
-  downloadModel,
-  checkModel,
 };

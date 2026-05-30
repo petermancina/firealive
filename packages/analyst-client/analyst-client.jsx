@@ -1115,7 +1115,8 @@ export default function AnalystClientApp() {
   const [kbChatInput, setKbChatInput] = useState("");
   const [kbChatLoading, setKbChatLoading] = useState(false);
   const [kbModelStatus, setKbModelStatus] = useState(null);
-  const [kbDownloading, setKbDownloading] = useState(false);
+  const [kbVerifying, setKbVerifying] = useState(false);
+  const [kbProvisioning, setKbProvisioning] = useState(null);
   const kbBridge = () => (typeof window !== "undefined" ? window.firealive : null);
   // Lightweight, on-device check for acute-distress cues. This assistant is for
   // research education, not crisis support — on a hit we route to Post-Incident
@@ -1141,16 +1142,22 @@ export default function AnalystClientApp() {
     try { setKbModelStatus(await b.invoke("kbChat:modelStatus", {})); }
     catch (_e) { setKbModelStatus({ available: false }); }
   };
-  const downloadKbModels = async () => {
+  const verifyKbModels = async () => {
     const b = kbBridge();
-    if (!b || kbDownloading) return;
-    setKbDownloading(true);
+    if (!b || kbVerifying) return;
+    setKbVerifying(true);
     try {
-      await b.invoke("kbChat:downloadModel", { which: "embed" });
-      await b.invoke("kbChat:downloadModel", { which: "chat" });
+      await b.invoke("kbChat:verifyModel", { which: "embed" });
+      await b.invoke("kbChat:verifyModel", { which: "chat" });
     } catch (_e) {}
     await refreshKbModelStatus();
-    setKbDownloading(false);
+    setKbVerifying(false);
+  };
+  const showKbProvisioning = async () => {
+    const b = kbBridge();
+    if (!b) return;
+    try { setKbProvisioning(await b.invoke("kbChat:provisioningInfo", {})); }
+    catch (_e) {}
   };
   const sendKbChat = async () => {
     const q = kbChatInput.trim();
@@ -3395,8 +3402,24 @@ export default function AnalystClientApp() {
             <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5,fontStyle:"italic"}}>This explains the research — it isn't therapy, diagnosis, or crisis support. If you're carrying something heavy, <span onClick={()=>setTab("recovery")} style={{color:C.a,cursor:"pointer",textDecoration:"underline"}}>Post-Incident Wellness</span> has resources and ways to reach a person.</M>
             {kbModelStatus && kbModelStatus.noBridge && <M style={{color:C.w,display:"block",marginBottom:8}}>The local assistant runs only in the desktop app.</M>}
             {kbModelStatus && !kbModelStatus.noBridge && kbModelStatus.available===false && <div style={{padding:10,border:`1px solid ${C.w}40`,borderRadius:8,marginBottom:10}}>
-              <M style={{color:C.w,display:"block",marginBottom:6,lineHeight:1.5}}>The on-device model isn't installed yet. It runs entirely on your machine — no data leaves the device.</M>
-              <Btn small onClick={downloadKbModels} disabled={kbDownloading}>{kbDownloading?"Downloading… (one-time)":"Download on-device model"}</Btn>
+              <M style={{color:C.w,display:"block",marginBottom:6,lineHeight:1.5}}>The on-device model isn't provisioned yet. FireAlive never downloads models — provision the official files on this machine, then verify. Everything runs locally; no data leaves the device.</M>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <Btn small onClick={verifyKbModels} disabled={kbVerifying}>{kbVerifying?"Verifying…":"Verify provisioned files"}</Btn>
+                {!kbProvisioning && <Btn small onClick={showKbProvisioning}>Show provisioning guide</Btn>}
+              </div>
+              {kbProvisioning && <div style={{marginTop:10,padding:10,border:`1px solid ${C.b}`,borderRadius:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <M style={{color:C.t,fontWeight:600}}>Provisioning (verify-only)</M>
+                  <Btn small onClick={()=>setKbProvisioning(null)}>Hide</Btn>
+                </div>
+                <M style={{color:C.tm,display:"block",fontSize:11,marginBottom:8,lineHeight:1.5}}>Place the official files in: <span style={{color:C.t,fontFamily:"monospace"}}>{kbProvisioning.modelRoot}</span></M>
+                {Object.keys(kbProvisioning.models||{}).map((mid)=>{const mm=kbProvisioning.models[mid];return (<div key={mid} style={{marginBottom:8,paddingTop:6,borderTop:`1px solid ${C.b}`}}>
+                  <M style={{color:C.t,fontWeight:600,display:"block"}}>{mm.label} — <span style={{color:mm.present?C.a:C.w}}>{mm.present?"provisioned":"not provisioned"}</span></M>
+                  <M style={{color:C.tm,display:"block",fontSize:11}}>Official: {mm.officialSource&&mm.officialSource.huggingFaceRepo} (pinned {mm.officialSource&&mm.officialSource.pinnedCommit})</M>
+                  <M style={{color:C.tm,display:"block",fontSize:11}}>Endpoint floor: {mm.endpointFloor}</M>
+                  {(mm.files||[]).map((ff)=>(<M key={ff.filename} style={{color:C.td,display:"block",fontSize:10,fontFamily:"monospace",wordBreak:"break-all"}}>{ff.filename} ({ff.sizeApprox}) — sha256: {ff.sha256}</M>))}
+                </div>);})}
+              </div>}
             </div>}
             {kbChatMsgs.length>0 && <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:10,maxHeight:360,overflowY:"auto"}}>
               {kbChatMsgs.map((msg,i)=>(

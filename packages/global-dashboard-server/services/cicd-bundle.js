@@ -42,7 +42,13 @@
 //      for SLSA L3)
 //   8. sign (Cosign keyless OIDC default; override via
 //      COSIGN_KEY_MODE=key-based + COSIGN_PRIVATE_KEY)
-//   9. CVE scan (Trivy with HIGH,CRITICAL exit 1)
+//   9. CVE scan (Grype — Anchore's scanner; pairs with Syft, scans the
+//      built image / SBOM, --fail-on high)
+//
+//   Pinned tool versions (no unpinned `main`/`@master`/`:latest`; bump only
+//   via reviewed PR):  Syft v1.44.0, Grype v0.110.0, Cosign v3.0.6.
+//   Installers use the immutable release tag; the Syft image digest is
+//   anchore/syft@sha256:86fde6445b483d902fe011dd9f68c4987dd94e07da1e9edc004e3c2422650de6.
 //   10. fuse-counter check (package.json fuseCounter monotonically
 //       advanced from main)
 //   11. Deploy (commented placeholder for operator customization)
@@ -170,7 +176,7 @@ function buildReadme(platform, purpose, snapshot, configId) {
     `6. Dependency-pin verification`,
     `7. Build (docker buildx with --provenance=mode=max --sbom=true for SLSA L3)`,
     `8. Sign (Cosign keyless OIDC by default)`,
-    `9. CVE scan (Trivy)`,
+    `9. CVE scan (Grype — Anchore; pairs with Syft, scans the built image / SBOM)`,
     `10. Fuse-counter check (R3 anti-rollback discipline)`,
     `11. Deploy (commented placeholder)`,
     ``,
@@ -252,14 +258,12 @@ function renderGithubActions(snapshot, purpose) {
     '        run: npm audit --audit-level=moderate || true',
     '',
     '      - name: Snyk',
-    '        uses: snyk/actions/node@master',
     '        env:',
     '          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}',
-    '        with:',
-    '          args: --severity-threshold=high',
+    '        run: npx snyk test --severity-threshold=high',
     '',
-    '      - name: Install Syft',
-    '        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin',
+    '      - name: Install Syft (pinned v1.44.0)',
+    '        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0',
     '',
     '      - name: SBOM',
     '        run: syft . -o spdx-json=sbom.spdx.json',
@@ -293,12 +297,11 @@ function renderGithubActions(snapshot, purpose) {
     `            cosign sign --yes ${GD_CICD_SHAPE.imageName}:\${{ github.sha }}`,
     '          fi',
     '',
-    '      - name: Trivy CVE scan',
-    '        uses: aquasecurity/trivy-action@master',
-    '        with:',
-    `          image-ref: ${GD_CICD_SHAPE.imageName}:\${{ github.sha }}`,
-    '          severity: HIGH,CRITICAL',
-    '          exit-code: "1"',
+    '      - name: Install Grype (pinned v0.110.0)',
+    '        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.110.0/install.sh | sh -s -- -b /usr/local/bin v0.110.0',
+    '',
+    '      - name: Grype CVE scan',
+    `        run: grype ${GD_CICD_SHAPE.imageName}:\${{ github.sha }} --fail-on high`,
     '',
     '      - name: Fuse-counter check',
     '        run: |',
@@ -361,7 +364,7 @@ function renderGitlabCi(snapshot, purpose) {
     '',
     'sbom:',
     '  stage: security',
-    '  image: anchore/syft:latest',
+    '  image: anchore/syft:v1.44.0',
     '  script: [syft . -o spdx-json=sbom.spdx.json]',
     '  artifacts:',
     '    paths: [sbom.spdx.json]',
@@ -394,8 +397,8 @@ function renderGitlabCi(snapshot, purpose) {
     '',
     'cve-scan:',
     '  stage: sign-verify',
-    '  image: aquasec/trivy:latest',
-    `  script: [trivy image --severity HIGH,CRITICAL --exit-code 1 ${GD_CICD_SHAPE.imageName}:$CI_COMMIT_SHA]`,
+    '  image: anchore/grype:v0.110.0',
+    `  script: [grype ${GD_CICD_SHAPE.imageName}:$CI_COMMIT_SHA --fail-on high]`,
     '',
     'fuse-counter:',
     '  stage: sign-verify',
@@ -437,7 +440,7 @@ function renderJenkinsfile(snapshot, purpose) {
     '    }',
     '    stage("SBOM") {',
     '      steps {',
-    '        sh "curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin"',
+    '        sh "curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0"',
     '        sh "syft . -o spdx-json=sbom.spdx.json"',
     '        archiveArtifacts artifacts: "sbom.spdx.json"',
     '      }',
@@ -465,7 +468,7 @@ function renderJenkinsfile(snapshot, purpose) {
     "      }",
     '    }',
     '    stage("CVE scan") {',
-    `      steps { sh "trivy image --severity HIGH,CRITICAL --exit-code 1 ${GD_CICD_SHAPE.imageName}:\${BUILD_NUMBER}" }`,
+    `      steps { sh "curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.110.0/install.sh | sh -s -- -b /usr/local/bin v0.110.0"; sh "grype ${GD_CICD_SHAPE.imageName}:\${BUILD_NUMBER} --fail-on high" }`,
     '    }',
     '    stage("Fuse-counter") {',
     "      steps {",
@@ -526,7 +529,7 @@ function renderCircleCi(snapshot, purpose) {
     '          environment: { SNYK_TOKEN: $SNYK_TOKEN }',
     '      - run:',
     '          name: Install Syft',
-    '          command: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin',
+    '          command: curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0',
     '      - run: { name: SBOM, command: syft . -o spdx-json=sbom.spdx.json }',
     '      - store_artifacts: { path: sbom.spdx.json }',
     '      - run:',
@@ -540,7 +543,7 @@ function renderCircleCi(snapshot, purpose) {
     `          command: docker buildx build --provenance=mode=max --sbom=true -t ${GD_CICD_SHAPE.imageName}:$CIRCLE_SHA1 .`,
     '      - run:',
     '          name: Install Cosign',
-    '          command: curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign',
+    '          command: curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign',
     '      - run:',
     '          name: Sign',
     '          command: |',
@@ -554,8 +557,8 @@ function renderCircleCi(snapshot, purpose) {
     '      - run:',
     '          name: CVE scan',
     '          command: |',
-    '            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin',
-    `            trivy image --severity HIGH,CRITICAL --exit-code 1 ${GD_CICD_SHAPE.imageName}:$CIRCLE_SHA1`,
+    '            curl -sSfL https://raw.githubusercontent.com/anchore/grype/v0.110.0/install.sh | sh -s -- -b /usr/local/bin v0.110.0',
+    `            grype ${GD_CICD_SHAPE.imageName}:$CIRCLE_SHA1 --fail-on high`,
     '      - run:',
     '          name: Fuse-counter',
     '          command: |',

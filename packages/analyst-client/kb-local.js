@@ -13,7 +13,7 @@
 // getAll/getByRefs, validateCitations (identical gate), and cosineSimilarity/
 // cosineTopN + entryEmbeddingText for retrieval. It loads no native modules and
 // touches no disk/network. local-llm.js builds the embedding vectors on-device
-// (via the local all-MiniLM model) and uses cosineTopN here to rank them.
+// (via the local Qwen3-Embedding model) and uses cosineTopN here to rank them.
 //
 // Exports: KB_VERSION, EXPECTED_ENTRY_COUNT, EXPECTED_DIM, RESEARCH_KB, getAll,
 //   getByRefs, validateCitations, cosineSimilarity, cosineTopN, entryEmbeddingText.
@@ -21,7 +21,7 @@
 
 const KB_VERSION = "2026.05.1";
 const EXPECTED_ENTRY_COUNT = 50;
-const EXPECTED_DIM = 384;
+const EXPECTED_DIM = 1024;
 
 const RESEARCH_KB = [
   {id:"R001",topic:"intervention",tags:["organizational", "meta-analysis", "exhaustion"],title:"Organizational interventions and occupational burnout: a meta-analysis with focus on exhaustion",finding:"Organizational interventions reduce exhaustion with a pooled effect size d=−0.30 (95% CI −0.42 to −0.18, I²=62%); combined organizational + individual interventions did better (d=−0.54, 95% CI −0.76 to −0.32). Among organizational subtypes, both participatory (d=−0.34) and workload-focused (d=−0.44) interventions reduced exhaustion. Overall evidence quality graded very low.",implication:"Structural changes (workload, scheduling, participatory redesign) are an evidence-based first response; treat magnitude as directional given the low evidence grade.",strength:"strong",cite:"Bes, I., Shoman, Y., Al-Gobari, M., et al. (2023), Int Arch Occup Environ Health, 96(9), 1211–1223",year:2023,summary:"A 2023 meta-analysis of controlled trials (11 articles, 13 studies) found that organizational interventions — changing how the work itself is structured — measurably reduce exhaustion, the core dimension of burnout, with a pooled effect size of d = −0.30 (95% CI −0.42 to −0.18). Interventions combining organizational and individual elements did better still (d = −0.54). Among the organizational subtypes studied, both participatory redesign (d = −0.34) and workload-focused changes (d = −0.44) reduced exhaustion. For a SOC, the evidence-based first move when burnout signals rise is structural — workload, routing, scheduling, and giving analysts a voice in those changes — rather than individual \"fix yourself\" programs alone. (The authors graded the overall evidence quality as very low, so treat the magnitude as directional.)",source:"https://doi.org/10.1007/s00420-023-02009-z"},

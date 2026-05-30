@@ -6,7 +6,7 @@
 //
 // Provides semantic retrieval over the FireAlive Research Knowledge Base
 // (server/services/research-kb.js). Loads a small, purpose-built text-embedding
-// model (all-MiniLM-L6-v2 as a GGUF) through the SAME node-llama-cpp library the
+// model (Qwen3-Embedding-0.6B as a GGUF) through the SAME node-llama-cpp library the
 // internal chat LLM uses, embeds each KB entry once, caches the vectors, and
 // answers cosine-similarity top-N queries.
 //
@@ -17,7 +17,7 @@
 // routes layer RAG (retrieve → ground an LLM → strict citation gate) on top.
 //
 // ── Model ───────────────────────────────────────────────────────────────────
-// Embedding model: all-MiniLM-L6-v2 (384-dim, ~80MB GGUF). Purpose-built for
+// Embedding model: Qwen3-Embedding-0.6B (1024-dim, ~639MB GGUF, official Qwen org, Apache-2.0). Purpose-built for
 // short-text retrieval and deliberately DECOUPLED from the chat LLM — a separate
 // model, separate context, separate lifecycle. It stays inside the ruled-in
 // node-llama-cpp library (this is NOT the transformers.js path the AI/ML strategy
@@ -41,7 +41,7 @@
 // ── Idle unload ───────────────────────────────────────────────────────────────
 // Like the internal LLM, the embedding model unloads after an idle timeout to
 // free memory (FIREALIVE_EMBED_IDLE_UNLOAD_MS, default 5 minutes). The in-memory
-// vector index (tiny — 50 × 384 floats) stays resident regardless; only the model
+// vector index (tiny — 50 × 1024 floats) stays resident regardless; only the model
 // (which is only needed to embed live queries) is unloaded.
 //
 // ── Anti-hallucination note ───────────────────────────────────────────────────
@@ -52,7 +52,7 @@
 // Public API:
 //   isReady()                         -> boolean (embedding model loaded)
 //   getStatus()                       -> object for the AI/ML Integrations tab
-//   embed(text)                       -> Promise<number[]>  (384-dim query vector)
+//   embed(text)                       -> Promise<number[]>  (1024-dim query vector)
 //   cosineSimilarity(a, b)            -> number  (pure)
 //   cosineTopN(queryVec, k, index?)   -> [{ id, score }]  sorted desc, len ≤ k
 //   loadEmbeddings()                  -> index | null  (read cache; null if stale/absent)
@@ -72,11 +72,11 @@ const kb = require('./research-kb');
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 // Default embedder filename. The exact source URL + pinned SHA-256 are wired in
-// scripts/download-model.js (PR2/C2); this is the on-disk name we look for.
-const DEFAULT_EMBED_FILENAME = 'all-MiniLM-L6-v2-Q8_0.gguf';
+// scripts/download-model.js (verify-only manifest); this is the on-disk name we look for.
+const DEFAULT_EMBED_FILENAME = 'Qwen3-Embedding-0.6B-Q8_0.gguf';
 
-// Expected dimensionality for all-MiniLM-L6-v2 (sanity check, not enforced).
-const EXPECTED_DIM = 384;
+// Expected dimensionality for Qwen3-Embedding-0.6B (sanity check, not enforced).
+const EXPECTED_DIM = 1024;
 
 function resolveEmbedIdleUnloadMs() {
   const raw = process.env.FIREALIVE_EMBED_IDLE_UNLOAD_MS;
@@ -355,7 +355,7 @@ async function buildEmbeddings(opts) {
     }
   }
   if (dim !== EXPECTED_DIM) {
-    logger.warn('KB embeddings dimension is not the expected 384', { dim, expected: EXPECTED_DIM });
+    logger.warn('KB embeddings dimension is not the expected 1024', { dim, expected: EXPECTED_DIM });
   }
 
   const cache = {

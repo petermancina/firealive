@@ -9,8 +9,9 @@
 //   GET  /api/ai-provider/config                  — list per-feature configs
 //   PUT  /api/ai-provider/config/:featureId       — update one feature config
 //   GET  /api/ai-provider/inferences/:featureId   — recent inference log
-//   POST /api/ai-provider/model/download          — trigger model download
-//   GET  /api/ai-provider/model/download/status   — poll download progress
+//   POST /api/ai-provider/model/verify            — verify provisioned model files (no download)
+//   GET  /api/ai-provider/model/verify/status     — poll verification
+//   GET  /api/ai-provider/model/provisioning      — provisioning guide + pinned hashes
 //   POST /api/ai-provider/model/load              — load model into memory
 //   POST /api/ai-provider/model/unload            — unload model from memory
 //
@@ -46,11 +47,12 @@ function getDownloader() {
   return downloader || null;
 }
 
-// ── Module-scoped download job tracker ──────────────────────────────────────
-// Single concurrent download supported. The download process runs in the
-// background; the client polls /model/download/status for progress.
+// ── Module-scoped verify job tracker ────────────────────────────────────────
+// FireAlive never downloads models. This verifies the operator-provisioned
+// files (streaming SHA-256) in the background; the client polls
+// /model/verify/status. The chat model (~9 GB) takes a moment to hash.
 
-let downloadJob = null;  // { variant, status, progress, error, startedAt, finishedAt }
+let verifyJob = null;  // { model, status, result, error, startedAt, finishedAt, initiatedBy }
 
 function leadOrAdmin(req, res, next) {
   if (!req.user || !['lead', 'admin'].includes(req.user.role)) {
@@ -68,17 +70,20 @@ router.get('/status', (req, res) => {
     const llm = getInternalLlm();
     const dl = getDownloader();
     const internalStatus = llm ? llm.getStatus() : { ready: false, available: false, reason: 'service not present' };
-    const modelPresent = dl ? dl.isModelPresent() : false;
+    const modelPresent = dl ? dl.isModelPresent('chat') : false;
+    const embedderPresent = dl ? dl.isModelPresent('embedding') : false;
     const configs = aiProvider.listProviderConfigs();
     return res.json({
       internalLlm: internalStatus,
       modelPresent,
+      embedderPresent,
+      provisioningRequired: !(modelPresent && embedderPresent),
       featuresConfigured: configs.length,
-      activeDownload: downloadJob ? {
-        variant: downloadJob.variant,
-        status: downloadJob.status,
-        progress: downloadJob.progress,
-        startedAt: downloadJob.startedAt,
+      activeDownload: null,  // FireAlive does not download models (verify-only)
+      activeVerify: verifyJob ? {
+        model: verifyJob.model,
+        status: verifyJob.status,
+        startedAt: verifyJob.startedAt,
       } : null,
     });
   } catch (err) {
@@ -184,72 +189,102 @@ router.get('/inferences/:featureId', (req, res) => {
   }
 });
 
-// ── POST /api/ai-provider/model/download ────────────────────────────────────
+// ── POST /api/ai-provider/model/verify  (alias: /model/download) ─────────────
+// FireAlive does NOT download models. This verifies the operator-provisioned
+// files against the source-pinned SHA-256s (scripts/download-model.js). The
+// legacy /model/download path is kept as a compat alias and also verifies.
 
-router.post('/model/download', (req, res) => {
+router.post(['/model/verify', '/model/download'], (req, res) => {
   const dl = getDownloader();
   if (!dl) {
-    return res.status(500).json({ error: 'download script not present' });
+    return res.status(500).json({ error: 'provisioning tool not present' });
+  }
+  if (verifyJob && verifyJob.status === 'running') {
+    return res.status(409).json({ error: 'a verification is already running', activeVerify: verifyJob });
   }
 
-  // Don't double-trigger
-  if (downloadJob && downloadJob.status === 'running') {
-    return res.status(409).json({ error: 'a download is already running', activeDownload: downloadJob });
-  }
+  // Optional model id. Legacy { variant: "phi3" } bodies are ignored and fall
+  // through to verifying everything.
+  const requested = (req.body && (req.body.model || req.body.variant)) || 'all';
+  const model = dl.MODELS[requested] ? requested : 'all';
 
-  const variant = (req.body && req.body.variant) || dl.DEFAULT_VARIANT;
-  if (!dl.VARIANTS[variant]) {
-    return res.status(400).json({ error: 'unknown variant; must be one of: ' + Object.keys(dl.VARIANTS).join(', ') });
-  }
-
-  downloadJob = {
-    variant,
+  verifyJob = {
+    model,
     status: 'running',
-    progress: { downloadedBytes: 0, totalBytes: 0, pct: 0 },
+    result: null,
     error: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     initiatedBy: req.user.id,
   };
 
-  // Run download in the background
-  dl.downloadModel(variant, {
-    silent: true,
-    onProgress: (p) => {
-      if (downloadJob) downloadJob.progress = p;
-    },
-  })
-    .then(() => {
-      downloadJob.status = 'complete';
-      downloadJob.progress.pct = 100;
-      downloadJob.finishedAt = new Date().toISOString();
-      auditLog(req.user.id, 'AI_MODEL_DOWNLOADED', `variant=${variant}`, null);
+  const run = model === 'all'
+    ? dl.verifyAll()
+    : dl.verifyModel(model).then(r => ({ ok: r.ok, models: { [model]: r } }));
+
+  Promise.resolve(run)
+    .then((result) => {
+      verifyJob.status = result.ok ? 'ok' : 'failed';
+      verifyJob.result = result;
+      verifyJob.finishedAt = new Date().toISOString();
+      auditLog(req.user.id, result.ok ? 'AI_MODEL_VERIFIED' : 'AI_MODEL_VERIFY_FAILED', `model=${model}`, null);
     })
     .catch((err) => {
-      downloadJob.status = 'error';
-      downloadJob.error = err.message;
-      downloadJob.finishedAt = new Date().toISOString();
-      logger.error('Model download failed', { variant, error: err.message });
-      auditLog(req.user.id, 'AI_MODEL_DOWNLOAD_FAILED', `variant=${variant} error=${err.message}`, null);
+      verifyJob.status = 'failed';
+      verifyJob.error = err.message;
+      verifyJob.finishedAt = new Date().toISOString();
+      logger.error('Model verification failed', { model, error: err.message });
+      auditLog(req.user.id, 'AI_MODEL_VERIFY_FAILED', `model=${model} error=${err.message}`, null);
     });
 
   return res.status(202).json({
     ok: true,
-    message: 'download started; poll /model/download/status for progress',
-    job: { variant, startedAt: downloadJob.startedAt },
+    message: 'FireAlive does not download models; verifying provisioned files. Poll /model/verify/status.',
+    job: { model, startedAt: verifyJob.startedAt },
   });
 });
 
-// ── GET /api/ai-provider/model/download/status ──────────────────────────────
+// ── GET /api/ai-provider/model/verify/status  (alias: /model/download/status) ─
 
-router.get('/model/download/status', (req, res) => {
-  if (!downloadJob) {
+router.get(['/model/verify/status', '/model/download/status'], (req, res) => {
+  if (!verifyJob) {
     return res.json({ active: false });
   }
   return res.json({
-    active: downloadJob.status === 'running',
-    job: downloadJob,
+    active: verifyJob.status === 'running',
+    job: verifyJob,
   });
+});
+
+// ── GET /api/ai-provider/model/provisioning ──────────────────────────────────
+// Operator guide: official first-party source, pinned hashes, target dir,
+// endpoint floor. No network is performed.
+
+router.get('/model/provisioning', (req, res) => {
+  const dl = getDownloader();
+  if (!dl) {
+    return res.status(500).json({ error: 'provisioning tool not present' });
+  }
+  try {
+    const modelDir = dl.resolveModelDir();
+    const models = {};
+    for (const id of dl.MODEL_IDS) {
+      const m = dl.MODELS[id];
+      models[id] = {
+        kind: m.kind,
+        label: m.label,
+        officialSource: m.officialSource,
+        endpointFloor: m.endpointFloor,
+        files: m.files.map(f => ({ filename: f.filename, sizeApprox: f.sizeApprox, sha256: f.sha256 })),
+        instructions: dl.provisioningInstructions(id),
+        present: dl.isModelPresent(id),
+      };
+    }
+    return res.json({ modelDir, models });
+  } catch (err) {
+    logger.error('provisioning info failed', { error: err.message });
+    return res.status(500).json({ error: 'failed to build provisioning info' });
+  }
 });
 
 // ── POST /api/ai-provider/model/load ────────────────────────────────────────

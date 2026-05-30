@@ -1411,6 +1411,7 @@ function ManagementConsole() {
   const [aiConfigs, setAiConfigs] = useState([]);  // /api/ai-provider/config
   const [aiLoading, setAiLoading] = useState(false);
   const [aiDownloadPolling, setAiDownloadPolling] = useState(false);
+  const [aiProvisioning, setAiProvisioning] = useState(null);  // /api/ai-provider/model/provisioning (verify-only guide)
   const [aiSelectedFeature, setAiSelectedFeature] = useState('ir_simulator');
   const [aiEditProvider, setAiEditProvider] = useState('internal');
   const [aiEditModelName, setAiEditModelName] = useState('');
@@ -1626,17 +1627,17 @@ function ManagementConsole() {
     return ()=>{ cancelled = true; clearInterval(handle); };
   }, [tab]);
 
-  // Poll download progress when a download is active
+  // Poll model verification when a verify is active (FireAlive never downloads)
   useEffect(()=>{
     if (!aiDownloadPolling) return;
     const tick = setInterval(()=>{
-      api.get('/api/ai-provider/model/download/status').then(r=>{
+      api.get('/api/ai-provider/model/verify/status').then(r=>{
         if (!r?.active) {
           setAiDownloadPolling(false);
           api.get('/api/ai-provider/status').then(s=>setAiStatus(s)).catch(()=>{});
           return;
         }
-        setAiStatus(prev=>prev ? {...prev, activeDownload: r.job} : prev);
+        setAiStatus(prev=>prev ? {...prev, activeVerify: r.job} : prev);
       }).catch(()=>{});
     }, 2000);
     return ()=>clearInterval(tick);
@@ -4682,8 +4683,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {iacResult&&!iacResult.ok&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
               <div style={{fontSize:12,fontWeight:500,color:C.d,marginBottom:6}}>Generation failed</div>
               <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{iacResult.message}</M>
-              {iacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Syft on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin</code></M>}
-              {iacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Cosign on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
+              {iacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Syft on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0</code></M>}
+              {iacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6,fontSize:10}}>Install Cosign on the FireAlive host:<br/><code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
             </Card>}
             <Btn primary disabled={!iacProvider||!iacTool||iacBusy} onClick={async()=>{
               setIacBusy(true);setIacResult(null);
@@ -5259,7 +5260,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Scan your cloud environment for misconfigurations and vulnerabilities that could affect FireAlive's deployment. These tools audit IAM policies, network ACLs, storage permissions, and cloud-specific security controls.</M>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Cloud Scanners</div>
-            {[{id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud auditing (AWS, Azure, GCP, OCI)"},{id:"prowler",l:"Prowler",d:"AWS/Azure/GCP CIS benchmark checks"},{id:"pacu",l:"Pacu",d:"AWS exploitation framework — offensive security testing"},{id:"cloudbrute",l:"CloudBrute",d:"Cloud asset enumeration across providers"},{id:"checkov",l:"Checkov",d:"IaC scanning — Terraform, CloudFormation, K8s manifests"},{id:"trivy",l:"Trivy",d:"Container/IaC vulnerability and misconfiguration scanner"}].map(sc=>(
+            {[{id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud auditing (AWS, Azure, GCP, OCI)"},{id:"prowler",l:"Prowler",d:"AWS/Azure/GCP CIS benchmark checks"},{id:"pacu",l:"Pacu",d:"AWS exploitation framework — offensive security testing"},{id:"cloudbrute",l:"CloudBrute",d:"Cloud asset enumeration across providers"},{id:"checkov",l:"Checkov",d:"IaC scanning — Terraform, CloudFormation, K8s manifests"}].map(sc=>(
               <label key={sc.id} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 0",borderBottom:`1px solid ${C.b}`,cursor:"pointer"}}>
                 <input type="checkbox" checked={cloudVulnCfg.scanners.includes(sc.id)} onChange={e=>{if(e.target.checked)setCloudVulnCfg(prev=>({...prev,scanners:[...prev.scanners,sc.id]}));else setCloudVulnCfg(prev=>({...prev,scanners:prev.scanners.filter(s=>s!==sc.id)}));}}/>
                 <div><div style={{fontSize:12,color:C.t}}>{sc.l}</div><M style={{color:C.td}}>{sc.d}</M></div>
@@ -5378,7 +5379,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               setCicdResult({ok:false,message:ed.message||err.message||"Generation failed"});
             }finally{setCicdBusy(false);}
           }}>{cicdBusy?"Generating pipeline...":"Generate Pipeline"}</Btn>
-          <Card style={{padding:12,borderColor:C.i+"30",marginTop:12}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Embedded pipeline stages</M><M style={{color:C.tm,lineHeight:1.8}}>1. Lint (ESLint) -> 2. Test (npm test) -> 3. Regression test (POST /api/regression/run) -> 4. npm audit -> 5. Snyk -> 6. SBOM (Syft) -> 7. Dep-pin verify -> 8. Build (docker buildx with SLSA L3 provenance) -> 9. Sign (Cosign keyless OIDC, key-based via COSIGN_KEY_MODE override) -> 10. CVE scan (Trivy) -> 11. Fuse-counter check -> 12. Deploy (placeholder).</M></Card>
+          <Card style={{padding:12,borderColor:C.i+"30",marginTop:12}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Embedded pipeline stages</M><M style={{color:C.tm,lineHeight:1.8}}>1. Lint (ESLint) -> 2. Test (npm test) -> 3. Regression test (POST /api/regression/run) -> 4. npm audit -> 5. Snyk -> 6. SBOM (Syft) -> 7. Dep-pin verify -> 8. Build (docker buildx with SLSA L3 provenance) -> 9. Sign (Cosign keyless OIDC, key-based via COSIGN_KEY_MODE override) -> 10. CVE scan (Grype) -> 11. Fuse-counter check -> 12. Deploy (placeholder).</M></Card>
           <Card style={{padding:12,borderColor:C.p+"30",marginTop:12}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:4}}>Webhook reporting (optional)</M><M style={{color:C.tm,lineHeight:1.8}}>The generated pipeline can POST run status back to this MC via the /api/cicd/runs endpoint with an api-key carrying the <code>cicd:webhook</code> scope. Idempotent on (platform, external_run_id). Configure FIREALIVE_WEBHOOK_URL + FIREALIVE_WEBHOOK_TOKEN secrets in your CI platform.</M></Card>
         </div>)}
 
@@ -8123,17 +8124,32 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </div>
             {aiLoading&&<M style={{color:C.td}}>Loading…</M>}
             {!aiLoading&&aiStatus&&(<div>
-              <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model file present:</M> <M style={{color:aiStatus.modelPresent?C.a:C.d,fontWeight:600}}>{aiStatus.modelPresent?"yes":"no"}</M></div>
+              <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Chat model present:</M> <M style={{color:aiStatus.modelPresent?C.a:C.d,fontWeight:600}}>{aiStatus.modelPresent?"yes":"no"}</M></div>
+              <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Embedder present:</M> <M style={{color:aiStatus.embedderPresent?C.a:C.d,fontWeight:600}}>{aiStatus.embedderPresent?"yes":"no"}</M></div>
               <div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model loaded in memory:</M> <M style={{color:aiStatus.internalLlm?.ready?C.a:C.tm,fontWeight:600}}>{aiStatus.internalLlm?.ready?"yes":"no"}</M></div>
               {aiStatus.internalLlm?.modelName&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Model name:</M> <M style={{color:C.t}}>{aiStatus.internalLlm.modelName}</M></div>}
               {aiStatus.internalLlm?.modelSizeBytes&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Size:</M> <M style={{color:C.t}}>{(aiStatus.internalLlm.modelSizeBytes/1024/1024).toFixed(1)} MB</M></div>}
               {aiStatus.internalLlm?.lastInferenceAt&&<div style={{padding:"4px 0"}}><M style={{color:C.tm}}>Last inference:</M> <M style={{color:C.t}}>{aiStatus.internalLlm.lastInferenceAt}</M></div>}
-              {aiStatus.activeDownload&&(<div style={{marginTop:10,padding:10,background:C.s,borderRadius:6,border:`1px solid ${C.a}40`}}>
-                <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Download in progress: {aiStatus.activeDownload.variant}</M>
-                <M style={{color:C.tm,display:"block",fontSize:11}}>Status: {aiStatus.activeDownload.status} — {aiStatus.activeDownload.progress?.pct||0}%{aiStatus.activeDownload.progress?.totalBytes?(" — "+(aiStatus.activeDownload.progress.downloadedBytes/1024/1024).toFixed(1)+" / "+(aiStatus.activeDownload.progress.totalBytes/1024/1024).toFixed(1)+" MB"):""}</M>
+              {aiStatus.activeVerify&&(<div style={{marginTop:10,padding:10,background:C.s,borderRadius:6,border:`1px solid ${C.a}40`}}>
+                <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Verifying provisioned files: {aiStatus.activeVerify.model}</M>
+                <M style={{color:C.tm,display:"block",fontSize:11}}>Status: {aiStatus.activeVerify.status} — computing SHA-256 against the source-pinned hashes…</M>
+              </div>)}
+              {aiProvisioning&&(<div style={{marginTop:10,padding:10,background:C.s,borderRadius:6,border:`1px solid ${C.a}40`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <M style={{color:C.t,fontWeight:600}}>Model provisioning (verify-only — FireAlive never downloads)</M>
+                  <Btn small onClick={()=>setAiProvisioning(null)}>Hide</Btn>
+                </div>
+                <M style={{color:C.tm,display:"block",fontSize:11,marginBottom:8}}>Obtain the official files through your own vetted channel and place them in: <code style={{color:C.t}}>{aiProvisioning.modelDir}</code></M>
+                {Object.keys(aiProvisioning.models||{}).map(mid=>{const mm=aiProvisioning.models[mid];return (<div key={mid} style={{marginBottom:8,paddingTop:6,borderTop:`1px solid ${C.a}40`}}>
+                  <M style={{color:C.t,fontWeight:600,display:"block"}}>{mm.label} — <M style={{color:mm.present?C.a:C.d}}>{mm.present?"provisioned":"not provisioned"}</M></M>
+                  <M style={{color:C.tm,display:"block",fontSize:11}}>Official source: {mm.officialSource&&mm.officialSource.huggingFaceRepo} (pinned {mm.officialSource&&mm.officialSource.pinnedCommit})</M>
+                  <M style={{color:C.tm,display:"block",fontSize:11,marginTop:2}}>Endpoint floor: {mm.endpointFloor}</M>
+                  {(mm.files||[]).map(ff=>(<M key={ff.filename} style={{color:C.td,display:"block",fontSize:10,fontFamily:"monospace",wordBreak:"break-all"}}>{ff.filename} ({ff.sizeApprox}) — sha256: {ff.sha256}</M>))}
+                </div>);})}
               </div>)}
               <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
-                {!aiStatus.modelPresent&&!aiStatus.activeDownload&&<Btn primary onClick={()=>{api.post("/api/ai-provider/model/download",{variant:"phi3"}).then(()=>{setAiDownloadPolling(true);addA("AI_MODEL_DOWNLOAD_STARTED","Local LLM download started (Phi-3-mini, ~2.4GB)");}).catch(e=>addA("AI_MODEL_DOWNLOAD_FAILED","Failed to start download: "+(e?.message||"unknown")));}}>Download Local AI Model (~2.4GB)</Btn>}
+                {!aiStatus.activeVerify&&<Btn primary onClick={()=>{api.post("/api/ai-provider/model/verify",{}).then(()=>{setAiDownloadPolling(true);addA("AI_MODEL_VERIFY_STARTED","Model verification started (SHA-256 vs source-pinned hashes)");}).catch(e=>addA("AI_MODEL_VERIFY_FAILED","Failed to start verification: "+(e?.message||"unknown")));}}>Verify Provisioned Files</Btn>}
+                {!aiProvisioning&&<Btn small onClick={()=>{api.get("/api/ai-provider/model/provisioning").then(pp=>setAiProvisioning(pp)).catch(e=>addA("AI_PROVISIONING_INFO_FAILED","Could not load provisioning guide: "+(e?.message||"unknown")));}}>Show Provisioning Guide</Btn>}
                 {aiStatus.modelPresent&&!aiStatus.internalLlm?.ready&&<Btn small onClick={()=>{api.post("/api/ai-provider/model/load",{}).then(r=>{setAiStatus(s=>({...s,internalLlm:r.status}));addA("AI_MODEL_LOADED","Local LLM loaded into memory");}).catch(e=>addA("AI_MODEL_LOAD_FAILED","Load failed: "+(e?.message||"unknown")));}}>Load Model</Btn>}
                 {aiStatus.internalLlm?.ready&&<Btn small onClick={()=>{api.post("/api/ai-provider/model/unload",{}).then(()=>{api.get("/api/ai-provider/status").then(s=>setAiStatus(s));addA("AI_MODEL_UNLOADED","Local LLM unloaded from memory");}).catch(()=>{});}}>Unload Model</Btn>}
               </div>

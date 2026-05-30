@@ -333,9 +333,10 @@ ipcMain.handle('abuse:cancel-export', async () => {
 
 
 // ── KB + local AI IPC (PR5) ────────────────────────────────────────
-// All on-device. kbChat:ask makes NO network call (the only network path is the
-// explicit, SHA-256-verified kbChat:downloadModel). Honest "unavailable on this
-// device" with no server fallback — the Tier-3 firewall.
+// All on-device, NO network path at all. Models are provisioned out-of-band by
+// the operator and verified here (verify-only): kbChat:verifyModel checks the
+// pinned SHA-256s, kbChat:provisioningInfo returns the official source + hashes.
+// Honest "unavailable on this device" with no server fallback — the Tier-3 firewall.
 
 const KB_CHAT_SYSTEM = [
   "You are the FireAlive Research Assistant, running on the analyst's own device.",
@@ -413,9 +414,14 @@ ipcMain.handle('kbChat:modelStatus', async () => {
   try { return localLlm.getStatus(); } catch (err) { return { error: 'status failed' }; }
 });
 
-ipcMain.handle('kbChat:downloadModel', async (_e, { which } = {}) => {
-  try { return await localLlm.downloadModel(which === 'embed' ? 'embed' : 'chat'); }
-  catch (err) { return { error: (err.message || 'download failed').slice(0, 200), code: err.code || null }; }
+ipcMain.handle('kbChat:verifyModel', async (_e, { which } = {}) => {
+  try { return await localLlm.verifyLocalModel(which === 'embed' ? 'embed' : 'chat'); }
+  catch (err) { return { error: (err.message || 'verify failed').slice(0, 200), code: err.code || null }; }
+});
+
+ipcMain.handle('kbChat:provisioningInfo', async () => {
+  try { return localLlm.provisioningInfo(); }
+  catch (err) { return { error: (err.message || 'provisioning info failed').slice(0, 200), code: err.code || null }; }
 });
 
 app.whenReady().then(() => {

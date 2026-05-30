@@ -2441,8 +2441,8 @@ export default function GlobalDashboard() {
               {gdIacResult&&!gdIacResult.ok&&<Card style={{marginTop:8,padding:10,borderColor:C.d+"40"}}>
                 <div style={{fontSize:11,fontWeight:500,color:C.d,marginBottom:4}}>Generation failed</div>
                 <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{gdIacResult.message}</M>
-                {gdIacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Syft on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin</code></M>}
-                {gdIacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Cosign on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
+                {gdIacResult.code==="SYFT_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Syft on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0</code></M>}
+                {gdIacResult.code==="COSIGN_NOT_INSTALLED"&&<M style={{color:C.td,display:"block",marginTop:6,fontSize:10}}>Install Cosign on the GD host: <code style={{background:C.s,padding:"2px 4px",borderRadius:3}}>curl -sSfL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign</code></M>}
               </Card>}
               <Btn primary disabled={!gdIacProvider||!gdIacTool||gdIacBusy} style={{marginTop:10}} onClick={async()=>{
                 setGdIacBusy(true);setGdIacResult(null);

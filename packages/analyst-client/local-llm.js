@@ -4,47 +4,50 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// The Analyst Client's OWN local AI: a heavyweight chat model + the all-MiniLM
+// The Analyst Client's OWN local AI: a heavyweight chat model + a first-party
 // embedder, both run on the analyst's device via node-llama-cpp. It powers the
 // Analyst KB Assistant chat (PR7) with ZERO server round-trips — preserving the
 // Tier-3 firewall (the analyst's questions and signals never leave the device).
 //
+// VERIFY-ONLY: FireAlive never downloads models. The operator provisions the
+// official files (verified Qwen org on Hugging Face, Alibaba ModelScope, or an
+// internal mirror) into the AC model directory; this module verifies each file
+// against a SHA-256 PINNED IN SOURCE before loading, and refuses on any mismatch
+// or absence. No network is performed here. The pinned hashes match the server
+// (scripts/download-model.js) and are updated only via a reviewed code change.
+//
 // There is NO server fallback by design: if the device can't run the model
-// (node-llama-cpp missing, model not downloaded, load failure), every entry point
-// returns/raises an honest AC_LOCAL_UNAVAILABLE. The renderer surfaces "unavailable
-// on this device" rather than silently reaching the server, which would breach the
-// firewall.
+// (node-llama-cpp missing, files not provisioned, hash mismatch, load failure),
+// every entry point raises an honest AC_LOCAL_UNAVAILABLE. The renderer surfaces
+// "unavailable on this device" rather than silently reaching the server.
 //
-// Mirrors the server conventions (server/services/internal-llm.js +
-// kb-embeddings.js + scripts/download-model.js): lazy require('node-llama-cpp'),
-// getLlama() → loadModel → context, idle-unload, SHA-256-verified download.
-//
-// Models (same caliber/source as the server):
-//   chat  — Phi-3-mini-4k-instruct-q4 (~2.4GB, MIT). Heavyweight; ops-configurable
-//           path but defaults heavyweight. This is the documented endpoint floor:
-//           under-spec / thin-VDI endpoints lose the local chat (honest unavailable).
-//   embed — all-MiniLM-L6-v2 Q8_0 (~25MB, 384-dim). Builds the KB vector index
-//           on-device on first use and caches it locally.
+// Models (same official Qwen sources as the server):
+//   chat  — Qwen2.5-14B-Instruct q4_K_M (Apache-2.0), 3 official split shards
+//           (~9GB total), loaded from shard-00001. Heavyweight; the documented
+//           endpoint floor is ~9GB free disk + ~10-12GB RAM. Under-spec /
+//           thin-VDI endpoints lose the local chat (honest unavailable).
+//   embed — Qwen3-Embedding-0.6B Q8_0 (Apache-2.0, ~639MB, 1024-dim). Builds the
+//           KB vector index on-device on first use and caches it locally.
 //
 // Public API:
 //   setModelRoot(dir) / getModelRootPath()
 //   getChatModelPath() / getEmbedModelPath()
 //   chatModelPresent() / embedModelPresent()
+//   verifyLocalModel(which) -> Promise<{ok,status,files}>   which: 'chat'|'embed'
+//   provisioningInfo() -> object for the renderer's provisioning UX
 //   getStatus() -> object for the renderer's model-status UX
 //   embed(text) -> Promise<number[]>
 //   ensureIndex() / buildIndex(opts) / loadIndex()
 //   search(query, k) -> Promise<[{id, score}]>
 //   generate(prompt, options) -> Promise<{text, modelName, tokenCount}>
-//   downloadModel(which, opts) -> Promise<{which, path, sha256}>   which: 'chat'|'embed'
 //   unloadAll() -> Promise<void>
-//   MODELS  (registry: filenames, source URLs, pinned SHA-256)
+//   MODELS  (registry: official source, loadFile, per-file pinned SHA-256)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const https = require('https');
 const kbLocal = require('./kb-local');
 
 // Minimal logger — the AC main process logs to the console.
@@ -54,24 +57,47 @@ const log = {
   error: (...a) => console.error('[local-llm]', ...a),
 };
 
-// ── Model registry (pinned, verified) ────────────────────────────────────────
+// ── Model registry (pinned in source, verify-only — NO download URLs) ─────────
+// SHA-256s were read from the official Qwen pages and are pinned here. They are
+// byte-identical to the server manifest (scripts/download-model.js).
 const MODELS = {
   chat: {
-    label: 'Phi-3-mini-4k-instruct q4 (Microsoft, MIT) — heavyweight local chat',
-    filename: 'phi-3-mini-4k-instruct-q4.gguf',
-    sourceUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
-    sha256: '8a83c7fb9049a9b2e92266fa7ad04933bb53aa1e85136b7b30f1b8000ff2edef',
+    label: 'Qwen2.5-14B-Instruct q4_K_M (Alibaba Qwen, Apache-2.0) — heavyweight on-device chat',
+    officialSource: {
+      huggingFaceRepo: 'Qwen/Qwen2.5-14B-Instruct-GGUF',
+      pinnedCommit: '2b6a96d780143b4e8e3b970394e39e3774551f29',
+      modelScope: 'Qwen/Qwen2.5-14B-Instruct-GGUF (Alibaba ModelScope, first-party)',
+    },
+    // node-llama-cpp loads the split GGUF from the first shard; siblings must be
+    // present in the same directory. All shards are verified before load.
+    loadFile: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf',
+    files: [
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf', sizeApprox: '3.99 GB',
+        sha256: 'a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68' },
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf', sizeApprox: '3.99 GB',
+        sha256: '21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae' },
+      { filename: 'qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf', sizeApprox: '1.01 GB',
+        sha256: 'c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976' },
+    ],
+    endpointFloor: '~9 GB free disk + ~10-12 GB RAM',
   },
   embed: {
-    label: 'all-MiniLM-L6-v2 Q8_0 (Second State, Apache-2.0) — 384-dim embedder',
-    filename: 'all-MiniLM-L6-v2-Q8_0.gguf',
-    sourceUrl: 'https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-Q8_0.gguf',
-    sha256: '263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed',
+    label: 'Qwen3-Embedding-0.6B Q8_0 (Alibaba Qwen, Apache-2.0) — 1024-dim embedder',
+    officialSource: {
+      huggingFaceRepo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
+      pinnedCommit: 'd20cf9c',
+      modelScope: 'Qwen/Qwen3-Embedding-0.6B-GGUF (Alibaba ModelScope, first-party)',
+    },
+    loadFile: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+    files: [
+      { filename: 'Qwen3-Embedding-0.6B-Q8_0.gguf', sizeApprox: '639 MB',
+        sha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439' },
+    ],
+    endpointFloor: '~640 MB free disk',
   },
 };
 
-const EXPECTED_DIM = kbLocal.EXPECTED_DIM || 384;
-const MAX_REDIRECTS = 5;
+const EXPECTED_DIM = kbLocal.EXPECTED_DIM || 1024;
 
 function resolveIdleUnloadMs() {
   const raw = process.env.FIREALIVE_AC_IDLE_UNLOAD_MS;
@@ -89,6 +115,9 @@ let chatModel = null, chatContext = null;
 let embedModel = null, embedContext = null;
 let embeddingIndex = null, indexMeta = null;
 let idleTimer = null;
+// Signature (size+mtime per file) of the last SHA-verified set, per model. Lets
+// idle-reload skip re-hashing a byte-stable model; a file swap changes it.
+let verifySig = { chat: null, embed: null };
 
 // ── Paths (trusted: env / app-configured / home; never request input) ─────────
 function setModelRoot(dir) {
@@ -100,30 +129,61 @@ function getModelRootPath() {
   if (env) return path.resolve(env);
   return path.resolve(os.homedir(), '.firealive', 'ac-models');
 }
-function getChatModelPath() { return path.join(getModelRootPath(), MODELS.chat.filename); }
-function getEmbedModelPath() { return path.join(getModelRootPath(), MODELS.embed.filename); }
+function getChatModelPath() { return path.join(getModelRootPath(), MODELS.chat.loadFile); }
+function getEmbedModelPath() { return path.join(getModelRootPath(), MODELS.embed.loadFile); }
 function getCachePath() { return path.join(getModelRootPath(), 'kb-embeddings-local.json'); }
-function embedderId() { return MODELS.embed.filename.replace(/\.gguf$/i, ''); }
+function embedderId() { return MODELS.embed.loadFile.replace(/\.gguf$/i, ''); }
 
 function fileExists(p) { try { return fs.existsSync(p); } catch (_e) { return false; } }
-function chatModelPresent() { return fileExists(getChatModelPath()); }
-function embedModelPresent() { return fileExists(getEmbedModelPath()); }
+function modelFilePaths(which) {
+  const m = MODELS[which];
+  if (!m) return [];
+  const dir = getModelRootPath();
+  return m.files.map(f => ({ ...f, path: path.join(dir, f.filename) }));
+}
+function chatModelPresent() { return modelFilePaths('chat').every(f => fileExists(f.path)); }
+function embedModelPresent() { return modelFilePaths('embed').every(f => fileExists(f.path)); }
 
-// ── Status ──────────────────────────────────────────────────────────────────
+// ── Status + provisioning ─────────────────────────────────────────────────────
 function getStatus() {
+  const chatPresent = chatModelPresent();
+  const embedPresent = embedModelPresent();
   return {
     modelRoot: getModelRootPath(),
-    chat: { present: chatModelPresent(), ready: !!(chatModel && chatContext), filename: MODELS.chat.filename, path: getChatModelPath() },
-    embed: { present: embedModelPresent(), ready: !!(embedModel && embedContext), filename: MODELS.embed.filename, path: getEmbedModelPath() },
+    chat: { present: chatPresent, ready: !!(chatModel && chatContext), loadFile: MODELS.chat.loadFile, path: getChatModelPath(), shards: MODELS.chat.files.length },
+    embed: { present: embedPresent, ready: !!(embedModel && embedContext), loadFile: MODELS.embed.loadFile, path: getEmbedModelPath() },
     dim: EXPECTED_DIM,
     kbVersion: kbLocal.KB_VERSION,
     indexReady: embeddingIndex !== null,
     indexMeta,
     cachePath: getCachePath(),
     idleUnloadMs: IDLE_UNLOAD_MS,
-    // Honest capability flag for the renderer: can we run the chat right now?
-    available: chatModelPresent() && embedModelPresent(),
+    available: chatPresent && embedPresent,
+    provisioningRequired: !(chatPresent && embedPresent),
   };
+}
+
+// Structured guide for the renderer: official source, pinned hashes, target dir.
+function provisioningInfo() {
+  const out = { modelRoot: getModelRootPath(), models: {} };
+  for (const which of Object.keys(MODELS)) {
+    const m = MODELS[which];
+    out.models[which] = {
+      label: m.label,
+      officialSource: m.officialSource,
+      endpointFloor: m.endpointFloor,
+      files: m.files.map(f => ({ filename: f.filename, sizeApprox: f.sizeApprox, sha256: f.sha256 })),
+      present: which === 'chat' ? chatModelPresent() : embedModelPresent(),
+    };
+  }
+  return out;
+}
+
+function provisioningHint(which) {
+  const m = MODELS[which];
+  if (!m) return '';
+  return 'Provision the official ' + m.officialSource.huggingFaceRepo + ' file(s) into ' +
+    getModelRootPath() + ' (verify-only; no download). Run with --instructions for hashes.';
 }
 
 function unavailable(message) {
@@ -138,6 +198,59 @@ function resetIdleTimer() {
     log.info('idle timeout — unloading local models');
     unloadAll().catch((e) => log.error('idle unload failed', e.message));
   }, IDLE_UNLOAD_MS);
+}
+
+// ── Verify (the only integrity gate; NO network) ─────────────────────────────
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+function filesSignature(which) {
+  try {
+    return modelFilePaths(which).map(f => {
+      try { const st = fs.statSync(f.path); return f.filename + ':' + st.size + ':' + st.mtimeMs; }
+      catch (_e) { return f.filename + ':missing'; }
+    }).join('|');
+  } catch (_e) { return null; }
+}
+
+async function verifyLocalModel(which) {
+  const m = MODELS[which];
+  if (!m) return { ok: false, status: 'unknown-model', which, files: [] };
+  const files = [];
+  let anyMissing = false, anyMismatch = false;
+  for (const f of modelFilePaths(which)) {
+    if (!fileExists(f.path)) {
+      anyMissing = true;
+      files.push({ filename: f.filename, present: false, match: false, expected: f.sha256, actual: null });
+      continue;
+    }
+    const actual = await sha256File(f.path);
+    const match = actual === f.sha256;
+    if (!match) anyMismatch = true;
+    files.push({ filename: f.filename, present: true, match, expected: f.sha256, actual });
+  }
+  const status = anyMissing ? 'missing' : (anyMismatch ? 'mismatch' : 'ok');
+  return { ok: status === 'ok', status, which, files };
+}
+
+// Verify-before-load with a re-hash skip: only re-hashes when the on-disk file
+// set changed (size/mtime) since the last successful verify.
+async function verifyBeforeLoad(which) {
+  const sig = filesSignature(which);
+  if (sig !== null && sig === verifySig[which]) return;
+  const v = await verifyLocalModel(which);
+  if (!v.ok) {
+    verifySig[which] = null;
+    throw unavailable(which + ' model failed verification (' + v.status + ') on this device. ' + provisioningHint(which));
+  }
+  verifySig[which] = sig;
 }
 
 // ── node-llama-cpp loader ─────────────────────────────────────────────────────
@@ -159,8 +272,8 @@ async function getLlamaInstance() {
 
 async function loadChat() {
   if (chatModel && chatContext) return;
+  await verifyBeforeLoad('chat');           // refuses on missing/mismatch, before any load
   const modelPath = getChatModelPath();
-  if (!fileExists(modelPath)) throw unavailable('chat model not downloaded on this device: ' + modelPath);
   const l = await getLlamaInstance();
   try {
     chatModel = await l.loadModel({ modelPath });
@@ -175,8 +288,8 @@ async function loadChat() {
 
 async function loadEmbed() {
   if (embedModel && embedContext) return;
+  await verifyBeforeLoad('embed');
   const modelPath = getEmbedModelPath();
-  if (!fileExists(modelPath)) throw unavailable('embedding model not downloaded on this device: ' + modelPath);
   const l = await getLlamaInstance();
   try {
     embedModel = await l.loadModel({ modelPath });
@@ -282,56 +395,7 @@ async function generate(prompt, options) {
     const e = new Error('local inference failed: ' + (err.message || String(err))); e.code = 'AC_LOCAL_FAILED'; throw e;
   }
   resetIdleTimer();
-  return { text, modelName: MODELS.chat.filename, tokenCount: estimateTokens(prompt, text) };
-}
-
-// ── First-run model download (SHA-256 verified; mirrors scripts/download-model.js) ─
-function downloadToFile(url, dest, redirectsLeft) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        if (redirectsLeft <= 0) return reject(new Error('too many redirects'));
-        return resolve(downloadToFile(res.headers.location, dest, redirectsLeft - 1));
-      }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error('download failed: HTTP ' + res.statusCode)); }
-      const hash = crypto.createHash('sha256');
-      const out = fs.createWriteStream(dest);
-      res.on('data', (chunk) => hash.update(chunk));
-      res.pipe(out);
-      out.on('finish', () => out.close(() => resolve(hash.digest('hex'))));
-      out.on('error', reject);
-      res.on('error', reject);
-    });
-    req.on('error', reject);
-  });
-}
-
-async function downloadModel(which, opts) {
-  opts = opts || {};
-  const m = MODELS[which];
-  if (!m) { const e = new Error('unknown model: ' + which); e.code = 'AC_LOCAL_FAILED'; throw e; }
-  const dir = getModelRootPath();
-  fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, m.filename);
-  const tmp = dest + '.download';
-  log.info('downloading ' + which + ' model', m.sourceUrl);
-  let actualSha;
-  try {
-    actualSha = await downloadToFile(m.sourceUrl, tmp, MAX_REDIRECTS);
-  } catch (err) {
-    try { fs.existsSync(tmp) && fs.unlinkSync(tmp); } catch (_e) {}
-    throw unavailable('model download failed: ' + (err.message || String(err)));
-  }
-  if (m.sha256 && actualSha !== m.sha256) {
-    try { fs.unlinkSync(tmp); } catch (_e) {}
-    const e = new Error('SHA-256 mismatch for ' + m.filename + ' (expected ' + m.sha256 + ', got ' + actualSha + ')');
-    e.code = 'AC_LOCAL_FAILED';
-    throw e;
-  }
-  fs.renameSync(tmp, dest);
-  log.info(which + ' model downloaded + verified', dest);
-  return { which, path: dest, sha256: actualSha };
+  return { text, modelName: MODELS.chat.loadFile, tokenCount: estimateTokens(prompt, text) };
 }
 
 module.exports = {
@@ -344,6 +408,8 @@ module.exports = {
   getCachePath,
   chatModelPresent,
   embedModelPresent,
+  verifyLocalModel,
+  provisioningInfo,
   getStatus,
   loadChat,
   loadEmbed,
@@ -354,5 +420,4 @@ module.exports = {
   ensureIndex,
   search,
   generate,
-  downloadModel,
 };

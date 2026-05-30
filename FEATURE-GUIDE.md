@@ -406,6 +406,26 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 1. Lead configures provider, endpoint, API key
 2. AI/ML features start using the configured integration
 
+**Local AI model provisioning (verify-only):** FireAlive never downloads AI models. The operator obtains the official files through their own vetted channel and places them in the model directory; FireAlive computes each file's SHA-256, compares it to a hash **pinned in source**, and loads the model only on an exact match — refusing with an honest "unavailable" on any missing or mismatched file. No outbound model fetch ever occurs, and operators never supply hashes at runtime (rotating a model is a reviewed source change).
+
+- **Chat model** (heavyweight; powers the server-side lead chat, burnout messages, IR simulator, and troubleshooter, and the Analyst Client's on-device chat): **Qwen2.5-14B-Instruct, q4_K_M** (Apache-2.0), 3 official split shards, loaded from shard 1.
+  - Official source: Hugging Face `Qwen/Qwen2.5-14B-Instruct-GGUF` (pinned commit `2b6a96d780143b4e8e3b970394e39e3774551f29`) or Alibaba ModelScope (`Qwen/Qwen2.5-14B-Instruct-GGUF`, first-party).
+  - Pinned SHA-256:
+    - `qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf` (3.99 GB) — `a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68`
+    - `qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf` (3.99 GB) — `21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae`
+    - `qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf` (1.01 GB) — `c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976`
+  - Endpoint floor: ~9 GB free disk + ~10–12 GB RAM. Under-spec / thin-VDI endpoints honestly report the local chat as unavailable rather than degrading silently.
+- **Embedder** (KB retrieval, server-side and on-device): **Qwen3-Embedding-0.6B, Q8_0** (Apache-2.0, 1024-dim), single file.
+  - Official source: Hugging Face `Qwen/Qwen3-Embedding-0.6B-GGUF` (pinned commit `d20cf9c`) or Alibaba ModelScope.
+  - Pinned SHA-256: `Qwen3-Embedding-0.6B-Q8_0.gguf` (639 MB) — `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`
+  - Endpoint floor: ~640 MB free disk.
+
+Target directory: the server model root (default `~/.firealive/models`, override `FIREALIVE_MODEL_PATH`) and, on the Analyst Client, the AC model root (default `~/.firealive/ac-models`, override `FIREALIVE_AC_MODEL_PATH`). Both the MC **AI/ML** tab and the AC **KB Assistant** surface a "Show provisioning guide" / "Verify provisioned files" action that displays the official source, target directory, and these pinned hashes, and verifies on demand.
+
+**Other deployment hardening:**
+- **Self-hosted fonts.** The Content-Security-Policy allows styles and fonts from `'self'` only (no `fonts.googleapis.com` / `fonts.gstatic.com`). Self-host any web fonts you want to use; otherwise the platform falls back to the system font stack.
+- **Pinned CI/CD supply-chain tools.** Generated pipelines pin Syft v1.44.0, Grype v0.110.0 (CVE scan), and Cosign v3.0.6, installed from immutable release tags — no `main` / `@master` / `:latest`. See the CI/CD section.
+
 ---
 
 ## Security group
@@ -596,7 +616,7 @@ For larger deployments needing more than two servers, use the Cluster / Scaling 
 
 It also serves a second purpose: contributing back upstream. Orgs that find security holes, build useful new features, or improve existing ones can use the same CI/CD feature to push their commits back to the public FireAlive GitHub repo. That accelerates collaborative development of the platform — better features, better security, broader applicability — and increases the platform's collective effectiveness in the war against analyst burnout and malicious attackers.
 
-Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side, 11 stages): lint -> test -> regression test (curl POST to `/api/regression/run` against the originating MC) -> npm audit -> Snyk -> SBOM (Syft -> SPDX-JSON artifact) -> dep-pin verify -> docker buildx with SLSA L3 provenance -> Cosign signing (keyless OIDC default; key-based via `COSIGN_KEY_MODE=key-based`) -> Trivy CVE scan (HIGH/CRITICAL exit 1) -> fuse-counter monotonicity check against `origin/main`. GD-side pipelines (10 stages) omit the inline regression invocation because GD's regression runner is inline in `index.js` rather than `require()`-able. Pipelines can POST run status back via webhook (`POST /api/cicd/runs`); MC uses api-key + `cicd:webhook` scope, GD uses an `X-CICD-Webhook-Secret` shared-secret header. See `docs/cicd-generation.md` for full architecture and the auth-divergence rationale.
+Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side, 11 stages): lint -> test -> regression test (curl POST to `/api/regression/run` against the originating MC) -> npm audit -> Snyk -> SBOM (Syft -> SPDX-JSON artifact) -> dep-pin verify -> docker buildx with SLSA L3 provenance -> Cosign signing (keyless OIDC default; key-based via `COSIGN_KEY_MODE=key-based`) -> Grype CVE scan (`--fail-on high`) -> fuse-counter monotonicity check against `origin/main`. GD-side pipelines (10 stages) omit the inline regression invocation because GD's regression runner is inline in `index.js` rather than `require()`-able. Pipelines can POST run status back via webhook (`POST /api/cicd/runs`); MC uses api-key + `cicd:webhook` scope, GD uses an `X-CICD-Webhook-Secret` shared-secret header. Supply-chain tools are pinned to specific versions installed from immutable release tags — Syft v1.44.0, Grype v0.110.0, and Cosign v3.0.6 (no `main` / `@master` / `:latest`). See `docs/cicd-generation.md` for full architecture and the auth-divergence rationale.
 
 **Workflow (custom org build):**
 1. Org's developers want to extend FireAlive with org-specific tooling
@@ -876,8 +896,8 @@ The KB is curated. It is not open to anyone to update — that would be an attac
 #### KB Assistant (Lead and Analyst)
 A research assistant lets leads and analysts ask the knowledge base questions in plain language. It retrieves the most relevant entries, answers **only** from them, and **cites every claim** — if it cannot produce a fully-cited answer, it withholds the answer rather than guessing. Cited entries appear as chips that open the KB entry (with its copiable source). It is research education — not therapy, diagnosis, or clinical advice — and when the underlying model isn't available it says so honestly instead of inventing an answer.
 
-- **Lead KB Assistant (Management Console):** runs server-side on FireAlive's internal model. The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
-- **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst's device** — a local model with no server round-trip. The analyst's question and their own signals are used only as on-device grounding and **never leave the device**. The model is downloaded once (integrity-verified) to the analyst's machine; an endpoint that can't run it gets an honest "unavailable on this device" rather than any server fallback. A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
+- **Lead KB Assistant (Management Console):** runs server-side on FireAlive's internal heavyweight model (Qwen2.5-14B-Instruct, verify-only — provisioned by the operator, never downloaded). The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
+- **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst's device** — a local model with no server round-trip. The analyst's question and their own signals are used only as on-device grounding and **never leave the device**. The model is provisioned on the analyst's machine by the operator and verified on load — its SHA-256 is checked against a hash pinned in source, and FireAlive never downloads it; an endpoint that can't run it gets an honest "unavailable on this device" rather than any server fallback (see AI/ML Integrations → Local AI model provisioning). A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
 
 ### Playbooks (SOAR Playbook / Runbook Generator)
 **What it's for:** Generate investigation and response playbooks for security incidents involving the FireAlive platform itself. The lead exports these to import into the SOAR system, or prints them as runbooks. Distinct from the Runbook Generator (which produces failure-and-compromise procedures for FireAlive) — these are SOAR-style automation playbooks for ongoing incident response involving FireAlive.
@@ -1019,7 +1039,7 @@ After the org's change-management approves the update, the lead pushes it to pro
 3. Scanner runs, findings flow back through the org's vuln management process
 
 ### Cloud Vulnerability Scan
-**What it's for:** Allow cloud-environment vulnerability scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov, Trivy) authorized access to scan FireAlive instances deployed in cloud environments. Catches misconfigurations specific to cloud deployment — exposed cloud storage, misconfigured IAM roles, network ACL gaps, container image vulnerabilities, virtual device exposure — that could be leveraged to compromise FireAlive or pivot to other resources.
+**What it's for:** Allow cloud-environment vulnerability scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) authorized access to scan FireAlive instances deployed in cloud environments. Catches misconfigurations specific to cloud deployment — exposed cloud storage, misconfigured IAM roles, network ACL gaps, container image vulnerabilities, virtual device exposure — that could be leveraged to compromise FireAlive or pivot to other resources.
 
 This is the cloud-specific companion to the Vulnerability Scan feature (which authorizes traditional vulnerability scanners) and to EDR/Threat Hunting (which authorize endpoint and behavioral scanners). Same model: FireAlive opens itself to authorized scanning by the org's security tooling.
 

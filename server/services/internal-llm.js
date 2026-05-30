@@ -9,9 +9,11 @@
 // chat-completion requests, and unloads after configurable idle timeout
 // to free memory.
 //
-// Default model: Phi-3-mini-4k-instruct-q4_K_M (~2.4GB, MIT licensed,
-// strong instruction-following + reasoning, 4k context window).
-// Optional smaller fallback: Qwen-2.5-1.5B-instruct-q4_K_M (~1GB).
+// Default model: Qwen2.5-14B-Instruct q4_K_M (Apache-2.0), provisioned as
+// 3 official split shards (~9GB total) and loaded from shard-00001. This is
+// the MC's heavyweight internal model: it serves the lead KB chat AND the
+// other server-side generative features (burnout messages, IR simulator,
+// troubleshooter). Endpoint floor: ~9GB free disk + ~10-12GB RAM.
 //
 // This service is called by the AI provider dispatcher (ai-provider.js)
 // when a feature is configured to use 'internal' as its provider. It
@@ -19,9 +21,11 @@
 // through the dispatcher so audit logging, timeouts, and error
 // classification are consistent.
 //
-// Model file location is determined by FIREALIVE_MODEL_PATH env var,
-// or defaults to ~/.firealive/models/. The bootstrap script
-// (scripts/download-model.js, commit 5) downloads the model on first run.
+// Model file location is determined by FIREALIVE_MODEL_PATH env var, or
+// defaults to ~/.firealive/models/. FireAlive never downloads models: the
+// operator provisions the official files and scripts/download-model.js
+// verifies them. doLoadModel refuses to load unless the pinned 'chat' model
+// passes SHA-256 verification (verify-only).
 //
 // Idle-unload behavior is configurable via FIREALIVE_LLM_IDLE_UNLOAD_MS.
 // Set to a positive integer (milliseconds) to override the default of
@@ -76,7 +80,7 @@ const os = require('os');
 const { logger } = require('./logger');
 
 // Configuration
-const DEFAULT_MODEL_FILENAME = 'phi-3-mini-4k-instruct-q4.gguf';
+const DEFAULT_MODEL_FILENAME = 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf';
 
 // Idle-unload timeout. Read once at module load from the
 // FIREALIVE_LLM_IDLE_UNLOAD_MS env var (positive integer milliseconds);
@@ -101,6 +105,8 @@ let modelInfo = null;          // { path, name, sizeBytes, loadedAt }
 let lastInferenceAt = null;
 let idleTimer = null;
 let loadingPromise = null;     // de-duplicates concurrent load requests
+let provisioning = null;       // lazily-required verify-only provisioning tool
+let chatVerifySig = null;      // signature of the last SHA-verified chat shard set
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -210,6 +216,19 @@ async function generate(prompt, options) {
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
+// Signature of the chat shard set (filename:size:mtime per shard). Lets us
+// skip re-hashing a byte-stable, already-verified model on idle-reload while
+// still detecting any on-disk file swap (size/mtime change forces re-verify).
+function chatFilesSignature() {
+  try {
+    if (!provisioning || typeof provisioning.modelFiles !== 'function') return null;
+    return provisioning.modelFiles('chat').map(f => {
+      try { const st = fs.statSync(f.path); return f.filename + ':' + st.size + ':' + st.mtimeMs; }
+      catch (_) { return f.filename + ':missing'; }
+    }).join('|');
+  } catch (_) { return null; }
+}
+
 async function doLoadModel(modelPath) {
   // PRECONDITION: `modelPath` has either been (a) validated by
   // resolveAndValidateModelPath() against getModelRootPath() when the
@@ -217,6 +236,31 @@ async function doLoadModel(modelPath) {
   // from FIREALIVE_MODEL_PATH / os.homedir(). Both sources are trusted
   // here. Direct calls to doLoadModel() with raw user input would bypass
   // this guarantee — always go through loadModel().
+
+  // ── Verify-before-load (verify-only; NO network) ──────────────────────────
+  // Refuse to load unless the pinned 'chat' model (Qwen2.5-14B q4_K_M, 3
+  // shards) passes SHA-256 verification against the source-pinned hashes.
+  if (provisioning === null) {
+    try { provisioning = require('../../scripts/download-model'); }
+    catch (_) { provisioning = false; }
+  }
+  if (provisioning && typeof provisioning.verifyModel === 'function') {
+    const sig = chatFilesSignature();
+    if (sig !== chatVerifySig) {
+      const v = await provisioning.verifyModel('chat');
+      if (!v.ok) {
+        chatVerifySig = null;
+        const err = new Error(
+          'internal chat model failed verification (' + v.status + '); refusing to load. ' +
+          'Provision the official Qwen2.5-14B q4_K_M shards, then verify: ' +
+          'node scripts/download-model.js --model chat');
+        err.code = 'AI_INTERNAL_UNAVAILABLE';
+        throw err;
+      }
+      chatVerifySig = sig;
+    }
+  }
+
   if (!fs.existsSync(modelPath)) {
     const err = new Error(`model file not found: ${modelPath}`);
     err.code = 'AI_INTERNAL_UNAVAILABLE';
@@ -326,7 +370,7 @@ async function resolveAndValidateModelPath(inputPath) {
   //   - '' if resolved === root (we reject — must be a file, not the dir)
   //   - a '..'-prefixed string if resolved escapes upward
   //   - an absolute path on a different drive/volume (Windows)
-  //   - a clean child path (e.g. 'phi-3-mini-4k-instruct-q4.gguf') otherwise
+  //   - a clean child path (e.g. 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf') otherwise
   // Only the last case is acceptable.
   const relative = path.relative(rootDir, resolved);
   if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
