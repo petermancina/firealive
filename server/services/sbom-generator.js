@@ -79,7 +79,7 @@ class SyftNotInstalledError extends Error {
   constructor(message) {
     super(
       message ||
-        'Syft is not installed on this host. Install via https://github.com/anchore/syft (e.g. `curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin`) and ensure it is on PATH. See docs/cloud-iac-supply-chain.md for full prerequisites.',
+        'Syft is not installed on this host. Install via https://github.com/anchore/syft (e.g. `curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.44.0/install.sh | sh -s -- -b /usr/local/bin v1.44.0`) and ensure it is on PATH. See docs/cloud-iac-supply-chain.md for full prerequisites.',
     );
     this.name = 'SyftNotInstalledError';
     this.code = 'SYFT_NOT_INSTALLED';
