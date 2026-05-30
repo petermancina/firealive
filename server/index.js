@@ -212,6 +212,7 @@ app.use('/api/external-restore', authMiddleware(['admin']), configLockGate(), re
 app.use('/api/ai-provider', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/ai-provider'));
 app.use('/api/ai-burnout', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ai-burnout'));
 app.use('/api/kb', authMiddleware(['lead', 'admin']), require('./routes/kb'));
+app.use('/api/kb-chat', authMiddleware(['lead', 'admin']), require('./routes/kb-chat'));
 app.use('/api/ooda', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ooda'));
 app.use('/api/iam', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/iam'));
 app.use('/api/upskilling', authMiddleware(['lead', 'admin']), require('./routes/upskilling'));

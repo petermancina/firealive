@@ -2797,6 +2797,27 @@ function ManagementConsole() {
   const [teamScores, setTeamScores] = useState([]);
   const [teamScoresLoading, setTeamScoresLoading] = useState(false);
   const [teamScoresError, setTeamScoresError] = useState(null);
+  const [kbChatMsgs, setKbChatMsgs] = useState([]);
+  const [kbChatInput, setKbChatInput] = useState("");
+  const [kbChatLoading, setKbChatLoading] = useState(false);
+  const sendKbChat = async () => {
+    const q = kbChatInput.trim();
+    if (!q || kbChatLoading) return;
+    setKbChatMsgs(m => [...m, { role: "user", text: q }]);
+    setKbChatInput("");
+    setKbChatLoading(true);
+    // Tier-1 aggregate background only (count, non-attributable). Never individual data.
+    const teamContext = (Array.isArray(teamScores) && teamScores.length) ? ("Team size: " + teamScores.length + " analysts.") : "";
+    const r = await api.post("/api/kb-chat", { question: q, teamContext });
+    setKbChatLoading(false);
+    if (!r || r.error) {
+      setKbChatMsgs(m => [...m, { role: "assistant", unavailable: true, reason: "error" }]);
+    } else if (r.unavailable) {
+      setKbChatMsgs(m => [...m, { role: "assistant", unavailable: true, reason: r.reason || "unavailable" }]);
+    } else {
+      setKbChatMsgs(m => [...m, { role: "assistant", text: r.answer, citedEntries: r.citedEntries || [] }]);
+    }
+  };
   // R3h-pt2: flagged-ratings review queue state. Populated by GET
   // /api/helper-pay/flagged-ratings when the peersupport tab opens.
   // flaggedDecideBusy tracks which rating's decide POST is in flight
@@ -4268,6 +4289,29 @@ function ManagementConsole() {
             <div><L style={{marginBottom:4}}>Research Knowledge Base</L><M style={{color:C.tm}}>v{KB_VERSION} · {KB_ENTRY_COUNT} peer-reviewed entries</M></div>
             <Btn small onClick={()=>setShowKBIngestion(true)} style={{borderColor:C.d+"30",color:C.d}}>Developer Ingestion</Btn>
           </div>
+          <Card style={{padding:14,marginBottom:16,borderColor:C.a+"30"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}><L style={{margin:0}}>Lead KB Assistant</L><Badge color={C.a}>internal AI</Badge><M style={{color:C.td,marginLeft:"auto"}}>Grounded in the {KB_ENTRY_COUNT} KB entries · cites every claim</M></div>
+            <M style={{color:C.td,display:"block",marginBottom:10,lineHeight:1.5}}>Ask a research question about burnout, workload, or team wellbeing. Answers are generated on-device by the internal model, grounded only in the Knowledge Base, and every claim is cited — unsupported answers are withheld. Research guidance, not clinical advice.</M>
+            {kbChatMsgs.length>0&&<div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:10,maxHeight:360,overflowY:"auto"}}>
+              {kbChatMsgs.map((msg,i)=>(
+                <div key={i} style={{alignSelf:msg.role==="user"?"flex-end":"flex-start",maxWidth:"90%"}}>
+                  {msg.role==="user"
+                    ? <div style={{background:C.ad,border:`1px solid ${C.b}`,borderRadius:10,padding:"8px 12px",fontSize:11,color:C.t}}>{msg.text}</div>
+                    : msg.unavailable
+                      ? <div style={{border:`1px solid ${C.w}40`,borderRadius:10,padding:"8px 12px"}}><M style={{color:C.w}}>{msg.reason==="citation_check_failed"?"Couldn't produce a fully-cited answer from the Knowledge Base, so it was withheld.":msg.reason==="no_retrieval"?"No relevant Knowledge Base entries were found for that question.":msg.reason==="model_not_loaded"?"The internal model isn't available on this server right now.":"The assistant is unavailable right now."}</M></div>
+                      : <div style={{border:`1px solid ${C.b}`,borderRadius:10,padding:"10px 12px"}}>
+                          <div style={{fontSize:11,color:C.t,lineHeight:1.7,whiteSpace:"pre-wrap"}}>{msg.text}</div>
+                          {Array.isArray(msg.citedEntries)&&msg.citedEntries.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:8}}>{msg.citedEntries.map(e=>(<button key={e.id} onClick={()=>setKbEntry(e)} style={{padding:"2px 8px",background:C.ad,border:`1px solid ${C.a}40`,borderRadius:6,color:C.a,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{e.id} ↗</button>))}</div>}
+                        </div>}
+                </div>
+              ))}
+            </div>}
+            {kbChatLoading&&<M style={{color:C.td,display:"block",marginBottom:8}}>Thinking… (on-device)</M>}
+            <div style={{display:"flex",gap:8}}>
+              <input value={kbChatInput} onChange={e=>setKbChatInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendKbChat();}}} placeholder="Ask the research base…" maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/>
+              <Btn small onClick={sendKbChat} disabled={kbChatLoading||!kbChatInput.trim()}>Ask</Btn>
+            </div>
+          </Card>
           <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>{["all",...[...new Set(RESEARCH_KB.map(r=>r.topic))]].map(f=>(
             <button key={f} onClick={()=>setKBFilter(f)} style={{padding:"3px 10px",background:kbFilter===f?C.ad:"transparent",border:`1px solid ${kbFilter===f?C.a+"50":C.b}`,borderRadius:6,color:kbFilter===f?C.a:C.td,fontSize:9,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{f}</button>
           ))}</div>

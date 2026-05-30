@@ -101,7 +101,7 @@ router.get('/config', (req, res) => {
 
 // ── PUT /api/ai-provider/config/:featureId ──────────────────────────────────
 
-const VALID_FEATURES = ['ir_simulator', 'burnout_messages', 'kb_synthesis', 'ttx_enhancement', 'troubleshooter'];
+const VALID_FEATURES = ['ir_simulator', 'burnout_messages', 'kb_synthesis', 'ttx_enhancement', 'troubleshooter', 'kb_chat'];
 const VALID_PROVIDERS = ['internal', 'anthropic', 'openai', 'gemini', 'azure_openai', 'aws_bedrock', 'custom'];
 
 router.put('/config/:featureId', (req, res) => {
