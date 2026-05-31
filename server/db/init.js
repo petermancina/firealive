@@ -6547,6 +6547,100 @@ function initDb() {
     );
   }
 
+  // ── B1: Cloud Vulnerability Scan — scanner authorization registry +
+  // tamper-evident scan-access log ─────────────────────────────────────────────
+  // Authorizes external cloud-posture / IaC scanners (ScoutSuite, Prowler, Pacu,
+  // CloudBrute, Checkov) to scan FireAlive's cloud deployment. FireAlive does NOT
+  // run scans and does NOT ingest/parse/store findings — those live in the
+  // scanner's own application. This integration records WHICH scanners are
+  // authorized (per-authorization bearer token stored hashed + source-IP/CIDR
+  // allow-list) and logs EVERY scan access (authorized or rejected) in an
+  // append-only, hash-chained log so the SOC has a tamper-evident record of when
+  // FireAlive was scanned. Coverage spans the deployed suite (MC / AC / ARC /
+  // main server / GD-server); the GD-server keeps its own duplicated config.
+  // Application-layer enforcement only — network-layer blocking remains the
+  // operator's firewall responsibility.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        scanner_type TEXT NOT NULL CHECK (scanner_type IN (
+          'scoutsuite',
+          'prowler',
+          'pacu',
+          'cloudbrute',
+          'checkov'
+        )),
+        display_name TEXT NOT NULL,
+        allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+        scope_components TEXT NOT NULL DEFAULT '[]',
+        token_hash TEXT NOT NULL,
+        token_salt TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_scan_at TEXT,
+        last_scan_source_ip TEXT,
+        notes TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cloud_vuln_auth_enabled
+        ON cloud_vuln_scanner_authorizations(enabled, scanner_type);
+
+      CREATE TABLE IF NOT EXISTS cloud_vuln_scan_access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prev_hash TEXT,
+        this_hash TEXT NOT NULL,
+        authorization_id TEXT REFERENCES cloud_vuln_scanner_authorizations(id) ON DELETE SET NULL,
+        scanner_type TEXT,
+        source_ip TEXT NOT NULL,
+        component TEXT NOT NULL CHECK (component IN (
+          'mc', 'ac', 'arc', 'main_server', 'gd_server'
+        )),
+        outcome TEXT NOT NULL CHECK (outcome IN (
+          'authorized',
+          'rejected_ip',
+          'rejected_token',
+          'rejected_disabled',
+          'rejected_unknown'
+        )),
+        request_path TEXT,
+        user_agent TEXT,
+        detail TEXT,
+        accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_accessed_at
+        ON cloud_vuln_scan_access_log(accessed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_outcome
+        ON cloud_vuln_scan_access_log(outcome);
+      CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_auth
+        ON cloud_vuln_scan_access_log(authorization_id);
+
+      CREATE TRIGGER IF NOT EXISTS cloud_vuln_scan_access_log_no_update
+        BEFORE UPDATE ON cloud_vuln_scan_access_log
+        BEGIN SELECT RAISE(ABORT, 'cloud_vuln_scan_access_log is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS cloud_vuln_scan_access_log_no_delete
+        BEFORE DELETE ON cloud_vuln_scan_access_log
+        BEGIN SELECT RAISE(ABORT, 'cloud_vuln_scan_access_log is append-only'); END;
+    `);
+    const cloudVulnAuthCount = db
+      .prepare("SELECT COUNT(*) as c FROM cloud_vuln_scanner_authorizations")
+      .get().c;
+    console.log(
+      `B1 migration: cloud_vuln_scanner_authorizations + cloud_vuln_scan_access_log ready (${cloudVulnAuthCount} authorization(s) present)`
+    );
+  } catch (b1CloudVulnMigrationErr) {
+    console.error(
+      'B1 cloud_vuln_scan migration FAILED:',
+      b1CloudVulnMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Cloud Vulnerability Scan tab cannot register scanner authorizations or record scan access: GET/POST/PUT/DELETE /api/cloud-vuln/* will return 500, and authorized scans will not be logged. No other feature is affected. Recovery: manually run the CREATE TABLE / CREATE INDEX / CREATE TRIGGER statements above in a SQLite shell against the production DB.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

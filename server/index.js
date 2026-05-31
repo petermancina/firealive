@@ -31,6 +31,7 @@ const { runtimeMonitor } = require('./services/runtime-monitor');
 const oodaJobs = require('./services/ooda-generation-jobs');
 const { gdPushService } = require('./services/gd-push');
 const { schedulingSyncService } = require('./services/scheduling-sync');
+const { isAuthorizedScannerIp } = require('./services/cloud-vuln-allowlist');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -139,7 +140,7 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: (req) => req.path === '/api/system/health',
+  skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip),
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });
@@ -237,6 +238,8 @@ app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
+app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockGate(), require('./routes/cloud-vuln-scan'));
+app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
 app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
 app.use('/api/legal-hold-exports', authMiddleware(['admin', 'ciso']), require('./routes/legal-hold-exports'));
 app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso', 'abuse_reviewer']), require('./routes/report-verification'));

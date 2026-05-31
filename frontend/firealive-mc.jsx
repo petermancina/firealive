@@ -2845,7 +2845,41 @@ function ManagementConsole() {
   const [playbookType, setPlaybookType] = useState("app_compromise");
   const [generatedPlaybook, setGenPlaybook] = useState(null);
   const [clientNotifCfg, setClientNotifCfg] = useState({enabled:true,channels:{desktop:true,slack:false,teams:false,email:false},slackWebhook:"",teamsWebhook:"",rules:{peerChatRequest:{enabled:true,realtime:true,channel:"desktop"},weeklyMetricsReminder:{enabled:true,day:"friday",time:"16:00",channel:"desktop"},burnoutSpike:{enabled:false,channel:"desktop"},shiftHandoff:{enabled:true,channel:"desktop"},scheduledChatReminder:{enabled:true,minutesBefore:15,channel:"desktop"}}});
-  const [cloudVulnCfg, setCloudVulnCfg] = useState({enabled:false,scanners:[],schedule:"weekly",targetEnvironment:null});
+  // ── B1: Cloud Vulnerability Scan — scanner authorization registry + scan-access log ──
+  const CLOUD_VULN_SCANNERS = [
+    {id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud posture auditing (AWS, Azure, GCP, OCI)"},
+    {id:"prowler",l:"Prowler",d:"AWS/Azure/GCP CIS benchmark checks"},
+    {id:"pacu",l:"Pacu",d:"AWS exploitation framework — offensive posture testing"},
+    {id:"cloudbrute",l:"CloudBrute",d:"Cloud asset enumeration across providers"},
+    {id:"checkov",l:"Checkov",d:"IaC scanning — Terraform, CloudFormation, K8s manifests"},
+  ];
+  const CLOUD_VULN_COMPONENTS = [
+    {id:"mc",l:"Management Console"},
+    {id:"ac",l:"Analyst Client"},
+    {id:"arc",l:"Abuse Review Console"},
+    {id:"main_server",l:"Main server"},
+    {id:"gd_server",l:"Global Dashboard server"},
+  ];
+  const [cloudVulnList, setCloudVulnList] = useState([]);
+  const [cloudVulnLoading, setCloudVulnLoading] = useState(false);
+  const [cloudVulnError, setCloudVulnError] = useState(null);
+  const [cloudVulnForm, setCloudVulnForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), scope_components[], notes, enabled}
+  const [cloudVulnNewToken, setCloudVulnNewToken] = useState(null); // one-time bearer token shown after create
+  const [cloudVulnLog, setCloudVulnLog] = useState([]);
+  const [cloudVulnLogTotal, setCloudVulnLogTotal] = useState(0);
+  const [cloudVulnChain, setCloudVulnChain] = useState(null); // {intact, count, brokenAt?}
+  const reloadCloudVuln = async () => {
+    setCloudVulnLoading(true); setCloudVulnError(null);
+    try {
+      const r = await api.get("/api/cloud-vuln/authorizations");
+      if (r && Array.isArray(r.authorizations)) setCloudVulnList(r.authorizations);
+      else if (r && r.error) setCloudVulnError(r.error);
+      const lg = await api.get("/api/cloud-vuln/access-log?limit=100");
+      if (lg && Array.isArray(lg.entries)) { setCloudVulnLog(lg.entries); setCloudVulnLogTotal(lg.total||lg.entries.length); }
+    } catch (e) { setCloudVulnError(e.message); }
+    setCloudVulnLoading(false);
+  };
+  useEffect(() => { reloadCloudVuln(); }, []);
   // Query tool
   const [querySource, setQuerySource] = useState("audit_log");
   const [queryRegex, setQueryRegex] = useState("");
@@ -5256,22 +5290,118 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* ══════════ CLOUD VULN SCAN ══════════ */}
         {tab==="cloud_vuln"&&(<div>
-          <L>Cloud Vulnerability Scanning</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Scan your cloud environment for misconfigurations and vulnerabilities that could affect FireAlive's deployment. These tools audit IAM policies, network ACLs, storage permissions, and cloud-specific security controls.</M>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Cloud Scanners</div>
-            {[{id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud auditing (AWS, Azure, GCP, OCI)"},{id:"prowler",l:"Prowler",d:"AWS/Azure/GCP CIS benchmark checks"},{id:"pacu",l:"Pacu",d:"AWS exploitation framework — offensive security testing"},{id:"cloudbrute",l:"CloudBrute",d:"Cloud asset enumeration across providers"},{id:"checkov",l:"Checkov",d:"IaC scanning — Terraform, CloudFormation, K8s manifests"}].map(sc=>(
-              <label key={sc.id} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 0",borderBottom:`1px solid ${C.b}`,cursor:"pointer"}}>
-                <input type="checkbox" checked={cloudVulnCfg.scanners.includes(sc.id)} onChange={e=>{if(e.target.checked)setCloudVulnCfg(prev=>({...prev,scanners:[...prev.scanners,sc.id]}));else setCloudVulnCfg(prev=>({...prev,scanners:prev.scanners.filter(s=>s!==sc.id)}));}}/>
-                <div><div style={{fontSize:12,color:C.t}}>{sc.l}</div><M style={{color:C.td}}>{sc.d}</M></div>
-              </label>
-            ))}
+          <L>Cloud Vulnerability Scan</L>
+          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan FireAlive's cloud deployment. FireAlive does not run scans or store findings — results appear in the scanner's own console. This tab authorizes scanners (by bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches FireAlive. Authorization can cover any deployed component: Management Console, Analyst Client, Abuse Review Console, main server, and the Global Dashboard server (the GD server has its own separate authorization config).</M>
+          <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
+            <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Application-layer authorization</M>
+            <M style={{color:C.t,lineHeight:1.6}}>FireAlive authorizes and logs scans that reach it; true network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility. Authorized scanner source IPs are exempt from FireAlive's API rate limiting so a sanctioned scan is not throttled — all other defenses stay active.</M>
           </Card>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-            <Sel label="Target environment" value={cloudVulnCfg.targetEnvironment||""} onChange={e=>setCloudVulnCfg(prev=>({...prev,targetEnvironment:e.target.value}))}><option value="">Select...</option><option value="aws">AWS</option><option value="azure">Azure</option><option value="gcp">GCP</option><option value="multi">Multi-cloud</option></Sel>
-            <Sel label="Schedule" value={cloudVulnCfg.schedule} onChange={e=>setCloudVulnCfg(prev=>({...prev,schedule:e.target.value}))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="manual">Manual only</option></Sel>
-          </div>
-          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLOUD_VULNSCAN_CONFIG",detail:"Cloud vulnerability scan configuration saved"}).then(()=>addA("CLOUD_VULNSCAN_CONFIG","Cloud vulnerability scan configuration saved"))}>Save Config</Btn>
+
+          {cloudVulnError&&<Card style={{marginBottom:16,borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Error: {cloudVulnError}</M></Card>}
+
+          {cloudVulnNewToken&&(<Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
+            <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner's configuration now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer …, or the X-Scan-Token header) when it records a scan via POST /api/cloud-vuln-access.</M>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{cloudVulnNewToken}</code>
+              <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(cloudVulnNewToken);}catch(e){}}}>Copy</Btn>
+              <Btn small onClick={()=>setCloudVulnNewToken(null)}>Dismiss</Btn>
+            </div>
+          </Card>)}
+
+          {/* ── AUTHORIZED SCANNERS LIST ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Authorized scanners ({cloudVulnList.length})</div>
+              <Btn primary small onClick={()=>{setCloudVulnNewToken(null);setCloudVulnForm({mode:"add",scanner_type:"",display_name:"",allowed_cidrs:"",scope_components:[],notes:"",enabled:true});}}>+ Authorize Scanner</Btn>
+            </div>
+            {cloudVulnLoading&&<M style={{color:C.tm}}>Loading...</M>}
+            {!cloudVulnLoading&&cloudVulnList.length===0&&(<div style={{padding:"24px 0",textAlign:"center"}}><M style={{color:C.tm,display:"block"}}>No scanners authorized. No external scanner can record a scan of FireAlive until one is added and enabled.</M></div>)}
+            {cloudVulnList.map(a=>{
+              const sc=CLOUD_VULN_SCANNERS.find(s=>s.id===a.scanner_type);
+              return(<div key={a.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:a.enabled?1:0.55}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                    <M style={{color:C.t,fontWeight:600}}>{a.display_name}</M>
+                    <Badge color={C.i}>{sc?sc.l:a.scanner_type}</Badge>
+                    {!a.enabled&&<Badge>DISABLED</Badge>}
+                  </div>
+                  <M style={{color:C.tm,display:"block"}}>Allow-list: {(a.allowed_cidrs||[]).join(", ")||"—"}</M>
+                  <M style={{color:C.tm,display:"block"}}>Scope: {(a.scope_components||[]).map(c=>{const cc=CLOUD_VULN_COMPONENTS.find(x=>x.id===c);return cc?cc.l:c;}).join(", ")||"—"}</M>
+                  <M style={{color:C.td,display:"block",marginTop:4}}>Last scan: {a.last_scan_at?(a.last_scan_at+(a.last_scan_source_ip?(" from "+a.last_scan_source_ip):"")):"never"}</M>
+                  {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn small onClick={async()=>{const r=await api.put(`/api/cloud-vuln/authorizations/${a.id}`,{enabled:!a.enabled});if(r&&!r.error)reloadCloudVuln();else setCloudVulnError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={()=>{setCloudVulnNewToken(null);setCloudVulnForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),scope_components:a.scope_components||[],notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
+                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const r=await api.del(`/api/cloud-vuln/authorizations/${a.id}`);if(r&&!r.error){addA("CLOUD_VULN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadCloudVuln();}else setCloudVulnError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                </div>
+              </div>);
+            })}
+          </Card>
+
+          {/* ── SCAN-ACCESS LOG ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Scan-access log ({cloudVulnLogTotal})</div>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                {cloudVulnChain&&<Badge color={cloudVulnChain.intact?C.a:C.d}>{cloudVulnChain.intact?("CHAIN OK ("+cloudVulnChain.count+")"):("CHAIN BROKEN @"+cloudVulnChain.brokenAt)}</Badge>}
+                <Btn small onClick={async()=>{const r=await api.get("/api/cloud-vuln/access-log/verify");if(r&&!r.error)setCloudVulnChain(r);else setCloudVulnError((r&&r.error)||"verify failed");}}>Verify chain</Btn>
+                <Btn small onClick={reloadCloudVuln}>Refresh</Btn>
+              </div>
+            </div>
+            {cloudVulnLog.length===0&&<M style={{color:C.tm}}>No scan access recorded yet.</M>}
+            {cloudVulnLog.map(e=>{
+              const okOutcome=e.outcome==="authorized";
+              return(<div key={e.id} style={{padding:"8px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:10}}>
+                <Badge color={okOutcome?C.a:C.d}>{e.outcome}</Badge>
+                <M style={{color:C.t,flex:1,minWidth:0}}>{(e.scanner_type||"unknown")+" · "+e.component+" · "+e.source_ip}</M>
+                <M style={{color:C.td,flexShrink:0}}>{e.accessed_at}</M>
+              </div>);
+            })}
+          </Card>
+
+          {/* ── AUTHORIZE / EDIT MODAL ── */}
+          {cloudVulnForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setCloudVulnForm(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:16,padding:32,maxWidth:560,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+              <L>{cloudVulnForm.mode==="add"?"Authorize Scanner":"Edit Authorization"}</L>
+              <Sel label="Scanner" value={cloudVulnForm.scanner_type} onChange={e=>setCloudVulnForm(prev=>({...prev,scanner_type:e.target.value}))} disabled={cloudVulnForm.mode==="edit"}>
+                <option value="">Select a scanner...</option>
+                {CLOUD_VULN_SCANNERS.map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+              </Sel>
+              {cloudVulnForm.scanner_type&&(()=>{const s=CLOUD_VULN_SCANNERS.find(x=>x.id===cloudVulnForm.scanner_type);return s?(<M style={{color:C.td,display:"block",marginTop:-8,marginBottom:12}}>{s.d}</M>):null;})()}
+              <Input label="Display name" value={cloudVulnForm.display_name} onChange={e=>setCloudVulnForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Prod Prowler (us-east-1)" maxLength={128}/>
+              <Input label="Source IP allow-list (comma-separated IPs or CIDRs)" value={cloudVulnForm.allowed_cidrs} onChange={e=>setCloudVulnForm(prev=>({...prev,allowed_cidrs:e.target.value}))} placeholder="e.g. 10.0.0.0/24, 203.0.113.7" maxLength={512}/>
+              <M style={{color:C.tm,marginBottom:6,display:"block"}}>Components in scope</M>
+              <div style={{display:"flex",flexWrap:"wrap",gap:12,marginBottom:14}}>
+                {CLOUD_VULN_COMPONENTS.map(c=>(<label key={c.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                  <input type="checkbox" checked={cloudVulnForm.scope_components.includes(c.id)} onChange={e=>{if(e.target.checked)setCloudVulnForm(prev=>({...prev,scope_components:[...prev.scope_components,c.id]}));else setCloudVulnForm(prev=>({...prev,scope_components:prev.scope_components.filter(x=>x!==c.id)}));}} style={{accentColor:C.a}}/>
+                  <M style={{color:C.t}}>{c.l}</M>
+                </label>))}
+              </div>
+              <Input label="Notes (optional)" value={cloudVulnForm.notes} onChange={e=>setCloudVulnForm(prev=>({...prev,notes:e.target.value}))} maxLength={1000}/>
+              {cloudVulnForm.mode==="edit"&&(<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:8}}><input type="checkbox" checked={cloudVulnForm.enabled} onChange={e=>setCloudVulnForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Enabled</M></label>)}
+              <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                <Btn onClick={()=>setCloudVulnForm(null)}>Cancel</Btn>
+                <Btn primary onClick={async()=>{
+                  const cidrs=cloudVulnForm.allowed_cidrs.split(",").map(x=>x.trim()).filter(Boolean);
+                  if(!cloudVulnForm.scanner_type){setCloudVulnError("Scanner is required");return;}
+                  if(!cloudVulnForm.display_name.trim()){setCloudVulnError("Display name is required");return;}
+                  if(cidrs.length===0){setCloudVulnError("At least one source IP / CIDR is required");return;}
+                  if(cloudVulnForm.scope_components.length===0){setCloudVulnError("Select at least one component in scope");return;}
+                  if(cloudVulnForm.mode==="add"){
+                    const r=await api.post("/api/cloud-vuln/authorizations",{scanner_type:cloudVulnForm.scanner_type,display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null});
+                    if(r&&!r.error&&r.token){addA("CLOUD_VULN_AUTH_CREATED",cloudVulnForm.display_name.trim()+" ("+cloudVulnForm.scanner_type+")");setCloudVulnForm(null);setCloudVulnError(null);setCloudVulnNewToken(r.token);reloadCloudVuln();}
+                    else setCloudVulnError((r&&r.error)||"create failed");
+                  }else{
+                    const r=await api.put(`/api/cloud-vuln/authorizations/${cloudVulnForm.id}`,{display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null,enabled:cloudVulnForm.enabled});
+                    if(r&&!r.error){addA("CLOUD_VULN_AUTH_UPDATED",cloudVulnForm.display_name.trim());setCloudVulnForm(null);setCloudVulnError(null);reloadCloudVuln();}
+                    else setCloudVulnError((r&&r.error)||"save failed");
+                  }
+                }}>{cloudVulnForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
+              </div>
+            </div>
+          </div>)}
         </div>)}
 
         {/* ══════════ REGRESSION TEST ══════════ */}

@@ -136,6 +136,14 @@ const authMiddleware = (roles) => (req, res, next) => {
   } catch (e) { return res.status(401).json({ error: 'Invalid or expired token' }); }
 };
 
+// ── B1: Cloud Vulnerability Scan (GD-server's own authorization config) ──────
+// Authorizes cloud-posture / IaC scanners to scan the GD-server and logs every
+// scan access (append-only hash chain). Management is ciso/vp; the scan-access
+// recorder is token + source-IP gated (a scanner presents its bearer token, so
+// it is not behind authMiddleware). Not a vulnerability aggregate/dashboard.
+app.use('/api/cloud-vuln', authMiddleware(['ciso', 'vp']), require('./routes/cloud-vuln-scan'));
+app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   const db = getDb();

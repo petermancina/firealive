@@ -511,41 +511,14 @@ regression:
   res.json({ platforms: Object.keys(configs), configs });
 });
 
-// ── Cloud Vulnerability Scanning ────────────────────────────────────────────
-router.get('/cloud/vuln-scan-config', (req, res) => {
-  try {
-    const db = getDb();
-    const config = db.prepare("SELECT value FROM team_config WHERE key = 'cloud_vuln_scan_config'").get();
-    db.close();
-    res.json(config ? JSON.parse(config.value) : {
-      enabled: false,
-      scanners: [], // scoutsuite, prowler, pacu, cloudbrute
-      schedule: 'weekly',
-      targetEnvironment: null, // aws, azure, gcp, multi
-      lastScan: null,
-    });
-  } catch (err) { res.status(500).json({ error: 'Failed to get cloud vuln config' }); }
-});
-
-router.put('/cloud/vuln-scan-config', (req, res) => {
-  const { enabled, scanners, schedule, targetEnvironment } = req.body;
-  const VALID_SCANNERS = ['scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov', 'trivy'];
-  const VALID_ENVS = ['aws', 'azure', 'gcp', 'multi'];
-  const config = {
-    enabled: !!enabled,
-    scanners: (scanners || []).filter(s => VALID_SCANNERS.includes(s)),
-    schedule: ['daily', 'weekly', 'monthly', 'manual'].includes(schedule) ? schedule : 'weekly',
-    targetEnvironment: VALID_ENVS.includes(targetEnvironment) ? targetEnvironment : null,
-    lastScan: null,
-    updatedAt: new Date().toISOString(),
-  };
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('cloud_vuln_scan_config', ?, ?)").run(JSON.stringify(config), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'CLOUD_VULNSCAN_CONFIG_UPDATED', `scanners=${config.scanners.join(',')}`, req.ip);
-    res.json({ ok: true, config });
-  } catch (err) { res.status(500).json({ error: 'Failed to update cloud vuln config' }); }
-});
+// Cloud Vulnerability Scan is now a real authorization + access-logging
+// integration: see server/routes/cloud-vuln-scan.js (mounted at /api/cloud-vuln
+// for admin management and /api/cloud-vuln-access for the token-gated scan-access
+// recorder). The earlier config-only stub that lived here — GET/PUT
+// /cloud/vuln-scan-config backed by the team_config 'cloud_vuln_scan_config'
+// row — has been removed. The old key/value row, if present from a prior
+// version, is harmless dead config: nothing reads it after this removal, and it
+// has no faithful mapping into the new per-scanner token + IP-allow-list
+// authorization model, so no authorizations are fabricated from it.
 
 module.exports = router;

@@ -382,6 +382,34 @@ export default function GlobalDashboard() {
   const [gdIacTool, setGdIacTool] = useState("");
   const [gdIacResult, setGdIacResult] = useState(null);
   const [gdIacBusy, setGdIacBusy] = useState(false);
+  // ── B1: Cloud Vulnerability Scan — GD-server's own scanner authorizations + scan-access log ──
+  const CLOUD_VULN_SCANNERS = [
+    {id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud posture auditing (AWS, Azure, GCP, OCI)"},
+    {id:"prowler",l:"Prowler",d:"AWS/Azure/GCP CIS benchmark checks"},
+    {id:"pacu",l:"Pacu",d:"AWS exploitation framework — offensive posture testing"},
+    {id:"cloudbrute",l:"CloudBrute",d:"Cloud asset enumeration across providers"},
+    {id:"checkov",l:"Checkov",d:"IaC scanning — Terraform, CloudFormation, K8s manifests"},
+  ];
+  const [cvList, setCvList] = useState([]);
+  const [cvLoading, setCvLoading] = useState(false);
+  const [cvError, setCvError] = useState(null);
+  const [cvForm, setCvForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), notes, enabled}
+  const [cvNewToken, setCvNewToken] = useState(null); // one-time bearer token shown after create
+  const [cvLog, setCvLog] = useState([]);
+  const [cvLogTotal, setCvLogTotal] = useState(0);
+  const [cvChain, setCvChain] = useState(null); // {intact, count, brokenAt?}
+  const reloadCloudVuln = async () => {
+    setCvLoading(true); setCvError(null);
+    try {
+      const r = await api.get("/api/cloud-vuln/authorizations");
+      if (r && Array.isArray(r.authorizations)) setCvList(r.authorizations);
+      else if (r && r.error) setCvError(r.error);
+      const lg = await api.get("/api/cloud-vuln/access-log?limit=100");
+      if (lg && Array.isArray(lg.entries)) { setCvLog(lg.entries); setCvLogTotal(lg.total||lg.entries.length); }
+    } catch (e) { setCvError(e.message); }
+    setCvLoading(false);
+  };
+  useEffect(() => { reloadCloudVuln(); }, []);
   const [gdCicdPlatform, setGdCicdPlatform] = useState("github-actions");
   const [gdCicdPurpose, setGdCicdPurpose] = useState("custom-build");
   const [gdCicdResult, setGdCicdResult] = useState(null);
@@ -1305,7 +1333,7 @@ export default function GlobalDashboard() {
     {id:"connections",label:"MC Connections"},{id:"mc_offboard",label:"MC Offboarding"},{id:"notifications",label:"Notifications"},
     {id:"query",label:"Query Tool"},{id:"sys_health",label:"System Health"},{id:"monitoring",label:"Monitoring Integrations"},
     {id:"iam",label:"IAM & Access"},{id:"mfa",label:"MFA"},{id:"posture",label:"Posture Assessment"},{id:"wifi",label:"WiFi Policy"},
-    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"vuln_scan",label:"Vulnerability Scan"},
+    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"vuln_scan",label:"Cloud Vuln Scan"},
     {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha_cluster",label:"HA & Clustering"},
     {id:"backup",label:"Backup & Restore"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
@@ -2404,16 +2432,105 @@ export default function GlobalDashboard() {
 
           {/* ══════════ VULNERABILITY SCAN ══════════ */}
           {tab==="vuln_scan"&&(<div>
-            <L>Vulnerability Scanner</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Allow approved vulnerability scanners to scan this dashboard server. Only scanners from approved IPs can connect.</M>
-            <Card>
-              <Input label="Approved scanner IPs (comma-separated)" placeholder="10.0.0.50, 10.0.0.51"/>
-              <Sel label="Scanner type"><option value="nessus">Nessus</option><option value="qualys">Qualys</option><option value="rapid7">Rapid7 InsightVM</option><option value="openvas">OpenVAS</option></Sel>
-              <Btn primary>Save Scanner Config</Btn>
+            <L>Cloud Vulnerability Scan</L>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan this Global Dashboard server. The GD-server does not run scans or store findings — results appear in the scanner's own console. This authorizes scanners (bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches the GD-server. These authorizations are the GD-server's own, independent of any Management Console.</M>
+            <Card style={{background:C.w+"14",border:`1px solid ${C.w}40`}}>
+              <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Application-layer authorization</M>
+              <M style={{color:C.t,display:"block",lineHeight:1.6}}>The GD-server authorizes and logs scans that reach it; network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility. Authorized scanner source IPs are exempt from the GD-server's API rate limiting so a sanctioned scan is not throttled — all other defenses stay active.</M>
             </Card>
+
+            {cvError&&<Card style={{background:C.d+"14",border:`1px solid ${C.d}40`}}><M style={{color:C.d}}>Error: {cvError}</M></Card>}
+
+            {cvNewToken&&(<Card style={{background:C.a+"10",border:`1px solid ${C.a}55`}}>
+              <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
+              <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer ..., or the X-Scan-Token header) when recording a scan via POST /api/cloud-vuln-access.</M>
+              <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{cvNewToken}</code>
+                <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(cvNewToken);}catch(e){}}}>Copy</Btn>
+                <Btn small onClick={()=>setCvNewToken(null)}>Dismiss</Btn>
+              </div>
+            </Card>)}
+
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                <M style={{color:C.t,fontWeight:600}}>Authorized scanners ({cvList.length})</M>
+                <Btn primary small onClick={()=>{setCvNewToken(null);setCvForm({mode:"add",scanner_type:"",display_name:"",allowed_cidrs:"",notes:"",enabled:true});}}>+ Authorize Scanner</Btn>
+              </div>
+              {cvLoading&&<M style={{color:C.tm}}>Loading...</M>}
+              {!cvLoading&&cvList.length===0&&<M style={{color:C.tm,display:"block",padding:"12px 0"}}>No scanners authorized. No external scanner can record a scan of the GD-server until one is added and enabled.</M>}
+              {cvList.map(a=>{
+                const sc=CLOUD_VULN_SCANNERS.find(s=>s.id===a.scanner_type);
+                return(<div key={a.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:a.enabled?1:0.55}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                      <M style={{color:C.t,fontWeight:600}}>{a.display_name}</M>
+                      <Badge color={C.i}>{sc?sc.l:a.scanner_type}</Badge>
+                      {!a.enabled&&<Badge color={C.td}>DISABLED</Badge>}
+                    </div>
+                    <M style={{color:C.tm,display:"block"}}>Allow-list: {(a.allowed_cidrs||[]).join(", ")||"—"}</M>
+                    <M style={{color:C.td,display:"block",marginTop:4}}>Last scan: {a.last_scan_at?(a.last_scan_at+(a.last_scan_source_ip?(" from "+a.last_scan_source_ip):"")):"never"}</M>
+                    {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
+                  </div>
+                  <div style={{display:"flex",gap:6,flexShrink:0}}>
+                    <Btn small onClick={async()=>{const r=await api.put("/api/cloud-vuln/authorizations/"+a.id,{enabled:!a.enabled});if(r&&!r.error){showGdToast(a.enabled?"Scanner disabled":"Scanner enabled");reloadCloudVuln();}else setCvError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                    <Btn small onClick={()=>{setCvNewToken(null);setCvForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
+                    <Btn small style={{color:C.d,borderColor:C.d+"50"}} onClick={async()=>{if(!window.confirm("Revoke authorization \""+a.display_name+"\"? The scanner's token will stop working."))return;const r=await api.del("/api/cloud-vuln/authorizations/"+a.id);if(r&&!r.error){showGdToast("Authorization revoked");reloadCloudVuln();}else setCvError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                  </div>
+                </div>);
+              })}
+            </Card>
+
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+                <M style={{color:C.t,fontWeight:600}}>Scan-access log ({cvLogTotal})</M>
+                <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                  {cvChain&&<Badge color={cvChain.intact?C.a:C.d}>{cvChain.intact?("CHAIN OK ("+cvChain.count+")"):("CHAIN BROKEN @"+cvChain.brokenAt)}</Badge>}
+                  <Btn small onClick={async()=>{const r=await api.get("/api/cloud-vuln/access-log/verify");if(r&&!r.error)setCvChain(r);else setCvError((r&&r.error)||"verify failed");}}>Verify chain</Btn>
+                  <Btn small onClick={reloadCloudVuln}>Refresh</Btn>
+                </div>
+              </div>
+              {cvLog.length===0&&<M style={{color:C.tm}}>No scan access recorded yet.</M>}
+              {cvLog.map(e=>(<div key={e.id} style={{padding:"8px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:10}}>
+                <Badge color={e.outcome==="authorized"?C.a:C.d}>{e.outcome}</Badge>
+                <M style={{color:C.t,flex:1,minWidth:0}}>{(e.scanner_type||"unknown")+" · "+e.component+" · "+e.source_ip}</M>
+                <M style={{color:C.td,flexShrink:0}}>{e.accessed_at}</M>
+              </div>))}
+            </Card>
+
+            {cvForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setCvForm(null)}>
+              <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:14,padding:28,maxWidth:540,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+                <L>{cvForm.mode==="add"?"Authorize Scanner":"Edit Authorization"}</L>
+                <Sel label="Scanner" value={cvForm.scanner_type} onChange={e=>setCvForm(prev=>({...prev,scanner_type:e.target.value}))} disabled={cvForm.mode==="edit"}>
+                  <option value="">Select a scanner...</option>
+                  {CLOUD_VULN_SCANNERS.map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+                </Sel>
+                <Input label="Display name" value={cvForm.display_name} onChange={e=>setCvForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Prod Prowler (us-east-1)" maxLength={128}/>
+                <Input label="Source IP allow-list (comma-separated IPs or CIDRs)" value={cvForm.allowed_cidrs} onChange={e=>setCvForm(prev=>({...prev,allowed_cidrs:e.target.value}))} placeholder="e.g. 10.0.0.0/24, 203.0.113.7" maxLength={512}/>
+                <M style={{color:C.td,display:"block",marginBottom:14}}>Scope: Global Dashboard server</M>
+                <Input label="Notes (optional)" value={cvForm.notes} onChange={e=>setCvForm(prev=>({...prev,notes:e.target.value}))} maxLength={1000}/>
+                {cvForm.mode==="edit"&&(<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:8}}><input type="checkbox" checked={cvForm.enabled} onChange={e=>setCvForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Enabled</M></label>)}
+                <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                  <Btn onClick={()=>setCvForm(null)}>Cancel</Btn>
+                  <Btn primary onClick={async()=>{
+                    const cidrs=cvForm.allowed_cidrs.split(",").map(x=>x.trim()).filter(Boolean);
+                    if(!cvForm.scanner_type){setCvError("Scanner is required");return;}
+                    if(!cvForm.display_name.trim()){setCvError("Display name is required");return;}
+                    if(cidrs.length===0){setCvError("At least one source IP / CIDR is required");return;}
+                    if(cvForm.mode==="add"){
+                      const r=await api.post("/api/cloud-vuln/authorizations",{scanner_type:cvForm.scanner_type,display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null});
+                      if(r&&!r.error&&r.token){showGdToast("Scanner authorized");setCvForm(null);setCvError(null);setCvNewToken(r.token);reloadCloudVuln();}
+                      else setCvError((r&&r.error)||"create failed");
+                    }else{
+                      const r=await api.put("/api/cloud-vuln/authorizations/"+cvForm.id,{display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null,enabled:cvForm.enabled});
+                      if(r&&!r.error){showGdToast("Authorization updated");setCvForm(null);setCvError(null);reloadCloudVuln();}
+                      else setCvError((r&&r.error)||"save failed");
+                    }
+                  }}>{cvForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
+                </div>
+              </div>
+            </div>)}
           </div>)}
 
-          {/* ══════════ CLOUD & IaC (R3k C40 wired) ══════════ */}
           {tab==="cloud_iac"&&(<div>
             <L>Cloud & Infrastructure as Code</L>
             <M style={{color:C.tm,display:"block",marginBottom:16}}>Generate signed deployment bundles for the GD Server (image, port 4001, GD_JWT_SECRET + GD_ENCRYPTION_KEY env vars). The server packages IaC files, an SPDX-JSON SBOM, and a Sigstore signature into a tar.gz ready to deploy.</M>

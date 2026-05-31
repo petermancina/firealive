@@ -1039,18 +1039,21 @@ After the org's change-management approves the update, the lead pushes it to pro
 3. Scanner runs, findings flow back through the org's vuln management process
 
 ### Cloud Vulnerability Scan
-**What it's for:** Allow cloud-environment vulnerability scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) authorized access to scan FireAlive instances deployed in cloud environments. Catches misconfigurations specific to cloud deployment — exposed cloud storage, misconfigured IAM roles, network ACL gaps, container image vulnerabilities, virtual device exposure — that could be leveraged to compromise FireAlive or pivot to other resources.
+**What it's for:** Authorize your organization's cloud-posture and IaC scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) to scan your FireAlive cloud deployment, and keep a tamper-evident record of every scan that reaches it. FireAlive does not run scans or store findings itself — scan results live in the scanner's own console, the same way EDR and threat-hunting integrations let approved tooling inspect FireAlive without FireAlive duplicating the tool. This is the cloud-posture companion to the endpoint-focused EDR/Threat Hunting integrations: FireAlive opens itself to authorized scanning by the org's security tooling and logs that access.
 
-This is the cloud-specific companion to the Vulnerability Scan feature (which authorizes traditional vulnerability scanners) and to EDR/Threat Hunting (which authorize endpoint and behavioral scanners). Same model: FireAlive opens itself to authorized scanning by the org's security tooling.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, Abuse Review Console, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
+
+FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled authorization are exempt from FireAlive's API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
 **Workflow:**
-1. Lead opens Cloud Vulnerability Scan
-2. Picks the scanners the org uses (one or more from the supported list)
-3. Configures the cloud environment FireAlive is deployed in (AWS / Azure / GCP / Hetzner / OVH / Exoscale)
-4. Schedules recurring scans (or runs ad-hoc)
-5. Scanners gain authorized access, run their checks against the FireAlive cloud deployment
-6. Findings come back in JSON/SARIF, displayed with severity and remediation guidance
-7. Lead remediates or assigns to platform team
+1. An administrator opens Cloud Vulnerability Scan and selects "Authorize Scanner"
+2. Picks the scanner type, names it, and sets the source-IP allow-list (the IPs or CIDRs the scanner originates from)
+3. FireAlive issues a one-time bearer token — copy it into the scanner's configuration now; it cannot be retrieved again
+4. The scanner runs its own checks against the FireAlive cloud deployment, presenting its token from an allow-listed IP
+5. FireAlive authorizes (or rejects) each access and records it in the scan-access log; findings remain in the scanner's console for the org's vulnerability-management process
+6. The administrator reviews the scan-access log, verifies the log's integrity (chain check), and can disable or revoke an authorization at any time — revoking immediately invalidates that scanner's token
+
+On the Global Dashboard server the same feature appears in its own console and authorizes scans of the GD server independently of any Management Console.
 
 ---
 

@@ -688,6 +688,67 @@ CREATE TRIGGER IF NOT EXISTS report_verifications_no_delete
   BEFORE DELETE ON report_verifications
   BEGIN SELECT RAISE(ABORT, 'report_verifications is permanent (no delete)'); END;
 
+-- ── B1: Cloud Vulnerability Scan (GD-server's own duplicated authorization
+-- config). Authorizes cloud-posture / IaC scanners to scan the GD-server in the
+-- cloud and logs every scan access in an append-only hash chain. The GD-server
+-- holds its OWN authorizations (independent of the MC); this is NOT a vulnerability
+-- aggregate/dashboard — it is the same EDR-style authorization + audit integration
+-- as on the main server, scoped to the GD-server.
+CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  scanner_type TEXT NOT NULL CHECK (scanner_type IN (
+    'scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov'
+  )),
+  display_name TEXT NOT NULL,
+  allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+  scope_components TEXT NOT NULL DEFAULT '[]',
+  token_hash TEXT NOT NULL,
+  token_salt TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_scan_at TEXT,
+  last_scan_source_ip TEXT,
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_vuln_auth_enabled
+  ON cloud_vuln_scanner_authorizations(enabled, scanner_type);
+
+CREATE TABLE IF NOT EXISTS cloud_vuln_scan_access_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  authorization_id TEXT REFERENCES cloud_vuln_scanner_authorizations(id) ON DELETE SET NULL,
+  scanner_type TEXT,
+  source_ip TEXT NOT NULL,
+  component TEXT NOT NULL CHECK (component IN (
+    'mc', 'ac', 'arc', 'main_server', 'gd_server'
+  )),
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'authorized', 'rejected_ip', 'rejected_token', 'rejected_disabled', 'rejected_unknown'
+  )),
+  request_path TEXT,
+  user_agent TEXT,
+  detail TEXT,
+  accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_accessed_at
+  ON cloud_vuln_scan_access_log(accessed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_outcome
+  ON cloud_vuln_scan_access_log(outcome);
+CREATE INDEX IF NOT EXISTS idx_cloud_vuln_access_auth
+  ON cloud_vuln_scan_access_log(authorization_id);
+
+CREATE TRIGGER IF NOT EXISTS cloud_vuln_scan_access_log_no_update
+  BEFORE UPDATE ON cloud_vuln_scan_access_log
+  BEGIN SELECT RAISE(ABORT, 'cloud_vuln_scan_access_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cloud_vuln_scan_access_log_no_delete
+  BEFORE DELETE ON cloud_vuln_scan_access_log
+  BEGIN SELECT RAISE(ABORT, 'cloud_vuln_scan_access_log is append-only'); END;
+
 INSERT OR IGNORE INTO config (key, value)
   VALUES ('instance_label', 'FireAlive Global Dashboard (unconfigured)');
 `;
