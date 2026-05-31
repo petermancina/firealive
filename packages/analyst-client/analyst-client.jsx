@@ -1117,6 +1117,7 @@ export default function AnalystClientApp() {
   const [kbModelStatus, setKbModelStatus] = useState(null);
   const [kbVerifying, setKbVerifying] = useState(false);
   const [kbProvisioning, setKbProvisioning] = useState(null);
+  const [kbModelScan, setKbModelScan] = useState(null);
   const kbBridge = () => (typeof window !== "undefined" ? window.firealive : null);
   // Lightweight, on-device check for acute-distress cues. This assistant is for
   // research education, not crisis support — on a hit we route to Post-Incident
@@ -1141,6 +1142,8 @@ export default function AnalystClientApp() {
     if (!b) { setKbModelStatus({ available: false, noBridge: true }); return; }
     try { setKbModelStatus(await b.invoke("kbChat:modelStatus", {})); }
     catch (_e) { setKbModelStatus({ available: false }); }
+    try { setKbModelScan(await b.invoke("kbChat:modelScanStatus", {})); }
+    catch (_e) {}
   };
   const verifyKbModels = async () => {
     const b = kbBridge();
@@ -3420,6 +3423,16 @@ export default function AnalystClientApp() {
                   {(mm.files||[]).map((ff)=>(<M key={ff.filename} style={{color:C.td,display:"block",fontSize:10,fontFamily:"monospace",wordBreak:"break-all"}}>{ff.filename} ({ff.sizeApprox}) — sha256: {ff.sha256}</M>))}
                 </div>);})}
               </div>}
+            </div>}
+            {kbModelScan && !kbModelScan.error && <div style={{padding:10,border:`1px solid ${C.b}`,borderRadius:8,marginBottom:10}}>
+              <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:6,fontSize:11}}>Model integrity &amp; safety gate</M>
+              {["chat","embed"].map((mid)=>{const g=kbModelScan[mid];const okp=g&&g.ok===true;const blocked=g&&g.ok===false;return (
+                <div key={mid} style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                  <M style={{color:C.tm,fontSize:11,textTransform:"capitalize",minWidth:46}}>{mid}</M>
+                  <Badge color={okp?C.a:(blocked?C.w:C.tm)}>{okp?"passed":(blocked?String(g.overall||"blocked").replace(/_/g," "):"not yet run")}</Badge>
+                  <M style={{color:blocked?C.w:C.tm,fontSize:11,lineHeight:1.5}}>{okp?"hash, format & malware checks clean":(blocked?(g.reason||"blocked before load"):"runs automatically before first use")}</M>
+                </div>);})}
+              <M style={{color:C.td,display:"block",fontSize:10,marginTop:4,lineHeight:1.5}}>Before the model loads, FireAlive checks the pinned hash, validates the GGUF format, and runs a local malware scan on this device. A file that fails any check is refused — it never loads.</M>
             </div>}
             {kbChatMsgs.length>0 && <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:10,maxHeight:360,overflowY:"auto"}}>
               {kbChatMsgs.map((msg,i)=>(

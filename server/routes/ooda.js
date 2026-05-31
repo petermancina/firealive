@@ -21,8 +21,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { generateScenario } = require('../services/ooda-scenario-generator');
-const { sanitize, SANITIZER_VERSION } = require('../services/content-sanitizer');
-const { IntegrationManager, INSPECTOR_VERSION } = require('../services/integration-manager');
+const { runUploadScans, scanAuditFragment } = require('../services/upload-scan');
 const oodaJobs = require('../services/ooda-generation-jobs');
 
 const MAX_POLICY_SIZE = 500000; // 500KB text max
@@ -70,46 +69,9 @@ function statusForGeneratorError(err) {
 //            error?, inspectorVersion},
 //   rejectedBy: 'layer1' | 'layer2' | null,
 // }
-async function runUploadScans(content, fileName, fileType) {
-  // Layer 1 — sanitizer (sync, deterministic, network-free)
-  const layer1 = sanitize(content, { fileName, fileType });
-  if (!layer1.clean) {
-    return { ok: false, layer1, layer2: null, rejectedBy: 'layer1' };
-  }
-
-  // Layer 2 — EDR (async; only runs if layer 1 cleared). The IntegrationManager
-  // is instantiated per upload because it caches a db handle in this.db; we
-  // open one, run the inspection, close it.
-  const db = getDb();
-  let layer2;
-  try {
-    const mgr = new IntegrationManager(db);
-    layer2 = await mgr.inspectFile(content, fileName, fileType);
-  } finally {
-    db.close();
-  }
-  if (!layer2.clean) {
-    return { ok: false, layer1, layer2, rejectedBy: 'layer2' };
-  }
-  return { ok: true, layer1, layer2, rejectedBy: null };
-}
-
-// Build the per-upload audit-log fragment that records both scan layers.
-// Used in the OODA_POLICY_UPLOADED and OODA_AAR_UPLOADED detail strings.
-function scanAuditFragment(scans) {
-  const parts = [
-    `sanitizer=${scans.layer1.sanitizerVersion}/${scans.layer1.scanId}`,
-  ];
-  if (scans.layer2 && scans.layer2.skipped) {
-    parts.push('edr=skipped');
-  } else if (scans.layer2) {
-    parts.push(
-      `edr=${scans.layer2.provider}/${scans.layer2.scanId || 'no-id'}`
-        + ` (${scans.layer2.latencyMs}ms)`
-    );
-  }
-  return parts.join(' ');
-}
+// runUploadScans + scanAuditFragment now live in ../services/upload-scan
+// (imported above) so the two-layer scan pipeline can be reused outside these
+// routes (e.g. by the model-file integrity & safety gate). Behavior unchanged.
 
 // ── Phase F4c: Threshold-mode replenishment check ───────────────────────────
 //

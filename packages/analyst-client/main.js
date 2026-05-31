@@ -424,6 +424,11 @@ ipcMain.handle('kbChat:provisioningInfo', async () => {
   catch (err) { return { error: (err.message || 'provisioning info failed').slice(0, 200), code: err.code || null }; }
 });
 
+ipcMain.handle('kbChat:modelScanStatus', async (_e, { which } = {}) => {
+  try { return localLlm.getModelSafetyStatus(which === 'chat' || which === 'embed' ? which : undefined); }
+  catch (err) { return { error: (err.message || 'scan status failed').slice(0, 200), code: err.code || null }; }
+});
+
 app.whenReady().then(() => {
   try { localLlm.setModelRoot(path.join(app.getPath('userData'), 'models')); } catch (_e) {}
   createWindow();

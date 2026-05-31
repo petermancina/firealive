@@ -1,4 +1,4 @@
-// FireAlive v1.0.47 — Research Knowledge Base (server-authoritative)
+// FireAlive v1.0.48 — Research Knowledge Base (server-authoritative)
 //
 // Server-side copy of the FireAlive Research Knowledge Base, extracted from
 // the management console (frontend/firealive-mc.jsx) where it previously lived

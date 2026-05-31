@@ -49,6 +49,8 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const kbLocal = require('./kb-local');
+const ggufValidate = require('./gguf-validate');
+const localMalwareScan = require('./local-malware-scan');
 
 // Minimal logger — the AC main process logs to the console.
 const log = {
@@ -118,6 +120,7 @@ let idleTimer = null;
 // Signature (size+mtime per file) of the last SHA-verified set, per model. Lets
 // idle-reload skip re-hashing a byte-stable model; a file swap changes it.
 let verifySig = { chat: null, embed: null };
+let lastGate = { chat: null, embed: null }; // last model-file integrity & safety gate result per model
 
 // ── Paths (trusted: env / app-configured / home; never request input) ─────────
 function setModelRoot(dir) {
@@ -174,9 +177,18 @@ function provisioningInfo() {
       endpointFloor: m.endpointFloor,
       files: m.files.map(f => ({ filename: f.filename, sizeApprox: f.sizeApprox, sha256: f.sha256 })),
       present: which === 'chat' ? chatModelPresent() : embedModelPresent(),
+      safety: lastGate[which]
+        ? { ok: lastGate[which].ok, overall: lastGate[which].overall, reason: lastGate[which].reason, at: lastGate[which].at }
+        : null,
     };
   }
   return out;
+}
+
+// Last model-file integrity & safety gate result (for the renderer / IPC).
+function getModelSafetyStatus(which) {
+  if (which) return lastGate[which] || null;
+  return { chat: lastGate.chat, embed: lastGate.embed };
 }
 
 function provisioningHint(which) {
@@ -240,15 +252,58 @@ async function verifyLocalModel(which) {
   return { ok: status === 'ok', status, which, files };
 }
 
-// Verify-before-load with a re-hash skip: only re-hashes when the on-disk file
-// set changed (size/mtime) since the last successful verify.
+// ── Model-file integrity & safety gate (fail-closed, on-device) ──────────────
+// Runs before the local loader reads the GGUF: hash-pin (layer 1) → GGUF format
+// validation (layer 3) → local malware scan (layer 4, by-path, nothing leaves
+// the device). Layer 2 (signature) is a server-side option; the AC gate is
+// hash / format / malware. Short-circuits on the first failing layer.
+async function runSafetyGate(which) {
+  const result = { ok: false, overall: 'loaded', reason: null, status: null, files: [], at: Date.now() };
+  const v = await verifyLocalModel(which); // layer 1 — hash-pin
+  result.status = v.status;
+  if (!v.ok) {
+    result.overall = 'blocked_hash';
+    result.reason = which + ' model failed verification (' + v.status + ')';
+    result.files = v.files.map(f => ({ filename: f.filename, hashPinOk: !!f.match, formatOk: null, malware: null }));
+    lastGate[which] = result;
+    return result;
+  }
+  for (const f of modelFilePaths(which)) {
+    const fr = { filename: f.filename, hashPinOk: true, formatOk: null, malware: null };
+    if (/\.gguf$/i.test(f.filename)) {
+      const fmt = ggufValidate.validateGguf(f.path); // layer 3 — format
+      fr.formatOk = !!fmt.ok;
+      if (!fmt.ok) {
+        result.overall = 'blocked_format';
+        result.reason = f.filename + ': GGUF format ' + fmt.reason + ' (' + fmt.code + ')';
+        result.files.push(fr); lastGate[which] = result; return result;
+      }
+    }
+    const mal = await localMalwareScan.scanModelFileLocal(f.path); // layer 4 — malware
+    fr.malware = {
+      scanner: mal.scanner || null,
+      outcome: mal.noScanner ? 'no-scanner' : (mal.error ? 'error' : (mal.clean ? 'clean' : 'threat')),
+      threats: mal.threats || [],
+    };
+    if (mal.noScanner) { result.overall = 'blocked_no_scanner'; result.reason = 'no local malware scanner available on this device'; result.files.push(fr); lastGate[which] = result; return result; }
+    if (mal.error) { result.overall = 'blocked_malware'; result.reason = f.filename + ': scan error: ' + mal.reason; result.files.push(fr); lastGate[which] = result; return result; }
+    if (!mal.clean) { result.overall = 'blocked_malware'; result.reason = f.filename + ': malware detected: ' + (mal.threats || []).join('; '); result.files.push(fr); lastGate[which] = result; return result; }
+    result.files.push(fr);
+  }
+  result.ok = true; result.overall = 'loaded';
+  lastGate[which] = result;
+  return result;
+}
+
+// Verify-before-load with a re-run skip: only re-runs the gate when the on-disk
+// file set changed (size/mtime) since the last successful gate pass.
 async function verifyBeforeLoad(which) {
   const sig = filesSignature(which);
   if (sig !== null && sig === verifySig[which]) return;
-  const v = await verifyLocalModel(which);
-  if (!v.ok) {
+  const gate = await runSafetyGate(which);
+  if (!gate.ok) {
     verifySig[which] = null;
-    throw unavailable(which + ' model failed verification (' + v.status + ') on this device. ' + provisioningHint(which));
+    throw unavailable(which + ' model failed the integrity & safety gate (' + gate.overall + '): ' + (gate.reason || 'unknown') + ' on this device. ' + provisioningHint(which));
   }
   verifySig[which] = sig;
 }
@@ -410,6 +465,7 @@ module.exports = {
   embedModelPresent,
   verifyLocalModel,
   provisioningInfo,
+  getModelSafetyStatus,
   getStatus,
   loadChat,
   loadEmbed,

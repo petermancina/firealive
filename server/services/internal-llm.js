@@ -107,6 +107,7 @@ let idleTimer = null;
 let loadingPromise = null;     // de-duplicates concurrent load requests
 let provisioning = null;       // lazily-required verify-only provisioning tool
 let chatVerifySig = null;      // signature of the last SHA-verified chat shard set
+const modelSafety = require('./model-file-safety'); // layered model-file integrity & safety gate
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -229,6 +230,43 @@ function chatFilesSignature() {
   } catch (_) { return null; }
 }
 
+// ── In-process loader hardening ──────────────────────────────────────────────
+// node-llama-cpp parses the GGUF and runs inference IN THIS PROCESS, so a loader
+// exploit executes with this process's privileges. The integrity & safety gate
+// (verifyModelFileSafety, above) is the primary mitigation; this is defence-in-
+// depth at the load point.
+//
+// Feasible in-JS control: refuse to load a native model as root in production
+// (a GGUF-parser RCE as root = full host compromise). Operators should run the
+// service as a dedicated non-root user. Escape hatch for constrained environments
+// that genuinely require it: FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1.
+//
+// Stronger isolation that CANNOT be enforced from here — apply at deployment:
+//   • run the container/service as a non-root user (USER in the Dockerfile)
+//   • mount the model directory read-only
+//   • drop Linux capabilities; apply a seccomp / AppArmor profile
+//   • deny network egress from the inference service (the model never needs it)
+//   • future work: move the loader into a sandboxed worker/subprocess with
+//     resource limits so a parser exploit is contained off the main process.
+function applyLoadHardening(modelPath) {
+  // POSIX privilege check (no-op where geteuid is unavailable, e.g. Windows).
+  if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
+    const allowRoot = process.env.FIREALIVE_ALLOW_ROOT_MODEL_LOAD === '1';
+    const production = process.env.NODE_ENV === 'production';
+    if (production && !allowRoot) {
+      const err = new Error(
+        'refusing to load the internal model as root in production: the GGUF loader runs ' +
+        'in-process, so a parser exploit would execute as root. Run the service as a non-root ' +
+        'user, or set FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1 to override.');
+      err.code = 'AI_INTERNAL_UNAVAILABLE';
+      err.modelSafety = { outcome: 'blocked_hardening', reason: 'root euid in production' };
+      throw err;
+    }
+    logger.warn('Loading the internal model as root; run the service as a non-root user for blast-radius containment',
+      { modelPath, production, allowRootOverride: allowRoot });
+  }
+}
+
 async function doLoadModel(modelPath) {
   // PRECONDITION: `modelPath` has either been (a) validated by
   // resolveAndValidateModelPath() against getModelRootPath() when the
@@ -247,14 +285,25 @@ async function doLoadModel(modelPath) {
   if (provisioning && typeof provisioning.verifyModel === 'function') {
     const sig = chatFilesSignature();
     if (sig !== chatVerifySig) {
-      const v = await provisioning.verifyModel('chat');
-      if (!v.ok) {
+      // Model-file integrity & safety gate (fail-closed) before the in-process
+      // loader reads the file: hash-pin (layer 1, = verifyModel) → optional
+      // signature → GGUF format validation → local malware scan. verifyModel
+      // runs inside the gate, so the SHA-256 is computed once; reuse the
+      // already-required provisioning tool for layer 1.
+      const gate = await modelSafety.verifyModelFileSafety('chat', {
+        actor: 'internal-llm',
+        deps: { verifyModel: (id) => provisioning.verifyModel(id) },
+      });
+      if (!gate.ok) {
         chatVerifySig = null;
         const err = new Error(
-          'internal chat model failed verification (' + v.status + '); refusing to load. ' +
-          'Provision the official Qwen2.5-14B q4_K_M shards, then verify: ' +
+          'internal chat model failed the integrity & safety gate (' + gate.overall + '): ' +
+          (gate.blockedReason || 'unknown reason') + '; refusing to load. ' +
+          'Provision the official Qwen2.5-14B q4_K_M shards and ensure a local malware ' +
+          'scanner (clamdscan/clamscan or Microsoft Defender) is available, then verify: ' +
           'node scripts/download-model.js --model chat');
         err.code = 'AI_INTERNAL_UNAVAILABLE';
+        err.modelSafety = { outcome: gate.overall, reason: gate.blockedReason };
         throw err;
       }
       chatVerifySig = sig;
@@ -283,6 +332,8 @@ async function doLoadModel(modelPath) {
   const stat = fs.statSync(modelPath);
   const filename = path.basename(modelPath);
   logger.info('Loading internal LLM', { path: modelPath, sizeBytes: stat.size });
+
+  applyLoadHardening(modelPath);
 
   const { getLlama } = llamaModule;
   const llama = await getLlama();

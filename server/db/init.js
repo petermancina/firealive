@@ -6641,6 +6641,61 @@ function initDb() {
     );
   }
 
+  // ── B1 (W2): model-file integrity & safety gate — server-side scan log ──────
+  // Append-only, per-layer record of every server-side model-file gate decision
+  // (hash-pin / signature / GGUF format / malware scan) made before a model is
+  // loaded. New table via CREATE IF NOT EXISTS (safe on existing DBs).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS model_file_scan_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id TEXT NOT NULL,
+        file_name TEXT,
+        sha256 TEXT,
+        hash_pin_ok INTEGER CHECK (hash_pin_ok IN (0, 1)),
+        signature_checked INTEGER NOT NULL DEFAULT 0 CHECK (signature_checked IN (0, 1)),
+        signature_ok INTEGER CHECK (signature_ok IN (0, 1)),
+        format_ok INTEGER CHECK (format_ok IN (0, 1)),
+        malware_scanner TEXT,
+        malware_outcome TEXT CHECK (malware_outcome IN ('clean', 'threat', 'error', 'skipped')),
+        threats TEXT NOT NULL DEFAULT '[]',
+        overall_outcome TEXT NOT NULL CHECK (overall_outcome IN (
+          'loaded', 'blocked_hash', 'blocked_signature', 'blocked_format',
+          'blocked_malware', 'blocked_no_scanner', 'error'
+        )),
+        detail TEXT,
+        actor TEXT,
+        scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_model_file_scan_log_scanned_at
+        ON model_file_scan_log(scanned_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_model_file_scan_log_model
+        ON model_file_scan_log(model_id, overall_outcome);
+
+      CREATE TRIGGER IF NOT EXISTS model_file_scan_log_no_update
+        BEFORE UPDATE ON model_file_scan_log
+        BEGIN SELECT RAISE(ABORT, 'model_file_scan_log is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS model_file_scan_log_no_delete
+        BEFORE DELETE ON model_file_scan_log
+        BEGIN SELECT RAISE(ABORT, 'model_file_scan_log is append-only'); END;
+    `);
+    const modelScanRows = db
+      .prepare("SELECT COUNT(*) as c FROM model_file_scan_log")
+      .get().c;
+    console.log(
+      `B1 migration: model_file_scan_log ready (${modelScanRows} scan record(s) present)`
+    );
+  } catch (b1ModelScanMigrationErr) {
+    console.error(
+      'B1 model_file_scan migration FAILED:',
+      b1ModelScanMigrationErr.message
+    );
+    console.error(
+      'The server will start, but server-side model-file gate decisions cannot be recorded: the integrity & safety gate still runs and fail-closes, only its audit log is unavailable. No other feature is affected. Recovery: run the CREATE TABLE / CREATE INDEX / CREATE TRIGGER statements above in a SQLite shell against the production DB.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();
