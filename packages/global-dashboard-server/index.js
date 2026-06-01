@@ -2874,10 +2874,15 @@ const CANONICAL_GD_TABLES = [
 
 function runGdRegression(db) {
   const tests = [];
+  const SKIP = (reason) => ({ __skip: true, detail: String(reason) });
   const record = (category, name, fn) => {
     try {
-      const detail = fn();
-      tests.push({ category, name, status: 'pass', detail: detail || 'ok' });
+      const r = fn();
+      if (r && typeof r === 'object' && r.__skip) {
+        tests.push({ category, name, status: 'skip', detail: r.detail || 'skipped' });
+      } else {
+        tests.push({ category, name, status: 'pass', detail: r || 'ok' });
+      }
     } catch (err) {
       tests.push({ category, name, status: 'fail', detail: String(err.message || err).slice(0, 500) });
     }
@@ -2890,6 +2895,11 @@ function runGdRegression(db) {
       throw new Error(`integrity_check returned ${JSON.stringify(r)}`);
     }
     return 'ok';
+  });
+  record('schema', 'foreign-key integrity', () => {
+    const rows = db.prepare('PRAGMA foreign_key_check').all();
+    if (rows.length > 0) throw new Error(`${rows.length} FK violation(s); first: ${JSON.stringify(rows[0])}`);
+    return 'no FK violations';
   });
   record('schema', 'canonical tables present', () => {
     const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
@@ -2911,6 +2921,35 @@ function runGdRegression(db) {
     const missing = required.filter(c => !names.includes(c));
     if (missing.length > 0) throw new Error(`signing_keys missing columns: ${missing.join(', ')}`);
     return `${cols.length} columns, all required present`;
+  });
+
+  // ── Crypto (3) ─────────────────────────────────────────────────────────
+  record('crypto', 'AES-256-GCM round-trip', () => {
+    const key = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(12);
+    const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const pt = Buffer.from('gd-regression');
+    const ct = Buffer.concat([c.update(pt), c.final()]);
+    const tag = c.getAuthTag();
+    const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    d.setAuthTag(tag);
+    const out = Buffer.concat([d.update(ct), d.final()]);
+    if (!out.equals(pt)) throw new Error('AES-256-GCM did not round-trip');
+    return 'AES-256-GCM ok';
+  });
+  record('crypto', 'SHA-256 hashing', () => {
+    const h = crypto.createHash('sha256').update('gd').digest('hex');
+    if (!/^[0-9a-f]{64}$/.test(h)) throw new Error('SHA-256 output malformed');
+    return 'SHA-256 ok';
+  });
+  record('crypto', 'Ed25519 sign/verify', () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const msg = Buffer.from('gd-sign');
+    const sig = crypto.sign(null, msg, privateKey);
+    if (!crypto.verify(null, msg, publicKey, sig)) throw new Error('Ed25519 verify failed');
+    const t = Buffer.from(msg); t[0] ^= 0xff;
+    if (crypto.verify(null, t, publicKey, sig)) throw new Error('Ed25519 verified a tampered message');
+    return 'Ed25519 sign/verify + tamper-detect ok';
   });
 
   // ── MC trust (3) ───────────────────────────────────────────────────────
@@ -2942,6 +2981,20 @@ function runGdRegression(db) {
     }
     if (!process.env.GD_JWT_SECRET) return 'using ephemeral fallback (set GD_JWT_SECRET for persistence across restarts)';
     return 'GD_JWT_SECRET env var present';
+  });
+  record('auth', 'auth flow round-trip (bcrypt + JWT)', () => {
+    const pw = 'rt-' + crypto.randomBytes(8).toString('hex');
+    const hash = bcrypt.hashSync(pw, 10);
+    if (!bcrypt.compareSync(pw, hash)) throw new Error('bcrypt failed to verify the correct password');
+    if (bcrypt.compareSync(pw + 'x', hash)) throw new Error('bcrypt accepted a wrong password');
+    const secret = JWT_SECRET || crypto.randomBytes(32).toString('hex');
+    const token = jwt.sign({ sub: 'regression', t: Date.now() }, secret, { algorithm: 'HS256', expiresIn: '60s' });
+    const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });
+    if (!decoded || decoded.sub !== 'regression') throw new Error('JWT did not round-trip the claim');
+    let rejected = false;
+    try { jwt.verify(token, secret + 'tamper', { algorithms: ['HS256'] }); } catch (_e) { rejected = true; }
+    if (!rejected) throw new Error('JWT verify accepted a wrong secret');
+    return 'bcrypt + JWT(HS256) round-trips ok';
   });
   record('auth', 'users table + CISO coverage', () => {
     const total = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -3000,6 +3053,24 @@ function runGdRegression(db) {
       throw new Error(`latest backup id=${latest.id} status=${latest.status}`);
     }
     return `latest id=${latest.id} status=${latest.status}`;
+  });
+
+  // ── Audit chain (1) ────────────────────────────────────────────────────
+  record('audit-chain', 'audit_log hash-chain linkage (B5a)', () => {
+    const cols = db.prepare('PRAGMA table_info(audit_log)').all().map(c => c.name);
+    if (!cols.includes('hash') || !cols.includes('prev_hash')) {
+      return SKIP('audit_log.hash/prev_hash not present yet — pending B5a (Audit Hash Chain)');
+    }
+    const rows = db.prepare('SELECT id, hash, prev_hash FROM audit_log ORDER BY id ASC LIMIT 5000').all();
+    if (rows.length === 0) return 'audit_log empty (chain trivially intact)';
+    let prev = null, breaks = 0, firstBreak = null;
+    for (const r of rows) {
+      if (!r.hash) { breaks++; if (!firstBreak) firstBreak = `row ${r.id} has no hash`; }
+      if (prev !== null && r.prev_hash !== prev) { breaks++; if (!firstBreak) firstBreak = `row ${r.id} prev_hash != prior hash`; }
+      prev = r.hash;
+    }
+    if (breaks > 0) throw new Error(`${breaks} chain break(s); first: ${firstBreak}`);
+    return `chain intact across ${rows.length} row(s)`;
   });
 
   // ── System (3) ─────────────────────────────────────────────────────────

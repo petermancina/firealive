@@ -175,7 +175,7 @@ module.exports = (checks) => ({
       id: 'A1.3',
       name: 'Recovery Testing',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 — /api/regression-test is a hardcoded-pass stub; no restore workflow; no restore_approvals table. Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. SOC-grade norm is quarterly DR testing; auditor will examine documented drill records.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 — /api/regression-test runs a real integration-test suite but is not a backup-restore drill; no restore workflow; no restore_approvals table. Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. SOC-grade norm is quarterly DR testing; auditor will examine documented drill records.',
     },
     // ── C1 Confidentiality ───────────────────────────────────────────────────
     {

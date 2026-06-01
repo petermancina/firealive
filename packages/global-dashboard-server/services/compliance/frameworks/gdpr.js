@@ -137,7 +137,7 @@ module.exports = (checks) => ({
       id: 'Art.32(1)(d)',
       name: 'Regular Testing of Technical and Organisational Measures',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). Art.32(1)(d) explicitly requires regular testing; quarterly is SOC-grade industry norm. Off-platform discipline applies until a future restore-workflow phase ships.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.32(1)(d) explicitly requires regular testing; quarterly is SOC-grade industry norm. Off-platform discipline applies until a future restore-workflow phase ships.',
     },
     {
       id: 'Art.32(2)',

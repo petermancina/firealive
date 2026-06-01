@@ -2417,15 +2417,16 @@ export default function GlobalDashboard() {
               setRegressionRunning(true);setRegressionResult(null);
               const r=await api.post("/api/regression-test",{});
               setRegressionRunning(false);
-              if(r&&!r.error){setRegressionResult(r);showGdToast(r.passed+"/"+r.total+" passed");}
+              if(r&&!r.error){setRegressionResult(r);showGdToast(r.passed+"/"+r.total+" passed"+(r.skipped>0?", "+r.skipped+" skip":""));}
               else showGdToast("Test failed: "+(r?.error||"unknown"));
             }}>{regressionRunning?"Running...":"Run Regression Test"}</Btn>
             {regressionResult&&<Card style={{marginTop:16}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                 <M style={{color:C.t,fontWeight:500}}>{regressionResult.timestamp?new Date(regressionResult.timestamp).toLocaleString():""}</M>
-                <Badge color={regressionResult.overall==="pass"?C.a:C.d}>{regressionResult.passed}/{regressionResult.total} {regressionResult.overall}</Badge>
+                <Badge color={regressionResult.overall==="pass"?C.a:C.d}>{regressionResult.passed}/{regressionResult.total} {regressionResult.overall}{regressionResult.skipped>0?" · "+regressionResult.skipped+" skip":""}</Badge>
               </div>
-              {regressionResult.tests?.map((t,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{t.name}</M><M style={{color:t.status==="pass"?C.a:C.d,fontWeight:500}}>{t.status?.toUpperCase()}</M></div>)}
+              {(()=>{const by={};(regressionResult.tests||[]).forEach(t=>{const k=t.category||"other";by[k]=by[k]||{p:0,s:0,n:0,f:false};by[k].n++;if(t.status==="pass")by[k].p++;else if(t.status==="skip")by[k].s++;else by[k].f=true;});const cats=Object.keys(by).sort();return cats.length?(<div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>{cats.map(c=><span key={c} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:`1px solid ${by[c].f?C.d:C.b}`,color:by[c].f?C.d:C.tm}}>{c} {by[c].p}/{by[c].n}{by[c].s>0?" ·"+by[c].s+" skip":""}</span>)}</div>):null;})()}
+              {regressionResult.tests?.map((t,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{t.name}</M><M style={{color:t.status==="pass"?C.a:t.status==="skip"?C.i:C.d,fontWeight:500}}>{t.status?.toUpperCase()}</M></div>)}
               <Btn small style={{marginTop:10}} onClick={()=>{const blob=new Blob([JSON.stringify(regressionResult,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="regression-"+Date.now()+".json";a.click();}}>Export Result</Btn>
             </Card>}
           </div>)}

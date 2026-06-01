@@ -149,7 +149,7 @@ module.exports = (checks) => ({
       id: 'Art.24-25',
       name: 'Digital Operational Resilience Testing Programme',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). Art.24 annual minimum is operator-managed off-platform discipline: provision side-by-side GD instance, restore from backup, verify recovery. Threat-led penetration testing under Art.26 is operator-coordinated with third-party testers regardless of platform feature state.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.24 annual minimum is operator-managed off-platform discipline: provision side-by-side GD instance, restore from backup, verify recovery. Threat-led penetration testing under Art.26 is operator-coordinated with third-party testers regardless of platform feature state.',
     },
     {
       id: 'Art.25',

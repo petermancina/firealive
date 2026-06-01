@@ -5418,14 +5418,15 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 fuse:r.fuse,
                 passed:r.passed||0,
                 failed:r.failed||0,
-                warnings:0,
+                skipped:r.skipped||0,
                 total:r.total||0,
+                summary:r.summary||{},
                 checks:(r.results||[]).map(c=>({id:c.category,name:c.name,status:c.status,detail:c.detail})),
               });
-              addA("REGRESSION_RUN","MC regression: "+(r.passed||0)+"/"+(r.total||0)+" pass, "+(r.failed||0)+" fail");
+              addA("REGRESSION_RUN","MC regression: "+(r.passed||0)+"/"+(r.total||0)+" pass, "+(r.failed||0)+" fail, "+(r.skipped||0)+" skip");
             }catch(err){
               const msg=(err.response&&err.response.data&&err.response.data.message)||err.message||"Regression run failed";
-              setRegressionResults({timestamp:new Date().toISOString(),version:appVersion,passed:0,failed:1,warnings:0,total:1,checks:[{id:"RUNNER",name:"Regression runner",status:"fail",detail:msg}]});
+              setRegressionResults({timestamp:new Date().toISOString(),version:appVersion,passed:0,failed:1,skipped:0,total:1,summary:{},checks:[{id:"RUNNER",name:"Regression runner",status:"fail",detail:msg}]});
               addA("REGRESSION_RUN_FAILED",msg);
             }finally{
               setRegressionRunning(false);
@@ -5435,11 +5436,20 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <div style={{display:"flex",gap:12,marginBottom:16}}>
               <Card style={{flex:1,padding:12,borderColor:C.a+"30",textAlign:"center"}}><div style={{fontSize:24,fontWeight:700,color:C.a}}>{regressionResults.passed}</div><M style={{color:C.tm}}>Passed</M></Card>
               <Card style={{flex:1,padding:12,borderColor:C.d+"30",textAlign:"center"}}><div style={{fontSize:24,fontWeight:700,color:regressionResults.failed>0?C.d:C.td}}>{regressionResults.failed}</div><M style={{color:C.tm}}>Failed</M></Card>
-              <Card style={{flex:1,padding:12,borderColor:C.w+"30",textAlign:"center"}}><div style={{fontSize:24,fontWeight:700,color:regressionResults.warnings>0?C.w:C.td}}>{regressionResults.warnings}</div><M style={{color:C.tm}}>Warnings</M></Card>
+              <Card style={{flex:1,padding:12,borderColor:C.i+"30",textAlign:"center"}}><div style={{fontSize:24,fontWeight:700,color:regressionResults.skipped>0?C.i:C.td}}>{regressionResults.skipped||0}</div><M style={{color:C.tm}}>Skipped</M></Card>
             </div>
+            {regressionResults.summary&&Object.keys(regressionResults.summary).length>0&&(
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>
+                {Object.keys(regressionResults.summary).sort().map(cat=>{const s=regressionResults.summary[cat];const bad=s.status==="fail";return(
+                  <span key={cat} style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:`1px solid ${bad?C.d:C.b}`,color:bad?C.d:C.tm,background:bad?C.dd:C.s}}>
+                    {cat} {s.passed}/{s.total}{s.skipped>0?" ·"+s.skipped+" skip":""}
+                  </span>
+                );})}
+              </div>
+            )}
             {regressionResults.checks.map((c,i)=>(
-              <Card key={i} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${c.status==="pass"?C.a:c.status==="warning"?C.w:C.d}`}}>
-                <div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{c.name}</M><Badge color={c.status==="pass"?C.a:c.status==="warning"?C.w:C.d}>{c.status}</Badge></div>
+              <Card key={i} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${c.status==="pass"?C.a:c.status==="skip"?C.i:c.status==="warning"?C.w:C.d}`}}>
+                <div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{c.name}</M><Badge color={c.status==="pass"?C.a:c.status==="skip"?C.i:c.status==="warning"?C.w:C.d}>{c.status}</Badge></div>
                 <M style={{color:C.td}}>{c.detail}</M>
                 {c.recommendation&&<M style={{color:C.w,display:"block",marginTop:4}}>{c.recommendation}</M>}
               </Card>

@@ -527,7 +527,7 @@ const REMEDIATIONS = {
   checkDrTestRecency: {
     summary: 'Perform off-platform DR drill until in-platform DR test infrastructure ships',
     steps: [
-      'CURRENT STATE: GD has no application-layer DR test infrastructure (/api/regression-test is a hardcoded-pass stub; no restore workflow)',
+      'CURRENT STATE: GD has no application-layer DR test infrastructure (/api/regression-test runs a real integration-test suite but is not a backup-restore drill; no restore workflow)',
       'Off-platform DR drill (SOC-grade norm: quarterly): provision a side-by-side GD instance; restore from backup; verify users/MCs/metrics are correctly recovered; document the drill in your operator runbook',
       'FUTURE STATE: B2 (v1.0.47) builds the regression test runner with real integration tests; B4 (v1.0.49) builds compromise scan orchestration; a future restore-workflow phase would close the DR-drill gap entirely',
       'Until then, schedule and document off-platform drills',

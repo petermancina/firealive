@@ -131,7 +131,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [32]',
       name: 'Systematic Testing of Controls',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). CPS 234 para 32 requirement for systematic testing (including vulnerability testing, penetration testing, response exercises) is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; APRA-grade norm is quarterly.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). CPS 234 para 32 requirement for systematic testing (including vulnerability testing, penetration testing, response exercises) is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; APRA-grade norm is quarterly.',
     },
     {
       id: 'CPS 234 [35]',

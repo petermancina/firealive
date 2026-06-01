@@ -151,7 +151,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(f)',
       name: 'Effectiveness Assessment of Cybersecurity Risk Management Measures',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). Art.21(2)(f) requirement for assessment of measures effectiveness is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; SOC-grade norm is quarterly.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.21(2)(f) requirement for assessment of measures effectiveness is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; SOC-grade norm is quarterly.',
     },
     {
       id: 'Art.21(2)(g)',

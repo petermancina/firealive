@@ -196,7 +196,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(7)(ii)(D)',
       name: 'Testing and Revision Procedures (Addressable)',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. Addressable specification; in-platform automation lands when a future restore-workflow phase ships.',
+      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. Addressable specification; in-platform automation lands when a future restore-workflow phase ships.',
     },
   ],
   customerResponsibility: [

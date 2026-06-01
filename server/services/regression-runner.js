@@ -79,12 +79,12 @@
 // run() returns:
 //
 //   {
-//     total, passed, failed, ranAt, version, fuse,
+//     total, passed, failed, skipped, ranAt, version, fuse,
 //     results: [
-//       { category, name, status: 'pass'|'fail', detail }, ...
+//       { category, name, status: 'pass'|'fail'|'skip', detail }, ...
 //     ],
 //     summary: {
-//       <category>: { passed: <n>, total: <n>, status: 'pass'|'fail' },
+//       <category>: { passed: <n>, skipped: <n>, total: <n>, status: 'pass'|'fail' },
 //       ...
 //     },
 //     failures: [ <subset of results where status='fail'> ]
@@ -117,13 +117,20 @@ class RegressionRunner {
     this.db = db;
   }
 
-  run() {
+  async run() {
     const results = [];
 
-    const check = (category, name, fn) => {
+    // A check may return SKIP(reason) to record a 'skip' (e.g. a control
+    // whose backing feature lands in a later phase). Skips count toward the
+    // total but never fail the suite or flip a category to 'fail'.
+    const SKIP = (reason) => ({ __skip: true, detail: String(reason) });
+
+    const check = async (category, name, fn) => {
       try {
-        const r = fn();
-        if (r === false || r === undefined || r === null || r === '') {
+        const r = await fn();
+        if (r && typeof r === 'object' && r.__skip) {
+          results.push({ category, name, status: 'skip', detail: r.detail || 'skipped' });
+        } else if (r === false || r === undefined || r === null || r === '') {
           results.push({ category, name, status: 'fail', detail: 'check returned no detail' });
         } else {
           results.push({ category, name, status: 'pass', detail: String(r) });
@@ -163,23 +170,28 @@ class RegressionRunner {
     };
 
     // ── Category 1: Schema integrity ───────────────────────────────
-    check('schema', 'SQLite integrity_check', () => {
+    await check('schema', 'SQLite integrity_check', () => {
       const r = this.db.prepare('PRAGMA integrity_check').get();
       if (r && r.integrity_check === 'ok') return 'integrity ok';
       throw new Error('integrity_check returned: ' + JSON.stringify(r));
     });
-    check('schema', 'Core canonical tables', () => {
+    await check('schema', 'Foreign-key integrity', () => {
+      const rows = this.db.prepare('PRAGMA foreign_key_check').all();
+      if (rows.length === 0) return 'no FK violations';
+      throw new Error(rows.length + ' FK violation(s); first: ' + JSON.stringify(rows[0]));
+    });
+    await check('schema', 'Core canonical tables', () => {
       return requireAll(['users', 'team_config', 'audit_log', 'system_meta']);
     });
-    check('schema', 'R3j routing tables', () => {
+    await check('schema', 'R3j routing tables', () => {
       return requireAll(['soar_routing_events', 'ticket_actions', 'ticket_assignments', 'routing_caps']);
     });
-    check('schema', 'R3k CI/CD + cloud-iac tables', () => {
+    await check('schema', 'R3k CI/CD + cloud-iac tables', () => {
       return requireAll(['cicd_configs', 'cicd_runs', 'cloud_iac_signing_keys']);
     });
 
     // ── Category 2: Crypto ─────────────────────────────────────────
-    check('crypto', 'AES-256-GCM round-trip', () => {
+    await check('crypto', 'AES-256-GCM round-trip', () => {
       const key = crypto.randomBytes(32);
       const iv  = crypto.randomBytes(12);
       const c = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -191,19 +203,19 @@ class RegressionRunner {
       if (pt !== 'hello') throw new Error('decrypt mismatch');
       return 'encrypt/decrypt ok';
     });
-    check('crypto', 'SHA-256 hashing', () => {
+    await check('crypto', 'SHA-256 hashing', () => {
       const h = crypto.createHash('sha256').update('x').digest('hex');
       if (h.length !== 64) throw new Error('unexpected digest length');
       return 'digest 64 hex chars';
     });
-    check('crypto', 'Ed25519 sign/verify', () => {
+    await check('crypto', 'Ed25519 sign/verify', () => {
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
       const msg = Buffer.from('regression-probe');
       const sig = crypto.sign(null, msg, privateKey);
       if (!crypto.verify(null, msg, publicKey, sig)) throw new Error('verify failed');
       return 'sign+verify ok';
     });
-    check('crypto', 'NaCl box (tweetnacl) round-trip', () => {
+    await check('crypto', 'NaCl box (tweetnacl) round-trip', () => {
       if (!nacl) throw new Error('tweetnacl not loadable');
       const a = nacl.box.keyPair();
       const b = nacl.box.keyPair();
@@ -216,15 +228,15 @@ class RegressionRunner {
     });
 
     // ── Category 3: Auth ───────────────────────────────────────────
-    check('auth', 'JWT_SECRET configured', () => {
+    await check('auth', 'JWT_SECRET configured', () => {
       const s = process.env.JWT_SECRET;
       if (!s || s.length < 16) throw new Error('JWT_SECRET not set or too short (<16 chars)');
       return 'configured (' + s.length + ' chars)';
     });
-    check('auth', 'api_keys + mfa_consumed_jtis tables', () => {
+    await check('auth', 'api_keys + mfa_consumed_jtis tables', () => {
       return requireAll(['api_keys', 'mfa_consumed_jtis']);
     });
-    check('auth', 'TOTP recovery code columns', () => {
+    await check('auth', 'TOTP recovery code columns', () => {
       const hasHashed = columnExists('users', 'totp_recovery_codes_hashed');
       const hasRem    = columnExists('users', 'totp_recovery_codes_remaining');
       if (!hasHashed || !hasRem) {
@@ -237,9 +249,52 @@ class RegressionRunner {
       }
       return 'both recovery columns present';
     });
+    await check('auth', 'Auth flow round-trip (bcrypt + JWT + TOTP)', () => {
+      // Exercises the real auth primitives with throwaway values (no DB,
+      // no side effects): password hash/verify, JWT HS256 sign/verify
+      // (using the install secret when present), and TOTP generate/verify.
+      const bcrypt = require('bcryptjs');
+      const jwt = require('jsonwebtoken');
+      const speakeasy = require('speakeasy');
+      const pw = 'rt-' + crypto.randomBytes(8).toString('hex');
+      const hash = bcrypt.hashSync(pw, 10);
+      if (!bcrypt.compareSync(pw, hash)) throw new Error('bcrypt failed to verify the correct password');
+      if (bcrypt.compareSync(pw + 'x', hash)) throw new Error('bcrypt accepted a wrong password');
+      const secret = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+      const token = jwt.sign({ sub: 'regression', t: Date.now() }, secret, { algorithm: 'HS256', expiresIn: '60s' });
+      const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });
+      if (!decoded || decoded.sub !== 'regression') throw new Error('JWT did not round-trip the claim');
+      let rejected = false;
+      try { jwt.verify(token, secret + 'tamper', { algorithms: ['HS256'] }); } catch (_e) { rejected = true; }
+      if (!rejected) throw new Error('JWT verify accepted a wrong secret');
+      const totpSecret = speakeasy.generateSecret({ length: 20 }).base32;
+      const otp = speakeasy.totp({ secret: totpSecret, encoding: 'base32' });
+      if (!speakeasy.totp.verify({ secret: totpSecret, encoding: 'base32', token: otp, window: 1 })) {
+        throw new Error('TOTP did not verify a freshly generated code');
+      }
+      return 'bcrypt + JWT(HS256) + TOTP round-trips ok';
+    });
+
+    // ── Category: IAM ──────────────────────────────────────────────
+    await check('iam', 'IAM offboarding columns + detector (B5b)', () => {
+      // Forward-aware + auto-activating. R0 added the offboarding columns; the
+      // scheduled IdP detector that writes them lands in B5b (IAM Real IdP
+      // Integration). Verify the columns exist now; skip the detector assertion
+      // until B5b populates last_iam_check, at which point this auto-activates.
+      const cols = ['last_iam_check', 'active', 'offboarded_at', 'external_id', 'auth_method'];
+      const missing = cols.filter(c => !columnExists('users', c));
+      if (missing.length > 0) throw new Error('missing users column(s): ' + missing.join(', '));
+      const probed = this.db
+        .prepare("SELECT COUNT(*) AS c FROM users WHERE last_iam_check IS NOT NULL")
+        .get();
+      if (!probed || probed.c === 0) {
+        return SKIP('offboarding columns present; IdP detector not yet writing last_iam_check — pending B5b');
+      }
+      return 'offboarding columns present; detector has run (' + probed.c + ' user(s) checked)';
+    });
 
     // ── Category 4: Anti-rollback ──────────────────────────────────
-    check('anti-rollback', 'Fuse counter row present in system_meta', () => {
+    await check('anti-rollback', 'Fuse counter row present in system_meta', () => {
       const row = this.db
         .prepare("SELECT value FROM system_meta WHERE key='fuse_counter'")
         .get();
@@ -248,7 +303,7 @@ class RegressionRunner {
       if (!Number.isInteger(n) || n < 0) throw new Error('fuse_counter not a non-negative integer: ' + row.value);
       return 'fuse = ' + n;
     });
-    check('anti-rollback', 'Fuse counter matches package.json', () => {
+    await check('anti-rollback', 'Fuse counter matches package.json', () => {
       const row = this.db
         .prepare("SELECT value FROM system_meta WHERE key='fuse_counter'")
         .get();
@@ -270,18 +325,18 @@ class RegressionRunner {
     });
 
     // ── Category 5: Integrations ───────────────────────────────────
-    check('integrations', 'integration_config table reachable', () => {
+    await check('integrations', 'integration_config table reachable', () => {
       if (!tableExists('integration_config')) throw new Error('missing table integration_config');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM integration_config').get().n;
       return c + ' integration_config row(s)';
     });
-    check('integrations', 'kms_providers registered', () => {
+    await check('integrations', 'kms_providers registered', () => {
       if (!tableExists('kms_providers')) throw new Error('missing table kms_providers');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM kms_providers').get().n;
       if (c === 0) return 'no providers registered (local-master-key fallback in use)';
       return c + ' provider(s) registered';
     });
-    check('integrations', 'KMS provider round-trip (each active)', () => {
+    await check('integrations', 'KMS provider round-trip (each active)', () => {
       if (!tableExists('kms_providers')) throw new Error('missing table kms_providers');
       let kmsService;
       try {
@@ -320,33 +375,81 @@ class RegressionRunner {
       }
       return okCount + '/' + active.length + ' provider(s) round-trip ok';
     });
+    await check('integrations', 'GD-push signing round-trip (Ed25519 + fingerprint)', () => {
+      // Exercises the real GD-push key primitives (no DB, no writes): generate
+      // an Ed25519 keypair, confirm the content-addressed fingerprint is stable,
+      // and round-trip a detached signature over a sample body — the same
+      // primitive the cross-region push outbox signs with — incl. tamper-detect.
+      const gdkeys = require('./gd-push-signing-keys');
+      const kp = gdkeys.generateKeypair();
+      if (!kp.publicKeyPem || !kp.privateKeyPem) throw new Error('keypair generation returned no PEM');
+      if (!/^[0-9a-f]{64}$/.test(kp.publicKeyFingerprint)) throw new Error('fingerprint is not 64 hex chars');
+      if (gdkeys.computePublicKeyFingerprint(kp.publicKeyPem) !== kp.publicKeyFingerprint) {
+        throw new Error('fingerprint not stable across recompute');
+      }
+      const body = Buffer.from(JSON.stringify({ probe: 'regression', t: Date.now() }), 'utf8');
+      const sig = crypto.sign(null, body, kp.privateKeyPem);
+      if (!crypto.verify(null, body, kp.publicKeyPem, sig)) throw new Error('signature did not verify');
+      const tampered = Buffer.from(body); tampered[0] ^= 0xff;
+      if (crypto.verify(null, tampered, kp.publicKeyPem, sig)) throw new Error('signature verified a tampered body');
+      return 'Ed25519 keygen + fingerprint + sign/verify round-trip ok';
+    });
+
+    // ── Category: Helper-pay ───────────────────────────────────────
+    await check('helper-pay', 'Points-ledger append + balance-cache invariant', () => {
+      // Verifies the helper-pay points-ledger model on an in-memory clone of the
+      // live schema (zero production writes). Mirrors appendLedger/getBalanceInternal:
+      // balance_after caches the running total and the latest row (created_at DESC,
+      // id DESC) holds the current balance. A throwaway user satisfies the FK.
+      const mem = cloneLiveSchema(this.db);
+      try {
+        if (!mem.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='helper_points_ledger'").get()) {
+          throw new Error('helper_points_ledger not in cloned schema');
+        }
+        const uid = 'rt-' + crypto.randomBytes(6).toString('hex');
+        mem.prepare("INSERT INTO users (id, username, role, name) VALUES (?, ?, 'analyst', ?)").run(uid, uid, uid);
+        const ins = (id, delta, balAfter) => mem.prepare(
+          "INSERT INTO helper_points_ledger (id, user_id, delta, reason, balance_after) VALUES (?, ?, ?, 'rating_received', ?)"
+        ).run(id, uid, delta, balAfter);
+        ins('a-' + uid, 10, 10);
+        ins('b-' + uid, 5, 15);
+        const row = mem.prepare(
+          "SELECT balance_after AS b FROM helper_points_ledger WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).get(uid);
+        const bal = row ? row.b : 0;
+        if (bal !== 15) throw new Error('cached balance ' + bal + ' != expected 15');
+        return 'ledger append + cached balance (15) verified on cloned schema';
+      } finally {
+        try { mem.close(); } catch (_e) { /* ignore */ }
+      }
+    });
 
     // ── Category 6: Burnout signals ────────────────────────────────
-    check('burnout', 'Burnout engine tables', () => {
+    await check('burnout', 'Burnout engine tables', () => {
       return requireAll(['analyst_baselines', 'analyst_signals', 'analyst_impacts', 'signal_readings']);
     });
-    check('burnout', 'AI provider config present', () => {
+    await check('burnout', 'AI provider config present', () => {
       if (!tableExists('ai_provider_config')) throw new Error('missing table ai_provider_config');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM ai_provider_config').get().n;
       return c + ' provider config row(s)';
     });
-    check('burnout', 'AI inference provenance log present', () => {
+    await check('burnout', 'AI inference provenance log present', () => {
       if (!tableExists('ai_inference_log')) throw new Error('missing table ai_inference_log');
       return 'ai_inference_log table present';
     });
 
     // ── Category 7: Routing ────────────────────────────────────────
-    check('routing', 'Routing tables (caps + overrides)', () => {
+    await check('routing', 'Routing tables (caps + overrides)', () => {
       return requireAll(['routing_caps', 'routing_overrides']);
     });
-    check('routing', 'team_config.routing_enabled present (R3j)', () => {
+    await check('routing', 'team_config.routing_enabled present (R3j)', () => {
       const row = this.db
         .prepare("SELECT value FROM team_config WHERE key='routing_enabled'")
         .get();
       if (!row) throw new Error('no routing_enabled row in team_config (R3j C2 migration may have failed)');
       return 'value = ' + row.value;
     });
-    check('routing', 'team_config.panic_mode key reachable', () => {
+    await check('routing', 'team_config.panic_mode key reachable', () => {
       const row = this.db
         .prepare("SELECT value FROM team_config WHERE key='panic_mode'")
         .get();
@@ -356,7 +459,7 @@ class RegressionRunner {
       if (!row) return 'no panic_mode row (default: inactive)';
       return 'value = ' + row.value;
     });
-    check('routing', 'soar_routing_events composite UNIQUE index (R3j C1)', () => {
+    await check('routing', 'soar_routing_events composite UNIQUE index (R3j C1)', () => {
       if (!indexExists('idx_soar_routing_events_external')) {
         throw new Error('missing idx_soar_routing_events_external');
       }
@@ -364,17 +467,17 @@ class RegressionRunner {
     });
 
     // ── Category 8: Backup ─────────────────────────────────────────
-    check('backup', 'backups table v2 columns', () => {
+    await check('backup', 'backups table v2 columns', () => {
       const required = ['format_version', 'manifest_path', 'archive_path', 'wrapped_key_path', 'signing_key_id'];
       const missing = required.filter(c => !columnExists('backups', c));
       if (missing.length > 0) throw new Error('missing column(s): ' + missing.join(', '));
       return 'all v2 columns present';
     });
-    check('backup', 'backups.kind column present (R3k C2)', () => {
+    await check('backup', 'backups.kind column present (R3k C2)', () => {
       if (!columnExists('backups', 'kind')) throw new Error('missing column kind');
       return 'kind column present';
     });
-    check('backup', 'backup_signing_keys has an active key', () => {
+    await check('backup', 'backup_signing_keys has an active key', () => {
       if (!tableExists('backup_signing_keys')) throw new Error('missing table backup_signing_keys');
       const row = this.db
         .prepare("SELECT COUNT(*) AS n FROM backup_signing_keys WHERE is_active = 1")
@@ -389,7 +492,7 @@ class RegressionRunner {
       }
       return row.n + ' active signing key(s)';
     });
-    check('backup', 'backup_schedules has at least one row', () => {
+    await check('backup', 'backup_schedules has at least one row', () => {
       if (!tableExists('backup_schedules')) throw new Error('missing table backup_schedules');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM backup_schedules').get().n;
       if (c === 0) throw new Error('no schedules (legacy default row should have been seeded by R3i)');
@@ -397,12 +500,12 @@ class RegressionRunner {
     });
 
     // ── Category 9: Audit chain ────────────────────────────────────
-    check('audit-chain', 'audit_log table reachable', () => {
+    await check('audit-chain', 'audit_log table reachable', () => {
       if (!tableExists('audit_log')) throw new Error('missing table audit_log');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n;
       return c + ' audit row(s)';
     });
-    check('audit-chain', 'backup_chain linkage walk (last 10 entries)', () => {
+    await check('audit-chain', 'backup_chain linkage walk (last 10 entries)', () => {
       if (!tableExists('backup_chain')) {
         // backup_chain is created lazily by the chain service; a
         // fresh install may legitimately have no entries.
@@ -423,7 +526,7 @@ class RegressionRunner {
       }
       return rows.length + ' entries linked ok';
     });
-    check('audit-chain', 'chain_signing_keys has an active key', () => {
+    await check('audit-chain', 'chain_signing_keys has an active key', () => {
       if (!tableExists('chain_signing_keys')) throw new Error('missing table chain_signing_keys');
       const row = this.db
         .prepare("SELECT COUNT(*) AS n FROM chain_signing_keys WHERE is_active = 1")
@@ -431,16 +534,38 @@ class RegressionRunner {
       if (row.n === 0) throw new Error('no active chain signing key');
       return row.n + ' active chain signing key(s)';
     });
+    await check('audit-chain', 'audit_log hash-chain linkage (B5a)', () => {
+      // Forward-aware + auto-activating. The audit_log SHA-256 hash chain lands
+      // in B5a (ALTER TABLE audit_log ADD COLUMN hash/prev_hash). Until those
+      // columns exist this skips; once they exist it verifies the chain LINKAGE
+      // (each row's prev_hash equals the prior row's hash) — detecting breaks,
+      // reordering, or deletions without coupling to B5a's exact hash formula.
+      if (!columnExists('audit_log', 'hash') || !columnExists('audit_log', 'prev_hash')) {
+        return SKIP('audit_log.hash/prev_hash not present yet — pending B5a (Audit Hash Chain)');
+      }
+      const rows = this.db
+        .prepare("SELECT id, hash, prev_hash FROM audit_log ORDER BY id ASC LIMIT 5000")
+        .all();
+      if (rows.length === 0) return 'audit_log empty (chain trivially intact)';
+      let prev = null, breaks = 0, firstBreak = null;
+      for (const r of rows) {
+        if (!r.hash) { breaks++; if (!firstBreak) firstBreak = 'row ' + r.id + ' has no hash'; }
+        if (prev !== null && r.prev_hash !== prev) { breaks++; if (!firstBreak) firstBreak = 'row ' + r.id + ' prev_hash != prior hash'; }
+        prev = r.hash;
+      }
+      if (breaks > 0) throw new Error(breaks + ' chain break(s); first: ' + firstBreak);
+      return 'chain intact across ' + rows.length + ' row(s)';
+    });
 
     // ── Category 10: Peer features ────────────────────────────────
-    check('peer', 'Peer session + message + rating tables', () => {
+    await check('peer', 'Peer session + message + rating tables', () => {
       return requireAll(['peer_sessions', 'peer_messages', 'peer_session_ratings']);
     });
-    check('peer', 'peer_abuse_flags table present', () => {
+    await check('peer', 'peer_abuse_flags table present', () => {
       if (!tableExists('peer_abuse_flags')) throw new Error('missing table peer_abuse_flags');
       return 'peer_abuse_flags present';
     });
-    check('peer', 'Peer-message E2E key column on users', () => {
+    await check('peer', 'Peer-message E2E key column on users', () => {
       // The peer-message NaCl box key pair is per-user. Canonical
       // column names (R3-era): peer_pubkey (or analogous).
       const candidates = ['peer_pubkey', 'peer_public_key', 'peer_box_pubkey'];
@@ -450,9 +575,30 @@ class RegressionRunner {
       }
       return 'column present: ' + present[0];
     });
+    await check('peer', 'Peer skill-share E2E envelope round-trip', () => {
+      // Mirrors the client-sealed, server-relayed peer skill-share envelope:
+      // a sender seals to the recipient's public key and the recipient opens.
+      // The server is content-blind, so this verifies the E2E primitive the
+      // relay depends on — including authentication (tamper -> open fails).
+      if (!nacl) throw new Error('tweetnacl not available');
+      const sender = nacl.box.keyPair();
+      const recipient = nacl.box.keyPair();
+      const nonce = nacl.randomBytes(nacl.box.nonceLength);
+      const msg = Buffer.from('skill-share: tune your SIEM correlation window', 'utf8');
+      const boxed = nacl.box(new Uint8Array(msg), nonce, recipient.publicKey, sender.secretKey);
+      const opened = nacl.box.open(boxed, nonce, sender.publicKey, recipient.secretKey);
+      if (!opened || Buffer.from(opened).toString('utf8') !== msg.toString('utf8')) {
+        throw new Error('peer envelope did not round-trip');
+      }
+      const tampered = boxed.slice();
+      tampered[0] ^= 0xff;
+      const openTampered = nacl.box.open(tampered, nonce, sender.publicKey, recipient.secretKey);
+      if (openTampered) throw new Error('peer envelope opened despite tampering (authentication broken)');
+      return 'box seal/open round-trip + tamper-detection ok';
+    });
 
     // ── Category 11: AC provisioning ──────────────────────────────
-    check('ac-prov', '/api/heartbeat route file loadable', () => {
+    await check('ac-prov', '/api/heartbeat route file loadable', () => {
       try {
         const mod = require('../routes/heartbeat');
         if (!mod) throw new Error('heartbeat module loaded but exported nothing');
@@ -461,11 +607,11 @@ class RegressionRunner {
         throw new Error('require failed: ' + e.message);
       }
     });
-    check('ac-prov', 'analyst_availability table present', () => {
+    await check('ac-prov', 'analyst_availability table present', () => {
       if (!tableExists('analyst_availability')) throw new Error('missing table analyst_availability');
       return 'analyst_availability present';
     });
-    check('ac-prov', 'users has analyst-role rows', () => {
+    await check('ac-prov', 'users has analyst-role rows', () => {
       if (!columnExists('users', 'role')) throw new Error('users.role column missing');
       const c = this.db
         .prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'analyst'")
@@ -474,20 +620,20 @@ class RegressionRunner {
     });
 
     // ── Category 12: System ────────────────────────────────────────
-    check('system', 'Node.js version >= 18', () => {
+    await check('system', 'Node.js version >= 18', () => {
       const major = parseInt(process.version.replace(/^v/, '').split('.')[0], 10);
       if (!Number.isFinite(major) || major < 18) {
         throw new Error('Node ' + process.version + ' is below the supported floor (>=18)');
       }
       return 'Node ' + process.version;
     });
-    check('system', 'Process memory (RSS) within sane bounds', () => {
+    await check('system', 'Process memory (RSS) within sane bounds', () => {
       const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
       // Soft ceiling 4 GB; over that and we want to know.
       if (rssMb > 4096) throw new Error('RSS ' + rssMb + ' MB exceeds 4 GB soft ceiling');
       return rssMb + ' MB RSS';
     });
-    check('system', 'Security middleware loadable', () => {
+    await check('system', 'Security middleware loadable', () => {
       const mods = [
         'security-hardening',
         'cors-policy',
@@ -507,21 +653,91 @@ class RegressionRunner {
       if (failures.length > 0) throw new Error('failed to load: ' + failures.join('; '));
       return mods.length + ' middleware module(s) loadable';
     });
-    check('system', 'sessions + auth_log tables', () => {
+    await check('system', 'sessions + auth_log tables', () => {
       return requireAll(['sessions', 'auth_log']);
+    });
+    await check('system', 'In-memory schema-clone harness', () => {
+      // Validates the side-effect-free harness used by write-path flow
+      // checks (they exercise real INSERT/constraint logic against an
+      // in-memory clone of the live schema, never the production DB).
+      const mem = cloneLiveSchema(this.db);
+      try {
+        const n = mem.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type='table'").get().c;
+        if (!n || n < 1) throw new Error('clone produced no tables');
+        return 'cloned ' + n + ' table(s) into :memory:';
+      } finally {
+        try { mem.close(); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    // ── Category: AI dispatcher ────────────────────────────────────
+    await check('ai', 'AI dispatcher graceful-fail (IR-simulator wiring)', async () => {
+      // The IR-Simulator OODA generator must be loadable and wired to the
+      // dispatcher. We probe the dispatcher with a SENTINEL feature id that has
+      // no config row, so it fast-fails AI_NOT_CONFIGURED before any provider
+      // call or inference-log write — zero side effects, no real generation.
+      const oodaGen = require('./ooda-scenario-generator');
+      if (!oodaGen || typeof oodaGen !== 'object') throw new Error('ooda-scenario-generator not loadable');
+      const aiProvider = require('./ai-provider');
+      if (typeof aiProvider.generate !== 'function') throw new Error('ai-provider.generate is not a function');
+      const sentinel = '__regression_probe_' + crypto.randomBytes(4).toString('hex');
+      let code = null;
+      try {
+        await aiProvider.generate(sentinel, 'probe', {});
+      } catch (e) {
+        code = e && e.code;
+      }
+      if (code !== 'AI_NOT_CONFIGURED') {
+        throw new Error('expected AI_NOT_CONFIGURED for an unconfigured feature, got ' + code);
+      }
+      return 'dispatcher reachable; unconfigured feature -> AI_NOT_CONFIGURED (graceful)';
+    });
+
+    // ── Category: Model-file safety ────────────────────────────────
+    await check('model-safety', 'Model-file safety gate fail-closed (hash mismatch)', async () => {
+      // Verifies the layered model-file safety gate FAILS CLOSED when the hash
+      // layer reports a mismatch. All collaborators are injected (deps) and the
+      // audit sink (getDb) returns a fresh in-memory clone of the live schema
+      // per call (logRow owns and closes it) — entirely side-effect-free: no
+      // model file, no scanner, no network, no write to the production
+      // model_file_scan_log.
+      const modelSafety = require('./model-file-safety');
+      const res = await modelSafety.verifyModelFileSafety('regression-probe', {
+        actor: 'regression',
+        deps: {
+          verifyModel: async () => ({
+            ok: false,
+            status: 'mismatch',
+            files: [{ filename: 'probe.gguf', path: '/nonexistent/probe.gguf', present: true, match: false, expected: 'aa', actual: 'bb' }],
+          }),
+          getDb: () => cloneLiveSchema(this.db),
+          // Not reached on a hash mismatch, but stubbed so a future ordering
+          // change can never touch the real filesystem/scanner from here.
+          validateGguf: () => ({ ok: false, reason: 'stubbed' }),
+          scanModelFileLocal: async () => ({ scanned: false, clean: false, scanner: 'stub', threats: [] }),
+          verifyModelSignature: () => ({ ok: false }),
+        },
+      });
+      if (res.ok) throw new Error('gate returned ok=true on a hash mismatch (not fail-closed)');
+      if (!res.blockedReason && res.overall === 'loaded') throw new Error('gate did not block; overall=' + res.overall);
+      return 'gate fail-closed on hash mismatch (' + res.overall + ')';
     });
 
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
-    const failed = results.length - passed;
+    const skipped = results.filter(r => r.status === 'skip').length;
+    const failed = results.filter(r => r.status === 'fail').length;
 
-    // Per-category summary
+    // Per-category summary. A 'skip' counts toward total + skipped but
+    // never flips a category to 'fail'.
     const summary = {};
     for (const r of results) {
-      if (!summary[r.category]) summary[r.category] = { passed: 0, total: 0, status: 'pass' };
-      summary[r.category].total++;
-      if (r.status === 'pass') summary[r.category].passed++;
-      else summary[r.category].status = 'fail';
+      if (!summary[r.category]) summary[r.category] = { passed: 0, skipped: 0, total: 0, status: 'pass' };
+      const s = summary[r.category];
+      s.total++;
+      if (r.status === 'pass') s.passed++;
+      else if (r.status === 'skip') s.skipped++;
+      else s.status = 'fail';
     }
 
     const failures = results.filter(r => r.status === 'fail');
@@ -542,6 +758,7 @@ class RegressionRunner {
       total: results.length,
       passed,
       failed,
+      skipped,
       results,
       ranAt: new Date().toISOString(),
       version: versionStr,
@@ -550,6 +767,28 @@ class RegressionRunner {
       failures,
     };
   }
+}
+
+// Build a throwaway in-memory SQLite database that mirrors the live schema,
+// by replaying the live DB's own DDL (tables, then indexes, then triggers).
+// Used by write-path flow checks so they exercise real INSERT/constraint/
+// trigger logic with zero writes/locks against the production database.
+function cloneLiveSchema(db) {
+  const Database = db.constructor; // better-sqlite3 Database class
+  const mem = new Database(':memory:');
+  mem.exec('PRAGMA foreign_keys=ON;');
+  const rank = { table: 0, index: 1, trigger: 2 };
+  const objs = db
+    .prepare("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index','trigger')")
+    .all()
+    .sort((a, b) => (rank[a.type] - rank[b.type]));
+  for (const o of objs) {
+    // Replay in dependency order; tolerate any single object that cannot be
+    // recreated in isolation (e.g. an index/trigger referencing a view) so a
+    // single odd object never aborts the clone.
+    try { mem.exec(o.sql + ';'); } catch (_e) { /* skip that object */ }
+  }
+  return mem;
 }
 
 module.exports = { RegressionRunner };

@@ -75,12 +75,12 @@ function writeAuditEvent(req, eventType, detail) {
   }
 }
 
-router.post('/run', (req, res) => {
+router.post('/run', async (req, res) => {
   let result;
   try {
     const db = getDb();
     const runner = new RegressionRunner(db);
-    result = runner.run();
+    result = await runner.run();
   } catch (runErr) {
     logger.error('regression run failed at top level', { error: runErr.message });
     return res.status(500).json({
