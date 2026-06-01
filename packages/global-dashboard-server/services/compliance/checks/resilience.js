@@ -23,11 +23,11 @@
 //   - GD has no restore_approvals table. The MC's DR test gauge is
 //     restore_approvals.status='consumed' rows; the GD has no
 //     restore workflow at all and therefore no DR test signal of
-//     that kind. Closest proxies: /api/regression-test (a stub
-//     endpoint returning hardcoded pass without exercising real
-//     test logic) and /api/compromise-scan (which DOES log a
+//     that kind. Closest proxies: /api/regression-test (a real
+//     integration-test suite that is not a backup-restore drill)
+//     and /api/compromise-scan (which DOES log a
 //     COMPROMISE_SCAN audit event). Neither is a true backup-restore
-//     drill; the GD has no DR test infrastructure as of v0.0.31.
+//     drill; the GD has no backup-restore DR-drill infrastructure as of v0.0.31.
 //   - GD has no ir_policies table. checkIrPlanExists returns warning;
 //     IR planning for the GD is operator-managed off-platform.
 //   - GD has no sla_config table. Notification thresholds live in
@@ -110,10 +110,10 @@ function checkBackupMultiDestination(db) {
 }
 
 // ── checkDrTestRecency ───────────────────────────────────────────────────────
-// Verifies disaster recovery test recency. The GD has no real DR test
-// infrastructure as of v0.0.31:
-//   - /api/regression-test is a stub returning hardcoded pass without
-//     exercising backup-restore logic (no audit_log entry).
+// Verifies disaster recovery test recency. The GD has no backup-restore
+// DR-drill infrastructure as of v0.0.31:
+//   - /api/regression-test runs a real integration-test suite (and writes
+//     a REGRESSION_RUN audit entry) but does not exercise backup-restore.
 //   - /api/compromise-scan does log a COMPROMISE_SCAN audit event but
 //     is a self-scan, not a recovery drill.
 //   - There is no restore workflow on the GD (no restore_approvals
@@ -131,7 +131,7 @@ function checkDrTestRecency(db) {
   if (compromiseScans.c > 0) {
     return {
       status: 'warning',
-      detail: `GD has no application-layer DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test is a hardcoded-pass stub). ${compromiseScans.c} compromise-scan event(s) in last 90 days provide partial self-integrity signal but are not a true backup-restore drill. SOC-grade DR testing on the GD is currently operator-managed off-platform.`,
+      detail: `GD has no application-layer DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). ${compromiseScans.c} compromise-scan event(s) in last 90 days provide partial self-integrity signal but are not a true backup-restore drill. SOC-grade DR testing on the GD is currently operator-managed off-platform.`,
     };
   }
   return {
