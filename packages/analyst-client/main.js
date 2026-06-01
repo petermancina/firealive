@@ -435,3 +435,5 @@ app.whenReady().then(() => {
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+// Stop the isolated model utilityProcess cleanly when the app quits.
+app.on('before-quit', () => { try { localLlm.shutdownUtil(); } catch (_e) { /* ignore */ } });

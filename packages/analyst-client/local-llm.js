@@ -111,12 +111,17 @@ const IDLE_UNLOAD_MS = resolveIdleUnloadMs();
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let modelRootOverride = null;
-let llamaModule = null;
-let llama = null;
-let chatModel = null, chatContext = null;
-let embedModel = null, embedContext = null;
 let embeddingIndex = null, indexMeta = null;
 let idleTimer = null;
+// ── Isolated utilityProcess (on-device; contained loader + inference) ─────────
+let util = null;                 // Electron UtilityProcess
+let utilReady = false;
+let utilReadyWaiters = [];
+let current = null;              // single in-flight request { match, resolve, reject, timer }
+let chain = Promise.resolve();   // single-flight executor
+const loaded = { chat: false, embed: false };
+let utilForkForTest = null;      // test injection hook (see __setUtilityFork)
+const UTIL_TIMEOUT_MS = Number(process.env.FIREALIVE_LOCAL_LLM_TIMEOUT_MS) || 120000;
 // Signature (size+mtime per file) of the last SHA-verified set, per model. Lets
 // idle-reload skip re-hashing a byte-stable model; a file swap changes it.
 let verifySig = { chat: null, embed: null };
@@ -153,8 +158,8 @@ function getStatus() {
   const embedPresent = embedModelPresent();
   return {
     modelRoot: getModelRootPath(),
-    chat: { present: chatPresent, ready: !!(chatModel && chatContext), loadFile: MODELS.chat.loadFile, path: getChatModelPath(), shards: MODELS.chat.files.length },
-    embed: { present: embedPresent, ready: !!(embedModel && embedContext), loadFile: MODELS.embed.loadFile, path: getEmbedModelPath() },
+    chat: { present: chatPresent, ready: loaded.chat, loadFile: MODELS.chat.loadFile, path: getChatModelPath(), shards: MODELS.chat.files.length },
+    embed: { present: embedPresent, ready: loaded.embed, loadFile: MODELS.embed.loadFile, path: getEmbedModelPath() },
     dim: EXPECTED_DIM,
     kbVersion: kbLocal.KB_VERSION,
     indexReady: embeddingIndex !== null,
@@ -308,63 +313,111 @@ async function verifyBeforeLoad(which) {
   verifySig[which] = sig;
 }
 
-// ── node-llama-cpp loader ─────────────────────────────────────────────────────
-function requireLlama() {
-  if (llamaModule) return llamaModule;
-  try {
-    llamaModule = require('node-llama-cpp');
-  } catch (err) {
-    throw unavailable('node-llama-cpp not available on this device: ' + err.message);
+// ── Isolated utilityProcess host (on-device; nothing leaves the machine) ──────
+function spawnUtil() {
+  const scriptPath = path.join(__dirname, 'model-utility.js');
+  let forkFn = utilForkForTest;
+  if (!forkFn) {
+    let up;
+    try { up = require('electron').utilityProcess; } catch (e) { throw unavailable('utilityProcess unavailable: ' + e.message); }
+    if (!up || typeof up.fork !== 'function') throw unavailable('Electron utilityProcess.fork unavailable');
+    forkFn = (p) => up.fork(p, [], { serviceName: 'firealive-model', stdio: 'inherit' });
   }
-  return llamaModule;
-}
-async function getLlamaInstance() {
-  if (llama) return llama;
-  const { getLlama } = requireLlama();
-  llama = await getLlama();
-  return llama;
+  util = forkFn(scriptPath);
+  utilReady = false;
+  util.on('message', onUtilMessage);
+  util.on('exit', onUtilExit);
 }
 
-async function loadChat() {
-  if (chatModel && chatContext) return;
-  await verifyBeforeLoad('chat');           // refuses on missing/mismatch, before any load
-  const modelPath = getChatModelPath();
-  const l = await getLlamaInstance();
-  try {
-    chatModel = await l.loadModel({ modelPath });
-    chatContext = await chatModel.createContext();
-  } catch (err) {
-    chatModel = null; chatContext = null;
-    throw unavailable('failed to load chat model on this device: ' + (err.message || String(err)));
+function finishCurrent(m, err) {
+  if (!current) return;
+  const c = current; current = null;
+  if (c.timer) clearTimeout(c.timer);
+  if (err) c.reject(err); else c.resolve(m);
+}
+
+function onUtilMessage(m) {
+  if (!m || typeof m.t !== 'string') return;
+  if (m.t === 'log') { const lv = m.level || 'info'; (log[lv] || log.info)('[model-utility] ' + m.msg, m.meta || undefined); return; }
+  if (m.t === 'ready') { utilReady = true; const w = utilReadyWaiters; utilReadyWaiters = []; w.forEach((r) => r()); return; }
+  if (m.t === 'loaded' && m.kind) loaded[m.kind] = true;
+  if (m.t === 'unloaded') { if (m.kind === 'all' || !m.kind) { loaded.chat = false; loaded.embed = false; } else loaded[m.kind] = false; }
+  if (current) {
+    if (m.t === 'error') { const e = new Error(m.message || 'utility error'); e.code = m.code || 'AC_LOCAL_UNAVAILABLE'; finishCurrent(null, e); return; }
+    if (current.match(m)) { finishCurrent(m, null); return; }
   }
+}
+
+function onUtilExit(code) {
+  utilReady = false; util = null; loaded.chat = false; loaded.embed = false;
+  if (current) finishCurrent(null, unavailable('model utility exited (' + code + ')'));
+  log.warn('model utility exited', { code });
+}
+
+async function ensureUtil() {
+  if (util && utilReady) return;
+  if (!util) spawnUtil();
+  if (!utilReady) {
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(unavailable('model utility did not become ready')), UTIL_TIMEOUT_MS);
+      utilReadyWaiters.push(() => { clearTimeout(to); resolve(); });
+    });
+  }
+}
+
+function runUtil(msg, match) {
+  const op = async () => {
+    await ensureUtil();
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const e = new Error('model utility timed out'); e.code = 'AC_LOCAL_FAILED';
+        finishCurrent(null, e);
+        try { if (util) util.kill(); } catch (_e) { /* ignore */ }
+      }, UTIL_TIMEOUT_MS);
+      current = { match, resolve, reject, timer };
+      try { util.postMessage(msg); } catch (e) { finishCurrent(null, unavailable('failed to message utility: ' + e.message)); }
+    });
+  };
+  const result = chain.then(op, op);
+  chain = result.then(() => {}, () => {});
+  return result;
+}
+
+function shutdownUtil() {
+  try { if (util) { if (typeof util.removeAllListeners === 'function') util.removeAllListeners('exit'); util.kill(); } } catch (_e) { /* ignore */ }
+  util = null; utilReady = false; loaded.chat = false; loaded.embed = false;
+  if (current) finishCurrent(null, unavailable('model utility shut down'));
+}
+
+// Test seam: inject a fake fork(scriptPath) -> UtilityProcess-like EventEmitter.
+function __setUtilityFork(fn) { utilForkForTest = fn; }
+
+async function loadChat() {
+  if (loaded.chat) return;
+  await verifyBeforeLoad('chat');           // gate runs in main, before any load
+  const modelPath = getChatModelPath();
+  let size = 0; try { size = fs.statSync(modelPath).size; } catch (_e) { /* worker re-stats */ }
+  await runUtil({ t: 'load', kind: 'chat', modelPath, expectedSizeBytes: size }, (m) => m.t === 'loaded' && m.kind === 'chat');
   resetIdleTimer();
-  log.info('chat model loaded');
+  log.info('chat model loaded (isolated)');
 }
 
 async function loadEmbed() {
-  if (embedModel && embedContext) return;
+  if (loaded.embed) return;
   await verifyBeforeLoad('embed');
   const modelPath = getEmbedModelPath();
-  const l = await getLlamaInstance();
-  try {
-    embedModel = await l.loadModel({ modelPath });
-    embedContext = await embedModel.createEmbeddingContext();
-  } catch (err) {
-    embedModel = null; embedContext = null;
-    throw unavailable('failed to load embedding model on this device: ' + (err.message || String(err)));
-  }
+  let size = 0; try { size = fs.statSync(modelPath).size; } catch (_e) { /* worker re-stats */ }
+  await runUtil({ t: 'load', kind: 'embed', modelPath, expectedSizeBytes: size }, (m) => m.t === 'loaded' && m.kind === 'embed');
   resetIdleTimer();
-  log.info('embedding model loaded');
+  log.info('embedding model loaded (isolated)');
 }
 
 async function unloadAll() {
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-  for (const [ctx, mdl] of [[chatContext, chatModel], [embedContext, embedModel]]) {
-    if (ctx) { try { await ctx.dispose(); } catch (_e) {} }
-    if (mdl) { try { await mdl.dispose(); } catch (_e) {} }
-  }
-  chatContext = chatModel = embedContext = embedModel = null;
-  log.info('local models unloaded');
+  // Stop the utility process entirely — frees all model memory and resets the
+  // blast radius; it respawns lazily on next use.
+  shutdownUtil();
+  log.info('local models unloaded (utility stopped)');
 }
 
 // ── Embedding + index ─────────────────────────────────────────────────────────
@@ -375,10 +428,10 @@ async function embed(text) {
   await loadEmbed();
   let vector;
   try {
-    const r = await embedContext.getEmbeddingFor(text);
-    vector = Array.from(r.vector);
+    const m = await runUtil({ t: 'embed', id: 'e', text }, (x) => x.t === 'embedding');
+    vector = m.vector;
   } catch (err) {
-    const e = new Error('embedding inference failed: ' + (err.message || String(err))); e.code = 'AC_LOCAL_FAILED'; throw e;
+    const e = new Error('embedding inference failed: ' + (err.message || String(err))); e.code = err.code || 'AC_LOCAL_FAILED'; throw e;
   }
   resetIdleTimer();
   return vector;
@@ -441,13 +494,12 @@ async function generate(prompt, options) {
   const maxTokens = options.maxTokens || 700;
   const temperature = (options.temperature !== undefined) ? options.temperature : 0.3;
   await loadChat();
-  const { LlamaChatSession } = requireLlama();
-  const session = new LlamaChatSession({ contextSequence: chatContext.getSequence() });
   let text;
   try {
-    text = await session.prompt(prompt, { temperature, maxTokens });
+    const m = await runUtil({ t: 'generate', id: 'g', prompt, options: { maxTokens, temperature } }, (x) => x.t === 'result');
+    text = m.text;
   } catch (err) {
-    const e = new Error('local inference failed: ' + (err.message || String(err))); e.code = 'AC_LOCAL_FAILED'; throw e;
+    const e = new Error('local inference failed: ' + (err.message || String(err))); e.code = err.code || 'AC_LOCAL_FAILED'; throw e;
   }
   resetIdleTimer();
   return { text, modelName: MODELS.chat.loadFile, tokenCount: estimateTokens(prompt, text) };
@@ -476,4 +528,6 @@ module.exports = {
   ensureIndex,
   search,
   generate,
+  shutdownUtil,
+  __setUtilityFork,
 };

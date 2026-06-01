@@ -98,9 +98,6 @@ function resolveIdleUnloadMs() {
 const IDLE_UNLOAD_MS = resolveIdleUnloadMs();
 
 // Module-level state
-let llamaModule = null;       // lazily-required node-llama-cpp module
-let model = null;              // loaded LlamaModel instance
-let context = null;            // active LlamaContext
 let modelInfo = null;          // { path, name, sizeBytes, loadedAt }
 let lastInferenceAt = null;
 let idleTimer = null;
@@ -108,11 +105,13 @@ let loadingPromise = null;     // de-duplicates concurrent load requests
 let provisioning = null;       // lazily-required verify-only provisioning tool
 let chatVerifySig = null;      // signature of the last SHA-verified chat shard set
 const modelSafety = require('./model-file-safety'); // layered model-file integrity & safety gate
+const { getSharedHost } = require('./model-worker-host'); // isolated child-process loader
+const workerHost = getSharedHost({ logger }); // chat (+ embed) run in a separate process
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
 function isReady() {
-  return model !== null && context !== null;
+  return modelInfo !== null && workerHost.isLoaded('chat');
 }
 
 function getStatus() {
@@ -125,11 +124,12 @@ function getStatus() {
     lastInferenceAt,
     idleUnloadMs: IDLE_UNLOAD_MS,
     available: modelFileExists(),
+    isolated: true,
   };
 }
 
 async function loadModel(modelPath) {
-  if (model && context) {
+  if (isReady()) {
     // Already loaded; return immediately
     return;
   }
@@ -161,14 +161,9 @@ async function unloadModel() {
     clearTimeout(idleTimer);
     idleTimer = null;
   }
-  if (context) {
-    try { await context.dispose(); } catch (_) { /* ignore */ }
-    context = null;
-  }
-  if (model) {
-    try { await model.dispose(); } catch (_) { /* ignore */ }
-    model = null;
-  }
+  // Unload the chat model from the shared worker (frees the heavyweight model;
+  // the worker process persists for embeddings, which kb-embeddings owns).
+  try { await workerHost.unload('chat'); } catch (_) { /* ignore */ }
   modelInfo = null;
   logger.info('Internal LLM unloaded');
 }
@@ -188,29 +183,17 @@ async function generate(prompt, options) {
     throw err;
   }
 
-  // Ensure the chat session uses a fresh sequence so prior calls don't
-  // leak context across unrelated features.
-  const { LlamaChatSession } = llamaModule;
-  const session = new LlamaChatSession({ contextSequence: context.getSequence() });
-
-  let outputText;
-  try {
-    outputText = await session.prompt(prompt, {
-      temperature,
-      maxTokens,
-    });
-  } catch (err) {
-    const wrapped = new Error('inference failed: ' + (err.message || String(err)));
-    wrapped.code = 'AI_INFERENCE_FAILED';
-    throw wrapped;
-  }
+  // Inference runs in the isolated worker process; the host carries the
+  // AI_INFERENCE_FAILED / AI_INTERNAL_UNAVAILABLE contract back on failure.
+  const result = await workerHost.generate(prompt, { maxTokens, temperature });
+  const outputText = result.text;
 
   lastInferenceAt = new Date().toISOString();
   resetIdleTimer();
 
   return {
     text: outputText,
-    modelName: modelInfo ? modelInfo.name : null,
+    modelName: (modelInfo ? modelInfo.name : null) || result.modelName || null,
     tokenCount: estimateTokens(prompt, outputText),
   };
 }
@@ -230,24 +213,21 @@ function chatFilesSignature() {
   } catch (_) { return null; }
 }
 
-// ── In-process loader hardening ──────────────────────────────────────────────
-// node-llama-cpp parses the GGUF and runs inference IN THIS PROCESS, so a loader
-// exploit executes with this process's privileges. The integrity & safety gate
-// (verifyModelFileSafety, above) is the primary mitigation; this is defence-in-
-// depth at the load point.
+// ── Loader privilege hardening (parent-side, pre-handoff) ────────────────────
+// The GGUF is parsed and inference runs in a SEPARATE worker process
+// (model-worker-host) — that isolation is the containment control, and the
+// integrity & safety gate (verifyModelFileSafety, above) is the primary control.
+// This function is the parent-side privilege check run BEFORE the path is handed
+// to the worker: it refuses to load a native model as root in production (a
+// parser RCE as root = full host compromise, and a worker forked from a root
+// parent inherits root). The worker re-checks the same condition. Escape hatch
+// for constrained environments that genuinely require it:
+// FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1.
 //
-// Feasible in-JS control: refuse to load a native model as root in production
-// (a GGUF-parser RCE as root = full host compromise). Operators should run the
-// service as a dedicated non-root user. Escape hatch for constrained environments
-// that genuinely require it: FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1.
-//
-// Stronger isolation that CANNOT be enforced from here — apply at deployment:
-//   • run the container/service as a non-root user (USER in the Dockerfile)
-//   • mount the model directory read-only
-//   • drop Linux capabilities; apply a seccomp / AppArmor profile
-//   • deny network egress from the inference service (the model never needs it)
-//   • future work: move the loader into a sandboxed worker/subprocess with
-//     resource limits so a parser exploit is contained off the main process.
+// Deployment confinement — non-root user, read-only model mount, dropped Linux
+// capabilities, seccomp/AppArmor, resource limits, no network egress — and the
+// remaining sidecar / in-process-privilege-drop options are documented in
+// docs/model-loader-isolation.md.
 function applyLoadHardening(modelPath) {
   // POSIX privilege check (no-op where geteuid is unavailable, e.g. Windows).
   if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
@@ -255,8 +235,8 @@ function applyLoadHardening(modelPath) {
     const production = process.env.NODE_ENV === 'production';
     if (production && !allowRoot) {
       const err = new Error(
-        'refusing to load the internal model as root in production: the GGUF loader runs ' +
-        'in-process, so a parser exploit would execute as root. Run the service as a non-root ' +
+        'refusing to load the internal model as root in production: a worker forked here would ' +
+        'inherit root, so a GGUF-parser exploit would execute as root. Run the service as a non-root ' +
         'user, or set FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1 to override.');
       err.code = 'AI_INTERNAL_UNAVAILABLE';
       err.modelSafety = { outcome: 'blocked_hardening', reason: 'root euid in production' };
@@ -316,29 +296,22 @@ async function doLoadModel(modelPath) {
     throw err;
   }
 
-  // Lazy-require node-llama-cpp so the dispatcher can be imported even when
-  // the dependency isn't installed (e.g. during the F4a commit sequence
-  // before package.json is updated in commit 9).
-  if (!llamaModule) {
-    try {
-      llamaModule = require('node-llama-cpp');
-    } catch (err) {
-      const wrapped = new Error('node-llama-cpp not available: ' + err.message);
-      wrapped.code = 'AI_INTERNAL_UNAVAILABLE';
-      throw wrapped;
-    }
-  }
-
   const stat = fs.statSync(modelPath);
   const filename = path.basename(modelPath);
   logger.info('Loading internal LLM', { path: modelPath, sizeBytes: stat.size });
 
+  // Parent-side privilege gate before we hand the path to the worker (the
+  // worker re-checks too). Refuses to load as root in production.
   applyLoadHardening(modelPath);
 
-  const { getLlama } = llamaModule;
-  const llama = await getLlama();
-  model = await llama.loadModel({ modelPath });
-  context = await model.createContext();
+  // Load in the isolated worker process. The gate above has already validated
+  // the file; the worker re-stats it (size) on open as a TOCTOU guard.
+  try {
+    await workerHost.load('chat', modelPath, stat.size);
+  } catch (err) {
+    if (!err.code) err.code = 'AI_INTERNAL_UNAVAILABLE';
+    throw err;
+  }
 
   modelInfo = {
     path: modelPath,
@@ -349,7 +322,7 @@ async function doLoadModel(modelPath) {
 
   resetIdleTimer();
 
-  logger.info('Internal LLM loaded', { name: filename });
+  logger.info('Internal LLM loaded (isolated worker)', { name: filename });
 }
 
 function resetIdleTimer() {

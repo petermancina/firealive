@@ -39,6 +39,9 @@
       "app.js",
       "kb-local.js",
       "local-llm.js",
+      "model-utility.js",
+      "gguf-validate.js",
+      "local-malware-scan.js",
       "assets/**/*"
     ],
     "asarUnpack": [

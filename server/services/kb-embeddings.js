@@ -91,14 +91,16 @@ function resolveEmbedIdleUnloadMs() {
 const IDLE_UNLOAD_MS = resolveEmbedIdleUnloadMs();
 
 // ── Module state ────────────────────────────────────────────────────────────
-let llamaModule = null;        // lazily-required node-llama-cpp module
-let model = null;              // loaded LlamaModel (embedding model)
-let embeddingContext = null;   // active embedding context
 let modelInfo = null;          // { path, name, sizeBytes, loadedAt }
 let idleTimer = null;
 let loadingPromise = null;     // de-duplicates concurrent loads
 let embeddingIndex = null;     // [{ id, vector:number[] }] — resident vector index
 let indexMeta = null;          // { kbVersion, embedderId, dim, count, generatedAt }
+let provisioning = null;       // lazily-required verify-only provisioning tool (gate layer 1)
+let embedVerifySig = null;     // signature of the last gated embedder file
+const modelSafety = require('./model-file-safety');        // layered integrity & safety gate
+const { getSharedHost } = require('./model-worker-host');  // isolated child-process loader
+const workerHost = getSharedHost({ logger });              // embed (+ chat) run in a separate process
 
 // ── Path resolution (server-computed, trusted; no request input here) ─────────
 
@@ -136,7 +138,7 @@ function embedderModelExists() {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 function isReady() {
-  return model !== null && embeddingContext !== null;
+  return modelInfo !== null && workerHost.isLoaded('embed');
 }
 
 function getStatus() {
@@ -151,13 +153,14 @@ function getStatus() {
     indexMeta: indexMeta,
     cachePath: getCachePath(),
     cacheFresh: isCacheFresh(readCacheSafe()),
+    isolated: true,
   };
 }
 
 // ── Embedding model lifecycle ─────────────────────────────────────────────────
 
 async function loadModel() {
-  if (model && embeddingContext) return;
+  if (isReady()) return;
   if (loadingPromise) return loadingPromise;
   loadingPromise = doLoadModel(getEmbedderModelPath());
   try {
@@ -174,25 +177,47 @@ async function doLoadModel(modelPath) {
     throw err;
   }
 
-  // Lazy-require node-llama-cpp so this module can be imported even when the
-  // dependency or the native binary isn't installed (mirrors internal-llm.js).
-  if (!llamaModule) {
-    try {
-      llamaModule = require('node-llama-cpp');
-    } catch (err) {
-      const wrapped = new Error('node-llama-cpp not available: ' + err.message);
-      wrapped.code = 'KB_EMBED_UNAVAILABLE';
-      throw wrapped;
-    }
-  }
-
   const stat = fs.statSync(modelPath);
   logger.info('Loading KB embedding model', { path: modelPath, sizeBytes: stat.size });
 
-  const { getLlama } = llamaModule;
-  const llama = await getLlama();
-  model = await llama.loadModel({ modelPath });
-  embeddingContext = await model.createEmbeddingContext();
+  // ── Integrity & safety gate (fail-closed) before the worker reads the file ──
+  // Closes the pre-isolation gap where the embedding model loaded without the
+  // B1 gate. download-model's id for the embedder is 'embedding'. Cached by the
+  // embedder file signature so it runs once per file change.
+  if (provisioning === null) {
+    try { provisioning = require('../../scripts/download-model'); }
+    catch (_) { provisioning = false; }
+  }
+  if (provisioning && typeof provisioning.verifyModel === 'function') {
+    const sig = stat.size + ':' + stat.mtimeMs;
+    if (sig !== embedVerifySig) {
+      const gate = await modelSafety.verifyModelFileSafety('embedding', {
+        actor: 'kb-embeddings',
+        deps: { verifyModel: (id) => provisioning.verifyModel(id) },
+      });
+      if (!gate.ok) {
+        embedVerifySig = null;
+        const err = new Error(
+          'KB embedding model failed the integrity & safety gate (' + gate.overall + '): ' +
+          (gate.blockedReason || 'unknown reason') + '; refusing to load. Provision the official ' +
+          'Qwen3-Embedding-0.6B Q8_0 file and ensure a local malware scanner is available, then ' +
+          'verify: node scripts/download-model.js --model embedding');
+        err.code = 'KB_EMBED_UNAVAILABLE';
+        err.modelSafety = { outcome: gate.overall, reason: gate.blockedReason };
+        throw err;
+      }
+      embedVerifySig = sig;
+    }
+  }
+
+  // Load in the isolated worker process (the gate above validated the file; the
+  // worker re-stats it on open as a TOCTOU guard).
+  try {
+    await workerHost.load('embed', modelPath, stat.size);
+  } catch (err) {
+    if (!err.code) err.code = 'KB_EMBED_UNAVAILABLE';
+    throw err;
+  }
 
   modelInfo = {
     path: modelPath,
@@ -201,19 +226,14 @@ async function doLoadModel(modelPath) {
     loadedAt: new Date().toISOString(),
   };
   resetIdleTimer();
-  logger.info('KB embedding model loaded', { name: modelInfo.name });
+  logger.info('KB embedding model loaded (isolated worker)', { name: modelInfo.name });
 }
 
 async function unloadModel() {
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-  if (embeddingContext) {
-    try { await embeddingContext.dispose(); } catch (_) { /* ignore */ }
-    embeddingContext = null;
-  }
-  if (model) {
-    try { await model.dispose(); } catch (_) { /* ignore */ }
-    model = null;
-  }
+  // Unload the embedding model from the shared worker (the worker process
+  // persists for the chat model, which internal-llm owns).
+  try { await workerHost.unload('embed'); } catch (_) { /* ignore */ }
   modelInfo = null;
   logger.info('KB embedding model unloaded');
 }
@@ -242,13 +262,11 @@ async function embed(text) {
   }
   let vector;
   try {
-    const result = await embeddingContext.getEmbeddingFor(text);
-    // node-llama-cpp returns a LlamaEmbedding whose .vector is a readonly
-    // array of numbers; copy into a plain array for downstream math/serialization.
-    vector = Array.from(result.vector);
+    // Inference runs in the isolated worker; it returns a plain number[].
+    vector = await workerHost.embed(text);
   } catch (err) {
     const wrapped = new Error('embedding inference failed: ' + (err.message || String(err)));
-    wrapped.code = 'KB_EMBED_FAILED';
+    wrapped.code = (err.code === 'AI_INTERNAL_UNAVAILABLE') ? 'KB_EMBED_UNAVAILABLE' : 'KB_EMBED_FAILED';
     throw wrapped;
   }
   resetIdleTimer();
