@@ -395,6 +395,54 @@ class RegressionRunner {
       return 'Ed25519 keygen + fingerprint + sign/verify round-trip ok';
     });
 
+    // ── Optional integration config (skip-trichotomy) ──────────────
+    // configured + structurally valid -> pass; configured + broken -> fail;
+    // optional + not configured -> skip. The runner judges only whether what is
+    // configured still works; the compliance engine owns missing controls.
+    const readJsonConfig = (key) => {
+      const row = this.db.prepare('SELECT value FROM config WHERE key = ?').get(key);
+      if (!row || !row.value) return undefined;           // not configured
+      try { return JSON.parse(row.value); } catch { return null; } // configured but broken
+    };
+    const optionalEndpointCheck = (label, key) => () => {
+      const cfg = readJsonConfig(key);
+      if (cfg === undefined) return SKIP(label + ' not configured');
+      if (cfg === null) throw new Error(label + ' config present but not valid JSON');
+      if (!cfg.endpoint) throw new Error(label + ' configured but missing endpoint');
+      return label + ' configured (' + (cfg.platform || 'endpoint set') + ')';
+    };
+    await check('integrations', 'SOAR config valid (if configured)', optionalEndpointCheck('SOAR', 'soar_config'));
+    await check('integrations', 'SIEM config valid (if configured)', optionalEndpointCheck('SIEM', 'siem_config'));
+    await check('integrations', 'Ticketing config valid (if configured)', optionalEndpointCheck('Ticketing', 'ticketing_config'));
+    await check('integrations', 'LDAP/AD config valid (if configured)', () => {
+      let row = null;
+      try { row = this.db.prepare("SELECT value FROM team_config WHERE key = 'iam_config'").get(); } catch { row = null; }
+      if (!row || !row.value) return SKIP('LDAP/AD not configured');
+      let cfg;
+      try { cfg = JSON.parse(row.value); } catch { throw new Error('iam_config present but not valid JSON'); }
+      if (!cfg.server && !cfg.bindDn) return SKIP('LDAP/AD not configured (no connection fields)');
+      if (!cfg.server || !cfg.bindDn) throw new Error('LDAP/AD partially configured (need server + bindDn)');
+      return 'LDAP/AD configured';
+    });
+    await check('integrations', 'Backup storage destination (if configured)', () => {
+      if (!tableExists('backup_destinations')) return SKIP('no backup destinations table');
+      const n = this.db.prepare('SELECT COUNT(*) AS n FROM backup_destinations WHERE enabled = 1').get().n;
+      if (n === 0) return SKIP('no enabled backup destination configured');
+      return n + ' enabled backup destination(s)';
+    });
+
+    // ── EDR / malware scanner is REQUIRED (fail-closed if absent) ──
+    // There is no scanning-off mode; a deployment without a scanner cannot
+    // fail-closed correctly, so its absence is a regression failure (not a skip).
+    await check('integrations', 'EDR/malware scanner configured (required)', () => {
+      if (!tableExists('malware_scanner_integrations')) {
+        throw new Error('malware scanner integration table missing; EDR/malware scanning is required');
+      }
+      const n = this.db.prepare('SELECT COUNT(*) AS n FROM malware_scanner_integrations').get().n;
+      if (n === 0) throw new Error('no EDR/malware scanner configured; scanning is required (no scanning-off mode)');
+      return n + ' scanner(s) configured';
+    });
+
     // ── Category: Helper-pay ───────────────────────────────────────
     await check('helper-pay', 'Points-ledger append + balance-cache invariant', () => {
       // Verifies the helper-pay points-ledger model on an in-memory clone of the
@@ -722,6 +770,33 @@ class RegressionRunner {
       if (!res.blockedReason && res.overall === 'loaded') throw new Error('gate did not block; overall=' + res.overall);
       return 'gate fail-closed on hash mismatch (' + res.overall + ')';
     });
+
+    // ── Category: Integration health (reflects the latest cached probe) ─────
+    // Surfaces the most recent integration-health probe result without running
+    // live probes, so the regression run stays side-effect-free. ok -> pass;
+    // benign states (disabled/not_configured/not_implemented/deep_skipped) ->
+    // skip; real failures (unreachable/auth_failed/permission_denied/timeout/
+    // error) -> fail.
+    {
+      let cached = null;
+      try {
+        const row = this.db.prepare("SELECT value FROM config WHERE key = 'integration_health_last_results'").get();
+        if (row && row.value) cached = JSON.parse(row.value);
+      } catch { cached = null; }
+      if (!cached || !Array.isArray(cached.results) || cached.results.length === 0) {
+        await check('integration_health', 'integration health probe run available', () => SKIP('no integration-health probe has run yet'));
+      } else {
+        const BENIGN = new Set(['disabled', 'not_configured', 'not_implemented', 'deep_skipped']);
+        for (const r of cached.results) {
+          const label = r.label || r.integration;
+          await check('integration_health', label + ' probe', () => {
+            if (r.status === 'ok') return 'ok' + (r.latencyMs != null ? ' (' + r.latencyMs + 'ms)' : '');
+            if (BENIGN.has(r.status)) return SKIP(r.detail || r.status);
+            throw new Error(r.status + (r.detail ? ': ' + r.detail : ''));
+          });
+        }
+      }
+    }
 
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;

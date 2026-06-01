@@ -375,6 +375,7 @@ export default function GlobalDashboard() {
   const [configLocked, setConfigLocked] = useState(false); // Start UNLOCKED — CISO sets up MFA first
   const [gdAudit, setGdAudit] = useState([]);
   const [gdHealth, setGdHealth] = useState({cpu:"—",memory:"—",uptime:"—"});
+  const [gdVersion, setGdVersion] = useState(null);
   const [gdToast, setGdToast] = useState(null);
   const showGdToast = (msg) => { setGdToast(msg); setTimeout(() => setGdToast(null), 3000); };
   // R3k C40 — GD Cloud & IaC + CI/CD server-side wiring
@@ -714,6 +715,16 @@ export default function GlobalDashboard() {
       if (r && !r.error) setGdHealth(r);
     });
   }, [stage, tab]);
+
+  // Load the GD-Server app version once the app is entered (any role), so the
+  // header, footer, and App Updates view show the live shipped version instead
+  // of a hardcoded string. Runs once when the app stage is reached.
+  useEffect(() => {
+    if (stage !== "app" || gdVersion) return;
+    api.get(/api/system/version).then(r => {
+      if (r && !r.error && r.version) setGdVersion(r.version);
+    });
+  }, [stage, gdVersion]);
 
   // Load query templates when the query tab is first opened. Populates the
   // template dropdown with the server-side registry; without this, the CISO
@@ -1578,7 +1589,7 @@ export default function GlobalDashboard() {
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>
-            <span style={{display:"inline-block",width:5,height:5,borderRadius:"50%",background:C.a,marginRight:6,boxShadow:`0 0 6px ${C.a}`}}/>FireAlive Global Dashboard · Read-Only · v1.0.0</M>
+            <span style={{display:"inline-block",width:5,height:5,borderRadius:"50%",background:C.a,marginRight:6,boxShadow:`0 0 6px ${C.a}`}}/>FireAlive Global Dashboard · Read-Only · v{gdVersion||"…"}</M>
           <div style={{fontSize:18,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Global SOC Wellbeing</div>
         </div>
         <div style={{display:"flex",gap:8}}>
@@ -3181,7 +3192,7 @@ export default function GlobalDashboard() {
             <M style={{color:C.tm,display:"block",marginBottom:16}}>The Global Dashboard updates independently of any regional MC. Updates are retrieved, lab-tested, and applied automatically on a schedule.</M>
             {configLocked&&<Card style={{borderColor:C.d+"40",marginBottom:12,padding:10}}><M style={{color:C.d}}>LOCK Configurations locked. Unlock with MFA to make changes.</M></Card>}
             <Card style={{marginBottom:12}}>
-              <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:8}}>Current version: v1.0.0</M>
+              <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:8}}>Current version: v{gdVersion||"…"}</M>
               <Sel label="Update channel"><option value="stable">Stable</option><option value="preview">Preview (early access)</option></Sel>
               <Sel label="Auto-update schedule"><option value="daily">Check daily</option><option value="weekly">Check weekly</option><option value="manual">Manual only</option></Sel>
               <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked disabled={configLocked}/><M style={{color:C.t}}>Lab-test updates before applying to production</M></label>
@@ -3202,7 +3213,7 @@ export default function GlobalDashboard() {
 
         </div>
       </div>
-      <div style={{padding:"14px 24px",borderTop:`1px solid ${C.b}`,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace",display:"flex",justifyContent:"space-between"}}><span>GLOBAL DASHBOARD · READ-ONLY · v1.0.0</span><span>{regions.length} regions · {totalAnalysts} analysts</span></div>
+      <div style={{padding:"14px 24px",borderTop:`1px solid ${C.b}`,fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace",display:"flex",justifyContent:"space-between"}}><span>GLOBAL DASHBOARD · READ-ONLY · v{gdVersion||"…"}</span><span>{regions.length} regions · {totalAnalysts} analysts</span></div>
     </div>
   );
 }

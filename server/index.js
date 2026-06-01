@@ -182,6 +182,8 @@ app.use('/api/audit/event', authMiddleware(['analyst', 'lead', 'admin']), requir
 app.use('/api/audit/mc-event', authMiddleware(['lead', 'admin']), require('./routes/audit-mc-event'));
 app.use('/api/audit', authMiddleware(['lead', 'admin']), configLockGate(), require('./routes/audit'));
 app.use('/api/metrics', authMiddleware(['lead', 'admin']), require('./routes/metrics'));
+app.use('/api/alert-config', authMiddleware(['admin']), require('./routes/alert-config'));
+app.use('/api/integration-health', authMiddleware(['admin']), require('./routes/integration-health'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
 app.use('/api/sla', authMiddleware(['lead', 'admin']), require('./routes/sla'));
 app.use('/api/notifications', authMiddleware(['admin']), require('./routes/notifications'));
@@ -283,19 +285,43 @@ async function start() {
     // Start bandwidth monitor
     bandwidthMonitor.start();
     bandwidthMonitor.onAlert((alert) => {
-      const { auditLog } = require('./middleware/audit');
-      auditLog(null, 'BANDWIDTH_ALERT', `${alert.type}: ${alert.message}`);
+      const { routeAlert } = require('./services/alert-router');
+      const db = getDb();
+      routeAlert(db, { ...alert, type: alert.type || 'BANDWIDTH_ALERT' })
+        .finally(() => { try { db.close(); } catch (_) {} });
     });
 
     // Start runtime monitor (continuous FIM + CPU/memory + DB read anomaly)
+    // Apply any admin-configured sustained-load thresholds first so the first
+    // intervals already honor them; defaults apply if none are stored.
+    try {
+      const cfgDb = getDb();
+      const stored = cfgDb.prepare("SELECT value FROM config WHERE key = 'runtime_monitor_thresholds'").get();
+      cfgDb.close();
+      if (stored && stored.value) runtimeMonitor.configureThresholds(JSON.parse(stored.value));
+    } catch (_) { /* defaults apply */ }
     runtimeMonitor.start();
     runtimeMonitor.onAlert((alert) => {
-      const { auditLog } = require('./middleware/audit');
-      auditLog(null, alert.type, alert.message);
-      // Dispatch critical alerts to SOAR
-      const { dispatchToSoar } = require('./services/soar-alerting');
-      dispatchToSoar(alert.type, alert);
+      // Severity-tiered fan-out: the router always audits, then dispatches to
+      // SOAR / SIEM (CEF push) / email / in-app notification / webhook per the
+      // configured per-severity routing matrix (B3-C3/C4).
+      const { routeAlert } = require('./services/alert-router');
+      const db = getDb();
+      routeAlert(db, alert)
+        .finally(() => { try { db.close(); } catch (_) {} });
     });
+
+    // Start the integration-health periodic scheduler. No-op until an admin
+    // enables the master + periodic toggles; honors the configured interval.
+    try {
+      const ihScheduler = require('./services/integration-health-scheduler');
+      ihScheduler.startIntegrationHealthScheduler(getDb);
+      // On a new build, run a one-shot smoke probe shortly after boot so config
+      // drift from the update surfaces immediately (only when probing is enabled).
+      ihScheduler.runUpdateSmokeTest(getDb);
+    } catch (e) {
+      logger.warn('Integration-health scheduler failed to start', { error: e.message });
+    }
 
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();

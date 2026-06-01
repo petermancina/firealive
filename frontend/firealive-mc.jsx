@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — SOC Analyst Wellbeing Platform v1.0.0
+// FIREALIVE — SOC Analyst Wellbeing Platform
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
@@ -1019,6 +1019,191 @@ function MyMfaSecuritySection() {
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  MANAGEMENT CONSOLE                                                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
+
+// ── B3 System Health panels: integration health + alert routing ─────────────
+function IntegrationHealthPanel() {
+  const [settings, setSettings] = React.useState(null);
+  const [results, setResults] = React.useState(null);
+  const [busy, setBusy] = React.useState({ load: true, save: false, probe: false });
+  const [msg, setMsg] = React.useState(null);
+
+  React.useEffect(() => {
+    api.get('/api/integration-health').then((s) => { if (s && !s.error) setSettings(s); setBusy((b) => ({ ...b, load: false })); });
+    api.get('/api/integration-health/results').then((r) => { if (r && !r.error) setResults(r); });
+  }, []);
+
+  const patch = (p) => setSettings((s) => ({ ...s, ...p }));
+  const toggleIntegration = (k) => setSettings((s) => ({ ...s, integrations: { ...s.integrations, [k]: !(s.integrations && s.integrations[k]) } }));
+
+  const save = () => {
+    if (!settings) return;
+    setBusy((b) => ({ ...b, save: true })); setMsg(null);
+    api.put('/api/integration-health', {
+      master: settings.master, periodicEnabled: settings.periodicEnabled,
+      intervalMinutes: Number(settings.intervalMinutes), kmsDeep: settings.kmsDeep,
+      integrations: settings.integrations,
+    }).then((r) => {
+      setBusy((b) => ({ ...b, save: false }));
+      if (r && !r.error) { setSettings(r); setMsg('Saved'); } else { setMsg('Save failed'); }
+    });
+  };
+  const probeNow = () => {
+    setBusy((b) => ({ ...b, probe: true })); setMsg(null);
+    api.post('/api/integration-health/probe', {}).then((r) => {
+      setBusy((b) => ({ ...b, probe: false }));
+      if (r && !r.error) { setResults(r); setMsg('Probe complete'); } else { setMsg('Probe failed'); }
+    });
+  };
+
+  const statusColor = (st) => {
+    if (st === 'ok') return C.a;
+    if (st === 'disabled' || st === 'not_configured' || st === 'not_implemented' || st === 'deep_skipped') return C.tm;
+    return C.d;
+  };
+
+  if (busy.load && !settings) return <Card style={{ marginBottom: 16 }}><M style={{ color: C.tm, fontStyle: 'italic' }}>Loading integration health…</M></Card>;
+  if (!settings) return <Card style={{ marginBottom: 16 }}><M style={{ color: C.w }}>Integration health settings unavailable (admin only).</M></Card>;
+
+  const keys = settings.integrationKeys || [];
+  const labels = { kms: 'KMS / Key-Wrapping', storage: 'Cloud Storage', iam: 'LDAP / AD', siem: 'SIEM', soar: 'SOAR', edr: 'EDR / Malware Scanner', ticketing: 'Ticketing' };
+  const okAll = results && results.summary && results.summary.ok === results.summary.total;
+
+  return (
+    <div>
+      <div style={{ fontSize: 12, fontWeight: 500, color: '#E8EDF5', marginTop: 16, marginBottom: 8 }}>Integration Health</div>
+      <Card style={{ marginBottom: 12 }}>
+        <M style={{ color: C.tm, display: 'block', marginBottom: 10, lineHeight: 1.6 }}>Opt-in, read-only health probes against external integrations, disabled by default at both the master and per-integration level. Probes are bounded and do not mutate integration data; the KMS deep probe performs a live wrap/unwrap round-trip only when enabled.</M>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}><input type="checkbox" checked={!!settings.master} onChange={() => patch({ master: !settings.master })} /><M style={{ color: C.t }}>Master: enable integration-health probing</M></label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}><input type="checkbox" checked={!!settings.periodicEnabled} onChange={() => patch({ periodicEnabled: !settings.periodicEnabled })} /><M style={{ color: C.t }}>Periodic probing (every {settings.intervalMinutes} min)</M></label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}><input type="checkbox" checked={!!settings.kmsDeep} onChange={() => patch({ kmsDeep: !settings.kmsDeep })} /><M style={{ color: C.t }}>KMS deep probe (live wrap/unwrap round-trip)</M></label>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '8px 0' }}>
+          <M style={{ color: C.tm }}>Interval (min):</M>
+          <input type="number" min={settings.intervalBounds ? settings.intervalBounds.min : 5} max={settings.intervalBounds ? settings.intervalBounds.max : 1440} value={settings.intervalMinutes} onChange={(e) => patch({ intervalMinutes: e.target.value })} style={{ width: 80, padding: 6, background: 'rgba(255,255,255,0.03)', border: `1px solid ${C.b}`, borderRadius: 4, color: C.t, fontSize: 12 }} />
+        </div>
+        <div style={{ borderTop: `1px solid ${C.b}`, marginTop: 8, paddingTop: 8 }}>
+          <M style={{ color: C.td, display: 'block', marginBottom: 6 }}>Probe these integrations</M>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 4 }}>
+            {keys.map((k) => (
+              <label key={k} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 0' }}><input type="checkbox" checked={!!(settings.integrations && settings.integrations[k])} onChange={() => toggleIntegration(k)} /><M style={{ color: C.t }}>{labels[k] || k}</M></label>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+          <Btn small primary disabled={busy.save} onClick={save}>{busy.save ? 'Saving…' : 'Save Settings'}</Btn>
+          <Btn small disabled={busy.probe} onClick={probeNow}>{busy.probe ? 'Probing…' : 'Probe Now'}</Btn>
+          {msg && <M style={{ color: C.a }}>{msg}</M>}
+        </div>
+      </Card>
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+          <M style={{ color: '#E8EDF5', fontWeight: 500 }}>Last Probe Run</M>
+          {results && results.summary ? <Badge color={okAll ? C.a : C.w}>{results.summary.ok + '/' + results.summary.total + ' ok'}</Badge> : <Badge color={C.tm}>none</Badge>}
+        </div>
+        {(!results || !results.results || results.results.length === 0) && <M style={{ color: C.tm, fontStyle: 'italic' }}>No probe has run yet. Enable the master toggle, then click Probe Now.</M>}
+        {results && results.results && results.results.length > 0 && <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, fontFamily: "'IBM Plex Mono',monospace" }}>
+            <thead><tr style={{ borderBottom: `1px solid ${C.b}` }}>{['Integration', 'Status', 'Detail', 'Latency'].map((h) => <th key={h} style={{ padding: '6px', textAlign: 'left', color: C.td, fontWeight: 500 }}>{h}</th>)}</tr></thead>
+            <tbody>{results.results.map((r, i) => (
+              <tr key={i} style={{ borderBottom: `1px solid ${C.b}` }}>
+                <td style={{ padding: '6px', color: C.t }}>{r.label || r.integration}</td>
+                <td style={{ padding: '6px' }}><Badge color={statusColor(r.status)}>{r.status}</Badge></td>
+                <td style={{ padding: '6px', color: C.tm }}>{r.detail || '—'}</td>
+                <td style={{ padding: '6px', color: C.td }}>{typeof r.latencyMs === 'number' ? r.latencyMs + 'ms' : '—'}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>}
+        {results && results.ranAt && <M style={{ color: C.td, display: 'block', marginTop: 6 }}>Ran: {new Date(results.ranAt).toLocaleString()}{results.masterEnabled === false ? ' · master disabled' : ''}</M>}
+      </Card>
+    </div>
+  );
+}
+
+function AlertRoutingPanel() {
+  const [cfg, setCfg] = React.useState(null);
+  const [busy, setBusy] = React.useState({ load: true, save: false });
+  const [msg, setMsg] = React.useState(null);
+  const [webhook, setWebhook] = React.useState('');
+
+  React.useEffect(() => {
+    api.get('/api/alert-config').then((c) => { if (c && !c.error) setCfg(c); setBusy((b) => ({ ...b, load: false })); });
+  }, []);
+
+  const toggleCell = (sev, ch) => setCfg((c) => ({ ...c, matrix: { ...c.matrix, [sev]: { ...c.matrix[sev], [ch]: !(c.matrix[sev] && c.matrix[sev][ch]) } } }));
+  const setThreshold = (k, v) => setCfg((c) => ({ ...c, thresholds: { ...c.thresholds, [k]: v } }));
+
+  const save = () => {
+    if (!cfg) return;
+    setBusy((b) => ({ ...b, save: true })); setMsg(null);
+    const numThresholds = {};
+    Object.keys(cfg.thresholds || {}).forEach((k) => { const n = Number(cfg.thresholds[k]); if (Number.isFinite(n)) numThresholds[k] = n; });
+    const body = { matrix: cfg.matrix, thresholds: numThresholds };
+    if (webhook.trim() !== '') body.webhookUrl = webhook.trim();
+    api.put('/api/alert-config', body).then((r) => {
+      setBusy((b) => ({ ...b, save: false }));
+      if (r && !r.error) { setCfg((c) => ({ ...c, matrix: r.matrix, thresholds: r.thresholds, webhookConfigured: r.webhookConfigured })); setMsg('Saved'); setWebhook(''); } else { setMsg('Save failed'); }
+    });
+  };
+
+  if (busy.load && !cfg) return <Card style={{ marginBottom: 16 }}><M style={{ color: C.tm, fontStyle: 'italic' }}>Loading alert configuration…</M></Card>;
+  if (!cfg) return <Card style={{ marginBottom: 16 }}><M style={{ color: C.w }}>Alert configuration unavailable (admin only).</M></Card>;
+
+  const severities = cfg.severities || ['info', 'warning', 'high', 'critical'];
+  const channels = cfg.channels || ['soar', 'siem', 'email', 'notification', 'webhook'];
+  const sevColor = { info: C.i, warning: C.w, high: '#FB923C', critical: C.d };
+  const thresholdRows = [
+    ['cpuEnter', 'CPU enter %'], ['cpuExit', 'CPU exit %'], ['cpuDwell', 'CPU dwell (intervals)'],
+    ['memEnterMult', 'Mem enter (x baseline)'], ['memExitMult', 'Mem exit (x baseline)'], ['memDwell', 'Mem dwell'],
+    ['dbEnterMult', 'DB-read enter (x)'], ['dbExitMult', 'DB-read exit (x)'], ['dbDwell', 'DB-read dwell'],
+    ['cooldownMs', 'Cooldown (ms)'],
+  ];
+
+  return (
+    <div>
+      <div style={{ fontSize: 12, fontWeight: 500, color: '#E8EDF5', marginTop: 16, marginBottom: 8 }}>Alert Routing</div>
+      <Card style={{ marginBottom: 12 }}>
+        <M style={{ color: C.tm, display: 'block', marginBottom: 10, lineHeight: 1.6 }}>Per-severity channel routing for runtime and integration-health alerts. Audit is always recorded and cannot be disabled.</M>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, fontFamily: "'IBM Plex Mono',monospace" }}>
+            <thead><tr style={{ borderBottom: `1px solid ${C.b}` }}>
+              <th style={{ padding: '6px', textAlign: 'left', color: C.td, fontWeight: 500 }}>Severity</th>
+              <th style={{ padding: '6px', textAlign: 'center', color: C.td, fontWeight: 500 }}>audit</th>
+              {channels.map((ch) => <th key={ch} style={{ padding: '6px', textAlign: 'center', color: C.td, fontWeight: 500 }}>{ch}</th>)}
+            </tr></thead>
+            <tbody>{severities.map((sev) => (
+              <tr key={sev} style={{ borderBottom: `1px solid ${C.b}` }}>
+                <td style={{ padding: '6px' }}><Badge color={sevColor[sev] || C.tm}>{sev}</Badge></td>
+                <td style={{ padding: '6px', textAlign: 'center', color: C.a }}>✓</td>
+                {channels.map((ch) => (
+                  <td key={ch} style={{ padding: '6px', textAlign: 'center' }}><input type="checkbox" checked={!!(cfg.matrix[sev] && cfg.matrix[sev][ch])} onChange={() => toggleCell(sev, ch)} /></td>
+                ))}
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+        <M style={{ color: C.td, display: 'block', marginTop: 8 }}>Webhook URL {cfg.webhookConfigured ? '(configured)' : '(not set)'}:</M>
+        <input type="text" maxLength={512} value={webhook} placeholder={cfg.webhookConfigured ? 'configured — leave blank to keep' : 'https://…'} onChange={(e) => setWebhook(e.target.value)} style={{ width: '100%', padding: 8, marginTop: 4, background: 'rgba(255,255,255,0.03)', border: `1px solid ${C.b}`, borderRadius: 6, color: C.t, fontSize: 12 }} />
+      </Card>
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 500, color: '#E8EDF5', marginBottom: 8 }}>Sustained-Load Thresholds</div>
+        <M style={{ color: C.tm, display: 'block', marginBottom: 10, lineHeight: 1.6 }}>Hysteresis thresholds for sustained CPU, memory, and DB-read load. Dwell is the number of consecutive sampling intervals above the enter threshold before an alert fires; exit clears it.</M>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 8 }}>
+          {thresholdRows.map((row) => (
+            <div key={row[0]} style={{ padding: 8, background: 'rgba(255,255,255,0.02)', borderRadius: 6 }}>
+              <M style={{ color: C.td, display: 'block', marginBottom: 4 }}>{row[1]}</M>
+              <input type="number" value={cfg.thresholds && cfg.thresholds[row[0]] != null ? cfg.thresholds[row[0]] : ''} onChange={(e) => setThreshold(row[0], e.target.value)} style={{ width: '100%', padding: 6, background: 'rgba(255,255,255,0.03)', border: `1px solid ${C.b}`, borderRadius: 4, color: C.t, fontSize: 12 }} />
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+          <Btn small primary disabled={busy.save} onClick={save}>{busy.save ? 'Saving…' : 'Save Alert Config'}</Btn>
+          {msg && <M style={{ color: C.a }}>{msg}</M>}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
@@ -6341,18 +6526,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               Uptime: {Math.floor(monMetrics.uptime/3600)}h {Math.floor((monMetrics.uptime%3600)/60)}m · Load avg: {monMetrics.loadAvg?.map(l=>l.toFixed(1)).join(", ")} · Free memory: {monMetrics.freeMemMB}MB / {monMetrics.totalMemMB}MB · Source files monitored: {monMetrics.fileCount} · Continuous FIM: Active (30s interval) · Bandwidth monitor: Active (15min window, 5x alert threshold)
             </div>
           </Card>
-          <Card>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Alert Thresholds (modifiable)</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
-              {[{label:"CPU spike %",key:"cpuThresh",def:80},{label:"Memory multiplier",key:"memMult",def:3},{label:"DB read multiplier",key:"dbMult",def:5},{label:"Bandwidth multiplier",key:"bwMult",def:5},{label:"Max response (MB)",key:"maxResp",def:50},{label:"FIM interval (sec)",key:"fimSec",def:30}].map(t=>(
-                <div key={t.key} style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:6}}>
-                  <M style={{color:C.td,display:"block",marginBottom:4}}>{t.label}</M>
-                  <input type="number" defaultValue={t.def} style={{width:"100%",padding:6,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12}} onChange={()=>addA("THRESHOLD_MODIFIED",t.label)}/>
-                </div>
-              ))}
-            </div>
-            <Btn small primary style={{marginTop:10}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"THRESHOLDS_SAVED",detail:"Alert thresholds updated"}).then(()=>addA("THRESHOLDS_SAVED","Alert thresholds updated"))}>Save Thresholds</Btn>
-          </Card>
+          <IntegrationHealthPanel/>
+          <AlertRoutingPanel/>
           {/* R3l C15: Connected Sessions card, wired to /api/system/connected-clients */}
           <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Sessions (WebSocket)</div>
           <Card style={{marginBottom:16}}>

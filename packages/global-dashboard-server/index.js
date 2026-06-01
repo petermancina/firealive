@@ -2738,6 +2738,22 @@ app.get('/api/verify/report/:hash', authMiddleware(['ciso', 'vp']), (req, res) =
 });
 
 // ── System Health (self-monitoring) ──────────────────────────────────────────
+// ── App version (any authenticated GD user) ──────────────────────────────────
+// Authoritative version string for the GD UI (header, footer, App Updates),
+// sourced from the GD-server package.json so it never drifts from the shipped
+// build. Any authenticated user may read it (no role gate) because the header
+// and footer are visible to read-only viewers too.
+app.get('/api/system/version', authMiddleware(), (req, res) => {
+  const pkg = require('./package.json');
+  const version = typeof pkg.version === 'string' ? pkg.version : null;
+  res.json({
+    version,
+    versionLabel: version ? 'v' + version : null,
+    fuseCounter: typeof pkg.fuseCounter === 'number' ? pkg.fuseCounter : null,
+    buildId: typeof pkg.buildId === 'string' ? pkg.buildId : null,
+  });
+});
+
 app.get('/api/system/health-metrics', authMiddleware(['ciso', 'vp']), (req, res) => {
   const mem = process.memoryUsage();
   const db = getDb();
@@ -3072,6 +3088,65 @@ function runGdRegression(db) {
     if (breaks > 0) throw new Error(`${breaks} chain break(s); first: ${firstBreak}`);
     return `chain intact across ${rows.length} row(s)`;
   });
+
+  // ── Integrations (GD's own external surface) ───────────────────────────
+  // Skip-trichotomy at parity with the MC runner: configured + valid -> pass;
+  // configured + broken -> fail; optional + not configured -> skip. GD's
+  // external SIEM/SOAR checks are forward-aware and auto-activate once GD's own
+  // SIEM/SOAR are configured (B3-C17). EDR — host/endpoint monitoring of the GD
+  // app itself, not just file scanning — is also required (see below).
+  const gdReadJson = (key) => {
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key);
+    if (!row || !row.value) return undefined;
+    try { return JSON.parse(row.value); } catch { return null; }
+  };
+  const gdOptionalEndpoint = (label, key) => () => {
+    const cfg = gdReadJson(key);
+    if (cfg === undefined) return SKIP(label + ' not configured');
+    if (cfg === null) throw new Error(label + ' config present but not valid JSON');
+    if (!cfg.endpoint) throw new Error(label + ' configured but missing endpoint');
+    return label + ' configured (' + (cfg.platform || 'endpoint set') + ')';
+  };
+  record('integrations', 'SOAR config valid (if configured)', gdOptionalEndpoint('SOAR', 'soar_config'));
+  record('integrations', 'SIEM config valid (if configured)', gdOptionalEndpoint('SIEM', 'siem_config'));
+
+  // EDR / endpoint monitoring of the GD host/app. Required once GD's in-platform
+  // EDR integration exists; until then host-level EDR is operator-managed
+  // off-platform, so a skip (not a fail). Forward-aware: auto-activates and
+  // becomes fail-closed when the malware_scanner_integrations table lands (the
+  // table name GD's compliance checks already reserve for this).
+  record('integrations', 'EDR/endpoint monitoring configured (required)', () => {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='malware_scanner_integrations'").get();
+    if (!t) return SKIP('GD in-platform EDR integration pending; host-level EDR operator-managed off-platform until then');
+    const n = db.prepare('SELECT COUNT(*) AS n FROM malware_scanner_integrations').get().n;
+    if (n === 0) throw new Error('no EDR/endpoint integration configured; endpoint monitoring is required (no monitoring-off mode)');
+    return n + ' EDR/endpoint integration(s) configured';
+  });
+
+  // ── Integration health (reflects GD's latest cached probe run) ─────────
+  // Reads the cached probe result without running live probes (side-effect-
+  // free). ok -> pass; benign states -> skip; real failures -> fail. Populated
+  // by GD's own integration-health probing (B3-C17); a skip until then.
+  {
+    let cached = null;
+    try {
+      const row = db.prepare("SELECT value FROM config WHERE key = 'integration_health_last_results'").get();
+      if (row && row.value) cached = JSON.parse(row.value);
+    } catch { cached = null; }
+    if (!cached || !Array.isArray(cached.results) || cached.results.length === 0) {
+      record('integration_health', 'integration health probe run available', () => SKIP('no integration-health probe has run yet'));
+    } else {
+      const BENIGN = new Set(['disabled', 'not_configured', 'not_implemented', 'deep_skipped']);
+      for (const r of cached.results) {
+        const label = r.label || r.integration;
+        record('integration_health', label + ' probe', () => {
+          if (r.status === 'ok') return 'ok' + (r.latencyMs != null ? ' (' + r.latencyMs + 'ms)' : '');
+          if (BENIGN.has(r.status)) return SKIP(r.detail || r.status);
+          throw new Error(r.status + (r.detail ? ': ' + r.detail : ''));
+        });
+      }
+    }
+  }
 
   // ── System (3) ─────────────────────────────────────────────────────────
   record('system', 'Node.js >= 18', () => {

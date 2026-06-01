@@ -1,7 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE v1.0.0 — Metrics Collector
+// FIREALIVE — Metrics Collector
 // Collects metrics across all features for monitoring and SIEM output
 // ═══════════════════════════════════════════════════════════════════════════════
+
+const { versionLabel, fuseCounter, buildId } = require('../lib/version');
 
 class MetricsCollector {
   constructor(db) { this.db = db; this.metrics = {}; }
@@ -32,7 +34,7 @@ class MetricsCollector {
       ir_policies: this._getIRPolicyMetrics(),
       baselines: this._getBaselineMetrics(),
       // System
-      system: { uptime: process.uptime(), memory: process.memoryUsage(), version: 'v1.0.0', fuse: 1 }
+      system: { uptime: process.uptime(), memory: process.memoryUsage(), version: versionLabel, fuse: fuseCounter, buildId }
     };
   }
 
@@ -63,7 +65,7 @@ class MetricsCollector {
   }
   _getAssessmentMetrics() {
     try {
-      const a = this.db.prepare("SELECT COUNT(*) as total, AVG(score) as avg FROM assessments WHERE status='completed'").get();
+      const a = this.db.prepare("SELECT COUNT(*) as total, AVG(score) as avg FROM assessment_results").get();
       return { completed: a?.total || 0, avgScore: Math.round(a?.avg || 0) };
     } catch { return { completed: 0, avgScore: 0 }; }
   }
@@ -94,20 +96,50 @@ class MetricsCollector {
   }
   _getIntegrationHealth() {
     try {
-      const soar = this.db.prepare("SELECT value FROM config WHERE key='soar_config'").get();
-      const ticketing = this.db.prepare("SELECT value FROM config WHERE key='ticketing_config'").get();
-      const iam = this.db.prepare("SELECT value FROM config WHERE key='iam_config'").get();
-      const siem = this.db.prepare("SELECT value FROM config WHERE key='siem_config'").get();
-      return {
-        soar: soar ? 'connected' : 'not configured',
-        ticketing: ticketing ? 'connected' : 'not configured',
-        iam: iam ? 'connected' : 'not configured',
-        siem: siem ? 'connected' : 'not configured'
-      };
+      // Prefer the most recent integration-health probe run when present.
+      const cached = {};
+      try {
+        const row = this.db.prepare("SELECT value FROM config WHERE key='integration_health_last_results'").get();
+        if (row && row.value) {
+          const parsed = JSON.parse(row.value);
+          for (const r of (parsed.results || [])) if (r && r.integration) cached[r.integration] = r.status;
+        }
+      } catch (_) { /* no cached run */ }
+      let masterEnabled = false;
+      try {
+        const m = this.db.prepare("SELECT value FROM config WHERE key='integration_health_probes_enabled'").get();
+        masterEnabled = !!m && (m.value === 'true' || m.value === '1');
+      } catch (_) { /* default off */ }
+
+      const keys = ['soar', 'ticketing', 'iam', 'siem', 'kms', 'storage', 'edr'];
+      const out = {};
+      for (const k of keys) {
+        if (cached[k]) { out[k] = cached[k]; continue; } // real probe status (ok/unreachable/auth_failed/...)
+        const configured = this._isIntegrationConfigured(k);
+        out[k] = !configured ? 'not_configured' : (masterEnabled ? 'configured_not_probed' : 'probes_disabled');
+      }
+      return out;
     } catch { return {}; }
   }
+
+  _isIntegrationConfigured(key) {
+    try {
+      if (key === 'soar' || key === 'ticketing' || key === 'siem') {
+        return !!this.db.prepare('SELECT 1 FROM config WHERE key = ?').get(`${key}_config`);
+      }
+      if (key === 'iam') {
+        const r = this.db.prepare("SELECT value FROM team_config WHERE key = 'iam_config'").get();
+        if (!r || !r.value) return false;
+        try { const c = JSON.parse(r.value); return !!(c && c.server && c.bindDn); } catch { return false; }
+      }
+      if (key === 'kms') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM kms_providers WHERE enabled = 1').get(); return !!(c && c.c > 0); }
+      if (key === 'storage') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1').get(); return !!(c && c.c > 0); }
+      if (key === 'edr') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM malware_scanner_integrations').get(); return !!(c && c.c > 0); }
+      return false;
+    } catch { return false; }
+  }
   _getNotificationMetrics() {
-    try { const n = this.db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) as unread FROM notifications").get(); return { total: n?.total || 0, unread: n?.unread || 0 }; } catch { return { total: 0, unread: 0 }; }
+    try { const n = this.db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) as unread FROM notifications").get(); return { total: n?.total || 0, unread: n?.unread || 0 }; } catch { return { total: 0, unread: 0 }; }
   }
   _getIRPolicyMetrics() {
     try { const p = this.db.prepare("SELECT COUNT(*) as c FROM ir_policies").get(); return { loaded: p?.c || 0 }; } catch { return { loaded: 0 }; }
