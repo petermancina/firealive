@@ -324,6 +324,8 @@ async function start() {
       logger.warn('Integration-health scheduler failed to start', { error: e.message });
     }
 
+    try { require('./services/tripwire-scheduler').startTripwireScheduler(getDb, { getWsServer: () => app.locals.wsServer }); logger.info('Tripwire scheduler started'); } catch (e) { logger.warn('Tripwire scheduler failed to start', { error: e.message }); }
+
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();
 
