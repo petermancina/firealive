@@ -1,4 +1,4 @@
-# FireAlive — SOC Analyst Wellbeing Platform
+# FireAlive — SOC Analyst Burnout Prevention Platform
 
 **Version:** v1.0.51 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
 **E-fuse counter:** 44 (anti-rollback)
