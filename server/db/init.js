@@ -1281,6 +1281,51 @@ CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_log(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 
+-- ── Audit Log Integrity: signed checkpoints (B5a) ────────────────────────
+-- The audit_log hash chain (audit_log.hash / .prev_hash) is established and
+-- backfilled by audit-chain.migrateAuditChain() during initDb, which also
+-- installs the audit_log append-only triggers AFTER the backfill. The two
+-- tables below are created here (always-run, never backfilled): the signed
+-- checkpoint ledger that notarizes the chain head, and the dedicated Ed25519
+-- key family that signs it (kept separate from the backup/forensic chain keys
+-- so one custody chain's key compromise cannot affect another).
+
+CREATE TABLE IF NOT EXISTS audit_chain_checkpoint (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  head_id INTEGER NOT NULL,
+  head_hash TEXT NOT NULL,
+  entry_count INTEGER NOT NULL,
+  signature TEXT NOT NULL,
+  signing_key_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Append-only: the checkpoint ledger is never updated or deleted.
+CREATE TRIGGER IF NOT EXISTS audit_chain_checkpoint_no_update
+BEFORE UPDATE ON audit_chain_checkpoint
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_checkpoint is append-only: UPDATE is not permitted');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_chain_checkpoint_no_delete
+BEFORE DELETE ON audit_chain_checkpoint
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_checkpoint is append-only: DELETE is not permitted');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_audit_chain_checkpoint_head ON audit_chain_checkpoint(head_id);
+
+CREATE TABLE IF NOT EXISTS audit_chain_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,
+  notes TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_chain_signing_keys_active ON audit_chain_signing_keys(is_active) WHERE is_active = 1;
+
 -- ── Fuse Counter (anti-rollback) ─────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS system_meta (
@@ -6833,6 +6878,27 @@ function initDb() {
     console.error(
       'The server will start, but compromise-scan orchestration and the reduced-routing tripwire cannot persist state: POST /api/compromise/* will return 500 and the tripwire detector will not run. No other feature is affected. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.'
     );
+  }
+
+  // ── B5a migration: audit log hash chain + signed checkpoints ──────────────
+  // Establishes audit_log.hash / .prev_hash, backfills existing rows into the
+  // chain (their stored content is unchanged), writes a baseline signed
+  // checkpoint, and installs the audit_log append-only triggers. One-time and
+  // idempotent (guarded by the audit_chain_backfilled marker). Runs LAST so
+  // every row written earlier in initDb (e.g. the R3l C53 backup_kind audit
+  // entries) is captured in the baseline.
+  try {
+    const auditChain = require('../services/audit-chain');
+    const acResult = auditChain.migrateAuditChain(db);
+    const acEntries = db.prepare('SELECT COUNT(*) AS c FROM audit_log').get().c;
+    if (acResult.migrated) {
+      console.log(`B5a migration: audit_log hash chain established (backfilled ${acResult.backfilled} row(s), ${acEntries} total); audit_chain_checkpoint + audit_chain_signing_keys ready; append-only triggers installed`);
+    } else {
+      console.log(`B5a migration: audit_log hash chain already established (${acEntries} entries)`);
+    }
+  } catch (b5aAuditChainMigrationErr) {
+    console.error('B5a audit-chain migration FAILED:', b5aAuditChainMigrationErr.message);
+    console.error('The server will start, but the audit log hash chain is not active: GET /api/audit/integrity will report unavailable and audit tamper-evidence falls back to SIEM ship-out only. No other feature is affected. Recovery: ensure the audit_chain_checkpoint and audit_chain_signing_keys tables exist, then restart to re-run the migration.');
   }
 
   console.log('Database initialized at', DB_PATH);

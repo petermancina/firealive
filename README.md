@@ -1,7 +1,7 @@
-# FireAlive — SOC Analyst Wellbeing Platform
+# FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.51 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
-**E-fuse counter:** 44 (anti-rollback)
+**Version:** v1.0.52 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina   
+**E-fuse counter:** 45 (anti-rollback)
 
 ---
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.51) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.52) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -110,7 +110,7 @@ All four Electron apps (AC, MC, ARC, GD) are self-contained: their UI is precomp
 | network-security | DDoS/slowloris, DNS size limits, client heartbeat, mTLS, anti-pivot |
 | cors-policy | Zero-trust CORS, known origins only |
 | pentest-hardening | Token storage (memory only), safe errors, request correlation, content-type enforcement, idle timeout |
-| audit | Immutable SHA-256 hash chain |
+| audit | Tamper-evident: per-row SHA-256 hash chain + Ed25519-signed checkpoints |
 | auth | JWT + RBAC |
 | network-hardening | Additional network protections |
 
@@ -202,7 +202,7 @@ Compliance reports for 16 frameworks: NIST CSF, ISO 27001, SOC 2, HIPAA, GDPR, D
 
 Each report follows a **Shared Responsibility** model split into two halves:
 
-- **verifiedControls** — technical controls FireAlive observes by inspecting its own running state. Categories: access control (RBAC), encryption (AES-256-GCM at rest, TLS in transit, libsignal for chat E2EE, X25519 multi-recipient envelopes for abuse-flag content), audit trail (SHA-256-chained immutable log), authentication (JWT + IAM/SSO + MFA), configuration management (e-fuse anti-rollback), incident response infrastructure (CISM retro protocol, routing-disable kill switches), data protection (pseudonymization, Tier-3 isolation), network (SIEM/SOAR), backups, notifications, and AI engine status.
+- **verifiedControls** — technical controls FireAlive observes by inspecting its own running state. Categories: access control (RBAC), encryption (AES-256-GCM at rest, TLS in transit, libsignal for chat E2EE, X25519 multi-recipient envelopes for abuse-flag content), audit trail (per-row SHA-256 hash chain + Ed25519-signed checkpoints, append-only), authentication (JWT + IAM/SSO + MFA), configuration management (e-fuse anti-rollback), incident response infrastructure (CISM retro protocol, routing-disable kill switches), data protection (pseudonymization, Tier-3 isolation), network (SIEM/SOAR), backups, notifications, and AI engine status.
 
 - **customerResponsibility** — organizational, procedural, physical, and contractual controls the operating organization must attest separately. Examples: risk-analysis methodology, workforce sanction policy, designated security official, business associate / data processor contracts, physical safeguards on the deployment environment, breach-notification procedures, board-level governance evidence (ISO 27001 management review minutes, internal audit reports), subprocessor agreements and data-transfer impact assessments. For HIPAA, verifiedControls covers 19 controls; customerResponsibility covers 42. The ratio varies by framework but reflects the reality that software handles a minority of any major compliance regime.
 

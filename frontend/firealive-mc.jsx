@@ -419,6 +419,12 @@ function LoginScreen({role, onLogin, onBack}) {
       if (r && r.version) setLoginVersion(r.version);
     }).catch(()=>{});
   },[]);
+  useEffect(()=>{
+    if (tab !== "log_integrity") return;
+    if (mcIntegrity !== null || mcIntegrityLoading) return;
+    setMcIntegrityLoading(true);
+    api.get("/api/audit/integrity").then(r=>setMcIntegrity(r||null)).finally(()=>setMcIntegrityLoading(false));
+  },[tab]);
 
   // ── Phase U3: provision this lead's Signal pre-key bundle on login ──────────
   // The management console is the lead-side client. On login we initialize the
@@ -1270,6 +1276,8 @@ function ManagementConsole() {
   // Initial audit entries for first-run demo. In production, populated from server.
   // Audit log populated from real events.
   const [audit, setAudit] = useState([]);
+  const [mcIntegrity, setMcIntegrity] = useState(null);
+  const [mcIntegrityLoading, setMcIntegrityLoading] = useState(false);
   const [autoSys, setAutoSys] = useState(AUTO_SYS_INIT);
   const [showAddAuto, setShowAddAuto] = useState(false);
   const [newAuto, setNewAuto] = useState({name:"",type:"EDR/XDR",l1:true,l2:false,l3:false,max:500,u:"alerts/hr"});
@@ -6832,18 +6840,26 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <L>Log Integrity Monitoring</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Checks for missing or tampered audit logs. Logs are append-only — the application prevents deletion. Retention follows your configured lifecycle policy. Missing logs trigger SOAR alerts for automated investigation.</M>
           <Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><M style={{color:"#E8EDF5",fontWeight:500}}>Integrity Status</M><Badge color={C.a}>Clean</Badge></div>
-            <M style={{color:C.tm,display:"block",marginBottom:8}}>Last check: {new Date().toLocaleTimeString()} · Checked hourly · No ID gaps or time gaps detected</M>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
-              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>{audit.length}</div><M style={{color:C.td}}>Total Events</M></Card>
-              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>0</div><M style={{color:C.td}}>ID Gaps</M></Card>
-              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>0</div><M style={{color:C.td}}>Time Gaps</M></Card>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <M style={{color:"#E8EDF5",fontWeight:500}}>Integrity Status</M>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <Badge color={!mcIntegrity?C.tm:(mcIntegrity.error?C.w:(mcIntegrity.intact?C.a:C.d))}>{!mcIntegrity?(mcIntegrityLoading?"checking…":"not verified"):(mcIntegrity.error?"unavailable":(mcIntegrity.intact?"Clean":"tamper detected"))}</Badge>
+                <Btn small primary disabled={mcIntegrityLoading} onClick={()=>{setMcIntegrityLoading(true);api.get("/api/audit/integrity").then(r=>{setMcIntegrity(r||null);if(r&&!r.error)addA("AUDIT_INTEGRITY_CHECK",r.intact?("Integrity verified — "+(r.entriesVerified!=null?r.entriesVerified+" entries":"intact")):("Integrity BREAK — "+(r.reason||"unknown")));}).finally(()=>setMcIntegrityLoading(false));}}>{mcIntegrityLoading?"Verifying…":"Verify Now"}</Btn>
+              </div>
             </div>
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"LOG_INTEGRITY_CHECK",detail:"Manual integrity check — passed"}).then(()=>addA("LOG_INTEGRITY_CHECK","Manual integrity check — passed"))}>Run Check Now</Btn>
+            {mcIntegrity&&!mcIntegrity.error&&<M style={{color:C.tm,display:"block",marginBottom:8}}>{mcIntegrity.intact?`${mcIntegrity.entriesVerified!=null?mcIntegrity.entriesVerified+" entries verified · ":""}SHA-256 hash chain + Ed25519-signed checkpoints`:`Chain break — reason: ${mcIntegrity.reason||"unknown"}${mcIntegrity.brokenAt!=null?" at id "+mcIntegrity.brokenAt:""}${mcIntegrity.detail?" — "+mcIntegrity.detail:""}`}</M>}
+            {mcIntegrity&&mcIntegrity.error&&<M style={{color:C.w,display:"block",marginBottom:8}}>Verification unavailable: {mcIntegrity.error}</M>}
+            {!mcIntegrity&&!mcIntegrityLoading&&<M style={{color:C.td,display:"block",marginBottom:8,fontStyle:"italic"}}>Click Verify Now to recompute the chain and validate the latest signed checkpoint.</M>}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
+              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>{audit.length}</div><M style={{color:C.td}}>Session Events</M></Card>
+              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>{mcIntegrity&&mcIntegrity.entriesVerified!=null?mcIntegrity.entriesVerified:"—"}</div><M style={{color:C.td}}>Entries Verified</M></Card>
+              <Card style={{textAlign:"center",padding:10}}><div style={{fontSize:18,fontWeight:600,color:C.a}}>{mcIntegrity&&mcIntegrity.checkpoint?("#"+mcIntegrity.checkpoint.id):"—"}</div><M style={{color:C.td}}>Signed Checkpoint</M></Card>
+            </div>
+            {mcIntegrity&&mcIntegrity.checkpoint&&<M style={{color:C.td,display:"block",marginBottom:4}}>Checkpoint head id {mcIntegrity.checkpoint.head_id} · notarized {mcIntegrity.checkpoint.created_at?new Date(mcIntegrity.checkpoint.created_at).toLocaleString():"—"}</M>}
           </Card>
           <Card>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Protection Mechanisms</div>
-            <M style={{color:C.tm,lineHeight:1.8}}>Append-only audit table (no DELETE/UPDATE permissions) · Sequential ID verification (detects gaps from external tampering) · Time continuity check (flags gaps &gt; 30 min) · HMAC signing on log exports · SOAR auto-dispatch on any violation · Retention lifecycle: configurable per data type (default audit: 365 days)</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>Append-only audit table (no DELETE/UPDATE — enforced by database triggers) · Per-row SHA-256 hash chain · Ed25519-signed checkpoints notarize the chain head · Sequential ID + time-continuity gap detection (flags gaps &gt; 30 min) · SOAR auto-dispatch on any violation · Retention lifecycle: configurable per data type (default audit: 365 days)</M>
           </Card>
         </div>)}
 

@@ -500,7 +500,8 @@ export default function GlobalDashboard() {
   const [drilldownData, setDrilldownData] = useState(null);
   const [drilldownLoading, setDrilldownLoading] = useState(false);
   // Log integrity
-  const [logIntegrity] = useState({status:"healthy",lastCheck:new Date().toISOString()});
+  const [logIntegrity, setLogIntegrity] = useState(null);
+  const [logIntegrityLoading, setLogIntegrityLoading] = useState(false);
   // Regions — loaded from GD-Server's GET /api/metrics/global on app entry.
   // The GD-Server's response shape uses snake_case columns from the SQLite
   // regional_metrics table; we map to the camelCase shape the rest of the
@@ -850,6 +851,16 @@ export default function GlobalDashboard() {
     api.get('/api/audit-logs?limit=100').then(r => {
       if (r && !r.error && r.logs) setAuditList(r.logs);
     }).finally(() => setAuditLoading(false));
+  }, [stage, tab]);
+
+  // B5a: auto-verify the audit-log hash chain once when the Audit tab opens.
+  // The verify endpoint also advances the signed checkpoint; the Verify Now
+  // button on the Log Integrity card re-runs it on demand.
+  useEffect(() => {
+    if (stage !== "app" || tab !== "audit_dash") return;
+    if (logIntegrity !== null || logIntegrityLoading) return;
+    setLogIntegrityLoading(true);
+    api.get("/api/audit/integrity").then(r => setLogIntegrity(r || null)).finally(() => setLogIntegrityLoading(false));
   }, [stage, tab]);
 
   // R3l C34: Tab-gated forensic-export list fetch.
@@ -1982,9 +1993,18 @@ export default function GlobalDashboard() {
               </div>
             </Card>
             <Card style={{marginBottom:12}}>
-              <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><M style={{color:C.i,fontWeight:500}}>Log Integrity</M><Badge color={logIntegrity.status==="healthy"?C.a:C.d}>{logIntegrity.status}</Badge></div>
-              <M style={{color:C.td}}>Last check: {new Date(logIntegrity.lastCheck).toLocaleString()} · Continuous monitoring · Tampering detection enabled</M>
-              <M style={{color:C.td,display:"block",marginTop:6,fontStyle:"italic"}}>Log integrity status auto-forwarded to configured SIEM/SOAR in the Monitoring Integrations tab.</M>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <M style={{color:C.i,fontWeight:500}}>Log Integrity</M>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <Badge color={!logIntegrity?C.tm:(logIntegrity.error?C.w:(logIntegrity.intact?C.a:C.d))}>{!logIntegrity?(logIntegrityLoading?"checking…":"not verified"):(logIntegrity.error?"unavailable":(logIntegrity.intact?"intact":"tamper detected"))}</Badge>
+                  <Btn small primary disabled={logIntegrityLoading} onClick={()=>{setLogIntegrityLoading(true);api.get("/api/audit/integrity").then(r=>setLogIntegrity(r||null)).finally(()=>setLogIntegrityLoading(false));}}>{logIntegrityLoading?"Verifying…":"Verify Now"}</Btn>
+                </div>
+              </div>
+              {logIntegrity&&!logIntegrity.error&&<M style={{color:C.td,display:"block"}}>{logIntegrity.intact?`${logIntegrity.entriesVerified!=null?logIntegrity.entriesVerified+" entries verified · ":""}SHA-256 hash chain + Ed25519-signed checkpoints`:`Chain break — reason: ${logIntegrity.reason||"unknown"}${logIntegrity.brokenAt!=null?" at id "+logIntegrity.brokenAt:""}`}</M>}
+              {logIntegrity&&logIntegrity.checkpoint&&<M style={{color:C.td,display:"block",marginTop:6}}>Signed checkpoint #{logIntegrity.checkpoint.id} · head id {logIntegrity.checkpoint.head_id} · notarized {logIntegrity.checkpoint.created_at?new Date(logIntegrity.checkpoint.created_at).toLocaleString():"—"}</M>}
+              {logIntegrity&&logIntegrity.error&&<M style={{color:C.w,display:"block"}}>Verification unavailable: {logIntegrity.error}</M>}
+              {!logIntegrity&&!logIntegrityLoading&&<M style={{color:C.td,display:"block",fontStyle:"italic"}}>Click Verify Now to recompute the chain and validate the latest signed checkpoint.</M>}
+              <M style={{color:C.td,display:"block",marginTop:6,fontStyle:"italic"}}>Tamper-evident from baseline establishment at deployment. A periodic check also runs hourly and records a critical audit event on any break.</M>
             </Card>
             <Card>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Export Audit Logs & Forensics</div>

@@ -116,8 +116,28 @@ function detectMissingLogs(thresholdMinutes = 30) {
     }
 
     if (findings.length > 0) {
-      auditLog(null, 'MISSING_LOGS', JSON.stringify(findings));
-      dispatchToSoar('MISSING_LOGS', findings);
+      // Route the gap finding through the B3 alert router (audit + SIEM + SOAR
+      // + notification per the matrix). routeAlert's audit channel records the
+      // event and its SOAR channel still reaches dispatchToSoar, so this
+      // replaces the prior direct auditLog + dispatchToSoar pair (no double
+      // logging). Fire-and-forget on its own connection, closed once the
+      // router's async channels settle.
+      try {
+        const { routeAlert } = require('./alert-router');
+        const adb = getDb();
+        Promise.resolve(
+          routeAlert(adb, {
+            type: 'MISSING_LOGS',
+            severity: 'high',
+            message: `Audit log gap detected: ${findings.map((f) => f.detail).join('; ')}`,
+            timestamp: new Date().toISOString(),
+          })
+        )
+          .catch((e) => logger.error('MISSING_LOGS alert dispatch failed', { error: e.message }))
+          .finally(() => { try { adb.close(); } catch (_e) { /* already closed */ } });
+      } catch (e) {
+        logger.error('MISSING_LOGS alert dispatch failed', { error: e.message });
+      }
     }
 
     return { clean: findings.length === 0, findings };

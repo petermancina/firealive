@@ -326,6 +326,7 @@ async function start() {
     }
 
     try { require('./services/tripwire-scheduler').startTripwireScheduler(getDb, { getWsServer: () => app.locals.wsServer }); logger.info('Tripwire scheduler started'); } catch (e) { logger.warn('Tripwire scheduler failed to start', { error: e.message }); }
+    try { require('./services/audit-integrity-scheduler').startAuditIntegrityScheduler(getDb); logger.info('Audit integrity scheduler started'); } catch (e) { logger.warn('Audit integrity scheduler failed to start', { error: e.message }); }
 
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();
@@ -336,17 +337,16 @@ async function start() {
     schedulingSyncService.start();
 
     // Scheduled jobs: account review (03:00), retention purge (04:00),
-    // recert check (09:00), log integrity (hourly)
+    // recert check (09:00). Log integrity (chain verify + signed checkpoint +
+    // gap check) runs on its own cadence via startAuditIntegrityScheduler below.
     const { runAccountReview } = require('./services/account-review');
     const { runRetentionPurge } = require('./services/retention');
-    const { detectMissingLogs } = require('./services/soar-alerting');
     const { checkRecertDue } = require('./services/recertification');
     setInterval(() => {
       const hour = new Date().getHours();
       if (hour === 3) runAccountReview();
       if (hour === 4) runRetentionPurge();
       if (hour === 9) checkRecertDue();
-      detectMissingLogs();
     }, 3600000);
 
     // Relay the two-person legal-hold export across the regional <-> GD channel:

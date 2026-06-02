@@ -930,20 +930,12 @@ router.put('/visibility', visibilityToggleLimiter, (req, res) => {
     // event_type LEADERBOARD_OPT_IN_FLIPPED is queryable for forensic
     // and compliance review.
     try {
-      const db = getDb();
-      try {
-        db.prepare(
-          `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
-             VALUES (?, ?, ?, ?)`
-        ).run(
-          req.user.id,
-          'LEADERBOARD_OPT_IN_FLIPPED',
-          JSON.stringify({ optIn: result.optIn }),
-          req.ip || null
-        );
-      } finally {
-        db.close();
-      }
+      auditLog(
+        req.user.id,
+        'LEADERBOARD_OPT_IN_FLIPPED',
+        JSON.stringify({ optIn: result.optIn }),
+        req.ip || null
+      );
     } catch (auditErr) {
       // Audit log failure must not fail the request; the canonical
       // state change (users.leaderboard_opt_in) is already committed.
@@ -1039,26 +1031,18 @@ router.post('/flagged-ratings/:ratingId/decide', (req, res) => {
     // forensic review. Includes the rating id, decider, decision,
     // reversal ledger id (if any), and the lead-supplied note.
     try {
-      const db = getDb();
-      try {
-        db.prepare(
-          `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
-             VALUES (?, ?, ?, ?)`
-        ).run(
-          req.user.id,
-          body.confirmFraud
-            ? 'LEADERBOARD_SOCKPUPPET_CONFIRMED'
-            : 'LEADERBOARD_SOCKPUPPET_DISMISSED',
-          JSON.stringify({
-            ratingId: req.params.ratingId,
-            reversalLedgerId: result.reversalLedgerId || null,
-            note: note || null,
-          }),
-          req.ip || null
-        );
-      } finally {
-        db.close();
-      }
+      auditLog(
+        req.user.id,
+        body.confirmFraud
+          ? 'LEADERBOARD_SOCKPUPPET_CONFIRMED'
+          : 'LEADERBOARD_SOCKPUPPET_DISMISSED',
+        JSON.stringify({
+          ratingId: req.params.ratingId,
+          reversalLedgerId: result.reversalLedgerId || null,
+          note: note || null,
+        }),
+        req.ip || null
+      );
     } catch (auditErr) {
       // Audit log failure must not fail the request; the canonical
       // state change is already committed.

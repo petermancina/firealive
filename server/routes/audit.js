@@ -29,7 +29,7 @@ router.get('/', (req, res) => {
     if (startDate) { sql += ' AND al.timestamp >= ?'; params.push(startDate); }
     if (endDate) { sql += ' AND al.timestamp <= ?'; params.push(endDate); }
 
-    sql += ' ORDER BY al.timestamp DESC LIMIT ? OFFSET ?';
+    sql += ' ORDER BY al.timestamp DESC, al.id DESC LIMIT ? OFFSET ?';
     params.push(Math.min(parseInt(limit, 10) || 200, 1000), Math.max(parseInt(offset, 10) || 0, 0));
 
     const rows = db.prepare(sql).all(...params);
@@ -85,7 +85,7 @@ router.get('/export', (req, res) => {
       return res.status(400).json({ error: `Invalid source: ${source}`, allowed: ['all', 'mc', 'ac', 'ac-analyst', 'server'] });
     }
 
-    sql += ' ORDER BY al.timestamp ASC';
+    sql += ' ORDER BY al.timestamp ASC, al.id ASC';
 
     const rows = db.prepare(sql).all(...params);
     db.close();
@@ -160,18 +160,62 @@ router.get('/stats', (req, res) => {
 //
 // The check itself is logged to the audit chain so that a Team Lead running
 // integrity checks creates an additional auditable trail of monitoring activity.
-router.get('/integrity', (req, res) => {
+router.get('/integrity', async (req, res) => {
+  let db;
   try {
-    const db = getDb();
+    db = getDb();
     const result = verifyAuditChain(db);
+
+    if (result.intact) {
+      // Notarize the current chain head at verify time, so an on-demand
+      // "Verify Now" also advances the signed-checkpoint anchor.
+      try {
+        const { createCheckpoint } = require('../services/audit-chain');
+        createCheckpoint(db);
+      } catch (cpErr) {
+        logger.warn('audit checkpoint after verify failed', { error: cpErr.message });
+      }
+    }
     db.close();
-    auditLog(req.user?.id, 'AUDIT_INTEGRITY_CHECK',
-      result.intact ? `intact entries=${result.entries}` : `BROKEN at id=${result.brokenAt}`,
-      req.ip);
+    db = null;
+
+    if (!result.intact) {
+      // Tamper detected — fire a critical alert through the alert router
+      // (audit + SIEM + SOAR + notification + email + webhook per the matrix).
+      try {
+        const { routeAlert } = require('../services/alert-router');
+        const adb = getDb();
+        try {
+          await routeAlert(adb, {
+            type: 'AUDIT_CHAIN_BREAK',
+            severity: 'critical',
+            message: `Audit log integrity check failed: ${result.reason || 'unknown'} at id ${result.brokenAt}`,
+            timestamp: new Date().toISOString(),
+          });
+        } finally {
+          adb.close();
+        }
+      } catch (alertErr) {
+        logger.error('Audit chain break alert dispatch failed', { error: alertErr.message });
+      }
+    }
+
+    // Record the check itself so running integrity checks leaves a monitoring
+    // trail in the chain.
+    auditLog(
+      req.user?.id,
+      'AUDIT_INTEGRITY_CHECK',
+      result.intact
+        ? `intact entries=${result.entriesVerified}`
+        : `BROKEN reason=${result.reason} id=${result.brokenAt}`,
+      req.ip
+    );
+
     res.json(result);
   } catch (err) {
+    if (db) { try { db.close(); } catch (_) { /* already closed */ } }
     logger.error('Audit integrity check error', { error: err.message });
-    res.status(500).json({ error: 'Failed to verify audit chain integrity' });
+    res.status(500).json({ error: 'Failed to verify audit chain integrity', detail: err.message });
   }
 });
 

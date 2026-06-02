@@ -625,27 +625,40 @@ class RegressionRunner {
       if (row.n === 0) throw new Error('no active chain signing key');
       return row.n + ' active chain signing key(s)';
     });
-    await check('audit-chain', 'audit_log hash-chain linkage (B5a)', () => {
-      // Forward-aware + auto-activating. The audit_log SHA-256 hash chain lands
-      // in B5a (ALTER TABLE audit_log ADD COLUMN hash/prev_hash). Until those
-      // columns exist this skips; once they exist it verifies the chain LINKAGE
-      // (each row's prev_hash equals the prior row's hash) — detecting breaks,
-      // reordering, or deletions without coupling to B5a's exact hash formula.
+    await check('audit-chain', 'audit_log hash chain recompute + linkage (B5a)', () => {
+      // Forward-aware + auto-activating. Until the B5a hash columns exist this
+      // skips; once present it runs the authoritative verifier — recomputes
+      // every row's SHA-256 from its content, checks prev_hash linkage, and
+      // validates the chain head against the latest Ed25519-signed checkpoint.
       if (!columnExists('audit_log', 'hash') || !columnExists('audit_log', 'prev_hash')) {
         return SKIP('audit_log.hash/prev_hash not present yet — pending B5a (Audit Hash Chain)');
       }
-      const rows = this.db
-        .prepare("SELECT id, hash, prev_hash FROM audit_log ORDER BY id ASC LIMIT 5000")
-        .all();
-      if (rows.length === 0) return 'audit_log empty (chain trivially intact)';
-      let prev = null, breaks = 0, firstBreak = null;
-      for (const r of rows) {
-        if (!r.hash) { breaks++; if (!firstBreak) firstBreak = 'row ' + r.id + ' has no hash'; }
-        if (prev !== null && r.prev_hash !== prev) { breaks++; if (!firstBreak) firstBreak = 'row ' + r.id + ' prev_hash != prior hash'; }
-        prev = r.hash;
+      const { verifyFull } = require('./audit-chain');
+      const r = verifyFull(this.db);
+      if (!r.intact) {
+        throw new Error('chain ' + (r.reason || 'broken') + (r.brokenAt != null ? (' at id ' + r.brokenAt) : '') + (r.detail ? (' — ' + r.detail) : ''));
       }
-      if (breaks > 0) throw new Error(breaks + ' chain break(s); first: ' + firstBreak);
-      return 'chain intact across ' + rows.length + ' row(s)';
+      return (r.entriesVerified != null ? r.entriesVerified : 0) + ' row(s) verified (recompute + linkage + checkpoint)';
+    });
+    await check('audit-chain', 'audit_log signed checkpoint (B5a)', () => {
+      // Explicitly validates the latest Ed25519-signed checkpoint: recomputes the
+      // head digest, verifies the signature against the active signing key, and
+      // confirms the chain head row matches the notarized head. Forward-aware.
+      if (!tableExists('audit_chain_checkpoint') || !tableExists('audit_chain_signing_keys') || !columnExists('audit_log', 'hash')) {
+        return SKIP('audit_chain checkpoint tables not present yet — pending B5a');
+      }
+      const ac = require('./audit-chain');
+      const cp = ac.getLatestCheckpoint(this.db);
+      if (!cp) return 'no signed checkpoint yet (baseline not established)';
+      const keyRow = this.db.prepare('SELECT public_key FROM audit_chain_signing_keys WHERE id = ?').get(cp.signing_key_id);
+      if (!keyRow) throw new Error('checkpoint ' + cp.id + ' references missing signing key ' + cp.signing_key_id);
+      const digest = ac.computeHeadDigest(cp);
+      const sig = cp.signatureBuf || Buffer.from(cp.signature, 'base64');
+      const ok = crypto.verify(null, digest, crypto.createPublicKey(keyRow.public_key), sig);
+      if (!ok) throw new Error('checkpoint ' + cp.id + ' Ed25519 signature INVALID');
+      const headRow = this.db.prepare('SELECT hash FROM audit_log WHERE id = ?').get(cp.head_id);
+      if (!headRow || headRow.hash !== cp.head_hash) throw new Error('chain head id ' + cp.head_id + ' does not match signed checkpoint ' + cp.id);
+      return 'checkpoint #' + cp.id + ' signature valid (head id ' + cp.head_id + ', ' + cp.entry_count + ' entries)';
     });
 
     // ── Category 10: Peer features ────────────────────────────────

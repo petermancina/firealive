@@ -27,6 +27,14 @@ const legalHoldExport = require('./services/legal-hold-export');
 const abuseExportApproval = require('./services/abuse-export-approval-keys');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
+const {
+  appendGdAuditEntry,
+  verifyFull,
+  verifyIncremental,
+  createCheckpoint,
+  getLatestCheckpoint,
+  ensureActiveAuditChainKey,
+} = require('./services/gd-audit-chain');
 
 const app = express();
 const PORT = process.env.GD_PORT || 4001;
@@ -115,8 +123,7 @@ app.use((req, res, next) => {
     if (req.path !== '/api/health') {
       try {
         const db = getDb();
-        db.prepare("INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, ?, ?, ?, ?)")
-          .run(req.user?.id || 'anonymous', 'HTTP_' + req.method, `${req.path} ${res.statusCode} ${Date.now() - start}ms`, req.ip, res.statusCode >= 400 ? 'warning' : 'info');
+        appendGdAuditEntry(db, { userId: req.user?.id || 'anonymous', eventType: 'HTTP_' + req.method, detail: `${req.path} ${res.statusCode} ${Date.now() - start}ms`, ip: req.ip, severity: res.statusCode >= 400 ? 'warning' : 'info' });
         db.close();
       } catch (e) { /* silent */ }
     }
@@ -228,8 +235,7 @@ app.post('/api/ingest/metrics', (req, res) => {
       rawBody: req.rawBody,
     });
     if (!sigResult.ok) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
-        .run(`mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      appendGdAuditEntry(db, { eventType: 'INGEST_SIGNATURE_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`, severity: 'critical' });
       db.close();
       return res.status(401).json({
         error: sigResult.error,
@@ -269,8 +275,7 @@ app.post('/api/ingest/metrics', (req, res) => {
         .run(mc.id, `${mc.name} SLA compliance at ${metrics.slaCompliance}% (threshold: ${notifCfg.sla_below}%)`);
     }
 
-    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('METRICS_INGESTED', ?, 'info')")
-      .run(`From ${mc.name}: health=${metrics.healthScore}, util=${metrics.utilization}% fingerprint=${sigResult.fingerprint}`);
+    appendGdAuditEntry(db, { eventType: 'METRICS_INGESTED', detail: `From ${mc.name}: health=${metrics.healthScore}, util=${metrics.utilization}% fingerprint=${sigResult.fingerprint}`, severity: 'info' });
     db.close();
     res.json({ success: true, mc: mc.name });
   } catch (e) { console.error('Ingest error:', e); res.status(500).json({ error: 'Metrics ingest failed' }); }
@@ -419,8 +424,7 @@ function handleFullReportIngest(req, res) {
       rawBody: req.rawBody,
     });
     if (!sigResult.ok) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
-        .run(`endpoint=compliance-reports-full mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      appendGdAuditEntry(db, { eventType: 'INGEST_SIGNATURE_REJECTED', detail: `endpoint=compliance-reports-full mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`, severity: 'critical' });
       db.close();
       return res.status(401).json({ error: sigResult.error, code: sigResult.code });
     }
@@ -432,23 +436,20 @@ function handleFullReportIngest(req, res) {
     } else if (typeof requestId === 'string' && /^[1-9][0-9]*$/.test(requestId)) {
       requestIdNum = parseInt(requestId, 10);
     } else {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=invalid_request_id fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} reason=invalid_request_id fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'requestId is required and must be a positive integer' });
     }
 
     // ── Validate framework ──
     if (typeof framework !== 'string' || !framework.trim()) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=missing_framework fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=missing_framework fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'framework is required and must be a non-empty string' });
     }
     const fw = framework.trim();
     if (fw.length > COMPLIANCE_FRAMEWORK_MAX_LEN || !COMPLIANCE_FRAMEWORK_PATTERN.test(fw)) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({
         error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${COMPLIANCE_FRAMEWORK_MAX_LEN} chars`,
@@ -457,22 +458,19 @@ function handleFullReportIngest(req, res) {
 
     // ── Validate report object ──
     if (!report || typeof report !== 'object' || Array.isArray(report)) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=missing_or_invalid_report fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=missing_or_invalid_report fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'report is required and must be an object' });
     }
     let reportJson;
     try { reportJson = JSON.stringify(report); }
     catch (jsonErr) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_not_serializable fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_not_serializable fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'report contains values that cannot be JSON-serialized' });
     }
     if (reportJson.length > COMPLIANCE_FULL_REPORT_MAX_BYTES) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_too_large bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=report_too_large bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({
         error: `report exceeds maximum size of ${COMPLIANCE_FULL_REPORT_MAX_BYTES} bytes`,
@@ -489,22 +487,19 @@ function handleFullReportIngest(req, res) {
       // Collapse "doesn't exist" and "exists but belongs to a different MC"
       // into the same 404 so an attacker can't enumerate other MCs'
       // request IDs.
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=request_not_found_for_mc fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} reason=request_not_found_for_mc fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(404).json({ error: 'requestId not found for this MC' });
     }
     if (requestRow.framework !== fw) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} body_framework=${fw} request_framework=${requestRow.framework} reason=framework_mismatch fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} body_framework=${fw} request_framework=${requestRow.framework} reason=framework_mismatch fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({
         error: `framework mismatch: request expects ${requestRow.framework}, body has ${fw}`,
       });
     }
     if (requestRow.status !== 'pending') {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} request_status=${requestRow.status} reason=request_not_pending fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} requestId=${requestIdNum} framework=${fw} request_status=${requestRow.status} reason=request_not_pending fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(409).json({
         error: `request is no longer pending (status=${requestRow.status})`,
@@ -569,12 +564,10 @@ function handleFullReportIngest(req, res) {
       rollupUpdated = true;
     } catch (rollupErr) {
       console.error('cross_region_rollup update failed (full report):', rollupErr.message);
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_ROLLUP_UPDATE_FAILED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} fullReportId=${fullReportId} reason=${rollupErr.message.slice(0, 200)}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_ROLLUP_UPDATE_FAILED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} fullReportId=${fullReportId} reason=${rollupErr.message.slice(0, 200)}`, severity: 'warning' });
     }
 
-    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_FULFILLED', ?, 'info')")
-      .run(`From ${mc.name}: framework=${fw} requestId=${requestIdNum} fullReportId=${fullReportId} bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`);
+    appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_FULFILLED', detail: `From ${mc.name}: framework=${fw} requestId=${requestIdNum} fullReportId=${fullReportId} bytes=${reportJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`, severity: 'info' });
     db.close();
 
     return res.status(202).json({
@@ -617,8 +610,7 @@ app.post('/api/ingest/compliance-reports', (req, res) => {
       rawBody: req.rawBody,
     });
     if (!sigResult.ok) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
-        .run(`endpoint=compliance-reports mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      appendGdAuditEntry(db, { eventType: 'INGEST_SIGNATURE_REJECTED', detail: `endpoint=compliance-reports mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`, severity: 'critical' });
       db.close();
       return res.status(401).json({
         error: sigResult.error,
@@ -628,23 +620,20 @@ app.post('/api/ingest/compliance-reports', (req, res) => {
 
     // ── Validate body shape ──
     if (typeof framework !== 'string' || !framework.trim()) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=missing_framework fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} reason=missing_framework fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'framework is required and must be a non-empty string' });
     }
     const fw = framework.trim();
     if (fw.length > COMPLIANCE_FRAMEWORK_MAX_LEN || !COMPLIANCE_FRAMEWORK_PATTERN.test(fw)) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} reason=invalid_framework framework=${JSON.stringify(fw.slice(0, 100))} fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({
         error: `framework must be ASCII-safe (letters, digits, hyphens, underscores) and max ${COMPLIANCE_FRAMEWORK_MAX_LEN} chars`,
       });
     }
     if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=missing_or_invalid_summary fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=missing_or_invalid_summary fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'summary is required and must be an object' });
     }
@@ -653,14 +642,12 @@ app.post('/api/ingest/compliance-reports', (req, res) => {
     try {
       summaryJson = JSON.stringify(summary);
     } catch (jsonErr) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_not_serializable fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_not_serializable fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'summary contains values that cannot be JSON-serialized (e.g., circular references)' });
     }
     if (summaryJson.length > COMPLIANCE_SUMMARY_MAX_BYTES) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_too_large bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} reason=summary_too_large bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({
         error: `summary exceeds maximum size of ${COMPLIANCE_SUMMARY_MAX_BYTES} bytes (use the full-report mailbox pattern for larger payloads)`,
@@ -725,12 +712,10 @@ app.post('/api/ingest/compliance-reports', (req, res) => {
       rollupUpdated = true;
     } catch (rollupErr) {
       console.error('cross_region_rollup update failed:', rollupErr.message);
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_ROLLUP_UPDATE_FAILED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} reportId=${result.lastInsertRowid} reason=${rollupErr.message.slice(0, 200)}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_ROLLUP_UPDATE_FAILED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} reportId=${result.lastInsertRowid} reason=${rollupErr.message.slice(0, 200)}`, severity: 'warning' });
     }
 
-    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_REPORT_INGESTED', ?, 'info')")
-      .run(`From ${mc.name}: framework=${fw} reportId=${result.lastInsertRowid} bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`);
+    appendGdAuditEntry(db, { eventType: 'COMPLIANCE_REPORT_INGESTED', detail: `From ${mc.name}: framework=${fw} reportId=${result.lastInsertRowid} bytes=${summaryJson.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''} rollup_updated=${rollupUpdated}`, severity: 'info' });
     db.close();
 
     return res.status(202).json({
@@ -755,8 +740,7 @@ app.post('/api/mc/register', authMiddleware(['ciso', 'vp']), (req, res) => {
     const id = crypto.randomBytes(4).toString('hex');
     db.prepare("INSERT INTO management_consoles (id, name, region, endpoint, api_key, country, regulatory_framework) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .run(id, name, region, endpoint, apiKey, country || null, regulatoryFramework || 'none');
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'MC_REGISTERED', ?)")
-      .run(req.user.id, `${name} (${region})`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_REGISTERED', detail: `${name} (${region})` });
     db.close();
     res.json({ success: true, id, apiKey, message: 'Provide this API key to the Regional Server for data push configuration' });
   } catch (e) { res.status(500).json({ error: 'MC registration failed' }); }
@@ -775,7 +759,7 @@ app.put('/api/mc/:id/offboard', authMiddleware(['ciso']), (req, res) => {
   try {
     const db = getDb();
     db.prepare("UPDATE management_consoles SET status = 'offboarded', offboarded_at = datetime('now') WHERE id = ?").run(req.params.id);
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'MC_OFFBOARDED', ?)").run(req.user.id, `MC ${req.params.id} offboarded`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_OFFBOARDED', detail: `MC ${req.params.id} offboarded` });
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'MC offboarding failed' }); }
@@ -857,11 +841,7 @@ app.post('/api/mc/:id/signing-key', (req, res) => {
     // write one INSERT so response timing is similar regardless of
     // input validity (no oracle leak on api_key validity).
     const auditWarn = (mcLabel, code, extra = '') =>
-      db.prepare(
-        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_SUBMIT_REJECTED', ?, 'warning')"
-      ).run(
-        `attempted_mc=${mcLabel} path_id=${req.params.id || 'none'} code=${code}${extra ? ' ' + extra : ''}`
-      );
+      appendGdAuditEntry(db, { eventType: 'MC_SIGNING_KEY_SUBMIT_REJECTED', detail: `attempted_mc=${mcLabel} path_id=${req.params.id || 'none'} code=${code}${extra ? ' ' + extra : ''}`, severity: 'warning' });
 
     if (!apiKey || !public_key || !public_key_fingerprint) {
       auditWarn('unknown', 'MISSING_FIELDS');
@@ -941,11 +921,7 @@ app.post('/api/mc/:id/signing-key', (req, res) => {
     //   submitted              -> 202 Accepted (new pending row created)
     //   idempotent_pending     -> 200 OK (already pending; no state change)
     //   idempotent_approved    -> 200 OK (already approved active)
-    db.prepare(
-      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_SUBMITTED', ?, 'info')"
-    ).run(
-      `mc=${mc.name} mc_id=${mc.id} keyId=${result.id} fingerprint=${result.fingerprint} action=${result.action}`
-    );
+    appendGdAuditEntry(db, { eventType: 'MC_SIGNING_KEY_SUBMITTED', detail: `mc=${mc.name} mc_id=${mc.id} keyId=${result.id} fingerprint=${result.fingerprint} action=${result.action}`, severity: 'info' });
 
     db.close();
 
@@ -1098,12 +1074,7 @@ app.post('/api/mc/:id/signing-keys/:keyId/approve',
       const supplied = (req.body || {}).confirmation_fingerprint;
       if (supplied !== undefined && supplied !== null) {
         if (typeof supplied !== 'string' || supplied.toLowerCase() !== target.public_key_fingerprint) {
-          db.prepare(
-            "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVE_BLOCKED', ?, 'warning')"
-          ).run(
-            req.user.id,
-            `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} reason=confirmation_fingerprint_mismatch`
-          );
+          appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_SIGNING_KEY_APPROVE_BLOCKED', detail: `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} reason=confirmation_fingerprint_mismatch`, severity: 'warning' });
           db.close();
           return res.status(400).json({
             error: 'confirmation_fingerprint does not match the keyId\'s stored fingerprint',
@@ -1121,12 +1092,7 @@ app.post('/api/mc/:id/signing-keys/:keyId/approve',
         });
       } catch (svcErr) {
         const mapped = mapSigningSvcError(svcErr, signingKeysSvc.CODES);
-        db.prepare(
-          "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVE_FAILED', ?, 'warning')"
-        ).run(
-          req.user.id,
-          `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`
-        );
+        appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_SIGNING_KEY_APPROVE_FAILED', detail: `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`, severity: 'warning' });
         db.close();
         return res.status(mapped.status).json(mapped.body);
       }
@@ -1134,12 +1100,7 @@ app.post('/api/mc/:id/signing-keys/:keyId/approve',
       const priorTail = result.priorKeyId
         ? ` prior_keyId=${result.priorKeyId} prior_fingerprint=${result.priorFingerprint}`
         : '';
-      db.prepare(
-        "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_APPROVED', ?, 'info')"
-      ).run(
-        req.user.id,
-        `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} action=${result.action}${priorTail}`
-      );
+      appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_SIGNING_KEY_APPROVED', detail: `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} action=${result.action}${priorTail}`, severity: 'info' });
 
       db.close();
       return res.json({
@@ -1203,24 +1164,14 @@ app.post('/api/mc/:id/signing-keys/:keyId/reject',
         });
       } catch (svcErr) {
         const mapped = mapSigningSvcError(svcErr, signingKeysSvc.CODES);
-        db.prepare(
-          "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_REJECT_FAILED', ?, 'warning')"
-        ).run(
-          req.user.id,
-          `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`
-        );
+        appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_SIGNING_KEY_REJECT_FAILED', detail: `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${keyIdNum} code=${svcErr.code || 'UNKNOWN'}`, severity: 'warning' });
         db.close();
         return res.status(mapped.status).json(mapped.body);
       }
 
       // Reason captured verbatim in audit detail (internal only — never
       // returned to MC).
-      db.prepare(
-        "INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'MC_SIGNING_KEY_REJECTED', ?, 'info')"
-      ).run(
-        req.user.id,
-        `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} reason=${reason.trim()}`
-      );
+      appendGdAuditEntry(db, { userId: req.user.id, eventType: 'MC_SIGNING_KEY_REJECTED', detail: `user_id=${req.user.id} role=${req.user.role} mc=${mc.name} (${mc.id}) keyId=${result.keyId} fingerprint=${result.fingerprint} reason=${reason.trim()}`, severity: 'info' });
 
       db.close();
       return res.json({
@@ -1448,8 +1399,7 @@ app.post('/api/mc/:id/full-report-requests',
         FROM mc_report_requests WHERE id = ?
       `).get(result.lastInsertRowid);
 
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_FULL_REPORT_REQUESTED', ?, 'info')")
-        .run(`mc=${mc.name} mc_id=${mc.id} framework=${fw} requestId=${row.id} requestedBy=${req.user.id}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_FULL_REPORT_REQUESTED', detail: `mc=${mc.name} mc_id=${mc.id} framework=${fw} requestId=${row.id} requestedBy=${req.user.id}`, severity: 'info' });
       db.close();
 
       return res.status(201).json({
@@ -1575,9 +1525,7 @@ app.post('/api/mc/me/signing-key-status', (req, res) => {
     db = getDb();
 
     const auditBlock = (mcLabel, code, extra = '') =>
-      db.prepare(
-        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_STATUS_BLOCKED', ?, 'warning')"
-      ).run(`attempted_mc=${mcLabel} keyId=${keyId === undefined ? 'none' : keyId} code=${code}${extra ? ' ' + extra : ''}`);
+      appendGdAuditEntry(db, { eventType: 'MC_SIGNING_KEY_STATUS_BLOCKED', detail: `attempted_mc=${mcLabel} keyId=${keyId === undefined ? 'none' : keyId} code=${code}${extra ? ' ' + extra : ''}`, severity: 'warning' });
 
     if (!apiKey || keyId === undefined || keyId === null) {
       auditBlock('unknown', 'MISSING_FIELDS');
@@ -1637,9 +1585,7 @@ app.post('/api/mc/me/signing-key-status', (req, res) => {
     const raw = signingKeysSvc.getStatusForMc(db, { mcId: mc.id, keyId: keyIdNum });
     const status = raw.status === null ? 'rejected' : raw.status;
 
-    db.prepare(
-      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('MC_SIGNING_KEY_STATUS_QUERIED', ?, 'info')"
-    ).run(`mc=${mc.name} (${mc.id}) keyId=${keyIdNum} status=${status}${raw.status === null ? ' note=collapsed_from_null' : ''}`);
+    appendGdAuditEntry(db, { eventType: 'MC_SIGNING_KEY_STATUS_QUERIED', detail: `mc=${mc.name} (${mc.id}) keyId=${keyIdNum} status=${status}${raw.status === null ? ' note=collapsed_from_null' : ''}`, severity: 'info' });
 
     db.close();
     return res.json({ status });
@@ -1746,9 +1692,7 @@ app.post('/api/mc/me/pending-requests', (req, res) => {
     db = getDb();
 
     const auditBlock = (mcLabel, code, extra = '') =>
-      db.prepare(
-        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_BLOCKED', ?, 'warning')"
-      ).run(`attempted_mc=${mcLabel} code=${code}${extra ? ' ' + extra : ''}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_PENDING_REQUESTS_BLOCKED', detail: `attempted_mc=${mcLabel} code=${code}${extra ? ' ' + extra : ''}`, severity: 'warning' });
 
     if (!apiKey || typeof apiKey !== 'string') {
       auditBlock('unknown', 'MISSING_API_KEY');
@@ -1777,9 +1721,7 @@ app.post('/api/mc/me/pending-requests', (req, res) => {
       rawBody: req.rawBody,
     });
     if (!sigResult.ok) {
-      db.prepare(
-        "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_BLOCKED', ?, 'warning')"
-      ).run(`attempted_mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'}`);
+      appendGdAuditEntry(db, { eventType: 'COMPLIANCE_PENDING_REQUESTS_BLOCKED', detail: `attempted_mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'}`, severity: 'warning' });
       db.close();
       return res.status(401).json({
         error: sigResult.error,
@@ -1794,9 +1736,7 @@ app.post('/api/mc/me/pending-requests', (req, res) => {
       ORDER BY id ASC
     `).all(mc.id);
 
-    db.prepare(
-      "INSERT INTO audit_log (event_type, detail, severity) VALUES ('COMPLIANCE_PENDING_REQUESTS_QUERIED', ?, 'info')"
-    ).run(`mc=${mc.name} mc_id=${mc.id} count=${rows.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''}`);
+    appendGdAuditEntry(db, { eventType: 'COMPLIANCE_PENDING_REQUESTS_QUERIED', detail: `mc=${mc.name} mc_id=${mc.id} count=${rows.length} fingerprint=${sigResult.fingerprint}${sigResult.viaGraceWindow ? ' viaGraceWindow=true' : ''}`, severity: 'info' });
     db.close();
 
     return res.json({ requests: rows });
@@ -2447,7 +2387,7 @@ app.post('/api/reports/generate', authMiddleware(['ciso', 'vp']), async (req, re
     db.prepare("INSERT INTO reports (id, type, data) VALUES (?, ?, ?)").run(id, type, JSON.stringify(report));
 
     if (format === 'json') {
-      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'REPORT_GENERATED', ?)").run(req.user.id, type);
+      appendGdAuditEntry(db, { userId: req.user.id, eventType: 'REPORT_GENERATED', detail: type });
       return res.json(report);
     }
 
@@ -2475,7 +2415,7 @@ app.post('/api/reports/generate', authMiddleware(['ciso', 'vp']), async (req, re
       material: buffer,
       metadata: { report_type: type, format, app_version: report.appVersion || null },
     });
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'REPORT_GENERATED', ?)").run(req.user.id, `${type} format=${format} report_id=${id}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'REPORT_GENERATED', detail: `${type} format=${format} report_id=${id}` });
 
     const ext = format === 'pdf' ? 'pdf' : 'docx';
     const ctype = format === 'pdf'
@@ -2619,7 +2559,7 @@ app.get('/api/compliance/report/:framework', authMiddleware(['ciso', 'vp']), asy
 
     if (format === 'json') {
       const db = getDb();
-      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} pass=${report.summary.passed}/${report.summary.total}`);
+      appendGdAuditEntry(db, { userId: req.user.id, eventType: 'COMPLIANCE_REPORT', detail: `framework=${fw} pass=${report.summary.passed}/${report.summary.total}` });
       db.close();
       return res.json(report);
     }
@@ -2659,7 +2599,7 @@ app.get('/api/compliance/report/:framework', authMiddleware(['ciso', 'vp']), asy
           app_version: report.appVersion,
         },
       });
-      db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'COMPLIANCE_REPORT', ?)").run(req.user.id, `framework=${fw} format=${format} pass=${report.summary.passed}/${report.summary.total} report_id=${subjectRef}`);
+      appendGdAuditEntry(db, { userId: req.user.id, eventType: 'COMPLIANCE_REPORT', detail: `framework=${fw} format=${format} pass=${report.summary.passed}/${report.summary.total} report_id=${subjectRef}` });
     } finally {
       db.close();
     }
@@ -2785,7 +2725,7 @@ app.post('/api/backups/trigger', authMiddleware(['ciso']), (req, res) => {
     const db = getDb();
     const id = crypto.randomBytes(4).toString('hex');
     db.prepare("INSERT INTO backups (id, type, destination, hash) VALUES (?, ?, ?, ?)").run(id, type, destination, crypto.randomBytes(16).toString('hex'));
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'BACKUP_TRIGGERED', ?)").run(req.user.id, `${type} to ${destination}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'BACKUP_TRIGGERED', detail: `${type} to ${destination}` });
     db.close();
     res.json({ success: true, backupId: id });
   } catch (e) { res.status(500).json({ error: 'Backup trigger failed' }); }
@@ -2834,8 +2774,7 @@ app.post('/api/compromise-scan', authMiddleware(['ciso']), (req, res) => {
       ],
       overall: 'clean',
     };
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'COMPROMISE_SCAN', ?, 'info')")
-      .run(req.user.id, `Result: ${results.overall}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'COMPROMISE_SCAN', detail: `Result: ${results.overall}`, severity: 'info' });
     db.close();
     res.json(results);
   } catch (e) { res.status(500).json({ error: 'Compromise scan failed' }); }
@@ -3072,21 +3011,36 @@ function runGdRegression(db) {
   });
 
   // ── Audit chain (1) ────────────────────────────────────────────────────
-  record('audit-chain', 'audit_log hash-chain linkage (B5a)', () => {
+  record('audit-chain', 'audit_log hash chain recompute + linkage (B5a)', () => {
     const cols = db.prepare('PRAGMA table_info(audit_log)').all().map(c => c.name);
     if (!cols.includes('hash') || !cols.includes('prev_hash')) {
       return SKIP('audit_log.hash/prev_hash not present yet — pending B5a (Audit Hash Chain)');
     }
-    const rows = db.prepare('SELECT id, hash, prev_hash FROM audit_log ORDER BY id ASC LIMIT 5000').all();
-    if (rows.length === 0) return 'audit_log empty (chain trivially intact)';
-    let prev = null, breaks = 0, firstBreak = null;
-    for (const r of rows) {
-      if (!r.hash) { breaks++; if (!firstBreak) firstBreak = `row ${r.id} has no hash`; }
-      if (prev !== null && r.prev_hash !== prev) { breaks++; if (!firstBreak) firstBreak = `row ${r.id} prev_hash != prior hash`; }
-      prev = r.hash;
+    const { verifyFull } = require('./services/gd-audit-chain');
+    const r = verifyFull(db);
+    if (!r.intact) {
+      throw new Error(`chain ${r.reason || 'broken'}${r.brokenAt != null ? ` at id ${r.brokenAt}` : ''}${r.detail ? ` — ${r.detail}` : ''}`);
     }
-    if (breaks > 0) throw new Error(`${breaks} chain break(s); first: ${firstBreak}`);
-    return `chain intact across ${rows.length} row(s)`;
+    return `${r.entriesVerified != null ? r.entriesVerified : 0} row(s) verified (recompute + linkage + checkpoint)`;
+  });
+  record('audit-chain', 'audit_log signed checkpoint (B5a)', () => {
+    const hasTable = (n) => !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(n);
+    const cols = db.prepare('PRAGMA table_info(audit_log)').all().map(c => c.name);
+    if (!hasTable('audit_chain_checkpoint') || !hasTable('audit_chain_signing_keys') || !cols.includes('hash')) {
+      return SKIP('audit_chain checkpoint tables not present yet — pending B5a');
+    }
+    const ac = require('./services/gd-audit-chain');
+    const cp = ac.getLatestCheckpoint(db);
+    if (!cp) return 'no signed checkpoint yet (baseline not established)';
+    const keyRow = db.prepare('SELECT public_key FROM audit_chain_signing_keys WHERE id = ?').get(cp.signing_key_id);
+    if (!keyRow) throw new Error(`checkpoint ${cp.id} references missing signing key ${cp.signing_key_id}`);
+    const digest = ac.computeHeadDigest(cp);
+    const sig = cp.signatureBuf || Buffer.from(cp.signature, 'base64');
+    const ok = crypto.verify(null, digest, crypto.createPublicKey(keyRow.public_key), sig);
+    if (!ok) throw new Error(`checkpoint ${cp.id} Ed25519 signature INVALID`);
+    const headRow = db.prepare('SELECT hash FROM audit_log WHERE id = ?').get(cp.head_id);
+    if (!headRow || headRow.hash !== cp.head_hash) throw new Error(`chain head id ${cp.head_id} does not match signed checkpoint ${cp.id}`);
+    return `checkpoint #${cp.id} signature valid (head id ${cp.head_id}, ${cp.entry_count} entries)`;
   });
 
   // ── Integrations (GD's own external surface) ───────────────────────────
@@ -3187,8 +3141,7 @@ app.post('/api/regression-test', authMiddleware(['ciso']), (req, res) => {
   try {
     const db = getDb();
     const results = runGdRegression(db);
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'REGRESSION_RUN', ?, ?)")
-      .run(req.user.id, `result: ${results.passed}/${results.total} pass, ${results.failed} fail`, results.failed === 0 ? 'info' : 'warning');
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'REGRESSION_RUN', detail: `result: ${results.passed}/${results.total} pass, ${results.failed} fail`, severity: results.failed === 0 ? 'info' : 'warning' });
     db.close();
     res.json(results);
   } catch (e) {
@@ -3243,8 +3196,7 @@ app.post('/api/cloud/package', authMiddleware(['ciso']), (req, res) => {
   try {
     db = getDb();
     const result = cloudIacBundle.generatePackage(db, provider, iac_tool, { userId: req.user.id });
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_PACKAGE_GENERATED', ?, 'info')")
-      .run(req.user.id, `id=${result.id} provider=${provider} iac_tool=${iac_tool}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CLOUD_PACKAGE_GENERATED', detail: `id=${result.id} provider=${provider} iac_tool=${iac_tool}`, severity: 'info' });
     db.close();
     res.json(result);
   } catch (err) {
@@ -3260,8 +3212,7 @@ app.post('/api/cloud/package', authMiddleware(['ciso']), (req, res) => {
     }
     try {
       const adb = getDb();
-      adb.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_PACKAGE_FAILED', ?, 'warning')")
-        .run(req.user.id, `provider=${provider} iac_tool=${iac_tool} error=${(err.message || '').slice(0, 200)}`);
+      appendGdAuditEntry(adb, { userId: req.user.id, eventType: 'CLOUD_PACKAGE_FAILED', detail: `provider=${provider} iac_tool=${iac_tool} error=${(err.message || '').slice(0, 200)}`, severity: 'warning' });
       adb.close();
     } catch (_) { /* swallow audit failure */ }
     res.status(500).json({ error: 'Cloud package generation failed', message: err.message });
@@ -3346,8 +3297,7 @@ app.post('/api/cloud/signing-keys/rotate', authMiddleware(['ciso']), (req, res) 
   try {
     const db = getDb();
     const result = cloudIacBundle.signingKeys.rotateActiveKey(db);
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CLOUD_SIGNING_KEY_ROTATED', ?, 'info')")
-      .run(req.user.id, `oldId=${result.oldId || '(none)'} newId=${result.newId}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CLOUD_SIGNING_KEY_ROTATED', detail: `oldId=${result.oldId || '(none)'} newId=${result.newId}`, severity: 'info' });
     db.close();
     res.json({ rotated: true, ...result });
   } catch (e) {
@@ -3435,8 +3385,7 @@ app.post('/api/cicd/generate', authMiddleware(['ciso']), (req, res) => {
   try {
     db = getDb();
     const result = cicdBundle.generateConfig(db, platform, purpose, { userId: req.user.id });
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_CONFIG_GENERATED', ?, 'info')")
-      .run(req.user.id, `id=${result.id} platform=${platform} purpose=${purpose}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CICD_CONFIG_GENERATED', detail: `id=${result.id} platform=${platform} purpose=${purpose}`, severity: 'info' });
     db.close();
     res.json(result);
   } catch (err) {
@@ -3446,8 +3395,7 @@ app.post('/api/cicd/generate', authMiddleware(['ciso']), (req, res) => {
     }
     try {
       const adb = getDb();
-      adb.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_CONFIG_FAILED', ?, 'warning')")
-        .run(req.user.id, `platform=${platform} purpose=${purpose} error=${(err.message || '').slice(0, 200)}`);
+      appendGdAuditEntry(adb, { userId: req.user.id, eventType: 'CICD_CONFIG_FAILED', detail: `platform=${platform} purpose=${purpose} error=${(err.message || '').slice(0, 200)}`, severity: 'warning' });
       adb.close();
     } catch (_) { /* swallow */ }
     res.status(500).json({ error: 'CICD config generation failed', message: err.message });
@@ -3613,8 +3561,7 @@ app.get('/api/cicd/webhook-secret', authMiddleware(['ciso']), (req, res) => {
   try {
     const db = getDb();
     const secret = gdGetOrCreateCicdWebhookSecret(db);
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_WEBHOOK_SECRET_REVEALED', 'CISO revealed CICD webhook secret', 'info')")
-      .run(req.user.id);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CICD_WEBHOOK_SECRET_REVEALED', detail: 'CISO revealed CICD webhook secret', severity: 'info' });
     db.close();
     res.json({ secret, header: 'X-CICD-Webhook-Secret' });
   } catch (e) {
@@ -3627,8 +3574,7 @@ app.post('/api/cicd/webhook-secret/rotate', authMiddleware(['ciso']), (req, res)
     const db = getDb();
     const newSecret = crypto.randomBytes(32).toString('hex');
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cicd_webhook_secret', ?)").run(newSecret);
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'CICD_WEBHOOK_SECRET_ROTATED', 'CISO rotated CICD webhook secret', 'info')")
-      .run(req.user.id);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CICD_WEBHOOK_SECRET_ROTATED', detail: 'CISO rotated CICD webhook secret', severity: 'info' });
     db.close();
     res.json({ rotated: true, secret: newSecret, header: 'X-CICD-Webhook-Secret' });
   } catch (e) {
@@ -3786,15 +3732,13 @@ app.post('/api/backup/full-suite', authMiddleware(['ciso']), (req, res) => {
   try {
     db = getDb();
     const result = gdPerformFullSuiteBackup(db, {});
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'FULL_SUITE_BACKUP_CREATED', ?, 'info')")
-      .run(req.user.id, `id=${result.id} size=${result.size_bytes} hash=${result.hash.slice(0, 16)}`);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'FULL_SUITE_BACKUP_CREATED', detail: `id=${result.id} size=${result.size_bytes} hash=${result.hash.slice(0, 16)}`, severity: 'info' });
     db.close();
     res.json(result);
   } catch (err) {
     if (db) {
       try {
-        db.prepare("INSERT INTO audit_log (user_id, event_type, detail, severity) VALUES (?, 'FULL_SUITE_BACKUP_FAILED', ?, 'warning')")
-          .run(req.user.id, (err.message || '').slice(0, 200));
+        appendGdAuditEntry(db, { userId: req.user.id, eventType: 'FULL_SUITE_BACKUP_FAILED', detail: (err.message || '').slice(0, 200), severity: 'warning' });
         db.close();
       } catch (_) { /* swallow */ }
     }
@@ -3816,7 +3760,7 @@ app.put('/api/config/:key', authMiddleware(['ciso']), (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(req.params.key, JSON.stringify(req.body));
-    db.prepare("INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, 'CONFIG_UPDATED', ?)").run(req.user.id, req.params.key);
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CONFIG_UPDATED', detail: req.params.key });
     db.close();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save config' }); }
@@ -4117,12 +4061,7 @@ app.post('/api/gd/query', authMiddleware(['ciso', 'vp']), (req, res) => {
     // Audit log — metadata only, never row content
     const db2 = getDb();
     try {
-      db2.prepare("INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, 'GD_QUERY', ?, ?, 'info')")
-        .run(
-          req.user?.id || 'unknown',
-          `template=${templateId} days=${days} filter=${normalizedFilterColumn || 'none'} pattern_len=${filterPattern?.length || 0} rows=${rows.length}`,
-          req.ip
-        );
+      appendGdAuditEntry(db2, { userId: req.user?.id || 'unknown', eventType: 'GD_QUERY', detail: `template=${templateId} days=${days} filter=${normalizedFilterColumn || 'none'} pattern_len=${filterPattern?.length || 0} rows=${rows.length}`, ip: req.ip, severity: 'info' });
     } finally {
       db2.close();
     }
@@ -4186,16 +4125,14 @@ app.post('/api/ingest/leaderboard', (req, res) => {
       rawBody: req.rawBody,
     });
     if (!sigResult.ok) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('INGEST_SIGNATURE_REJECTED', ?, 'critical')")
-        .run(`endpoint=leaderboard mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`);
+      appendGdAuditEntry(db, { eventType: 'INGEST_SIGNATURE_REJECTED', detail: `endpoint=leaderboard mc=${mc.name} mc_id=${mc.id} code=${sigResult.code} fingerprint=${sigResult.fingerprint || 'none'} reason=${JSON.stringify(sigResult.error || '')}`, severity: 'critical' });
       db.close();
       return res.status(401).json({ error: sigResult.error, code: sigResult.code });
     }
 
     // ── Validate body shape ──
     if (!leaderboard || typeof leaderboard !== 'object' || Array.isArray(leaderboard)) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=missing_or_invalid_leaderboard fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'LEADERBOARD_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} reason=missing_or_invalid_leaderboard fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'leaderboard is required and must be an object' });
     }
@@ -4213,8 +4150,7 @@ app.post('/api/ingest/leaderboard', (req, res) => {
       // Defensive ceiling. The MC's LEADERBOARD_PUSH_LIMIT is 50; anything
       // more than 100 indicates either a misconfigured MC or an attempt to
       // flood the GD. Reject rather than silently truncate.
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_REJECTED', ?, 'warning')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=entries_too_many count=${entries.length} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'LEADERBOARD_INGEST_REJECTED', detail: `mc=${mc.name} mc_id=${mc.id} reason=entries_too_many count=${entries.length} fingerprint=${sigResult.fingerprint}`, severity: 'warning' });
       db.close();
       return res.status(400).json({ error: 'leaderboard.entries exceeds maximum (100)' });
     }
@@ -4276,14 +4212,12 @@ app.post('/api/ingest/leaderboard', (req, res) => {
       });
       txn();
     } catch (txnErr) {
-      db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_FAILED', ?, 'critical')")
-        .run(`mc=${mc.name} mc_id=${mc.id} reason=transaction_failed error=${JSON.stringify(txnErr.message).slice(0, 200)} fingerprint=${sigResult.fingerprint}`);
+      appendGdAuditEntry(db, { eventType: 'LEADERBOARD_INGEST_FAILED', detail: `mc=${mc.name} mc_id=${mc.id} reason=transaction_failed error=${JSON.stringify(txnErr.message).slice(0, 200)} fingerprint=${sigResult.fingerprint}`, severity: 'critical' });
       db.close();
       return res.status(500).json({ error: 'Failed to persist leaderboard' });
     }
 
-    db.prepare("INSERT INTO audit_log (event_type, detail, severity) VALUES ('LEADERBOARD_INGEST_SUCCESS', ?, 'info')")
-      .run(`mc=${mc.name} mc_id=${mc.id} entries=${validated.length} fingerprint=${sigResult.fingerprint}`);
+    appendGdAuditEntry(db, { eventType: 'LEADERBOARD_INGEST_SUCCESS', detail: `mc=${mc.name} mc_id=${mc.id} entries=${validated.length} fingerprint=${sigResult.fingerprint}`, severity: 'info' });
     db.close();
     res.json({ ok: true, entries: validated.length });
   } catch (err) {
@@ -4409,9 +4343,7 @@ function auditLogForensic(userId, eventType, detail, ip, severity) {
   let db;
   try {
     db = getDb();
-    db.prepare(
-      "INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, ?, ?, ?, ?)"
-    ).run(userId || 'anonymous', eventType, detail || '', ip || null, severity || 'info');
+    appendGdAuditEntry(db, { userId: userId || 'anonymous', eventType: eventType, detail: detail || '', ip: ip || null, severity: severity || 'info' });
   } catch (e) {
     // Silent — audit failures must not crash handlers (matches the request-
     // logging middleware pattern at the top of this file).
@@ -4703,9 +4635,7 @@ function auditLogLegalHold(userId, eventType, detail, ip, severity) {
   let db;
   try {
     db = getDb();
-    db.prepare(
-      "INSERT INTO audit_log (user_id, event_type, detail, ip, severity) VALUES (?, ?, ?, ?, ?)"
-    ).run(userId || 'anonymous', eventType, detail || '', ip || null, severity || 'info');
+    appendGdAuditEntry(db, { userId: userId || 'anonymous', eventType: eventType, detail: detail || '', ip: ip || null, severity: severity || 'info' });
   } catch (e) {
     // Silent — audit failures must not crash handlers.
   } finally {
@@ -5110,6 +5040,90 @@ app.post('/api/abuse-export/:id/deny', authMiddleware(['ciso']), (req, res) => {
     return res.json({ id: row.id, status: 'denied', decidedAt: token.decidedAt });
   } catch (e) { if (db) db.close(); console.error('abuse-export deny failed:', e.message); return res.status(500).json({ error: 'deny failed' }); }
 });
+
+// ── B5a: Audit Log Integrity (hash chain + Ed25519-signed checkpoints) ──────
+// On-demand full verification. Recomputes every row's hash, checks prev_hash
+// linkage, and validates the chain head against the latest signed checkpoint.
+// On success it advances the signed checkpoint; on a break it records a
+// critical AUDIT_CHAIN_BREAK row — the GD has no separate alert router, so a
+// critical audit_log row is its alert primitive (surfaced to operators and
+// ingested by the management console).
+app.get('/api/audit/integrity', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    const result = verifyFull(db);
+
+    if (result.intact) {
+      try {
+        createCheckpoint(db);
+      } catch (cpErr) {
+        console.error('GD audit checkpoint after verify failed:', cpErr.message);
+      }
+    } else {
+      try {
+        appendGdAuditEntry(db, {
+          userId: req.user && req.user.id ? req.user.id : null,
+          eventType: 'AUDIT_CHAIN_BREAK',
+          detail: `integrity check failed: ${result.reason || 'unknown'} at id ${result.brokenAt}`,
+          ip: req.ip,
+          severity: 'critical',
+        });
+      } catch (alertErr) {
+        console.error('GD audit chain break alert failed:', alertErr.message);
+      }
+    }
+
+    appendGdAuditEntry(db, {
+      userId: req.user && req.user.id ? req.user.id : null,
+      eventType: 'AUDIT_INTEGRITY_CHECK',
+      detail: result.intact
+        ? `intact entries=${result.entriesVerified}`
+        : `BROKEN reason=${result.reason} id=${result.brokenAt}`,
+      ip: req.ip,
+      severity: result.intact ? 'info' : 'critical',
+    });
+
+    db.close();
+    db = null;
+    return res.json(result);
+  } catch (err) {
+    if (db) { try { db.close(); } catch (_e) { /* already closed */ } }
+    console.error('GD audit integrity check error:', err.message);
+    return res.status(500).json({ error: 'Failed to verify audit chain integrity', detail: err.message });
+  }
+});
+
+// ── B5a: periodic audit-log integrity watch (the GD's first scheduled job) ──
+// Incrementally verifies the chain from the latest signed checkpoint forward,
+// notarizes a fresh checkpoint when intact, and on a break records a critical
+// AUDIT_CHAIN_BREAK audit row. Hourly; fresh db per cycle; unref() so the timer
+// never blocks process shutdown. Guarded so an un-migrated database (init-db
+// not yet run) logs and skips rather than crashing.
+const GD_AUDIT_INTEGRITY_INTERVAL_MS = 3600000;
+const gdAuditIntegrityTimer = setInterval(() => {
+  let db;
+  try {
+    db = getDb();
+    const result = verifyIncremental(db);
+    if (result.intact) {
+      createCheckpoint(db);
+    } else {
+      appendGdAuditEntry(db, {
+        eventType: 'AUDIT_CHAIN_BREAK',
+        detail: `periodic integrity check failed: ${result.reason || 'unknown'} at id ${result.brokenAt}`,
+        severity: 'critical',
+      });
+      console.error('GD audit log hash chain BROKEN:', result.reason, 'at id', result.brokenAt);
+    }
+  } catch (e) {
+    console.error('GD audit integrity cycle error:', e.message);
+  } finally {
+    if (db) { try { db.close(); } catch (_e) { /* already closed */ } }
+  }
+}, GD_AUDIT_INTEGRITY_INTERVAL_MS);
+if (gdAuditIntegrityTimer && typeof gdAuditIntegrityTimer.unref === 'function') gdAuditIntegrityTimer.unref();
+
 
 app.listen(PORT, () => {
   console.log(`FireAlive Global Dashboard Server v0.0.31 running on port ${PORT}`);

@@ -376,6 +376,47 @@ CREATE TABLE IF NOT EXISTS audit_log (
   severity TEXT DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'error', 'critical'))
 );
 
+-- ── B5a: Audit log integrity (hash chain + Ed25519-signed checkpoints) ──
+-- Signed checkpoints notarize the audit_log chain head; an attacker who edits a
+-- row and recomputes every downstream hash still cannot forge a signed head.
+-- Both tables are append-only. The audit_log hash/prev_hash columns and the
+-- audit_log append-only triggers are installed by migrateGdAuditChain (after
+-- the baseline backfill), not here.
+CREATE TABLE IF NOT EXISTS audit_chain_checkpoint (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  head_id INTEGER NOT NULL,
+  head_hash TEXT NOT NULL,
+  entry_count INTEGER NOT NULL,
+  signature TEXT NOT NULL,
+  signing_key_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_chain_checkpoint_head ON audit_chain_checkpoint(head_id);
+CREATE TRIGGER IF NOT EXISTS audit_chain_checkpoint_no_update
+BEFORE UPDATE ON audit_chain_checkpoint
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_checkpoint is append-only: UPDATE is not permitted');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_chain_checkpoint_no_delete
+BEFORE DELETE ON audit_chain_checkpoint
+BEGIN
+  SELECT RAISE(ABORT, 'audit_chain_checkpoint is append-only: DELETE is not permitted');
+END;
+
+-- Ed25519 signing key family dedicated to the audit chain (separate from the
+-- report / abuse-export / MC-trust families). Private keys are AES-256-GCM
+-- encrypted at rest via gd-encryption.
+CREATE TABLE IF NOT EXISTS audit_chain_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,
+  notes TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_chain_signing_keys_active ON audit_chain_signing_keys(is_active) WHERE is_active = 1;
+
 -- Auth log (login attempts)
 CREATE TABLE IF NOT EXISTS auth_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1151,6 +1192,23 @@ function initDb() {
   } catch (reportKeyErr) {
     console.error('U4: report-signing keypair init FAILED:', reportKeyErr.message);
     console.error('Signed report exports (PDF/DOCX) will fail until an active report-signing key exists; re-run `npm run init-db` after setting the Tier-1 encryption key.');
+  }
+
+  // ── B5a: establish the audit-log hash chain + signed-checkpoint baseline ──
+  // Adds the hash/prev_hash columns, chains and notarizes existing rows as the
+  // tamper-evident baseline (without altering their content), then installs the
+  // audit_log append-only triggers. Run-once and guarded (idempotent on
+  // re-init). Like the other migrations above, this applies during
+  // `npm run init-db`.
+  try {
+    const { migrateGdAuditChain } = require('./services/gd-audit-chain');
+    const acRes = migrateGdAuditChain(db);
+    if (acRes.migrated) {
+      console.log(`B5a: audit log hash chain established (${acRes.backfilled} row(s) chained as baseline)`);
+    }
+  } catch (acErr) {
+    console.error('B5a audit chain migration failed:', acErr.message);
+    console.error('Audit log integrity verification will be unavailable until this succeeds; re-run `npm run init-db` after setting the Tier-1 encryption key.');
   }
 
   console.log('Global Dashboard database initialized at', DB_PATH);

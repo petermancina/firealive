@@ -6,6 +6,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 
 const { getDb, initDb } = require('./init');
+const { appendAuditEntry } = require('../services/audit-chain');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
@@ -74,8 +75,14 @@ async function seed() {
   insertAuto.run(id(), 'Abnormal Security', 'Email AI', 1, 0, 0, 1200, 'emails/hr', 'operational');
 
   // ── Seed audit log ─────────────────────────────────────────────────────
-  db.prepare(`INSERT INTO audit_log (user_id, event_type, detail) VALUES (?, ?, ?)`)
-    .run(adminId, 'SYSTEM_INIT', 'Database seeded with demo data');
+  // Chained append (audit_log hash chain) so the seed's SYSTEM_INIT row links
+  // to the chain instead of writing a NULL hash. initDb() above has already
+  // established the chain and installed the append-only triggers.
+  appendAuditEntry(db, {
+    userId: adminId,
+    eventType: 'SYSTEM_INIT',
+    detail: 'Database seeded with demo data',
+  });
 
   console.log('Seed complete:', analysts.length, 'analysts, 1 lead, 1 admin, 4 automation systems');
   db.close();

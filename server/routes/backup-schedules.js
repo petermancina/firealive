@@ -90,6 +90,7 @@ const router = express.Router();
 const backupSchedules = require('../services/backup-schedules');
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
+const { auditLog } = require('../middleware/audit');
 
 // ── Helper: write an explicit audit_log row ──────────────────────────
 //
@@ -104,11 +105,7 @@ const { logger } = require('../services/logger');
 // failure must not change the response semantics.
 function writeAuditEvent(req, eventType, detail) {
   try {
-    const db = getDb();
-    db.prepare(
-      `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
-         VALUES (?, ?, ?, ?)`
-    ).run(
+    auditLog(
       req.user ? req.user.id : null,
       eventType,
       JSON.stringify(detail || {}),

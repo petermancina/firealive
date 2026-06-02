@@ -54,14 +54,11 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { RegressionRunner } = require('../services/regression-runner');
+const { auditLog } = require('../middleware/audit');
 
 function writeAuditEvent(req, eventType, detail) {
   try {
-    const db = getDb();
-    db.prepare(
-      `INSERT INTO audit_log (user_id, event_type, detail, ip_address)
-         VALUES (?, ?, ?, ?)`
-    ).run(
+    auditLog(
       req.user ? req.user.id : null,
       eventType,
       JSON.stringify(detail || {}),

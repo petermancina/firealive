@@ -1,12 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE — Audit Middleware
 // Every API action is logged. Generates CEF format for SIEM streaming.
-// Audit log is append-only (immutable).
+// Audit log is append-only with a SHA-256 hash chain + Ed25519-signed
+// checkpoints (see services/audit-chain.js): every write goes through the
+// chained appendAuditEntry path, which links each row to the previous one and
+// is verified by GET /api/audit/integrity and the periodic integrity check.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { cefDeviceVersion } = require('../lib/version');
+const { appendAuditEntry } = require('../services/audit-chain');
 
 function formatCEF(event, userId, detail, ip) {
   const ts = new Date().toISOString();
@@ -36,13 +40,15 @@ function auditMiddleware(req, res, next) {
       const detail = `${statusCode} ${duration}ms`;
       const cef = formatCEF(eventType, userId, detail, ip);
 
-      db.prepare(
-        'INSERT INTO audit_log (user_id, event_type, detail, ip_address, cef_message) VALUES (?, ?, ?, ?, ?)'
-      ).run(userId, eventType, detail, ip, cef);
+      // Chained, tamper-evident append (audit_log.hash / .prev_hash). The
+      // head-read + INSERT run inside a transaction so concurrent requests
+      // cannot read the same head and fork the chain.
+      appendAuditEntry(db, { userId, eventType, detail, ip, cef });
 
       db.close();
 
-      // Stream to SIEM if configured
+      // Stream to SIEM if configured — the independent external copy that
+      // forms the third tamper-evidence leg alongside the chain + checkpoints.
       if (process.env.SIEM_ENABLED === 'true') {
         streamToSIEM(cef);
       }
@@ -68,9 +74,9 @@ function auditLog(userId, eventType, detail, ip) {
   try {
     const db = getDb();
     const cef = formatCEF(eventType, userId, detail, ip);
-    db.prepare(
-      'INSERT INTO audit_log (user_id, event_type, detail, ip_address, cef_message) VALUES (?, ?, ?, ?, ?)'
-    ).run(userId, eventType, detail, ip, cef);
+    // Same chained append path as the middleware — business events are part of
+    // the same tamper-evident chain.
+    appendAuditEntry(db, { userId, eventType, detail, ip, cef });
     db.close();
 
     if (process.env.SIEM_ENABLED === 'true') {
