@@ -1726,6 +1726,10 @@ function ManagementConsole() {
         if (msg && msg.type === "feature_toggles_updated" && msg.features) {
           setFT(msg.features);
         }
+        // B4: live compromise-scan progress — nudge the active run to re-poll.
+        if (msg && msg.type === "scan_progress") {
+          setCompromiseTick(t => t + 1);
+        }
       };
       ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
       ws.onerror = () => { try { ws.close(); } catch (_e) {} };
@@ -1765,6 +1769,42 @@ function ManagementConsole() {
       setRoutingHydrated(true);
     }).catch(()=>setRoutingHydrated(true));
   }, [tab, routingHydrated]);
+
+  // B4: hydrate the tripwire tab (config, live status, events) on open.
+  useEffect(()=>{
+    if (tab !== "tripwire" || tripwireHydrated) return;
+    api.get("/api/tripwire/config").then(res=>{ if(res&&!res.error&&res.config) setTripwireCfg(prev=>({...prev,...res.config,response:{...prev.response,...(res.config.response||{})}})); });
+    api.get("/api/tripwire/status").then(res=>{ if(res&&!res.error){ setTripwireStatus(res); setTripwireTriggered(!!res.active_event); } });
+    api.get("/api/tripwire/events").then(res=>{ if(res&&!res.error&&Array.isArray(res.events)) setTripwireEvents(res.events); });
+    setTripwireHydrated(true);
+  }, [tab, tripwireHydrated]);
+
+  // B4: hydrate the compromise-scan tab (run history, retention) on open.
+  useEffect(()=>{
+    if (tab !== "compromise_scan" || compromiseHydrated) return;
+    api.get("/api/compromise/runs").then(res=>{ if(res&&!res.error&&Array.isArray(res.runs)) setCompromiseRuns(res.runs); });
+    api.get("/api/compromise/retention").then(res=>{ if(res&&!res.error){ setCompromiseRetention(res.retention_days); setCompromiseRetentionInput(res.retention_days==null?"":String(res.retention_days)); } });
+    setCompromiseHydrated(true);
+  }, [tab, compromiseHydrated]);
+
+  // B4: poll the active compromise run for signed results until it settles. A
+  // WS scan_progress push also nudges this via compromiseTick; the run record
+  // is authoritative (results are stored only after signature verification).
+  useEffect(()=>{
+    if (!compromiseRunId || !compromiseScanRunning) return;
+    let cancelled=false, n=0;
+    const tick=()=>{ api.get("/api/compromise/runs/"+compromiseRunId).then(res=>{
+      if (cancelled||!res||res.error||!res.run) return;
+      const clients=(res.results||[]).map(r=>({pseudonym:r.pseudonym_at_scan||r.user_id||"client",status:r.status,passed:r.tests_passed,tests:r.tests_total,inconclusive:r.tests_inconclusive,verified:r.signature_verified===1}));
+      const pending=(res.queue||[]).filter(q=>q.status==="queued"||q.status==="delivered").map(q=>q.user_id);
+      const expired=(res.queue||[]).filter(q=>q.status==="expired").map(q=>q.user_id);
+      setCompScanResults({ts:res.run.created_at,run:res.run,clients,pending,expired});
+      if (res.run.status==="complete"||res.run.status==="partial"){ cancelled=true; setCompScanRunning(false); }
+    }); };
+    tick();
+    const iv=setInterval(()=>{ n++; if(n>40){clearInterval(iv);setCompScanRunning(false);return;} tick(); }, 3000);
+    return ()=>{ cancelled=true; clearInterval(iv); };
+  }, [compromiseRunId, compromiseScanRunning, compromiseTick]);
 
   // R3j C9: Poll /api/routing/panic every 30s to keep panicMode and the
   // post-deactivation linger banner in sync with the canonical state.
@@ -2405,12 +2445,24 @@ function ManagementConsole() {
   const [mfaCfg, setMfaCfg] = useState({enabled:false,method:"totp",enforceForAll:true,graceLogins:3,rememberDeviceDays:30,backupCodes:true,status:"not_configured"});
   // Threat hunting integrations (expanded beyond EDR)
   const [threatHuntCfg, setThreatHuntCfg] = useState({xdr:{enabled:false,provider:null,behaviorMonitoring:true,consumptionMetrics:true},atp:{enabled:false,provider:null},ngav:{enabled:false,provider:null,realTimeScan:true},mspScanner:{enabled:false,provider:null,agentId:""}});
-  // Tripwire
-  const [tripwireCfg, setTripwireCfg] = useState({enabled:false,thresholdPct:40,autoDisableRouting:true,notifyLead:true,triggerSoarScan:true,triggerEdrScan:true,preserveAnonymity:true});
+  // Tripwire (B4 — server-backed)
+  const [tripwireCfg, setTripwireCfg] = useState({enabled:false,threshold_pct:60,reduced_capacity_threshold:60,trip_score:3,window_minutes:10,response:{auto_disable_routing:true,notify_lead:true,trigger_soar:true,trigger_compromise_scan:true}});
   const [tripwireTriggered, setTripwireTriggered] = useState(false);
-  // Client compromise scan
+  const [tripwireStatus, setTripwireStatus] = useState(null);
+  const [tripwireEvents, setTripwireEvents] = useState([]);
+  const [tripwireHydrated, setTripwireHydrated] = useState(false);
+  const [tripwireBusy, setTripwireBusy] = useState(false);
+  const [tripwireForce, setTripwireForce] = useState(false);
+  // Client compromise scan (B4 — server-backed)
   const [compromiseScanRunning, setCompScanRunning] = useState(false);
   const [compromiseScanResults, setCompScanResults] = useState(null);
+  const [compromiseTarget, setCompromiseTarget] = useState("all");
+  const [compromiseRunId, setCompromiseRunId] = useState(null);
+  const [compromiseRuns, setCompromiseRuns] = useState([]);
+  const [compromiseRetention, setCompromiseRetention] = useState(null);
+  const [compromiseRetentionInput, setCompromiseRetentionInput] = useState("");
+  const [compromiseHydrated, setCompromiseHydrated] = useState(false);
+  const [compromiseTick, setCompromiseTick] = useState(0);
   // Auth logs
   const [authLogs, setAuthLogs] = useState([
     {ts:"2026-04-08T08:01:00Z",user:"lead@corp.local",action:"LOGIN_SUCCESS",ip:"10.0.1.50",method:"password+totp"},
@@ -5421,7 +5473,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"MSP Multi-Tenancy",s:mspCfg.enabled?mspCfg.tenants.length+" tenants":"disabled",d:mspCfg.enabled?`Isolation: ${Object.values(mspCfg.isolation).filter(Boolean).length}/5 controls active`:"Not enabled — see MSP tab"},
               {n:"MFA",s:mfaCfg.status==="configured"?"configured":"pending",d:mfaCfg.status==="configured"?`Method: ${mfaCfg.method} · Enforce all: ${mfaCfg.enforceForAll?"yes":"no"}`:"Not configured — see MFA tab"},
               {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?`${threatHuntCfg.xdr.provider} · Behavior monitoring`:"Not configured — see Threat Hunting tab"},
-              {n:"Tripwire",s:tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled",d:tripwireCfg.enabled?`Threshold: ${tripwireCfg.thresholdPct}% analysts in reduced routing`:"Not enabled — see Tripwire tab"},
+              {n:"Tripwire",s:tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled",d:tripwireCfg.enabled?`Threshold: ${tripwireCfg.threshold_pct}% analysts in reduced routing`:"Not enabled — see Tripwire tab"},
               {n:"Posture Assessment",s:postureCfg.enabled?"enabled":"disabled",d:postureCfg.enabled?`${Object.values(postureCfg.checks).filter(v=>v===true).length} checks active · ${postureCfg.blockOnFail?"strict":"warn"} mode`:"Not enabled — see Posture tab"},
               {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?`${haCfg.mode} · Sync every ${haCfg.syncIntervalSec}s`:"Not configured — see HA tab"},
               {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure · Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled — see Fail-Open tab"},
@@ -7130,72 +7182,104 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* ══════════ v1.0.0 — TRIPWIRE ══════════ */}
         {tab==="tripwire"&&(<div>
           <L>Reduced-Routing Tripwire</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>If a large percentage of analysts simultaneously enter reduced routing, it could indicate a coordinated attack where compromised clients are requesting load reduction to degrade SOC response capacity. This tripwire automatically disables burnout routing and alerts you to investigate.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>If analysts synchronously enter reduced routing in a way the server's independent workload record does not justify, it can indicate compromised clients throttling SOC response. The detector weighs six signals — synchronization, breadth, slope, an independent workload-justification cross-check, uniformity, and corroborating security events. On a trip it fails routing open, launches a signed compromise scan, alerts, and holds an investigation lockout until the fleet is confirmed clean. Verdicts are team/segment-level only — no per-analyst identity, no burnout data.</M>
           <Card style={{marginBottom:16}}>
             <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={tripwireCfg.enabled} onChange={e=>setTripwireCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable tripwire</label>
-            <Input label={"Threshold — trip when ≥ this % of analysts are in reduced routing"} value={tripwireCfg.thresholdPct} onChange={e=>setTripwireCfg(prev=>({...prev,thresholdPct:parseInt(e.target.value)||0}))} type="number"/>
+            <Input label="Breadth threshold — % of a segment in reduced routing that starts to count" value={tripwireCfg.threshold_pct} onChange={e=>setTripwireCfg(prev=>({...prev,threshold_pct:parseInt(e.target.value)||0}))} type="number"/>
+            <Input label="Reduced-capacity threshold — capacity_score below this counts as reduced" value={tripwireCfg.reduced_capacity_threshold} onChange={e=>setTripwireCfg(prev=>({...prev,reduced_capacity_threshold:parseInt(e.target.value)||0}))} type="number"/>
+            <Input label="Trip score — weighted-signal sum at which the wire trips" value={tripwireCfg.trip_score} onChange={e=>setTripwireCfg(prev=>({...prev,trip_score:parseInt(e.target.value)||0}))} type="number"/>
+            <Input label="Window (minutes) — synchronization / slope observation window" value={tripwireCfg.window_minutes} onChange={e=>setTripwireCfg(prev=>({...prev,window_minutes:parseInt(e.target.value)||1}))} type="number"/>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:12,marginBottom:8}}>When Tripped</div>
             <M style={{color:C.a,fontWeight:500,display:"block",padding:"8px 0",borderBottom:"1px solid "+C.b}}>Anonymity always enforced.</M>
-            {[{k:"autoDisableRouting",l:"Auto-disable all burnout routing (tickets flow unfiltered)"},{k:"notifyLead",l:"Send alert to Team Lead (email + desktop + SMS)"},{k:"triggerSoarScan",l:"Trigger SOAR playbook to investigate compromised clients"},{k:"triggerEdrScan",l:"Trigger EDR/XDR scans on all analyst clients"}].map(s=>(
-              <label key={s.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={tripwireCfg[s.k]} onChange={e=>setTripwireCfg(prev=>({...prev,[s.k]:e.target.checked}))}/><M style={{color:s.k==="preserveAnonymity"?C.p:C.t}}>{s.l}</M></label>
+            {[{k:"auto_disable_routing",l:"Fail routing open (stop honoring reduced-load so response capacity is restored)"},{k:"notify_lead",l:"Notify lead/admin (in-app + configured channels)"},{k:"trigger_soar",l:"Dispatch to SOAR via the alert router"},{k:"trigger_compromise_scan",l:"Auto-launch a signed compromise scan across all analyst clients"}].map(s=>(
+              <label key={s.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={!!(tripwireCfg.response&&tripwireCfg.response[s.k]!==false)} onChange={e=>setTripwireCfg(prev=>({...prev,response:{...prev.response,[s.k]:e.target.checked}}))}/><M style={{color:C.t}}>{s.l}</M></label>
             ))}
+            <div style={{display:"flex",gap:8,marginTop:12}}>
+              <Btn primary disabled={tripwireBusy} onClick={()=>{setTripwireBusy(true);api.put("/api/tripwire/config",{config:tripwireCfg}).then(res=>{setTripwireBusy(false);addA(res&&!res.error?"TRIPWIRE_CONFIG_SAVED":"TRIPWIRE_CONFIG_ERROR",res&&!res.error?"Tripwire config saved":((res&&res.error)||"save failed"));});}}>Save Config</Btn>
+              <Btn disabled={tripwireBusy} onClick={()=>{setTripwireBusy(true);api.post("/api/tripwire/evaluate",{}).then(res=>{setTripwireBusy(false);if(res&&!res.error&&res.verdict){setTripwireStatus(prev=>({...(prev||{}),verdict:res.verdict}));addA("TRIPWIRE_EVALUATE","Detector run — score "+res.verdict.score+(res.verdict.tripped?" (would trip)":""));}});}}>Run Detector Now</Btn>
+            </div>
           </Card>
-          {tripwireTriggered&&<Card style={{padding:14,borderColor:C.d,marginBottom:16,animation:"pulse 1.5s infinite"}}><M style={{color:C.d,fontWeight:700,fontSize:14}}>⚠ TRIPWIRE TRIGGERED</M><M style={{color:C.tm,display:"block",marginTop:6}}>Routing DISABLED. Training CANCELLED. Filter OFF.</M></Card>}
-          <div style={{display:"flex",gap:8}}>
-            <Btn primary onClick={()=>addA("TRIPWIRE_CONFIG_SAVED","Tripwire config saved — threshold: "+tripwireCfg.thresholdPct+"%")}>Save Tripwire Config</Btn>
-            <Btn onClick={()=>{setTripwireTriggered(true);setPanicMode(true);api.post("/api/audit/mc-event",{event_type:"TRIPWIRE_MANUAL_TEST",detail:"Tripwire triggered"}).then(()=>addA("TRIPWIRE_MANUAL_TEST","Tripwire triggered"));}}>Test Tripwire</Btn>
-            {tripwireTriggered&&<Btn onClick={()=>{setTripwireTriggered(false);api.post("/api/audit/mc-event",{event_type:"TRIPWIRE_RESET",detail:"Tripwire reset"}).then(()=>addA("TRIPWIRE_RESET","Tripwire reset"));}}>Reset Tripwire</Btn>}
-          </div>
+          {tripwireStatus&&tripwireStatus.verdict&&!tripwireStatus.verdict.error&&(<Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Detector — segment {tripwireStatus.verdict.segment||"global"}{tripwireStatus.verdict.degraded?" (degraded)":""}</div>
+              <Badge color={tripwireStatus.verdict.tripped?C.d:C.a}>{tripwireStatus.verdict.tripped?"would trip":"nominal"}</Badge>
+            </div>
+            <M style={{color:C.tm,display:"block",marginBottom:8}}>Score {tripwireStatus.verdict.score} / trip at {tripwireStatus.verdict.trip_score} · {tripwireStatus.verdict.pct_in_reduced}% in reduced routing</M>
+            {tripwireStatus.verdict.signals&&Object.keys(tripwireStatus.verdict.signals).map(k=>{const sg=tripwireStatus.verdict.signals[k];return (<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"3px 0"}}><M style={{color:sg.fired?C.w:C.td}}>{k.replace(/_/g," ")}</M><M style={{color:sg.fired?C.w:C.tm}}>{sg.strength} ×{sg.weight}</M></div>);})}
+          </Card>)}
+          {tripwireStatus&&tripwireStatus.active_event&&(<Card style={{padding:14,borderColor:C.d,marginBottom:16}}>
+            <M style={{color:C.d,fontWeight:700,fontSize:14}}>⚠ TRIPWIRE LOCKOUT ACTIVE</M>
+            <M style={{color:C.tm,display:"block",marginTop:6}}>Segment {tripwireStatus.active_event.segment} · {tripwireStatus.active_event.pct_in_reduced}% reduced · tripped {new Date(tripwireStatus.active_event.tripped_at).toLocaleString()}. Routing failed open and a compromise scan was launched. Resolve once the fleet is confirmed clean.</M>
+            <label style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}><input type="checkbox" checked={tripwireForce} onChange={e=>setTripwireForce(e.target.checked)}/><M style={{color:C.w}}>Force-resolve without a clean scan (admin only)</M></label>
+            <Btn danger style={{marginTop:10}} disabled={tripwireBusy} onClick={()=>{setTripwireBusy(true);api.post("/api/tripwire/resolve",{force:tripwireForce}).then(res=>{setTripwireBusy(false);if(res&&!res.error){setTripwireForce(false);addA("TRIPWIRE_RESOLVED","Tripwire lockout resolved"+(res.forced?" (forced)":""));api.get("/api/tripwire/status").then(s=>{if(s&&!s.error){setTripwireStatus(s);setTripwireTriggered(!!s.active_event);}});api.get("/api/tripwire/events").then(ev=>{if(ev&&!ev.error&&Array.isArray(ev.events))setTripwireEvents(ev.events);});}else{addA("TRIPWIRE_RESOLVE_BLOCKED",(res&&res.error)||"resolve blocked");}});}}>Resolve Lockout</Btn>
+          </Card>)}
+          {tripwireEvents.length>0&&(<Card>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Trip History</div>
+            {tripwireEvents.map(ev=>(
+              <div key={ev.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{flex:1,paddingRight:10}}><M style={{color:C.t}}>{new Date(ev.tripped_at).toLocaleString()} · {ev.segment} · {ev.pct_in_reduced}%</M><M style={{color:C.td,display:"block"}}>{ev.verdict}</M></div>
+                <Badge color={ev.lockout_active&&!ev.resolved_at?C.d:C.a}>{ev.lockout_active&&!ev.resolved_at?"active":"resolved"}</Badge>
+              </div>
+            ))}
+          </Card>)}
         </div>)}
 
         {/* ══════════ v1.0.0 — COMPROMISE SCAN ══════════ */}
         {tab==="compromise_scan"&&(<div>
           <L>Client Compromise Scan</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Orchestrate automated compromise tests across analyst clients. Each client runs self-diagnostics and returns a signed report. Use after a tripwire event or any time you suspect client compromise. Tests run via integrated EDR/XDR/SOAR systems and the client's own integrity checks. Scan results use pseudonyms and contain NO burnout data — only system health metrics (binary integrity, memory, network, config drift).</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Orchestrate the analyst-client self-scan across connected clients. Each client runs ten integrity checks in its isolated main process and returns a report signed by a per-device key the server verifies; results are tri-state (pass / inconclusive / fail) and never faked. Offline clients are queued for delivery on reconnect within 15 minutes. Reports use pseudonyms and carry NO burnout data — only system-health metrics.</M>
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Tests Performed on Each Client</div>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Ten checks per client</div>
             <M style={{color:C.tm,lineHeight:1.8,display:"block"}}>
-              1. SHA-256 integrity check of app binary against known-good hash{"\n"}
-              2. Memory analysis — check for injected code or suspicious processes{"\n"}
-              3. Database query spike detection (unusual request patterns){"\n"}
-              4. Network connection audit (unexpected outbound connections){"\n"}
-              5. Configuration drift detection (compare against last known-good config){"\n"}
-              6. EDR/XDR scan invocation (malware, worms, rootkits){"\n"}
-              7. API token validity and scope verification{"\n"}
-              8. Audit log continuity check (gaps or deletions){"\n"}
-              9. TLS certificate pinning verification{"\n"}
-              10. File system integrity (unexpected new files in app directories)
+              1. Binary integrity (signed release manifest){"\n"}
+              2. Memory analysis · 3. Network connections · 4. Configuration drift{"\n"}
+              5. Audit-log continuity · 6. EDR/XDR status · 7. API token scope{"\n"}
+              8. TLS pinning · 9. Filesystem integrity · 10. Encryption keys
             </M>
           </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Target</div>
-            <div style={{display:"flex",gap:8,marginBottom:12}}>
-              <Btn primary onClick={()=>{setCompScanRunning(true);api.post("/api/audit/mc-event",{event_type:"COMPROMISE_SCAN_ALL",detail:"Initiated compromise scan on ALL linked clients"}).then(()=>addA("COMPROMISE_SCAN_ALL","Initiated compromise scan on ALL linked clients"));setTimeout(()=>{setCompScanRunning(false);setCompScanResults({ts:new Date().toISOString(),clients:[{name:"jordan-p-ws",status:"clean",tests:10,passed:10,signed:true},{name:"priya-s-ws",status:"clean",tests:10,passed:10,signed:true},{name:"alex-k-ws",status:"warning",tests:10,passed:9,signed:true,failures:["Unusual DB query spike (42 queries/sec vs baseline 8/sec)"]},{name:"maya-c-ws",status:"clean",tests:10,passed:10,signed:true},{name:"fatima-a-ws",status:"clean",tests:10,passed:10,signed:true},{name:"sam-r-ws",status:"clean",tests:10,passed:10,signed:true}]});api.post("/api/audit/mc-event",{event_type:"COMPROMISE_SCAN_COMPLETE",detail:"Scan complete — 5 clean, 1 warning"}).then(()=>addA("COMPROMISE_SCAN_COMPLETE","Scan complete — 5 clean, 1 warning"));},2500);}} disabled={compromiseScanRunning}>{compromiseScanRunning?"Scanning...":"Scan All Clients"}</Btn>
-            </div>
-            <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
-              <Sel label="Scan single client" value="" onChange={e=>{if(!e.target.value)return;const name=e.target.value;setCompScanRunning(true);addA("COMPROMISE_SCAN_SINGLE","Scanning: "+name);setTimeout(()=>{setCompScanRunning(false);setCompScanResults({ts:new Date().toISOString(),clients:[{name,status:"clean",tests:10,passed:10,signed:true}]});addA("COMPROMISE_SCAN_SINGLE_DONE",name+" — clean");},1500);}}>
-                <option value="">Select client...</option>{analysts.map(a=><option key={a.id} value={a.name+"-ws"}>{a.name} ({a.name}-ws)</option>)}
-              </Sel>
-            </div>
+            <Sel label="Scan target" value={compromiseTarget} onChange={e=>setCompromiseTarget(e.target.value)}>
+              <option value="all">All active analysts</option>
+              {analysts.map(a=><option key={a.id} value={a.id}>{a.name||a.pseudonym||a.id}</option>)}
+            </Sel>
+            <Btn primary disabled={compromiseScanRunning} onClick={()=>{const targets=compromiseTarget==="all"?"all":[compromiseTarget];setCompScanResults(null);api.post("/api/compromise/orchestrate",{targets}).then(res=>{if(res&&!res.error&&res.runId){setCompromiseRunId(res.runId);setCompScanRunning(true);addA("COMPROMISE_SCAN_START","Scan dispatched — "+res.dispatched+"/"+res.targetCount+" online, "+((res.unreachable&&res.unreachable.length)||0)+" queued");}else{addA("COMPROMISE_SCAN_ERROR",(res&&res.error)||"failed to start scan");}});}}>{compromiseScanRunning?"Scanning…":"Start Scan"}</Btn>
           </Card>
           {compromiseScanResults&&(<Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Scan Results — {new Date(compromiseScanResults.ts).toLocaleString()}</div>
-            {compromiseScanResults.clients.map(c=>(
-              <div key={c.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Results{compromiseScanResults.run?(" — "+compromiseScanResults.run.status):""}{compromiseScanResults.ts?(" · "+new Date(compromiseScanResults.ts).toLocaleString()):""}</div>
+            {compromiseScanResults.clients.length===0&&<M style={{color:C.tm,display:"block"}}>Awaiting signed reports…</M>}
+            {compromiseScanResults.clients.map((c,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
                 <div>
-                  <M style={{color:C.t,fontWeight:500}}>{c.name}</M>
-                  <M style={{color:C.td,display:"block"}}>{c.passed}/{c.tests} tests passed · Report {c.signed?"signed ✓":"unsigned ⚠"}</M>
-                  {c.failures&&c.failures.map((f,i)=><M key={i} style={{color:C.w,display:"block"}}>⚠ {f}</M>)}
+                  <M style={{color:C.t,fontWeight:500}}>{c.pseudonym}</M>
+                  <M style={{color:C.td,display:"block"}}>{c.passed}/{c.tests} passed{c.inconclusive?(" · "+c.inconclusive+" inconclusive"):""} · {c.verified?"signature verified ✓":"UNVERIFIED ⚠"}</M>
                 </div>
-                <Badge color={c.status==="clean"?C.a:c.status==="warning"?C.w:C.d}>{c.status}</Badge>
+                <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                  {!c.verified&&<Badge color={C.d}>unverified</Badge>}
+                  <Badge color={c.status==="clean"?C.a:(c.status==="warning"||c.status==="inconclusive")?C.w:C.d}>{c.status}</Badge>
+                </div>
               </div>
             ))}
-            <div style={{display:"flex",gap:8,marginTop:12}}>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_EXPORT",detail:"Compromise scan report exported"}).then(()=>addA("COMPROMISE_REPORT_EXPORT","Compromise scan report exported"))}>Export Report</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_SOAR",detail:"Sent to SOAR for automated follow-up"}).then(()=>addA("COMPROMISE_REPORT_SOAR","Sent to SOAR for automated follow-up"))}>Send to SOAR</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"COMPROMISE_REPORT_SIEM",detail:"Sent to SIEM as security event"}).then(()=>addA("COMPROMISE_REPORT_SIEM","Sent to SIEM as security event"))}>Send to SIEM</Btn>
-            </div>
+            {compromiseScanResults.pending&&compromiseScanResults.pending.length>0&&<M style={{color:C.tm,display:"block",marginTop:8}}>{compromiseScanResults.pending.length} offline — queued for reconnect</M>}
+            {compromiseScanResults.expired&&compromiseScanResults.expired.length>0&&<M style={{color:C.td,display:"block",marginTop:4}}>{compromiseScanResults.expired.length} unreachable — delivery window expired</M>}
           </Card>)}
+          {compromiseRuns.length>0&&(<Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Run History</div>
+            {compromiseRuns.slice(0,12).map(r=>(
+              <div key={r.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div><M style={{color:C.t}}>{new Date(r.created_at).toLocaleString()} · {r.trigger}</M><M style={{color:C.td,display:"block"}}>{r.completed_count}/{r.target_count} reported · {r.unreachable_count} unreachable</M></div>
+                <Badge color={r.status==="complete"?C.a:r.status==="partial"?C.w:C.i}>{r.status}</Badge>
+              </div>
+            ))}
+          </Card>)}
+          <Card>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Result Retention</div>
+            <M style={{color:C.tm,display:"block",marginBottom:8}}>Currently: {compromiseRetention==null?"indefinite":compromiseRetention+" days"}. Blank = indefinite.</M>
+            <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+              <div style={{flex:1}}><Input label="Retention (days, 1–3650; blank = indefinite)" value={compromiseRetentionInput} onChange={e=>setCompromiseRetentionInput(e.target.value)} type="number"/></div>
+              <Btn onClick={()=>{const v=compromiseRetentionInput===""?null:parseInt(compromiseRetentionInput,10);api.put("/api/compromise/retention",{retention_days:v}).then(res=>{if(res&&!res.error){setCompromiseRetention(res.retention_days);addA("COMPROMISE_RETENTION_SET","Retention set to "+(res.retention_days==null?"indefinite":res.retention_days+" days"));}else{addA("COMPROMISE_RETENTION_ERROR",(res&&res.error)||"failed");}});}}>Save</Btn>
+            </div>
+          </Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — AUTH LOGS ══════════ */}
@@ -7324,7 +7408,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 else if(q.toLowerCase().includes("backup")||q.toLowerCase().includes("restore")) checks.push("✓ Latest backup: "+backups[0]?.ts,"✓ Backup status: "+backups[0]?.status,"✓ Backup schedules: "+schedules.length+" configured","→ Check: Verify backup schedule in Backup Schedules tab. Ensure disk space is available.");
                 else if(q.toLowerCase().includes("client")||q.toLowerCase().includes("provision")) checks.push("✓ Provisioned clients: "+provisionedClients.length,"✓ Client sync interval: "+syncIntervalCfg.intervalMin+"min","→ If a client can't connect: verify server is running, config.json has correct endpoint, firewall allows port 3001, enrollment token is valid");
                 else if(q.toLowerCase().includes("mfa")||q.toLowerCase().includes("auth")) checks.push("✓ MFA: "+(mfaCfg.status==="configured"?"configured":"not configured"),"✓ MFA method: "+mfaCfg.method,"✓ Auth logs: "+authLogs.length+" events","→ If MFA isn't working: verify TOTP secret is synced with authenticator app. If using WebAuthn, ensure browser supports FIDO2.");
-                else if(q.toLowerCase().includes("tripwire")) checks.push("✓ Tripwire: "+(tripwireCfg.enabled?"enabled":"disabled"),"✓ Threshold: "+tripwireCfg.thresholdPct+"%","✓ Status: "+(tripwireTriggered?"TRIGGERED":"armed"),"→ If tripwire triggered unexpectedly, check if analysts legitimately requested reduced load vs. compromise.");
+                else if(q.toLowerCase().includes("tripwire")) checks.push("✓ Tripwire: "+(tripwireCfg.enabled?"enabled":"disabled"),"✓ Threshold: "+tripwireCfg.threshold_pct+"%","✓ Status: "+(tripwireTriggered?"TRIGGERED":"armed"),"→ If tripwire triggered unexpectedly, check if analysts legitimately requested reduced load vs. compromise.");
                 else if(q.toLowerCase().includes("upskill")) checks.push("✓ Upskilling hour: "+(upskillingCfg.enabled?"enabled":"disabled"),"✓ Hour: "+upskillingCfg.hourOfShift+" of shift","✓ Stop routing: "+(upskillingCfg.stopRouting?"yes":"no"),"→ When upskilling hour activates, routing pauses for that analyst. Peer chat and training are enabled.");
                 else checks.push("Running general diagnostic:","✓ Backend API: "+(apiReady?"connected":"not connected — backend may need restart"),"✓ Feature toggles: "+Object.entries(featureToggles).filter(([_,v])=>!v).length+" features disabled","✓ SOAR: "+(soarUrl?"configured":"not configured"),"✓ Panic mode: "+(panicMode?"ACTIVE":"off"),"✓ MFA: "+(mfaCfg.status==="configured"?"configured":"pending"),"✓ Tripwire: "+(tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled"),"✓ HA: "+(haCfg.enabled?haCfg.mode:"disabled"),"✓ Clients: "+provisionedClients.length+" provisioned","→ For specific help, mention: soar, siem, peer, routing, backup, client, mfa, tripwire, upskilling");
                 setTroubleshooterMsgs(prev=>[...prev,{role:"assistant",text:checks.join("\n")}]);

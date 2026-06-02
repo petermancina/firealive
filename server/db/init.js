@@ -6696,6 +6696,145 @@ function initDb() {
     );
   }
 
+  // ── B4: Compromise Scan Orchestration + Reduced-Routing Tripwire schema ─────
+  // MC-orchestrated compromise scans across analyst clients (each AC runs a
+  // 10-point self-scan and returns an Ed25519 device-signed result), the
+  // offline-target delivery queue, per-AC device signing keys (public key only
+  // server-side; the private key never leaves the AC), and the reduced-routing
+  // tripwire detector's trip-event ledger. Config defaults seed into team_config.
+  // All idempotent (CREATE IF NOT EXISTS / INSERT OR IGNORE), safe on existing DBs.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS compromise_scan_runs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        trigger TEXT NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'tripwire', 'api')),
+        initiated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        targets_json TEXT NOT NULL DEFAULT '"all"',
+        target_count INTEGER NOT NULL DEFAULT 0,
+        completed_count INTEGER NOT NULL DEFAULT 0,
+        unreachable_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'complete', 'partial')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_compromise_scan_runs_created_at
+        ON compromise_scan_runs(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS compromise_scan_results (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        run_id TEXT NOT NULL REFERENCES compromise_scan_runs(id) ON DELETE CASCADE,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        pseudonym_at_scan TEXT,
+        status TEXT NOT NULL CHECK (status IN ('clean', 'warning', 'fail', 'inconclusive', 'unreachable')),
+        tests_total INTEGER NOT NULL DEFAULT 0,
+        tests_passed INTEGER NOT NULL DEFAULT 0,
+        tests_failed INTEGER NOT NULL DEFAULT 0,
+        tests_inconclusive INTEGER NOT NULL DEFAULT 0,
+        details_json TEXT NOT NULL DEFAULT '[]',
+        signature TEXT,
+        signature_verified INTEGER NOT NULL DEFAULT 0 CHECK (signature_verified IN (0, 1)),
+        signed_at TEXT,
+        scan_started_at TEXT,
+        scan_duration_ms INTEGER,
+        received_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_compromise_scan_results_run
+        ON compromise_scan_results(run_id);
+      CREATE INDEX IF NOT EXISTS idx_compromise_scan_results_user
+        ON compromise_scan_results(user_id, received_at DESC);
+
+      CREATE TABLE IF NOT EXISTS ac_device_signing_keys (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        public_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        retired_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ac_device_signing_keys_user
+        ON ac_device_signing_keys(user_id, active);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ac_device_signing_keys_one_active
+        ON ac_device_signing_keys(user_id) WHERE active = 1;
+
+      CREATE TABLE IF NOT EXISTS compromise_scan_queue (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        run_id TEXT NOT NULL REFERENCES compromise_scan_runs(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'delivered', 'expired')),
+        queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        delivered_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_compromise_scan_queue_user
+        ON compromise_scan_queue(user_id, status);
+
+      CREATE TABLE IF NOT EXISTS tripwire_events (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        tripped_at TEXT NOT NULL DEFAULT (datetime('now')),
+        trigger_signals_json TEXT NOT NULL DEFAULT '{}',
+        pct_in_reduced REAL,
+        segment TEXT NOT NULL DEFAULT 'global',
+        verdict TEXT,
+        response_json TEXT NOT NULL DEFAULT '{}',
+        scan_run_id TEXT REFERENCES compromise_scan_runs(id) ON DELETE SET NULL,
+        lockout_active INTEGER NOT NULL DEFAULT 0 CHECK (lockout_active IN (0, 1)),
+        resolved_at TEXT,
+        resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tripwire_events_tripped_at
+        ON tripwire_events(tripped_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_tripwire_events_lockout
+        ON tripwire_events(lockout_active);
+    `);
+    const tripwireDefaults = JSON.stringify({
+      enabled: true,
+      threshold_pct: 60,
+      window_minutes: 10,
+      signal_weights: {
+        velocity: 1.0,
+        breadth: 1.0,
+        slope: 1.0,
+        signal_justification: 2.0,
+        uniformity: 1.0,
+        corroboration: 1.0
+      },
+      trip_score: 3.0,
+      response: {
+        auto_disable_routing: true,
+        notify_lead: true,
+        trigger_compromise_scan: true,
+        trigger_soar: true
+      },
+      per_segment: true
+    });
+    db.prepare(
+      "INSERT OR IGNORE INTO team_config (key, value, updated_by) VALUES ('tripwire_config', ?, NULL)"
+    ).run(tripwireDefaults);
+    db.prepare(
+      "INSERT OR IGNORE INTO team_config (key, value, updated_by) VALUES ('compromise_scan_retention_days', 'null', NULL)"
+    ).run();
+    const compromiseRunCount = db
+      .prepare("SELECT COUNT(*) as c FROM compromise_scan_runs")
+      .get().c;
+    console.log(
+      `B4 migration: compromise_scan_runs + compromise_scan_results + ac_device_signing_keys + compromise_scan_queue + tripwire_events ready (${compromiseRunCount} run(s) present)`
+    );
+  } catch (b4CompromiseScanMigrationErr) {
+    console.error(
+      'B4 compromise_scan migration FAILED:',
+      b4CompromiseScanMigrationErr.message
+    );
+    console.error(
+      'The server will start, but compromise-scan orchestration and the reduced-routing tripwire cannot persist state: POST /api/compromise/* will return 500 and the tripwire detector will not run. No other feature is affected. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.'
+    );
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

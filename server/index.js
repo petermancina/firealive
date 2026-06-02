@@ -236,6 +236,8 @@ app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-monitoring'));
 app.use('/api/system/connected-clients', authMiddleware(['admin']), require('./routes/system-connected-clients'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
+app.use('/api/compromise', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/compromise-scan-orchestration'));
+app.use('/api/tripwire', authMiddleware(['lead', 'admin']), require('./routes/tripwire'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
@@ -322,6 +324,8 @@ async function start() {
     } catch (e) {
       logger.warn('Integration-health scheduler failed to start', { error: e.message });
     }
+
+    try { require('./services/tripwire-scheduler').startTripwireScheduler(getDb, { getWsServer: () => app.locals.wsServer }); logger.info('Tripwire scheduler started'); } catch (e) { logger.warn('Tripwire scheduler failed to start', { error: e.message }); }
 
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();

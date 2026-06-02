@@ -86,6 +86,8 @@ class FireAliveWebSocket {
           this.clients.set(decoded.id, ws);
           this._updateHeartbeat(decoded.id, true);
           this._send(ws, { type: 'auth_ok', userId: decoded.id });
+          // B4: deliver any compromise-scan commands queued while offline.
+          this._deliverQueuedScans(ws, decoded.id);
         } catch (err) {
           const code = err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
           this._send(ws, { type: 'auth_error', error: err.message, code });
@@ -116,6 +118,11 @@ class FireAliveWebSocket {
       case 'subscribe_notifications':
         ws.subscribeNotifications = true;
         break;
+      case 'scan_result': {
+        // B4: ingest a device-signed compromise self-scan report from an AC.
+        this._ingestScanResult(ws, msg);
+        break;
+      }
     }
   }
 
@@ -188,6 +195,146 @@ class FireAliveWebSocket {
       }
     });
   }
+
+  // ── B4: Compromise scan orchestration over the WebSocket channel ─────────
+  // Fan out an orchestrate_scan command to the connected target ACs. Offline
+  // targets are handled by the route (queued) and delivered on reconnect via
+  // _deliverQueuedScans below.
+  dispatchCompromiseScan(runId, userIds, opts = {}) {
+    const manifest = opts.manifest || null;
+    const expectedConfig = opts.expectedConfig || null;
+    for (const userId of userIds) {
+      const ws = this.clients.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'orchestrate_scan', runId, manifest, expectedConfig });
+      }
+    }
+  }
+
+  // Deliver scan commands queued while an AC was offline (called after auth).
+  // Stale (expired) queue entries are closed out; live ones are dispatched and
+  // marked delivered. The original run's manifest/config are not replayed here.
+  _deliverQueuedScans(ws, userId) {
+    try {
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE compromise_scan_queue SET status = 'expired' WHERE user_id = ? AND status = 'queued' AND expires_at <= ?").run(userId, now);
+      const pending = this.db.prepare("SELECT id, run_id FROM compromise_scan_queue WHERE user_id = ? AND status = 'queued' AND expires_at > ?").all(userId, now);
+      for (const q of pending) {
+        this._send(ws, { type: 'orchestrate_scan', runId: q.run_id, manifest: null, expectedConfig: null });
+        this.db.prepare("UPDATE compromise_scan_queue SET status = 'delivered', delivered_at = ? WHERE id = ?").run(now, q.id);
+      }
+    } catch (e) { try { console.error('[WS] queued-scan delivery error:', e.message); } catch {} }
+  }
+
+  // Canonical bytes the AC device key signed. MUST match the analyst-client
+  // main-process canonicalScanString exactly (fixed field order).
+  _canonicalScan(r) {
+    return [
+      r.runId || '',
+      r.scan_started_at,
+      String(r.scan_duration_ms),
+      r.status,
+      String(r.tests_total),
+      String(r.tests_passed),
+      String(r.tests_failed),
+      String(r.tests_inconclusive),
+      r.details_json,
+    ].join('\n');
+  }
+
+  // Ingest a signed scan report: verify the device signature against the
+  // registered public key, store the (verified-or-not) result, advance run
+  // completion, close out the delivery queue, and push progress to leads.
+  _ingestScanResult(ws, msg) {
+    try {
+      if (!ws.userId) return;
+      const result = msg && msg.result;
+      if (!result || typeof result !== 'object' || typeof result.details_json !== 'string') return;
+      if (!['clean', 'warning', 'fail', 'inconclusive'].includes(result.status)) return;
+
+      let verified = false;
+      const keyRow = this.db.prepare("SELECT public_key FROM ac_device_signing_keys WHERE user_id = ? AND active = 1").get(ws.userId);
+      if (keyRow && result.signature) {
+        try {
+          const pub = crypto.createPublicKey(keyRow.public_key);
+          verified = crypto.verify(null, Buffer.from(this._canonicalScan(result), 'utf8'), pub, Buffer.from(result.signature, 'base64'));
+        } catch { verified = false; }
+      }
+
+      let runId = (typeof msg.runId === 'string' && msg.runId) ? msg.runId : null;
+      let targetCount = 1;
+      if (runId) {
+        const run = this.db.prepare("SELECT targets_json, target_count FROM compromise_scan_runs WHERE id = ?").get(runId);
+        if (!run) return; // unknown run
+        let ids = [];
+        try { ids = (JSON.parse(run.targets_json).ids) || []; } catch {}
+        if (!ids.includes(ws.userId)) return; // not a target — never store injected results
+        targetCount = run.target_count || ids.length || 1;
+      } else {
+        // Self-initiated scan: rate-limited to one self-run per user per 30s.
+        const recent = this.db.prepare("SELECT id FROM compromise_scan_runs WHERE initiated_by = ? AND trigger = 'manual' AND target_count = 1 AND created_at > datetime('now', '-30 seconds') ORDER BY created_at DESC, rowid DESC LIMIT 1").get(ws.userId);
+        if (recent) { runId = recent.id; }
+        else {
+          const created = this.db.prepare("INSERT INTO compromise_scan_runs (trigger, initiated_by, targets_json, target_count, unreachable_count, status) VALUES ('manual', ?, ?, 1, 0, 'in_progress') RETURNING id").get(ws.userId, JSON.stringify({ mode: 'self', ids: [ws.userId] }));
+          runId = created.id;
+        }
+        targetCount = 1;
+      }
+
+      const pseudoRow = this.db.prepare("SELECT pseudonym FROM users WHERE id = ?").get(ws.userId);
+      const pseudonym = pseudoRow ? pseudoRow.pseudonym : null;
+
+      this.db.prepare(
+        "INSERT INTO compromise_scan_results (run_id, user_id, pseudonym_at_scan, status, tests_total, tests_passed, tests_failed, tests_inconclusive, details_json, signature, signature_verified, signed_at, scan_started_at, scan_duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(
+        runId, ws.userId, pseudonym, result.status,
+        result.tests_total | 0, result.tests_passed | 0, result.tests_failed | 0, result.tests_inconclusive | 0,
+        result.details_json, result.signature || null, verified ? 1 : 0, result.signed_at || null,
+        result.scan_started_at || null, result.scan_duration_ms | 0
+      );
+
+      this.db.prepare("UPDATE compromise_scan_queue SET status = 'delivered', delivered_at = datetime('now') WHERE run_id = ? AND user_id = ? AND status IN ('queued', 'delivered')").run(runId, ws.userId);
+
+      const completed = this.db.prepare("SELECT COUNT(*) AS c FROM compromise_scan_results WHERE run_id = ? AND signature_verified = 1").get(runId).c;
+      if (completed >= targetCount) {
+        this.db.prepare("UPDATE compromise_scan_runs SET completed_count = ?, status = 'complete', completed_at = datetime('now') WHERE id = ?").run(completed, runId);
+      } else {
+        this.db.prepare("UPDATE compromise_scan_runs SET completed_count = ? WHERE id = ?").run(completed, runId);
+      }
+
+      this._pushScanProgress(runId, pseudonym, result.status, verified);
+
+      // B4 (C6): route non-clean or unverified results through the B3 alert
+      // router. A failed check is critical; an unverified signature is a high
+      // tampering signal; an inconclusive-only result is a warning. Clean,
+      // signature-verified results raise nothing. Best-effort, fire-and-forget.
+      let _sev = null, _type = null;
+      if (!verified) { _sev = 'high'; _type = 'COMPROMISE_SCAN_UNVERIFIED'; }
+      else if (result.status === 'fail') { _sev = 'critical'; _type = 'COMPROMISE_SCAN_FAIL'; }
+      else if (result.status === 'warning') { _sev = 'warning'; _type = 'COMPROMISE_SCAN_WARNING'; }
+      if (_sev) {
+        try {
+          const { routeAlert } = require('./alert-router');
+          const _label = pseudonym || 'an analyst client';
+          const _msg = !verified
+            ? `Compromise self-scan report from ${_label} failed device-signature verification (possible tampering or key mismatch)`
+            : `Compromise self-scan ${result.status} for ${_label}: ${result.tests_failed | 0} failed, ${result.tests_inconclusive | 0} inconclusive of ${result.tests_total | 0}`;
+          Promise.resolve(routeAlert(this.db, { type: _type, severity: _sev, message: _msg, timestamp: new Date().toISOString() })).catch(() => {});
+        } catch (_) { /* alert routing is best-effort */ }
+      }
+    } catch (e) { try { console.error('[WS] scan_result ingest error:', e.message); } catch {} }
+  }
+
+  // Push per-client scan progress to leads/admins. Pseudonym only — no user id
+  // and no burnout data ever crosses to the management console.
+  _pushScanProgress(runId, pseudonym, status, verified) {
+    this.clients.forEach((ws) => {
+      if ((ws.userRole === 'lead' || ws.userRole === 'admin') && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'scan_progress', runId, pseudonym, status, verified });
+      }
+    });
+  }
+
 
   _send(ws, data) {
     try { ws.send(JSON.stringify(data)); } catch {}

@@ -965,6 +965,9 @@ export default function AnalystClientApp() {
   React.useEffect(() => { api.get("/api/features").then(r => { if (r && r.features) setFT(r.features); }).catch(() => {}); }, []);
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
+  // B4: live socket handle so a manually-run self-scan can report its signed
+  // result to the management console over the same authenticated channel.
+  const acScanWsRef = React.useRef(null);
   // ── N1a C25: Desktop notification WebSocket client ──────────────────────
   // The AC opens a WebSocket to the server's /ws endpoint after login,
   // authenticates with the JWT, and listens for { type: 'desktop_notify',
@@ -1006,6 +1009,7 @@ export default function AnalystClientApp() {
       }
       ws.onopen = () => {
         backoffMs = 1000;
+        acScanWsRef.current = ws;
         try { ws.send(JSON.stringify({ type: "auth", token: api._token })); } catch (_e) {}
       };
       ws.onmessage = (evt) => {
@@ -1018,8 +1022,18 @@ export default function AnalystClientApp() {
         if (msg && msg.type === "feature_toggles_updated" && msg.features) {
           setFT(msg.features);
         }
+        // B4: MC-orchestrated compromise scan. Run the local self-scan in the
+        // main process and return the device-signed result over this socket.
+        if (msg && msg.type === "orchestrate_scan") {
+          bridge.invoke("selfscan:run", { runId: msg.runId || null, manifest: msg.manifest || null, expectedConfig: msg.expectedConfig || null, token: api._token })
+            .then((result) => {
+              if (result && !result.error) {
+                try { ws.send(JSON.stringify({ type: "scan_result", runId: msg.runId || null, result: result })); } catch (_e) {}
+              }
+            }).catch(() => {});
+        }
       };
-      ws.onclose = () => { if (!closedByUnmount) scheduleReconnect(); };
+      ws.onclose = () => { acScanWsRef.current = null; if (!closedByUnmount) scheduleReconnect(); };
       ws.onerror = () => { try { ws.close(); } catch (_e) {} };
     }
 
@@ -1030,6 +1044,23 @@ export default function AnalystClientApp() {
       clearTimeout(reconnectTimer);
       if (ws) { try { ws.close(); } catch (_e) {} }
     };
+  }, [stage]);
+
+  // ── B4: device signing-key registration ────────────────────────────────
+  // On reaching the authenticated app stage, register this client's Ed25519
+  // device public key with the server so it can verify signed self-scan
+  // reports. The private key never leaves the main process. No-op without the
+  // Electron bridge; harmless if already registered (the server upserts).
+  React.useEffect(() => {
+    if (stage !== "app") return;
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") return;
+    let cancelled = false;
+    bridge.invoke("selfscan:getPublicKey").then((k) => {
+      if (cancelled || !k || k.error || !k.publicKey) return;
+      api.post("/api/compromise/device-key", { publicKey: k.publicKey, fingerprint: k.fingerprint }).catch(() => {});
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, [stage]);
 
   // ── R3j C12: panic banner state + polling ──────────────────────────────
@@ -3586,14 +3617,14 @@ export default function AnalystClientApp() {
         {tab==="scan"&&(<div>
           <L>Client Self-Scan</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run a 10-point compromise check on this analyst client. Tests binary integrity, memory analysis, network connections, configuration drift, audit log continuity, TLS certificate pinning, API token validation, filesystem integrity, EDR agent status, and encryption key validity. Results are displayed to you AND automatically sent to your management console — this is not optional because compromise affects the whole team.</M>
-          <Btn primary disabled={selfScanRunning} onClick={()=>{setSelfScanRunning(true);logC("SELF_SCAN_STARTED","Compromise self-scan initiated");setTimeout(()=>{setSelfScanRunning(false);const r={ts:new Date().toISOString(),tests:10,passed:10,status:"clean",details:["Binary integrity: SHA-256 verified against known-good hash","Memory analysis: No injected code or suspicious processes detected","Network connections: No unexpected outbound connections","Configuration drift: Matches management console last-known-good config","Audit log continuity: Sequential, no gaps or deletions detected","TLS certificate: Pinned certificate valid and not expired","API tokens: All tokens properly scoped and not expired","Filesystem integrity: No unauthorized file changes in app directories","EDR agent: Running and reporting to management console","Encryption keys: All keys valid, rotation schedule on track"]};setSelfScanResult(r);logC("SELF_SCAN_COMPLETE","Result: "+r.status+" (10/10 passed) — auto-sent to management console");},2500);}}>{selfScanRunning?"Scanning all 10 checks...":"Run Self-Scan"}</Btn>
+          <Btn primary disabled={selfScanRunning} onClick={()=>{const bridge=(typeof window!=="undefined")?window.firealive:null;if(!bridge||typeof bridge.invoke!=="function"){logC("SELF_SCAN_STARTED","Self-scan requires the desktop app");return;}setSelfScanRunning(true);logC("SELF_SCAN_STARTED","Compromise self-scan initiated");bridge.invoke("selfscan:run",{token:api._token}).then((r)=>{setSelfScanRunning(false);if(!r||r.error){logC("SELF_SCAN_COMPLETE","Self-scan error: "+((r&&r.error)||"unknown"));return;}let details=[];try{details=JSON.parse(r.details_json);}catch(_e){}setSelfScanResult({ts:r.scan_started_at,status:r.status,tests:r.tests_total,passed:r.tests_passed,failed:r.tests_failed,inconclusive:r.tests_inconclusive,details:details});try{if(acScanWsRef.current&&acScanWsRef.current.readyState===1)acScanWsRef.current.send(JSON.stringify({type:"scan_result",runId:null,result:r}));}catch(_e){}logC("SELF_SCAN_COMPLETE","Result: "+r.status+" ("+r.tests_passed+"/"+r.tests_total+" passed)");}).catch(()=>{setSelfScanRunning(false);logC("SELF_SCAN_COMPLETE","Self-scan failed");});}}>{selfScanRunning?"Scanning all 10 checks...":"Run Self-Scan"}</Btn>
           {selfScanResult&&(<Card style={{marginTop:16}}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
               <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Scan Results — {new Date(selfScanResult.ts).toLocaleString()}</div>
-              <Badge color={selfScanResult.status==="clean"?C.a:C.d}>{selfScanResult.status}</Badge>
+              <Badge color={selfScanResult.status==="clean"?C.a:selfScanResult.status==="fail"?C.d:C.w}>{selfScanResult.status}</Badge>
             </div>
-            <M style={{color:C.td,display:"block",marginBottom:12}}>{selfScanResult.passed}/{selfScanResult.tests} tests passed · Results auto-sent to management console ✓</M>
-            {selfScanResult.details.map((d,i)=><div key={i} style={{padding:"4px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.a}}>✓ </M><M style={{color:C.t}}>{d}</M></div>)}
+            <M style={{color:C.td,display:"block",marginBottom:12}}>{selfScanResult.passed} passed · {selfScanResult.failed} failed · {selfScanResult.inconclusive} inconclusive (of {selfScanResult.tests})</M>
+            {(selfScanResult.details||[]).map((d,i)=>{const col=d.status==="pass"?C.a:d.status==="fail"?C.d:C.w;const mk=d.status==="pass"?"✓":d.status==="fail"?"✗":"~";return <div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{d.name||d.id}</M><M style={{color:col,fontWeight:600}}>{mk} {d.status}</M></div>{d.detail&&<M style={{color:C.tm,fontSize:11,display:"block",marginTop:2}}>{d.detail}</M>}</div>;})}
           </Card>)}
         </div>)}
 

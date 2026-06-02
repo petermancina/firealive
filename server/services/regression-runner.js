@@ -190,6 +190,49 @@ class RegressionRunner {
       return requireAll(['cicd_configs', 'cicd_runs', 'cloud_iac_signing_keys']);
     });
 
+    await check('schema', 'B4 compromise-scan + tripwire tables', () => {
+      return requireAll(['compromise_scan_runs', 'compromise_scan_results', 'ac_device_signing_keys', 'compromise_scan_queue', 'tripwire_events']);
+    });
+    await check('schema', 'B4 device-key one-active-per-user index', () => {
+      if (indexExists('idx_ac_device_signing_keys_one_active')) return 'partial-unique index present';
+      throw new Error('missing idx_ac_device_signing_keys_one_active');
+    });
+
+    // ── Category: Compromise scan + reduced-routing tripwire (B4) ───
+    await check('compromise', 'Orchestration route loads', () => {
+      const r = require('../routes/compromise-scan-orchestration');
+      if (typeof r !== 'function') throw new Error('route is not an express router');
+      return 'router exported';
+    });
+    await check('compromise', 'Tripwire route loads', () => {
+      const r = require('../routes/tripwire');
+      if (typeof r !== 'function') throw new Error('route is not an express router');
+      return 'router exported';
+    });
+    await check('compromise', 'Tripwire detector evaluates', () => {
+      const det = require('./tripwire-detector');
+      if (typeof det.evaluate !== 'function') throw new Error('evaluate missing');
+      const v = det.evaluate(this.db, {});
+      if (!v || typeof v.tripped !== 'boolean' || typeof v.signals !== 'object') throw new Error('verdict shape invalid');
+      return 'verdict ok (score ' + v.score + ', tripped ' + v.tripped + ')';
+    });
+    await check('compromise', 'Tripwire scheduler API', () => {
+      const sch = require('./tripwire-scheduler');
+      if (typeof sch.startTripwireScheduler !== 'function' || typeof sch.runTripwireCycle !== 'function') throw new Error('scheduler API missing');
+      return 'scheduler API present';
+    });
+    await check('compromise', 'Tripwire config seeded', () => {
+      const row = this.db.prepare("SELECT value FROM team_config WHERE key = 'tripwire_config'").get();
+      if (!row) return SKIP('tripwire_config not present (control may have been cleared)');
+      JSON.parse(row.value);
+      return 'tripwire_config present and valid JSON';
+    });
+    await check('compromise', 'Compromise retention config seeded', () => {
+      const row = this.db.prepare("SELECT value FROM team_config WHERE key = 'compromise_scan_retention_days'").get();
+      if (!row) return SKIP('compromise_scan_retention_days not present');
+      return 'retention config present';
+    });
+
     // ── Category 2: Crypto ─────────────────────────────────────────
     await check('crypto', 'AES-256-GCM round-trip', () => {
       const key = crypto.randomBytes(32);

@@ -721,7 +721,7 @@ export default function GlobalDashboard() {
   // of a hardcoded string. Runs once when the app stage is reached.
   useEffect(() => {
     if (stage !== "app" || gdVersion) return;
-    api.get(/api/system/version).then(r => {
+    api.get("/api/system/version").then(r => {
       if (r && !r.error && r.version) setGdVersion(r.version);
     });
   }, [stage, gdVersion]);

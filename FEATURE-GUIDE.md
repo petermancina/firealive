@@ -520,23 +520,36 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 3. AC enforcement: on every connection (or first launch only), runs posture check, reports compliance to MC, blocks if failed
 
 ### Tripwire
-**What it's for:** Detection for a specific attack pattern: if a large percentage of analysts simultaneously enter "reduced routing" status, it could indicate compromised analyst clients are coordinately requesting load reduction to degrade SOC response capacity. The tripwire auto-disables burnout routing and alerts the lead to investigate.
+**What it's for:** Detection for a specific attack — compromised analyst clients weaponizing FireAlive's legitimate reduced-routing mechanism to throttle SOC response capacity. Rather than a static percentage, the detector weighs six signals and trips on the *attack signature* — synchronized, workload-unjustified, uniform load reduction — not on genuine team stress. On a trip it fails routing open, launches a signed compromise scan, alerts, and holds an investigation lockout until the fleet is confirmed clean. Verdicts are team/segment-level only — no per-analyst identity, no burnout data.
+
+**The six signals** (each yields a strength in [0,1], combined as a weighted sum against a configurable trip score; evaluated globally and per tier/shift):
+1. **Velocity** — how many analysts entered reduced routing inside the window (synchronization).
+2. **Breadth** — share of the segment currently in reduced routing versus the threshold.
+3. **Slope** — acceleration of entries versus the prior window.
+4. **Signal-justification (linchpin, weighted x2)** — cross-checks each reduction against the server's *independent* workload record (recent ticket actions and open assignments). Reduced-but-idle implies an injected reduction rather than an earned one. This is what separates a genuine burnout wave (busy, justified) from an attack; a lone idle analyst is damped, a coordinated idle cohort reaches full strength.
+5. **Uniformity** — low variance of capacity values or entry timing across the reduced cohort (scripted/replayed).
+6. **Corroboration** — co-occurring security events in the audit log lower the trip bar.
 
 **Workflow:**
-1. Lead configures threshold (e.g. "if >40% of analysts go into reduced routing within 5 minutes")
-2. Normal operation: occasional analyst goes reduced — no alarm
-3. Attack scenario: 5+ analysts request reduction in quick succession — tripwire fires
-4. Burnout routing auto-disables, lead gets urgent notification, lead investigates
+1. Admin configures the breadth threshold, reduced-capacity threshold, trip score, window, and which response actions fire. Small teams fall back to a degraded mode that leans on velocity, the justification linchpin, and corroboration.
+2. Normal operation: a genuinely stressed team shows high breadth but *justified* (busy) reductions with varied capacities — the score stays low, no trip.
+3. Attack: a synchronized cohort drops into reduced routing while their independent workload stays idle, with uniform capacities or replayed timing — the weighted sum crosses the trip score (or a single extreme signal trips immediately).
+4. Response, each independently toggleable: routing fails open (reduced-load overrides are deactivated — burnout-derived `capacity_score` is never altered), a signed compromise scan is auto-launched across all clients, a critical alert routes through SOAR / notification / SIEM, and an investigation lockout is held.
+5. The lead can run the detector read-only ("Run Detector Now") to see the live verdict and per-signal strengths without firing any response.
+6. Resolving the lockout is gated on a clean scan — the linked scan must have no failed or unverified results and all reachable clients must have reported clean. An admin may force-resolve after out-of-band investigation; the resolving user is recorded on the event.
 
 ### Compromise Scan
-**What it's for:** Orchestrate compromise tests across analyst clients. Each AC runs 10-point self-diagnostics (binary integrity, memory analysis, network connections, configuration drift, audit log continuity, TLS pinning, API tokens, filesystem integrity, EDR status, encryption keys) and returns a signed report. Lead uses this after a tripwire event or any time client compromise is suspected.
+**What it's for:** Orchestrate the analyst-client self-scan across connected clients. Each AC runs ten integrity checks in its isolated Electron main process — binary integrity (against a signed release manifest), memory analysis, network connections, configuration drift, audit-log continuity, EDR/XDR status, API token scope, TLS pinning, filesystem integrity, encryption keys — and returns a report signed by a per-device Ed25519 key the server verifies. Results are tri-state (pass / inconclusive / fail) and never faked: a check that can't be determined returns inconclusive rather than a false pass. Reports use pseudonyms and carry NO burnout data — only system-health metrics. Use after a tripwire event or any time client compromise is suspected.
 
 **Workflow:**
-1. Lead opens Compromise Scan
-2. Either picks a single client or "Scan All Clients"
-3. ACs run their 10-point checks (takes a couple minutes)
-4. Results come back with pseudonyms — lead sees per-client pass/fail breakdown
-5. Failed checks → lead investigates that client, may rotate its pseudonym, reprovision, or escalate
+1. Lead opens Compromise Scan and picks a target — all active analysts, or one analyst.
+2. The server creates a run, dispatches the scan command to connected clients over the authenticated WebSocket channel, and queues offline clients for delivery on reconnect within a 15-minute window.
+3. Each client runs its ten checks and returns a signed report. The server verifies the device signature before storing; reports that fail verification are flagged UNVERIFIED (a tampering or key-mismatch signal) and are never counted as clean.
+4. The lead sees live per-client results — tri-state status, passed/inconclusive counts, a signature-verified or unverified indicator, and which clients are still offline-queued or had their delivery window expire.
+5. Failed or unverified clients route through the alert router (failed → critical, unverified → high) so SOAR / SIEM / notification fire; the lead investigates, may rotate the pseudonym, reprovision, or escalate.
+6. Result retention is admin-configurable (indefinite by default, or 1–3650 days); run history is kept for review.
+
+**Note — scanning the Global Dashboard:** this surface scans *analyst clients*. The GD inspecting *itself* for compromise is a separate GD self-scan, scoped to a later phase; the MC does not reach into or scan the GD.
 
 ### Log Integrity
 **What it's for:** Audit logs are append-only with SHA-256 hash chain. The application prevents deletion. This tab monitors the chain for missing logs (gaps suggest tampering or partition events) and triggers SOAR alerts on detection.
@@ -552,7 +565,7 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 **Workflow:**
 1. After applying an update or making major config changes
 2. Lead opens Regression Test, clicks Run
-3. Server runs the canonical regression-runner via `POST /api/regression/run` (admin-gated; replaces an earlier setTimeout-based client-side fake). The MC suite is 57 checks across 12 categories on a freshly bootstrapped install (rising by one per probed integration once integration-health probing has run): schema + foreign-key integrity, an in-memory schema-clone harness, auth-flow round-trips (bcrypt + JWT + TOTP), AES-256-GCM / SHA-256 / Ed25519 / NaCl-box crypto round-trips, peer skill-share E2E envelope round-trip, GD-push Ed25519 signing + fingerprint, KMS / key-wrapping round-trips, helper-pay points-ledger invariant, routing, burnout-signal plumbing, backups v2-aware schema, anti-rollback fuse counter, the cloud / cicd / full-suite signing infrastructure, AI-dispatcher graceful-fail (IR-simulator wiring), model-file-safety fail-closed, external-integration reachability, and integration health.
+3. Server runs the canonical regression-runner via `POST /api/regression/run` (admin-gated; replaces an earlier setTimeout-based client-side fake). The MC suite is 65 checks across 13 categories on a freshly bootstrapped install (rising by one per probed integration once integration-health probing has run): schema + foreign-key integrity, an in-memory schema-clone harness, auth-flow round-trips (bcrypt + JWT + TOTP), AES-256-GCM / SHA-256 / Ed25519 / NaCl-box crypto round-trips, peer skill-share E2E envelope round-trip, GD-push Ed25519 signing + fingerprint, KMS / key-wrapping round-trips, helper-pay points-ledger invariant, routing, burnout-signal plumbing, backups v2-aware schema, anti-rollback fuse counter, the cloud / cicd / full-suite signing infrastructure, AI-dispatcher graceful-fail (IR-simulator wiring), model-file-safety fail-closed, external-integration reachability, integration health, and the compromise-scan + reduced-routing-tripwire surface (the five B4 tables, the device-key partial-unique index, the detector verdict, the scheduler API, both routes, and the seeded tripwire / retention controls).
 4. **Zero production side effects (by design).** Verifiable controls are read-only on the live database; write-path "flow" checks run against an in-memory SQLite clone of the live schema; crypto and E2E checks use throwaway keys held only in memory; the AI and scanner checks exercise plumbing and fail-closed behavior only (no real inference or scan).
 5. **Three statuses — pass / fail / skip.** A skip never counts as a failure. Two checks are forward-dependent: they skip until the phase that backs them ships, then auto-activate. The `audit_log` hash-chain linkage check skips until the hash columns land (B5a — Audit Hash Chain); the IAM offboarding-detector check skips until the scheduled IdP detector populates `last_iam_check` (B5b — IAM Real IdP Integration). The columns and wiring they assert are verified now even while the deeper assertion is deferred. The `integrations` category applies the same trichotomy to optional external integrations — SOAR, SIEM, ticketing, LDAP/AD, and backup storage each pass when configured and reachable, fail when configured but broken, and skip when not configured — while EDR / malware-scanner coverage is treated as required and fails when absent. The `integration_health` category reflects the most recent cached integration-health probe without running any live probe: a healthy probe passes, a benign state (disabled / not configured / not implemented) skips, and a real probe failure (unreachable / auth failed / permission denied / timeout / error) fails; with no cached probe it records a single skip.
 6. The Global Dashboard runs its own CISO-gated suite (32 checks across 8 categories) via `POST /api/regression-test`, covering GD schema + FK integrity, AES-256-GCM / SHA-256 / Ed25519 crypto round-trips, auth-flow round-trip (bcrypt + JWT), MC-trust signing-key coverage, cross-region rollup, compliance tables, backups, the same forward-aware audit-chain check, and forward-aware integrations + integration-health checks. The GD’s SOAR / SIEM and required-EDR integration checks are deliberately forward-aware: they skip until the GD grows its own runtime-monitoring and integration surface — a separately scoped future phase (see `docs/runtime-monitoring-and-system-health.md`) — and then activate. The AI, model-safety, peer, helper-pay, and IAM checks are intentionally not ported — those subsystems do not run on the GD.
@@ -1272,14 +1285,14 @@ Tier-3 PRIVATE — the lead literally cannot see whether the analyst accesses th
 6. None of this is logged in a way the lead can see — fully private
 
 ### Self-Scan
-**What it's for:** Analyst-initiated 10-point compromise check on their own client. Tests binary integrity, memory analysis, network connections, configuration drift, audit log continuity, TLS pinning, API tokens, filesystem integrity, EDR status, encryption keys. Results go to the analyst AND auto-send to MC — not optional, because client compromise affects the whole team.
+**What it's for:** Analyst-initiated 10-point compromise check on their own client. Tests binary integrity, memory analysis, network connections, configuration drift, audit log continuity, TLS pinning, API tokens, filesystem integrity, EDR status, encryption keys. The device-signed, tri-state report (pass / inconclusive / fail) is shown to the analyst and transmitted to the MC over the authenticated channel (self-initiated reports are rate-limited and recorded as a per-analyst self-run) — not optional, because client compromise affects the whole team.
 
 **Workflow:**
 1. Analyst notices something off about their machine, or it's part of weekly hygiene
 2. Opens Self-Scan, clicks Run
-3. Scan runs (~2-3 minutes), 10 checks
-4. Results display: pass/fail per check
-5. Auto-transmitted to MC — lead may follow up if any failed
+3. Scan runs the 10 checks in the client’s isolated main process
+4. Results display tri-state (pass / inconclusive / fail) per check, each device-signed
+5. The device-signed report is transmitted to the MC — lead may follow up on any failed or unverified result
 
 ### Audit (AC-side)
 **What it's for:** Local audit log of events on this client. Auto-mirrored to MC. So if questions arise about what the analyst was doing at a specific time, they can see their own log.
