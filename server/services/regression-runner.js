@@ -892,6 +892,33 @@ class RegressionRunner {
       return 'gate fail-closed on hash mismatch (' + res.overall + ')';
     });
 
+    // ── Category: Troubleshooter ───────────────
+    await check('troubleshooter', 'rule-based diagnostics over schema clone', () => {
+      // Exercises the rule-based troubleshooter engine end-to-end against a
+      // side-effect-free in-memory clone of the live schema -- the same path
+      // the /api/troubleshoot route falls back to when the internal model is
+      // unavailable. No LLM, no writes to the production DB.
+      const diagnostics = require('./troubleshooter-diagnostics');
+      if (typeof diagnostics.runDiagnostics !== 'function') throw new Error('troubleshooter-diagnostics.runDiagnostics is not a function');
+      const mem = cloneLiveSchema(this.db);
+      try {
+        const r = diagnostics.runDiagnostics(mem, 'soar playbook routing is failing');
+        if (!r || typeof r !== 'object') throw new Error('runDiagnostics did not return an object');
+        if (typeof r.topic !== 'string' || !r.topic) throw new Error('missing topic');
+        if (!Array.isArray(r.findings) || r.findings.length === 0) throw new Error('expected non-empty findings for a routed topic');
+        if (!Array.isArray(r.baseline) || r.baseline.length === 0) throw new Error('expected a non-empty baseline');
+        const VALID = new Set(['pass', 'warn', 'fail']);
+        for (const f of r.findings.concat(r.baseline)) {
+          if (!f || typeof f.label !== 'string' || !f.label) throw new Error('finding missing label');
+          if (!VALID.has(f.status)) throw new Error('finding has invalid status: ' + (f && f.status));
+          if (typeof f.detail !== 'string' || !f.detail) throw new Error('finding missing detail');
+        }
+        return 'topic=' + r.topic + ' findings=' + r.findings.length + ' baseline=' + r.baseline.length;
+      } finally {
+        try { mem.close(); } catch (_e) { /* ignore */ }
+      }
+    });
+
     // ── Category: Integration health (reflects the latest cached probe) ─────
     // Surfaces the most recent integration-health probe result without running
     // live probes, so the regression run stays side-effect-free. ok -> pass;

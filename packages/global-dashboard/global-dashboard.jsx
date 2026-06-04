@@ -3052,21 +3052,45 @@ export default function GlobalDashboard() {
           {/* ══════════ TROUBLESHOOTER ══════════ */}
           {tab==="troubleshooter"&&(<div>
             <L>Troubleshooter</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Diagnose issues with the Global Dashboard, MC connections, data sync, and backend health. Describe the symptom and the GD-Server runs targeted diagnostic checks.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run a comprehensive, read-only diagnostic of the Global Dashboard: management-console connectivity and sync, regional and compliance rollup freshness, backups, and dashboard core health. The dashboard runs no model, so this returns structured checks only.</M>
             <Card>
-              <Input label="Describe the issue" value={troubleQuery} onChange={e=>setTroubleQuery(e.target.value)} placeholder="e.g., MC not syncing, reports not generating, notifications delayed" disabled={troubleRunning}/>
-              <Btn primary disabled={troubleRunning||!troubleQuery.trim()} onClick={async()=>{
+              <Input label="Describe the issue (optional)" value={troubleQuery} onChange={e=>setTroubleQuery(e.target.value)} placeholder="e.g., MC not syncing, reports not generating" disabled={troubleRunning}/>
+              <Btn primary disabled={troubleRunning} onClick={async()=>{
                 setTroubleRunning(true);setTroubleResult(null);
                 const r=await api.post("/api/troubleshoot",{query:troubleQuery});
                 setTroubleRunning(false);
-                if(r&&!r.error&&r.checks){setTroubleResult(r);showGdToast("Diagnostics returned "+r.checks.length+" checks");}
-                else showGdToast("Troubleshoot failed: "+(r?.error||"unknown"));
-              }}>{troubleRunning?"Diagnosing...":"Diagnose"}</Btn>
+                if(r&&!r.error&&Array.isArray(r.findings)){setTroubleResult(r);}
+                else{setTroubleResult(null);showGdToast("Troubleshoot failed: "+(r?.error||"unknown"));}
+              }}>{troubleRunning?"Diagnosing...":"Run diagnostics"}</Btn>
             </Card>
-            {troubleResult&&troubleResult.checks&&<Card style={{marginTop:16}}>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Diagnostic Results</div>
-              {troubleResult.checks.map((c,i)=><div key={i} style={{padding:"6px 0",borderBottom:i<troubleResult.checks.length-1?`1px solid ${C.b}`:"none",fontFamily:"'IBM Plex Mono',monospace",fontSize:11}}><M style={{color:c.startsWith("→")?C.i:c.startsWith("✓")?C.a:c.startsWith("✗")||c.startsWith("✘")?C.d:C.t}}>{c}</M></div>)}
-            </Card>}
+            {troubleResult&&Array.isArray(troubleResult.findings)&&(<div>
+              <Card style={{marginTop:16}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Findings</div>
+                {troubleResult.findings.map((f,i)=>(
+                  <div key={i} style={{padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                      <Badge color={f.status==="pass"?C.a:f.status==="fail"?C.d:C.w}>{f.status}</Badge>
+                      <M style={{color:C.t,fontWeight:500}}>{f.label}</M>
+                    </div>
+                    <M style={{color:C.tm,display:"block",lineHeight:1.6}}>{f.detail}</M>
+                    {f.fix&&<M style={{color:C.tm,display:"block",marginTop:4,lineHeight:1.6}}>Fix: {f.fix}</M>}
+                  </div>
+                ))}
+              </Card>
+              {troubleResult.baseline&&troubleResult.baseline.length>0&&<Card style={{marginTop:16}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Dashboard baseline</div>
+                {troubleResult.baseline.map((f,i)=>(
+                  <div key={i} style={{padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                      <Badge color={f.status==="pass"?C.a:f.status==="fail"?C.d:C.w}>{f.status}</Badge>
+                      <M style={{color:C.t,fontWeight:500}}>{f.label}</M>
+                    </div>
+                    <M style={{color:C.tm,display:"block",lineHeight:1.6}}>{f.detail}</M>
+                    {f.fix&&<M style={{color:C.tm,display:"block",marginTop:4,lineHeight:1.6}}>Fix: {f.fix}</M>}
+                  </div>
+                ))}
+              </Card>}
+            </div>)}
           </div>)}
 
           {/* ══════════ APP UPDATES ══════════ */}

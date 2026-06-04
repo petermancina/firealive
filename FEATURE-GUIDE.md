@@ -1206,15 +1206,17 @@ After the org’s change-management approves the update, the lead pushes it to p
 
 ### Troubleshooter
 
-**What it’s for:** Interactive assistant that diagnoses why a feature isn’t working. The lead describes the problem, the troubleshooter checks integrations, configs, logs, and suggests fixes.
+**What it’s for:** A one-shot diagnostic for when a feature isn’t behaving. An admin describes the symptom and the server runs rule-based checks against live configuration and state, then — when the internal model is loaded — adds a short most-likely-cause and prioritized-fix summary on top of those checks.
 
-**Workflow:**
+**How it works:**
 
-1. Something’s broken — “SOAR routing isn’t assigning tickets”
-1. Lead opens Troubleshooter, types description
-1. System checks SOAR connectivity, routing engine status, recent audit logs
-1. Returns diagnosis + suggested fixes
-1. Lead either applies fix or escalates with the diagnosis as evidence
+1. Something looks wrong — for example “SOAR routing isn’t assigning tickets”
+1. The admin opens Troubleshooter and describes it
+1. The server keyword-routes the description to a topic, runs the matching checks (for SOAR: integration connectivity, the routing toggle, recent routing events) plus an always-run baseline (database, recent audit events, integration health, panic mode), and returns structured findings — each with a pass / warn / fail status, a detail, an optional suggested fix, and a jump-link to the relevant settings tab
+1. When the internal model is available it also returns a grounded “diagnosis and prioritized fixes” summary that reasons only over those findings; when it isn’t, the tab shows an honest “AI diagnosis unavailable” note and the rule-based findings stand on their own
+1. The admin reviews the findings and either applies a fix or escalates with them as evidence — nothing is applied automatically
+
+The synthesis runs on the FireAlive internal model only; the troubleshooter never sends its context to an external provider, and the problem description and the generated summary are never logged (only metadata: model, token estimate, latency, status).
 
 -----
 
@@ -1625,7 +1627,7 @@ Connect GD to org’s monitoring stack so compromise of the GD itself is detecte
 
 ### IAM & Access / MFA / Posture / WiFi / Compromise Scan / Vulnerability Scan / Regression Test / Cloud & IaC / SDN-SASE / HA & Clustering / Backup / Data Sovereignty / Recertification / Troubleshooter / App Updates
 
-Same purposes as MC equivalents but scoped to the GD server (which is independent infrastructure separate from the regional MC).
+Same purposes as MC equivalents but scoped to the GD server (which is independent infrastructure separate from the regional MC). The GD Troubleshooter, though, is rule-based only — the Global Dashboard runs no model — and returns the same kind of structured findings, without an AI summary.
 
 ### Audit & Forensics
 

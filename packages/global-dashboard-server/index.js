@@ -3439,6 +3439,26 @@ function runGdRegression(db) {
     return `sqlite ${r.v}`;
   });
 
+  // ── Troubleshooter (1) ─────────────────────────
+  record('troubleshooter', 'GD diagnostics over schema clone', () => {
+    const mem = gdCloneSchema(db);
+    try {
+      const r = runGdDiagnostics(mem);
+      if (!r || typeof r !== 'object') throw new Error('runGdDiagnostics did not return an object');
+      if (!Array.isArray(r.findings) || r.findings.length === 0) throw new Error('expected non-empty findings');
+      if (!Array.isArray(r.baseline) || r.baseline.length === 0) throw new Error('expected non-empty baseline');
+      const VALID = new Set(['pass', 'warn', 'fail']);
+      for (const f of r.findings.concat(r.baseline)) {
+        if (!f || typeof f.label !== 'string' || !f.label) throw new Error('finding missing label');
+        if (!VALID.has(f.status)) throw new Error('finding has invalid status: ' + (f && f.status));
+        if (typeof f.detail !== 'string' || !f.detail) throw new Error('finding missing detail');
+      }
+      return 'findings=' + r.findings.length + ' baseline=' + r.baseline.length;
+    } finally {
+      try { mem.close(); } catch (_e) { /* ignore */ }
+    }
+  });
+
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;
   const skipped = tests.filter(t => t.status === 'skip').length;
@@ -4087,27 +4107,125 @@ app.put('/api/config/:key', authMiddleware(['ciso']), (req, res) => {
 });
 
 // ── Troubleshooter ───────────────────────────────────────────────────────────
-app.post('/api/troubleshoot', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const { query } = req.body;
-    const db = getDb();
-    const checks = [];
-    const q = (query || '').toLowerCase();
+// ----------------------------------------------------------------------------
+// GD Troubleshooter diagnostics: a comprehensive, read-only, rule-based scan of
+// dashboard subsystems (console connectivity/sync, signing-key coverage,
+// regional + compliance rollup freshness, backups) plus a core-health baseline
+// (database integrity, audit-chain integrity, recent audit events, CISO
+// coverage, health snapshot). No model is consulted -- the Global Dashboard has
+// no AI infrastructure -- so it returns structured findings only, no synthesis.
+// Each check is wrapped so a single failure degrades to a warn finding instead
+// of throwing. Returns { findings, baseline }; entries are
+// { label, status, detail, fix? } with status one of pass | warn | fail.
+// ----------------------------------------------------------------------------
+function runGdDiagnostics(db) {
+  const findings = [];
+  const baseline = [];
+  const F = (label, status, detail, fix) => {
+    const o = { label: label, status: status, detail: detail };
+    if (fix) { o.fix = fix; }
+    return o;
+  };
+  const safe = (arr, label, fn) => {
+    try { arr.push(fn()); }
+    catch (_e) { arr.push(F(label, 'warn', 'Could not evaluate this check against the current dashboard state.')); }
+  };
 
-    if (q.includes('mc') || q.includes('connect')) {
-      const mcs = db.prepare("SELECT COUNT(*) as total FROM management_consoles").get();
-      const active = db.prepare("SELECT COUNT(*) as active FROM management_consoles WHERE status = 'active'").get();
-      checks.push(`✓ Total MCs: ${mcs.total}`, `✓ Active: ${active.active}`, '→ Check MC endpoint URLs and API keys if a region is not syncing');
-    } else if (q.includes('backup')) {
-      const latest = db.prepare("SELECT * FROM backups ORDER BY created_at DESC LIMIT 1").get();
-      checks.push(`✓ Latest backup: ${latest?.created_at || 'none'}`, `✓ Status: ${latest?.status || 'N/A'}`, '→ Check backup schedule and storage destination');
-    } else {
-      const health = process.memoryUsage();
-      checks.push(`✓ Memory: ${Math.round(health.rss / 1024 / 1024)}MB`, `✓ Uptime: ${Math.round(process.uptime())}s`, '→ Describe the specific issue for more targeted diagnostics');
+  // ---- Findings: per-subsystem diagnostics ----
+  safe(findings, 'Connected management consoles', () => {
+    const total = db.prepare('SELECT COUNT(*) AS c FROM management_consoles').get().c;
+    const active = db.prepare("SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active'").get().c;
+    if (total === 0) return F('Connected management consoles', 'warn', 'No management consoles are registered with this dashboard.', 'Onboard at least one regional management console.');
+    if (active === 0) return F('Connected management consoles', 'warn', total + ' console(s) registered but none are active.', 'Check each console endpoint and credentials.');
+    return F('Connected management consoles', 'pass', active + ' of ' + total + ' registered console(s) are active.');
+  });
+  safe(findings, 'Console sync freshness', () => {
+    const active = db.prepare("SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active'").get().c;
+    if (active === 0) return F('Console sync freshness', 'warn', 'No active consoles to evaluate.');
+    const stale = db.prepare("SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active' AND (last_sync IS NULL OR last_sync < datetime('now','-24 hours'))").get().c;
+    if (stale > 0) return F('Console sync freshness', 'warn', stale + ' of ' + active + ' active console(s) have not synced in the last 24 hours.', 'Verify connectivity and push scheduling for the stale region(s).');
+    return F('Console sync freshness', 'pass', 'All ' + active + ' active console(s) have synced within the last 24 hours.');
+  });
+  safe(findings, 'MC signing-key coverage', () => {
+    const mcs = db.prepare("SELECT id FROM management_consoles WHERE status = 'active'").all();
+    if (mcs.length === 0) return F('MC signing-key coverage', 'pass', 'No active consoles to cover.');
+    let uncovered = 0;
+    for (const mc of mcs) {
+      const n = db.prepare("SELECT COUNT(*) AS n FROM signing_keys WHERE mc_id = ? AND status = 'active'").get(mc.id).n;
+      if (n === 0) { uncovered++; }
     }
-    db.close();
-    res.json({ checks });
-  } catch (e) { res.status(500).json({ error: 'Troubleshoot failed' }); }
+    if (uncovered > 0) return F('MC signing-key coverage', 'fail', uncovered + ' active console(s) have no active signing key, so their pushes cannot be signature-verified.', 'Have each affected console submit a signing key for approval.');
+    return F('MC signing-key coverage', 'pass', 'All ' + mcs.length + ' active console(s) have an active signing key.');
+  });
+  safe(findings, 'Regional metrics freshness', () => {
+    const row = db.prepare('SELECT MAX(timestamp) AS latest FROM regional_metrics').get();
+    if (!row || !row.latest) return F('Regional metrics freshness', 'warn', 'No regional metrics have been received yet.', 'Confirm consoles are pushing aggregate metrics.');
+    const recent = db.prepare("SELECT COUNT(*) AS c FROM regional_metrics WHERE timestamp > datetime('now','-24 hours')").get().c;
+    if (recent === 0) return F('Regional metrics freshness', 'warn', 'No regional metrics received in the last 24 hours (latest: ' + row.latest + ').', 'Check console push scheduling.');
+    return F('Regional metrics freshness', 'pass', recent + ' regional metric row(s) received in the last 24 hours.');
+  });
+  safe(findings, 'Compliance rollup freshness', () => {
+    const row = db.prepare('SELECT MAX(last_push_at) AS latest FROM cross_region_rollup').get();
+    if (!row || !row.latest) return F('Compliance rollup freshness', 'warn', 'No cross-region compliance rollups have been received yet.', 'Confirm consoles are pushing compliance summaries.');
+    return F('Compliance rollup freshness', 'pass', 'Most recent compliance rollup received ' + row.latest + '.');
+  });
+  safe(findings, 'Dashboard backups', () => {
+    const latest = db.prepare('SELECT status, created_at FROM backups ORDER BY created_at DESC LIMIT 1').get();
+    if (!latest) return F('Dashboard backups', 'warn', 'No dashboard backups have been recorded.', 'Configure and run a backup schedule.');
+    if (latest.status === 'failed' || latest.status === 'error') return F('Dashboard backups', 'fail', 'The most recent backup is in state "' + latest.status + '" (created ' + latest.created_at + ').', 'Investigate and re-run the backup.');
+    return F('Dashboard backups', 'pass', 'Most recent backup: ' + (latest.status || 'recorded') + ' at ' + latest.created_at + '.');
+  });
+  safe(findings, 'Backup schedules', () => {
+    const active = db.prepare('SELECT COUNT(*) AS c FROM backup_schedules WHERE active = 1').get().c;
+    if (active === 0) return F('Backup schedules', 'warn', 'No active backup schedule is configured.', 'Add a recurring backup schedule.');
+    return F('Backup schedules', 'pass', active + ' active backup schedule(s) configured.');
+  });
+
+  // ---- Baseline: dashboard core health ----
+  safe(baseline, 'Database integrity', () => {
+    const r = db.prepare('PRAGMA integrity_check').get();
+    const v = r && (r.integrity_check || r['integrity_check']);
+    if (v !== 'ok') return F('Database integrity', 'fail', 'SQLite integrity_check returned a non-ok result.', 'Restore from a verified backup.');
+    return F('Database integrity', 'pass', 'SQLite integrity_check reports ok.');
+  });
+  safe(baseline, 'Audit chain integrity', () => {
+    const v = verifyIncremental(db);
+    if (v && v.intact) return F('Audit chain integrity', 'pass', 'The audit chain verifies intact' + (v.entriesVerified != null ? ' (' + v.entriesVerified + ' entr' + (v.entriesVerified === 1 ? 'y' : 'ies') + ' since the last checkpoint).' : '.'));
+    return F('Audit chain integrity', 'fail', 'The audit chain did not verify' + (v && v.reason ? ' (' + v.reason + ')' : '') + (v && v.brokenAt != null ? ' near id ' + v.brokenAt : '') + '.', 'Investigate the audit log; tamper-evidence has triggered.');
+  });
+  safe(baseline, 'Recent audit events', () => {
+    const c = db.prepare("SELECT COUNT(*) AS c FROM audit_log WHERE severity IN ('warning','error','critical') AND timestamp > datetime('now','-7 days')").get().c;
+    if (c > 0) return F('Recent audit events', 'warn', c + ' elevated-severity audit event(s) in the last 7 days.', 'Review the audit log for the flagged events.');
+    return F('Recent audit events', 'pass', 'No elevated-severity audit events in the last 7 days.');
+  });
+  safe(baseline, 'CISO account coverage', () => {
+    const c = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'ciso'").get().c;
+    if (c === 0) return F('CISO account coverage', 'warn', 'No CISO account is provisioned.', 'Provision at least one CISO account.');
+    return F('CISO account coverage', 'pass', c + ' CISO account(s) provisioned.');
+  });
+  safe(baseline, 'Dashboard health snapshot', () => {
+    const row = db.prepare('SELECT memory_mb, uptime_sec, connected_mcs FROM system_health ORDER BY timestamp DESC LIMIT 1').get();
+    if (!row) return F('Dashboard health snapshot', 'pass', 'Live: ' + Math.round(process.memoryUsage().rss / 1048576) + ' MB RSS, uptime ' + Math.round(process.uptime()) + 's.');
+    const parts = [];
+    if (row.memory_mb != null) parts.push(row.memory_mb + ' MB');
+    if (row.uptime_sec != null) parts.push('uptime ' + row.uptime_sec + 's');
+    if (row.connected_mcs != null) parts.push(row.connected_mcs + ' connected console(s)');
+    return F('Dashboard health snapshot', 'pass', 'Last recorded: ' + (parts.length ? parts.join(', ') + '.' : 'no snapshot fields.'));
+  });
+
+  return { findings: findings, baseline: baseline };
+}
+
+app.post('/api/troubleshoot', authMiddleware(['ciso', 'vp']), (req, res) => {
+  let db;
+  try {
+    db = getDb();
+    res.json(runGdDiagnostics(db));
+  } catch (e) {
+    res.status(500).json({ error: 'Troubleshoot failed' });
+  } finally {
+    try { if (db) db.close(); } catch (_e) { /* ignore */ }
+  }
 });
 
 // ── CISO Custom Regional Query ───────────────────────────────────────────────
