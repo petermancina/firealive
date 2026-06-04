@@ -472,8 +472,8 @@ async function start() {
       cert: tlsMaterial.cert,
       ca: tlsMaterial.ca,
       // Client certificates are REQUESTED at the TLS handshake but not REQUIRED
-      // there (rejectUnauthorized:false): when allow_password is enabled,
-      // password/LDAP-exception users must still be able to connect and then
+      // there (rejectUnauthorized:false): the WebAuthn login and first-credential
+      // enrollment paths connect without a client cert and then
       // authenticate at the app layer. Encryption itself is never optional --
       // there is no plaintext listener. mTLS client-cert AUTHENTICATION is
       // enforced in routes/auth.js, which passes the presented peer certificate
