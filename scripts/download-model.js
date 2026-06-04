@@ -112,7 +112,7 @@ function modelFiles(id) {
   return m.files.map(f => ({ ...f, path: path.join(dir, f.filename) }));
 }
 
-// Path the loader hands to node-llama-cpp (first shard for split GGUF).
+// Path the loader hands to node-llama-cpp (the model's load file).
 function resolveModelPath(id) {
   const m = MODELS[id];
   if (!m) throw new Error('unknown model: ' + id);
@@ -211,11 +211,6 @@ function provisioningInstructions(id) {
   for (const f of m.files) {
     lines.push(`  ${f.filename}  (${f.sizeApprox})`);
     lines.push(`    sha256: ${f.sha256}`);
-  }
-  if (m.files.length > 1) {
-    lines.push('');
-    lines.push(`  (Split GGUF — keep all ${m.files.length} shards together; FireAlive loads from`);
-    lines.push(`   ${m.loadFile} and verifies every shard before loading.)`);
   }
   lines.push('');
   lines.push('Then verify:  node scripts/download-model.js --model ' + id);

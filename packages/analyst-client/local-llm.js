@@ -151,7 +151,7 @@ function getStatus() {
   const embedPresent = embedModelPresent();
   return {
     modelRoot: getModelRootPath(),
-    chat: { present: chatPresent, ready: loaded.chat, loadFile: MODELS.chat.loadFile, path: getChatModelPath(), shards: MODELS.chat.files.length },
+    chat: { present: chatPresent, ready: loaded.chat, loadFile: MODELS.chat.loadFile, path: getChatModelPath() },
     embed: { present: embedPresent, ready: loaded.embed, loadFile: MODELS.embed.loadFile, path: getEmbedModelPath() },
     dim: EXPECTED_DIM,
     kbVersion: kbLocal.KB_VERSION,
