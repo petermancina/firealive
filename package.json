@@ -48,7 +48,7 @@
     "ldapts": "^8.1.8",
     "node-cron": "^4.2.1",
     "node-llama-cpp": "^3.18.1",
-    "nodemailer": "^8.0.7",
+    "nodemailer": "^8.0.10",
     "pdfkit": "^0.18.0",
     "qrcode": "^1.5.4",
     "sharp": "^0.34.5",
