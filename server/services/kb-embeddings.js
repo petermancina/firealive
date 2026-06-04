@@ -6,7 +6,7 @@
 //
 // Provides semantic retrieval over the FireAlive Research Knowledge Base
 // (server/services/research-kb.js). Loads a small, purpose-built text-embedding
-// model (Qwen3-Embedding-0.6B as a GGUF) through the SAME node-llama-cpp library the
+// model (Nomic Embed Text v1.5 as a GGUF) through the SAME node-llama-cpp library the
 // internal chat LLM uses, embeds each KB entry once, caches the vectors, and
 // answers cosine-similarity top-N queries.
 //
@@ -17,7 +17,7 @@
 // routes layer RAG (retrieve → ground an LLM → strict citation gate) on top.
 //
 // ── Model ───────────────────────────────────────────────────────────────────
-// Embedding model: Qwen3-Embedding-0.6B (1024-dim, ~639MB GGUF, official Qwen org, Apache-2.0). Purpose-built for
+// Embedding model: Nomic Embed Text v1.5 (768-dim, ~274MB GGUF, Nomic AI, Apache-2.0). Purpose-built for
 // short-text retrieval and deliberately DECOUPLED from the chat LLM — a separate
 // model, separate context, separate lifecycle. It stays inside the ruled-in
 // node-llama-cpp library (this is NOT the transformers.js path the AI/ML strategy
@@ -29,6 +29,9 @@
 // ── Embedding text ──────────────────────────────────────────────────────────
 // Each KB entry is embedded as `finding + implication + summary` joined by
 // newlines — the three FireAlive-authored fields that carry the entry's meaning.
+// Nomic Embed requires a task-instruction prefix on every input: indexed KB
+// entries use `search_document: ` and live queries use `search_query: `, so the
+// two share one vector space.
 //
 // ── Cache (kb-embeddings.json) ────────────────────────────────────────────────
 // Embedding the corpus is done once and cached, keyed by KB_VERSION + embedder id.
@@ -41,7 +44,7 @@
 // ── Idle unload ───────────────────────────────────────────────────────────────
 // Like the internal LLM, the embedding model unloads after an idle timeout to
 // free memory (FIREALIVE_EMBED_IDLE_UNLOAD_MS, default 5 minutes). The in-memory
-// vector index (tiny — 50 × 1024 floats) stays resident regardless; only the model
+// vector index (tiny — 50 × 768 floats) stays resident regardless; only the model
 // (which is only needed to embed live queries) is unloaded.
 //
 // ── Anti-hallucination note ───────────────────────────────────────────────────
@@ -52,7 +55,7 @@
 // Public API:
 //   isReady()                         -> boolean (embedding model loaded)
 //   getStatus()                       -> object for the AI/ML Integrations tab
-//   embed(text)                       -> Promise<number[]>  (1024-dim query vector)
+//   embed(text)                       -> Promise<number[]>  (768-dim query vector)
 //   cosineSimilarity(a, b)            -> number  (pure)
 //   cosineTopN(queryVec, k, index?)   -> [{ id, score }]  sorted desc, len ≤ k
 //   loadEmbeddings()                  -> index | null  (read cache; null if stale/absent)
@@ -73,10 +76,10 @@ const kb = require('./research-kb');
 
 // Default embedder filename. The exact source URL + pinned SHA-256 are wired in
 // scripts/download-model.js (verify-only manifest); this is the on-disk name we look for.
-const DEFAULT_EMBED_FILENAME = 'Qwen3-Embedding-0.6B-Q8_0.gguf';
+const DEFAULT_EMBED_FILENAME = 'nomic-embed-text-v1.5.f16.gguf';
 
-// Expected dimensionality for Qwen3-Embedding-0.6B (sanity check, not enforced).
-const EXPECTED_DIM = 1024;
+// Expected dimensionality for Nomic Embed Text v1.5 (sanity check, not enforced).
+const EXPECTED_DIM = 768;
 
 function resolveEmbedIdleUnloadMs() {
   const raw = process.env.FIREALIVE_EMBED_IDLE_UNLOAD_MS;
@@ -200,7 +203,7 @@ async function doLoadModel(modelPath) {
         const err = new Error(
           'KB embedding model failed the integrity & safety gate (' + gate.overall + '): ' +
           (gate.blockedReason || 'unknown reason') + '; refusing to load. Provision the official ' +
-          'Qwen3-Embedding-0.6B Q8_0 file and ensure a local malware scanner is available, then ' +
+          'Nomic Embed Text v1.5 F16 file and ensure a local malware scanner is available, then ' +
           'verify: node scripts/download-model.js --model embedding');
         err.code = 'KB_EMBED_UNAVAILABLE';
         err.modelSafety = { outcome: gate.overall, reason: gate.blockedReason };
@@ -248,12 +251,21 @@ function resetIdleTimer() {
 
 // ── Embedding ─────────────────────────────────────────────────────────────────
 
+// Nomic Embed task-instruction prefixes. embed() is the query entry point, so
+// bare text defaults to a search query; document callers pass 'search_document: '.
+const NOMIC_TASK_PREFIXES = ['search_query: ', 'search_document: ', 'classification: ', 'clustering: '];
+function hasNomicTaskPrefix(text) {
+  return NOMIC_TASK_PREFIXES.some(function (p) { return text.startsWith(p); });
+}
+
 async function embed(text) {
   if (typeof text !== 'string' || text.length === 0) {
     const err = new Error('embed() requires a non-empty string');
     err.code = 'KB_EMBED_FAILED';
     throw err;
   }
+  // Nomic requires a task prefix; bare text is treated as a search query.
+  const prefixed = hasNomicTaskPrefix(text) ? text : 'search_query: ' + text;
   if (!isReady()) await loadModel();
   if (!isReady()) {
     const err = new Error('KB embedding model not loaded');
@@ -263,7 +275,7 @@ async function embed(text) {
   let vector;
   try {
     // Inference runs in the isolated worker; it returns a plain number[].
-    vector = await workerHost.embed(text);
+    vector = await workerHost.embed(prefixed);
   } catch (err) {
     const wrapped = new Error('embedding inference failed: ' + (err.message || String(err)));
     wrapped.code = (err.code === 'AI_INTERNAL_UNAVAILABLE') ? 'KB_EMBED_UNAVAILABLE' : 'KB_EMBED_FAILED';
@@ -365,7 +377,7 @@ async function buildEmbeddings(opts) {
   logger.info('Building KB embeddings', { count: entries.length, embedderId: embedderId(), kbVersion: kb.KB_VERSION });
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    const vector = await embed(entryEmbeddingText(entry));
+    const vector = await embed('search_document: ' + entryEmbeddingText(entry));
     if (dim === null) dim = vector.length;
     built.push({ id: entry.id, vector });
     if (typeof opts.onProgress === 'function') {
@@ -373,7 +385,7 @@ async function buildEmbeddings(opts) {
     }
   }
   if (dim !== EXPECTED_DIM) {
-    logger.warn('KB embeddings dimension is not the expected 1024', { dim, expected: EXPECTED_DIM });
+    logger.warn('KB embeddings dimension is not the expected 768', { dim, expected: EXPECTED_DIM });
   }
 
   const cache = {
@@ -406,7 +418,7 @@ async function ensureEmbeddings() {
 // layer maps ids → enriched entries via research-kb.getByRefs().
 async function search(query, k) {
   await ensureEmbeddings();
-  const queryVec = await embed(query);
+  const queryVec = await embed('search_query: ' + query);
   return cosineTopN(queryVec, k);
 }
 

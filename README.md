@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.53 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 46 (anti-rollback)
+**Version:** v1.0.54 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 47 (anti-rollback)
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.53) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.54) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -135,7 +135,7 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **TTX Generator API (/api/ttx, 3 endpoints):** Tabletop exercise document generator. Curated scenario library producing Situation Manuals and blank After-Action Report templates in PDF and DOCX. Document structure follows HSEEP Volume IV and NIST SP 800-84 conventions.
 
-**AI Provider API (/api/ai-provider, 8 endpoints):** Unified AI dispatcher and local LLM management. Per-feature routing config (internal local LLM vs. external provider — Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom OpenAI-compatible endpoint). Status, config CRUD, model verify/load/unload, provisioning guide, recent inference log. Backed by `server/services/ai-provider.js` (dispatcher), `server/services/internal-llm.js` (node-llama-cpp wrapper, default model: Qwen2.5-14B-Instruct q4_K_M, Apache-2.0, verify-only — provisioned by the operator, never downloaded), `server/services/external-llm.js` (HTTP calls to external providers), and `scripts/download-model.js` (verify-only provisioning — verifies operator-provided files against source-pinned SHA-256s; no network). Inference audit log records token counts and metadata only — prompt and response content are NOT stored, to protect Tier-3 burnout data. The IR Simulator scenario generator (F4b) and burnout intervention message generator (N1b) route through this dispatcher. Statistical features like burnout signal detection and burnout-aware routing remain rule-based for determinism, speed, and audit clarity.
+**AI Provider API (/api/ai-provider, 8 endpoints):** Unified AI dispatcher and local LLM management. Per-feature routing config (internal local LLM vs. external provider — Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom OpenAI-compatible endpoint). Status, config CRUD, model verify/load/unload, provisioning guide, recent inference log. Backed by `server/services/ai-provider.js` (dispatcher), `server/services/internal-llm.js` (node-llama-cpp wrapper, default model: Phi-4 Q4_K, MIT, verify-only — provisioned by the operator, never downloaded), `server/services/external-llm.js` (HTTP calls to external providers), and `scripts/download-model.js` (verify-only provisioning — verifies operator-provided files against source-pinned SHA-256s; no network). Inference audit log records token counts and metadata only — prompt and response content are NOT stored, to protect Tier-3 burnout data. The IR Simulator scenario generator (F4b) and burnout intervention message generator (N1b) route through this dispatcher. Statistical features like burnout signal detection and burnout-aware routing remain rule-based for determinism, speed, and audit clarity.
 
 **AI Burnout API (/api/ai-burnout, 3 endpoints):** Read/refresh access to the precomputed burnout-message caches. Analysts retrieve their own per-signal interpretations (Tier-3, decrypted only for the owning analyst); team leads retrieve team-level intervention prompts (Tier-1 aggregate, with active conditions recomputed live) and can trigger a refresh (rate-limited and audited). No inference runs in the request path — the scheduler precomputes and caches content, and these endpoints serve fresh cached rows or an honest AI-unavailable state, never canned advice. All AI content is strictly grounded in the research KB: every citation is validated against the 42-entry KB and any off-KB reference is rejected rather than served, so a hallucinated citation cannot reach a user. Backed by `server/services/burnout-message-generator.js` (orchestration + citation gate), `server/services/research-kb.js` (authoritative KB + validator), `server/services/team-health.js` and `server/services/team-conditions.js` (server-side team-state computation), with two scheduled precompute jobs in `server/services/scheduler.js`.
 

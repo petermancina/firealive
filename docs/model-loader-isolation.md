@@ -54,7 +54,7 @@ separate sidecar container (see "Stronger isolation", below).
 | `FIREALIVE_EMBED_IDLE_UNLOAD_MS` | Idle timeout for the embedding model | `300000` |
 | `FIREALIVE_ALLOW_ROOT_MODEL_LOAD` | Set to `1` to permit loading as root in production (not recommended) | unset |
 | `FIREALIVE_MODEL_PATH` | Chat model directory (or `.gguf` path) — mount **read-only** | `~/.firealive/models` |
-| `FIREALIVE_EMBED_MODEL_PATH` | Embedding model `.gguf` path — mount **read-only** | `<model root>/Qwen3-Embedding-0.6B-Q8_0.gguf` |
+| `FIREALIVE_EMBED_MODEL_PATH` | Embedding model `.gguf` path — mount **read-only** | `<model root>/nomic-embed-text-v1.5.f16.gguf` |
 
 The worker's restart cap (5 spawns) and window (60 s) are built-in defaults in
 `model-worker-host.js`.

@@ -488,17 +488,15 @@ The model loads only if every file clears every applicable layer. The gate runs 
 
 **Loader isolation & privilege hardening:** the model loader (node-llama-cpp) parses the GGUF and runs inference in a **separate, isolated process** — a forked child on the server, an Electron utilityProcess on the Analyst Client — not in the main process. A loader or parser exploit is therefore contained in a disposable worker that the host respawns, rather than running with the main process’s reach; the gate above remains the primary control and this isolation is defence-in-depth for the residual risk. The server additionally refuses to load a model as **root** in production (set `FIREALIVE_ALLOW_ROOT_MODEL_LOAD=1` only if a constrained environment genuinely requires it), and per-request timeouts plus a restart circuit keep a wedged or crash-looping worker from degrading the service. Recommended deployment confinement — non-root user, read-only model mount, dropped Linux capabilities, a seccomp/AppArmor profile, resource limits, and no network egress from the inference service — is documented in `docs/model-loader-isolation.md`; running the worker under a separate lower-privileged identity (a sidecar container, or an in-process privilege drop) is the remaining hardening step.
 
-- **Chat model** (heavyweight; powers the server-side lead chat, burnout messages, IR simulator, and troubleshooter, and the Analyst Client’s on-device chat): **Qwen2.5-14B-Instruct, q4_K_M** (Apache-2.0), 3 official split shards, loaded from shard 1.
-  - Official source: Hugging Face `Qwen/Qwen2.5-14B-Instruct-GGUF` (pinned commit `2b6a96d780143b4e8e3b970394e39e3774551f29`) or Alibaba ModelScope (`Qwen/Qwen2.5-14B-Instruct-GGUF`, first-party).
+- **Chat model** (heavyweight; powers the server-side lead chat, burnout messages, IR simulator, and troubleshooter, and the Analyst Client’s on-device chat): **Phi-4, Q4_K** (MIT), a single official GGUF.
+  - Official source: Hugging Face `microsoft/phi-4-gguf` (pinned commit `18ece485b98ae22388ffad82ad468cc2d774f6d4`).
   - Pinned SHA-256:
-    - `qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf` (3.99 GB) — `a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68`
-    - `qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf` (3.99 GB) — `21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae`
-    - `qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf` (1.01 GB) — `c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976`
-  - Endpoint floor: ~9 GB free disk + ~10–12 GB RAM. Under-spec / thin-VDI endpoints honestly report the local chat as unavailable rather than degrading silently.
-- **Embedder** (KB retrieval, server-side and on-device): **Qwen3-Embedding-0.6B, Q8_0** (Apache-2.0, 1024-dim), single file.
-  - Official source: Hugging Face `Qwen/Qwen3-Embedding-0.6B-GGUF` (pinned commit `d20cf9c`) or Alibaba ModelScope.
-  - Pinned SHA-256: `Qwen3-Embedding-0.6B-Q8_0.gguf` (639 MB) — `06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`
-  - Endpoint floor: ~640 MB free disk.
+    - `phi-4-Q4_K.gguf` (9.05 GB) — `5652b9be0ea4ae2842130d04fe31bc869fcb99a2b7106c53b4e754a343fd688f`
+  - Endpoint floor: ~9.05 GB free disk + ~10–12 GB RAM. Under-spec / thin-VDI endpoints honestly report the local chat as unavailable rather than degrading silently.
+- **Embedder** (KB retrieval, server-side and on-device): **Nomic Embed Text v1.5, F16** (Apache-2.0, 768-dim), single file.
+  - Official source: Hugging Face `nomic-ai/nomic-embed-text-v1.5-GGUF` (pinned commit `18d1044f4866e224159fce8c6fc5c4f3920176e7`).
+  - Pinned SHA-256: `nomic-embed-text-v1.5.f16.gguf` (274 MB) — `f7af6f66802f4df86eda10fe9bbcfc75c39562bed48ef6ace719a251cf1c2fdb`
+  - Endpoint floor: ~274 MB free disk.
 
 Target directory: the server model root (default `~/.firealive/models`, override `FIREALIVE_MODEL_PATH`) and, on the Analyst Client, the AC model root (default `~/.firealive/ac-models`, override `FIREALIVE_AC_MODEL_PATH`). Both the MC **AI/ML** tab and the AC **KB Assistant** surface a “Show provisioning guide” / “Verify provisioned files” action that displays the official source, target directory, and these pinned hashes, and verifies on demand.
 
@@ -1074,7 +1072,7 @@ The KB is curated. It is not open to anyone to update — that would be an attac
 
 A research assistant lets leads and analysts ask the knowledge base questions in plain language. It retrieves the most relevant entries, answers **only** from them, and **cites every claim** — if it cannot produce a fully-cited answer, it withholds the answer rather than guessing. Cited entries appear as chips that open the KB entry (with its copiable source). It is research education — not therapy, diagnosis, or clinical advice — and when the underlying model isn’t available it says so honestly instead of inventing an answer.
 
-- **Lead KB Assistant (Management Console):** runs server-side on FireAlive’s internal heavyweight model (Qwen2.5-14B-Instruct, verify-only — provisioned by the operator, never downloaded). The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
+- **Lead KB Assistant (Management Console):** runs server-side on FireAlive’s internal heavyweight model (Phi-4, verify-only — provisioned by the operator, never downloaded). The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
 - **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst’s device** — a local model with no server round-trip. The analyst’s question and their own signals are used only as on-device grounding and **never leave the device**. The model is provisioned on the analyst’s machine by the operator and verified on load by the model-file integrity & safety gate (hash-pin → GGUF format validation → on-device malware scan, fail-closed), and FireAlive never downloads it; an endpoint that can’t run it gets an honest “unavailable on this device” rather than any server fallback (see AI/ML Integrations → Local AI model provisioning). A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
 
 ### Playbooks (SOAR Playbook / Runbook Generator)

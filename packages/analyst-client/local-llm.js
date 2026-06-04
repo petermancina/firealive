@@ -10,7 +10,7 @@
 // Tier-3 firewall (the analyst's questions and signals never leave the device).
 //
 // VERIFY-ONLY: FireAlive never downloads models. The operator provisions the
-// official files (verified Qwen org on Hugging Face, Alibaba ModelScope, or an
+// official files (the official publisher's page on Hugging Face or an
 // internal mirror) into the AC model directory; this module verifies each file
 // against a SHA-256 PINNED IN SOURCE before loading, and refuses on any mismatch
 // or absence. No network is performed here. The pinned hashes match the server
@@ -21,13 +21,13 @@
 // every entry point raises an honest AC_LOCAL_UNAVAILABLE. The renderer surfaces
 // "unavailable on this device" rather than silently reaching the server.
 //
-// Models (same official Qwen sources as the server):
-//   chat  — Qwen2.5-14B-Instruct q4_K_M (Apache-2.0), 3 official split shards
-//           (~9GB total), loaded from shard-00001. Heavyweight; the documented
-//           endpoint floor is ~9GB free disk + ~10-12GB RAM. Under-spec /
-//           thin-VDI endpoints lose the local chat (honest unavailable).
-//   embed — Qwen3-Embedding-0.6B Q8_0 (Apache-2.0, ~639MB, 1024-dim). Builds the
-//           KB vector index on-device on first use and caches it locally.
+// Models (same official sources as the server):
+//   chat  — Phi-4 Q4_K (MIT), a single official GGUF (~9.05GB), loaded
+//           directly. Heavyweight; the documented endpoint floor is
+//           ~9.05GB free disk + ~10-12GB RAM. Under-spec / thin-VDI
+//           endpoints lose the local chat (honest unavailable).
+//   embed — Nomic Embed Text v1.5 F16 (Apache-2.0, ~274MB, 768-dim). Builds
+//           the KB vector index on-device on first use and caches it locally.
 //
 // Public API:
 //   setModelRoot(dir) / getModelRootPath()
@@ -60,46 +60,39 @@ const log = {
 };
 
 // ── Model registry (pinned in source, verify-only — NO download URLs) ─────────
-// SHA-256s were read from the official Qwen pages and are pinned here. They are
+// SHA-256s were read from the official publisher pages and are pinned here. They are
 // byte-identical to the server manifest (scripts/download-model.js).
 const MODELS = {
   chat: {
-    label: 'Qwen2.5-14B-Instruct q4_K_M (Alibaba Qwen, Apache-2.0) — heavyweight on-device chat',
+    label: 'Phi-4 Q4_K (Microsoft, MIT) - heavyweight on-device chat',
     officialSource: {
-      huggingFaceRepo: 'Qwen/Qwen2.5-14B-Instruct-GGUF',
-      pinnedCommit: '2b6a96d780143b4e8e3b970394e39e3774551f29',
-      modelScope: 'Qwen/Qwen2.5-14B-Instruct-GGUF (Alibaba ModelScope, first-party)',
+      huggingFaceRepo: 'microsoft/phi-4-gguf',
+      pinnedCommit: '18ece485b98ae22388ffad82ad468cc2d774f6d4',
     },
-    // node-llama-cpp loads the split GGUF from the first shard; siblings must be
-    // present in the same directory. All shards are verified before load.
-    loadFile: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf',
+    // node-llama-cpp loads this single-file GGUF; it is verified before load.
+    loadFile: 'phi-4-Q4_K.gguf',
     files: [
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf', sizeApprox: '3.99 GB',
-        sha256: 'a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68' },
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf', sizeApprox: '3.99 GB',
-        sha256: '21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae' },
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf', sizeApprox: '1.01 GB',
-        sha256: 'c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976' },
+      { filename: 'phi-4-Q4_K.gguf', sizeApprox: '9.05 GB',
+        sha256: '5652b9be0ea4ae2842130d04fe31bc869fcb99a2b7106c53b4e754a343fd688f' },
     ],
-    endpointFloor: '~9 GB free disk + ~10-12 GB RAM',
+    endpointFloor: '~9.05 GB free disk + ~10-12 GB RAM',
   },
   embed: {
-    label: 'Qwen3-Embedding-0.6B Q8_0 (Alibaba Qwen, Apache-2.0) — 1024-dim embedder',
+    label: 'Nomic Embed Text v1.5 F16 (Nomic AI, Apache-2.0) - 768-dim embedder',
     officialSource: {
-      huggingFaceRepo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
-      pinnedCommit: 'd20cf9c',
-      modelScope: 'Qwen/Qwen3-Embedding-0.6B-GGUF (Alibaba ModelScope, first-party)',
+      huggingFaceRepo: 'nomic-ai/nomic-embed-text-v1.5-GGUF',
+      pinnedCommit: '18d1044f4866e224159fce8c6fc5c4f3920176e7',
     },
-    loadFile: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+    loadFile: 'nomic-embed-text-v1.5.f16.gguf',
     files: [
-      { filename: 'Qwen3-Embedding-0.6B-Q8_0.gguf', sizeApprox: '639 MB',
-        sha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439' },
+      { filename: 'nomic-embed-text-v1.5.f16.gguf', sizeApprox: '274 MB',
+        sha256: 'f7af6f66802f4df86eda10fe9bbcfc75c39562bed48ef6ace719a251cf1c2fdb' },
     ],
-    endpointFloor: '~640 MB free disk',
+    endpointFloor: '~274 MB free disk',
   },
 };
 
-const EXPECTED_DIM = kbLocal.EXPECTED_DIM || 1024;
+const EXPECTED_DIM = kbLocal.EXPECTED_DIM || 768;
 
 function resolveIdleUnloadMs() {
   const raw = process.env.FIREALIVE_AC_IDLE_UNLOAD_MS;
@@ -421,14 +414,23 @@ async function unloadAll() {
 }
 
 // ── Embedding + index ─────────────────────────────────────────────────────────
+// Nomic Embed task-instruction prefixes. embed() is the query entry point, so
+// bare text defaults to a search query; document callers pass 'search_document: '.
+const NOMIC_TASK_PREFIXES = ['search_query: ', 'search_document: ', 'classification: ', 'clustering: '];
+function hasNomicTaskPrefix(text) {
+  return NOMIC_TASK_PREFIXES.some(function (p) { return text.startsWith(p); });
+}
+
 async function embed(text) {
   if (typeof text !== 'string' || text.length === 0) {
     const e = new Error('embed() requires a non-empty string'); e.code = 'AC_LOCAL_FAILED'; throw e;
   }
+  // Nomic requires a task prefix; bare text is treated as a search query.
+  const prefixed = hasNomicTaskPrefix(text) ? text : 'search_query: ' + text;
   await loadEmbed();
   let vector;
   try {
-    const m = await runUtil({ t: 'embed', id: 'e', text }, (x) => x.t === 'embedding');
+    const m = await runUtil({ t: 'embed', id: 'e', text: prefixed }, (x) => x.t === 'embedding');
     vector = m.vector;
   } catch (err) {
     const e = new Error('embedding inference failed: ' + (err.message || String(err))); e.code = err.code || 'AC_LOCAL_FAILED'; throw e;
@@ -457,7 +459,7 @@ async function buildIndex(opts) {
   const built = [];
   let dim = null;
   for (let i = 0; i < entries.length; i++) {
-    const v = await embed(kbLocal.entryEmbeddingText(entries[i]));
+    const v = await embed('search_document: ' + kbLocal.entryEmbeddingText(entries[i]));
     if (dim === null) dim = v.length;
     built.push({ id: entries[i].id, vector: v });
     if (typeof opts.onProgress === 'function') opts.onProgress({ done: i + 1, total: entries.length });
@@ -482,7 +484,7 @@ async function ensureIndex() {
 
 async function search(query, k) {
   await ensureIndex();
-  const qv = await embed(query);
+  const qv = await embed('search_query: ' + query);
   return kbLocal.cosineTopN(qv, k, embeddingIndex);
 }
 

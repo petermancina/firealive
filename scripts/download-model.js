@@ -10,8 +10,8 @@
 // network calls. There is no URL on the other end for anyone to poison.
 //
 // The operator obtains the official files through their OWN vetted channel
-// (the verified Qwen org on Hugging Face, Alibaba's ModelScope, or an internal
-// mirror), places them in the model directory, and FireAlive verifies each file
+// (the official publisher's page on Hugging Face or an internal mirror),
+// places them in the model directory, and FireAlive verifies each file
 // against a SHA-256 that is PINNED IN THIS SOURCE FILE (reviewed, version-
 // controlled). A file only loads on an exact hash match; anything else is
 // refused. Because the expected hashes live in code — never supplied at runtime
@@ -21,9 +21,9 @@
 // per-file sha256 below), never a runtime input.
 //
 // Two models are provisioned (both land in the same model directory):
-//   • chat      — Qwen2.5-14B-Instruct, q4_K_M (3 split shards, ~9 GB total).
+//   • chat      — Phi-4, Q4_K (single GGUF, ~9.05 GB).
 //                 Used by the MC lead KB chat via server/services/internal-llm.js.
-//   • embedding — Qwen3-Embedding-0.6B, Q8_0 (~639 MB, 1024-dim). Used by
+//   • embedding — Nomic Embed Text v1.5, F16 (~274 MB, 768-dim). Used by
 //                 server/services/kb-embeddings.js for KB semantic retrieval.
 //
 // Usage (no network, ever):
@@ -48,7 +48,7 @@ const os = require('os');
 const crypto = require('crypto');
 
 // ── Pinned model manifest (source of truth) ──────────────────────────────────
-// Every expected SHA-256 below was read from the official Qwen pages and is
+// Every expected SHA-256 below was read from the official publisher pages and is
 // pinned here. NOTHING here is fetched. To change a model, update pinnedCommit
 // and the per-file sha256 in a reviewed commit.
 
@@ -56,44 +56,37 @@ const MODELS = {
   chat: {
     id: 'chat',
     kind: 'chat',
-    label: 'Qwen2.5-14B-Instruct q4_K_M (Alibaba Qwen, 14.7B, Apache-2.0)',
+    label: 'Phi-4 Q4_K (Microsoft, 14B, MIT)',
     officialSource: {
-      publisher: 'Qwen (Alibaba Cloud)',
-      huggingFaceRepo: 'Qwen/Qwen2.5-14B-Instruct-GGUF',
-      pinnedCommit: '2b6a96d780143b4e8e3b970394e39e3774551f29',
-      modelScope: 'Qwen/Qwen2.5-14B-Instruct-GGUF (Alibaba ModelScope, first-party)',
+      publisher: 'Microsoft',
+      huggingFaceRepo: 'microsoft/phi-4-gguf',
+      pinnedCommit: '18ece485b98ae22388ffad82ad468cc2d774f6d4',
     },
-    // node-llama-cpp loads a split GGUF from the first shard; the siblings must
-    // be present in the same directory. ALL shards are verified before load.
-    loadFile: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf',
+    // node-llama-cpp loads this single-file GGUF; it is verified before load.
+    loadFile: 'phi-4-Q4_K.gguf',
     files: [
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf', sizeApprox: '3.99 GB',
-        sha256: 'a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68' },
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf', sizeApprox: '3.99 GB',
-        sha256: '21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae' },
-      { filename: 'qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf', sizeApprox: '1.01 GB',
-        sha256: 'c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976' },
+      { filename: 'phi-4-Q4_K.gguf', sizeApprox: '9.05 GB',
+        sha256: '5652b9be0ea4ae2842130d04fe31bc869fcb99a2b7106c53b4e754a343fd688f' },
     ],
-    endpointFloor: '~9 GB free disk + ~10–12 GB RAM to run the 14B locally.',
+    endpointFloor: '~9.05 GB free disk + ~10-12 GB RAM to run the 14B locally.',
   },
   embedding: {
     id: 'embedding',
     kind: 'embedding',
-    label: 'Qwen3-Embedding-0.6B Q8_0 (Alibaba Qwen, 1024-dim, Apache-2.0)',
+    label: 'Nomic Embed Text v1.5 F16 (Nomic AI, 768-dim, Apache-2.0)',
     officialSource: {
-      publisher: 'Qwen (Alibaba Cloud)',
-      huggingFaceRepo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
-      pinnedCommit: 'd20cf9c',
-      modelScope: 'Qwen/Qwen3-Embedding-0.6B-GGUF (Alibaba ModelScope, first-party)',
+      publisher: 'Nomic AI',
+      huggingFaceRepo: 'nomic-ai/nomic-embed-text-v1.5-GGUF',
+      pinnedCommit: '18d1044f4866e224159fce8c6fc5c4f3920176e7',
     },
     // MUST match DEFAULT_EMBED_FILENAME in server/services/kb-embeddings.js and
     // the AC bundled embedder — that's where retrieval looks.
-    loadFile: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
+    loadFile: 'nomic-embed-text-v1.5.f16.gguf',
     files: [
-      { filename: 'Qwen3-Embedding-0.6B-Q8_0.gguf', sizeApprox: '639 MB',
-        sha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439' },
+      { filename: 'nomic-embed-text-v1.5.f16.gguf', sizeApprox: '274 MB',
+        sha256: 'f7af6f66802f4df86eda10fe9bbcfc75c39562bed48ef6ace719a251cf1c2fdb' },
     ],
-    endpointFloor: '~640 MB free disk; minimal RAM.',
+    endpointFloor: '~274 MB free disk; minimal RAM.',
   },
 };
 
@@ -208,9 +201,8 @@ function provisioningInstructions(id) {
   lines.push('your own vetted channel, then place them in the model directory below.');
   lines.push('');
   lines.push('Official first-party source:');
-  lines.push(`  • Hugging Face (verified Qwen org): ${m.officialSource.huggingFaceRepo}`);
+  lines.push(`  • Hugging Face (official publisher): ${m.officialSource.huggingFaceRepo}`);
   lines.push(`    pinned commit: ${m.officialSource.pinnedCommit}`);
-  lines.push(`  • Alibaba ModelScope (Qwen first-party): ${m.officialSource.modelScope}`);
   lines.push('');
   lines.push(`Model directory: ${dir}`);
   lines.push(`Endpoint floor: ${m.endpointFloor}`);
