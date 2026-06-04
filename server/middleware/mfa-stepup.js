@@ -1,154 +1,95 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Step-up MFA Middleware
+// FIREALIVE — Step-up MFA Middleware (WebAuthn)
 //
-// Wraps an individual route handler in a "must provide a fresh
-// totp_code (or recovery_code) in the request body" check, separate
-// from login-time MFA. Used to gate sensitive admin actions
-// (config-lock toggle, foreign signing-key registration, audit log
-// purges, etc.) so that even a hijacked session cannot perform them
-// without proving live access to the user's authenticator (or
-// recovery code).
+// Wraps an individual route handler in a "must present a fresh,
+// user-verified WebAuthn assertion" check, separate from login-time
+// auth. Used to gate sensitive actions (config-lock toggle, restore
+// approvals, foreign signing-key registration, audit-log purges, ...)
+// so that even a hijacked session cannot perform them without live
+// access to the user's authenticator — the operator re-proves the
+// hardware credential at the moment of the action.
+//
+// This replaces the former TOTP / recovery-code step-up. TOTP is
+// deprecated platform-wide; a phishable one-time code guarding the most
+// sensitive operations was exactly backwards (the login path is already
+// phishing-resistant). A fresh user-verified passkey assertion keeps the
+// whole stack at AAL3.
 //
 // USAGE
 //
 //   const { mfaStepUp } = require('../middleware/mfa-stepup');
 //   const { authMiddleware } = require('../middleware/auth');
 //
-//   // Default: TOTP or recovery code accepted
 //   router.post('/sensitive',
 //     authMiddleware(['admin']),
 //     mfaStepUp(),
 //     handler);
 //
-//   // Recovery codes NOT accepted (e.g. recovery-regenerate route
-//   // itself, or any other action where falling back to a recovery
-//   // code would defeat the purpose):
-//   router.post('/regenerate-recovery',
-//     authMiddleware(['admin', 'lead', 'developer', 'analyst']),
-//     mfaStepUp({ allowRecovery: false }),
-//     handler);
+// TWO-STEP PROTOCOL (the client fetches a challenge, signs it, then
+// calls the sensitive route with the assertion):
 //
-// MUST be applied AFTER an auth middleware that sets req.user. This
-// file does NOT do authentication itself; it reads req.user.id and
-// trusts the upstream auth middleware established the session.
+//   1. POST /api/mfa/stepup/options   → { options, challengeToken }
+//                                        (see routes/mfa.js)
+//   2. navigator.credentials.get(options)   → assertion
+//   3. POST <sensitive route>  with body.stepup = { challengeToken, response }
+//
+// MUST be applied AFTER an auth middleware that sets req.user. This file
+// does NOT authenticate; it reads req.user.id and re-proves the
+// credential the session belongs to.
 //
 // REQUEST CONTRACT
 //
-// Body must contain EXACTLY ONE of:
-//   { "totp_code":     "123456" }              -- 6 digits
-//   { "recovery_code": "K7QM-3RTX-W9HJ" }      -- 14-char alphanumeric
-//
-// Sending both is rejected with 400 INVALID_INPUT to prevent
-// ambiguity (and to deny attackers a way to probe both factors in a
-// single request).
+//   body.stepup = {
+//     challengeToken: "<jwt issued by /api/mfa/stepup/options>",
+//     response:       { <PublicKeyCredential assertion JSON> }
+//   }
 //
 // RESPONSE ON SUCCESS
 //
-// Calls next(). Sets req.mfaStepUp for downstream handlers and
-// audit:
-//   { method: 'totp',     step:      <verified-step>      }  -- TOTP path
-//   { method: 'recovery', remaining: <codes-left-after> }    -- recovery path
+//   Calls next(). Sets req.mfaStepUp for downstream handlers and audit:
+//     { method: 'webauthn', credentialId: <base64url credential id> }
 //
 // RESPONSE ON FAILURE
 //
-// Returns the appropriate HTTP status with body:
-//   { error: <message>, code: <stable-error-code>, detail?: <object> }
-//
-// Status mapping mirrors routes/mfa.js: 400 INVALID_INPUT, 401
-// CODE_INVALID / CODE_REPLAY / RECOVERY_CODE_INVALID, 403 NOT_ENROLLED
-// / RECOVERY_CODES_EXHAUSTED / NO_RECOVERY_CODES_GENERATED, 404
-// USER_NOT_FOUND, 409 RECOVERY_CODE_RACE, 429 LOCKED_OUT, 500
-// ENCRYPTION_NOT_CONFIGURED. The 401 MFA_STEPUP_REQUIRED status is
-// returned when neither totp_code nor recovery_code is provided.
+//   401 MFA_STEPUP_REQUIRED   no assertion supplied (client must fetch a
+//                             challenge, sign it, and resend)
+//   400 INVALID_INPUT         malformed body.stepup / assertion
+//   401 STEPUP_FAILED         unknown or foreign credential, or the
+//                             assertion failed verification (bad
+//                             signature, wrong challenge/origin/RPID,
+//                             user-verification not performed, expired or
+//                             mismatched challenge token)
+//   500 INTERNAL              middleware misconfigured / unexpected error
 //
 // AUDIT LOG
 //
-// totp.verify() and totp.consumeRecoveryCode() audit-log every
-// outcome (TOTP_VERIFY_OK / TOTP_VERIFY_FAIL / TOTP_RECOVERY_USED /
-// TOTP_RECOVERY_FAIL / etc.). The middleware does NOT add its own
-// audit row -- the global auditMiddleware in index.js writes the
-// HTTP-level entry, the totp service writes the operation-specific
-// entry, and double-logging would be noise.
+// The WebAuthn service is a pure primitive and does not log, so this
+// middleware writes the operation-level audit row for every outcome
+// (STEPUP_WEBAUTHN_OK / STEPUP_WEBAUTHN_FAILED). The global
+// auditMiddleware in index.js still writes the HTTP-level entry, and the
+// gated route records the action itself with req.mfaStepUp.method.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const totp = require('../services/totp');
+const webauthn = require('../services/webauthn');
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function totpCodeToHttpStatus(code) {
-  switch (code) {
-    case totp.CODES.INVALID_INPUT:
-      return 400;
-    case totp.CODES.USER_NOT_FOUND:
-      return 404;
-    case totp.CODES.NOT_ENROLLED:
-    case totp.CODES.RECOVERY_CODES_EXHAUSTED:
-    case totp.CODES.NO_RECOVERY_CODES_GENERATED:
-      return 403;
-    case totp.CODES.CODE_INVALID:
-    case totp.CODES.CODE_REPLAY:
-    case totp.CODES.RECOVERY_CODE_INVALID:
-      return 401;
-    case totp.CODES.RECOVERY_CODE_RACE:
-      return 409;
-    case totp.CODES.LOCKED_OUT:
-      return 429;
-    case totp.CODES.ENCRYPTION_NOT_CONFIGURED:
-      return 500;
-    default:
-      return 500;
-  }
-}
-
-function sendTotpError(res, err) {
-  const status = totpCodeToHttpStatus(err.code);
-  const body = { error: err.message, code: err.code };
-  if (err.detail !== undefined) body.detail = err.detail;
-  return res.status(status).json(body);
-}
-
-function validateTotpCode(value) {
-  if (typeof value !== 'string') return 'totp_code must be a string';
-  if (!/^\d{6}$/.test(value)) return 'totp_code must be exactly 6 digits';
-  return null;
-}
-
-function validateRecoveryCode(value) {
-  if (typeof value !== 'string') return 'recovery_code must be a string';
-  // 14-char alphanumeric hyphenated format (e.g. "K7QM-3RTX-W9HJ").
-  // The actual hash comparison happens in totp.consumeRecoveryCode;
-  // this is just a syntactic gate to reject obviously-malformed
-  // input before paying the bcrypt cost. Length-only check (1..64)
-  // matches the service's input validation; we don't enforce the
-  // exact format here so legacy formats remain consumable.
-  if (value.length === 0 || value.length > 64) return 'recovery_code must be 1-64 characters';
-  return null;
-}
+const { auditLog } = require('./audit');
 
 // ── Middleware factory ───────────────────────────────────────────────────────
 
 /**
- * Build a step-up MFA middleware with the given options.
+ * Build a step-up MFA middleware that requires a fresh, user-verified
+ * WebAuthn assertion from the acting user before the route handler runs.
  *
- * Args:
- *   options
- *     allowRecovery   boolean, default true. When false, recovery
- *                     codes are rejected with 403 RECOVERY_NOT_ALLOWED
- *                     and only totp_code is accepted. Set false on
- *                     routes where falling back to a recovery code
- *                     would defeat the security purpose (e.g. the
- *                     recovery-code regeneration endpoint itself --
- *                     consuming a recovery code to authorize
- *                     regeneration would be circular).
+ * Takes no options: there is no recovery-code fallback (recovery codes
+ * were a TOTP construct) and no relaxation knob — step-up is always a
+ * live, user-verified assertion. Account-recovery / lockout is handled
+ * by the audited break-glass flow, not by relaxing step-up.
  */
-function mfaStepUp(options = {}) {
-  const allowRecovery = (options && options.allowRecovery !== false);
-
-  return function mfaStepUpMiddleware(req, res, next) {
+function mfaStepUp() {
+  return async function mfaStepUpMiddleware(req, res, next) {
     // Auth must have run already and set req.user.
     if (!req.user || typeof req.user.id !== 'string') {
       logger.error('mfaStepUp invoked without upstream auth -- check route definition order');
@@ -158,72 +99,92 @@ function mfaStepUp(options = {}) {
       });
     }
 
-    const totpCode = req.body && req.body.totp_code;
-    const recoveryCode = req.body && req.body.recovery_code;
+    // The assertion + its challenge token travel together in body.stepup,
+    // namespaced so they never collide with the gated route's own body.
+    const stepup = req.body && req.body.stepup;
+    if (!stepup || typeof stepup !== 'object') {
+      return res.status(401).json({
+        error: 'MFA step-up required: obtain a challenge from /api/mfa/stepup/options, '
+          + 'sign it with your passkey, and resend the assertion in body.stepup',
+        code: 'MFA_STEPUP_REQUIRED',
+        accepts: ['stepup'],
+      });
+    }
 
-    // Strict: exactly one factor input must be present. Rejecting
-    // both-provided prevents an attacker from probing both factors
-    // in a single request, and rejecting neither is the standard
-    // step-up-required signal to the client.
-    if (totpCode && recoveryCode) {
+    const challengeToken = stepup.challengeToken;
+    const response = stepup.response;
+    if (typeof challengeToken !== 'string' || !challengeToken
+      || !response || typeof response !== 'object') {
       return res.status(400).json({
-        error: 'provide exactly one of totp_code or recovery_code, not both',
+        error: 'body.stepup must contain challengeToken (string) and response (assertion object)',
         code: 'INVALID_INPUT',
       });
     }
-    if (!totpCode && !recoveryCode) {
-      return res.status(401).json({
-        error: 'MFA step-up required: provide totp_code or recovery_code in the request body',
-        code: 'MFA_STEPUP_REQUIRED',
-        accepts: allowRecovery ? ['totp_code', 'recovery_code'] : ['totp_code'],
+
+    const credId = response.id || response.rawId;
+    if (!credId || typeof credId !== 'string') {
+      return res.status(400).json({
+        error: 'malformed assertion: missing credential id',
+        code: 'INVALID_INPUT',
       });
     }
 
-    // Refuse recovery codes early on routes that opt out -- before
-    // touching the DB, before incurring any bcrypt cost.
-    if (recoveryCode && !allowRecovery) {
-      return res.status(403).json({
-        error: 'this endpoint requires a TOTP code; recovery codes are not accepted',
-        code: 'RECOVERY_NOT_ALLOWED',
-      });
-    }
-
-    // Syntactic input validation. Service-level validation is the
-    // authoritative one (it generates the audit log on real
-    // failures), but checking here lets us 400 obviously-malformed
-    // input without paying the DB / bcrypt cost.
-    if (totpCode) {
-      const codeError = validateTotpCode(totpCode);
-      if (codeError) {
-        return res.status(400).json({ error: codeError, code: 'INVALID_INPUT' });
-      }
-    } else {
-      const codeError = validateRecoveryCode(recoveryCode);
-      if (codeError) {
-        return res.status(400).json({ error: codeError, code: 'INVALID_INPUT' });
-      }
-    }
-
+    const db = getDb();
     try {
-      const db = getDb();
-
-      if (totpCode) {
-        const result = totp.verify(db, req.user.id, totpCode, req.ip || null);
-        req.mfaStepUp = { method: 'totp', step: result.step };
-      } else {
-        const result = totp.consumeRecoveryCode(db, req.user.id, recoveryCode, req.ip || null);
-        req.mfaStepUp = { method: 'recovery', remaining: result.remaining };
+      // The credential must exist, belong to the acting user, and be
+      // enrolled for passwordless use. Scoping the lookup to req.user.id
+      // is the DB-level ownership check; finishStepUp additionally binds
+      // the challenge token's sub claim to the acting user, so a stolen
+      // challenge minted for someone else cannot be replayed here.
+      const cred = db.prepare(
+        'SELECT * FROM webauthn_credentials WHERE credential_id = ? AND user_id = ? AND is_passwordless = 1'
+      ).get(credId, req.user.id);
+      if (!cred) {
+        auditLog(req.user.id, 'STEPUP_WEBAUTHN_FAILED', 'unknown or foreign credential', req.ip);
+        return res.status(401).json({ error: 'step-up failed', code: 'STEPUP_FAILED' });
       }
 
+      const rp = webauthn.getRpConfig(db);
+      let verification;
+      try {
+        verification = await webauthn.finishStepUp({
+          rp,
+          response,
+          challengeToken,
+          credential: {
+            credentialId: cred.credential_id,
+            publicKey: cred.public_key,
+            counter: cred.sign_count,
+            transports: cred.transports,
+          },
+          expectedUserId: req.user.id,
+        });
+      } catch (vErr) {
+        auditLog(req.user.id, 'STEPUP_WEBAUTHN_FAILED', `err=${vErr.message}`, req.ip);
+        return res.status(401).json({ error: 'step-up failed', code: 'STEPUP_FAILED' });
+      }
+      if (!verification.verified) {
+        auditLog(req.user.id, 'STEPUP_WEBAUTHN_FAILED', 'not verified', req.ip);
+        return res.status(401).json({ error: 'step-up failed', code: 'STEPUP_FAILED' });
+      }
+
+      // Persist the new signature counter (authenticator clone detection),
+      // mirroring the login path.
+      db.prepare("UPDATE webauthn_credentials SET sign_count = ?, last_used_at = datetime('now') WHERE id = ?")
+        .run(verification.newCounter != null ? verification.newCounter : cred.sign_count, cred.id);
+
+      auditLog(req.user.id, 'STEPUP_WEBAUTHN_OK', `credentialId=${credId}`, req.ip);
+      req.mfaStepUp = { method: 'webauthn', credentialId: credId };
       return next();
     } catch (err) {
-      if (err instanceof totp.TotpError) return sendTotpError(res, err);
       logger.error('mfaStepUp middleware error', {
         userId: req.user.id,
         error: err.message,
         stack: err.stack,
       });
       return res.status(500).json({ error: 'MFA verification error', code: 'INTERNAL' });
+    } finally {
+      try { db.close(); } catch (_) { /* ignore */ }
     }
   };
 }

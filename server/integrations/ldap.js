@@ -1,15 +1,29 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — LDAP/Active Directory Integration Client
-// Provides user provisioning via LDAP/LDAPS directory sync.
-// Used by the IAM configuration wizard (iam_ldap integration type).
+// FIREALIVE — LDAP/Active Directory Integration Client (Phase B5b)
+// Provides directory-backed presence checks, LDAP authentication, and user
+// provisioning via LDAP/LDAPS.
+//
+// Built on `ldapts` (promise-based, actively maintained). The long-standing
+// `ldapjs` package has been decommissioned by its author and is no longer
+// maintained, so it is deliberately NOT used here.
 //
 // Capabilities:
-//   - Search directory for users matching group filters
-//   - Sync user attributes (name, email, groups → role mapping)
-//   - Test bind credentials and connectivity
-//   - JIT (Just-In-Time) provisioning on LDAP-authenticated login
+//   - testConnection()        verify connectivity + service-account bind
+//   - searchUsers(filter)      directory search (group/user filters)
+//   - userExists(identifier)   directory-presence check for the offboarding
+//                              detector — fail-SAFE (a directory error is never
+//                              reported as "absent")
+//   - authenticate(user, pw)   bind AS the user to verify credentials (the
+//                              allow_password LDAP login path)
+//   - syncUsers(db)            JIT provisioning / attribute sync
+//
+// Two roles in B5b: the always-available directory-presence source the
+// offboarding detector reads, and LDAP-as-auth under the off-by-default
+// allow_password exception. LDAPS (encrypted) is strongly preferred; an
+// unencrypted ldap:// bind is allowed but logged as a warning.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const { Client, InvalidCredentialsError } = require('ldapts');
 const { logger } = require('../services/logger');
 
 // ── Role Mapping from AD Groups ──────────────────────────────────────────────
@@ -20,104 +34,240 @@ const DEFAULT_GROUP_MAPPING = {
   'CN=SOC-Developers,OU=Security,DC=corp': 'developer',
 };
 
+const SEARCH_ATTRS = ['sAMAccountName', 'userPrincipalName', 'displayName', 'cn', 'mail', 'memberOf', 'objectGUID', 'entryUUID'];
+const OP_TIMEOUT_MS = 10000;
+
+// RFC 4515 filter escaping — anything user-supplied that enters a search filter
+// MUST pass through this to prevent LDAP filter injection.
+function escapeFilterValue(s) {
+  return String(s).replace(/[\\*()\u0000]/g, (c) => '\\' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+}
+
+// AD objectGUID is a 16-byte binary value; format it as the canonical GUID
+// string (AD stores the first three groups little-endian). Falls back to a
+// base64 rendering for non-16-byte values (e.g. an OpenLDAP entryUUID already
+// arriving as a string is handled separately in _mapEntry).
+function formatGuid(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length !== 16) {
+    try { return Buffer.from(buf).toString('base64'); } catch (_) { return null; }
+  }
+  const h = buf.toString('hex');
+  return [
+    h.substr(6, 2) + h.substr(4, 2) + h.substr(2, 2) + h.substr(0, 2),
+    h.substr(10, 2) + h.substr(8, 2),
+    h.substr(14, 2) + h.substr(12, 2),
+    h.substr(16, 4),
+    h.substr(20, 12),
+  ].join('-');
+}
+
+function firstValue(v) {
+  if (Array.isArray(v)) return v.length ? v[0] : null;
+  return v == null ? null : v;
+}
+
 class LdapClient {
   constructor(config) {
-    this.server = config.server;       // ldaps://ad.corp.example.com:636
-    this.baseDn = config.baseDn;       // DC=corp,DC=example,DC=com
-    this.bindDn = config.bindDn;       // CN=firealive-svc,OU=Service Accounts,DC=corp
-    this.bindPassword = config.bindPassword;
-    this.groupFilter = config.groupFilter || '(memberOf=CN=SOC-*,OU=Security,DC=corp)';
-    this.userFilter = config.userFilter || '(&(objectClass=user)(objectCategory=person))';
-    this.syncInterval = config.syncInterval || 3600; // seconds
-    this.groupMapping = config.groupMapping || DEFAULT_GROUP_MAPPING;
+    this.config = config || {};
+    this.url = this._buildUrl(this.config);
+    this.baseDn = this.config.baseDn;
+    this.bindDn = this.config.bindDn;
+    this.bindPassword = this.config.bindPassword;
+    this.groupFilter = this.config.groupFilter || '';
+    this.userFilter = this.config.userFilter || '(&(objectClass=user)(objectCategory=person))';
+    this.userIdAttr = this.config.userIdAttr || 'sAMAccountName';
+    this.syncInterval = this.config.syncInterval || 3600; // seconds
+    this.groupMapping = this.config.groupMapping || DEFAULT_GROUP_MAPPING;
     this.tlsOptions = {
-      rejectUnauthorized: config.verifyCert !== false,
-      ca: config.caCert || undefined,
+      rejectUnauthorized: this.config.verifyCert !== false,
+      ca: this.config.caCert || undefined,
     };
   }
 
-  /**
-   * Test bind credentials and connectivity.
-   * In production, this creates an actual LDAP connection and performs a bind.
-   */
+  // Accept either a full URL in `server` (ldaps://host:port) or the MC form's
+  // hostname + port + useTLS triple.
+  _buildUrl(config) {
+    const s = String(config.server || '').trim();
+    if (/^ldaps?:\/\//i.test(s)) return s;
+    const scheme = config.useTLS === false ? 'ldap' : 'ldaps';
+    const port = config.port || (scheme === 'ldaps' ? 636 : 389);
+    return `${scheme}://${s}:${port}`;
+  }
+
+  _newClient() {
+    return new Client({
+      url: this.url,
+      timeout: OP_TIMEOUT_MS,
+      connectTimeout: OP_TIMEOUT_MS,
+      tlsOptions: this.tlsOptions,
+    });
+  }
+
+  _isEncrypted() {
+    return this.url.toLowerCase().startsWith('ldaps://');
+  }
+
+  _mapEntry(e) {
+    let oid = null;
+    if (e.objectGUID) oid = formatGuid(e.objectGUID);
+    else if (e.entryUUID) oid = firstValue(e.entryUUID);
+    return {
+      dn: e.dn,
+      sAMAccountName: firstValue(e.sAMAccountName),
+      userPrincipalName: firstValue(e.userPrincipalName),
+      displayName: firstValue(e.displayName) || firstValue(e.cn),
+      mail: firstValue(e.mail),
+      memberOf: Array.isArray(e.memberOf) ? e.memberOf : (e.memberOf ? [e.memberOf] : []),
+      objectGUID: oid,
+    };
+  }
+
+  // ── Test bind credentials and connectivity ──────────────────────────────────
   async testConnection() {
+    if (!this.config.server) return { success: false, error: 'LDAP server URL required' };
+    if (!this.baseDn) return { success: false, error: 'Base DN required' };
+    if (!this.bindDn || !this.bindPassword) return { success: false, error: 'Bind credentials required' };
+
+    const encrypted = this._isEncrypted();
+    if (!encrypted) logger.warn('LDAP connection is not encrypted (use ldaps://)');
+
+    const client = this._newClient();
+    const t0 = Date.now();
     try {
-      // Validate config
-      if (!this.server) throw new Error('LDAP server URL required');
-      if (!this.baseDn) throw new Error('Base DN required');
-      if (!this.bindDn || !this.bindPassword) throw new Error('Bind credentials required');
-
-      // Check for LDAPS (encrypted)
-      const isSecure = this.server.startsWith('ldaps://');
-      if (!isSecure) {
-        logger.warn('LDAP connection is not encrypted (use ldaps://)');
-      }
-
-      // In production: const client = ldap.createClient({ url: this.server, tlsOptions: this.tlsOptions });
-      // await client.bind(this.bindDn, this.bindPassword);
-
-      return {
-        success: true,
-        server: this.server,
-        baseDn: this.baseDn,
-        encrypted: isSecure,
-        latencyMs: Math.floor(Math.random() * 80) + 30, // simulated
-      };
+      await client.bind(this.bindDn, this.bindPassword);
+      return { success: true, server: this.url, baseDn: this.baseDn, encrypted, latencyMs: Date.now() - t0 };
     } catch (err) {
-      logger.error('LDAP test failed', { server: this.server, error: err.message });
-      return { success: false, error: err.message };
+      const msg = err instanceof InvalidCredentialsError ? 'Invalid bind credentials' : (err && err.message) || 'bind failed';
+      logger.error('LDAP test failed', { server: this.url, error: msg });
+      return { success: false, encrypted, error: msg };
+    } finally {
+      try { await client.unbind(); } catch (_) { /* ignore */ }
     }
   }
 
-  /**
-   * Search directory for users matching the configured filters.
-   * Returns user objects ready for provisioning.
-   */
+  // ── Search the directory for users ──────────────────────────────────────────
   async searchUsers(filter) {
+    if (!this.bindDn || !this.bindPassword) return { success: false, error: 'Bind credentials required' };
+    const searchFilter = filter || (this.groupFilter ? `(&${this.userFilter}${this.groupFilter})` : this.userFilter);
+    const client = this._newClient();
     try {
-      const searchFilter = filter || `(&${this.userFilter}${this.groupFilter})`;
-
-      // In production: actual LDAP search
-      // const results = await client.search(this.baseDn, { scope: 'sub', filter: searchFilter, attributes: [...] });
-
-      logger.info('LDAP search', { baseDn: this.baseDn, filter: searchFilter });
-
-      return {
-        success: true,
-        users: [], // populated by actual LDAP search results
+      await client.bind(this.bindDn, this.bindPassword);
+      const { searchEntries } = await client.search(this.baseDn, {
+        scope: 'sub',
         filter: searchFilter,
-      };
+        attributes: SEARCH_ATTRS,
+        explicitBufferAttributes: ['objectGUID'],
+        sizeLimit: 1000,
+      });
+      const users = searchEntries.map((e) => this._mapEntry(e));
+      logger.info('LDAP search', { baseDn: this.baseDn, filter: searchFilter, count: users.length });
+      return { success: true, users, filter: searchFilter };
     } catch (err) {
-      logger.error('LDAP search failed', { error: err.message });
-      return { success: false, error: err.message };
+      logger.error('LDAP search failed', { error: err && err.message });
+      return { success: false, error: (err && err.message) || 'search failed' };
+    } finally {
+      try { await client.unbind(); } catch (_) { /* ignore */ }
     }
   }
 
-  /**
-   * Sync users from directory to FireAlive database.
-   * - Creates new users found in AD but not in FireAlive
-   * - Updates existing users if AD attributes changed
-   * - Deactivates FireAlive users no longer in AD groups
-   *
-   * Does NOT delete users — only deactivates (sets available = 0).
-   */
+  // ── Directory-presence check (offboarding detector) ─────────────────────────
+  // Returns { found: boolean, entry?, error? }. CRITICAL: a directory error
+  // returns found:false WITH an error field set; the offboarding detector must
+  // treat "error present" as UNKNOWN (not absent) so a transient LDAP failure
+  // can never cause a real analyst to be flagged for offboarding.
+  async userExists(identifier) {
+    if (!identifier) return { found: false };
+    if (!this.bindDn || !this.bindPassword) return { found: false, error: 'Bind credentials required' };
+    const esc = escapeFilterValue(identifier);
+    const filter = `(|(${this.userIdAttr}=${esc})(sAMAccountName=${esc})(userPrincipalName=${esc})(mail=${esc}))`;
+    const client = this._newClient();
+    try {
+      await client.bind(this.bindDn, this.bindPassword);
+      const { searchEntries } = await client.search(this.baseDn, {
+        scope: 'sub',
+        filter,
+        attributes: SEARCH_ATTRS,
+        explicitBufferAttributes: ['objectGUID'],
+        sizeLimit: 2,
+      });
+      if (!searchEntries.length) return { found: false };
+      return { found: true, entry: this._mapEntry(searchEntries[0]) };
+    } catch (err) {
+      return { found: false, error: (err && err.message) || 'search failed' };
+    } finally {
+      try { await client.unbind(); } catch (_) { /* ignore */ }
+    }
+  }
+
+  // ── Authenticate a user via LDAP bind (allow_password login path) ────────────
+  async authenticate(username, password) {
+    if (!username || !password) return { success: false, error: 'Username and password required' };
+
+    // 1. Resolve the user's DN. With a service account, search for it; without
+    //    one, fall back to a best-effort DN (works for simple flat directories).
+    let userDn = null;
+    let entry = null;
+    if (this.bindDn && this.bindPassword) {
+      const esc = escapeFilterValue(username);
+      const filter = `(|(${this.userIdAttr}=${esc})(sAMAccountName=${esc})(userPrincipalName=${esc}))`;
+      const findClient = this._newClient();
+      try {
+        await findClient.bind(this.bindDn, this.bindPassword);
+        const { searchEntries } = await findClient.search(this.baseDn, {
+          scope: 'sub',
+          filter,
+          attributes: SEARCH_ATTRS,
+          explicitBufferAttributes: ['objectGUID'],
+          sizeLimit: 2,
+        });
+        if (searchEntries.length > 1) return { success: false, error: 'Ambiguous username' };
+        if (searchEntries.length === 0) return { success: false, error: 'User not found' };
+        userDn = searchEntries[0].dn;
+        entry = this._mapEntry(searchEntries[0]);
+      } catch (err) {
+        logger.error('LDAP auth lookup failed', { error: err && err.message });
+        return { success: false, error: 'Directory lookup failed' };
+      } finally {
+        try { await findClient.unbind(); } catch (_) { /* ignore */ }
+      }
+    } else {
+      userDn = `${this.userIdAttr}=${username},${this.baseDn}`;
+    }
+
+    // 2. Bind AS the user with the supplied password — this is the credential check.
+    const userClient = this._newClient();
+    try {
+      await userClient.bind(userDn, password);
+      return { success: true, username, dn: userDn, entry };
+    } catch (err) {
+      return { success: false, error: 'Invalid LDAP credentials' };
+    } finally {
+      try { await userClient.unbind(); } catch (_) { /* ignore */ }
+    }
+  }
+
+  // ── Sync users from directory to FireAlive DB (JIT provisioning) ─────────────
+  // Creates users found in the directory, updates changed attributes. Does NOT
+  // delete or deactivate here — offboarding is surfaced (never auto-applied) by
+  // the account-review detector.
   async syncUsers(db) {
     try {
       const searchResult = await this.searchUsers();
       if (!searchResult.success) return searchResult;
 
-      let created = 0, updated = 0, deactivated = 0;
+      let created = 0;
+      let updated = 0;
 
       for (const adUser of searchResult.users) {
+        if (!adUser.objectGUID || !adUser.sAMAccountName) continue;
         const role = this._mapGroupToRole(adUser.memberOf);
         const existing = db.prepare('SELECT * FROM users WHERE external_id = ? AND auth_method = ?').get(adUser.objectGUID, 'ldap');
 
         if (!existing) {
-          // JIT provisioning
           db.prepare(`
             INSERT INTO users (username, name, role, tier, auth_method, external_id)
             VALUES (?, ?, ?, ?, 'ldap', ?)
-          `).run(adUser.sAMAccountName, adUser.displayName, role, role === 'analyst' ? 1 : null, adUser.objectGUID);
+          `).run(adUser.sAMAccountName, adUser.displayName || adUser.sAMAccountName, role, role === 'analyst' ? 1 : null, adUser.objectGUID);
           created++;
         } else if (existing.name !== adUser.displayName || existing.role !== role) {
           db.prepare('UPDATE users SET name = ?, role = ?, updated_at = datetime("now") WHERE id = ?').run(adUser.displayName, role, existing.id);
@@ -125,33 +275,17 @@ class LdapClient {
         }
       }
 
-      logger.info('LDAP sync complete', { created, updated, deactivated });
-      return { success: true, created, updated, deactivated };
+      logger.info('LDAP sync complete', { created, updated });
+      return { success: true, created, updated, deactivated: 0 };
     } catch (err) {
-      logger.error('LDAP sync failed', { error: err.message });
-      return { success: false, error: err.message };
-    }
-  }
-
-  /**
-   * Authenticate a user via LDAP bind (used during login).
-   */
-  async authenticate(username, password) {
-    try {
-      // In production: bind as the user to verify credentials
-      // const userDn = `CN=${username},${this.baseDn}`;
-      // await client.bind(userDn, password);
-
-      return { success: true, username };
-    } catch (err) {
-      return { success: false, error: 'Invalid LDAP credentials' };
+      logger.error('LDAP sync failed', { error: err && err.message });
+      return { success: false, error: err && err.message };
     }
   }
 
   // ── Group → Role Mapping ───────────────────────────────────────────────
   _mapGroupToRole(memberOfList) {
     if (!Array.isArray(memberOfList)) return 'analyst';
-
     for (const group of memberOfList) {
       for (const [pattern, role] of Object.entries(this.groupMapping)) {
         if (group.includes(pattern) || group === pattern) return role;
@@ -161,4 +295,4 @@ class LdapClient {
   }
 }
 
-module.exports = { LdapClient, DEFAULT_GROUP_MAPPING };
+module.exports = { LdapClient, DEFAULT_GROUP_MAPPING, escapeFilterValue, formatGuid };

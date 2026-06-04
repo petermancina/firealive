@@ -15,16 +15,18 @@
 //   GET  /api/config/lock     read current lock state (any
 //                              authenticated user; AC/MC use this to
 //                              render lock-state across config UI)
-//   POST /api/config/lock     toggle lock state (admin role + fresh
-//                              MFA only; body specifies action and
-//                              TOTP or recovery code)
+//   POST /api/config/lock     toggle lock state (admin role + a fresh
+//                              WebAuthn step-up assertion; body
+//                              specifies action and body.stepup)
 //
 // REQUEST SHAPE — POST
 //
 //   {
 //     "action": "lock" | "unlock",
-//     "totp_code": "123456"          // either this
-//     "recovery_code": "ABCD-EFGH-IJKL"   // or this, never both
+//     "stepup": {
+//       "challengeToken": "<jwt from POST /api/mfa/stepup/options>",
+//       "response":       { <PublicKeyCredential assertion JSON> }
+//     }
 //   }
 //
 // RESPONSE SHAPE — GET / successful POST
@@ -40,13 +42,15 @@
 // ERROR CODES
 //
 //   400 INVALID_ACTION             action neither "lock" nor "unlock"
-//   400 MISSING_MFA                neither totp_code nor recovery_code
-//                                   provided (mfaStepUp middleware
-//                                   returns this; restated here for
-//                                   completeness)
-//   400 BOTH_MFA_PROVIDED          both totp_code and recovery_code
-//                                   provided (mfaStepUp middleware)
-//   401 MFA_INVALID                wrong TOTP code or recovery code
+//   401 MFA_STEPUP_REQUIRED        no step-up assertion in body.stepup
+//                                   (mfaStepUp middleware returns this;
+//                                   the client must fetch a challenge
+//                                   from /api/mfa/stepup/options, sign
+//                                   it, and resend)
+//   400 INVALID_INPUT              malformed body.stepup / assertion
+//                                   (mfaStepUp middleware)
+//   401 STEPUP_FAILED              unknown or foreign credential, or the
+//                                   assertion failed verification
 //                                   (mfaStepUp middleware)
 //   403 INSUFFICIENT_ROLE          authenticated but role != 'admin'.
 //                                   Writes CONFIG_LOCK_BYPASS_ATTEMPT
@@ -54,16 +58,13 @@
 //   409 ALREADY_IN_STATE           lock already in requested state
 //                                   (e.g., POST action=lock when
 //                                   lock_active=1 already)
-//   429 LOCKED_OUT                 TOTP attempts exceeded (mfaStepUp
-//                                   middleware returns this via the
-//                                   auth-hardening lockout namespace)
 //   500 STATE_NOT_INITIALIZED      singleton row missing (should never
 //                                   occur post-init; defensive)
 //
 // AUDIT EVENTS
 //
-//   CONFIG_LOCK_ENABLED            successful lock; method=totp|recovery
-//   CONFIG_LOCK_DISABLED           successful unlock; method=totp|recovery
+//   CONFIG_LOCK_ENABLED            successful lock; method=webauthn
+//   CONFIG_LOCK_DISABLED           successful unlock; method=webauthn
 //   CONFIG_LOCK_BYPASS_ATTEMPT     non-admin attempted POST
 //
 // SoD NOTE
@@ -88,8 +89,8 @@ const { logger } = require('../services/logger');
 // ── Inline role gate ────────────────────────────────────────────────────────
 //
 // Sits between authMiddleware and mfaStepUp in the chain so that:
-//   1. Non-admin requests are refused before any TOTP processing,
-//      eliminating a TOTP-probing surface for non-admin accounts.
+//   1. Non-admin requests are refused before any step-up processing,
+//      eliminating a credential-probing surface for non-admin accounts.
 //   2. The refusal emits CONFIG_LOCK_BYPASS_ATTEMPT to the audit log,
 //      not just a logger.warn (authMiddleware's role gate emits only
 //      logger.warn; for this SOC-grade event we want the structured
@@ -162,18 +163,17 @@ router.get('/lock', authMiddleware(), (req, res) => {
 
 // ── POST /api/config/lock ───────────────────────────────────────────────────
 //
-// Toggle lock state. Admin role + fresh MFA (TOTP or single-use
-// recovery code) both required. Middleware chain:
+// Toggle lock state. Admin role + a fresh user-verified WebAuthn
+// step-up assertion both required. Middleware chain:
 //
 //   1. authMiddleware()         -- require any authenticated user
 //   2. adminOnlyWithAudit       -- require role='admin', emit
 //                                   CONFIG_LOCK_BYPASS_ATTEMPT on
 //                                   role mismatch
-//   3. mfaStepUp({allowRecovery: true})  -- require fresh TOTP or
-//                                            single-use recovery
-//                                            code; sets
-//                                            req.mfaStepUp.method
-//                                            on success
+//   3. mfaStepUp()              -- require a fresh user-verified
+//                                   WebAuthn assertion (body.stepup);
+//                                   sets req.mfaStepUp.method
+//                                   ('webauthn') on success
 //   4. handler                  -- perform state transition + audit
 //                                   log + return updated state
 //
@@ -185,7 +185,7 @@ router.get('/lock', authMiddleware(), (req, res) => {
 router.post('/lock',
   authMiddleware(),
   adminOnlyWithAudit,
-  mfaStepUp({ allowRecovery: true }),
+  mfaStepUp(),
   (req, res) => {
     const { action } = req.body || {};
 

@@ -29,8 +29,12 @@
 //                               box round-trips; CSPRNG presence
 //                               implied by the round-trips
 //   3. Auth                  — JWT_SECRET configured, api_keys and
-//                               mfa_consumed_jtis present, TOTP
-//                               recovery code columns present
+//                               mfa_consumed_jtis present; passwordless
+//                               PKI + WebAuthn: a CA issue/verify/revoke/
+//                               CRL round-trip, WebAuthn + step-up wiring,
+//                               break-glass recovery, LDAP directory
+//                               helpers, and passwordless-only enforcement
+//                               (no password login endpoint)
 //   4. Anti-rollback         — Fuse counter row exists in
 //                               system_meta and matches package.json
 //   5. Integrations          — integration_config rows parseable,
@@ -279,30 +283,11 @@ class RegressionRunner {
     await check('auth', 'api_keys + mfa_consumed_jtis tables', () => {
       return requireAll(['api_keys', 'mfa_consumed_jtis']);
     });
-    await check('auth', 'TOTP recovery code columns', () => {
-      const hasHashed = columnExists('users', 'totp_recovery_codes_hashed');
-      const hasRem    = columnExists('users', 'totp_recovery_codes_remaining');
-      if (!hasHashed || !hasRem) {
-        throw new Error(
-          'missing column(s): ' +
-            [!hasHashed && 'totp_recovery_codes_hashed', !hasRem && 'totp_recovery_codes_remaining']
-              .filter(Boolean)
-              .join(', ')
-        );
-      }
-      return 'both recovery columns present';
-    });
-    await check('auth', 'Auth flow round-trip (bcrypt + JWT + TOTP)', () => {
-      // Exercises the real auth primitives with throwaway values (no DB,
-      // no side effects): password hash/verify, JWT HS256 sign/verify
-      // (using the install secret when present), and TOTP generate/verify.
-      const bcrypt = require('bcryptjs');
+    await check('auth', 'JWT session round-trip (HS256 sign / verify / tamper-reject)', () => {
+      // Passwordless system: the only login-time secret exercised here is the
+      // JWT session token. There is no password hash and no TOTP — those
+      // primitives were removed, so they are no longer tested.
       const jwt = require('jsonwebtoken');
-      const speakeasy = require('speakeasy');
-      const pw = 'rt-' + crypto.randomBytes(8).toString('hex');
-      const hash = bcrypt.hashSync(pw, 10);
-      if (!bcrypt.compareSync(pw, hash)) throw new Error('bcrypt failed to verify the correct password');
-      if (bcrypt.compareSync(pw + 'x', hash)) throw new Error('bcrypt accepted a wrong password');
       const secret = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
       const token = jwt.sign({ sub: 'regression', t: Date.now() }, secret, { algorithm: 'HS256', expiresIn: '60s' });
       const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });
@@ -310,12 +295,92 @@ class RegressionRunner {
       let rejected = false;
       try { jwt.verify(token, secret + 'tamper', { algorithms: ['HS256'] }); } catch (_e) { rejected = true; }
       if (!rejected) throw new Error('JWT verify accepted a wrong secret');
-      const totpSecret = speakeasy.generateSecret({ length: 20 }).base32;
-      const otp = speakeasy.totp({ secret: totpSecret, encoding: 'base32' });
-      if (!speakeasy.totp.verify({ secret: totpSecret, encoding: 'base32', token: otp, window: 1 })) {
-        throw new Error('TOTP did not verify a freshly generated code');
+      return 'JWT(HS256) sign / verify / tamper-reject ok';
+    });
+    await check('auth', 'Passwordless-only enforcement (no password login endpoint)', () => {
+      // The auth router must expose the passwordless entry points and must NOT
+      // expose any password / LDAP-password / TOTP login route. Inspect the
+      // router's registered paths directly.
+      let router;
+      try { router = require('../routes/auth'); } catch (e) { throw new Error('cannot load auth router: ' + e.message); }
+      const paths = new Set(
+        (router && router.stack ? router.stack : [])
+          .filter(l => l && l.route && l.route.path)
+          .map(l => l.route.path)
+      );
+      const required = ['/login-cert', '/login-webauthn/options', '/login-webauthn/verify'];
+      const missing = required.filter(p => !paths.has(p));
+      if (missing.length) throw new Error('missing passwordless login route(s): ' + missing.join(', '));
+      const forbidden = ['/login', '/login-ldap', '/login-mfa', '/login-enroll-start', '/login-enroll-confirm'];
+      const present = forbidden.filter(p => paths.has(p));
+      if (present.length) throw new Error('password / TOTP login route(s) still present: ' + present.join(', '));
+      return 'cert + passkey login present; no password / LDAP / TOTP login route';
+    });
+    await check('auth', 'CA issue / verify / revoke / CRL round-trip', () => {
+      // Real openssl-backed CA round-trip against a throwaway in-memory clone:
+      // the CA key lives in the DB, so a fresh clone gets its own CA, and
+      // openssl scratch goes to a temp dir. No live CA state is touched.
+      const ca = require('./ca');
+      const { execFileSync } = require('child_process');
+      const os = require('os'); const fsx = require('fs'); const pathx = require('path');
+      const mem = cloneLiveSchema(this.db);
+      const init = ca.initCa(mem);
+      if (!init || !init.caCertPem) throw new Error('CA did not initialize');
+      const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'rr-ca-'));
+      try {
+        const keyP = pathx.join(dir, 'c.key'); const csrP = pathx.join(dir, 'c.csr');
+        execFileSync('openssl', ['genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', keyP], { stdio: 'ignore' });
+        execFileSync('openssl', ['req', '-new', '-key', keyP, '-subj', '/CN=regression-client', '-out', csrP], { stdio: 'ignore' });
+        const csrPem = fsx.readFileSync(csrP, 'utf8');
+        const issued = ca.issueClientCert(mem, { csrPem, commonName: 'regression-client', externalId: 'rr-' + crypto.randomBytes(4).toString('hex') });
+        if (!issued || !issued.certPem || !issued.serial) throw new Error('issueClientCert returned no cert/serial');
+        const v1 = ca.verifyClientCert(mem, issued.certPem);
+        if (!v1 || !v1.valid) throw new Error('freshly issued cert failed to verify: ' + (v1 && v1.reason));
+        ca.revokeCert(mem, { serial: issued.serial, reason: 'regression' });
+        const v2 = ca.verifyClientCert(mem, issued.certPem);
+        if (!v2 || v2.valid) throw new Error('revoked cert still verified as valid');
+        if (v2.reason !== 'revoked') throw new Error('expected reason "revoked", got "' + v2.reason + '"');
+        const crl = ca.buildRevocationList(mem);
+        const inCrl = crl && Array.isArray(crl.revoked) && crl.revoked.some(r => r.serial === issued.serial);
+        if (!inCrl) throw new Error('revoked serial not present in CRL');
+        if (!crl.signature) throw new Error('CRL is not signed');
+        return 'issue -> verify(valid) -> revoke -> verify(revoked) -> CRL(signed, serial present) ok';
+      } finally {
+        try { fsx.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
       }
-      return 'bcrypt + JWT(HS256) + TOTP round-trips ok';
+    });
+    await check('auth', 'Break-glass recovery credential (verify correct / reject wrong)', () => {
+      // Against a clone: mint the one-time recovery credential, confirm the
+      // correct secret verifies and a wrong one does not (timing-safe).
+      const ca = require('./ca');
+      const mem = cloneLiveSchema(this.db);
+      const r = ca.ensureRecoveryCredential(mem);
+      if (!r || !r.recoveryCredential) throw new Error('recovery credential was not minted on a fresh authority');
+      if (!ca.verifyRecoveryCredential(mem, r.recoveryCredential)) throw new Error('correct recovery credential failed to verify');
+      if (ca.verifyRecoveryCredential(mem, r.recoveryCredential + 'x')) throw new Error('a wrong recovery credential verified');
+      return 'recovery credential mint + verify(correct) + reject(wrong) ok';
+    });
+    await check('auth', 'WebAuthn subsystem present (registration / authentication / step-up)', () => {
+      let wa;
+      try { wa = require('./webauthn'); } catch (e) { throw new Error('cannot load webauthn service: ' + e.message); }
+      const need = ['beginRegistration', 'finishRegistration', 'beginAuthentication', 'finishAuthentication', 'beginStepUp', 'finishStepUp'];
+      const missing = need.filter(f => typeof wa[f] !== 'function');
+      if (missing.length) throw new Error('missing webauthn fn(s): ' + missing.join(', '));
+      if (!tableExists('webauthn_credentials')) throw new Error('missing table webauthn_credentials');
+      return 'registration + authentication + step-up wired; webauthn_credentials present';
+    });
+    await check('auth', 'LDAP directory helpers (filter-escape + group mapping)', () => {
+      // The directory layer is used for offboarding presence, not for
+      // authentication. Exercise the injection-safe filter escaper and the
+      // default group map; a live bind is not attempted (no directory here).
+      let ldap;
+      try { ldap = require('../integrations/ldap'); } catch (e) { throw new Error('cannot load ldap integration: ' + e.message); }
+      if (typeof ldap.escapeFilterValue !== 'function') throw new Error('escapeFilterValue missing');
+      const esc = ldap.escapeFilterValue('*()\\');
+      if (esc === '*()\\' || esc.indexOf('\\') === -1) throw new Error('LDAP filter value not escaped: ' + esc);
+      if (typeof ldap.LdapClient !== 'function') throw new Error('LdapClient missing');
+      if (!ldap.DEFAULT_GROUP_MAPPING || typeof ldap.DEFAULT_GROUP_MAPPING !== 'object') throw new Error('DEFAULT_GROUP_MAPPING missing');
+      return 'filter-escape + group mapping present (directory-only; bind not exercised)';
     });
 
     // ── Category: IAM ──────────────────────────────────────────────

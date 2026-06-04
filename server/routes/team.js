@@ -49,7 +49,6 @@ router.post('/provision', (req, res) => {
     return res.status(400).json({ error: 'name, username, tier, and shift are required' });
   }
 
-  const bcrypt = require('bcryptjs');
   const crypto = require('crypto');
   const db = getDb();
 
@@ -60,25 +59,38 @@ router.post('/provision', (req, res) => {
     return res.status(409).json({ error: 'Username already exists' });
   }
 
-  const tempPassword = crypto.randomBytes(12).toString('base64url');
   const id = crypto.randomBytes(16).toString('hex');
   const activationId = 'SCR-' + crypto.randomBytes(6).toString('hex').toUpperCase();
 
+  // Passwordless-first: no password is set. The analyst enrolls a passkey by
+  // redeeming the enrollment token minted below.
   db.prepare(
-    'INSERT INTO users (id, username, password_hash, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, username, bcrypt.hashSync(tempPassword, 10), 'analyst', name, tier, shift);
+    'INSERT INTO users (id, username, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, username, 'analyst', name, tier, shift);
 
   db.prepare(
     'INSERT INTO routing_caps (analyst_id, max_complexity) VALUES (?, ?)'
   ).run(id, tier === 3 ? 5 : tier === 2 ? 3 : 2);
+
+  // Mint a single-use enrollment token (SHA-256 hash at rest; plaintext shown
+  // once). The analyst redeems it to enroll their first passkey. Expiry is
+  // stored in SQLite datetime format so it compares correctly at redemption.
+  const enrollmentToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = crypto.createHash('sha256').update(enrollmentToken).digest('hex');
+  db.prepare(
+    "INSERT INTO enrollment_tokens (user_id, token_hash, expires_at, created_by, scope) VALUES (?, ?, datetime('now', '+7 days'), ?, 'first-credential')"
+  ).run(id, tokenHash, req.user.id);
 
   db.close();
 
   auditLog(req.user.id, 'ANALYST_PROVISIONED', `${name} · L${tier} · ${shift} · ${activationId}`, req.ip);
 
   res.status(201).json({
-    id, name, username, tier, shift, activationId, tempPassword,
-    message: 'Analyst provisioned. Provide the temporary password securely — it must be changed on first login.',
+    id, name, username, tier, shift, activationId,
+    enrollmentToken,
+    enrollmentExpiresInDays: 7,
+    enrollEndpoint: '/api/auth/enroll/passkey/options',
+    message: 'Analyst provisioned. Provide the enrollment token securely — the analyst redeems it once to enroll their first passkey. It expires in 7 days and can be used only once.',
   });
 });
 

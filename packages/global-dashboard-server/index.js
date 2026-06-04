@@ -16,8 +16,10 @@ const cors = require('cors');
 const compression = require('compression');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const { getDb, initDb, DB_PATH } = require('./db-init');
+const https = require('https');
+const gdCa = require('./services/gd-ca');
+const gdWebauthn = require('./services/gd-webauthn');
 const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
 const cloudIacBundle = require('./services/cloud-iac-bundle');
@@ -161,47 +163,288 @@ app.get('/api/health', (req, res) => {
 });
 
 // ── Authentication ───────────────────────────────────────────────────────────
-app.post('/api/auth/login', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// B5b — Passwordless authentication (mutual-TLS client cert + FIDO2/WebAuthn)
+//
+// The Global Dashboard is the CISO's console and the platform's most privileged
+// realm, so it is PASSWORDLESS-ONLY: the only ways in are a mutual-TLS client
+// certificate (verified against the GD's own CA) or a FIDO2/WebAuthn passkey
+// with user verification — both AAL3 and MFA-complete on their own, so the GD is
+// always-MFA by construction. Unlike the management console, there is no
+// password login and no allow_password exception here. First-credential
+// bootstrap is gated on the one-time break-glass recovery credential shown at CA
+// initialization.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Verify the TLS peer certificate against the GD's own CA (chain + validity +
+// local revocation). The GD has no plaintext listener; a presented client cert
+// is verified here at the app layer.
+function verifyGdPeerCertificate(req, db) {
+  const sock = req && req.socket;
+  const peer = sock && typeof sock.getPeerCertificate === 'function' ? sock.getPeerCertificate() : null;
+  if (!peer || !peer.raw || Object.keys(peer).length === 0) return { valid: false, reason: 'no_client_cert' };
+  let pem;
+  try { pem = new crypto.X509Certificate(peer.raw).toString(); }
+  catch (_) { return { valid: false, reason: 'parse_error' }; }
+  return gdCa.verifyClientCert(db, pem);
+}
+
+// Issue a GD session for a passwordless login. A cert or a user-verifying passkey
+// is MFA-complete, so there is no second-factor bridge — the GD is always-MFA by
+// virtue of the method itself.
+function gdIssuePasswordlessSession(db, user, req, method) {
+  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '8h' });
+  db.prepare("INSERT INTO auth_log (username, action, ip, method) VALUES (?, 'LOGIN_SUCCESS', ?, ?)").run(user.username, req.ip, method);
+  db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(user.id);
+  try { appendGdAuditEntry(db, { userId: user.id, eventType: 'LOGIN_SUCCESS', detail: `user=${user.username} role=${user.role} method=${method} aal=high`, ip: req.ip, severity: 'info' }); } catch (_) { /* audit best-effort */ }
+  return { token, user: { id: user.id, name: user.name, role: user.role } };
+}
+
+// Gate first-credential bootstrap enrollment on the break-glass recovery
+// credential plus a target operator who holds a privileged GD role. Returns the
+// user row, or an error descriptor.
+function gdResolveEnrollmentTarget(db, body) {
+  const cred = body && body.recoveryCredential;
+  const username = body && body.username;
+  if (!cred || !username) return { ok: false, status: 400, error: 'recoveryCredential and username required' };
+  if (!gdCa.verifyRecoveryCredential(db, cred)) return { ok: false, status: 401, error: 'invalid recovery credential' };
+  const user = db.prepare("SELECT * FROM users WHERE username = ? AND role IN ('ciso','vp')").get(username);
+  if (!user) return { ok: false, status: 404, error: 'no privileged GD operator with that username' };
+  return { ok: true, user };
+}
+
+// ── POST /api/auth/login-cert — passwordless mutual-TLS login ────────────────
+app.post('/api/auth/login-cert', (req, res) => {
+  const db = getDb();
   try {
-    const { username, password } = req.body;
-    const db = getDb();
-    const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+    const result = verifyGdPeerCertificate(req, db);
+    if (!result.valid) {
+      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (NULL, 'LOGIN_CERT_FAILED', ?, ?)").run(req.ip, result.reason || 'unknown');
+      return res.status(401).json({ error: 'client certificate not accepted', reason: result.reason });
+    }
+    const user = result.userId ? db.prepare('SELECT * FROM users WHERE id = ?').get(result.userId) : null;
     if (!user) {
-      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_FAILED', ?, 'User not found')").run(username, req.ip);
-      db.close();
-      return res.status(401).json({ error: 'Invalid credentials' });
+      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (NULL, 'LOGIN_CERT_NO_USER', ?, 'cert valid, no matching user')").run(req.ip);
+      return res.status(401).json({ error: 'certificate valid but no matching user' });
     }
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_FAILED', ?, 'Wrong password')").run(username, req.ip);
-      db.close();
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    if (user.mfa_enabled) {
-      db.close();
-      return res.json({ requireMFA: true, userId: user.id });
-    }
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '8h' });
-    db.prepare("INSERT INTO auth_log (username, action, ip, method) VALUES (?, 'LOGIN_SUCCESS', ?, 'password')").run(username, req.ip);
-    db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(user.id);
-    db.close();
-    res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
-  } catch (e) { res.status(500).json({ error: 'Authentication failed' }); }
+    return res.json(gdIssuePasswordlessSession(db, user, req, 'cert'));
+  } catch (e) { return res.status(500).json({ error: 'Authentication error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
 });
 
-app.post('/api/auth/mfa-verify', (req, res) => {
+// ── POST /api/auth/login-webauthn/options — passkey assertion options ────────
+app.post('/api/auth/login-webauthn/options', async (req, res) => {
+  const db = getDb();
   try {
-    const { userId, code } = req.body;
-    // In production: verify TOTP code against user's mfa_secret
-    if (!code || code.length < 6) return res.status(400).json({ error: 'Invalid MFA code' });
-    const db = getDb();
-    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
-    if (!user) { db.close(); return res.status(404).json({ error: 'User not found' }); }
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '8h' });
-    db.prepare("INSERT INTO auth_log (username, action, ip, method) VALUES (?, 'LOGIN_SUCCESS', ?, 'password+mfa')").run(user.username, req.ip);
-    db.close();
-    res.json({ token, user: { id: user.id, name: user.name, role: user.role } });
-  } catch (e) { res.status(500).json({ error: 'MFA verification failed' }); }
+    const rp = gdWebauthn.getRpConfig(db);
+    let allowCredentials = [];
+    const username = req.body && req.body.username;
+    if (username) {
+      const u = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+      if (u) allowCredentials = db.prepare('SELECT credential_id AS credentialId, transports FROM webauthn_credentials WHERE user_id = ? AND is_passwordless = 1').all(u.id);
+    }
+    const { options, challengeToken } = await gdWebauthn.beginAuthentication({ rp, allowCredentials, userVerification: 'required' });
+    return res.json({ options, challengeToken });
+  } catch (e) { return res.status(500).json({ error: 'could not start passkey authentication' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// ── POST /api/auth/login-webauthn/verify — verify passkey assertion ──────────
+app.post('/api/auth/login-webauthn/verify', async (req, res) => {
+  const db = getDb();
+  try {
+    const body = req.body || {};
+    if (!body.response || !body.challengeToken) return res.status(400).json({ error: 'response and challengeToken required' });
+    const credId = body.response.id || body.response.rawId;
+    if (!credId) return res.status(400).json({ error: 'malformed assertion' });
+    const cred = db.prepare('SELECT * FROM webauthn_credentials WHERE credential_id = ?').get(credId);
+    if (!cred) return res.status(401).json({ error: 'unknown credential' });
+    const rp = gdWebauthn.getRpConfig(db);
+    let verification;
+    try {
+      verification = await gdWebauthn.finishAuthentication({
+        rp, response: body.response, challengeToken: body.challengeToken,
+        credential: { credentialId: cred.credential_id, publicKey: cred.public_key, counter: cred.sign_count, transports: cred.transports },
+        requireUserVerification: true,
+      });
+    } catch (vErr) { return res.status(401).json({ error: 'passkey verification failed' }); }
+    if (!verification.verified) return res.status(401).json({ error: 'passkey verification failed' });
+    db.prepare("UPDATE webauthn_credentials SET sign_count = ?, last_used_at = datetime('now') WHERE id = ?")
+      .run(verification.newCounter != null ? verification.newCounter : cred.sign_count, cred.id);
+    if (cred.is_passwordless !== 1) return res.status(403).json({ error: 'this passkey is not enrolled for passwordless login' });
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(cred.user_id);
+    if (!user) return res.status(401).json({ error: 'user no longer exists' });
+    return res.json(gdIssuePasswordlessSession(db, user, req, 'webauthn'));
+  } catch (e) { return res.status(500).json({ error: 'Authentication error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// ── POST /api/auth/enroll/cert — break-glass first-cert bootstrap ────────────
+app.post('/api/auth/enroll/cert', (req, res) => {
+  const db = getDb();
+  try {
+    const auth = gdResolveEnrollmentTarget(db, req.body);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const body = req.body || {};
+    if (!body.csrPem || typeof body.csrPem !== 'string') return res.status(400).json({ error: 'csrPem (PEM string) required' });
+    let issued;
+    try { issued = gdCa.issueClientCert(db, { csrPem: body.csrPem, userId: auth.user.id }); }
+    catch (cErr) { return res.status(400).json({ error: 'certificate issuance failed', detail: cErr.message }); }
+    try { appendGdAuditEntry(db, { userId: auth.user.id, eventType: 'ENROLL_CERT_BREAKGLASS', detail: `user=${auth.user.username} serial=${issued.serial}`, ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+    return res.status(201).json({ enrolled: true, certPem: issued.certPem, serial: issued.serial, fingerprint256: issued.fingerprint256, caCertPem: issued.caCertPem });
+  } catch (e) { return res.status(500).json({ error: 'enrollment error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// ── POST /api/auth/enroll/passkey/options — break-glass first-passkey bootstrap ─
+app.post('/api/auth/enroll/passkey/options', async (req, res) => {
+  const db = getDb();
+  try {
+    const auth = gdResolveEnrollmentTarget(db, req.body);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const rp = gdWebauthn.getRpConfig(db);
+    const existing = db.prepare('SELECT credential_id AS credentialId, transports FROM webauthn_credentials WHERE user_id = ?').all(auth.user.id);
+    const { options, challengeToken } = await gdWebauthn.beginRegistration({ rp, userId: auth.user.id, userName: auth.user.username, existingCredentials: existing, residentKey: 'required', userVerification: 'required' });
+    return res.json({ options, challengeToken });
+  } catch (e) { return res.status(500).json({ error: 'could not start passkey enrollment' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// ── POST /api/auth/enroll/passkey/verify — break-glass first-passkey bootstrap ─
+app.post('/api/auth/enroll/passkey/verify', async (req, res) => {
+  const db = getDb();
+  try {
+    const auth = gdResolveEnrollmentTarget(db, req.body);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const body = req.body || {};
+    if (!body.response || !body.challengeToken) return res.status(400).json({ error: 'response and challengeToken required' });
+    const rp = gdWebauthn.getRpConfig(db);
+    let result;
+    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true }); }
+    catch (vErr) { return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message }); }
+    if (!result.verified || !result.credential) return res.status(400).json({ error: 'passkey verification failed' });
+    const c = result.credential;
+    try {
+      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless) VALUES (?, ?, ?, ?, ?, ?, 1)")
+        .run(auth.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null);
+    } catch (dbErr) {
+      if (/UNIQUE|constraint/i.test(dbErr.message)) return res.status(409).json({ error: 'this authenticator is already enrolled' });
+      throw dbErr;
+    }
+    try { appendGdAuditEntry(db, { userId: auth.user.id, eventType: 'ENROLL_PASSKEY_BREAKGLASS', detail: `user=${auth.user.username} cred=${String(c.credentialId).slice(0, 12)}…`, ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+    return res.status(201).json({ enrolled: true, passwordless: true, credential_id: c.credentialId });
+  } catch (e) { return res.status(500).json({ error: 'enrollment error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// ── Self-service credential management (authenticated CISO / VP) ─────────────
+// Passwordless self-service for the calling operator: enroll / list / remove
+// passkeys and view / revoke their own client certificates. Every route is
+// scoped to req.user.id server-side and never accepts a user_id. Mirrors the
+// MC's server/routes/mfa.js, built on gd-webauthn and gd-ca. There is no TOTP.
+//
+//   POST   /api/mfa/passkey/register-options  -> { options, challengeToken }
+//   POST   /api/mfa/passkey/register-verify   { response, challengeToken, label? }
+//   GET    /api/mfa/passkeys                   -> { passkeys }
+//   DELETE /api/mfa/passkeys/:id               -> { removed }   (last-credential-guarded)
+//   GET    /api/mfa/certs                       -> { certs }
+//   POST   /api/mfa/certs/revoke               { serial, reason? } -> { revoked, serial }
+
+// Count an operator's remaining login credentials, optionally excluding one
+// passkey row id: passwordless passkeys + active client certificates. Used to
+// refuse removing the operator's last way in.
+function gdCountLoginMethodsExcluding(db, userId, excludePasskeyId) {
+  const pk = db.prepare(
+    "SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ? AND is_passwordless = 1 AND id != ?"
+  ).get(userId, excludePasskeyId || '');
+  const cert = db.prepare(
+    "SELECT COUNT(*) AS c FROM issued_certs WHERE user_id = ? AND status = 'active'"
+  ).get(userId);
+  return (pk.c || 0) + (cert.c || 0);
+}
+
+app.post('/api/mfa/passkey/register-options', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const db = getDb();
+  try {
+    const rp = gdWebauthn.getRpConfig(db);
+    const existing = db.prepare('SELECT credential_id AS credentialId, transports FROM webauthn_credentials WHERE user_id = ?').all(req.user.id);
+    const { options, challengeToken } = await gdWebauthn.beginRegistration({ rp, userId: req.user.id, userName: req.user.username, existingCredentials: existing, residentKey: 'required', userVerification: 'required' });
+    return res.json({ options, challengeToken });
+  } catch (e) { return res.status(500).json({ error: 'could not start passkey enrollment' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+app.post('/api/mfa/passkey/register-verify', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const db = getDb();
+  try {
+    const body = req.body || {};
+    if (!body.response || !body.challengeToken) return res.status(400).json({ error: 'response and challengeToken required' });
+    const rp = gdWebauthn.getRpConfig(db);
+    let result;
+    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true }); }
+    catch (vErr) { return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message }); }
+    if (!result.verified || !result.credential) return res.status(400).json({ error: 'passkey verification failed' });
+    const c = result.credential;
+    try {
+      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless) VALUES (?, ?, ?, ?, ?, ?, 1)")
+        .run(req.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null);
+    } catch (dbErr) {
+      if (/UNIQUE|constraint/i.test(dbErr.message)) return res.status(409).json({ error: 'this authenticator is already enrolled' });
+      throw dbErr;
+    }
+    try { appendGdAuditEntry(db, { userId: req.user.id, eventType: 'WEBAUTHN_PASSKEY_ENROLLED', detail: `cred=${String(c.credentialId).slice(0, 12)}\u2026`, ip: req.ip, severity: 'info' }); } catch (_) { /* best-effort */ }
+    return res.status(201).json({ registered: true, passwordless: true, credential_id: c.credentialId });
+  } catch (e) { return res.status(500).json({ error: 'enrollment error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+app.get('/api/mfa/passkeys', authMiddleware(['ciso', 'vp']), (req, res) => {
+  const db = getDb();
+  try {
+    const rows = db.prepare('SELECT id, credential_id, is_passwordless, aaguid, created_at, last_used_at FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id);
+    return res.json({ passkeys: rows });
+  } catch (e) { return res.status(500).json({ error: 'internal error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+app.delete('/api/mfa/passkeys/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
+  const db = getDb();
+  try {
+    const id = req.params.id;
+    const cred = db.prepare('SELECT id, credential_id FROM webauthn_credentials WHERE id = ? AND user_id = ?').get(id, req.user.id);
+    if (!cred) return res.status(404).json({ error: 'passkey not found' });
+    if (gdCountLoginMethodsExcluding(db, req.user.id, id) === 0) {
+      return res.status(409).json({ error: 'cannot remove your last login credential; enroll another authenticator first' });
+    }
+    db.prepare('DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?').run(id, req.user.id);
+    try { appendGdAuditEntry(db, { userId: req.user.id, eventType: 'WEBAUTHN_PASSKEY_REMOVED', detail: `cred=${String(cred.credential_id).slice(0, 12)}\u2026`, ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+    return res.json({ removed: true, id });
+  } catch (e) { return res.status(500).json({ error: 'internal error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+app.get('/api/mfa/certs', authMiddleware(['ciso', 'vp']), (req, res) => {
+  const db = getDb();
+  try {
+    const rows = db.prepare("SELECT serial, subject, status, issued_at, expires_at, fingerprint256, revoked_at, revoked_reason FROM issued_certs WHERE user_id = ? ORDER BY issued_at DESC").all(req.user.id);
+    return res.json({ certs: rows });
+  } catch (e) { return res.status(500).json({ error: 'internal error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+app.post('/api/mfa/certs/revoke', authMiddleware(['ciso', 'vp']), (req, res) => {
+  const db = getDb();
+  try {
+    const { serial, reason } = req.body || {};
+    if (!serial) return res.status(400).json({ error: 'serial required' });
+    const owned = db.prepare("SELECT serial FROM issued_certs WHERE serial = ? AND user_id = ?").get(serial, req.user.id);
+    if (!owned) return res.status(404).json({ error: 'certificate not found' });
+    const r = gdCa.revokeCert(db, { serial, reason: reason || 'self-service revocation' });
+    if (!r || !r.revoked) return res.status(400).json({ error: 'revocation failed' });
+    try { appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CERT_REVOKED', detail: `serial=${serial}`, ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+    return res.json({ revoked: true, serial });
+  } catch (e) { return res.status(500).json({ error: 'internal error' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
 });
 
 // ── Regional MC Data Ingest (receives pushes from Regional Servers) ──────────
@@ -2827,6 +3070,24 @@ const CANONICAL_GD_TABLES = [
   'system_health', 'system_meta', 'users',
 ];
 
+// Clone the live schema into a fresh in-memory database for side-effect-free
+// checks (e.g. a CA round-trip): replay every table/index/trigger from
+// sqlite_master in dependency order; tolerate any single un-recreatable object.
+function gdCloneSchema(db) {
+  const Database = db.constructor;
+  const mem = new Database(':memory:');
+  mem.exec('PRAGMA foreign_keys=ON;');
+  const rank = { table: 0, index: 1, trigger: 2 };
+  const objs = db
+    .prepare("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index','trigger')")
+    .all()
+    .sort((a, b) => (rank[a.type] - rank[b.type]));
+  for (const o of objs) {
+    try { mem.exec(o.sql + ';'); } catch (_e) { /* skip that object */ }
+  }
+  return mem;
+}
+
 function runGdRegression(db) {
   const tests = [];
   const SKIP = (reason) => ({ __skip: true, detail: String(reason) });
@@ -2929,7 +3190,7 @@ function runGdRegression(db) {
     return 'service module loaded';
   });
 
-  // ── Auth (3) ───────────────────────────────────────────────────────────
+  // ── Auth (8) ───────────────────────────────────────────────────────────
   record('auth', 'JWT_SECRET configured', () => {
     if (!JWT_SECRET || typeof JWT_SECRET !== 'string' || JWT_SECRET.length < 16) {
       throw new Error('JWT_SECRET missing or too short');
@@ -2937,11 +3198,9 @@ function runGdRegression(db) {
     if (!process.env.GD_JWT_SECRET) return 'using ephemeral fallback (set GD_JWT_SECRET for persistence across restarts)';
     return 'GD_JWT_SECRET env var present';
   });
-  record('auth', 'auth flow round-trip (bcrypt + JWT)', () => {
-    const pw = 'rt-' + crypto.randomBytes(8).toString('hex');
-    const hash = bcrypt.hashSync(pw, 10);
-    if (!bcrypt.compareSync(pw, hash)) throw new Error('bcrypt failed to verify the correct password');
-    if (bcrypt.compareSync(pw + 'x', hash)) throw new Error('bcrypt accepted a wrong password');
+  record('auth', 'JWT session round-trip (HS256 sign / verify / tamper-reject)', () => {
+    // Passwordless system: the only login-time secret exercised here is the
+    // JWT session token. There is no password hash and no TOTP.
     const secret = JWT_SECRET || crypto.randomBytes(32).toString('hex');
     const token = jwt.sign({ sub: 'regression', t: Date.now() }, secret, { algorithm: 'HS256', expiresIn: '60s' });
     const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });
@@ -2949,7 +3208,68 @@ function runGdRegression(db) {
     let rejected = false;
     try { jwt.verify(token, secret + 'tamper', { algorithms: ['HS256'] }); } catch (_e) { rejected = true; }
     if (!rejected) throw new Error('JWT verify accepted a wrong secret');
-    return 'bcrypt + JWT(HS256) round-trips ok';
+    return 'JWT(HS256) sign / verify / tamper-reject ok';
+  });
+  record('auth', 'passwordless-only enforcement (no password login route)', () => {
+    const r = app && app._router;
+    const stack = (r && r.stack) ? r.stack : [];
+    if (!stack.length) return SKIP('router stack not introspectable in this runtime');
+    const paths = new Set(stack.filter(l => l && l.route && l.route.path).map(l => l.route.path));
+    const required = ['/api/auth/login-cert', '/api/auth/login-webauthn/options', '/api/auth/login-webauthn/verify'];
+    const missing = required.filter(p => !paths.has(p));
+    if (missing.length) throw new Error('missing passwordless login route(s): ' + missing.join(', '));
+    const forbidden = ['/api/auth/login', '/api/auth/login-ldap', '/api/auth/mfa-verify'];
+    const present = forbidden.filter(p => paths.has(p));
+    if (present.length) throw new Error('password / MFA login route(s) still present: ' + present.join(', '));
+    return 'cert + passkey login present; no password / LDAP / mfa-verify route';
+  });
+  record('auth', 'CA issue / verify / revoke / CRL round-trip', () => {
+    // Real openssl-backed round-trip against a throwaway in-memory schema clone:
+    // the GD CA key lives in the DB, so a clone gets its own fresh CA, and
+    // openssl scratch goes to a temp dir. No live CA state is touched.
+    const { execFileSync } = require('child_process');
+    const os = require('os'); const fsx = require('fs'); const pathx = require('path');
+    const mem = gdCloneSchema(db);
+    const init = gdCa.initCa(mem);
+    if (!init || !init.caCertPem) throw new Error('GD CA did not initialize');
+    const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'gd-rr-ca-'));
+    try {
+      const keyP = pathx.join(dir, 'c.key'); const csrP = pathx.join(dir, 'c.csr');
+      execFileSync('openssl', ['genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', keyP], { stdio: 'ignore' });
+      execFileSync('openssl', ['req', '-new', '-key', keyP, '-subj', '/CN=gd-regression', '-out', csrP], { stdio: 'ignore' });
+      const csrPem = fsx.readFileSync(csrP, 'utf8');
+      const issued = gdCa.issueClientCert(mem, { csrPem, commonName: 'gd-regression', externalId: 'gd-rr-' + crypto.randomBytes(4).toString('hex') });
+      if (!issued || !issued.certPem || !issued.serial) throw new Error('issueClientCert returned no cert/serial');
+      const v1 = gdCa.verifyClientCert(mem, issued.certPem);
+      if (!v1 || !v1.valid) throw new Error('freshly issued cert failed to verify: ' + (v1 && v1.reason));
+      gdCa.revokeCert(mem, { serial: issued.serial, reason: 'regression' });
+      const v2 = gdCa.verifyClientCert(mem, issued.certPem);
+      if (!v2 || v2.valid) throw new Error('revoked cert still verified as valid');
+      if (v2.reason !== 'revoked') throw new Error('expected reason "revoked", got "' + v2.reason + '"');
+      const crl = gdCa.buildRevocationList(mem);
+      const inCrl = crl && Array.isArray(crl.revoked) && crl.revoked.some(rr => rr.serial === issued.serial);
+      if (!inCrl) throw new Error('revoked serial not present in CRL');
+      if (!crl.signature) throw new Error('CRL is not signed');
+      return 'issue -> verify(valid) -> revoke -> verify(revoked) -> CRL(signed, serial present) ok';
+    } finally {
+      try { fsx.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+    }
+  });
+  record('auth', 'break-glass recovery credential (verify correct / reject wrong)', () => {
+    const mem = gdCloneSchema(db);
+    const rc = gdCa.ensureRecoveryCredential(mem);
+    if (!rc || !rc.recoveryCredential) throw new Error('recovery credential was not minted on a fresh authority');
+    if (!gdCa.verifyRecoveryCredential(mem, rc.recoveryCredential)) throw new Error('correct recovery credential failed to verify');
+    if (gdCa.verifyRecoveryCredential(mem, rc.recoveryCredential + 'x')) throw new Error('a wrong recovery credential verified');
+    return 'recovery credential mint + verify(correct) + reject(wrong) ok';
+  });
+  record('auth', 'WebAuthn subsystem present (registration / authentication)', () => {
+    const need = ['getRpConfig', 'beginRegistration', 'finishRegistration', 'beginAuthentication', 'finishAuthentication'];
+    const missing = need.filter(f => typeof gdWebauthn[f] !== 'function');
+    if (missing.length) throw new Error('missing gd-webauthn fn(s): ' + missing.join(', '));
+    const has = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='webauthn_credentials'").get();
+    if (!has) throw new Error('missing table webauthn_credentials');
+    return 'registration + authentication wired; webauthn_credentials present';
   });
   record('auth', 'users table + CISO coverage', () => {
     const total = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -5125,8 +5445,80 @@ const gdAuditIntegrityTimer = setInterval(() => {
 if (gdAuditIntegrityTimer && typeof gdAuditIntegrityTimer.unref === 'function') gdAuditIntegrityTimer.unref();
 
 
-app.listen(PORT, () => {
-  console.log(`FireAlive Global Dashboard Server v0.0.31 running on port ${PORT}`);
+// ── B5b: HTTPS/mTLS bootstrap ────────────────────────────────────────────────
+// Initializes the GD's own CA, mints the one-time break-glass recovery
+// credential (shown once here for offline capture), and issues/loads the
+// localhost TLS server certificate (persisted 0600 under the data dir, re-issued
+// only if missing, expired, or no longer chaining to the active CA). The GD
+// serves ONLY over HTTPS — there is no plaintext listener.
+function bootstrapGdTlsMaterial() {
+  const { X509Certificate } = require('crypto');
+  const db = getDb();
+  try {
+    gdCa.initCa(db);
+    const rec = gdCa.ensureRecoveryCredential(db);
+    if (rec.created) {
+      console.warn(
+        '\n================================================================\n' +
+        ' GD BREAK-GLASS RECOVERY CREDENTIAL (shown once — store offline NOW)\n' +
+        '   ' + rec.recoveryCredential + '\n' +
+        ' Bootstraps the first CISO/VP authenticator at the enrollment\n' +
+        ' endpoints if every credential is lost. Only its hash is stored;\n' +
+        ' it cannot be recovered if not captured now.\n' +
+        '================================================================'
+      );
+    }
+    const caCertPem = gdCa.getCaCertPem(db);
+    const dataDir = path.dirname(DB_PATH);
+    const certPath = path.join(dataDir, 'gd-server-tls.crt');
+    const keyPath = path.join(dataDir, 'gd-server-tls.key');
+    let certPem = null;
+    let keyPem = null;
+    if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+      try {
+        const c = fs.readFileSync(certPath, 'utf8');
+        const k = fs.readFileSync(keyPath, 'utf8');
+        const x = new X509Certificate(c);
+        const caX = new X509Certificate(caCertPem);
+        const now = Date.now();
+        if (x.verify(caX.publicKey) && now >= Date.parse(x.validFrom) && now <= Date.parse(x.validTo)) {
+          certPem = c;
+          keyPem = k;
+        }
+      } catch (_) { /* unreadable/parse failure -> re-issue below */ }
+    }
+    if (!certPem) {
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+      const issued = gdCa.issueServerCert(db, { commonName: 'localhost' });
+      certPem = issued.certPem;
+      keyPem = issued.keyPem;
+      fs.writeFileSync(keyPath, keyPem, { mode: 0o600 });
+      fs.writeFileSync(certPath, certPem, { mode: 0o644 });
+      try { fs.chmodSync(keyPath, 0o600); } catch (_) { /* best effort */ }
+      console.log('Issued new GD TLS server certificate (localhost)');
+    }
+    return { key: keyPem, cert: certPem, ca: caCertPem };
+  } finally {
+    try { db.close(); } catch (_) { /* ignore */ }
+  }
+}
+
+const gdTlsMaterial = bootstrapGdTlsMaterial();
+https.createServer({
+  key: gdTlsMaterial.key,
+  cert: gdTlsMaterial.cert,
+  ca: gdTlsMaterial.ca,
+  // Client certificates are REQUESTED but not REQUIRED at the handshake
+  // (rejectUnauthorized:false): the WebAuthn login path and the regional MC push
+  // path connect without a client cert and authenticate at the app layer.
+  // Encryption itself is never optional — there is no plaintext listener. mTLS
+  // client-cert AUTHENTICATION is enforced in /api/auth/login-cert, which passes
+  // the presented peer certificate to gdCa.verifyClientCert.
+  requestCert: true,
+  rejectUnauthorized: false,
+  minVersion: 'TLSv1.2',
+}, app).listen(PORT, () => {
+  console.log(`FireAlive Global Dashboard Server v0.0.31 running on https://localhost:${PORT} (HTTPS/mTLS)`);
   console.log('Awaiting aggregate data pushes from Regional Servers');
 });
 

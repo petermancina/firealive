@@ -4,6 +4,10 @@
 // protection, ARP spoofing detection at application layer
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const crypto = require('crypto');
+const ca = require('../services/ca');
+const { getDb } = require('../db/init');
+
 // ── Connection Tracking (anti-DDoS, anti-slowloris) ─────────────────────────
 const activeConnections = new Map();
 const CONNECTION_LIMITS = { perIp: 50, total: 500, slowThresholdMs: 30000 };
@@ -54,19 +58,59 @@ const isClientAlive = (clientId) => {
   return (Date.now() - last) < HEARTBEAT_TIMEOUT;
 };
 
-// ── mTLS Validation (anti-ARP-spoofing at app layer) ────────────────────────
+// ── Client-certificate verification (mTLS) ──────────────────────────────────
+// With the HTTPS listener running requestCert:true / rejectUnauthorized:false,
+// a client certificate is OPTIONAL at the TLS handshake (so password/LDAP-
+// exception users can still connect); FireAlive therefore verifies a presented
+// client cert at the APPLICATION layer against the built-in CA. This helper
+// pulls the peer certificate off the TLS socket and runs it through
+// ca.verifyClientCert (chain-to-CA + validity window + local revocation),
+// returning the mapped user/external_id. routes/auth.js (/login-cert) uses it
+// for passwordless cert login; validateMtls (below) uses it to gate the
+// internal inter-component API. Absence of a cert is reported as
+// { valid:false, reason:'no_client_cert' } and is NOT an error by itself —
+// whether to require a cert is the caller's policy decision.
+function verifyPeerCertificate(req, db) {
+  const sock = req && req.socket;
+  const peer = sock && typeof sock.getPeerCertificate === 'function'
+    ? sock.getPeerCertificate()
+    : null;
+  // An un-authenticated TLS peer yields an empty object (no DER); a presented
+  // certificate carries .raw (DER bytes).
+  if (!peer || !peer.raw || Object.keys(peer).length === 0) {
+    return { valid: false, reason: 'no_client_cert' };
+  }
+  let pem;
+  try {
+    pem = new crypto.X509Certificate(peer.raw).toString();
+  } catch (_) {
+    return { valid: false, reason: 'parse_error' };
+  }
+  const ownDb = !db;
+  const handle = db || getDb();
+  try {
+    return ca.verifyClientCert(handle, pem);
+  } finally {
+    if (ownDb) { try { handle.close(); } catch (_) { /* ignore */ } }
+  }
+}
+
+// mTLS enforcement for the internal inter-component API. A valid, CA-issued,
+// non-revoked client certificate is REQUIRED for any /api/internal/ route;
+// other routes are not gated here (user authentication is handled in
+// routes/auth.js). This runs regardless of NODE_ENV — the server always
+// serves over TLS with client certs requested, so there is no dev exemption.
 const validateMtls = (req, res, next) => {
-  // In production, Node.js TLS server validates client certificates
-  // This middleware checks the certificate fingerprint matches known clients
-  if (process.env.NODE_ENV === 'production') {
-    const cert = req.socket?.getPeerCertificate?.();
-    if (!cert || cert.fingerprint256 === undefined) {
-      // No client cert = not a trusted FireAlive component
-      // Allow in dev, reject in production for inter-component calls
-      if (req.path.startsWith('/api/internal/')) {
-        return res.status(403).json({ error: 'mTLS required for internal API' });
-      }
+  if (req.path.startsWith('/api/internal/')) {
+    const result = verifyPeerCertificate(req);
+    if (!result.valid) {
+      return res.status(403).json({ error: 'mTLS required for internal API' });
     }
+    req.mtlsClient = {
+      userId: result.userId || null,
+      externalId: result.externalId || null,
+      fingerprint256: result.fingerprint256 || null,
+    };
   }
   next();
 };
@@ -92,4 +136,4 @@ const preventPivot = (req, res, next) => {
   next();
 };
 
-module.exports = { connectionTracker, validateDnsSize, registerHeartbeat, isClientAlive, validateMtls, preventPivot };
+module.exports = { connectionTracker, validateDnsSize, registerHeartbeat, isClientAlive, validateMtls, verifyPeerCertificate, preventPivot };

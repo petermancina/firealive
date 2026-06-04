@@ -1,6 +1,6 @@
 {
   "name": "firealive-global-dashboard-server",
-  "version": "1.0.52",
+  "version": "1.0.53",
   "description": "FireAlive Global Dashboard — Independent Backend Server",
   "main": "index.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "express": "^4.18.2",
     "better-sqlite3": "^9.4.3",
     "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3",
+    "@simplewebauthn/server": "^13.3.1",
     "helmet": "^8.2.0",
     "cors": "^2.8.5",
     "compression": "^1.7.4",

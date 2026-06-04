@@ -6901,6 +6901,120 @@ function initDb() {
     console.error('The server will start, but the audit log hash chain is not active: GET /api/audit/integrity will report unavailable and audit tamper-evidence falls back to SIEM ship-out only. No other feature is affected. Recovery: ensure the audit_chain_checkpoint and audit_chain_signing_keys tables exist, then restart to re-run the migration.');
   }
 
+  // ── B5b migration: IAM & SOC-grade authentication ─────────────────────────
+  // The built-in Certificate Authority (ca_authority), the certs it issues
+  // (issued_certs, with a local revocation list — no OCSP), passwordless FIDO2
+  // credentials (webauthn_credentials; is_passwordless=1 marks discoverable
+  // login keys), the offboarding detector's surfaced candidates
+  // (offboarding_candidates — surface-only, never auto-deactivated), and the
+  // one-time break-glass recovery credential (auth_recovery, hash only —
+  // plaintext shown once at CA init). All idempotent (CREATE IF NOT EXISTS).
+  // The default auth posture is passwordless and is enforced in the auth layer
+  // when iam_config is absent, so no config row is seeded here.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ca_authority (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        subject TEXT NOT NULL,
+        key_algo TEXT NOT NULL DEFAULT 'ec-p256',
+        ca_cert_pem TEXT NOT NULL,
+        ca_private_key_encrypted TEXT NOT NULL,
+        serial_counter INTEGER NOT NULL DEFAULT 1,
+        is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        rotated_out_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_authority_one_active
+        ON ca_authority(is_active) WHERE is_active = 1;
+
+      CREATE TABLE IF NOT EXISTS issued_certs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        serial TEXT NOT NULL UNIQUE,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        external_id TEXT,
+        subject TEXT NOT NULL,
+        fingerprint256 TEXT NOT NULL,
+        cert_pem TEXT NOT NULL,
+        issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked', 'expired')),
+        revoked_at TEXT,
+        revoked_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_issued_certs_user ON issued_certs(user_id, status);
+      CREATE INDEX IF NOT EXISTS idx_issued_certs_fingerprint ON issued_certs(fingerprint256);
+      CREATE INDEX IF NOT EXISTS idx_issued_certs_revoked ON issued_certs(status) WHERE status = 'revoked';
+
+      CREATE TABLE IF NOT EXISTS webauthn_credentials (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        credential_id TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        sign_count INTEGER NOT NULL DEFAULT 0,
+        transports TEXT,
+        aaguid TEXT,
+        is_passwordless INTEGER NOT NULL DEFAULT 0 CHECK (is_passwordless IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+      CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_passwordless
+        ON webauthn_credentials(is_passwordless) WHERE is_passwordless = 1;
+
+      CREATE TABLE IF NOT EXISTS offboarding_candidates (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        source TEXT NOT NULL CHECK (source IN ('ldap_absent', 'cert_revoked', 'cert_expired', 'stale')),
+        detail TEXT,
+        detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed_active', 'offboarded')),
+        resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        resolved_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_offboarding_candidates_status
+        ON offboarding_candidates(status, detected_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_offboarding_candidates_open
+        ON offboarding_candidates(user_id) WHERE status = 'pending';
+
+      CREATE TABLE IF NOT EXISTS auth_recovery (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        credential_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        use_count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_recovery_one_active
+        ON auth_recovery(is_active) WHERE is_active = 1;
+
+      -- Bootstrap & recovery enrollment tokens. A single-use, expiring,
+      -- revocable token (SHA-256 hash at rest; plaintext shown once at mint)
+      -- that authorizes a session-less caller to enroll their FIRST credential
+      -- (passkey or client cert). Issued by admin provisioning; redeemed at an
+      -- unauthenticated endpoint. Break-glass uses its own signed token, not
+      -- this table.
+      CREATE TABLE IF NOT EXISTS enrollment_tokens (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'first-credential'
+          CHECK (scope IN ('first-credential')),
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_user ON enrollment_tokens(user_id);
+      CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_hash ON enrollment_tokens(token_hash);
+    `);
+    const caCount = db.prepare("SELECT COUNT(*) AS c FROM ca_authority").get().c;
+    console.log(`B5b migration: ca_authority + issued_certs + webauthn_credentials + offboarding_candidates + auth_recovery + enrollment_tokens ready (${caCount} CA present)`);
+  } catch (b5bIamMigrationErr) {
+    console.error('B5b IAM/auth migration FAILED:', b5bIamMigrationErr.message);
+    console.error('The server will start, but client-certificate and FIDO2 passkey authentication cannot be provisioned: cert enrollment, passkey registration, the offboarding detector, and break-glass recovery will be unavailable. No other feature is affected. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.');
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

@@ -3,7 +3,7 @@ const pkg = require('./package.json');
 
 // Expose only whitelisted IPC channels
 const ALLOWED_CHANNELS = [
-  'auth:login', 'auth:logout', 'auth:mfa',
+  'auth:login', 'auth:logout', 'auth:importCaCert', 'auth:caStatus',
   'data:fetch', 'data:save', 'data:signals',
   'peer:connect', 'peer:message', 'peer:disconnect',
   'training:submit', 'assessment:submit',

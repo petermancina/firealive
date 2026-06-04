@@ -58,7 +58,7 @@ const COMPLIANCE_FRAMEWORKS = [
 // behavior for a CISO console).
 const api = {
   _token: null,
-  _baseUrl: 'http://localhost:4001',
+  _baseUrl: 'https://localhost:4001',
   setBaseUrl(url) { this._baseUrl = url; },
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
   async post(path, data) { try { const r = await fetch(this._baseUrl + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
@@ -92,267 +92,317 @@ const api = {
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║  MY MFA SECURITY SECTION (R3f)                                          ║
+// ║  MY SECURITY SECTION                                                    ║
 // ║                                                                         ║
-// ║  Self-service MFA management for the currently authenticated user       ║
-// ║  (CISO / global admin). Renders in the MFA tab in place of the prior    ║
-// ║  placeholder TOTP card. Talks to /api/mfa/* (status, enroll-start,      ║
-// ║  enroll-confirm, recovery-status, regenerate-recovery, disable). All    ║
-// ║  operations scope to req.user.id on the server side -- this component   ║
-// ║  never accepts or sends a user_id parameter.                            ║
+// ║  Self-service passwordless credential management for the current        ║
+// ║  CISO / VP operator. Renders in the MFA tab. Talks to /api/mfa/* on     ║
+// ║  the GD-Server — passkey/register-options + register-verify,            ║
+// ║  GET/DELETE passkeys, GET certs, certs/revoke — all scoped to           ║
+// ║  req.user.id server-side. There is no TOTP. Reuses the module-level     ║
+// ║  WebAuthn (de)serialization helpers.                                    ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function MyMfaSecuritySection() {
-  const [status, setStatus] = useState(null);
-  const [recovery, setRecovery] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [stage, setStage] = useState('idle');
-  const [enrollData, setEnrollData] = useState(null);
-  const [confirmCode, setConfirmCode] = useState('');
-  const [actionCode, setActionCode] = useState('');
-  const [codes, setCodes] = useState(null);
-  const [error, setError] = useState('');
+  const [passkeys, setPasskeys] = useState(null);   // null = not loaded
+  const [certs, setCerts] = useState(null);
+  const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
 
-  const refresh = async () => {
-    setLoading(true); setError('');
+  const loadPasskeys = async () => {
+    const r = await api.get("/api/mfa/passkeys");
+    setPasskeys(r && Array.isArray(r.passkeys) ? r.passkeys : []);
+  };
+  const loadCerts = async () => {
+    const r = await api.get("/api/mfa/certs");
+    setCerts(r && Array.isArray(r.certs) ? r.certs : []);
+  };
+  useEffect(()=>{ loadPasskeys().catch(()=>{}); loadCerts().catch(()=>{}); },[]);
+
+  const addPasskey = async () => {
+    setBusy(true); setErr(""); setMsg("");
     try {
-      const s = await api.get('/api/mfa/status');
-      if (s && s.error) { setError(typeof s.error === 'string' ? s.error : 'Failed to load MFA status.'); setLoading(false); return; }
-      setStatus(s || { enrolled: false, in_enrollment: false });
-      if (s && s.enrolled) {
-        const r = await api.get('/api/mfa/recovery-status');
-        if (r && !r.error) setRecovery(r); else setRecovery(null);
-      } else {
-        setRecovery(null);
+      const opt = await api.post("/api/mfa/passkey/register-options", {});
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) {
+        setBusy(false);
+        setErr(opt && opt.error ? String(opt.error) : "Could not start passkey enrollment.");
+        return;
       }
-      setLoading(false);
+      let cred;
+      try { cred = await navigator.credentials.create({ publicKey: deserializeRegOptions(opt.options) }); }
+      catch (_e) { setBusy(false); setErr("Passkey enrollment was cancelled or failed."); return; }
+      if (!cred) { setBusy(false); setErr("No passkey was created."); return; }
+      const r = await api.post("/api/mfa/passkey/register-verify", {
+        response: serializeAttestation(cred),
+        challengeToken: opt.challengeToken,
+        label: label.trim() || undefined,
+      });
+      setBusy(false);
+      if (!r || r.error || !r.registered) { setErr(r && r.error ? String(r.error) : "Passkey verification failed."); return; }
+      setMsg("Passkey enrolled."); setLabel(""); loadPasskeys().catch(()=>{});
     } catch (e) {
-      setError(e.message || 'Failed to load MFA status.');
-      setLoading(false);
+      setBusy(false);
+      setErr(e.message || "Passkey enrollment failed.");
     }
   };
 
-  useEffect(() => { refresh(); }, []);
-
-  const startEnroll = async () => {
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/enroll-start', {});
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Failed to start enrollment.'); return; }
-      if (!r || !r.secret_base32) { setError('Enrollment response was incomplete.'); return; }
-      setEnrollData(r);
-      setConfirmCode('');
-      setStage('enrolling-confirm');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Failed to start enrollment.');
-    }
+  const removePasskey = async (id) => {
+    if (!window.confirm("Remove this passkey?")) return;
+    setErr(""); setMsg("");
+    const r = await api.del("/api/mfa/passkeys/" + id);
+    if (r && r.removed) { setMsg("Passkey removed."); loadPasskeys().catch(()=>{}); }
+    else { setErr(r && r.error ? String(r.error) : "Could not remove passkey."); }
   };
 
-  const confirmEnroll = async () => {
-    if (confirmCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/enroll-confirm', { totp_code: confirmCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Confirmation failed.'); return; }
-      if (!r || !Array.isArray(r.recovery_codes)) { setError('Confirmation response was incomplete.'); return; }
-      setCodes(r.recovery_codes);
-      setStage('display-codes');
-      setConfirmCode('');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Confirmation failed.');
-    }
+  const revokeCert = async (serial) => {
+    if (!window.confirm("Revoke certificate " + serial + "? It will no longer authenticate.")) return;
+    setErr(""); setMsg("");
+    const r = await api.post("/api/mfa/certs/revoke", { serial });
+    if (r && r.revoked) { setMsg("Certificate " + serial + " revoked."); loadCerts().catch(()=>{}); }
+    else { setErr(r && r.error ? String(r.error) : "Revocation failed."); }
   };
 
-  const startRegen = () => { setActionCode(''); setError(''); setStage('regenerating'); };
-
-  const confirmRegen = async () => {
-    if (actionCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/regenerate-recovery', { totp_code: actionCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Regeneration failed.'); return; }
-      if (!r || !Array.isArray(r.recovery_codes)) { setError('Regeneration response was incomplete.'); return; }
-      setCodes(r.recovery_codes);
-      setStage('display-codes');
-      setActionCode('');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Regeneration failed.');
-    }
-  };
-
-  const startDisable = () => {
-    if (!window.confirm('Disable MFA for your account? This removes second-factor protection.')) return;
-    setActionCode(''); setError(''); setStage('disabling');
-  };
-
-  const confirmDisable = async () => {
-    if (actionCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/disable', { totp_code: actionCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Disable failed.'); return; }
-      setStage('idle'); setActionCode(''); setEnrollData(null); setCodes(null);
-      await refresh();
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Disable failed.');
-    }
-  };
-
-  const acknowledgeCodes = () => { setCodes(null); setEnrollData(null); setStage('idle'); refresh(); };
-  const cancel = () => { setStage('idle'); setError(''); setConfirmCode(''); setActionCode(''); };
-
-  if (loading) {
-    return (
-      <Card style={{borderColor:C.b}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>My MFA Enrollment</div>
-        <M style={{color:C.tm}}>Loading…</M>
-      </Card>
-    );
-  }
-
-  if (stage === 'display-codes' && codes) {
-    return (
-      <Card style={{borderColor:C.a+"40"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:8}}>Save Your Recovery Codes</div>
-        <M style={{color:C.d,display:"block",marginBottom:10,fontWeight:500,lineHeight:1.6}}>These codes will not be shown again. Each can be used once if you lose access to your authenticator.</M>
-        <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Print them, store them in a password manager, or write them down.</M>
-        <div style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,padding:12,marginBottom:12,fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:C.t,lineHeight:1.8,userSelect:"all"}}>
-          {codes.map((c,i)=><div key={i}>{c}</div>)}
-        </div>
-        <button onClick={()=>{ try { if (navigator && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(codes.join("\n")); } catch (_e) {} }} style={{width:"100%",marginBottom:8,padding:10,background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Copy all to clipboard</button>
-        <button onClick={acknowledgeCodes} style={{width:"100%",padding:10,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>I've saved my recovery codes</button>
-      </Card>
-    );
-  }
-
-  if (stage === 'enrolling-confirm' && enrollData) {
-    return (
-      <Card style={{borderColor:C.i+"30"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:8}}>Scan QR Code to Enroll</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Scan with your authenticator app, then enter the 6-digit code it generates.</M>
-        <div style={{background:"#fff",borderRadius:8,padding:14,textAlign:"center",marginBottom:12}}>
-          {enrollData.qr_png_data_url ? (
-            <img src={enrollData.qr_png_data_url} alt="TOTP QR code" style={{width:200,height:200}}/>
-          ) : (
-            <div style={{width:200,height:200,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",border:"2px dashed #ccc",borderRadius:8,color:"#666",fontSize:11,padding:8}}>QR rendering unavailable.<br/>Use manual entry below.</div>
-          )}
-        </div>
-        <details style={{marginBottom:12}}>
-          <summary style={{cursor:"pointer",color:C.tm,fontSize:11,marginBottom:8}}>Can't scan? Enter manually</summary>
-          <div style={{padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,marginTop:8}}>
-            <M style={{color:C.td,display:"block",marginBottom:6}}>Secret (base32):</M>
-            <code style={{display:"block",color:C.t,fontSize:12,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.secret_base32}</code>
-            <M style={{color:C.td,display:"block",marginTop:10,marginBottom:6}}>Or paste this URL into a TOTP-aware app:</M>
-            <code style={{display:"block",color:C.t,fontSize:10,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.otpauth_url}</code>
-          </div>
-        </details>
-        <Input label="6-digit code from authenticator" value={confirmCode} onChange={e=>setConfirmCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={confirmEnroll} disabled={busy} style={{flex:1,padding:10,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{busy?"Confirming...":"Confirm Enrollment"}</button>
-          <Btn small onClick={cancel} disabled={busy}>Cancel</Btn>
-        </div>
-      </Card>
-    );
-  }
-
-  if (stage === 'regenerating') {
-    return (
-      <Card style={{borderColor:C.i+"30"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:8}}>Regenerate Recovery Codes</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Generates 10 new recovery codes. ALL existing codes will be invalidated immediately. Enter your current authenticator code to confirm.</M>
-        <Input label="6-digit code from authenticator" value={actionCode} onChange={e=>setActionCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={confirmRegen} disabled={busy} style={{flex:1,padding:10,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{busy?"Regenerating...":"Regenerate Codes"}</button>
-          <Btn small onClick={cancel} disabled={busy}>Cancel</Btn>
-        </div>
-      </Card>
-    );
-  }
-
-  if (stage === 'disabling') {
-    return (
-      <Card style={{borderColor:C.d+"40"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.d,marginBottom:8}}>Disable MFA</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Removes second-factor protection from your account. Existing recovery codes will also be cleared. Enter your current authenticator code to confirm.</M>
-        <Input label="6-digit code from authenticator" value={actionCode} onChange={e=>setActionCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={confirmDisable} disabled={busy} style={{flex:1,padding:10,background:`${C.d}20`,border:`1px solid ${C.d}50`,borderRadius:8,color:C.d,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{busy?"Disabling...":"Confirm Disable"}</button>
-          <Btn small onClick={cancel} disabled={busy}>Cancel</Btn>
-        </div>
-      </Card>
-    );
-  }
-
-  const enrolled = !!(status && status.enrolled);
-  const inEnrollment = !!(status && status.in_enrollment && !enrolled);
-  const lowCodes = recovery && recovery.generated && recovery.remaining <= 3;
+  const dangerBtn = { color: C.d, borderColor: C.d + "50" };
 
   return (
-    <Card style={{borderColor:enrolled?C.a+"30":C.b}}>
-      <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:8}}>My MFA Enrollment</div>
-      {enrolled && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.a}>ENROLLED</Badge>
-            <M style={{color:C.tm}}>TOTP authenticator active</M>
+    <Card>
+      <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>My Security — Passkeys & Certificates</div>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a FIDO2/WebAuthn passkey or a client certificate — there is no password. Keep at least one working credential enrolled at all times.</M>
+
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>Passkeys</div>
+      {passkeys===null ? <M style={{color:C.td}}>Loading…</M> : passkeys.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No passkeys enrolled.</M> : passkeys.map((k,i)=>(
+        <div key={k.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{minWidth:0}}>
+            <M style={{color:C.t,display:"block"}}>{String(k.credential_id||"").slice(0,16)}…{k.is_passwordless?"":" (second-factor)"}</M>
+            <M style={{color:C.td,display:"block"}}>added {k.created_at?String(k.created_at).slice(0,10):"—"}{k.last_used_at?(" · last used "+String(k.last_used_at).slice(0,10)):" · never used"}</M>
           </div>
-          {recovery && recovery.generated ? (
-            <M style={{color:lowCodes?C.d:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>
-              {recovery.remaining} of {recovery.total} recovery codes remaining
-              {lowCodes ? " — regenerate soon to avoid lockout if you lose your authenticator." : "."}
-            </M>
-          ) : (
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Recovery codes status unavailable.</M>
-          )}
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            <Btn small onClick={startRegen} disabled={busy}>Regenerate Recovery Codes</Btn>
-            <button onClick={startDisable} disabled={busy} style={{padding:"5px 12px",background:"transparent",border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:10,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>Disable MFA</button>
+          <Btn small style={dangerBtn} onClick={()=>removePasskey(k.id)}>Remove</Btn>
+        </div>
+      ))}
+      <div style={{display:"flex",gap:8,alignItems:"flex-end",marginTop:10}}>
+        <div style={{flex:1}}><Input label="New passkey label (optional)" value={label} onChange={e=>setLabel(e.target.value)} placeholder="e.g. YubiKey 5C" maxLength={64}/></div>
+        <Btn primary onClick={addPasskey} disabled={busy}>{busy?"Working…":"Add a passkey"}</Btn>
+      </div>
+
+      <div style={{fontSize:12,fontWeight:600,color:C.t,margin:"18px 0 8px"}}>Client Certificates</div>
+      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>Certificates are issued during provisioning or by an administrator. Review them here and revoke one you no longer use or that may be compromised.</M>
+      {certs===null ? <M style={{color:C.td}}>Loading…</M> : certs.length===0 ? <M style={{color:C.td}}>No certificates issued to you.</M> : certs.map((c,i)=>(
+        <div key={c.serial||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{minWidth:0}}>
+            <M style={{color:C.t,display:"block"}}>{c.subject||"(no subject)"}</M>
+            <M style={{color:C.td,display:"block"}}>serial {c.serial} · {c.status}{c.expires_at?(" · exp "+String(c.expires_at).slice(0,10)):""}</M>
           </div>
-        </>
-      )}
-      {!enrolled && inEnrollment && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.w}>IN PROGRESS</Badge>
-            <M style={{color:C.tm}}>Enrollment was started but not confirmed</M>
-          </div>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>You have a TOTP secret pending confirmation. Click below to view the QR again or restart enrollment with a fresh secret.</M>
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <button onClick={startEnroll} disabled={busy} style={{width:"100%",padding:10,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{busy?"Loading...":"Resume / Restart Enrollment"}</button>
-        </>
-      )}
-      {!enrolled && !inEnrollment && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.d}>NOT ENROLLED</Badge>
-            <M style={{color:C.tm}}>Enroll to add a second factor to your account</M>
-          </div>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment.</M>
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <button onClick={startEnroll} disabled={busy} style={{width:"100%",padding:10,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{busy?"Loading...":"Enroll MFA"}</button>
-        </>
-      )}
+          {c.status==="active" ? <Btn small style={dangerBtn} onClick={()=>revokeCert(c.serial)}>Revoke</Btn> : <Badge color={c.status==="revoked"?C.d:C.tm}>{c.status}</Badge>}
+        </div>
+      ))}
+
+      {msg&&<M style={{color:C.tm,display:"block",marginTop:12}}>{msg}</M>}
+      {err&&<M style={{color:C.d,display:"block",marginTop:12}}>{err}</M>}
     </Card>
   );
 }
 
 
+// ── WebAuthn (de)serialization for navigator.credentials ─────────────────────
+// The GD-Server speaks base64url JSON (via @simplewebauthn); the browser
+// WebAuthn API speaks ArrayBuffers. Convert assertion/creation options in and
+// the produced assertion/attestation out.
+function b64urlToBuf(s) {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const bin = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function bufToB64url(buf) {
+  const u = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function deserializeAuthOptions(options) {
+  return {
+    ...options,
+    challenge: b64urlToBuf(options.challenge),
+    allowCredentials: (options.allowCredentials || []).map((c) => ({ ...c, id: b64urlToBuf(c.id) })),
+  };
+}
+function serializeAssertion(cred) {
+  const r = cred.response;
+  return {
+    id: cred.id,
+    rawId: bufToB64url(cred.rawId),
+    type: cred.type,
+    response: {
+      authenticatorData: bufToB64url(r.authenticatorData),
+      clientDataJSON: bufToB64url(r.clientDataJSON),
+      signature: bufToB64url(r.signature),
+      userHandle: r.userHandle ? bufToB64url(r.userHandle) : null,
+    },
+    clientExtensionResults: typeof cred.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : {},
+  };
+}
+function deserializeRegOptions(options) {
+  return {
+    ...options,
+    challenge: b64urlToBuf(options.challenge),
+    user: { ...options.user, id: b64urlToBuf(options.user.id) },
+    excludeCredentials: (options.excludeCredentials || []).map((c) => ({ ...c, id: b64urlToBuf(c.id) })),
+  };
+}
+function serializeAttestation(cred) {
+  const r = cred.response;
+  return {
+    id: cred.id,
+    rawId: bufToB64url(cred.rawId),
+    type: cred.type,
+    response: {
+      attestationObject: bufToB64url(r.attestationObject),
+      clientDataJSON: bufToB64url(r.clientDataJSON),
+      transports: typeof r.getTransports === "function" ? r.getTransports() : [],
+    },
+    clientExtensionResults: typeof cred.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : {},
+  };
+}
+
+// ── Passwordless Global Dashboard login ──────────────────────────────────────
+// Two phishing-resistant methods (passkey, client certificate) against a
+// configurable GD-Server, a one-time CA-trust import (the renderer must trust
+// the GD-Server's CA to reach it over HTTPS), and a break-glass panel to enroll
+// the first CISO/VP passkey on a fresh deployment using the recovery credential.
+function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [caStatus, setCaStatus] = useState(null);   // null=checking; {pinned, unmanaged?}
+  const [caPem, setCaPem] = useState("");
+  const [caImporting, setCaImporting] = useState(false);
+  const [bgOpen, setBgOpen] = useState(false);
+  const [bgUsername, setBgUsername] = useState("");
+  const [bgRecovery, setBgRecovery] = useState("");
+  const [bgBusy, setBgBusy] = useState(false);
+  const [bgMsg, setBgMsg] = useState("");
+
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setCaStatus({ pinned: true, unmanaged: true }); return; }
+    bridge.invoke("auth:caStatus").then(s=>setCaStatus(s || { pinned: false })).catch(()=>setCaStatus({ pinned: false }));
+  },[]);
+
+  const base = () => { api.setBaseUrl((gdServerUrl || "").replace(/\/+$/, "")); };
+  const finish = (r) => {
+    if (!r || r.error || !(r.token || r.accessToken) || !r.user) {
+      setError(r && typeof r.error === "string" ? r.error : "Sign-in failed.");
+      return false;
+    }
+    api.setToken(r.token || r.accessToken);
+    onLoggedIn();
+    return true;
+  };
+
+  const handlePasskeyLogin = async () => {
+    if (!gdServerUrl || !gdServerUrl.trim()) { setError("Enter the GD-Server URL."); return; }
+    setBusy(true); setError(""); base();
+    try {
+      const opt = await api.post("/api/auth/login-webauthn/options", {});
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) { setBusy(false); setError("Could not start passkey sign-in. Is the GD-Server CA trusted?"); return; }
+      let cred;
+      try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
+      catch (_e) { setBusy(false); setError("Passkey sign-in was cancelled, or no passkey was available."); return; }
+      if (!cred) { setBusy(false); setError("No passkey assertion was produced."); return; }
+      const r = await api.post("/api/auth/login-webauthn/verify", { response: serializeAssertion(cred), challengeToken: opt.challengeToken });
+      setBusy(false); finish(r);
+    } catch (e) { setBusy(false); setError(e.message || "Passkey sign-in failed."); }
+  };
+
+  const handleCertLogin = async () => {
+    if (!gdServerUrl || !gdServerUrl.trim()) { setError("Enter the GD-Server URL."); return; }
+    setBusy(true); setError(""); base();
+    try {
+      const r = await api.post("/api/auth/login-cert", {});
+      setBusy(false);
+      if (!r || r.error || !(r.token || r.accessToken) || !r.user) { setError(r && typeof r.error === "string" ? r.error : "Certificate sign-in failed. Ensure a client certificate is installed and selected."); return; }
+      api.setToken(r.token || r.accessToken); onLoggedIn();
+    } catch (e) { setBusy(false); setError(e.message || "Certificate sign-in failed."); }
+  };
+
+  const handleImportCa = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setError("CA import is only available in the desktop app."); return; }
+    if (!caPem.trim()) { setError("Paste the GD-Server CA certificate (PEM)."); return; }
+    setCaImporting(true); setError("");
+    try {
+      const res = await bridge.invoke("auth:importCaCert", { pem: caPem.trim() });
+      if (!res || !res.ok) { setError(res && res.error ? res.error : "CA import failed."); return; }
+      const s = await bridge.invoke("auth:caStatus").catch(()=>null);
+      setCaStatus(s || { pinned: true }); setCaPem("");
+    } catch (e) { setError(e.message || "CA import failed."); }
+    finally { setCaImporting(false); }
+  };
+
+  const handleBreakGlassEnroll = async () => {
+    if (!gdServerUrl || !gdServerUrl.trim()) { setBgMsg("Enter the GD-Server URL above first."); return; }
+    if (!bgUsername.trim() || !bgRecovery.trim()) { setBgMsg("Username and recovery credential are required."); return; }
+    setBgBusy(true); setBgMsg(""); base();
+    const gate = { recoveryCredential: bgRecovery.trim(), username: bgUsername.trim() };
+    try {
+      const opt = await api.post("/api/auth/enroll/passkey/options", gate);
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) { setBgBusy(false); setBgMsg(opt && opt.error ? String(opt.error) : "Could not start enrollment."); return; }
+      let cred;
+      try { cred = await navigator.credentials.create({ publicKey: deserializeRegOptions(opt.options) }); }
+      catch (_e) { setBgBusy(false); setBgMsg("Passkey creation was cancelled or failed."); return; }
+      if (!cred) { setBgBusy(false); setBgMsg("No passkey was created."); return; }
+      const r = await api.post("/api/auth/enroll/passkey/verify", { ...gate, response: serializeAttestation(cred), challengeToken: opt.challengeToken });
+      setBgBusy(false);
+      if (!r || r.error || !r.enrolled) { setBgMsg(r && r.error ? String(r.error) : "Enrollment failed."); return; }
+      setBgMsg("Passkey enrolled. You can now sign in with it."); setBgRecovery("");
+    } catch (e) { setBgBusy(false); setBgMsg(e.message || "Enrollment failed."); }
+  };
+
+  const caUnpinned = caStatus && caStatus.pinned === false;
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{maxWidth:480,width:"100%",padding:"0 24px"}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <div style={{fontSize:28,fontWeight:600,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:4}}>FireAlive</div>
+          <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase"}}>Global Dashboard Login</M>
+        </div>
+        <Card>
+          <Input label="GD-Server URL" value={gdServerUrl} onChange={e=>setGdServerUrl(e.target.value)} placeholder="https://gd.corp.com:4001"/>
+          {caUnpinned ? (
+            <div>
+              <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Trust the GD-Server CA to connect over HTTPS. Paste the CA certificate (PEM) from the server's /ca-cert endpoint. Done once.</M>
+              <textarea value={caPem} onChange={e=>setCaPem(e.target.value)} placeholder="-----BEGIN CERTIFICATE-----" rows={5} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical",marginBottom:10}}/>
+              <Btn primary style={{width:"100%"}} onClick={handleImportCa} disabled={caImporting}>{caImporting?"Importing...":"Import CA certificate"}</Btn>
+            </div>
+          ) : (
+            <div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Sign in with your passkey or hardware certificate. There is no password.</M>
+              <Btn primary style={{width:"100%",marginBottom:8}} onClick={handlePasskeyLogin} disabled={busy}>{busy?"Working...":"Sign in with a passkey"}</Btn>
+              <Btn style={{width:"100%"}} onClick={handleCertLogin} disabled={busy}>Sign in with a certificate</Btn>
+            </div>
+          )}
+          {error&&<M style={{color:C.d,display:"block",marginTop:12}}>{error}</M>}
+        </Card>
+        <Card>
+          <button onClick={()=>setBgOpen(o=>!o)} style={{width:"100%",background:"transparent",border:"none",color:C.tm,fontSize:11,cursor:"pointer",textAlign:"left",fontFamily:"'IBM Plex Mono',monospace"}}>{bgOpen?"\u25be":"\u25b8"} First-time setup / break-glass enrollment</button>
+          {bgOpen&&(<div style={{marginTop:12}}>
+            <M style={{color:C.td,display:"block",marginBottom:10,lineHeight:1.6}}>Enroll the first CISO/VP passkey on a new deployment using the one-time break-glass recovery credential shown at setup. Requires the operator's username.</M>
+            <Input label="Operator username" value={bgUsername} onChange={e=>setBgUsername(e.target.value)} placeholder="ciso"/>
+            <Input label="Break-glass recovery credential" value={bgRecovery} onChange={e=>setBgRecovery(e.target.value)} type="password" placeholder="recovery credential"/>
+            <Btn primary style={{width:"100%"}} onClick={handleBreakGlassEnroll} disabled={bgBusy}>{bgBusy?"Enrolling...":"Enroll first passkey"}</Btn>
+            {bgMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{bgMsg}</M>}
+          </div>)}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 export default function GlobalDashboard() {
   const [stage, setStage] = useState("login");
-  const [gdServerUrl, setGdServerUrl] = useState("http://localhost:4001");
+  const [gdServerUrl, setGdServerUrl] = useState("https://localhost:4001");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
@@ -1365,195 +1415,8 @@ export default function GlobalDashboard() {
   ];
 
   // LOGIN
-  if(stage==="login") {
-    // Helper: persist the JWT, set the api token, store the refresh token
-    // for /api/auth/refresh, and advance the app to welcome/app stage.
-    const finalizeLogin = (loginResponse) => {
-      if (loginResponse && loginResponse.accessToken) {
-        api.setToken(loginResponse.accessToken);
-      }
-      if (loginResponse && loginResponse.refreshToken) {
-        try { localStorage.setItem('fa_gd_refresh_token', loginResponse.refreshToken); } catch (_e) {}
-      }
-      setStage(firstLaunch ? "welcome" : "app");
-    };
+  if(stage==="login") return <GdLoginScreen onLoggedIn={()=>setStage(firstLaunch?"welcome":"app")} firstLaunch={firstLaunch} gdServerUrl={gdServerUrl} setGdServerUrl={setGdServerUrl} />;
 
-    const submitLogin = async () => {
-      if (!username || !password || !gdServerUrl) {
-        setLoginError("All fields required");
-        return;
-      }
-      setLoginError("");
-      setLoginInFlight(true);
-      api.setBaseUrl(gdServerUrl.replace(/\/+$/, ''));
-      const r = await api.post('/api/auth/login', { username, password });
-      setLoginInFlight(false);
-      if (r && r.error) {
-        setLoginError(typeof r.error === 'string' ? r.error : 'Login failed');
-        return;
-      }
-      // Three-path response handling per R3f
-      if (r && r.mfa_required && r.mfa_session_token) {
-        setMfaSessionToken(r.mfa_session_token);
-        setLoginStage("mfa");
-        return;
-      }
-      if (r && r.mfa_enrollment_required && r.mfa_session_token) {
-        setMfaSessionToken(r.mfa_session_token);
-        setLoginStage("enroll-start");
-        return;
-      }
-      if (r && r.accessToken && r.user) {
-        finalizeLogin(r);
-        return;
-      }
-      setLoginError("Unexpected login response");
-    };
-
-    const submitMfa = async () => {
-      const code = useRecoveryLogin ? recoveryCodeInput.trim() : mfaCode.trim();
-      if (!useRecoveryLogin && code.length < 6) return;
-      if (useRecoveryLogin && code.length === 0) { setLoginError("Enter recovery code"); return; }
-      setLoginError("");
-      setLoginInFlight(true);
-      const body = useRecoveryLogin
-        ? { mfa_session_token: mfaSessionToken, recovery_code: code }
-        : { mfa_session_token: mfaSessionToken, totp_code: code };
-      const r = await api.post('/api/auth/login-mfa', body);
-      setLoginInFlight(false);
-      if (r && r.error) {
-        setLoginError(typeof r.error === 'string' ? r.error : 'MFA verification failed');
-        return;
-      }
-      if (r && r.accessToken && r.user) {
-        finalizeLogin(r);
-        return;
-      }
-      setLoginError("Unexpected MFA response");
-    };
-
-    const submitEnrollStart = async () => {
-      setLoginError("");
-      setLoginInFlight(true);
-      const r = await api.post('/api/auth/login-enroll-start', { mfa_session_token: mfaSessionToken });
-      setLoginInFlight(false);
-      if (r && r.error) {
-        setLoginError(typeof r.error === 'string' ? r.error : 'Failed to start enrollment');
-        return;
-      }
-      if (!r || !r.secret_base32) {
-        setLoginError("Enrollment response was incomplete");
-        return;
-      }
-      setEnrollData(r);
-      setEnrollConfirmCode("");
-      setLoginStage("enroll-confirm");
-    };
-
-    const submitEnrollConfirm = async () => {
-      if (enrollConfirmCode.length < 6) { setLoginError("Enter 6-digit code"); return; }
-      setLoginError("");
-      setLoginInFlight(true);
-      const r = await api.post('/api/auth/login-enroll-confirm', {
-        mfa_session_token: mfaSessionToken,
-        totp_code: enrollConfirmCode,
-      });
-      setLoginInFlight(false);
-      if (r && r.error) {
-        setLoginError(typeof r.error === 'string' ? r.error : 'Enrollment confirmation failed');
-        return;
-      }
-      if (!r || !r.accessToken || !r.user || !Array.isArray(r.recovery_codes)) {
-        setLoginError("Enrollment response was incomplete");
-        return;
-      }
-      // Hold the JWT response until the user has acknowledged the recovery
-      // codes display. finalizeLogin runs from the recovery-display screen
-      // when the user clicks "I've saved my recovery codes".
-      setRecoveryCodesDisplay(r.recovery_codes);
-      setPendingLoginResponse(r);
-      setEnrollConfirmCode("");
-      setLoginStage("recovery-display");
-    };
-
-    const acknowledgeRecoveryCodes = () => {
-      if (pendingLoginResponse) {
-        finalizeLogin(pendingLoginResponse);
-      }
-    };
-
-    return (
-    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
-      <style>{CSS}</style>
-      <div style={{width:480,padding:40,background:C.s,border:`1px solid ${C.b}`,borderRadius:16}}>
-        <div style={{textAlign:"center",marginBottom:32}}>
-          <div style={{fontSize:28,fontWeight:600,color:C.a,fontFamily:"'Fraunces',serif",marginBottom:4}}>FireAlive</div>
-          <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase"}}>Global Dashboard Login</M>
-        </div>
-        {loginStage==="creds"&&(<div>
-          <Input label="GD-Server URL" value={gdServerUrl} onChange={e=>setGdServerUrl(e.target.value)} placeholder="https://gd.corp.com:4001"/>
-          <Input label="Username" value={username} onChange={e=>setUsername(e.target.value)} placeholder="ciso@corp.com" disabled={loginInFlight}/>
-          <Input label="Password" value={password} onChange={e=>setPassword(e.target.value)} type="password" disabled={loginInFlight}/>
-          <button onClick={submitLogin} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",fontFamily:"'IBM Plex Mono',monospace",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Signing in...":"Sign In"}</button>
-        </div>)}
-        {loginStage==="mfa"&&(<div>
-          <M style={{color:C.tm,display:"block",marginBottom:16}}>{useRecoveryLogin?"Enter one of your single-use recovery codes":"Enter MFA code from your authenticator app"}</M>
-          {!useRecoveryLogin && (
-            <Input label="MFA Code" value={mfaCode} onChange={e=>setMfaCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="123456" maxLength={6} disabled={loginInFlight}/>
-          )}
-          {useRecoveryLogin && (
-            <Input label="Recovery Code" value={recoveryCodeInput} onChange={e=>setRecoveryCodeInput(e.target.value.toUpperCase().slice(0,32))} placeholder="ABCD-1234-EFGH" maxLength={32} disabled={loginInFlight}/>
-          )}
-          <button onClick={submitMfa} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Verifying...":"Verify"}</button>
-          <button onClick={()=>{setUseRecoveryLogin(!useRecoveryLogin);setLoginError("");setMfaCode("");setRecoveryCodeInput("");}} style={{width:"100%",marginTop:10,padding:8,background:"transparent",border:"none",color:C.tm,fontSize:11,cursor:"pointer",textDecoration:"underline"}}>{useRecoveryLogin?"Use authenticator code instead":"Use a recovery code instead"}</button>
-          <Btn small onClick={()=>{setLoginStage("creds");setMfaCode("");setRecoveryCodeInput("");setUseRecoveryLogin(false);setMfaSessionToken(null);setLoginError("");}} style={{width:"100%",marginTop:8}}>Back</Btn>
-        </div>)}
-        {loginStage==="enroll-start"&&(<div>
-          <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:10}}>MFA Enrollment Required</div>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Your role requires multi-factor authentication. You will scan a QR code into an authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter a verification code.</M>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>You will receive 10 single-use recovery codes after enrollment. Save them in a secure place; they are your only way back into your account if you lose access to your authenticator.</M>
-          <button onClick={submitEnrollStart} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Preparing...":"Begin Enrollment"}</button>
-        </div>)}
-        {loginStage==="enroll-confirm"&&enrollData&&(<div>
-          <div style={{fontSize:14,fontWeight:600,color:C.t,marginBottom:10}}>Scan QR Code</div>
-          <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Scan with your authenticator app, then enter the 6-digit code it generates.</M>
-          <div style={{background:"#fff",borderRadius:8,padding:12,textAlign:"center",marginBottom:12}}>
-            {enrollData.qr_png_data_url ? (
-              <img src={enrollData.qr_png_data_url} alt="TOTP QR code" style={{width:200,height:200}}/>
-            ) : (
-              <div style={{width:200,height:200,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",border:"2px dashed #ccc",borderRadius:8,color:"#666",fontSize:11,padding:8}}>QR rendering unavailable.<br/>Use manual entry below.</div>
-            )}
-          </div>
-          <details style={{marginBottom:12}}>
-            <summary style={{cursor:"pointer",color:C.tm,fontSize:11,marginBottom:8}}>Can't scan? Enter manually</summary>
-            <div style={{padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,marginTop:8}}>
-              <M style={{color:C.td,display:"block",marginBottom:6}}>Secret (base32):</M>
-              <code style={{display:"block",color:C.t,fontSize:12,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.secret_base32}</code>
-              <M style={{color:C.td,display:"block",marginTop:10,marginBottom:6}}>Or paste this URL into a TOTP-aware app:</M>
-              <code style={{display:"block",color:C.t,fontSize:10,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.otpauth_url}</code>
-            </div>
-          </details>
-          <Input label="6-digit code from authenticator" value={enrollConfirmCode} onChange={e=>setEnrollConfirmCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6} disabled={loginInFlight}/>
-          <button onClick={submitEnrollConfirm} disabled={loginInFlight} style={{width:"100%",padding:12,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:loginInFlight?"wait":"pointer",opacity:loginInFlight?0.6:1}}>{loginInFlight?"Confirming...":"Confirm Enrollment"}</button>
-        </div>)}
-        {loginStage==="recovery-display"&&recoveryCodesDisplay&&(<div>
-          <div style={{fontSize:14,fontWeight:600,color:C.a,marginBottom:10}}>Save Your Recovery Codes</div>
-          <M style={{color:C.d,display:"block",marginBottom:10,lineHeight:1.6,fontWeight:500}}>These codes will not be shown again. Each can be used once if you lose access to your authenticator.</M>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Print them, store them in a password manager, or write them down. The server cannot recover them.</M>
-          <div style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,padding:14,marginBottom:12,fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:C.t,lineHeight:1.8,userSelect:"all"}}>
-            {recoveryCodesDisplay.map((c,i)=><div key={i}>{c}</div>)}
-          </div>
-          <button onClick={()=>{ try { if (navigator && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(recoveryCodesDisplay.join("\n")); } catch (_e) {} }} style={{width:"100%",marginBottom:8,padding:10,background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Copy all to clipboard</button>
-          <button onClick={acknowledgeRecoveryCodes} style={{width:"100%",padding:12,background:C.ad,border:`1px solid ${C.a}50`,borderRadius:8,color:C.a,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>I've saved my recovery codes</button>
-        </div>)}
-        {loginError&&<div style={{marginTop:16,padding:10,background:"rgba(239,68,68,0.08)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>{loginError}</div>}
-        <M style={{color:C.td,display:"block",textAlign:"center",marginTop:24}}>FireAlive · AGPL-3.0</M>
-      </div>
-    </div>
-  );
-  }
-
-  // WELCOME
   if(stage==="welcome") return(
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
       <style>{CSS}</style>

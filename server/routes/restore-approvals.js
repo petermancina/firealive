@@ -12,7 +12,7 @@
 //   GET    /api/restore-approvals                        list w/ filters
 //   GET    /api/restore-approvals/:id                    single (admin/lead OR
 //                                                         original requester)
-//   POST   /api/restore-approvals/:id/approve            admin + TOTP required
+//   POST   /api/restore-approvals/:id/approve            admin + step-up required
 //   POST   /api/restore-approvals/:id/deny               admin/lead
 //
 // Auth model:
@@ -22,12 +22,13 @@
 //   matches how routes/team.js etc. are scoped at mount but tighten per-
 //   handler when needed.
 //
-// TOTP gate (approve only):
+// Step-up gate (approve only):
 //   The service contract for approvalsSvc.approve() requires
-//   totp_verified=true. This route enforces it by calling totp.verify()
-//   with the user-supplied code BEFORE delegating to the service. A TOTP
-//   failure short-circuits with a 401/403/429 (per totpCodeToHttpStatus)
-//   and never touches the approval row.
+//   totp_verified=true. This route satisfies it with a fresh,
+//   user-verified WebAuthn step-up assertion (the mfaStepUp middleware)
+//   supplied in body.stepup BEFORE delegating to the service. A step-up
+//   failure short-circuits in the middleware (401/400) and never touches
+//   the approval row.
 //
 // Audit log:
 //   Every state-changing operation writes a RESTORE_APPROVAL_* event via
@@ -43,7 +44,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const approvalsSvc = require('../services/restore-approvals');
-const totp = require('../services/totp');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 // ── Validation + helpers ─────────────────────────────────────────────────────
 
@@ -100,39 +101,9 @@ function approvalCodeToHttpStatus(code) {
   }
 }
 
-// Map TotpError code -> HTTP status.
-function totpCodeToHttpStatus(code) {
-  switch (code) {
-    case totp.CODES.INVALID_INPUT:
-      return 400;
-    case totp.CODES.USER_NOT_FOUND:
-      return 404;
-    case totp.CODES.NOT_ENROLLED:
-      return 403;
-    case totp.CODES.ALREADY_ENROLLED:
-      return 409;
-    case totp.CODES.CODE_INVALID:
-    case totp.CODES.CODE_REPLAY:
-      return 401;
-    case totp.CODES.LOCKED_OUT:
-      return 429;
-    case totp.CODES.ENCRYPTION_NOT_CONFIGURED:
-      return 500;
-    default:
-      return 500;
-  }
-}
-
 function sendApprovalError(res, err) {
   const status = approvalCodeToHttpStatus(err.code);
   const body = { error: err.message, code: err.code };
-  if (err.detail !== undefined) body.detail = err.detail;
-  res.status(status).json(body);
-}
-
-function sendTotpError(res, err) {
-  const status = totpCodeToHttpStatus(err.code);
-  const body = { error: err.message, code: `TOTP_${err.code}` };
   if (err.detail !== undefined) body.detail = err.detail;
   res.status(status).json(body);
 }
@@ -320,55 +291,40 @@ router.get('/:id', (req, res) => {
   }
 });
 
-// ── POST /api/restore-approvals/:id/approve — admin + TOTP ──────────────────
+// ── POST /api/restore-approvals/:id/approve — admin + step-up ────────────
 //
-// Auth: admin only.
-// Body: { totp_code: string (required, 6 digits) }
+// Auth: admin only, plus a fresh WebAuthn step-up assertion.
+// Body: { stepup: { challengeToken, response } }  (verified by mfaStepUp)
 //
 // Flow:
-//   1. Role check (admin)
-//   2. TOTP verify (totp.verify) -- on failure, short-circuit with TOTP error
-//   3. Delegate to approvalsSvc.approve() with totp_verified=true
+//   1. approveAdminGate -- refuse non-admins (403) before any step-up
+//      processing, so the step-up surface is admin-only
+//   2. mfaStepUp() -- require a fresh user-verified WebAuthn assertion; a
+//      failure short-circuits in the middleware (401/400) and never
+//      touches the approval row
+//   3. Delegate to approvalsSvc.approve() with totp_verified=true -- the
+//      service's "a second factor was verified" guard, now satisfied by
+//      the step-up middleware
 //   4. Audit log RESTORE_APPROVAL_APPROVED on success
 //
 // The service enforces the per-mode rules:
 //   strict                 approver must differ from requester
 //   delayed-self-approval  approver may be requester only after window elapsed
 //   disabled               this method always rejects (auto-approved at creation)
-router.post('/:id/approve', (req, res) => {
+
+// Admin-gate middleware: 403 before any step-up processing, so non-admins
+// never reach (or can probe) the step-up verification.
+function approveAdminGate(req, res, next) {
   if (!checkRole(req, res, ['admin'])) return;
+  next();
+}
 
-  const totpCode = (req.body && typeof req.body.totp_code === 'string') ? req.body.totp_code : null;
-  if (!totpCode) {
-    return res.status(400).json({
-      error: 'totp_code is required',
-      code: 'INVALID_INPUT',
-    });
-  }
-
+router.post('/:id/approve', approveAdminGate, mfaStepUp(), (req, res) => {
   const db = getDb();
   const ip = req.ip || null;
 
-  // Step 1 -- TOTP verify. Failures here never touch the approval row.
-  try {
-    totp.verify(db, req.user.id, totpCode, ip);
-  } catch (err) {
-    if (err instanceof totp.TotpError) {
-      auditLog(
-        req.user.id,
-        'RESTORE_APPROVAL_APPROVE_TOTP_FAIL',
-        `approval_id=${req.params.id} totp_code_failure=${err.code}`,
-        ip,
-      );
-      return sendTotpError(res, err);
-    }
-    logger.error('Restore approval approve: TOTP verify threw unexpectedly', {
-      error: err.message, stack: err.stack,
-    });
-    return res.status(500).json({ error: 'internal error', code: 'INTERNAL' });
-  }
-
-  // Step 2 -- delegate to service. TOTP just verified, so we pass true.
+  // The step-up middleware already verified a fresh user-verified assertion,
+  // so delegate straight to the service.
   try {
     const result = approvalsSvc.approve(db, {
       id: req.params.id,
@@ -407,6 +363,7 @@ router.post('/:id/approve', (req, res) => {
     return res.status(500).json({ error: 'internal error', code: 'INTERNAL' });
   }
 });
+
 
 // ── POST /api/restore-approvals/:id/deny ────────────────────────────────────
 //

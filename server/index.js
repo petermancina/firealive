@@ -18,7 +18,10 @@ const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { isIP } = require('net');
 const path = require('path');
-const { initDb, getDb } = require('./db/init');
+const https = require('https');
+const fs = require('fs');
+const { initDb, getDb, DB_PATH } = require('./db/init');
+const ca = require('./services/ca');
 const { logger } = require('./services/logger');
 const { auditMiddleware } = require('./middleware/audit');
 const { authMiddleware } = require('./middleware/auth');
@@ -151,6 +154,26 @@ app.use('/api/', auditMiddleware);
 
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
+// ── B5b: public CA certificate distribution ─────────────────────────────────
+// Unauthenticated by necessity -- a client must obtain and trust the CA cert
+// BEFORE it can present a client certificate or trust the TLS server cert. This
+// serves ONLY the public CA certificate, never the key. Desktop apps also
+// bundle-trust this CA out-of-band; this endpoint is a convenience/re-fetch
+// channel.
+app.get('/ca-cert', (req, res) => {
+  const db = getDb();
+  try {
+    const pem = ca.getCaCertPem(db);
+    if (!pem) return res.status(503).type('text/plain').send('CA not initialized');
+    return res
+      .type('application/x-pem-file')
+      .set('Content-Disposition', 'attachment; filename="firealive-ca.pem"')
+      .send(pem);
+  } finally {
+    try { db.close(); } catch (_) { /* ignore */ }
+  }
+});
+
 app.use('/api/auth', require('./routes/auth'));
 app.get('/api/system/health', require('./routes/system')); // health check is public
 
@@ -267,11 +290,91 @@ app.use((err, req, res, next) => {
 });
 
 // ── Startup ──────────────────────────────────────────────────────────────────
+// ── B5b: built-in CA + HTTPS/WSS material ────────────────────────────────────
+// FireAlive serves only over HTTPS, and the WebSocket server rides the same
+// listener as WSS. There is no plaintext listener and no dev-HTTP escape hatch;
+// if TLS material cannot be established this throws, and start()'s catch exits
+// the process (fail-closed) rather than fall back to cleartext.
+//
+// On first boot the built-in CA self-initializes, mints the one-time break-glass
+// recovery credential (logged once, here, for offline capture), and issues the
+// localhost TLS server certificate. The server leaf cert+key are persisted under
+// the data directory and reused across boots; they are re-issued only if missing,
+// expired, or no longer chaining to the active CA (e.g. after a CA reset). The
+// server key is a 0600 file because a non-interactive boot must load it without a
+// passphrase -- standard TLS practice, and a far lower-value secret than the CA
+// key (which stays AES-256-GCM encrypted in the database).
+function bootstrapTlsMaterial() {
+  const { X509Certificate } = require('crypto');
+  const db = getDb();
+  try {
+    ca.initCa(db);
+
+    const rec = ca.ensureRecoveryCredential(db);
+    if (rec.created) {
+      logger.warn(
+        '\n================================================================\n' +
+        ' BREAK-GLASS RECOVERY CREDENTIAL (shown once -- store offline NOW)\n' +
+        '   ' + rec.recoveryCredential + '\n' +
+        ' This is displayed only at first CA initialization. It re-provisions\n' +
+        ' an admin authenticator at the audited recovery endpoint if every\n' +
+        ' other credential is lost. Only its hash is stored; it cannot be\n' +
+        ' recovered if not captured now.\n' +
+        '================================================================'
+      );
+    }
+
+    const caCertPem = ca.getCaCertPem(db);
+    const dataDir = path.dirname(DB_PATH);
+    const certPath = path.join(dataDir, 'server-tls.crt');
+    const keyPath = path.join(dataDir, 'server-tls.key');
+
+    let certPem = null;
+    let keyPem = null;
+    if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+      try {
+        const c = fs.readFileSync(certPath, 'utf8');
+        const k = fs.readFileSync(keyPath, 'utf8');
+        const x = new X509Certificate(c);
+        const caX = new X509Certificate(caCertPem);
+        const now = Date.now();
+        const chains = x.verify(caX.publicKey);
+        const inWindow = now >= Date.parse(x.validFrom) && now <= Date.parse(x.validTo);
+        if (chains && inWindow) {
+          certPem = c;
+          keyPem = k;
+        }
+      } catch (_) {
+        // unreadable/parse failure -> re-issue below
+      }
+    }
+
+    if (!certPem) {
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+      const issued = ca.issueServerCert(db, { commonName: 'localhost' });
+      certPem = issued.certPem;
+      keyPem = issued.keyPem;
+      fs.writeFileSync(keyPath, keyPem, { mode: 0o600 });
+      fs.writeFileSync(certPath, certPem, { mode: 0o644 });
+      try { fs.chmodSync(keyPath, 0o600); } catch (_) { /* best effort */ }
+      logger.info('Issued new TLS server certificate (localhost)');
+    }
+
+    return { key: keyPem, cert: certPem, ca: caCertPem };
+  } finally {
+    try { db.close(); } catch (_) { /* ignore */ }
+  }
+}
+
 async function start() {
   try {
     // Initialize database
     initDb();
     logger.info('Database initialized');
+
+    // B5b: built-in CA + HTTPS/WSS material (fail-closed; no plaintext listener).
+    const tlsMaterial = bootstrapTlsMaterial();
+    logger.info('TLS material ready (built-in CA)');
 
     // Start scheduled jobs (report generation, backup, signal aggregation)
     schedulerService.start();
@@ -364,9 +467,23 @@ async function start() {
     }, 120000);
     abuseExportRelayTimer.unref();
 
-    const server = app.listen(PORT, HOST, () => {
+    const server = https.createServer({
+      key: tlsMaterial.key,
+      cert: tlsMaterial.cert,
+      ca: tlsMaterial.ca,
+      // Client certificates are REQUESTED at the TLS handshake but not REQUIRED
+      // there (rejectUnauthorized:false): when allow_password is enabled,
+      // password/LDAP-exception users must still be able to connect and then
+      // authenticate at the app layer. Encryption itself is never optional --
+      // there is no plaintext listener. mTLS client-cert AUTHENTICATION is
+      // enforced in routes/auth.js, which passes the presented peer certificate
+      // to ca.verifyClientCert.
+      requestCert: true,
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+    }, app).listen(PORT, HOST, () => {
       const pkg = require('../package.json');
-      logger.info(`FireAlive v${pkg.version} running on http://${HOST}:${PORT}`);
+      logger.info(`FireAlive v${pkg.version} running on https://${HOST}:${PORT}`);
       validatePortBinding(server, parseInt(PORT, 10));
     });
 

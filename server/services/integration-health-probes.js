@@ -91,14 +91,16 @@ async function storageProbe(db) {
 }
 
 // ── LDAP / Active Directory ─────────────────────────────────────────────────
-// Reads the IAM config from team_config; activates a real bind when LDAP
-// connection fields are present. The bind itself is a minimal connectivity bind
-// (no directory search). Live binding is scaffolded in integrations/ldap.js and
-// becomes a real network check when the production bind path is enabled there.
+// Reads the LDAP connection config from integration_config (the encrypted
+// 'iam_ldap' entry the IAM admin saves, and the same source the offboarding
+// detector uses), then runs a minimal connectivity bind via integrations/
+// ldap.js (no directory search). Returns null when no config is present.
 function _loadIamConfig(db) {
   try {
-    const r = db.prepare("SELECT value FROM team_config WHERE key = 'iam_config'").get();
-    return r && r.value ? JSON.parse(r.value) : null;
+    const row = db.prepare("SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap'").get();
+    if (!row || !row.config_encrypted) return null;
+    const { decryptConfig } = require('./encryption');
+    return decryptConfig(row.config_encrypted) || null;
   } catch { return null; }
 }
 

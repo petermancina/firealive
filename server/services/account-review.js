@@ -11,6 +11,8 @@
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
+const { LdapClient } = require('../integrations/ldap');
+const { decryptConfig } = require('./encryption');
 
 const STALE_THRESHOLD_DAYS = 90;
 const SUSPICIOUS_API_CALLS_PER_HOUR = 500;
@@ -160,4 +162,121 @@ function runAccountReview() {
   return findings;
 }
 
-module.exports = { runAccountReview, STALE_THRESHOLD_DAYS };
+// ═══════════════════════════════════════════════════════════════════════════════
+// B5b — Offboarding detection (surface-only)
+//
+// Flags users who appear to have departed — absent from the directory (a real
+// LDAPS presence check, FAIL-SAFE: a directory error is treated as UNKNOWN,
+// never as absent), whose certificate access has been revoked or has expired,
+// or who have gone stale — into offboarding_candidates (status 'pending'). It
+// NEVER deactivates an account; a human resolves each candidate via the
+// management surface. The partial-unique index on offboarding_candidates keeps
+// at most one open (pending) candidate per user, so re-runs do not duplicate.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const OFFBOARD_STALE_DAYS = 90;
+
+// Decide the single highest-priority offboarding source for a user, or null.
+// Priority: ldap_absent > cert_revoked > cert_expired > stale.
+async function classifyOffboardingSource(db, ldap, u, staleCutoff) {
+  // 1. Directory absence (fail-safe). Only when we have a directory client and
+  //    a directory identity to look up.
+  if (ldap && (u.username || u.external_id)) {
+    try {
+      const result = await ldap.userExists(u.username || u.external_id);
+      // found:false WITHOUT an error is a definitive directory miss. found:false
+      // WITH an error means the directory was unreachable/erroring → treat as
+      // UNKNOWN and do not flag.
+      if (result && result.found === false && !result.error) {
+        return { source: 'ldap_absent', detail: `Not present in directory (looked up ${u.username || u.external_id}).` };
+      }
+    } catch (_) {
+      // unreachable → unknown → no flag (fail-safe)
+    }
+  }
+
+  // 2/3. Certificate state — only meaningful for users who have ever held a
+  //      certificate. A status of 'active' with a past expires_at is treated as
+  //      expired (nothing flips the stored status on expiry).
+  const certs = db.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'active' AND expires_at > datetime('now') THEN 1 ELSE 0 END) AS valid,
+      SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END) AS revoked,
+      SUM(CASE WHEN status = 'expired' OR (status = 'active' AND expires_at <= datetime('now')) THEN 1 ELSE 0 END) AS expired,
+      COUNT(*) AS total
+    FROM issued_certs WHERE user_id = ?
+  `).get(u.id);
+  if (certs && certs.total > 0 && (certs.valid || 0) === 0) {
+    if ((certs.revoked || 0) > 0) {
+      return { source: 'cert_revoked', detail: `All ${certs.total} issued certificate(s) revoked; none active.` };
+    }
+    if ((certs.expired || 0) > 0) {
+      return { source: 'cert_expired', detail: `All ${certs.total} issued certificate(s) expired; none active.` };
+    }
+  }
+
+  // 4. Stale — an established account with no recent login or directory check.
+  //    A freshly-created account (created after the cutoff) is never flagged
+  //    stale just because it has not logged in yet.
+  const lastSeen = u.last_login || u.last_iam_check || null;
+  if (u.created_at && u.created_at < staleCutoff && (!lastSeen || lastSeen < staleCutoff)) {
+    return { source: 'stale', detail: `No activity since ${lastSeen || 'never'} (threshold ${OFFBOARD_STALE_DAYS}d).` };
+  }
+
+  return null;
+}
+
+// Run offboarding detection across the human SOC roles. Surface-only: inserts
+// pending candidates, never deactivates. Returns a summary.
+async function runOffboardingDetection() {
+  const db = getDb();
+  const detected = [];
+  try {
+    // Directory client — only if LDAP is configured + reachable enough to have
+    // a saved config. (userExists is itself fail-safe per directory error.)
+    let ldap = null;
+    try {
+      const row = db.prepare(
+        "SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap' AND status IN ('configured','operational')"
+      ).get();
+      if (row && row.config_encrypted) {
+        const cfg = decryptConfig(row.config_encrypted);
+        if (cfg && cfg.server) ldap = new LdapClient(cfg);
+      }
+    } catch (e) {
+      logger.warn('Offboarding detection: LDAP config unavailable; directory checks skipped', { error: e.message });
+    }
+
+    const staleCutoff = new Date(Date.now() - OFFBOARD_STALE_DAYS * 86400000).toISOString();
+    const users = db.prepare(
+      "SELECT id, username, external_id, last_login, last_iam_check, created_at FROM users WHERE active = 1 AND role IN ('analyst','lead','admin')"
+    ).all();
+
+    for (const u of users) {
+      let src = null;
+      try {
+        src = await classifyOffboardingSource(db, ldap, u, staleCutoff);
+      } catch (e) {
+        logger.warn('Offboarding classify failed for a user; skipping', { error: e.message });
+        continue;
+      }
+      if (!src) continue;
+      const r = db.prepare(`
+        INSERT OR IGNORE INTO offboarding_candidates (user_id, source, detail, status)
+        VALUES (?, ?, ?, 'pending')
+      `).run(u.id, src.source, src.detail);
+      if (r.changes > 0) detected.push({ userId: u.id, source: src.source, detail: src.detail });
+    }
+
+    auditLog(null, 'OFFBOARDING_DETECTION', `scanned=${users.length} new_candidates=${detected.length}`, null);
+    logger.info('Offboarding detection complete', { scanned: users.length, newCandidates: detected.length });
+    return { scanned: users.length, newCandidates: detected.length, detected };
+  } catch (err) {
+    logger.error('Offboarding detection error', { error: err.message });
+    return { scanned: 0, newCandidates: 0, detected: [], error: err.message };
+  } finally {
+    db.close();
+  }
+}
+
+module.exports = { runAccountReview, STALE_THRESHOLD_DAYS, runOffboardingDetection, classifyOffboardingSource, OFFBOARD_STALE_DAYS };

@@ -8,6 +8,9 @@ COPY .env.example .env
 RUN find server/ -name "*.js" -exec sha256sum {} \; > /app/integrity-manifest.sha256
 FROM node:24-alpine
 WORKDIR /app
+# B5b: the built-in CA issues certificates by shelling out to the openssl CLI.
+# Alpine ships libcrypto but not the openssl binary, so install it at runtime.
+RUN apk add --no-cache openssl
 RUN addgroup -g 1001 firealive && adduser -u 1001 -G firealive -s /bin/sh -D firealive
 COPY --from=builder /app /app
 RUN chmod -R 550 /app/server && mkdir -p /app/data /app/backups /app/logs && chown -R firealive:firealive /app/data /app/backups /app/logs

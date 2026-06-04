@@ -31,7 +31,7 @@ const C = {
 };
 
 // ── API Client ──────────────────────────────────────────────────────────────
-const API_BASE = 'http://localhost:3000';
+const API_BASE = 'https://localhost:3000';
 const api = {
   _token: null,
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
@@ -365,50 +365,109 @@ function generateCEF(th, type, version) {
 // ║  LOGIN                                                                  ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
+// ── WebAuthn (de)serialization for navigator.credentials ─────────────────────
+// The server speaks base64url JSON (via @simplewebauthn); the browser WebAuthn
+// API speaks ArrayBuffers. Convert the assertion options on the way in and the
+// produced assertion on the way out.
+function b64urlToBuf(s) {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const bin = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function bufToB64url(buf) {
+  const u = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function deserializeAuthOptions(options) {
+  return {
+    ...options,
+    challenge: b64urlToBuf(options.challenge),
+    allowCredentials: (options.allowCredentials || []).map((c) => ({
+      ...c,
+      id: b64urlToBuf(c.id),
+    })),
+  };
+}
+function serializeAssertion(cred) {
+  const r = cred.response;
+  return {
+    id: cred.id,
+    rawId: bufToB64url(cred.rawId),
+    type: cred.type,
+    response: {
+      authenticatorData: bufToB64url(r.authenticatorData),
+      clientDataJSON: bufToB64url(r.clientDataJSON),
+      signature: bufToB64url(r.signature),
+      userHandle: r.userHandle ? bufToB64url(r.userHandle) : null,
+    },
+    clientExtensionResults:
+      typeof cred.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : {},
+  };
+}
+
+function deserializeRegOptions(options) {
+  return {
+    ...options,
+    challenge: b64urlToBuf(options.challenge),
+    user: { ...options.user, id: b64urlToBuf(options.user.id) },
+    excludeCredentials: (options.excludeCredentials || []).map((c) => ({
+      ...c,
+      id: b64urlToBuf(c.id),
+    })),
+  };
+}
+function serializeAttestation(cred) {
+  const r = cred.response;
+  return {
+    id: cred.id,
+    rawId: bufToB64url(cred.rawId),
+    type: cred.type,
+    response: {
+      attestationObject: bufToB64url(r.attestationObject),
+      clientDataJSON: bufToB64url(r.clientDataJSON),
+      transports: typeof r.getTransports === "function" ? r.getTransports() : [],
+    },
+    clientExtensionResults:
+      typeof cred.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : {},
+  };
+}
+
 function LoginScreen({role, onLogin, onBack}) {
-  // ── Stages ────────────────────────────────────────────────────────────────
-  //   creds              username + password entry
-  //   mfa                user is enrolled; enter TOTP or recovery code
-  //   enroll-start       enrollment-required user; intro screen + Begin button
-  //   enroll-confirm     showing QR / otpauth URL; user enters first TOTP
-  //   recovery-display   showing 10 plaintext recovery codes once
-  //   verify             success animation pre-onLogin
+  // ── Passwordless login ──────────────────────────────────────────────────────
+  // Two phishing-resistant methods, both AAL3, no password and no TOTP:
+  //   - a FIDO2/WebAuthn passkey (discoverable/resident key; the assertion is
+  //     produced by the authenticator in the renderer and verified server-side),
+  //   - a hardware client certificate (PIV/CAC) presented from the OS store at
+  //     the TLS handshake (the main process selects it).
+  // The renderer talks to its bundled server over HTTPS, so the FireAlive CA must
+  // be trusted (pinned in the main process). Until it is, API calls fail and the
+  // CA-import panel is shown in place of the sign-in buttons.
   //
-  // The new /api/auth/login response can be one of three shapes:
-  //   { mfa_required: true, mfa_session_token, accepts: [...] }
-  //   { mfa_enrollment_required: true, mfa_session_token, enroll_endpoints }
-  //   { accessToken, refreshToken, user }
-  // The first two require the client to follow up via /login-mfa or
-  // /login-enroll-start + /login-enroll-confirm before a JWT is issued.
+  // Stages: "creds" = method choice (or CA import); "verify" = success animation.
   const [stage, setStage] = useState("creds");
-  const [user, setUser] = useState("");
-  const [pass, setPass] = useState("");
-  const [mfa, setMfa] = useState("");
-  const [recoveryCode, setRecoveryCode] = useState("");
-  const [useRecovery, setUseRecovery] = useState(false);
-  const [mfaSessionToken, setMfaSessionToken] = useState("");
-  const [enrollData, setEnrollData] = useState(null);     // { secret_base32, otpauth_url, qr_png_data_url }
-  const [enrollConfirmCode, setEnrollConfirmCode] = useState("");
-  const [recoveryCodes, setRecoveryCodes] = useState(null); // shown once after enrollment
-  const [pendingLogin, setPendingLogin] = useState(null);   // login response held until user dismisses recovery codes
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [apiMode, setApiMode] = useState(null);
   const [loginVersion, setLoginVersion] = useState("");
+  const [caStatus, setCaStatus] = useState(null);   // null=checking; { pinned, subject?, unmanaged? }
+  const [caPem, setCaPem] = useState("");
+  const [caImporting, setCaImporting] = useState(false);
 
   const roleLabel = "FireAlive";
   const roleGroup = role==="analyst"?"soc_analyst_group":"soc_teamlead_group";
 
-  // Probe backend availability. apiMode true = real API path; false = demo
-  // mode (offline-dev fallback that simulates the flow without making
-  // network calls so the UI is testable without a backend).
+  // Probe backend availability. This is also an implicit CA-trust check: if the
+  // FireAlive CA is not yet pinned, the HTTPS probe fails and apiMode is false.
   useEffect(()=>{
     if(window.FireAliveAPI && window.FireAliveAPI.system){
       window.FireAliveAPI.system.health()
         .then(d=>{ if(d && d.status==='healthy') setApiMode(true); else setApiMode(false); })
         .catch(()=>setApiMode(false));
     } else {
-      // No FireAliveAPI bridge -- probe directly via the api helper.
       api.get("/api/system/health").then(r=>{
         setApiMode(r && r.status==='healthy');
       }).catch(()=>setApiMode(false));
@@ -425,6 +484,17 @@ function LoginScreen({role, onLogin, onBack}) {
     setMcIntegrityLoading(true);
     api.get("/api/audit/integrity").then(r=>setMcIntegrity(r||null)).finally(()=>setMcIntegrityLoading(false));
   },[tab]);
+
+  // Whether the FireAlive CA is pinned in the main process. The renderer cannot
+  // reach its own server over HTTPS until it is. No Electron bridge (a plain
+  // browser) is treated as unmanaged so the sign-in buttons still render.
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setCaStatus({ pinned: true, unmanaged: true }); return; }
+    bridge.invoke("auth:caStatus")
+      .then(s=>setCaStatus(s || { pinned: false }))
+      .catch(()=>setCaStatus({ pinned: false }));
+  },[]);
 
   // ── Phase U3: provision this lead's Signal pre-key bundle on login ──────────
   // The management console is the lead-side client. On login we initialize the
@@ -456,8 +526,9 @@ function LoginScreen({role, onLogin, onBack}) {
   };
 
   // Centralized JWT-issuance handler. Sets the token on the api helper so
-  // subsequent calls authenticate correctly, persists the refresh token
-  // for /api/auth/refresh, and hands control back to the parent component.
+  // subsequent calls authenticate correctly, persists the refresh token for
+  // /api/auth/refresh, provisions the lead E2EE keys for the authenticated
+  // user id, and hands control back to the parent component.
   const finalizeLogin = (loginResponse) => {
     if (loginResponse && loginResponse.accessToken) {
       api.setToken(loginResponse.accessToken);
@@ -465,15 +536,14 @@ function LoginScreen({role, onLogin, onBack}) {
     if (loginResponse && loginResponse.refreshToken) {
       try { localStorage.setItem('fa_refresh_token', loginResponse.refreshToken); } catch (_e) {}
     }
-    bootstrapLeadE2EE(user);
+    bootstrapLeadE2EE(loginResponse && loginResponse.user ? loginResponse.user.id : null);
     setStage("verify");
     setTimeout(()=>onLogin(),800);
   };
 
-  // Role-match gate: same logic as the prior demo-mode flow, kept here so
-  // analysts logging into the MC and managers logging into the AC still
-  // get rejected client-side. (Server-side role enforcement is still the
-  // authoritative check via authMiddleware role lists.)
+  // Role-match gate: an analyst signing into the MC, or a manager into the AC,
+  // is rejected client-side. (Server-side role enforcement via authMiddleware
+  // role lists remains the authoritative check.)
   const roleMismatch = (userObj) => {
     if (!userObj) return false;
     if (role==="analyst" && userObj.role!=="analyst") return true;
@@ -481,164 +551,91 @@ function LoginScreen({role, onLogin, onBack}) {
     return false;
   };
 
-  const handleCreds = async () => {
-    if(!user.trim()||!pass.trim()){setError("Username and password required.");return;}
+  // Passkey sign-in: fetch assertion options (usernameless / discoverable), have
+  // the authenticator produce a user-verified assertion in the renderer, and
+  // verify it server-side for a session.
+  const handlePasskeyLogin = async () => {
     setLoading(true); setError("");
-
-    // Demo mode: simulate the enrolled-MFA path (most common case for
-    // testing the UI).
-    if (apiMode === false) {
-      setTimeout(()=>{setLoading(false); setStage("mfa");},700);
-      return;
-    }
-
     try {
-      const r = await api.post("/api/auth/login", { username: user, password: pass });
+      const opt = await api.post("/api/auth/login-webauthn/options", {});
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) {
+        setLoading(false);
+        setError("Could not start passkey sign-in. Is the FireAlive CA trusted?");
+        return;
+      }
+      let cred;
+      try {
+        cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) });
+      } catch (_e) {
+        setLoading(false);
+        setError("Passkey sign-in was cancelled, or no passkey was available.");
+        return;
+      }
+      if (!cred) { setLoading(false); setError("No passkey assertion was produced."); return; }
+      const r = await api.post("/api/auth/login-webauthn/verify", {
+        response: serializeAssertion(cred),
+        challengeToken: opt.challengeToken,
+      });
       setLoading(false);
-      if (r && r.error) {
-        setError(typeof r.error === 'string' ? r.error : "Authentication failed.");
+      if (!r || r.error || !r.accessToken || !r.user) {
+        setError(r && typeof r.error === "string" ? r.error : "Passkey verification failed.");
         return;
       }
-
-      if (r && r.mfa_required && r.mfa_session_token) {
-        // Path 1: user enrolled, complete via /login-mfa
-        setMfaSessionToken(r.mfa_session_token);
-        setStage("mfa");
-        return;
-      }
-      if (r && r.mfa_enrollment_required && r.mfa_session_token) {
-        // Path 2: user must enroll before getting a JWT
-        setMfaSessionToken(r.mfa_session_token);
-        setStage("enroll-start");
-        return;
-      }
-      if (r && r.accessToken && r.user) {
-        // Path 3: analyst direct path -- no MFA needed
-        if (roleMismatch(r.user)) {
-          setError("Account role does not match selected role.");
-          return;
-        }
-        finalizeLogin(r);
-        return;
-      }
-      setError("Unexpected login response.");
-    } catch (e) {
-      setLoading(false);
-      setError(e.message || "Authentication failed.");
-    }
-  };
-
-  const handleMFA = async () => {
-    const code = useRecovery ? recoveryCode.trim() : mfa.trim();
-    if (!useRecovery && code.length<6){setError("Enter 6-digit code.");return;}
-    if (useRecovery && code.length===0){setError("Enter recovery code.");return;}
-    setLoading(true); setError("");
-
-    if (apiMode === false) {
-      // Demo mode: simulate success
-      setTimeout(()=>{setLoading(false); finalizeLogin({});},600);
-      return;
-    }
-
-    try {
-      const body = useRecovery
-        ? { mfa_session_token: mfaSessionToken, recovery_code: code }
-        : { mfa_session_token: mfaSessionToken, totp_code: code };
-      const r = await api.post("/api/auth/login-mfa", body);
-      setLoading(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : "MFA verification failed."); return; }
-      if (!r || !r.accessToken || !r.user) { setError("MFA verification failed."); return; }
-      if (roleMismatch(r.user)) {
-        setError("Account role does not match selected role.");
-        return;
-      }
+      if (roleMismatch(r.user)) { setError("Account role does not match the selected role."); return; }
       finalizeLogin(r);
     } catch (e) {
       setLoading(false);
-      setError(e.message || "MFA verification failed.");
+      setError(e.message || "Passkey sign-in failed.");
     }
   };
 
-  const handleEnrollStart = async () => {
+  // Certificate sign-in: the main process presents an OS-store client certificate
+  // at the TLS handshake; the server reads the peer certificate and issues a
+  // session. The renderer just calls the endpoint.
+  const handleCertLogin = async () => {
     setLoading(true); setError("");
-    if (apiMode === false) {
-      // Demo mode: simulate enrollment data
-      setTimeout(()=>{
-        setLoading(false);
-        setEnrollData({
-          secret_base32: "JBSWY3DPEHPK3PXP",
-          otpauth_url: "otpauth://totp/FireAlive:demo@example.com?secret=JBSWY3DPEHPK3PXP&issuer=FireAlive",
-          qr_png_data_url: null,
-        });
-        setStage("enroll-confirm");
-      },500);
-      return;
-    }
     try {
-      const r = await api.post("/api/auth/login-enroll-start", { mfa_session_token: mfaSessionToken });
+      const r = await api.post("/api/auth/login-cert", {});
       setLoading(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : "Failed to start enrollment."); return; }
-      if (!r || !r.secret_base32) { setError("Enrollment response was incomplete."); return; }
-      setEnrollData(r);
-      setStage("enroll-confirm");
-    } catch (e) {
-      setLoading(false);
-      setError(e.message || "Failed to start enrollment.");
-    }
-  };
-
-  const handleEnrollConfirm = async () => {
-    if (enrollConfirmCode.length<6){setError("Enter 6-digit code from your authenticator.");return;}
-    setLoading(true); setError("");
-
-    if (apiMode === false) {
-      // Demo mode: simulate enrollment confirm + recovery codes
-      setTimeout(()=>{
-        setLoading(false);
-        setRecoveryCodes(["DEMO-AAAA-1111","DEMO-BBBB-2222","DEMO-CCCC-3333","DEMO-DDDD-4444","DEMO-EEEE-5555","DEMO-FFFF-6666","DEMO-GGGG-7777","DEMO-HHHH-8888","DEMO-JJJJ-9999","DEMO-KKKK-0000"]);
-        setPendingLogin({ accessToken: null, refreshToken: null, user: { role: role==="manager"?"admin":"analyst" } });
-        setStage("recovery-display");
-      },600);
-      return;
-    }
-
-    try {
-      const r = await api.post("/api/auth/login-enroll-confirm", {
-        mfa_session_token: mfaSessionToken,
-        totp_code: enrollConfirmCode,
-      });
-      setLoading(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : "Enrollment confirmation failed."); return; }
-      if (!r || !r.accessToken || !r.user || !Array.isArray(r.recovery_codes)) {
-        setError("Enrollment response was incomplete.");
+      if (!r || r.error || !r.accessToken || !r.user) {
+        setError(r && typeof r.error === "string" ? r.error
+          : "Certificate sign-in failed. Ensure a client certificate is installed and selected.");
         return;
       }
-      if (roleMismatch(r.user)) {
-        setError("Account role does not match selected role.");
-        return;
-      }
-      // Hold the JWT response until the user has acknowledged the
-      // recovery codes display. finalizeLogin runs from the
-      // recovery-display screen's button.
-      setRecoveryCodes(r.recovery_codes);
-      setPendingLogin(r);
-      setStage("recovery-display");
+      if (roleMismatch(r.user)) { setError("Account role does not match the selected role."); return; }
+      finalizeLogin(r);
     } catch (e) {
       setLoading(false);
-      setError(e.message || "Enrollment confirmation failed.");
+      setError(e.message || "Certificate sign-in failed.");
     }
   };
 
-  const handleRecoveryAcknowledge = () => {
-    if (pendingLogin) {
-      finalizeLogin(pendingLogin);
-    } else {
-      // Demo mode shouldn't reach here without pendingLogin, but be safe
-      onLogin();
+  // Import / pin the FireAlive CA certificate (PEM) into the main process so the
+  // renderer can trust its own server over HTTPS. Available from the server's
+  // /ca-cert endpoint; done once.
+  const handleImportCa = async () => {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setError("CA import is only available in the desktop app."); return; }
+    if (!caPem.trim()) { setError("Paste the FireAlive CA certificate (PEM)."); return; }
+    setCaImporting(true); setError("");
+    try {
+      const res = await bridge.invoke("auth:importCaCert", { pem: caPem.trim() });
+      if (!res || !res.ok) { setError(res && res.error ? res.error : "CA import failed."); return; }
+      const s = await bridge.invoke("auth:caStatus").catch(()=>null);
+      setCaStatus(s || { pinned: true });
+      setCaPem("");
+      // Re-probe now that the CA is trusted.
+      api.get("/api/system/health").then(r=>setApiMode(r && r.status==='healthy')).catch(()=>{});
+      api.get("/api/system/version").then(r=>{ if (r && r.version) setLoginVersion(r.version); }).catch(()=>{});
+    } catch (e) {
+      setError(e.message || "CA import failed.");
+    } finally {
+      setCaImporting(false);
     }
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
+  const caUnpinned = caStatus && caStatus.pinned === false;
 
   return (
     <div style={{minHeight:"100vh",background:"#050810",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
@@ -651,94 +648,35 @@ function LoginScreen({role, onLogin, onBack}) {
 
         {stage==="creds"&&(
           <Card style={{padding:24}}>
-            <Input label="Username" value={user} onChange={e=>setUser(e.target.value)} placeholder="analyst.name@corp.local" maxLength={128}/>
-            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Password</M><input type="password" value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••" maxLength={128} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
-            {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
-            <Btn primary style={{width:"100%"}} onClick={handleCreds} disabled={loading}>{loading?"Authenticating...":"Sign In"}</Btn>
-            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v{loginVersion||"…"} · AGPL-3.0</M>
-          </Card>
-        )}
-
-        {stage==="mfa"&&(
-          <Card style={{padding:24}}>
-            <L>{useRecovery?"Use Recovery Code":"Enter MFA Code"}</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>{useRecovery?"Enter one of your single-use recovery codes (e.g. ABCD-1234-EFGH).":"Enter the 6-digit code from your authenticator app."}</M>
-            {!useRecovery && (
-              <Input label="MFA Code" value={mfa} onChange={e=>setMfa(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-            )}
-            {useRecovery && (
-              <Input label="Recovery Code" value={recoveryCode} onChange={e=>setRecoveryCode(e.target.value.toUpperCase().slice(0,32))} placeholder="ABCD-1234-EFGH" maxLength={32}/>
-            )}
-            {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
-            <Btn primary style={{width:"100%"}} onClick={handleMFA} disabled={loading}>{loading?"Verifying...":"Verify"}</Btn>
-            <button onClick={()=>{setUseRecovery(!useRecovery);setError("");setMfa("");setRecoveryCode("");}} style={{width:"100%",marginTop:12,padding:8,background:"transparent",border:"none",color:C.tm,fontSize:11,cursor:"pointer",textDecoration:"underline"}}>
-              {useRecovery?"Use authenticator code instead":"Use a recovery code instead"}
-            </button>
-          </Card>
-        )}
-
-        {stage==="enroll-start"&&(
-          <Card style={{padding:24}}>
-            <L>MFA Enrollment Required</L>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Your role requires multi-factor authentication. You will scan a QR code into an authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter a verification code.</M>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>You will receive 10 single-use recovery codes after enrollment. Save them in a secure place; they are your only way back into your account if you lose access to your authenticator.</M>
-            {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
-            <Btn primary style={{width:"100%"}} onClick={handleEnrollStart} disabled={loading}>{loading?"Preparing...":"Begin Enrollment"}</Btn>
-          </Card>
-        )}
-
-        {stage==="enroll-confirm"&&enrollData&&(
-          <Card style={{padding:24}}>
-            <L>Scan QR Code</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Scan this QR code with your authenticator app, then enter the 6-digit code it generates.</M>
-            <div style={{background:"#fff",borderRadius:8,padding:16,textAlign:"center",marginBottom:14}}>
-              {enrollData.qr_png_data_url ? (
-                <img src={enrollData.qr_png_data_url} alt="TOTP QR code" style={{width:240,height:240}}/>
-              ) : (
-                <div style={{width:240,height:240,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",border:"2px dashed #ccc",borderRadius:8,color:"#666",fontSize:11,padding:8}}>
-                  QR rendering unavailable.<br/>Use manual entry below.
-                </div>
-              )}
-            </div>
-            <details style={{marginBottom:14}}>
-              <summary style={{cursor:"pointer",color:C.tm,fontSize:11,marginBottom:8}}>Can't scan? Enter manually</summary>
-              <div style={{padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,marginTop:8}}>
-                <M style={{color:C.td,display:"block",marginBottom:6}}>Secret (base32):</M>
-                <code style={{display:"block",color:C.t,fontSize:12,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.secret_base32}</code>
-                <M style={{color:C.td,display:"block",marginTop:10,marginBottom:6}}>Or paste this URL into a TOTP-aware app:</M>
-                <code style={{display:"block",color:C.t,fontSize:10,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.otpauth_url}</code>
+            {caUnpinned ? (
+              <div>
+                <L>Trust the FireAlive CA</L>
+                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>This console connects to its server over HTTPS. Paste the FireAlive CA certificate (PEM) to trust it — it is served from the server's /ca-cert endpoint. You only do this once.</M>
+                <textarea value={caPem} onChange={e=>setCaPem(e.target.value)} placeholder="-----BEGIN CERTIFICATE-----" rows={6} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical",marginBottom:12}}/>
+                {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
+                <Btn primary style={{width:"100%"}} onClick={handleImportCa} disabled={caImporting}>{caImporting?"Importing...":"Import CA certificate"}</Btn>
               </div>
-            </details>
-            <Input label="6-digit code from authenticator" value={enrollConfirmCode} onChange={e=>setEnrollConfirmCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-            {error&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{error}</div>}
-            <Btn primary style={{width:"100%"}} onClick={handleEnrollConfirm} disabled={loading}>{loading?"Confirming...":"Confirm Enrollment"}</Btn>
-          </Card>
-        )}
-
-        {stage==="recovery-display"&&recoveryCodes&&(
-          <Card style={{padding:24}}>
-            <L>Save Your Recovery Codes</L>
-            <M style={{color:C.d,display:"block",marginBottom:14,lineHeight:1.6,fontWeight:500}}>These codes will not be shown again. Each can be used once if you lose access to your authenticator.</M>
-            <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Print them, store them in a password manager, or write them down somewhere safe. The server cannot recover them.</M>
-            <div style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,padding:16,marginBottom:16,fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:C.t,lineHeight:1.8,userSelect:"all"}}>
-              {recoveryCodes.map((c,i)=>(<div key={i}>{c}</div>))}
-            </div>
-            <button onClick={()=>{
-              try {
-                const text = recoveryCodes.join("\n");
-                if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-                  navigator.clipboard.writeText(text);
-                }
-              } catch (_e) {}
-            }} style={{width:"100%",marginBottom:8,padding:10,background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Copy all to clipboard</button>
-            <Btn primary style={{width:"100%"}} onClick={handleRecoveryAcknowledge}>I've saved my recovery codes</Btn>
+            ) : (
+              <div>
+                <L>Sign In</L>
+                <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Authenticate with your passkey or your hardware certificate. There is no password.</M>
+                <Btn primary style={{width:"100%",marginBottom:10}} onClick={handlePasskeyLogin} disabled={loading}>{loading?"Working…":"Sign in with a passkey"}</Btn>
+                <Btn style={{width:"100%"}} onClick={handleCertLogin} disabled={loading}>Sign in with a certificate</Btn>
+                {error&&<div style={{fontSize:11,color:C.d,marginTop:12}}>{error}</div>}
+                {apiMode===false&&!error&&<div style={{fontSize:11,color:C.td,marginTop:12}}>Cannot reach the server. On a new install the FireAlive CA may not be trusted yet.</div>}
+                {caStatus&&caStatus.pinned&&!caStatus.unmanaged&&caStatus.subject&&(
+                  <M style={{color:C.td,display:"block",marginTop:12}}>Trusted CA: {caStatus.subject}</M>
+                )}
+              </div>
+            )}
+            <M style={{color:C.td,display:"block",textAlign:"center",marginTop:16}}>FireAlive v{loginVersion||"…"} · AGPL-3.0</M>
           </Card>
         )}
 
         {stage==="verify"&&(
           <Card style={{padding:24,textAlign:"center"}}>
             <L>Verified</L>
-            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Logging in...</M>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Logging in…</M>
           </Card>
         )}
       </div>
@@ -747,277 +685,116 @@ function LoginScreen({role, onLogin, onBack}) {
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║  MY MFA SECURITY SECTION (R3f)                                          ║
+// ║  MY SECURITY SECTION                                                    ║
 // ║                                                                         ║
-// ║  Self-service MFA management for the currently authenticated user.      ║
-// ║  Renders inside the MFA tab above the admin-policy controls. Talks to   ║
-// ║  /api/mfa/* (status, enroll-start, enroll-confirm, recovery-status,     ║
-// ║  regenerate-recovery, disable). All operations scope to req.user.id     ║
-// ║  on the server side -- this component never accepts or sends a user_id  ║
-// ║  parameter.                                                             ║
+// ║  Self-service passwordless credential management for the currently      ║
+// ║  authenticated user. Renders inside the MFA tab above the admin         ║
+// ║  controls. Talks to /api/mfa/* — passkey/register-options,              ║
+// ║  passkey/register-verify, GET/DELETE passkeys, GET certs, certs/revoke  ║
+// ║  — all scoped to req.user.id server-side; this component never accepts  ║
+// ║  or sends a user_id parameter. There is no TOTP.                        ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 function MyMfaSecuritySection() {
-  const [status, setStatus] = useState(null);            // { enrolled, in_enrollment }
-  const [recovery, setRecovery] = useState(null);        // { generated, remaining, total }
-  const [loading, setLoading] = useState(true);
-  const [stage, setStage] = useState('idle');
-    // idle | enrolling-confirm | display-codes | regenerating | disabling
-  const [enrollData, setEnrollData] = useState(null);    // { secret_base32, otpauth_url, qr_png_data_url }
-  const [confirmCode, setConfirmCode] = useState('');
-  const [actionCode, setActionCode] = useState('');
-  const [codes, setCodes] = useState(null);              // recovery codes for one-time display
-  const [error, setError] = useState('');
+  const [passkeys, setPasskeys] = useState(null);   // null = not loaded
+  const [certs, setCerts] = useState(null);
+  const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
 
-  const refresh = async () => {
-    setLoading(true); setError('');
+  const loadPasskeys = async () => {
+    const r = await api.get("/api/mfa/passkeys");
+    setPasskeys(r && Array.isArray(r.passkeys) ? r.passkeys : []);
+  };
+  const loadCerts = async () => {
+    const r = await api.get("/api/mfa/certs");
+    setCerts(r && Array.isArray(r.certs) ? r.certs : []);
+  };
+  useEffect(()=>{ loadPasskeys().catch(()=>{}); loadCerts().catch(()=>{}); },[]);
+
+  // Enroll a new passwordless passkey: fetch creation options, create the
+  // credential in the renderer, and verify it server-side.
+  const addPasskey = async () => {
+    setBusy(true); setErr(""); setMsg("");
     try {
-      const s = await api.get('/api/mfa/status');
-      if (s && s.error) { setError(typeof s.error === 'string' ? s.error : 'Failed to load MFA status.'); setLoading(false); return; }
-      setStatus(s || { enrolled: false, in_enrollment: false });
-      if (s && s.enrolled) {
-        const r = await api.get('/api/mfa/recovery-status');
-        if (r && !r.error) setRecovery(r);
-        else setRecovery(null);
-      } else {
-        setRecovery(null);
+      const opt = await api.post("/api/mfa/passkey/register-options", { passwordless: true });
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) {
+        setBusy(false);
+        setErr(opt && opt.error ? String(opt.error) : "Could not start passkey enrollment.");
+        return;
       }
-      setLoading(false);
+      let cred;
+      try { cred = await navigator.credentials.create({ publicKey: deserializeRegOptions(opt.options) }); }
+      catch (_e) { setBusy(false); setErr("Passkey enrollment was cancelled or failed."); return; }
+      if (!cred) { setBusy(false); setErr("No passkey was created."); return; }
+      const r = await api.post("/api/mfa/passkey/register-verify", {
+        response: serializeAttestation(cred),
+        challengeToken: opt.challengeToken,
+        passwordless: true,
+        label: label.trim() || undefined,
+      });
+      setBusy(false);
+      if (!r || r.error) { setErr(r && r.error ? String(r.error) : "Passkey verification failed."); return; }
+      setMsg("Passkey enrolled."); setLabel(""); loadPasskeys().catch(()=>{});
     } catch (e) {
-      setError(e.message || 'Failed to load MFA status.');
-      setLoading(false);
+      setBusy(false);
+      setErr(e.message || "Passkey enrollment failed.");
     }
   };
 
-  useEffect(() => { refresh(); }, []);
-
-  const startEnroll = async () => {
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/enroll-start', {});
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Failed to start enrollment.'); return; }
-      if (!r || !r.secret_base32) { setError('Enrollment response was incomplete.'); return; }
-      setEnrollData(r);
-      setConfirmCode('');
-      setStage('enrolling-confirm');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Failed to start enrollment.');
-    }
+  // Remove a passkey. The server refuses if it is the user's last login
+  // credential (409), surfaced as an error.
+  const removePasskey = async (id) => {
+    if (!window.confirm("Remove this passkey?")) return;
+    setErr(""); setMsg("");
+    const r = await api.del("/api/mfa/passkeys/" + id);
+    if (r && r.removed) { setMsg("Passkey removed."); loadPasskeys().catch(()=>{}); }
+    else { setErr(r && r.error ? String(r.error) : "Could not remove passkey."); }
   };
 
-  const confirmEnroll = async () => {
-    if (confirmCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/enroll-confirm', { totp_code: confirmCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Confirmation failed.'); return; }
-      if (!r || !Array.isArray(r.recovery_codes)) { setError('Confirmation response was incomplete.'); return; }
-      setCodes(r.recovery_codes);
-      setStage('display-codes');
-      setConfirmCode('');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Confirmation failed.');
-    }
+  const revokeCert = async (serial) => {
+    if (!window.confirm("Revoke certificate " + serial + "? It will no longer authenticate.")) return;
+    setErr(""); setMsg("");
+    const r = await api.post("/api/mfa/certs/revoke", { serial });
+    if (r && r.revoked) { setMsg("Certificate " + serial + " revoked."); loadCerts().catch(()=>{}); }
+    else { setErr(r && r.error ? String(r.error) : "Revocation failed."); }
   };
-
-  const startRegen = () => {
-    setActionCode(''); setError(''); setStage('regenerating');
-  };
-
-  const confirmRegen = async () => {
-    if (actionCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/regenerate-recovery', { totp_code: actionCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Regeneration failed.'); return; }
-      if (!r || !Array.isArray(r.recovery_codes)) { setError('Regeneration response was incomplete.'); return; }
-      setCodes(r.recovery_codes);
-      setStage('display-codes');
-      setActionCode('');
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Regeneration failed.');
-    }
-  };
-
-  const startDisable = () => {
-    if (!window.confirm('Disable MFA for your account? This removes second-factor protection.')) return;
-    setActionCode(''); setError(''); setStage('disabling');
-  };
-
-  const confirmDisable = async () => {
-    if (actionCode.length < 6) { setError('Enter the 6-digit code from your authenticator.'); return; }
-    setBusy(true); setError('');
-    try {
-      const r = await api.post('/api/mfa/disable', { totp_code: actionCode });
-      setBusy(false);
-      if (r && r.error) { setError(typeof r.error === 'string' ? r.error : 'Disable failed.'); return; }
-      setStage('idle'); setActionCode(''); setEnrollData(null); setCodes(null);
-      await refresh();
-    } catch (e) {
-      setBusy(false);
-      setError(e.message || 'Disable failed.');
-    }
-  };
-
-  const acknowledgeCodes = () => {
-    setCodes(null); setEnrollData(null); setStage('idle');
-    refresh();
-  };
-
-  const cancel = () => {
-    setStage('idle'); setError('');
-    setConfirmCode(''); setActionCode('');
-  };
-
-  // ── Render branches ──────────────────────────────────────────────────────
-
-  if (loading) {
-    return (
-      <Card style={{marginBottom:12,padding:14,borderColor:C.b}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>My MFA Enrollment</div>
-        <M style={{color:C.tm}}>Loading…</M>
-      </Card>
-    );
-  }
-
-  if (stage === 'display-codes' && codes) {
-    return (
-      <Card style={{marginBottom:12,padding:16,borderColor:C.a+"40"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:8}}>Save Your Recovery Codes</div>
-        <M style={{color:C.d,display:"block",marginBottom:10,fontWeight:500,lineHeight:1.6}}>These codes will not be shown again. Each can be used once if you lose access to your authenticator.</M>
-        <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Print them, store them in a password manager, or write them down.</M>
-        <div style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,padding:12,marginBottom:12,fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:C.t,lineHeight:1.8,userSelect:"all"}}>
-          {codes.map((c,i)=><div key={i}>{c}</div>)}
-        </div>
-        <button onClick={()=>{
-          try { if (navigator && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(codes.join("\n")); } catch (_e) {}
-        }} style={{width:"100%",marginBottom:8,padding:10,background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Copy all to clipboard</button>
-        <Btn primary style={{width:"100%"}} onClick={acknowledgeCodes}>I've saved my recovery codes</Btn>
-      </Card>
-    );
-  }
-
-  if (stage === 'enrolling-confirm' && enrollData) {
-    return (
-      <Card style={{marginBottom:12,padding:16,borderColor:C.i+"30"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:8}}>Scan QR Code to Enroll</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Scan with your authenticator app, then enter the 6-digit code it generates.</M>
-        <div style={{background:"#fff",borderRadius:8,padding:14,textAlign:"center",marginBottom:12}}>
-          {enrollData.qr_png_data_url ? (
-            <img src={enrollData.qr_png_data_url} alt="TOTP QR code" style={{width:200,height:200}}/>
-          ) : (
-            <div style={{width:200,height:200,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",border:"2px dashed #ccc",borderRadius:8,color:"#666",fontSize:11,padding:8}}>QR rendering unavailable.<br/>Use manual entry below.</div>
-          )}
-        </div>
-        <details style={{marginBottom:12}}>
-          <summary style={{cursor:"pointer",color:C.tm,fontSize:11,marginBottom:8}}>Can't scan? Enter manually</summary>
-          <div style={{padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,marginTop:8}}>
-            <M style={{color:C.td,display:"block",marginBottom:6}}>Secret (base32):</M>
-            <code style={{display:"block",color:C.t,fontSize:12,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.secret_base32}</code>
-            <M style={{color:C.td,display:"block",marginTop:10,marginBottom:6}}>Or paste this URL into a TOTP-aware app:</M>
-            <code style={{display:"block",color:C.t,fontSize:10,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all"}}>{enrollData.otpauth_url}</code>
-          </div>
-        </details>
-        <Input label="6-digit code from authenticator" value={confirmCode} onChange={e=>setConfirmCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <Btn primary style={{flex:1}} onClick={confirmEnroll} disabled={busy}>{busy?"Confirming...":"Confirm Enrollment"}</Btn>
-          <button onClick={cancel} disabled={busy} style={{flex:"0 0 auto",padding:"8px 14px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Cancel</button>
-        </div>
-      </Card>
-    );
-  }
-
-  if (stage === 'regenerating') {
-    return (
-      <Card style={{marginBottom:12,padding:16,borderColor:C.i+"30"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:8}}>Regenerate Recovery Codes</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Generates 10 new recovery codes. ALL existing codes will be invalidated immediately. Enter your current authenticator code to confirm.</M>
-        <Input label="6-digit code from authenticator" value={actionCode} onChange={e=>setActionCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <Btn primary style={{flex:1}} onClick={confirmRegen} disabled={busy}>{busy?"Regenerating...":"Regenerate Codes"}</Btn>
-          <button onClick={cancel} disabled={busy} style={{flex:"0 0 auto",padding:"8px 14px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Cancel</button>
-        </div>
-      </Card>
-    );
-  }
-
-  if (stage === 'disabling') {
-    return (
-      <Card style={{marginBottom:12,padding:16,borderColor:C.d+"40"}}>
-        <div style={{fontSize:13,fontWeight:600,color:C.d,marginBottom:8}}>Disable MFA</div>
-        <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Removes second-factor protection from your account. Existing recovery codes will also be cleared. Enter your current authenticator code to confirm.</M>
-        <Input label="6-digit code from authenticator" value={actionCode} onChange={e=>setActionCode(e.target.value.replace(/\D/g,"").slice(0,6))} placeholder="000000" maxLength={6}/>
-        {error&&<div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={confirmDisable} disabled={busy} style={{flex:1,padding:"10px 14px",background:`${C.d}20`,border:`1px solid ${C.d}50`,borderRadius:8,color:C.d,fontSize:12,fontWeight:500,cursor:busy?"default":"pointer"}}>{busy?"Disabling...":"Confirm Disable"}</button>
-          <button onClick={cancel} disabled={busy} style={{flex:"0 0 auto",padding:"8px 14px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Cancel</button>
-        </div>
-      </Card>
-    );
-  }
-
-  // Default idle stage: show enrollment status + actions
-  const enrolled = !!(status && status.enrolled);
-  const inEnrollment = !!(status && status.in_enrollment && !enrolled);
-  const lowCodes = recovery && recovery.generated && recovery.remaining <= 3;
 
   return (
-    <Card style={{marginBottom:12,padding:16,borderColor:enrolled?C.a+"30":C.b}}>
-      <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:8}}>My MFA Enrollment</div>
-      {enrolled && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.a}>ENROLLED</Badge>
-            <M style={{color:C.tm}}>TOTP authenticator active</M>
+    <Card style={{marginBottom:16}}>
+      <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>My Security — Passkeys & Certificates</div>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a FIDO2/WebAuthn passkey or a client certificate — there is no password. Keep at least one working credential enrolled at all times.</M>
+
+      <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:8}}>Passkeys</div>
+      {passkeys===null ? <M style={{color:C.td}}>Loading…</M> : passkeys.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No passkeys enrolled.</M> : passkeys.map((k,i)=>(
+        <div key={k.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{minWidth:0}}>
+            <M style={{color:C.t,display:"block"}}>{String(k.credential_id||"").slice(0,16)}…{k.is_passwordless?"":" (second-factor)"}</M>
+            <M style={{color:C.td,display:"block"}}>added {k.created_at?String(k.created_at).slice(0,10):"—"}{k.last_used_at?(" · last used "+String(k.last_used_at).slice(0,10)):" · never used"}</M>
           </div>
-          {recovery && recovery.generated ? (
-            <M style={{color:lowCodes?C.d:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>
-              {recovery.remaining} of {recovery.total} recovery codes remaining
-              {lowCodes ? " — regenerate soon to avoid lockout if you lose your authenticator." : "."}
-            </M>
-          ) : (
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>
-              Recovery codes status unavailable.
-            </M>
-          )}
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-            <button onClick={startRegen} disabled={busy} style={{padding:"8px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,color:C.tm,fontSize:11,cursor:"pointer"}}>Regenerate Recovery Codes</button>
-            <button onClick={startDisable} disabled={busy} style={{padding:"8px 12px",background:"transparent",border:`1px solid ${C.d}40`,borderRadius:8,color:C.d,fontSize:11,cursor:"pointer"}}>Disable MFA</button>
+          <Btn small danger onClick={()=>removePasskey(k.id)}>Remove</Btn>
+        </div>
+      ))}
+      <div style={{display:"flex",gap:8,alignItems:"flex-end",marginTop:10}}>
+        <div style={{flex:1}}><Input label="New passkey label (optional)" value={label} onChange={e=>setLabel(e.target.value)} placeholder="e.g. YubiKey 5C" maxLength={64}/></div>
+        <Btn primary onClick={addPasskey} disabled={busy}>{busy?"Working…":"Add a passkey"}</Btn>
+      </div>
+
+      <div style={{fontSize:12,fontWeight:500,color:C.t,margin:"18px 0 8px"}}>Client Certificates</div>
+      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>Certificates are issued to you during provisioning or by an administrator. Review them here and revoke one you no longer use or that may be compromised.</M>
+      {certs===null ? <M style={{color:C.td}}>Loading…</M> : certs.length===0 ? <M style={{color:C.td}}>No certificates issued to you.</M> : certs.map((c,i)=>(
+        <div key={c.serial||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{minWidth:0}}>
+            <M style={{color:C.t,display:"block"}}>{c.subject||"(no subject)"}</M>
+            <M style={{color:C.td,display:"block"}}>serial {c.serial} · {c.status}{c.expires_at?(" · exp "+String(c.expires_at).slice(0,10)):""}</M>
           </div>
-        </>
-      )}
-      {!enrolled && inEnrollment && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.w}>IN PROGRESS</Badge>
-            <M style={{color:C.tm}}>Enrollment was started but not confirmed</M>
-          </div>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>You have a TOTP secret pending confirmation. Click below to view the QR again or restart enrollment with a fresh secret.</M>
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <Btn primary style={{width:"100%"}} onClick={startEnroll} disabled={busy}>{busy?"Loading...":"Resume / Restart Enrollment"}</Btn>
-        </>
-      )}
-      {!enrolled && !inEnrollment && (
-        <>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
-            <Badge color={C.d}>NOT ENROLLED</Badge>
-            <M style={{color:C.tm}}>Enroll to add a second factor to your account</M>
-          </div>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Scan a QR code into your authenticator app (Google Authenticator, Authy, 1Password, etc.) and enter the first code to enroll. You'll receive 10 single-use recovery codes after enrollment.</M>
-          {error && <div style={{fontSize:11,color:C.d,marginBottom:10}}>{error}</div>}
-          <Btn primary style={{width:"100%"}} onClick={startEnroll} disabled={busy}>{busy?"Loading...":"Enroll MFA"}</Btn>
-        </>
-      )}
+          {c.status==="active" ? <Btn small danger onClick={()=>revokeCert(c.serial)}>Revoke</Btn> : <Badge color={c.status==="revoked"?C.d:C.tm}>{c.status}</Badge>}
+        </div>
+      ))}
+
+      {msg&&<M style={{color:C.tm,display:"block",marginTop:12}}>{msg}</M>}
+      {err&&<M style={{color:C.d,display:"block",marginTop:12}}>{err}</M>}
     </Card>
   );
 }
@@ -1210,6 +987,203 @@ function AlertRoutingPanel() {
   );
 }
 
+
+function IamPanel() {
+  // Self-contained Identity & Access panel for the passwordless model. Three
+  // subtabs wired to /api/iam: the built-in CA + issued client certificates,
+  // the LDAP/AD directory used only as a user/offboarding source (never for
+  // authentication), and directory-driven offboarding. There is no SSO/SAML/OIDC
+  // and no auth-method selector -- the method is fixed (mTLS cert + FIDO2 passkey).
+  const [sub, setSub] = useState("ca");          // ca | directory | offboarding
+  const [posture, setPosture] = useState(null);
+
+  // Built-in CA + issued certificates
+  const [caInfo, setCaInfo] = useState(null);    // null = not loaded
+  const [certs, setCerts] = useState(null);
+  const [certFilter, setCertFilter] = useState("");
+  const [revokeReason, setRevokeReason] = useState("");
+  const [caMsg, setCaMsg] = useState("");
+
+  // LDAP / AD directory
+  const [ldap, setLdap] = useState({server:"",port:"636",baseDn:"",bindDn:"",bindPassword:"",useTLS:true,userFilter:"",groupFilter:""});
+  const [ldapMeta, setLdapMeta] = useState({configured:false,hasBindPassword:false,status:""});
+  const [ldapLoaded, setLdapLoaded] = useState(false);
+  const [ldapMsg, setLdapMsg] = useState("");
+  const [ldapBusy, setLdapBusy] = useState(false);
+
+  // Offboarding candidates
+  const [cands, setCands] = useState(null);
+  const [offMsg, setOffMsg] = useState("");
+  const [offBusy, setOffBusy] = useState(false);
+
+  const audit = (event_type, detail) => { try { api.post("/api/audit/mc-event", {event_type, detail}); } catch (_e) {} };
+
+  const loadCa = async () => {
+    const c = await api.get("/api/iam/ca");
+    setCaInfo(c && !c.error ? c : { initialized: false });
+    const cl = await api.get("/api/iam/certs");
+    setCerts(cl && Array.isArray(cl.certs) ? cl.certs : []);
+  };
+  const loadLdap = async () => {
+    const r = await api.get("/api/iam/ldap-config");
+    if (r && r.configured) {
+      setLdap({server:r.server||"",port:String(r.port||636),baseDn:r.baseDn||"",bindDn:r.bindDn||"",bindPassword:"",useTLS:r.useTLS!==false,userFilter:r.userFilter||"",groupFilter:r.groupFilter||""});
+      setLdapMeta({configured:true,hasBindPassword:!!r.hasBindPassword,status:r.status||""});
+    } else {
+      setLdapMeta({configured:false,hasBindPassword:false,status:""});
+    }
+    setLdapLoaded(true);
+  };
+  const loadOff = async () => {
+    const r = await api.get("/api/iam/offboarding-candidates");
+    setCands(r && Array.isArray(r.candidates) ? r.candidates : []);
+  };
+
+  useEffect(()=>{ api.get("/api/iam/enforcement").then(p=>setPosture(p&&!p.error?p:null)).catch(()=>{}); },[]);
+  useEffect(()=>{
+    if (sub==="ca" && caInfo===null) loadCa().catch(()=>{});
+    if (sub==="directory" && !ldapLoaded) loadLdap().catch(()=>{});
+    if (sub==="offboarding" && cands===null) loadOff().catch(()=>{});
+  },[sub]);
+
+  const doRevoke = async (serial) => {
+    if (!serial) { setCaMsg("No certificate serial to revoke."); return; }
+    if (!window.confirm("Revoke certificate "+serial+"? This adds it to the CRL and cannot be undone.")) return;
+    const r = await api.post("/api/iam/certs/revoke", { serial, reason: revokeReason.trim() || "administrative" });
+    if (r && r.revoked) { setCaMsg("Revoked "+serial+"."); audit("CERT_REVOKED","serial="+serial); loadCa().catch(()=>{}); }
+    else { setCaMsg(r && r.error ? String(r.error) : "Revocation failed."); }
+  };
+  const downloadCrl = async () => {
+    const r = await api.get("/api/iam/crl");
+    if (!r || r.error) { setCaMsg(r && r.error ? String(r.error) : "Could not fetch CRL."); return; }
+    try {
+      const data = typeof r === "string" ? r : JSON.stringify(r, null, 2);
+      const blob = new Blob([data], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "firealive-crl-"+new Date().toISOString().slice(0,10)+".json";
+      a.click();
+      audit("CRL_EXPORTED","revocation list exported");
+    } catch (_e) { setCaMsg("Could not export CRL."); }
+  };
+  const saveLdap = async () => {
+    if (!ldap.server.trim()||!ldap.baseDn.trim()||!ldap.bindDn.trim()) { setLdapMsg("Server, Base DN, and Bind DN are required."); return; }
+    setLdapBusy(true); setLdapMsg("");
+    const body = { server:ldap.server.trim(), port:Number(ldap.port)||636, baseDn:ldap.baseDn.trim(), bindDn:ldap.bindDn.trim(), useTLS:ldap.useTLS, userFilter:ldap.userFilter.trim(), groupFilter:ldap.groupFilter.trim() };
+    if (ldap.bindPassword) body.bindPassword = ldap.bindPassword;
+    const r = await api.post("/api/iam/ldap-config", body);
+    setLdapBusy(false);
+    if (r && !r.error) { setLdapMsg("Directory configuration saved."); audit("IAM_LDAP_CONFIGURED","server="+body.server); setLdap(prev=>({...prev,bindPassword:""})); setLdapLoaded(false); loadLdap().catch(()=>{}); }
+    else { setLdapMsg(r && r.error ? String(r.error) : "Save failed."); }
+  };
+  const testLdap = async () => {
+    setLdapBusy(true); setLdapMsg("Testing directory connection…");
+    const r = await api.post("/api/iam/ldap-config/test", {});
+    setLdapBusy(false);
+    setLdapMsg(r && r.ok ? "Connection succeeded." : (r && r.error ? String(r.error) : "Connection test failed."));
+  };
+  const scanOff = async () => {
+    setOffBusy(true); setOffMsg("Scanning the directory for departed accounts…");
+    const r = await api.post("/api/iam/offboarding-candidates/scan", {});
+    setOffBusy(false);
+    setOffMsg(r && !r.error ? "Scan complete." : (r && r.error ? String(r.error) : "Scan failed."));
+    loadOff().catch(()=>{});
+  };
+  const resolveOff = async (id, action) => {
+    const verb = action==="offboard" ? "Offboard" : "Mark active";
+    if (!window.confirm(verb+" this account?"+(action==="offboard"?" Their client certificates will be revoked.":""))) return;
+    const r = await api.post("/api/iam/offboarding-candidates/resolve", { id, action });
+    if (r && !r.error) { audit("OFFBOARDING_RESOLVED","id="+id+" action="+action); loadOff().catch(()=>{}); }
+    else { setOffMsg(r && r.error ? String(r.error) : "Action failed."); }
+  };
+
+  const filteredCerts = (certs||[]).filter(c => !certFilter || c.status===certFilter);
+  const subTabs = [{id:"ca",l:"Built-in CA"},{id:"directory",l:"Directory (LDAP/AD)"},{id:"offboarding",l:"Offboarding"}];
+
+  return (<div>
+    <L>IAM / Authentication</L>
+    <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
+      <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Authentication: Passwordless</M>
+      <M style={{color:C.tm,lineHeight:1.6}}>Operators sign in with a mutual-TLS client certificate (PIV/CAC) or a FIDO2/WebAuthn passkey — both phishing-resistant, AAL3. There is no password or TOTP, and the method is not operator-configurable.{posture&&posture.authEnforcement?(" Server policy: "+posture.authEnforcement+"."):""}</M>
+    </Card>
+
+    <div style={{display:"flex",gap:4,marginBottom:20}}>{subTabs.map(t=><button key={t.id} onClick={()=>setSub(t.id)} style={{padding:"6px 14px",background:sub===t.id?C.ad:"transparent",border:`1px solid ${sub===t.id?C.a+"50":C.b}`,borderRadius:6,color:sub===t.id?C.a:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{t.l}</button>)}</div>
+
+    {sub==="ca"&&(<div>
+      <Card style={{marginBottom:12}}>
+        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Built-in Certificate Authority</div>
+        {caInfo===null ? <M style={{color:C.td}}>Loading…</M> : caInfo.initialized ? (
+          <div>
+            <M style={{color:C.tm,display:"block",lineHeight:1.8}}>Subject: {caInfo.subject}{"\n"}Key: {caInfo.keyAlgo} · Next serial: {caInfo.serial}{caInfo.created_at?(" · Created "+String(caInfo.created_at).slice(0,10)):""}</M>
+            <M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.6}}>This CA signs operator and analyst client certificates. Distribute the CA certificate (served at /ca-cert) so clients can trust the server over HTTPS.</M>
+          </div>
+        ) : <M style={{color:C.tm}}>The certificate authority is not initialized yet. It is created automatically on first server start.</M>}
+      </Card>
+
+      <Card>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,gap:8}}>
+          <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Issued Client Certificates</div>
+          <div style={{display:"flex",gap:6}}>
+            <select value={certFilter} onChange={e=>setCertFilter(e.target.value)} style={{padding:"4px 8px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:6,color:C.t,fontSize:10}}><option value="">All</option><option value="active">Active</option><option value="revoked">Revoked</option><option value="expired">Expired</option></select>
+            <Btn small onClick={()=>loadCa().catch(()=>{})}>Refresh</Btn>
+          </div>
+        </div>
+        <div style={{marginBottom:10}}><Input label="Revocation reason (applies to next revoke)" value={revokeReason} onChange={e=>setRevokeReason(e.target.value)} placeholder="administrative" maxLength={120}/></div>
+        {certs===null ? <M style={{color:C.td}}>Loading…</M> : filteredCerts.length===0 ? <M style={{color:C.td}}>No certificates{certFilter?(" with status "+certFilter):""}.</M> : filteredCerts.map((c,i)=>(
+          <div key={c.serial||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+            <div style={{minWidth:0}}>
+              <M style={{color:C.t,display:"block"}}>{c.subject||"(no subject)"}</M>
+              <M style={{color:C.td,display:"block"}}>serial {c.serial}{c.external_id?(" · ext "+c.external_id):""} · {c.status}{c.expires_at?(" · exp "+String(c.expires_at).slice(0,10)):""}</M>
+            </div>
+            {c.status==="active" ? <Btn small danger onClick={()=>doRevoke(c.serial)}>Revoke</Btn> : <Badge color={c.status==="revoked"?C.d:C.tm}>{c.status}</Badge>}
+          </div>
+        ))}
+        <div style={{display:"flex",gap:8,marginTop:12}}><Btn onClick={downloadCrl}>Download CRL</Btn></div>
+        {caMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{caMsg}</M>}
+      </Card>
+    </div>)}
+
+    {sub==="directory"&&(<Card>
+      <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Directory (LDAP / Active Directory)</div>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Connect a directory over LDAPS as a read-only source for user and offboarding sync. The directory is never used to authenticate operators — sign-in is always by client certificate or passkey.</M>
+      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:12}}>
+        <Input label="Server" value={ldap.server} onChange={e=>setLdap(p=>({...p,server:e.target.value}))} placeholder="dc01.corp.local" maxLength={253}/>
+        <Input label="Port" value={ldap.port} onChange={e=>setLdap(p=>({...p,port:e.target.value.replace(/\D/g,"").slice(0,5)}))} placeholder="636" maxLength={5}/>
+      </div>
+      <Input label="Base DN" value={ldap.baseDn} onChange={e=>setLdap(p=>({...p,baseDn:e.target.value}))} placeholder="DC=corp,DC=local" maxLength={512}/>
+      <Input label="Bind DN" value={ldap.bindDn} onChange={e=>setLdap(p=>({...p,bindDn:e.target.value}))} placeholder="CN=svc-firealive,OU=Service Accounts,DC=corp,DC=local" maxLength={512}/>
+      <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Bind Password{ldapMeta.hasBindPassword?" (stored — leave blank to keep)":""}</M><input type="password" value={ldap.bindPassword} onChange={e=>setLdap(p=>({...p,bindPassword:e.target.value}))} placeholder={ldapMeta.hasBindPassword?"••••••••":"bind account password"} maxLength={256} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+        <Input label="User filter" value={ldap.userFilter} onChange={e=>setLdap(p=>({...p,userFilter:e.target.value}))} placeholder="(objectClass=user)" maxLength={256}/>
+        <Input label="Group filter" value={ldap.groupFilter} onChange={e=>setLdap(p=>({...p,groupFilter:e.target.value}))} placeholder="(objectClass=group)" maxLength={256}/>
+      </div>
+      <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={ldap.useTLS} onChange={e=>setLdap(p=>({...p,useTLS:e.target.checked}))} style={{accentColor:C.a}}/>Use LDAPS (TLS)</label>
+      {ldapMeta.configured&&<M style={{color:C.td,display:"block",marginBottom:10}}>Current status: {ldapMeta.status||"configured"}</M>}
+      <div style={{display:"flex",gap:8}}><Btn primary onClick={saveLdap} disabled={ldapBusy}>{ldapBusy?"Working…":"Save directory"}</Btn><Btn onClick={testLdap} disabled={ldapBusy}>Test connection</Btn></div>
+      {ldapMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{ldapMsg}</M>}
+    </Card>)}
+
+    {sub==="offboarding"&&(<Card>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,gap:8}}>
+        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Offboarding Candidates</div>
+        <div style={{display:"flex",gap:6}}><Btn small onClick={()=>loadOff().catch(()=>{})}>Refresh</Btn><Btn small primary onClick={scanOff} disabled={offBusy}>{offBusy?"Scanning…":"Scan directory"}</Btn></div>
+      </div>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Accounts flagged as departed or disabled in the directory. Confirm an account is still active, or offboard it — offboarding revokes its client certificates at the CRL level so the credential can no longer authenticate.</M>
+      {cands===null ? <M style={{color:C.td}}>Loading…</M> : cands.length===0 ? <M style={{color:C.td}}>No candidates. Run a scan to check the directory.</M> : cands.map((c,i)=>(
+        <div key={c.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{minWidth:0}}>
+            <M style={{color:C.t,display:"block"}}>{c.username||("user "+c.user_id)}{c.role?(" · "+c.role):""}{c.external_id?(" · ext "+c.external_id):""}</M>
+            <M style={{color:C.td,display:"block"}}>{c.source?(c.source+": "):""}{c.detail||""}{c.detected_at?(" · "+String(c.detected_at).slice(0,10)):""} · {c.status}</M>
+          </div>
+          {c.status==="pending" ? (
+            <div style={{display:"flex",gap:6,flexShrink:0}}><Btn small onClick={()=>resolveOff(c.id,"confirm_active")}>Active</Btn><Btn small danger onClick={()=>resolveOff(c.id,"offboard")}>Offboard</Btn></div>
+          ) : <Badge color={c.status==="offboarded"?C.d:C.tm}>{c.status}</Badge>}
+        </div>
+      ))}
+      {offMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{offMsg}</M>}
+    </Card>)}
+  </div>);
+}
 
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
@@ -2234,7 +2208,10 @@ function ManagementConsole() {
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
-  const [newA, setNewA] = useState({name:"",tier:1,shift:"day",hostname:"",ip:""});
+  const [newA, setNewA] = useState({name:"",username:"",tier:1,shift:"day",hostname:"",ip:""});
+  const [provisionBusy, setProvisionBusy] = useState(false);
+  const [provisionErr, setProvisionErr] = useState("");
+  const [provisionResult, setProvisionResult] = useState(null);
   const [showCEF, setShowCEF] = useState(false);
   const [showCloudWF, setShowCloudWF] = useState(null);
   const [showIaC, setShowIaC] = useState(false);
@@ -2311,8 +2288,6 @@ function ManagementConsole() {
   const [auditExportBusy, setAuditExportBusy] = useState(false);
   const [auditExportError, setAuditExportError] = useState(null);
   // IAM wizard state
-  const [iamTab, setIamTab] = useState("saml");
-  const [iamCfg, setIamCfg] = useState({saml:{entityId:"",metadataUrl:"",cert:"",jit:true,status:"not_configured"},oidc:{issuer:"",clientId:"",secret:"",scopes:"openid profile email groups",status:"not_configured"},ad:{server:"",port:"636",baseDn:"",bindDn:"",useTLS:true,syncInterval:"15",status:"not_configured"},cloud:{provider:"none",tenantId:"",status:"not_configured"}});
   // Report engine state
   const [reportTab, setReportTab] = useState("config");
   const [reportCfg, setReportCfg] = useState({schedule:"weekly",day:"monday",time:"08:00",format:"pdf",recipients:"",siemFeed:true,sections:{teamHealth:true,utilization:true,tierBreakdown:true,automationRate:true,trendAnalysis:true,kbInsights:true,skillProgress:true,upskillingGaps:true}});
@@ -3244,9 +3219,15 @@ function ManagementConsole() {
     });
   const highP=activeP.filter(([,p])=>p.sev==="high");
 
-  const handleProvision = () => {
-    if(!newA.name.trim()||!newA.hostname.trim()) return;
-    const activationId = genId();
+  const handleProvision = async () => {
+    if(!newA.name.trim()||!newA.username.trim()||!newA.hostname.trim()) return;
+    setProvisionBusy(true); setProvisionErr("");
+    let resp;
+    try { resp = await api.post("/api/team/provision", { name:newA.name.trim(), username:newA.username.trim(), tier:newA.tier, shift:newA.shift, hostname:newA.hostname.trim(), ip:newA.ip.trim()||undefined }); }
+    catch(e){ setProvisionBusy(false); setProvisionErr(e.message||"Provisioning failed."); return; }
+    setProvisionBusy(false);
+    if(!resp||resp.error){ setProvisionErr(resp&&resp.error?String(resp.error):"Provisioning failed."); return; }
+    const activationId = resp.activationId || genId();
     const newAnalyst = {id:`prov-${Date.now()}`,name:newA.name,tier:newA.tier,shift:newA.shift,days:0,available:true};
     setAnalysts(prev=>[...prev,newAnalyst]);
     setRC(prev=>({...prev,[newAnalyst.id]:newA.tier===3?5:newA.tier===2?3:2}));
@@ -3254,8 +3235,8 @@ function ManagementConsole() {
     const client = {id:activationId,analyst:newA.name,tier:newA.tier,shift:newA.shift,hostname:newA.hostname,ip:newA.ip,provisionedAt:new Date().toISOString(),status:"calibrating",analystId:newAnalyst.id};
     setPC(prev=>[...prev,client]);
     addA("ANALYST_PROVISIONED",`${newA.name} · ${tierLbl(newA.tier)} · ${newA.shift} · Host: ${newA.hostname} · Activation: ${activationId}`);
-    setNewA({name:"",tier:1,shift:"day",hostname:"",ip:""});
-    setShowProvision(false);
+    setProvisionResult({ name:newA.name, username:newA.username, activationId, enrollmentToken:resp.enrollmentToken||"", expiresInDays:resp.enrollmentExpiresInDays||7 });
+    setNewA({name:"",username:"",tier:1,shift:"day",hostname:"",ip:""});
   };
 
   const checkUpdate = () => {
@@ -4518,50 +4499,7 @@ function ManagementConsole() {
         </div>)}
 
         {/* IAM — NEW v0.0.8 */}
-        {tab==="iam"&&(<div>
-          <L>IAM / Identity Provider Configuration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure authentication against your enterprise identity infrastructure. All connections use encrypted channels.</M>
-          <div style={{display:"flex",gap:4,marginBottom:20}}>{[{id:"saml",l:"SAML 2.0"},{id:"oidc",l:"OIDC"},{id:"ad",l:"Active Directory"},{id:"cloud",l:"Cloud IAM"}].map(t=><button key={t.id} onClick={()=>setIamTab(t.id)} style={{padding:"6px 14px",background:iamTab===t.id?C.ad:"transparent",border:`1px solid ${iamTab===t.id?C.a+"50":C.b}`,borderRadius:6,color:iamTab===t.id?C.a:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{t.l}{iamCfg[t.id]?.status==="configured"?" ✓":""}</button>)}</div>
-          {iamTab==="saml"&&(<Card>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>SAML 2.0 Federation</div>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>SSO with Okta, Azure AD, PingOne, OneLogin. Platform acts as SAML Service Provider.</M>
-            <Input label="SP Entity ID" value={iamCfg.saml.entityId} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,entityId:e.target.value}}))} placeholder="https://soc-wellbeing.corp.local/saml/metadata" maxLength={512}/>
-            <Input label="IdP Metadata URL" value={iamCfg.saml.metadataUrl} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,metadataUrl:e.target.value}}))} placeholder="https://idp.corp.com/metadata.xml" maxLength={512}/>
-            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>IdP Signing Certificate (PEM)</M><textarea value={iamCfg.saml.cert} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,cert:e.target.value}}))} placeholder="-----BEGIN CERTIFICATE-----" style={{width:"100%",height:60,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical"}} maxLength={5000}/></div>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={iamCfg.saml.jit} onChange={e=>setIamCfg(prev=>({...prev,saml:{...prev.saml,jit:e.target.checked}}))} style={{accentColor:C.a}}/>Enable JIT user provisioning</label>
-            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,saml:{...prev.saml,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"SAML 2.0"}).then(()=>addA("IAM_CONFIGURED","SAML 2.0"));}}>Save SAML</Btn>
-          </Card>)}
-          {iamTab==="oidc"&&(<Card>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>OpenID Connect</div>
-            <Input label="Issuer URL" value={iamCfg.oidc.issuer} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,issuer:e.target.value}}))} placeholder="https://idp.corp.com/realms/main" maxLength={512}/>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Client ID" value={iamCfg.oidc.clientId} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,clientId:e.target.value}}))} placeholder="soc-wellbeing-client" maxLength={256}/>
-              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Client Secret</M><input type="password" value={iamCfg.oidc.secret} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,secret:e.target.value}}))} placeholder="••••••••" style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} maxLength={256}/></div>
-            </div>
-            <Input label="Scopes" value={iamCfg.oidc.scopes} onChange={e=>setIamCfg(prev=>({...prev,oidc:{...prev.oidc,scopes:e.target.value}}))} maxLength={256}/>
-            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,oidc:{...prev.oidc,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"OIDC"}).then(()=>addA("IAM_CONFIGURED","OIDC"));}}>Save OIDC</Btn>
-          </Card>)}
-          {iamTab==="ad"&&(<Card>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>Active Directory / LDAP</div>
-            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:12}}>
-              <Input label="Server" value={iamCfg.ad.server} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,server:e.target.value}}))} placeholder="dc01.corp.local" maxLength={253}/>
-              <Input label="Port" value={iamCfg.ad.port} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,port:e.target.value}}))} maxLength={5}/>
-            </div>
-            <Input label="Base DN" value={iamCfg.ad.baseDn} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,baseDn:e.target.value}}))} placeholder="DC=corp,DC=local" maxLength={512}/>
-            <Input label="Bind DN" value={iamCfg.ad.bindDn} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,bindDn:e.target.value}}))} placeholder="CN=svc-socwellbeing,OU=Service Accounts" maxLength={512}/>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Sync interval (min)" value={iamCfg.ad.syncInterval} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,syncInterval:String(Math.max(1,Math.min(1440,Number(e.target.value)||15)))}}))} type="number" min={1} max={1440}/>
-              <div style={{paddingTop:22}}><label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t}}><input type="checkbox" checked={iamCfg.ad.useTLS} onChange={e=>setIamCfg(prev=>({...prev,ad:{...prev.ad,useTLS:e.target.checked}}))} style={{accentColor:C.a}}/>LDAPS</label></div>
-            </div>
-            <div style={{display:"flex",gap:8}}><Btn primary onClick={()=>{setIamCfg(prev=>({...prev,ad:{...prev.ad,status:"configured"}}));api.post("/api/audit/mc-event",{event_type:"IAM_CONFIGURED",detail:"Active Directory LDAPS"}).then(()=>addA("IAM_CONFIGURED","Active Directory LDAPS"));}}>Save AD</Btn><Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"AD_TEST",detail:"Testing LDAPS..."}).then(()=>addA("AD_TEST","Testing LDAPS..."))}>Test Connection</Btn></div>
-          </Card>)}
-          {iamTab==="cloud"&&(<Card>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:14}}>Cloud IAM</div>
-            <Sel label="Provider" value={iamCfg.cloud.provider} onChange={e=>setIamCfg(prev=>({...prev,cloud:{...prev.cloud,provider:e.target.value}}))}><option value="none">Select...</option><option value="aws">AWS Cognito</option><option value="azure">Azure Entra ID</option><option value="gcp">GCP Identity Platform</option></Sel>
-            {iamCfg.cloud.provider!=="none"&&<><Input label={iamCfg.cloud.provider==="aws"?"User Pool ID":iamCfg.cloud.provider==="azure"?"Tenant ID":"Project ID"} value={iamCfg.cloud.tenantId} onChange={e=>setIamCfg(prev=>({...prev,cloud:{...prev.cloud,tenantId:e.target.value}}))} maxLength={256}/>
-            <Btn primary onClick={()=>{setIamCfg(prev=>({...prev,cloud:{...prev.cloud,status:"configured"}}));addA("IAM_CONFIGURED",`Cloud: ${iamCfg.cloud.provider.toUpperCase()}`);}}>Save Cloud IAM</Btn></>}
-          </Card>)}
-        </div>)}
+        {tab==="iam"&&<IamPanel/>}
 
         {/* KB — NEW v0.0.8 */}
         {tab==="kb"&&(<div>
@@ -4826,20 +4764,33 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               ))}
             </div>
           </>}
-          {showProvision&&<Modal title="Provision Analyst Client" onClose={()=>setShowProvision(false)} width={520}>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Like configuring a Filebeat or Winlogbeat agent: specify the target host, assign to an analyst, and the client registers with the platform using its activation ID.</M>
-            <Input label="Analyst name" value={newA.name} onChange={e=>setNewA(prev=>({...prev,name:e.target.value}))} placeholder="Full name" maxLength={100}/>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Sel label="Tier" value={newA.tier} onChange={e=>setNewA(prev=>({...prev,tier:Number(e.target.value)}))}><option value={1}>L1</option><option value={2}>L2</option><option value={3}>L3</option></Sel>
-              <Sel label="Shift" value={newA.shift} onChange={e=>setNewA(prev=>({...prev,shift:e.target.value}))}><option value="day">Day</option><option value="swing">Swing</option><option value="night">Night</option></Sel>
-            </div>
-            <Input label="Target hostname" value={newA.hostname} onChange={e=>setNewA(prev=>({...prev,hostname:e.target.value}))} placeholder="SOC-WS-042.corp.local" maxLength={253}/>
-            <Input label="IP address (optional)" value={newA.ip} onChange={e=>setNewA(prev=>({...prev,ip:e.target.value}))} placeholder="10.0.5.42" maxLength={45}/>
-            <Card style={{marginBottom:16,padding:12,borderColor:C.a+"30"}}>
-              <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:6}}>Provisioning will:</M>
-              <M style={{color:C.tm,lineHeight:2}}>1. Create Tier-3 encrypted data store (analyst-private)<br/>2. Generate activation ID for client registration<br/>3. Deploy client package to target host via SCCM/Ansible<br/>4. Configure routing eligibility (cap based on tier)<br/>5. Begin 14-day baseline calibration (no signals flagged)<br/>6. Update SIEM feed (team aggregate only)</M>
-            </Card>
-            <Btn primary style={{width:"100%"}} disabled={!newA.name.trim()||!newA.hostname.trim()} onClick={handleProvision}>Provision Client</Btn>
+          {showProvision&&<Modal title="Provision Analyst Client" onClose={()=>{setShowProvision(false);setProvisionResult(null);setProvisionErr("");}} width={520}>
+            {provisionResult ? (
+              <div>
+                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>{provisionResult.name} ({provisionResult.username}) is provisioned. Activation ID: {provisionResult.activationId}.</M>
+                <Card style={{marginBottom:14,padding:12,borderColor:C.d+"30"}}>
+                  <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:6}}>One-time enrollment token</M>
+                  <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Give this to the analyst over a secure channel. They redeem it once to enroll their first passkey. It expires in {provisionResult.expiresInDays} days and is shown only here.</M>
+                  <code style={{display:"block",color:C.t,fontSize:11,wordBreak:"break-all",fontFamily:"'IBM Plex Mono',monospace",userSelect:"all",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8}}>{provisionResult.enrollmentToken}</code>
+                </Card>
+                <div style={{display:"flex",gap:8}}>
+                  <Btn onClick={()=>{ try { if(navigator&&navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(provisionResult.enrollmentToken); } catch(_e){} }}>Copy token</Btn>
+                  <Btn primary onClick={()=>{setProvisionResult(null);setShowProvision(false);}}>Done</Btn>
+                </div>
+              </div>
+            ) : (<div>
+              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Specify the target host and assign to an analyst. No password is set — the analyst redeems a one-time enrollment token (shown next) to enroll their first passkey.</M>
+              <Input label="Analyst name" value={newA.name} onChange={e=>setNewA(prev=>({...prev,name:e.target.value}))} placeholder="Full name" maxLength={100}/>
+              <Input label="Username" value={newA.username} onChange={e=>setNewA(prev=>({...prev,username:e.target.value}))} placeholder="analyst.name" maxLength={64}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                <Sel label="Tier" value={newA.tier} onChange={e=>setNewA(prev=>({...prev,tier:Number(e.target.value)}))}><option value={1}>L1</option><option value={2}>L2</option><option value={3}>L3</option></Sel>
+                <Sel label="Shift" value={newA.shift} onChange={e=>setNewA(prev=>({...prev,shift:e.target.value}))}><option value="day">Day</option><option value="swing">Swing</option><option value="night">Night</option></Sel>
+              </div>
+              <Input label="Target hostname" value={newA.hostname} onChange={e=>setNewA(prev=>({...prev,hostname:e.target.value}))} placeholder="SOC-WS-042.corp.local" maxLength={253}/>
+              <Input label="IP address (optional)" value={newA.ip} onChange={e=>setNewA(prev=>({...prev,ip:e.target.value}))} placeholder="10.0.5.42" maxLength={45}/>
+              {provisionErr&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{provisionErr}</div>}
+              <Btn primary style={{width:"100%"}} disabled={!newA.name.trim()||!newA.username.trim()||!newA.hostname.trim()||provisionBusy} onClick={handleProvision}>{provisionBusy?"Provisioning…":"Provision Client"}</Btn>
+            </div>)}
           </Modal>}
         </div>)}
 
@@ -5456,9 +5407,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginBottom:16}}>
             {[
               {n:"SIEM CEF Stream",s:"connected",d:"TLS 6514 · Last event 2s ago"},
-              {n:"Active Directory / LDAP",s:iamCfg.ad.status==="configured"?"connected":"pending",d:iamCfg.ad.status==="configured"?"LDAPS 636 · Syncing":"Awaiting configuration"},
-              {n:"SSO Providers (SAML/OIDC)",s:[iamCfg.saml,iamCfg.oidc].filter(c=>c.status==="configured").length>0?"connected":"pending",d:[iamCfg.saml.status==="configured"&&"SAML",iamCfg.oidc.status==="configured"&&"OIDC"].filter(Boolean).join(", ")||"Not configured"},
-              {n:"Cloud IAM",s:iamCfg.cloud.status==="configured"?"connected":"pending",d:iamCfg.cloud.status==="configured"?iamCfg.cloud.provider.toUpperCase():"Not configured"},
+              {n:"Authentication",s:"connected",d:"Passwordless \u2014 mTLS client certificate + FIDO2 passkey (AAL3). Directory/offboarding via the IAM tab."},
               {n:"SOAR Platform",s:"connected",d:"Splunk SOAR · Webhook active · Last playbook trigger 12m ago"},
               {n:"Automation / SOAR Routing",s:autoSys.length+" connected",d:autoSys.map(a=>a.name).join(", ")||"None"},
               {n:"Ticketing System",s:"connected",d:"ServiceNow · REST API · Last sync 5m ago"},
@@ -7573,7 +7522,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <div style={{display:"flex",gap:8}}>
             <Btn primary onClick={()=>{api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_CONFIG_SAVED",detail:"Pseudonym system config saved"}).then(()=>addA("PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
-            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
+            {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,external_id:a.external_id||null,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
             <Btn onClick={()=>{const birds=["Phoenix","Merlin","Peregrine","Kestrel","Harrier","Gyrfalcon","Sparrowhawk","Kite","Buzzard","Shrike"];setAnalystPseudonyms(prev=>prev.map((ap,i)=>({...ap,pseudonym:"Analyst-"+birds[i%birds.length]+"-"+Math.floor(Math.random()*99),assignedAt:new Date().toISOString().slice(0,10)})));api.post("/api/audit/mc-event",{event_type:"PSEUDONYMS_ROTATED",detail:"All analyst pseudonyms rotated"}).then(()=>addA("PSEUDONYMS_ROTATED","All analyst pseudonyms rotated"));}}>Rotate All Pseudonyms</Btn>
           </div>
         </div>)}

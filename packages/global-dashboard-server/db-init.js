@@ -790,6 +790,73 @@ CREATE TRIGGER IF NOT EXISTS cloud_vuln_scan_access_log_no_delete
   BEFORE DELETE ON cloud_vuln_scan_access_log
   BEGIN SELECT RAISE(ABORT, 'cloud_vuln_scan_access_log is append-only'); END;
 
+-- ── B5b: IAM & SOC-grade authentication (the GD runs its own CA trust realm) ──
+-- ca_authority: the GD's built-in CA (encrypted key, cert, serial; one active).
+-- issued_certs: certs the GD CA issues to CISO/VP users, with a local revocation
+--   list (no OCSP) checked at the mTLS handshake.
+-- webauthn_credentials: FIDO2 passkeys (is_passwordless=1 = discoverable login).
+-- auth_recovery: the one-time break-glass recovery credential (hash only).
+-- (No offboarding_candidates here — the offboarding detector is analyst-side on
+-- the MC; the GD's users are a small fixed CISO/VP set.)
+CREATE TABLE IF NOT EXISTS ca_authority (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  subject TEXT NOT NULL,
+  key_algo TEXT NOT NULL DEFAULT 'ec-p256',
+  ca_cert_pem TEXT NOT NULL,
+  ca_private_key_encrypted TEXT NOT NULL,
+  serial_counter INTEGER NOT NULL DEFAULT 1,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_authority_one_active
+  ON ca_authority(is_active) WHERE is_active = 1;
+
+CREATE TABLE IF NOT EXISTS issued_certs (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  serial TEXT NOT NULL UNIQUE,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  external_id TEXT,
+  subject TEXT NOT NULL,
+  fingerprint256 TEXT NOT NULL,
+  cert_pem TEXT NOT NULL,
+  issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked', 'expired')),
+  revoked_at TEXT,
+  revoked_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_issued_certs_user ON issued_certs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_issued_certs_fingerprint ON issued_certs(fingerprint256);
+CREATE INDEX IF NOT EXISTS idx_issued_certs_revoked ON issued_certs(status) WHERE status = 'revoked';
+
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  credential_id TEXT NOT NULL UNIQUE,
+  public_key TEXT NOT NULL,
+  sign_count INTEGER NOT NULL DEFAULT 0,
+  transports TEXT,
+  aaguid TEXT,
+  is_passwordless INTEGER NOT NULL DEFAULT 0 CHECK (is_passwordless IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
+CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_passwordless
+  ON webauthn_credentials(is_passwordless) WHERE is_passwordless = 1;
+
+CREATE TABLE IF NOT EXISTS auth_recovery (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  credential_hash TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT,
+  use_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_recovery_one_active
+  ON auth_recovery(is_active) WHERE is_active = 1;
+
 INSERT OR IGNORE INTO config (key, value)
   VALUES ('instance_label', 'FireAlive Global Dashboard (unconfigured)');
 `;
