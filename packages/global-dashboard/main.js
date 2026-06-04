@@ -19,10 +19,11 @@ app.on('web-contents-created', (event, contents) => {
 // client must trust that CA out-of-band. The operator imports the GD CA
 // certificate once (auth:importCaCert); it is stored under userData as
 // firealive-gd-ca.pem and pinned here. setCertificateVerifyProc trusts a server
-// certificate ONLY if it chains to that pinned CA, otherwise it defers to
-// Chromium's default verification (which still accepts a publicly-trusted cert
-// and rejects an untrusted one). The CA certificate is public, not a secret, so
-// it is kept as a plain file rather than in safeStorage.
+// certificate ONLY if it chains to that pinned CA, and rejects every other
+// certificate outright (strict pinning: a publicly-trusted but non-FireAlive
+// cert is NOT accepted, which defeats a mis-issued or compromised public CA).
+// The CA certificate is public, not a secret, so it is kept as a plain file
+// rather than in safeStorage.
 //
 // The Global Dashboard is passwordless-only; the in-app login method is a
 // FIDO2/WebAuthn passkey, handled in the renderer via navigator.credentials — the
@@ -115,11 +116,11 @@ function createWindow() {
     callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': ["default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' https://localhost:*; img-src 'self' data:; frame-src 'none'"] } });
   });
   // Pin the GD server's CA: trust a server certificate only if it chains to
-  // the imported GD CA; otherwise defer to default verification.
+  // the imported GD CA; reject every other cert (strict pinning).
   session.defaultSession.setCertificateVerifyProc((request, callback) => {
     const leafPem = request && request.certificate && request.certificate.data;
     if (leafPem && serverCertChainsToPinnedCa(leafPem)) return callback(0); // trusted via pinned CA
-    return callback(-3); // defer to Chromium's default verification
+    return callback(-2); // reject: not signed by the pinned GD CA
   });
   win.loadFile('index.html');
 }

@@ -20,10 +20,10 @@ app.on('web-contents-created', (event, contents) => {
 // CA out-of-band. The operator imports the MC CA certificate (firealive-ca.pem,
 // downloadable from the server's /ca-cert) once; it is stored under userData and
 // pinned here. setCertificateVerifyProc trusts a server certificate ONLY if it
-// chains to that pinned CA, otherwise it defers to Chromium's default
-// verification (which still accepts a publicly-trusted cert and rejects an
-// untrusted one). The CA certificate is public, not a secret, so it is kept as a
-// plain file rather than in safeStorage.
+// chains to that pinned CA, and rejects every other certificate outright
+// (strict pinning: a publicly-trusted but non-FireAlive cert is NOT accepted,
+// which defeats a mis-issued or compromised public CA). The CA certificate is
+// public, not a secret, so it is kept as a plain file rather than in safeStorage.
 //
 // The in-app login method is a FIDO2/WebAuthn passkey, handled in the renderer
 // via navigator.credentials — the private key never leaves the authenticator. A
@@ -115,11 +115,11 @@ function createWindow() {
   });
 
   // Pin the management console's CA: trust a server certificate only if it
-  // chains to the imported MC CA; otherwise defer to default verification.
+  // chains to the imported MC CA; reject every other cert (strict pinning).
   session.defaultSession.setCertificateVerifyProc((request, callback) => {
     const leafPem = request && request.certificate && request.certificate.data;
     if (leafPem && serverCertChainsToPinnedCa(leafPem)) return callback(0); // trusted via pinned CA
-    return callback(-3); // defer to Chromium's default verification
+    return callback(-2); // reject: not signed by the pinned MC CA
   });
 
   win.loadFile('index.html');
