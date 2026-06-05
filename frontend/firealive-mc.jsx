@@ -1580,10 +1580,6 @@ function ManagementConsole() {
   const [aiDownloadPolling, setAiDownloadPolling] = useState(false);
   const [aiProvisioning, setAiProvisioning] = useState(null);  // /api/ai-provider/model/provisioning (verify-only guide)
   const [aiSelectedFeature, setAiSelectedFeature] = useState('ir_simulator');
-  const [aiEditProvider, setAiEditProvider] = useState('internal');
-  const [aiEditModelName, setAiEditModelName] = useState('');
-  const [aiEditApiKey, setAiEditApiKey] = useState('');
-  const [aiEditEndpoint, setAiEditEndpoint] = useState('');
   const [aiEditMaxTokens, setAiEditMaxTokens] = useState(1024);
   const [aiEditTemperature, setAiEditTemperature] = useState(0.7);
   const [aiInferences, setAiInferences] = useState([]);
@@ -1855,18 +1851,12 @@ function ManagementConsole() {
     if (tab !== 'internal_ai') return;
     const cfg = aiConfigs.find(c=>c.featureId===aiSelectedFeature);
     if (cfg) {
-      setAiEditProvider(cfg.provider);
-      setAiEditModelName(cfg.modelName || '');
       setAiEditMaxTokens(cfg.maxTokens || 1024);
       setAiEditTemperature(cfg.temperature !== null && cfg.temperature !== undefined ? cfg.temperature : 0.7);
     } else {
-      setAiEditProvider('internal');
-      setAiEditModelName('');
       setAiEditMaxTokens(1024);
       setAiEditTemperature(0.7);
     }
-    setAiEditApiKey('');
-    setAiEditEndpoint('');
     api.get('/api/ai-provider/inferences/'+aiSelectedFeature+'?limit=20').then(r=>{
       setAiInferences(r?.inferences || []);
     }).catch(()=>setAiInferences([]));
@@ -8487,7 +8477,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* ══════════ v1.0.0 — HELP ══════════ */}
         {tab==="internal_ai"&&(<div>
           <L>Internal AI</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>FireAlive ships internal AI by default. Some features use statistical/rule-based logic (deterministic, fast, no model needed); others use a local large language model bundled with FireAlive (private, no data leaves the host). Externally-hosted providers (Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom endpoints) can be configured per feature for orgs that prefer them.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>FireAlive uses internal AI only. Some features use statistical/rule-based logic (deterministic, fast, no model needed); others use a local large language model bundled with FireAlive. All inference runs on the host; no data ever leaves your infrastructure.</M>
 
           <Card style={{marginBottom:12,borderColor:C.a+"30"}}>
             <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:10}}>Always Internal (statistical / rule-based — not configurable)</div>
@@ -8547,22 +8537,14 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <option value="kb_synthesis">Knowledge Base synthesis</option>
               <option value="ttx_enhancement">TTX scenario enhancement (optional)</option>
             </Sel>
-            <Input label="Model name (optional; provider default used if blank)" value={aiEditModelName} onChange={e=>setAiEditModelName(e.target.value)} placeholder="e.g. claude-opus-4-7"/>
-            {aiEditProvider!=="internal"&&(<>
-              <Input label="API key" type="password" value={aiEditApiKey} onChange={e=>setAiEditApiKey(e.target.value)} placeholder="Required for external providers"/>
-              <Input label="Endpoint URL (optional for most; required for Azure OpenAI, AWS Bedrock proxy, custom)" value={aiEditEndpoint} onChange={e=>setAiEditEndpoint(e.target.value)} placeholder="Leave blank to use provider default"/>
-            </>)}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
               <Input label="Max tokens" type="number" value={aiEditMaxTokens} onChange={e=>setAiEditMaxTokens(parseInt(e.target.value)||1024)}/>
               <Input label="Temperature (0-2)" type="number" value={aiEditTemperature} onChange={e=>setAiEditTemperature(Math.max(0,Math.min(2,Number(e.target.value)||0.7)))}/>
             </div>
             <Btn primary style={{marginTop:12}} onClick={()=>{
-              const body = {provider:aiEditProvider,modelName:aiEditModelName||null,maxTokens:aiEditMaxTokens,temperature:aiEditTemperature};
-              if (aiEditProvider!=="internal") {
-                body.providerConfig = {apiKey:aiEditApiKey,endpointUrl:aiEditEndpoint||undefined};
-              }
+              const body = {maxTokens:aiEditMaxTokens,temperature:aiEditTemperature};
               api.put("/api/ai-provider/config/"+aiSelectedFeature,body).then(()=>{
-                addA("AI_PROVIDER_CONFIGURED","Tuning for "+aiSelectedFeature+" saved (max tokens "+aiEditMaxTokens+", temperature "+aiEditTemperature+);
+                addA("AI_PROVIDER_CONFIGURED","Tuning for "+aiSelectedFeature+" saved (max tokens "+aiEditMaxTokens+", temperature "+aiEditTemperature+")");
                 api.get("/api/ai-provider/config").then(r=>setAiConfigs(r?.configs||[]));
               }).catch(e=>addA("AI_PROVIDER_CONFIG_FAILED","Save failed: "+(e?.message||"unknown")));
             }}>Save Tuning for {aiSelectedFeature}</Btn>
