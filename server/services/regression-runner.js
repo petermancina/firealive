@@ -862,6 +862,24 @@ class RegressionRunner {
       return 'dispatcher reachable; unconfigured feature -> AI_NOT_CONFIGURED (graceful)';
     });
 
+    await check('ai', 'Provider CHECK rejects non-internal (B5c2)', () => {
+      // After B5c2 the ai_provider_config provider CHECK allows only 'internal',
+      // so no feature can be pointed at an external provider. Verified against a
+      // side-effect-free in-memory clone of the live schema: 'internal' is
+      // accepted and an external provider value is rejected by the CHECK. No
+      // writes touch the production DB.
+      const mem = cloneLiveSchema(this.db);
+      mem.prepare("INSERT INTO ai_provider_config (feature_id, provider) VALUES ('kb_chat', 'internal')").run();
+      let rejected = false;
+      try {
+        mem.prepare("INSERT INTO ai_provider_config (feature_id, provider) VALUES ('kb_synthesis', 'anthropic')").run();
+      } catch (_e) {
+        rejected = true;
+      }
+      if (!rejected) throw new Error('provider=anthropic was accepted; internal-only CHECK not enforced');
+      return 'provider CHECK enforces internal-only (external provider rejected)';
+    });
+
     // ── Category: Model-file safety ────────────────────────────────
     await check('model-safety', 'Model-file safety gate fail-closed (hash mismatch)', async () => {
       // Verifies the layered model-file safety gate FAILS CLOSED when the hash

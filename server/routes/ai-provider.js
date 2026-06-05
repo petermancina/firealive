@@ -3,7 +3,7 @@
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Endpoints for the AI/ML Integrations tab in MC. Lead-only.
+// Endpoints for the Internal AI tab in MC. Lead-only.
 //
 //   GET  /api/ai-provider/status                  — overall status
 //   GET  /api/ai-provider/config                  — list per-feature configs
@@ -15,17 +15,15 @@
 //   POST /api/ai-provider/model/load              — load model into memory
 //   POST /api/ai-provider/model/unload            — unload model from memory
 //
-// All endpoints require lead/admin role; AI provider routing is a platform-
-// configuration concern and analysts shouldn't be able to point burnout
-// message generation (their own data) at an unapproved external provider.
-// Each modification fires an audit log entry.
+// All endpoints require lead/admin role; AI configuration is a platform
+// concern and not something analysts should change. Each modification fires
+// an audit log entry.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { getDb } = require('../db/init');
-const { encryptConfig } = require('../services/encryption');
 const aiProvider = require('../services/ai-provider');
 
 // Lazy requires for services that may not exist yet (commit-sequence safety)
@@ -107,7 +105,6 @@ router.get('/config', (req, res) => {
 // ── PUT /api/ai-provider/config/:featureId ──────────────────────────────────
 
 const VALID_FEATURES = ['ir_simulator', 'burnout_messages', 'kb_synthesis', 'ttx_enhancement', 'troubleshooter', 'kb_chat'];
-const VALID_PROVIDERS = ['internal', 'anthropic', 'openai', 'gemini', 'azure_openai', 'aws_bedrock', 'custom'];
 
 router.put('/config/:featureId', (req, res) => {
   const { featureId } = req.params;
@@ -116,11 +113,7 @@ router.put('/config/:featureId', (req, res) => {
   }
 
   const body = req.body || {};
-  const { provider, modelName, providerConfig, maxTokens, temperature } = body;
-
-  if (!VALID_PROVIDERS.includes(provider)) {
-    return res.status(400).json({ error: 'invalid provider; must be one of: ' + VALID_PROVIDERS.join(', ') });
-  }
+  const { maxTokens, temperature } = body;
 
   const maxTok = parseInt(maxTokens, 10) || 1024;
   if (maxTok < 1 || maxTok > 32000) {
@@ -132,35 +125,20 @@ router.put('/config/:featureId', (req, res) => {
     return res.status(400).json({ error: 'temperature must be between 0 and 2' });
   }
 
-  // Encrypt providerConfig if present (external providers need credentials).
-  // Internal provider has no credentials so config_encrypted is NULL.
-  let configEncrypted = null;
-  if (provider !== 'internal') {
-    if (!providerConfig || typeof providerConfig !== 'object') {
-      return res.status(400).json({ error: `providerConfig required for provider: ${provider}` });
-    }
-    try {
-      configEncrypted = encryptConfig(providerConfig);
-    } catch (err) {
-      logger.error('Failed to encrypt provider config', { featureId, error: err.message });
-      return res.status(500).json({ error: 'failed to encrypt provider config' });
-    }
-  }
-
+  // FireAlive uses internal AI only. provider is always 'internal' (the column
+  // default and CHECK) and is not settable here; model_name and config_encrypted
+  // are left untouched (informational; no credentials exist).
   const db = getDb();
   try {
     db.prepare(`
-      INSERT INTO ai_provider_config (feature_id, provider, model_name, config_encrypted, max_tokens, temperature, updated_by, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO ai_provider_config (feature_id, max_tokens, temperature, updated_by, updated_at)
+      VALUES (?, ?, ?, ?, datetime('now'))
       ON CONFLICT(feature_id) DO UPDATE SET
-        provider = excluded.provider,
-        model_name = excluded.model_name,
-        config_encrypted = excluded.config_encrypted,
         max_tokens = excluded.max_tokens,
         temperature = excluded.temperature,
         updated_by = excluded.updated_by,
         updated_at = datetime('now')
-    `).run(featureId, provider, modelName || null, configEncrypted, maxTok, temp, req.user.id);
+    `).run(featureId, maxTok, temp, req.user.id);
   } catch (err) {
     logger.error('Failed to write ai_provider_config', { featureId, error: err.message });
     return res.status(500).json({ error: 'failed to save config' });
@@ -168,8 +146,8 @@ router.put('/config/:featureId', (req, res) => {
     db.close();
   }
 
-  auditLog(req.user.id, 'AI_PROVIDER_CONFIGURED', `feature=${featureId} provider=${provider} model=${modelName || 'default'}`, req.ip);
-  return res.json({ ok: true, featureId, provider, modelName: modelName || null });
+  auditLog(req.user.id, 'AI_PROVIDER_CONFIGURED', `feature=${featureId} maxTokens=${maxTok} temperature=${temp}`, req.ip);
+  return res.json({ ok: true, featureId, provider: 'internal', maxTokens: maxTok, temperature: temp });
 });
 
 // ── GET /api/ai-provider/inferences/:featureId ──────────────────────────────

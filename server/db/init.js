@@ -2054,7 +2054,7 @@ CREATE INDEX IF NOT EXISTS idx_malware_scanner_provider
 
 -- ── AI Provider Configuration ────────────────────────────────────────────
 -- Per-feature routing for AI calls. One row per AI-using feature.
--- The dispatcher reads this to decide internal vs external for each call.
+-- The dispatcher reads this to run each call on the internal local LLM.
 --
 -- Adding a new AI feature requires updating the feature_id CHECK list
 -- below BEFORE any code calls aiProvider.generate('new_feature', ...).
@@ -2083,8 +2083,7 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
     'kb_chat'
   )),
   provider TEXT NOT NULL DEFAULT 'internal' CHECK (provider IN (
-    'internal',
-    'anthropic', 'openai', 'gemini', 'azure_openai', 'aws_bedrock', 'custom'
+    'internal'
   )),
   model_name TEXT,
   config_encrypted BLOB,
@@ -2096,10 +2095,8 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
 
 -- Seed both internal-LLM features to the internal (local) provider by
 -- default, so the app's own AI is the out-of-box engine. INSERT OR IGNORE
--- never clobbers an admin's later choice. Switching a feature to an external
--- provider is a deliberate, audited change made through the config-locked AI
--- Provider tab — only that path routes data off-box. model_name records the
--- local default; internal-llm reports the actually-loaded model at runtime.
+-- never clobbers an admin's later choice. model_name records the local
+-- default; internal-llm reports the actually-loaded model at runtime.
 INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
   VALUES ('burnout_messages', 'internal', 'phi-4-Q4_K.gguf');
 INSERT OR IGNORE INTO ai_provider_config (feature_id, provider, model_name)
@@ -3063,6 +3060,65 @@ function initDb() {
     }
   } catch (flagU3MigErr) {
     console.error('peer_abuse_flags migration (U3) failed (non-fatal):', flagU3MigErr.message);
+  }
+
+  // ── Migration: ai_provider_config provider CHECK (B5c2) ─────────────
+  // FireAlive uses internal AI only. The provider CHECK is tightened to
+  // 'internal' so no row can name an external provider. SQLite cannot ALTER a
+  // CHECK constraint, so an existing table is rebuilt. Gated on the table's
+  // stored SQL still naming an external provider ('anthropic'), so it is a
+  // no-op on fresh installs (whose canonical shape from SCHEMA already has the
+  // tightened CHECK) and on already-migrated databases. The feature_id CHECK
+  // is preserved unchanged. Any row that named an external provider is reset
+  // to 'internal' and its config_encrypted cleared (internal rows never had
+  // one). Foreign keys toggle OFF for the rebuild and back ON afterward.
+  try {
+    const apRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='ai_provider_config'").get();
+    if (apRow && apRow.sql && apRow.sql.includes('anthropic')) {
+      console.log('ai_provider_config migration (B5c2): tightening provider CHECK to internal only');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE ai_provider_config_new (
+            feature_id TEXT PRIMARY KEY CHECK (feature_id IN (
+              'ir_simulator',
+              'burnout_messages',
+              'kb_synthesis',
+              'ttx_enhancement',
+              'troubleshooter',
+              'kb_chat'
+            )),
+            provider TEXT NOT NULL DEFAULT 'internal' CHECK (provider IN ('internal')),
+            model_name TEXT,
+            config_encrypted BLOB,
+            max_tokens INTEGER NOT NULL DEFAULT 1024,
+            temperature REAL NOT NULL DEFAULT 0.7,
+            updated_by TEXT REFERENCES users(id),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM ai_provider_config').get().n;
+        db.exec(`
+          INSERT INTO ai_provider_config_new
+            (feature_id, provider, model_name, config_encrypted, max_tokens, temperature, updated_by, updated_at)
+          SELECT
+            feature_id, 'internal', model_name, NULL, max_tokens, temperature, updated_by, updated_at
+          FROM ai_provider_config
+        `);
+        db.exec('DROP TABLE ai_provider_config');
+        db.exec('ALTER TABLE ai_provider_config_new RENAME TO ai_provider_config');
+        db.exec('COMMIT');
+        console.log(`ai_provider_config migration (B5c2): rebuilt, preserved ${copied} feature row(s)`);
+      } catch (apRebuildErr) {
+        db.exec('ROLLBACK');
+        throw apRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (apMigErr) {
+    console.error('ai_provider_config migration (B5c2) failed (non-fatal):', apMigErr.message);
   }
 
   // ── Migration: peer_abuse_flags.determination column (U4 PR 5) ──────

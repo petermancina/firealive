@@ -464,14 +464,14 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 1. Deployment tool pushes the AC to the analyst’s machine
 1. Analyst opens the AC, trusts the FireAlive CA, redeems the one-time enrollment token to enroll a passkey (or installs their client certificate), signs in, and baseline calibration begins
 
-### AI/ML Integrations
+### Internal AI
 
-**What it’s for:** External AI/ML systems FireAlive can integrate with for the burnout prediction engine, scenario generation in the IR Simulator, signal analysis. Some are internal (always required), some optional.
+**What it’s for:** FireAlive’s internal AI. Generative features — IR Simulator scenario generation, burnout intervention messages, the troubleshooter, and KB assistance — run on a local LLM bundled with the platform; burnout prediction and signal analysis use statistical/rule-based engines. All inference runs on the host, and there is no external-provider option.
 
 **Workflow:**
 
-1. Lead configures provider, endpoint, API key
-1. AI/ML features start using the configured integration
+1. The operator provisions and verifies the local model files (see below)
+1. Generative features use the internal model automatically; a lead can tune per-feature generation (max tokens, temperature) on the Internal AI tab
 
 **Local AI model provisioning (verify-only):** FireAlive never downloads AI models. The operator obtains the official files through their own vetted channel and places them in the model directory; FireAlive computes each file’s SHA-256, compares it to a hash **pinned in source**, and loads the model only on an exact match — refusing with an honest “unavailable” on any missing or mismatched file. No outbound model fetch ever occurs, and operators never supply hashes at runtime (rotating a model is a reviewed source change).
 
@@ -498,7 +498,7 @@ The model loads only if every file clears every applicable layer. The gate runs 
   - Pinned SHA-256: `nomic-embed-text-v1.5.f16.gguf` (274 MB) — `f7af6f66802f4df86eda10fe9bbcfc75c39562bed48ef6ace719a251cf1c2fdb`
   - Endpoint floor: ~274 MB free disk.
 
-Target directory: the server model root (default `~/.firealive/models`, override `FIREALIVE_MODEL_PATH`) and, on the Analyst Client, the AC model root (default `~/.firealive/ac-models`, override `FIREALIVE_AC_MODEL_PATH`). Both the MC **AI/ML** tab and the AC **KB Assistant** surface a “Show provisioning guide” / “Verify provisioned files” action that displays the official source, target directory, and these pinned hashes, and verifies on demand.
+Target directory: the server model root (default `~/.firealive/models`, override `FIREALIVE_MODEL_PATH`) and, on the Analyst Client, the AC model root (default `~/.firealive/ac-models`, override `FIREALIVE_AC_MODEL_PATH`). Both the MC **Internal AI** tab and the AC **KB Assistant** surface a “Show provisioning guide” / “Verify provisioned files” action that displays the official source, target directory, and these pinned hashes, and verifies on demand.
 
 **Other deployment hardening:**
 
@@ -1073,7 +1073,7 @@ The KB is curated. It is not open to anyone to update — that would be an attac
 A research assistant lets leads and analysts ask the knowledge base questions in plain language. It retrieves the most relevant entries, answers **only** from them, and **cites every claim** — if it cannot produce a fully-cited answer, it withholds the answer rather than guessing. Cited entries appear as chips that open the KB entry (with its copiable source). It is research education — not therapy, diagnosis, or clinical advice — and when the underlying model isn’t available it says so honestly instead of inventing an answer.
 
 - **Lead KB Assistant (Management Console):** runs server-side on FireAlive’s internal heavyweight model (Phi-4, verify-only — provisioned by the operator, never downloaded). The lead may supply brief, non-attributable team-aggregate context; individual analyst data is never used. Question and answer content are not logged (audit captures metadata only).
-- **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst’s device** — a local model with no server round-trip. The analyst’s question and their own signals are used only as on-device grounding and **never leave the device**. The model is provisioned on the analyst’s machine by the operator and verified on load by the model-file integrity & safety gate (hash-pin → GGUF format validation → on-device malware scan, fail-closed), and FireAlive never downloads it; an endpoint that can’t run it gets an honest “unavailable on this device” rather than any server fallback (see AI/ML Integrations → Local AI model provisioning). A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
+- **Analyst KB Assistant (Analyst Client):** runs **entirely on the analyst’s device** — a local model with no server round-trip. The analyst’s question and their own signals are used only as on-device grounding and **never leave the device**. The model is provisioned on the analyst’s machine by the operator and verified on load by the model-file integrity & safety gate (hash-pin → GGUF format validation → on-device malware scan, fail-closed), and FireAlive never downloads it; an endpoint that can’t run it gets an honest “unavailable on this device” rather than any server fallback (see Internal AI → Local AI model provisioning). A framing guardrail routes acute-distress input to the Post-Incident Wellness resources instead of to the model.
 
 ### Playbooks (SOAR Playbook / Runbook Generator)
 
