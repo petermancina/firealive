@@ -1590,7 +1590,7 @@ function ManagementConsole() {
 
   // Fetch AI provider status + configs when tab is opened
   useEffect(()=>{
-    if (tab !== 'ai_integrations') return;
+    if (tab !== 'internal_ai') return;
     setAiLoading(true);
     Promise.all([
       api.get('/api/ai-provider/status').catch(()=>null),
@@ -1852,7 +1852,7 @@ function ManagementConsole() {
 
   // Load existing config into edit form when feature selection changes
   useEffect(()=>{
-    if (tab !== 'ai_integrations') return;
+    if (tab !== 'internal_ai') return;
     const cfg = aiConfigs.find(c=>c.featureId===aiSelectedFeature);
     if (cfg) {
       setAiEditProvider(cfg.provider);
@@ -2460,10 +2460,10 @@ function ManagementConsole() {
   const [haCfg, setHaCfg] = useState({enabled:false,mode:"active_passive",failoverEndpoint:"",syncIntervalSec:5,loadBalancer:{enabled:false,type:"round_robin",healthCheckSec:10,healthPath:"/api/health"},replicationStatus:"idle",lastSyncAt:null});
   // Fail-open routing
   const [failOpenCfg, setFailOpenCfg] = useState({enabled:true,autoDetect:true,notifyOnFailOpen:true,maxFailOpenMin:60,restoreAuto:true});
-  // Config troubleshooter
-  const [troubleshooterOpen, setTroubleshooterOpen] = useState(false);
-  const [troubleshooterMsgs, setTroubleshooterMsgs] = useState([]);
+  // Troubleshooter (server-side diagnostics + internal-LLM synthesis)
   const [troubleshooterInput, setTroubleshooterInput] = useState("");
+  const [troubleshooterResult, setTroubleshooterResult] = useState(null);
+  const [troubleshooterLoading, setTroubleshooterLoading] = useState(false);
   // General cert uploads (beyond training-linked certs)
   const [generalCerts, setGeneralCerts] = useState([
     {id:"gc1",name:"CompTIA Security+",issuer:"CompTIA",earned:"2025-06-15",expires:"2028-06-15",analyst:"jordan-p"},
@@ -3256,7 +3256,7 @@ function ManagementConsole() {
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"training_reviews",label:"Training Reviews",badge:trainingReviewPendingCount},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
     ]},
     {cat:"integrations",label:"Integrations",items:[
-      {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"ai_integrations",label:"AI/ML Integrations"},
+      {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"internal_ai",label:"Internal AI"},
     ]},
     {cat:"security",label:"Security",items:[
       {id:"iam",label:"IAM"},{id:"mfa",label:"MFA"},{id:"apikeys",label:"API Keys"},{id:"access_ctrl",label:"Access Control"},{id:"auth_logs",label:"Auth Logs"},{id:"kms",label:"KMS"},{id:"wifi",label:"WiFi Policy"},{id:"posture",label:"Posture Assessment"},{id:"tripwire",label:"Tripwire"},{id:"compromise_scan",label:"Compromise Scan"},{id:"log_integrity",label:"Log Integrity"},{id:"regression",label:"Regression Test"},{id:"ttx",label:"TTX Generator"},
@@ -7347,39 +7347,57 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"FAILOPEN_CONFIG_SAVED",detail:"Fail-open routing config saved"}).then(()=>addA("FAILOPEN_CONFIG_SAVED","Fail-open routing config saved"))}>Save Fail-Open Config</Btn>
         </div>)}
 
-        {/* ══════════ v1.0.0 — CONFIG TROUBLESHOOTER ══════════ */}
+        {/* ══════════ TROUBLESHOOTER ══════════ */}
         {tab==="troubleshooter"&&(<div>
-          <L>Configuration Troubleshooter</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>An interactive assistant that helps diagnose why a feature isn't working as expected. Describe the problem and it will check your integrations, configurations, and suggest fixes.</M>
-          <Card style={{marginBottom:16,maxHeight:400,overflowY:"auto"}}>
-            {troubleshooterMsgs.length===0&&<M style={{color:C.td,padding:20,textAlign:"center",display:"block"}}>Describe a problem you're experiencing with any FireAlive feature and the troubleshooter will help diagnose it.</M>}
-            {troubleshooterMsgs.map((m,i)=>(
-              <div key={i} style={{padding:"10px 14px",marginBottom:4,background:m.role==="user"?C.bg:C.s,borderRadius:8,borderLeft:m.role==="assistant"?`3px solid ${C.i}`:"none"}}>
-                <M style={{color:m.role==="user"?C.t:C.tm,lineHeight:1.6}}>{m.text}</M>
-              </div>
-            ))}
-          </Card>
-          <div style={{display:"flex",gap:8}}>
+          <L>Troubleshooter</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Describe a problem with any FireAlive feature. The troubleshooter runs live rule-based checks against your current configuration and, when the internal model is loaded, adds a most-likely-cause and prioritized-fix summary. All checks run server-side; nothing is sent to any external service.</M>
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
             <Input label="" value={troubleshooterInput} onChange={e=>setTroubleshooterInput(e.target.value)} placeholder="e.g., SOAR integration isn't sending playbook triggers..." maxLength={1000} style={{flex:1}}/>
-            <Btn primary style={{marginTop:0}} disabled={!troubleshooterInput.trim()} onClick={()=>{
-              const q=troubleshooterInput.trim();setTroubleshooterInput("");
-              setTroubleshooterMsgs(prev=>[...prev,{role:"user",text:q}]);
-              setTimeout(()=>{
-                const checks=[];
-                if(q.toLowerCase().includes("soar")) checks.push("✓ SOAR platform: "+(soarPlatform||"not configured"),"✓ SOAR URL: "+(soarUrl||"empty — needs endpoint"),"✓ SOAR API key: "+(soarApiKeyPresent?"configured server-side":(soarApiKey?"set (unsaved)":"missing — required for communication")),"→ Fix: Go to SOAR tab and ensure endpoint URL and API key are both configured. Test connection with the 'Test Webhook' button.");
-                else if(q.toLowerCase().includes("siem")) checks.push("✓ SIEM feed: "+(featureToggles.siem_feed?"enabled":"disabled"),"→ Check: Ensure SIEM integration is enabled in Features tab and SIEM endpoint is configured in SIEM tab.");
-                else if(q.toLowerCase().includes("peer")||q.toLowerCase().includes("chat")) checks.push("✓ Peer chat feature: "+(featureToggles.peer_chat?"enabled":"disabled"),"✓ Peer scheduling: "+(featureToggles.peer_scheduling?"enabled":"disabled"),"→ Check: Ensure both are enabled in Features tab. Verify E2EE keys are provisioned for the analysts.");
-                else if(q.toLowerCase().includes("routing")||q.toLowerCase().includes("ticket")) checks.push("✓ Burnout routing: "+(featureToggles.burnout_routing?"enabled":"disabled"),"✓ Panic mode: "+(panicMode?"ACTIVE — routing is disabled!":"off"),"✓ Fail-open: "+(failOpenCfg.enabled?"enabled":"disabled"),"→ If tickets aren't being filtered, check if panic mode was accidentally activated.");
-                else if(q.toLowerCase().includes("backup")||q.toLowerCase().includes("restore")) checks.push("✓ Latest backup: "+backups[0]?.ts,"✓ Backup status: "+backups[0]?.status,"✓ Backup schedules: "+schedules.length+" configured","→ Check: Verify backup schedule in Backup Schedules tab. Ensure disk space is available.");
-                else if(q.toLowerCase().includes("client")||q.toLowerCase().includes("provision")) checks.push("✓ Provisioned clients: "+provisionedClients.length,"✓ Client sync interval: "+syncIntervalCfg.intervalMin+"min","→ If a client can't connect: verify server is running, config.json has correct endpoint, firewall allows port 3001, enrollment token is valid");
-                else if(q.toLowerCase().includes("mfa")||q.toLowerCase().includes("auth")) checks.push("✓ MFA: "+(mfaCfg.status==="configured"?"configured":"not configured"),"✓ MFA method: "+mfaCfg.method,"✓ Auth logs: "+authLogs.length+" events","→ If MFA isn't working: verify TOTP secret is synced with authenticator app. If using WebAuthn, ensure browser supports FIDO2.");
-                else if(q.toLowerCase().includes("tripwire")) checks.push("✓ Tripwire: "+(tripwireCfg.enabled?"enabled":"disabled"),"✓ Threshold: "+tripwireCfg.threshold_pct+"%","✓ Status: "+(tripwireTriggered?"TRIGGERED":"armed"),"→ If tripwire triggered unexpectedly, check if analysts legitimately requested reduced load vs. compromise.");
-                else if(q.toLowerCase().includes("upskill")) checks.push("✓ Upskilling hour: "+(upskillingCfg.enabled?"enabled":"disabled"),"✓ Hour: "+upskillingCfg.hourOfShift+" of shift","✓ Stop routing: "+(upskillingCfg.stopRouting?"yes":"no"),"→ When upskilling hour activates, routing pauses for that analyst. Peer chat and training are enabled.");
-                else checks.push("Running general diagnostic:","✓ Backend API: "+(apiReady?"connected":"not connected — backend may need restart"),"✓ Feature toggles: "+Object.entries(featureToggles).filter(([_,v])=>!v).length+" features disabled","✓ SOAR: "+(soarUrl?"configured":"not configured"),"✓ Panic mode: "+(panicMode?"ACTIVE":"off"),"✓ MFA: "+(mfaCfg.status==="configured"?"configured":"pending"),"✓ Tripwire: "+(tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled"),"✓ HA: "+(haCfg.enabled?haCfg.mode:"disabled"),"✓ Clients: "+provisionedClients.length+" provisioned","→ For specific help, mention: soar, siem, peer, routing, backup, client, mfa, tripwire, upskilling");
-                setTroubleshooterMsgs(prev=>[...prev,{role:"assistant",text:checks.join("\n")}]);
-              },800);
-            }}>Diagnose</Btn>
+            <Btn primary style={{marginTop:0}} disabled={troubleshooterLoading||!troubleshooterInput.trim()} onClick={async()=>{
+              const q=troubleshooterInput.trim();
+              setTroubleshooterLoading(true);setTroubleshooterResult(null);
+              const r=await api.post("/api/troubleshoot",{description:q});
+              setTroubleshooterLoading(false);
+              setTroubleshooterResult(r&&!r.error?r:{error:(r&&r.error)||"Request failed"});
+            }}>{troubleshooterLoading?"Diagnosing...":"Diagnose"}</Btn>
           </div>
+          {troubleshooterResult&&troubleshooterResult.error&&(
+            <Card style={{marginBottom:16}}><M style={{color:C.d}}>Could not run the troubleshooter: {troubleshooterResult.error}</M></Card>
+          )}
+          {troubleshooterResult&&!troubleshooterResult.error&&(<div>
+            <M style={{color:C.td,display:"block",marginBottom:8}}>Topic: {troubleshooterResult.topic}</M>
+            {troubleshooterResult.findings&&troubleshooterResult.findings.length>0&&(<Card style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Findings</div>
+              {troubleshooterResult.findings.map((f,i)=>(
+                <div key={i} style={{padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <Badge color={f.status==="pass"?C.a:f.status==="fail"?C.d:C.w}>{f.status}</Badge>
+                    <M style={{color:C.t,fontWeight:500}}>{f.label}</M>
+                  </div>
+                  <M style={{color:C.tm,display:"block",lineHeight:1.6}}>{f.detail}</M>
+                  {f.fix&&<M style={{color:C.tm,display:"block",marginTop:4,lineHeight:1.6}}>Fix: {f.fix}</M>}
+                  {f.tab&&<Btn small style={{marginTop:6}} onClick={()=>setTab(f.tab)}>Open {f.tab}</Btn>}
+                </div>
+              ))}
+            </Card>)}
+            {troubleshooterResult.baseline&&troubleshooterResult.baseline.length>0&&(<Card style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>System baseline</div>
+              {troubleshooterResult.baseline.map((f,i)=>(
+                <div key={i} style={{padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <Badge color={f.status==="pass"?C.a:f.status==="fail"?C.d:C.w}>{f.status}</Badge>
+                    <M style={{color:C.t,fontWeight:500}}>{f.label}</M>
+                  </div>
+                  <M style={{color:C.tm,display:"block",lineHeight:1.6}}>{f.detail}</M>
+                  {f.fix&&<M style={{color:C.tm,display:"block",marginTop:4,lineHeight:1.6}}>Fix: {f.fix}</M>}
+                  {f.tab&&<Btn small style={{marginTop:6}} onClick={()=>setTab(f.tab)}>Open {f.tab}</Btn>}
+                </div>
+              ))}
+            </Card>)}
+            {troubleshooterResult.aiUnavailable
+              ?(<Card style={{borderLeft:`3px solid ${C.w}`}}><M style={{color:C.tm,lineHeight:1.6}}>AI diagnosis unavailable ({troubleshooterResult.aiReason}). The checks above are rule-based and stand on their own; the internal model adds an optional summary when it is loaded.</M></Card>)
+              :(<Card style={{borderLeft:`3px solid ${C.a}`}}><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Diagnosis and prioritized fixes</div><M style={{color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{troubleshooterResult.diagnosis}</M></Card>)}
+          </div>)}
         </div>)}
 
         {/* ══════════ v1.0.0 — GENERAL CERTS ══════════ */}
@@ -8467,8 +8485,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — HELP ══════════ */}
-        {tab==="ai_integrations"&&(<div>
-          <L>AI/ML Integrations</L>
+        {tab==="internal_ai"&&(<div>
+          <L>Internal AI</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>FireAlive ships internal AI by default. Some features use statistical/rule-based logic (deterministic, fast, no model needed); others use a local large language model bundled with FireAlive (private, no data leaves the host). Externally-hosted providers (Anthropic, OpenAI, Gemini, Azure OpenAI, AWS Bedrock, custom endpoints) can be configured per feature for orgs that prefer them.</M>
 
           <Card style={{marginBottom:12,borderColor:C.a+"30"}}>
@@ -8521,23 +8539,13 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
 
           <Card style={{marginBottom:12}}>
-            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Feature Provider Routing</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>For features that use generative AI, choose where the inference runs. Internal uses the local LLM (private; no data leaves the host). External providers send the prompt over the network and require credentials.</M>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Per-Feature Tuning</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>For features that use the local LLM, tune how it generates. Inference always runs on the bundled internal model — private, with no data leaving the host.</M>
             <Sel label="Feature" value={aiSelectedFeature} onChange={e=>setAiSelectedFeature(e.target.value)}>
               <option value="ir_simulator">IR Simulator scenario generation</option>
               <option value="burnout_messages">Burnout intervention messages</option>
               <option value="kb_synthesis">Knowledge Base synthesis</option>
               <option value="ttx_enhancement">TTX scenario enhancement (optional)</option>
-              <option value="troubleshooter">Troubleshooter AI diagnosis</option>
-            </Sel>
-            <Sel label="Provider" value={aiEditProvider} onChange={e=>setAiEditProvider(e.target.value)}>
-              <option value="internal">FireAlive Internal AI (local LLM)</option>
-              <option value="anthropic">Anthropic (Claude)</option>
-              <option value="openai">OpenAI (GPT)</option>
-              <option value="gemini">Google Gemini</option>
-              <option value="azure_openai">Azure OpenAI Service</option>
-              <option value="aws_bedrock">AWS Bedrock</option>
-              <option value="custom">Custom (OpenAI-compatible endpoint)</option>
             </Sel>
             <Input label="Model name (optional; provider default used if blank)" value={aiEditModelName} onChange={e=>setAiEditModelName(e.target.value)} placeholder="e.g. claude-opus-4-7"/>
             {aiEditProvider!=="internal"&&(<>
@@ -8554,15 +8562,15 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 body.providerConfig = {apiKey:aiEditApiKey,endpointUrl:aiEditEndpoint||undefined};
               }
               api.put("/api/ai-provider/config/"+aiSelectedFeature,body).then(()=>{
-                addA("AI_PROVIDER_CONFIGURED","Provider for "+aiSelectedFeature+" set to "+aiEditProvider);
+                addA("AI_PROVIDER_CONFIGURED","Tuning for "+aiSelectedFeature+" saved (max tokens "+aiEditMaxTokens+", temperature "+aiEditTemperature+);
                 api.get("/api/ai-provider/config").then(r=>setAiConfigs(r?.configs||[]));
               }).catch(e=>addA("AI_PROVIDER_CONFIG_FAILED","Save failed: "+(e?.message||"unknown")));
-            }}>Save Routing for {aiSelectedFeature}</Btn>
+            }}>Save Tuning for {aiSelectedFeature}</Btn>
           </Card>
 
           <Card style={{marginBottom:12}}>
             <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>Recent inferences for {aiSelectedFeature}</div>
-            {aiInferences.length===0&&<M style={{color:C.tm}}>No inference activity yet. Once features start using their configured provider, calls will be logged here (token counts and metadata only — prompt and response content are not stored to protect Tier-3 data).</M>}
+            {aiInferences.length===0&&<M style={{color:C.tm}}>No inference activity yet. Once features start using the internal model, calls will be logged here (token counts and metadata only — prompt and response content are not stored to protect Tier-3 data).</M>}
             {aiInferences.length>0&&(<div style={{maxHeight:300,overflowY:"auto"}}>
               {aiInferences.map(inf=>(
                 <div key={inf.id} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,fontSize:11}}>
