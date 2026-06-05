@@ -8562,7 +8562,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 body.providerConfig = {apiKey:aiEditApiKey,endpointUrl:aiEditEndpoint||undefined};
               }
               api.put("/api/ai-provider/config/"+aiSelectedFeature,body).then(()=>{
-                addA("AI_PROVIDER_CONFIGURED","Tuning for "+aiSelectedFeature+" saved (max tokens "+aiEditMaxTokens+", temperature "+aiEditTemperature+);
+                addA("AI_PROVIDER_CONFIGURED","Tuning for "+aiSelectedFeature+" saved (max tokens "+aiEditMaxTokens+", temperature "+aiEditTemperature+")");
                 api.get("/api/ai-provider/config").then(r=>setAiConfigs(r?.configs||[]));
               }).catch(e=>addA("AI_PROVIDER_CONFIG_FAILED","Save failed: "+(e?.message||"unknown")));
             }}>Save Tuning for {aiSelectedFeature}</Btn>
