@@ -74,7 +74,7 @@
           ]
         }
       ],
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.ico"
     },
     "linux": {
       "target": [
@@ -91,9 +91,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "installerIcon": "assets/icon.ico",
-      "uninstallerIcon": "assets/icon.ico"
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true
     },
     "icon": "assets/icon.png"
   }

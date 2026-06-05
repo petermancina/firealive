@@ -58,7 +58,7 @@
           ]
         }
       ],
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.ico"
     },
     "linux": {
       "target": [
@@ -70,6 +70,11 @@
         }
       ],
       "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true
     },
     "icon": "assets/icon.png"
   }
