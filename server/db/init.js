@@ -2394,6 +2394,7 @@ CREATE TABLE IF NOT EXISTS ticket_actions (
   category TEXT,              -- malware, phishing, intrusion, etc. (used by signal-collector for task-switching metric)
   response_time_min REAL,     -- minutes from ticket arrival to first action
   notes TEXT,
+  external_action_id TEXT,    -- B5d1-F: stable id of the source platform's action event (via the activity-events push); NULL for internally-generated actions. Deduped by the partial UNIQUE index created in the initDb migration block.
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -3913,6 +3914,35 @@ function initDb() {
   } catch (r1TaMigrationErr) {
     console.error('ticket_actions R1 migration FAILED:', r1TaMigrationErr.message);
     console.error('The server will start, but ticket_actions may retain the legacy shape (action column instead of action_type) until the migration is investigated.');
+  }
+
+  // ── Migration: Phase B5d1-F — ticket_actions.external_action_id + dedup index ──
+  //
+  // The burnout-signal data feed ingests analyst ticket actions by push
+  // (POST /api/integrations/ticketing/activity-events). external_action_id holds
+  // the stable id the source platform assigns each action event, so a re-
+  // delivered event is idempotently ignored rather than double-counted.
+  //
+  // ALTER TABLE ADD COLUMN is idempotent here: it runs only when the column is
+  // missing, so it is a no-op on fresh installs (which get it from SCHEMA) and on
+  // already-migrated databases. It runs after the R1 rebuild above so the table
+  // is already in its canonical shape when the column is added.
+  //
+  // The UNIQUE index is PARTIAL (WHERE external_action_id IS NOT NULL): it
+  // enforces one row per source action id for pushed events while allowing any
+  // number of NULL rows (existing rows and internally-generated actions that
+  // carry no external id). It is created in this migration block rather than in
+  // SCHEMA because SCHEMA is exec'd before the migration block, so on an existing
+  // database the column would not yet exist at the time SCHEMA ran.
+  try {
+    const taExtCols = db.prepare("PRAGMA table_info(ticket_actions)").all().map(c => c.name);
+    if (!taExtCols.includes('external_action_id')) {
+      db.exec("ALTER TABLE ticket_actions ADD COLUMN external_action_id TEXT");
+      console.log('ticket_actions migration (B5d1-F): added external_action_id column');
+    }
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_actions_external ON ticket_actions(external_action_id) WHERE external_action_id IS NOT NULL");
+  } catch (taExtMigErr) {
+    console.error('ticket_actions external_action_id migration (B5d1-F) failed (non-fatal):', taExtMigErr.message);
   }
 
   try {
