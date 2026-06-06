@@ -1,24 +1,24 @@
 // FireAlive v1.0.42 — AI Burnout Message routes
 //
-// Read/refresh endpoints over the precomputed burnout-message caches. No LLM
-// inference happens here: the scheduler jobs generate and cache content; these
-// endpoints only serve fresh cached rows or report the honest AI-unavailable
-// state. Never any canned content.
+// Read/refresh endpoints over the precomputed team burnout-message cache. No
+// LLM inference happens here: the scheduler job generates and caches content;
+// these endpoints only serve fresh cached rows or report the honest
+// AI-unavailable state. Never any canned content.
 //
-//   GET  /api/ai-burnout/analyst-interpretations   (analyst — own Tier-3 data)
+// Per-analyst AI interpretations are not served here. Under B5d1 an analyst's
+// interpretation is private to the analyst: it is generated and read on the
+// analyst's own device and is never decrypted server-side.
+//
 //   GET  /api/ai-burnout/team-intervention-prompts (lead/admin — Tier-1 only)
 //   POST /api/ai-burnout/refresh                    (lead/admin — queue regen)
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
-const { decryptTier3 } = require('../services/encryption');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
 const { computeTeamHealth } = require('../services/team-health');
 const teamConditions = require('../services/team-conditions');
 const researchKb = require('../services/research-kb');
-
-const SIGNAL_KEYS = ['investigationTime', 'dismissRate', 'ticketQuality', 'escalationRate'];
 
 // Narrow the already-authenticated request (set by the mount-level
 // authMiddleware) to a specific role set without re-verifying the token.
@@ -31,29 +31,19 @@ function requireRole(...roles) {
   };
 }
 
-// Derive a coarse, honest reason for an unavailable item from the latest failed
-// inference for this feature, scoped to the analyst (selfUserId) or to the
-// scheduled team calls (selfUserId null). When the last call did not error,
-// there is simply no fresh content yet (not generated, regenerating, or a
-// rejected citation) -> 'pending'.
-function unavailableReason(db, selfUserId) {
+// Derive a coarse, honest reason for an unavailable team prompt from the latest
+// failed inference for this feature; the scheduled team calls log under a null
+// user_id. When the last call did not error, there is simply no fresh content
+// yet (not generated, regenerating, or a rejected citation) -> 'pending'.
+function unavailableReason(db) {
   let row;
   try {
-    if (selfUserId) {
-      row = db
-        .prepare(
-          "SELECT status, error_message FROM ai_inference_log WHERE feature_id='burnout_messages' " +
-            "AND user_id=? AND status != 'success' ORDER BY created_at DESC LIMIT 1"
-        )
-        .get(selfUserId);
-    } else {
-      row = db
-        .prepare(
-          "SELECT status, error_message FROM ai_inference_log WHERE feature_id='burnout_messages' " +
-            "AND user_id IS NULL AND status != 'success' ORDER BY created_at DESC LIMIT 1"
-        )
-        .get();
-    }
+    row = db
+      .prepare(
+        "SELECT status, error_message FROM ai_inference_log WHERE feature_id='burnout_messages' " +
+          "AND user_id IS NULL AND status != 'success' ORDER BY created_at DESC LIMIT 1"
+      )
+      .get();
   } catch {
     row = null;
   }
@@ -66,55 +56,6 @@ function unavailableReason(db, selfUserId) {
   return { reason, detail: msg ? msg.slice(0, 200) : null };
 }
 
-// ── GET /analyst-interpretations — the caller's own per-signal interpretations.
-// Returns all four signals; each is either AI content or an unavailable notice.
-// The signal values themselves are not returned here (the My Signals tab
-// already has them) — only the AI interpretation text, which is Tier-3 and
-// decrypted for the owning analyst alone.
-router.get('/analyst-interpretations', requireRole('analyst'), (req, res) => {
-  const db = getDb();
-  try {
-    const analystId = req.user.id;
-    const fallback = unavailableReason(db, analystId);
-    const out = {};
-    for (const sk of SIGNAL_KEYS) {
-      const row = db
-        .prepare(
-          "SELECT interpretation_encrypted, model_name, kb_refs, generated_at FROM analyst_interpretations " +
-            "WHERE analyst_id=? AND signal_key=? AND expires_at > datetime('now')"
-        )
-        .get(analystId, sk);
-      if (!row) {
-        out[sk] = { status: 'unavailable', reason: fallback.reason, detail: fallback.detail };
-        continue;
-      }
-      try {
-        const dec = decryptTier3(row.interpretation_encrypted);
-        out[sk] = {
-          status: 'ai',
-          text: dec && dec.text,
-          model_name: row.model_name,
-          kb_refs: safeParseArray(row.kb_refs),
-          generated_at: row.generated_at,
-        };
-      } catch (err) {
-        logger.warn('ai-burnout: analyst interpretation decrypt failed', {
-          analystId,
-          signal: sk,
-          error: err.message,
-        });
-        out[sk] = { status: 'unavailable', reason: 'decryption_failed', detail: null };
-      }
-    }
-    res.json({ interpretations: out, kbVersion: researchKb.KB_VERSION });
-  } catch (err) {
-    logger.error('ai-burnout: analyst-interpretations failed', { error: err.message });
-    res.status(500).json({ error: 'internal error' });
-  } finally {
-    db.close();
-  }
-});
-
 // ── GET /team-intervention-prompts — Tier-1 team Actions feed.
 // Recomputes team health and the active conditions live, then attaches the
 // cached AI prompt for each active condition (or an unavailable notice). The
@@ -125,7 +66,7 @@ router.get('/team-intervention-prompts', requireRole('lead', 'admin'), (req, res
   try {
     const th = computeTeamHealth(db);
     const active = teamConditions.getActive(th);
-    const fallback = unavailableReason(db, null);
+    const fallback = unavailableReason(db);
     const conditions = active.map((c) => {
       const base = { key: c.key, severity: c.severity, label: c.label };
       const row = db

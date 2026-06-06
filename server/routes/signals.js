@@ -8,6 +8,9 @@
 //   • current     — latest decrypted snapshot from analyst_signals (current state)
 //   • readings    — time-series rows from signal_readings (for trend rendering,
 //                   written by services/ai-burnout-engine.js)
+//   • sealed_readings — B5d1 per-analyst snapshots sealed to the analyst's own
+//                   X25519 public key (analyst_private_data, kind='reading').
+//                   Opaque ciphertext; decrypted only on the Analyst Client.
 //   • meta        — pagination + filter echo
 //
 // This is the new canonical analyst-self endpoint. The pre-existing
@@ -136,12 +139,35 @@ router.get('/me', (req, res) => {
 
     const readings = db.prepare(readingsSql).all(...params);
 
+    // -- Sealed readings -- the analyst's own private snapshots (B5d1) ----------
+    // analyst_private_data holds one snapshot per collection cycle, sealed to
+    // this analyst's X25519 public key. The server stores and returns only
+    // opaque ciphertext and holds no key to open it. The Analyst Client decrypts
+    // each blob on-device (burnout key custody) to render its own trend and
+    // compute its own baseline and drift. Self-scoped by the same JWT analyst id
+    // used above; time-filtered to match the readings window. Snapshots carry
+    // all signals at once, so the ?signal= filter does not apply here -- the
+    // client filters after decrypting. Served alongside the legacy plaintext
+    // readings until the client is migrated to this sealed source.
+    const sealedReadings = db.prepare(
+      `SELECT id, ciphertext, key_version, recorded_at
+       FROM analyst_private_data
+       WHERE analyst_id = ?
+         AND kind = 'reading'
+         AND datetime(recorded_at) >= datetime(?)
+         AND datetime(recorded_at) <= datetime(?)
+       ORDER BY recorded_at DESC
+       LIMIT ?`
+    ).all(analystId, sinceDate.toISOString(), untilDate.toISOString(), limit);
+
     res.json({
       analyst_id: analystId,
       current,
       readings,
+      sealed_readings: sealedReadings,
       meta: {
         count: readings.length,
+        sealed_count: sealedReadings.length,
         since: sinceDate.toISOString(),
         until: untilDate.toISOString(),
         signal: signalFilter || null,

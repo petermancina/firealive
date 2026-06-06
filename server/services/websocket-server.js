@@ -1,5 +1,5 @@
 // FireAlive v1.0.0 — WebSocket Server
-// Real-time: routing feed, peer chat, client heartbeat, notifications, signal updates
+// Real-time: routing feed, peer chat, client heartbeat, notifications
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
@@ -108,9 +108,10 @@ class FireAliveWebSocket {
         }
         break;
       case 'signal_reading':
-        // Record burnout signal from AC
-        const { AiBurnoutEngine } = require('./ai-burnout-engine');
-        new AiBurnoutEngine(this.db).recordSignal(ws.userId, msg.signal, msg.value);
+        // B5d1: the server no longer ingests client-pushed signal readings.
+        // Per-analyst signals are computed server-side by the collector and
+        // sealed to the analyst's own key; nothing is stored as server-readable
+        // plaintext. Older clients may still send this frame; it is ignored.
         break;
       case 'subscribe_routing':
         ws.subscribeRouting = true;
@@ -173,15 +174,6 @@ class FireAliveWebSocket {
     }
     this._send(ws, { type: 'desktop_notify', payload });
     return { sent: true };
-  }
-
-  // Broadcast signal update to MC
-  broadcastSignalUpdate(analystId, signals) {
-    this.clients.forEach((ws) => {
-      if (ws.subscribeRouting && ws.readyState === WebSocket.OPEN) {
-        this._send(ws, { type: 'signal_update', analystId, signals });
-      }
-    });
   }
 
   // U1: notify every connected client that the feature-toggle state changed,
@@ -350,15 +342,11 @@ class FireAliveWebSocket {
     try {
       const { SignalCollector } = require('./signal-collector');
       const collector = new SignalCollector(this.db);
-      const result = await collector.collectAll();
-      // Broadcast updates to MC
-      const { AiBurnoutEngine } = require('./ai-burnout-engine');
-      const engine = new AiBurnoutEngine(this.db);
-      const analysts = this.db.prepare("SELECT id FROM users WHERE role='analyst' AND active=1").all();
-      for (const a of analysts) {
-        const signals = engine.getSignals(a.id);
-        this.broadcastSignalUpdate(a.id, signals);
-      }
+      await collector.collectAll();
+      // B5d1: no per-analyst broadcast. Individual signal status is private to
+      // the analyst (sealed at collection, interpreted on-device). Management
+      // sees only the team aggregate, read by the MC via the team-health
+      // endpoint, never a per-analyst feed.
     } catch (e) { console.error('[WS] Signal collection error:', e.message); }
   }
 

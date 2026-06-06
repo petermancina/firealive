@@ -1,18 +1,26 @@
 // FireAlive v1.0.42 — Team Health (server-side computeTH replica)
 //
-// Tier-1 aggregate. Reproduces the management console's computeTH formula
-// exactly, but computed server-side from canonical operational data instead of
-// the hardcoded demo dataset the MC used. Returns ONLY the team aggregate
-// { score, status, avgUtil, oc, ext, size } — never any per-analyst value — so
-// it is safe to surface to leads and to drive the team-intervention conditions.
+// Tier-1 team PRESSURE aggregate. This is the operational, lead-visible side of
+// the pressure/behavior split: it summarizes workload applied to the team
+// (ticket volume, overtime), never the analysts' private behavioral response.
+// It reads only workload inputs — never signal_readings, the sealed
+// analyst_private_data, or the de-identified store — and returns ONLY the team
+// aggregate { score, status, avgUtil, oc, ext, size }, never any per-analyst
+// value. That is what makes it safe to surface to leads and to drive the
+// team-intervention conditions: a lead can see team pressure and reduce it
+// before burnout without seeing any individual's data.
 //
-// Inputs, all from canonical sources (the same ones the signal collector uses):
+// Reproduces the management console's computeTH formula exactly, but computed
+// server-side from canonical operational data instead of the hardcoded demo
+// dataset the MC used.
+//
+// Inputs, all from canonical sources (the collector's pressure inputs):
 //   - roster: analysts currently on shift (active + available). The MC demo
 //     filtered a hardcoded "day" cohort; the available flag generalizes this
 //     without baking in time-of-day shift assumptions.
 //   - tk (ticket count, last hour): COUNT(*) from ticket_actions.
 //   - wo (overtime hours): config key 'overtime_<analyst_id>'.
-//   - util (0-1): the signal collector's canonical load metric reused here —
+//   - util (0-1): the collector's canonical pressure/load metric reused here —
 //     cognitive_load = min(100, ticketCount * 8), normalized to 0-1. Reusing
 //     the established metric avoids a parallel definition of "load".
 //
