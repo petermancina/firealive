@@ -185,9 +185,10 @@ class SignalCollector {
     // Response latency: avg time to first action on ticket
     const latency = this._getResponseLatency(analyst.id);
     signals.push({ signal: 'response_latency', value: latency });
-    // Break compliance: % of scheduled breaks actually taken
+    // Break compliance: % of offered breaks actually taken (null when no breaks
+    // were decided in the window — skip rather than fabricate a value).
     const breaks = this._getBreakCompliance(analyst.id);
-    signals.push({ signal: 'break_compliance', value: breaks });
+    if (breaks !== null) signals.push({ signal: 'break_compliance', value: breaks });
     // Shift overtime: hours past shift end
     const overtime = this._getOvertime(analyst.id);
     signals.push({ signal: 'shift_overtime', value: overtime });
@@ -219,10 +220,24 @@ class SignalCollector {
     } catch { return 3.0; }
   }
   _getBreakCompliance(analystId) {
+    // Computed at read time from proactive_break_events: taken / decided over a
+    // trailing 30-day window, as a percentage. "decided" = breaks with a
+    // recorded outcome plus offered breaks left unanswered past a 1-hour grace
+    // (implicit expiry, counted as not-taken; no sweep needed). Offered breaks
+    // still within grace are pending and excluded. Returns null when the analyst
+    // had no decided breaks in the window, so the caller skips the signal.
     try {
-      const r = this.db.prepare("SELECT value FROM config WHERE key='break_compliance_' || ?").get(analystId);
-      return r ? parseFloat(r.value) : 85;
-    } catch { return 85; }
+      const r = this.db.prepare(
+        "SELECT " +
+        "SUM(CASE WHEN outcome='taken' THEN 1 ELSE 0 END) AS taken, " +
+        "SUM(CASE WHEN outcome IN ('taken','declined','expired') OR offered_at <= datetime('now','-1 hour') THEN 1 ELSE 0 END) AS decided " +
+        "FROM proactive_break_events " +
+        "WHERE analyst_id=? AND offered_at > datetime('now','-30 days')"
+      ).get(analystId);
+      const decided = r?.decided || 0;
+      if (decided === 0) return null;
+      return Math.round(((r.taken || 0) / decided) * 1000) / 10;
+    } catch { return null; }
   }
   _getOvertime(analystId) {
     try {

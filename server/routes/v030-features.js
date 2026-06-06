@@ -149,15 +149,53 @@ router.post('/clients/propagate-config', (req, res) => {
 });
 
 // ── Proactive break: MC approves, server notifies client ─────────────────────
+// Records the break as OFFERED (proactive_break_events) so the break_compliance
+// signal has a denominator, then audits. analyst_pseudonym -> analyst_id is
+// resolved server-side (active analysts only); an unknown/stale pseudonym still
+// audits but records no row.
 router.post('/proactive-break/send', (req, res) => {
   try {
     const { analystPseudonym, hours, duration } = req.body;
     const db = getDb();
+    const analyst = db.prepare("SELECT id FROM users WHERE pseudonym = ? AND active = 1").get(analystPseudonym);
+    if (analyst) {
+      db.prepare("INSERT INTO proactive_break_events (analyst_id, duration_min, hours_context) VALUES (?, ?, ?)")
+        .run(analyst.id, Number.isFinite(Number(duration)) ? Number(duration) : null, Number.isFinite(Number(hours)) ? Number(hours) : null);
+    }
     // In production: WebSocket push to the specific analyst's client
     auditLog(req.user?.id || 'system', 'PROACTIVE_BREAK_SENT', `To ${analystPseudonym}: ${duration}min break after ${hours}hr`);
     db.close();
     res.json({ success: true, notification: 'sent', pseudonym: analystPseudonym });
   } catch (e) { res.status(500).json({ error: 'Failed to send break notification' }); }
+});
+
+// ── Proactive break: analyst reports the outcome (taken | declined) ──────────
+// Closes the analyst's most-recent OPEN ('offered') break with the reported
+// outcome — the numerator for break_compliance. The caller is identified from
+// the JWT (req.user.id), never from the body, so an analyst can only resolve
+// their own break. Nothing analyst-identifying is returned.
+router.post('/proactive-break/outcome', (req, res) => {
+  try {
+    const outcome = req.body && req.body.outcome;
+    if (outcome !== 'taken' && outcome !== 'declined') {
+      return res.status(400).json({ error: "outcome must be 'taken' or 'declined'" });
+    }
+    const analystId = req.user && req.user.id;
+    if (!analystId) return res.status(401).json({ error: 'Authentication required' });
+    const db = getDb();
+    const open = db.prepare(
+      "SELECT id FROM proactive_break_events WHERE analyst_id = ? AND outcome = 'offered' ORDER BY offered_at DESC LIMIT 1"
+    ).get(analystId);
+    if (!open) {
+      db.close();
+      return res.status(404).json({ error: 'No open break to resolve' });
+    }
+    db.prepare("UPDATE proactive_break_events SET outcome = ?, outcome_at = datetime('now') WHERE id = ?")
+      .run(outcome, open.id);
+    db.close();
+    auditLog(req.user.id, 'PROACTIVE_BREAK_OUTCOME', `outcome=${outcome}`);
+    res.json({ success: true, outcome });
+  } catch (e) { res.status(500).json({ error: 'Failed to record break outcome' }); }
 });
 
 // ── Post-incident recovery: MC initiates, server propagates to clients ───────

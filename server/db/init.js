@@ -5929,6 +5929,56 @@ function initDb() {
     );
   }
 
+  // ── Migration: Phase B5d1-F — proactive_break_events (break_compliance feed) ──
+  //
+  // One row per proactive break OFFERED to an analyst, with its outcome
+  // lifecycle (offered -> taken | declined | expired). This is the authoritative
+  // source for the break_compliance behavioral signal: the signal collector
+  // computes compliance directly from this table at collection time (taken vs
+  // decided over a trailing window), so there is no config['break_compliance_*']
+  // cache to keep fresh. analyst_id (not pseudonym) is stored for clean
+  // per-analyst aggregation; ON DELETE CASCADE drops an offboarded analyst's
+  // rows with them.
+  //
+  // Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+  //
+  // Runs in its own try/catch for fault isolation; a failure here does not mask
+  // any prior migration block.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS proactive_break_events (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        offered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        duration_min INTEGER,
+        hours_context REAL,
+        outcome TEXT NOT NULL DEFAULT 'offered'
+          CHECK (outcome IN ('offered', 'taken', 'declined', 'expired')),
+        outcome_at TEXT
+      );
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_proactive_break_events_analyst
+        ON proactive_break_events (analyst_id, offered_at DESC);
+    `);
+
+    const pbeCount = db
+      .prepare('SELECT COUNT(*) AS n FROM proactive_break_events')
+      .get().n;
+    console.log(
+      `B5d1-F migration: proactive_break_events table ready (${pbeCount} event(s) present)`
+    );
+  } catch (pbeMigrationErr) {
+    console.error(
+      'B5d1-F proactive_break_events migration FAILED:',
+      pbeMigrationErr.message
+    );
+    console.error(
+      'The server will start, but proactive break outcomes will not be recorded and the break_compliance signal will be skipped until this migration completes successfully.'
+    );
+  }
+
   // ── R3j C2 — routing_enabled global toggle backfill row ──────────────
   //
   // Seeds a single row in team_config keyed 'routing_enabled' with

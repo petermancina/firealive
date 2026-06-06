@@ -2323,8 +2323,8 @@ export default function AnalystClientApp() {
       {breakPrompt&&featureToggles.proactive_interventions!==false&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>
         <M style={{color:C.p,fontWeight:500}}>Your lead approved a break for you. You have been doing incredible work. </M>
         <div style={{display:"flex",gap:8,marginTop:8}}>
-          <Btn small primary onClick={()=>{setBreakPrompt(null);logC("BREAK_ACCEPTED","Break accepted");}}>Take Break</Btn>
-          <Btn small onClick={()=>{setBreakPrompt(null);logC("BREAK_DECLINED","Continuing work");}}>Continue</Btn>
+          <Btn small primary onClick={()=>{api.post("/api/proactive-break/outcome",{outcome:"taken"});setBreakPrompt(null);logC("BREAK_ACCEPTED","Break accepted");}}>Take Break</Btn>
+          <Btn small onClick={()=>{api.post("/api/proactive-break/outcome",{outcome:"declined"});setBreakPrompt(null);logC("BREAK_DECLINED","Continuing work");}}>Continue</Btn>
         </div>
       </div>)}
       {showHelp&&(<div style={{padding:"16px 24px",background:C.s,borderBottom:`1px solid ${C.b}`,maxHeight:300,overflowY:"auto"}}>
