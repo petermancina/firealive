@@ -567,7 +567,7 @@ function AcLoginScreen({ onLoggedIn, logC }) {
     logC("LOGIN_SUCCESS", "Authenticated via " + method);
     const selfId = loginResponse && loginResponse.user ? loginResponse.user.id : null;
     bootstrapE2EE(selfId);
-    onLoggedIn();
+    onLoggedIn(selfId);
   };
 
   const handlePasskeyLogin = async () => {
@@ -688,8 +688,124 @@ function AcLoginScreen({ onLoggedIn, logC }) {
   );
 }
 
+// -- B5d1: Analyst-private key enrollment / unlock gate -----------------------
+// Runs once after login, before the dashboard renders. If no key is enrolled it
+// creates one (services analyst-crypto key custody, main process), trying a
+// WebAuthn PRF assertion first and falling back to OS secure storage; it then
+// registers the public key + recovery wraps with the server and shows the
+// one-time recovery code. If a key exists but is locked it unlocks it for the
+// session (a passkey touch, a passphrase, or automatically for safeStorage).
+// In a plain browser (no Electron bridge) it is a no-op so the app still loads.
+function BurnoutKeyGate({ userId, onReady, logC }) {
+  const [phase, setPhase] = useState("checking"); // checking | enroll | unlock | recovery | error
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [mode, setMode] = useState(null);
+  const [passphrase, setPassphrase] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
+  const [acked, setAcked] = useState(false);
+  const bridge = (typeof window !== "undefined") ? window.firealive : null;
+  const done = useRef(false);
+  const finish = function () { if (!done.current) { done.current = true; onReady(); } };
+
+  // Try a WebAuthn PRF assertion; returns base64 PRF bytes, or null if the
+  // authenticator/runtime does not support PRF (then we use OS secure storage).
+  async function tryPrf() {
+    try {
+      if (!(typeof navigator !== "undefined" && navigator.credentials && navigator.credentials.get)) return null;
+      const salt = new TextEncoder().encode("firealive-burnout-prf-v1");
+      const challenge = (typeof window !== "undefined" && window.crypto && window.crypto.getRandomValues)
+        ? window.crypto.getRandomValues(new Uint8Array(32)) : new Uint8Array(32);
+      const assertion = await navigator.credentials.get({ publicKey: { challenge: challenge, userVerification: "required", timeout: 60000, extensions: { prf: { eval: { first: salt } } } } });
+      const ext = (assertion && assertion.getClientExtensionResults) ? assertion.getClientExtensionResults() : null;
+      const first = (ext && ext.prf && ext.prf.results) ? ext.prf.results.first : null;
+      if (!first) return null;
+      return btoa(String.fromCharCode.apply(null, new Uint8Array(first)));
+    } catch (_e) { return null; }
+  }
+
+  async function autoUnlockSafeStorage() {
+    const res = await bridge.invoke("burnout:unlockKey", { userId: userId });
+    if (res && res.ok) { if (logC) logC("BURNOUT_KEY_UNLOCKED", "Unlocked analyst-private key"); finish(); }
+    else { setMode("safestorage"); setPhase("unlock"); setMsg(res && res.error ? res.error : "Could not unlock your key automatically."); }
+  }
+
+  const recheck = async function () {
+    if (!bridge || !bridge.invoke || !userId) { finish(); return; }
+    setPhase("checking"); setMsg("");
+    const st = await bridge.invoke("burnout:status", { userId: userId }).catch(function () { return null; });
+    if (!st || st.error) { setPhase("error"); setMsg(st && st.error ? st.error : "Could not check your key status."); return; }
+    if (st.enrolled && st.unlocked) { finish(); return; }
+    if (st.enrolled) { setMode(st.mode || null); if (st.mode === "safestorage") { autoUnlockSafeStorage(); } else { setPhase("unlock"); } }
+    else { setPhase("enroll"); }
+  };
+
+  useEffect(function () { recheck(); }, []);
+
+  async function doEnroll() {
+    setBusy(true); setMsg("");
+    const prfSecret = await tryPrf();
+    const res = await bridge.invoke("burnout:enrollKey", { userId: userId, prfSecret: prfSecret, withRecoveryCode: true });
+    if (!res || res.error) { setBusy(false); setMsg(res && res.error ? res.error : "Enrollment failed."); return; }
+    const reg = await api.post("/api/analyst-keys/register", { public_key: res.public_key, recovery_wraps: res.recovery_wraps });
+    if (!reg || reg.error) { setBusy(false); setMsg(reg && reg.error ? String(reg.error) : "Could not register your key with the server."); return; }
+    if (logC) logC("BURNOUT_KEY_ENROLLED", "Enrolled analyst-private key (" + (res.mode || "safestorage") + ")");
+    setBusy(false);
+    if (res.recoveryCode) { setRecoveryCode(res.recoveryCode); setPhase("recovery"); }
+    else { finish(); }
+  }
+
+  async function doUnlock() {
+    setBusy(true); setMsg("");
+    let prfSecret = null; let pass = null;
+    if (mode === "prf") { prfSecret = await tryPrf(); if (!prfSecret) { setBusy(false); setMsg("Could not get a passkey response. Please try again."); return; } }
+    else if (mode === "passphrase") { if (!passphrase) { setBusy(false); setMsg("Enter your passphrase."); return; } pass = passphrase; }
+    const res = await bridge.invoke("burnout:unlockKey", { userId: userId, prfSecret: prfSecret, passphrase: pass });
+    if (!res || res.error) { setBusy(false); setMsg(res && res.error ? res.error : "Unlock failed."); return; }
+    if (logC) logC("BURNOUT_KEY_UNLOCKED", "Unlocked analyst-private key");
+    setBusy(false); finish();
+  }
+
+  const Shell = function (inner) {
+    return (<div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}><style>{CSS}</style><div style={{width:520,padding:36,background:C.s,border:"1px solid "+C.b,borderRadius:16}}>{inner}</div></div>);
+  };
+
+  if (phase === "checking") return Shell(<M style={{color:C.tm}}>Checking your private-data key{"\u2026"}</M>);
+
+  if (phase === "error") return Shell(<div>
+    <L>Private-data key</L>
+    <M style={{color:C.d,display:"block",margin:"12px 0",lineHeight:1.6}}>{msg}</M>
+    <Btn onClick={recheck}>Retry</Btn>
+  </div>);
+
+  if (phase === "enroll") return Shell(<div>
+    <L>Protect your wellbeing data</L>
+    <M style={{color:C.tm,display:"block",margin:"12px 0 18px",lineHeight:1.7}}>FireAlive will create a key on this device so your individual wellbeing signals are sealed to you alone. The server stores them only as ciphertext it cannot read, and they are decrypted only here, on your device. If your authenticator supports it the key is bound to your hardware passkey; otherwise it is sealed in this machine's secure storage.</M>
+    {msg ? <M style={{color:C.d,display:"block",marginBottom:12,lineHeight:1.5}}>{msg}</M> : null}
+    <Btn primary disabled={busy} onClick={doEnroll}>{busy ? "Setting up\u2026" : "Set up my key"}</Btn>
+  </div>);
+
+  if (phase === "recovery") return Shell(<div>
+    <L>Save your recovery code</L>
+    <M style={{color:C.tm,display:"block",margin:"12px 0 14px",lineHeight:1.7}}>This one-time code can restore access to your wellbeing data if you set up FireAlive on a new device or lose your authenticator. It is shown once and is never stored anywhere in readable form. Write it down and keep it somewhere safe.</M>
+    <div style={{padding:14,background:"rgba(255,255,255,0.04)",border:"1px solid "+C.b,borderRadius:10,fontFamily:"'IBM Plex Mono',monospace",fontSize:15,letterSpacing:1,color:C.t,wordBreak:"break-all",marginBottom:16}}>{recoveryCode}</div>
+    <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,cursor:"pointer"}}><input type="checkbox" checked={acked} onChange={function (e) { setAcked(e.target.checked); }}/><M style={{color:C.tm}}>I have saved my recovery code.</M></label>
+    <Btn primary disabled={!acked} onClick={finish}>Continue</Btn>
+  </div>);
+
+  return Shell(<div>
+    <L>Unlock your wellbeing data</L>
+    <M style={{color:C.tm,display:"block",margin:"12px 0 18px",lineHeight:1.7}}>{mode === "prf" ? "Confirm with your passkey to unlock your private wellbeing data for this session." : "Enter your passphrase to unlock your private wellbeing data for this session."}</M>
+    {mode === "passphrase" ? <Input label="Passphrase" type="password" value={passphrase} onChange={function (e) { setPassphrase(e.target.value); }} disabled={busy}/> : null}
+    {msg ? <M style={{color:C.d,display:"block",marginBottom:12,lineHeight:1.5}}>{msg}</M> : null}
+    <Btn primary disabled={busy} onClick={doUnlock}>{busy ? "Unlocking\u2026" : (mode === "prf" ? "Unlock with passkey" : "Unlock")}</Btn>
+  </div>);
+}
+
 export default function AnalystClientApp() {
-  const [stage, setStage] = useState("login"); // login → welcome → app
+  const [stage, setStage] = useState("login");
+  const [selfUserId, setSelfUserId] = useState(null);
+  const [burnoutReady, setBurnoutReady] = useState(false); // login → welcome → app
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [mfaCode, setMfaCode] = useState("");
@@ -2116,7 +2232,7 @@ export default function AnalystClientApp() {
   };
 
   // ── LOGIN SCREEN (R3g: real /api/auth/login + three-path MFA flow) ──
-  if (stage === "login") return <AcLoginScreen onLoggedIn={() => setStage(firstLaunch ? "welcome" : "app")} logC={logC} />;
+  if (stage === "login") return <AcLoginScreen onLoggedIn={(uid) => {setSelfUserId(uid);setStage(firstLaunch ? "welcome" : "app");}} logC={logC} />;
 
   // ── WELCOME GUIDE ──
   if (stage === "welcome") return (
@@ -2153,6 +2269,8 @@ export default function AnalystClientApp() {
       </div>
     </div>
   );
+
+  if (!burnoutReady) return <BurnoutKeyGate userId={selfUserId} onReady={function(){setBurnoutReady(true);}} logC={logC} />;
 
   return(
     <div style={{minHeight:"100vh",background:"#060A10",color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
@@ -2199,7 +2317,7 @@ export default function AnalystClientApp() {
         </div>
         <div style={{display:"flex",gap:8}}>
           <Btn small onClick={()=>setShowHelp(!showHelp)}>Help</Btn>
-          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
+          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setBurnoutReady(false);try{window.firealive&&window.firealive.invoke&&window.firealive.invoke("burnout:lock");}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
         </div>
       </div>
       {breakPrompt&&featureToggles.proactive_interventions!==false&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>

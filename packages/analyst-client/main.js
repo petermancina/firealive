@@ -450,6 +450,209 @@ function acClampK(k, def, max) {
   return (Number.isInteger(k) && k > 0) ? Math.min(k, max) : def;
 }
 
+// -- B5d1: Analyst-private burnout key custody (X25519 seal-open, main) --------
+// The analyst owns an X25519 keypair. The server holds only the PUBLIC key and
+// seals burnout detail to it (services/analyst-crypto.js); the PRIVATE key is
+// generated on and never leaves this machine. At rest it is sealed in the OS
+// keychain (safeStorage); on a passkey device it is additionally wrapped under
+// a key derived from the authenticator's WebAuthn PRF output, so unlocking it
+// requires the hardware authenticator. The renderer performs the PRF assertion
+// (it owns the navigator.credentials context) and hands the PRF bytes to these
+// handlers; main never sees a passkey credential, only derived bytes. Recovery
+// wraps (primary PRF, a backup authenticator, an offline recovery code) are
+// returned to the renderer to register server-side as opaque blobs the server
+// cannot unwrap -- never an escrow.
+//
+// The open below must stay byte-compatible with services/analyst-crypto.js
+// (X25519 + HKDF-SHA256 + AES-256-GCM, magic FAP1).
+const burnoutKeyFile = () => path.join(app.getPath('userData'), 'burnout-key.bin');
+const BURNOUT_SEAL_INFO = Buffer.from('firealive-analyst-seal-v1', 'utf8'); // must match analyst-crypto
+const BURNOUT_WRAP_INFO = Buffer.from('firealive-burnout-keywrap-v1', 'utf8');
+const BURNOUT_WRAP_VERSION = 1;
+const BURNOUT_MODE_PRF = 1;
+const BURNOUT_MODE_SCRYPT = 2;
+const BURNOUT_SCRYPT = { N: 16384, r: 8, p: 1 };
+const BURNOUT_SALT_LEN = 16;
+const BURNOUT_IV_LEN = 12;
+const BURNOUT_TAG_LEN = 16;
+
+// In-memory unlocked key for the current session; cleared by burnout:lock.
+let _burnoutKey = null;
+
+function burnoutDeriveKek(mode, secret, salt) {
+  const sec = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret), 'utf8');
+  if (mode === BURNOUT_MODE_PRF) return Buffer.from(crypto.hkdfSync('sha256', sec, salt, BURNOUT_WRAP_INFO, 32));
+  if (mode === BURNOUT_MODE_SCRYPT) return crypto.scryptSync(sec, salt, 32, BURNOUT_SCRYPT);
+  throw new Error('unknown wrap mode');
+}
+
+// Wrap a PKCS8 private key under a KEK derived from a factor secret. Returns a
+// base64 blob: version | mode | salt(16) | iv(12) | tag(16) | ciphertext.
+function burnoutWrapPrivateKey(privPkcs8, mode, secret) {
+  const salt = crypto.randomBytes(BURNOUT_SALT_LEN);
+  const kek = burnoutDeriveKek(mode, secret, salt);
+  const iv = crypto.randomBytes(BURNOUT_IV_LEN);
+  const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);
+  const ct = Buffer.concat([cipher.update(privPkcs8), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([Buffer.from([BURNOUT_WRAP_VERSION, mode]), salt, iv, tag, ct]).toString('base64');
+}
+
+function burnoutUnwrapPrivateKey(blobB64, secret) {
+  const buf = Buffer.from(String(blobB64 || ''), 'base64');
+  if (buf.length < 2 + BURNOUT_SALT_LEN + BURNOUT_IV_LEN + BURNOUT_TAG_LEN) throw new Error('wrap blob too short');
+  if (buf[0] !== BURNOUT_WRAP_VERSION) throw new Error('unsupported wrap version');
+  const mode = buf[1];
+  let p = 2;
+  const salt = buf.subarray(p, p + BURNOUT_SALT_LEN); p += BURNOUT_SALT_LEN;
+  const iv = buf.subarray(p, p + BURNOUT_IV_LEN); p += BURNOUT_IV_LEN;
+  const tag = buf.subarray(p, p + BURNOUT_TAG_LEN); p += BURNOUT_TAG_LEN;
+  const ct = buf.subarray(p);
+  const kek = burnoutDeriveKek(mode, secret, salt);
+  const d = crypto.createDecipheriv('aes-256-gcm', kek, iv);
+  d.setAuthTag(tag);
+  return Buffer.concat([d.update(ct), d.final()]);
+}
+
+// Open a server seal (analyst-crypto FAP1 envelope) with a private KeyObject.
+function burnoutOpenSeal(sealedB64, privKeyObj) {
+  const buf = Buffer.from(String(sealedB64 || ''), 'base64');
+  const MAGIC = Buffer.from('FAP1', 'utf8');
+  const EPH = 44;
+  const HEADER = MAGIC.length + 1 + EPH + BURNOUT_IV_LEN + BURNOUT_TAG_LEN;
+  if (buf.length < HEADER || !buf.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error('bad seal');
+  if (buf[MAGIC.length] !== 1) throw new Error('unsupported seal version');
+  let p = MAGIC.length + 1;
+  const ephSpki = buf.subarray(p, p + EPH); p += EPH;
+  const iv = buf.subarray(p, p + BURNOUT_IV_LEN); p += BURNOUT_IV_LEN;
+  const tag = buf.subarray(p, p + BURNOUT_TAG_LEN); p += BURNOUT_TAG_LEN;
+  const ct = buf.subarray(p);
+  const recipientSpki = crypto.createPublicKey(privKeyObj).export({ format: 'der', type: 'spki' });
+  const shared = crypto.diffieHellman({
+    privateKey: privKeyObj,
+    publicKey: crypto.createPublicKey({ key: ephSpki, format: 'der', type: 'spki' }),
+  });
+  const key = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.concat([ephSpki, recipientSpki]), BURNOUT_SEAL_INFO, 32));
+  const dd = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  dd.setAuthTag(tag);
+  return Buffer.concat([dd.update(ct), dd.final()]);
+}
+
+function burnoutStore() {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('OS secure storage is unavailable; refusing to store the burnout key unsealed');
+  }
+  return createSealedStore(burnoutKeyFile());
+}
+
+ipcMain.handle('burnout:status', async (_e, { userId } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    const meta = await burnoutStore().get(String(userId) + ':meta');
+    return {
+      enrolled: !!meta,
+      mode: meta ? meta.mode : null,
+      keyVersion: meta ? meta.keyVersion : null,
+      unlocked: !!(_burnoutKey && _burnoutKey.userId === String(userId)),
+    };
+  } catch (err) {
+    return { error: (err.message || 'burnout status unavailable').slice(0, 200) };
+  }
+});
+
+ipcMain.handle('burnout:enrollKey', async (_e, { userId, prfSecret = null, prfBackupSecret = null, passphrase = null, withRecoveryCode = false } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    const uid = String(userId);
+    const store = burnoutStore();
+    if (await store.get(uid + ':meta')) {
+      return { error: 'a burnout key is already enrolled for this user on this device' };
+    }
+
+    const kp = crypto.generateKeyPairSync('x25519');
+    const pubB64 = kp.publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    const privPkcs8 = kp.privateKey.export({ format: 'der', type: 'pkcs8' });
+
+    let mode;
+    if (prfSecret) {
+      mode = 'prf';
+      await store.set(uid + ':wrapped', burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_PRF, Buffer.from(prfSecret, 'base64')));
+    } else if (passphrase) {
+      mode = 'passphrase';
+      await store.set(uid + ':wrapped', burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_SCRYPT, passphrase));
+    } else {
+      mode = 'safestorage';
+      await store.set(uid + ':private', privPkcs8.toString('base64'));
+    }
+    const keyVersion = 1;
+    await store.set(uid + ':meta', { mode, keyVersion, publicKey: pubB64, enrolledAt: new Date().toISOString() });
+
+    const recoveryWraps = [];
+    if (prfSecret) {
+      recoveryWraps.push({ factor: 'prf_primary', wrapped_sk: burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_PRF, Buffer.from(prfSecret, 'base64')), label: 'primary authenticator' });
+    }
+    if (prfBackupSecret) {
+      recoveryWraps.push({ factor: 'prf_backup', wrapped_sk: burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_PRF, Buffer.from(prfBackupSecret, 'base64')), label: 'backup authenticator' });
+    }
+    let recoveryCode = null;
+    if (withRecoveryCode) {
+      recoveryCode = crypto.randomBytes(16).toString('hex');
+      recoveryWraps.push({ factor: 'recovery_code', wrapped_sk: burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_SCRYPT, recoveryCode), label: 'offline recovery code' });
+    }
+
+    _burnoutKey = { privateKey: kp.privateKey, publicKeyB64: pubB64, keyVersion, userId: uid };
+
+    const result = { ok: true, public_key: pubB64, recovery_wraps: recoveryWraps, mode, key_version: keyVersion };
+    if (recoveryCode) result.recoveryCode = recoveryCode; // shown once; never stored in clear
+    return result;
+  } catch (err) {
+    return { error: (err.message || 'enrollment failed').slice(0, 200) };
+  }
+});
+
+ipcMain.handle('burnout:unlockKey', async (_e, { userId, prfSecret = null, passphrase = null } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    const uid = String(userId);
+    if (_burnoutKey && _burnoutKey.userId === uid) return { ok: true, mode: 'cached', key_version: _burnoutKey.keyVersion };
+    const store = burnoutStore();
+    const meta = await store.get(uid + ':meta');
+    if (!meta) return { error: 'no burnout key enrolled on this device' };
+
+    let privPkcs8;
+    if (meta.mode === 'prf') {
+      if (!prfSecret) return { error: 'prfSecret required to unlock' };
+      privPkcs8 = burnoutUnwrapPrivateKey(await store.get(uid + ':wrapped'), Buffer.from(prfSecret, 'base64'));
+    } else if (meta.mode === 'passphrase') {
+      if (!passphrase) return { error: 'passphrase required to unlock' };
+      privPkcs8 = burnoutUnwrapPrivateKey(await store.get(uid + ':wrapped'), passphrase);
+    } else {
+      privPkcs8 = Buffer.from(await store.get(uid + ':private'), 'base64');
+    }
+    const privateKey = crypto.createPrivateKey({ key: privPkcs8, format: 'der', type: 'pkcs8' });
+    _burnoutKey = { privateKey, publicKeyB64: meta.publicKey, keyVersion: meta.keyVersion, userId: uid };
+    return { ok: true, mode: meta.mode, key_version: meta.keyVersion };
+  } catch (err) {
+    return { error: (err.message || 'unlock failed').slice(0, 200) };
+  }
+});
+
+ipcMain.handle('burnout:decrypt', async (_e, { sealed } = {}) => {
+  try {
+    if (!_burnoutKey) return { error: 'burnout key is locked; unlock first' };
+    if (typeof sealed !== 'string' || !sealed) return { error: 'sealed blob required' };
+    return { ok: true, plaintext: burnoutOpenSeal(sealed, _burnoutKey.privateKey).toString('utf8') };
+  } catch (err) {
+    return { error: (err.message || 'decrypt failed').slice(0, 200) };
+  }
+});
+
+ipcMain.handle('burnout:lock', async () => {
+  _burnoutKey = null;
+  return { ok: true };
+});
+
+
 ipcMain.handle('kb:search', async (_e, { query, k } = {}) => {
   const q = (typeof query === 'string' ? query.trim() : '');
   if (!q) return { error: 'query required' };

@@ -1009,22 +1009,48 @@ class RegressionRunner {
     await check('analyst-privacy', 'Seal-to-public-key round-trips; no server decrypt path', () => {
       // The server can SEAL burnout detail to an analyst's public key but must
       // have no way to read it back. Confirms the sealed box opens with the
-      // matching secret key (the AC-side operation) and fails with a wrong key,
-      // and asserts services/analyst-crypto exports no decrypt/open/unseal
-      // function -- the server holds no code path to read analyst data.
-      if (!nacl) return SKIP('tweetnacl unavailable');
+      // matching X25519 private key (the AC-side operation) and fails with a
+      // wrong key or on tamper, and asserts services/analyst-crypto exports no
+      // decrypt/open/unseal function -- the server holds no code path to read
+      // analyst data. Uses node crypto only; no production DB is touched.
       const ac = require('./analyst-crypto');
       const decryptish = Object.keys(ac).filter((k) => /(decrypt|unseal|unwrap|open)/i.test(k));
       if (decryptish.length) throw new Error('analyst-crypto exports a decrypt-shaped function: ' + decryptish.join(', '));
-      const kp = nacl.box.keyPair();
-      const pub = Buffer.from(kp.publicKey).toString('base64');
-      const sealed = ac.sealToPublicKey('{"signal":"cognitive_load","value":0.8}', pub);
-      const parsed = ac.parseSealed(sealed);
-      const opened = nacl.box.open(parsed.ciphertext, parsed.nonce, parsed.ephemeralPublicKey, kp.secretKey);
-      if (!opened) throw new Error('sealed box did not open with the correct key');
-      const wrong = nacl.box.open(parsed.ciphertext, parsed.nonce, parsed.ephemeralPublicKey, nacl.box.keyPair().secretKey);
-      if (wrong) throw new Error('sealed box opened with a wrong key');
-      return 'seal/open round-trip ok; wrong key rejected; no decrypt export';
+
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
+      const pubB64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+
+      // Open exactly as the Analyst Client does: ephemeral ECDH -> HKDF-SHA256
+      // -> AES-256-GCM, using parseSealed to split the envelope.
+      const open = (sealedB64, priv) => {
+        const p = ac.parseSealed(sealedB64);
+        const recipientSpki = crypto.createPublicKey(priv).export({ format: 'der', type: 'spki' });
+        const shared = crypto.diffieHellman({
+          privateKey: priv,
+          publicKey: crypto.createPublicKey({ key: p.ephemeralPublicKey, format: 'der', type: 'spki' }),
+        });
+        const salt = Buffer.concat([p.ephemeralPublicKey, recipientSpki]);
+        const key = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from('firealive-analyst-seal-v1', 'utf8'), 32));
+        const d = crypto.createDecipheriv('aes-256-gcm', key, p.iv);
+        d.setAuthTag(p.tag);
+        return Buffer.concat([d.update(p.ciphertext), d.final()]);
+      };
+
+      const payload = '{"signal":"cognitive_load","value":0.8}';
+      const sealed = ac.sealToPublicKey(payload, pubB64);
+      if (open(sealed, privateKey).toString('utf8') !== payload) throw new Error('seal/open round-trip mismatch');
+
+      const wrongPriv = crypto.generateKeyPairSync('x25519').privateKey;
+      let wrongRejected = false;
+      try { open(sealed, wrongPriv); } catch (_e) { wrongRejected = true; }
+      if (!wrongRejected) throw new Error('a wrong key opened the sealed box');
+
+      const tampered = Buffer.from(sealed, 'base64'); tampered[tampered.length - 1] ^= 0xff;
+      let tamperRejected = false;
+      try { open(tampered.toString('base64'), privateKey); } catch (_e) { tamperRejected = true; }
+      if (!tamperRejected) throw new Error('a tampered sealed box opened');
+
+      return 'seal/open round-trip ok; wrong key + tamper rejected; no decrypt export';
     });
 
     await check('analyst-privacy', 'analyst-keys route is self-scoped (no analyst id from request)', () => {
