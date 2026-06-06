@@ -1411,6 +1411,57 @@ CREATE TABLE IF NOT EXISTS analyst_impacts (
   recorded_at TEXT DEFAULT (datetime('now'))
 );
 
+-- B5d1: analyst-private data architecture --------------------------------
+-- Per-analyst burnout detail is sealed to the analyst's own public key so
+-- the server can write it but never read it back. The server's aggregate
+-- and routing needs are met by the de-identified store and the metric-free
+-- routing cap, not by reading the sealed per-analyst data.
+
+CREATE TABLE IF NOT EXISTS analyst_keys (
+  analyst_id TEXT PRIMARY KEY REFERENCES users(id),
+  public_key TEXT NOT NULL,
+  algo TEXT NOT NULL DEFAULT 'x25519-sealedbox',
+  key_version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'erased')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS analyst_key_recovery_wraps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analyst_id TEXT NOT NULL REFERENCES users(id),
+  factor TEXT NOT NULL CHECK (factor IN ('prf_primary', 'prf_backup', 'recovery_code')),
+  wrapped_sk BLOB NOT NULL,
+  label TEXT,
+  key_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_key_recovery_wraps_analyst
+  ON analyst_key_recovery_wraps (analyst_id);
+
+CREATE TABLE IF NOT EXISTS analyst_private_data (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  analyst_id TEXT NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL CHECK (kind IN ('reading', 'interpretation')),
+  ciphertext BLOB NOT NULL,
+  key_version INTEGER NOT NULL DEFAULT 1,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_private_data_owner
+  ON analyst_private_data (analyst_id, kind, recorded_at);
+
+CREATE TABLE IF NOT EXISTS analyst_metrics_deidentified (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_tag TEXT,
+  shift_tag TEXT,
+  signal TEXT NOT NULL,
+  value REAL NOT NULL,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_metrics_deid_group
+  ON analyst_metrics_deidentified (team_tag, shift_tag, signal, recorded_at);
+-- end B5d1 ----------------------------------------------------------------
+
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

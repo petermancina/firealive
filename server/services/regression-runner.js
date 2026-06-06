@@ -964,6 +964,81 @@ class RegressionRunner {
       }
     }
 
+    // -- Category: Analyst-privacy (B5d1 analyst-private data architecture) --
+    await check('analyst-privacy', 'B5d1 schema + indexes present', () => {
+      requireAll([
+        'analyst_keys',
+        'analyst_key_recovery_wraps',
+        'analyst_private_data',
+        'analyst_metrics_deidentified',
+      ]);
+      const missing = [
+        'idx_analyst_private_data_owner',
+        'idx_analyst_key_recovery_wraps_analyst',
+        'idx_analyst_metrics_deid_group',
+      ].filter((n) => !indexExists(n));
+      if (missing.length) throw new Error('missing index(es): ' + missing.join(', '));
+      return '4 tables + 3 indexes present';
+    });
+
+    await check('analyst-privacy', 'De-identified metrics store carries no identity', () => {
+      // The aggregate store must let the server group by team/shift but never
+      // attribute a value to a person, so it must carry NO identity column.
+      // This is the core B5d1 invariant for management-side aggregates.
+      const leaked = ['analyst_id', 'pseudonym', 'user_id', 'username', 'name', 'email']
+        .filter((c) => columnExists('analyst_metrics_deidentified', c));
+      if (leaked.length) throw new Error('de-identified store has identity column(s): ' + leaked.join(', '));
+      for (const c of ['team_tag', 'shift_tag', 'signal', 'value']) {
+        if (!columnExists('analyst_metrics_deidentified', c)) throw new Error('missing expected column: ' + c);
+      }
+      return 'no analyst_id/pseudonym/user/name/email; team/shift-tagged values only';
+    });
+
+    await check('analyst-privacy', 'analyst_keys holds a public key only (no private material)', () => {
+      // The registry stores the PUBLIC key the server seals to; private
+      // material must never live here. Recovery wraps are a separate,
+      // server-opaque table.
+      if (!columnExists('analyst_keys', 'public_key')) throw new Error('analyst_keys missing public_key');
+      const priv = this.db.prepare('PRAGMA table_info(analyst_keys)').all()
+        .map((c) => String(c.name).toLowerCase())
+        .filter((c) => /(private|secret|wrapped|privkey)/.test(c) || c === 'sk');
+      if (priv.length) throw new Error('analyst_keys has private-key-shaped column(s): ' + priv.join(', '));
+      return 'public_key present; no private/secret/wrapped column';
+    });
+
+    await check('analyst-privacy', 'Seal-to-public-key round-trips; no server decrypt path', () => {
+      // The server can SEAL burnout detail to an analyst's public key but must
+      // have no way to read it back. Confirms the sealed box opens with the
+      // matching secret key (the AC-side operation) and fails with a wrong key,
+      // and asserts services/analyst-crypto exports no decrypt/open/unseal
+      // function -- the server holds no code path to read analyst data.
+      if (!nacl) return SKIP('tweetnacl unavailable');
+      const ac = require('./analyst-crypto');
+      const decryptish = Object.keys(ac).filter((k) => /(decrypt|unseal|unwrap|open)/i.test(k));
+      if (decryptish.length) throw new Error('analyst-crypto exports a decrypt-shaped function: ' + decryptish.join(', '));
+      const kp = nacl.box.keyPair();
+      const pub = Buffer.from(kp.publicKey).toString('base64');
+      const sealed = ac.sealToPublicKey('{"signal":"cognitive_load","value":0.8}', pub);
+      const parsed = ac.parseSealed(sealed);
+      const opened = nacl.box.open(parsed.ciphertext, parsed.nonce, parsed.ephemeralPublicKey, kp.secretKey);
+      if (!opened) throw new Error('sealed box did not open with the correct key');
+      const wrong = nacl.box.open(parsed.ciphertext, parsed.nonce, parsed.ephemeralPublicKey, nacl.box.keyPair().secretKey);
+      if (wrong) throw new Error('sealed box opened with a wrong key');
+      return 'seal/open round-trip ok; wrong key rejected; no decrypt export';
+    });
+
+    await check('analyst-privacy', 'analyst-keys route is self-scoped (no analyst id from request)', () => {
+      // Tier-3 invariant: the route must take the analyst id only from the JWT
+      // (req.user.id) and never from the request body/query/params.
+      try { require('../routes/analyst-keys'); } catch (e) { throw new Error('cannot load analyst-keys route: ' + e.message); }
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'analyst-keys.js'), 'utf8');
+      if (!/req\.user\b/.test(src)) throw new Error('route does not scope by req.user');
+      const bad = src.match(/req\.(?:body|query|params)\.analyst[_]?id/i);
+      if (bad) throw new Error('route reads analyst id from the request: ' + bad[0]);
+      return 'scoped by req.user.id; no analyst id taken from body/query/params';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;
