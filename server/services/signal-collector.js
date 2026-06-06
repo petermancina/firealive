@@ -37,7 +37,7 @@ function signalSeverity(signal, value) {
   switch (signal) {
     case 'cognitive_load':   return value >= 80 ? 2 : value >= 60 ? 1 : 0;
     case 'queue_pressure':   return value >= 12 ? 2 : value >= 8  ? 1 : 0;
-    case 'shift_overtime':   return value >= 2  ? 2 : value >= 1  ? 1 : 0;
+    case 'shift_overtime':   return value >= 8  ? 2 : value >= 4  ? 1 : 0;
     case 'response_latency': return value >= 10 ? 2 : value >= 6  ? 1 : 0;
     case 'task_switching':   return value >= 10 ? 2 : value >= 6  ? 1 : 0;
     case 'break_compliance': return value <= 50 ? 2 : value <= 70 ? 1 : 0; // low = strain
@@ -71,6 +71,14 @@ class SignalCollector {
 
   // Called periodically (every 15 min) to collect signals for active analysts
   async collectAll() {
+    // B5d1-F: refresh the per-analyst shift_overtime cache (config['overtime_<id>'])
+    // from the roster + after-hours activity before reading signals this cycle, so
+    // both the collector below and team-health see a fresh value. Fault-isolated.
+    try {
+      require('./shift-overtime').computeAndStoreAll(this.db);
+    } catch (e) {
+      console.error('[signal-collector] shift-overtime compute failed:', e.message);
+    }
     const analysts = this.db
       .prepare("SELECT id, tier, shift FROM users WHERE role='analyst' AND active=1")
       .all();
