@@ -16,7 +16,7 @@ const VALID_SCOPES = [
   'health:read', 'siem:read', 'siem:write',
   'reports:generate', 'routing:read', 'routing:write', 'routing:events',
   'audit:read', 'backup:trigger', 'assessments:read',
-  'integrations:read', 'integrations:write',
+  'integrations:read', 'integrations:write', 'ticketing:events',
   'cicd:webhook',
 ];
 
