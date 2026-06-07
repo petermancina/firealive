@@ -1065,6 +1065,105 @@ class RegressionRunner {
       return 'scoped by req.user.id; no analyst id taken from body/query/params';
     });
 
+    // ── Category: B5d1-F burnout-signal data feed ──────────────────
+    // The feed that gives the collector real inputs: the ticketing
+    // activity-events push (-> ticket_actions), the break-outcome loop
+    // (-> proactive_break_events), and the shift_overtime computation
+    // (roster + after-hours). These checks assert the wiring and the
+    // privacy/coupling invariants, not seeded data volume.
+    await check('signal-feed', 'activity-events idempotency surface (ticket_actions.external_action_id + partial index)', () => {
+      if (!columnExists('ticket_actions', 'external_action_id')) {
+        throw new Error('ticket_actions is missing external_action_id (activity-events push target)');
+      }
+      if (!indexExists('idx_ticket_actions_external')) {
+        throw new Error('missing idx_ticket_actions_external (partial UNIQUE for idempotent push)');
+      }
+      return 'ticket_actions.external_action_id present; partial UNIQUE idx_ticket_actions_external de-dups re-delivered events';
+    });
+
+    await check('signal-feed', 'activity-events route resolves pseudonym server-side (no id from request)', () => {
+      try { require('../routes/ticketing-activity'); } catch (e) { throw new Error('cannot load ticketing-activity route: ' + e.message); }
+      const fs = require('fs');
+      const code = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ticketing-activity.js'), 'utf8')
+        .replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      if (!/FROM\s+users\s+WHERE\s+pseudonym\s*=\s*\?/i.test(code)) {
+        throw new Error('route does not resolve analyst_pseudonym to users.id server-side');
+      }
+      if (!/active\s*=\s*1/i.test(code)) {
+        throw new Error('route does not restrict pseudonym resolution to active analysts');
+      }
+      if (/req\.(?:body|query|params)\.analyst[_]?id/i.test(code)) {
+        throw new Error('route trusts an analyst id taken from the request');
+      }
+      return 'resolves analyst_pseudonym to users.id (active only); never reads an analyst id from body/query/params';
+    });
+
+    await check('signal-feed', 'activity-events is decoupled from SOAR routing (no ticket_assignments write)', () => {
+      const fs = require('fs');
+      const code = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ticketing-activity.js'), 'utf8')
+        .replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      if (!/INSERT\s+OR\s+IGNORE\s+INTO\s+ticket_actions/i.test(code)) {
+        throw new Error('route does not INSERT OR IGNORE into ticket_actions');
+      }
+      const writesAssignments =
+        /INSERT\b[\s\S]*?INTO\s+ticket_assignments\b/i.test(code) ||
+        /UPDATE\s+ticket_assignments\b/i.test(code) ||
+        /DELETE\s+FROM\s+ticket_assignments\b/i.test(code);
+      if (writesAssignments) {
+        throw new Error('route mutates ticket_assignments (must stay decoupled from the SOAR routing rail)');
+      }
+      return 'writes ticket_actions only; never mutates ticket_assignments (events accepted for non-routed tickets)';
+    });
+
+    await check('signal-feed', 'break-outcome loop present and scoped to the JWT caller', () => {
+      if (!tableExists('proactive_break_events')) {
+        throw new Error('missing proactive_break_events (break_compliance event store)');
+      }
+      if (!indexExists('idx_proactive_break_events_analyst')) {
+        throw new Error('missing idx_proactive_break_events_analyst');
+      }
+      const fs = require('fs');
+      const code = fs.readFileSync(path.join(__dirname, '..', 'routes', 'v030-features.js'), 'utf8')
+        .replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      if (!/proactive-break\/outcome/.test(code)) {
+        throw new Error('no POST /proactive-break/outcome handler');
+      }
+      if (!/req\.user\.id/.test(code)) {
+        throw new Error('outcome handler is not scoped by req.user.id');
+      }
+      if (/req\.(?:body|query|params)\.analyst[_]?id/i.test(code)) {
+        throw new Error('outcome handler trusts a request-supplied analyst id');
+      }
+      if (!/UPDATE\s+proactive_break_events[\s\S]{0,160}outcome/i.test(code)) {
+        throw new Error('outcome handler does not update the break outcome');
+      }
+      return 'proactive_break_events + index present; outcome attributed to req.user.id (never the body) and closes an open offered row';
+    });
+
+    await check('signal-feed', 'shift_overtime service computes scheduled hours and folds after-hours', () => {
+      let mod;
+      try { mod = require('./shift-overtime'); } catch (e) { throw new Error('cannot load shift-overtime service: ' + e.message); }
+      for (const fn of ['weeklyScheduledHours', 'computeAndStoreAll', 'localWallClockToUtc']) {
+        if (typeof mod[fn] !== 'function') throw new Error('shift-overtime export missing: ' + fn);
+      }
+      const fullWeek = {
+        monday:    [{ start: '09:00', end: '17:00' }],
+        tuesday:   [{ start: '09:00', end: '17:00' }],
+        wednesday: [{ start: '09:00', end: '17:00' }],
+        thursday:  [{ start: '09:00', end: '17:00' }],
+        friday:    [{ start: '09:00', end: '17:00' }],
+      };
+      const hrs = mod.weeklyScheduledHours(fullWeek);
+      if (Math.abs(hrs - 40) > 1e-9) throw new Error('weeklyScheduledHours(5x 09:00-17:00) = ' + hrs + ', expected 40');
+      const degenerate = mod.weeklyScheduledHours({ monday: [{ start: '17:00', end: '09:00' }], tuesday: [{ start: 'x', end: 'y' }] });
+      if (degenerate !== 0) throw new Error('inverted/invalid slots should sum to 0, got ' + degenerate);
+      const endUtc = mod.localWallClockToUtc(2025, 7, 15, 17, 0, 'America/Chicago');
+      if (!(endUtc instanceof Date) || isNaN(endUtc.getTime())) {
+        throw new Error('localWallClockToUtc did not resolve a valid Date (after-hours conversion broken)');
+      }
+      return 'weeklyScheduledHours sums durations (5x 8h -> 40.0h); inverted/invalid slots -> 0; localWallClockToUtc resolves a UTC Date for the after-hours fold';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

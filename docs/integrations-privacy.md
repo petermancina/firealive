@@ -1,12 +1,12 @@
 # Integrations Privacy Contract — SOAR, Ticketing, Routing Webhook
 
-This document covers the privacy contracts of three FireAlive-to-external integrations introduced or finalized in R3j (v1.0.36): the SOAR routing-variable publication, the ticketing-system read channel, and the SOAR-to-FireAlive routing-decisions webhook. Each is a distinct data-flow direction with its own contract; conflating them blurs the security boundary.
+This document covers the privacy contracts of the FireAlive-to-external integrations: three introduced or finalized in R3j (v1.0.36) — the SOAR routing-variable publication, the ticketing-system read channel, and the SOAR-to-FireAlive routing-decisions webhook — plus the ticketing activity-events feed added in B5d1 (v1.0.56). Each is a distinct data-flow direction with its own contract; conflating them blurs the security boundary.
 
 This is **not a general privacy overview** of the FireAlive platform. For the Tier-1 / Tier-3 / pseudonym architecture see `FEATURE-GUIDE.md` and `Security.md`. For backup data residency see `docs/backup-destinations-eu.md`. This document covers only the integration surfaces R3j ships.
 
 This is **not legal advice**. Compliance posture depends on your sector, member state, and DPA's interpretation. Talk to your DPO before relying on any specific contract here for a regulated-data workflow.
 
-## The three data flows in scope
+## The data flows in scope
 
 ```
                   outbound: routing variables
@@ -26,9 +26,16 @@ This is **not legal advice**. Compliance posture depends on your sector, member 
                   Live ticketing-API integration deferred
                   to R3k or later; the read-only invariant
                   is established server-side in R3j.
+
+
+                  inbound: per-action push (activity events)
+       FireAlive  ◀──────────────────────────────────────  Ticketing System
+                  POST /api/integrations/ticketing/
+                       activity-events
+                  (api-key + ticketing:events scope)
 ```
 
-The SOAR and ticketing systems are external; once data crosses the boundary, FireAlive's privacy controls do not apply. Both contracts are designed to minimize what crosses the boundary in the first place.
+The SOAR and ticketing systems are external; once data crosses the boundary, FireAlive's privacy controls do not apply. These contracts are designed to minimize what crosses the boundary in the first place.
 
 ## Contract 1: SOAR routing-variable publication
 
@@ -152,6 +159,41 @@ The ticketing integration in R3j v1.0.36 is limited to read patterns:
 The integration does NOT expose a write endpoint at all in R3j. There is no `POST /api/integrations/ticketing/assign-ticket`, no `PUT /api/integrations/ticketing/ticket/:id`, no `DELETE`. The combination of (a) server-side `readOnly: true` enforcement in the stored config and (b) no write endpoints in the route file produces a defense-in-depth posture: even if a future commit accidentally introduced a write endpoint, the stored config's `readOnly: true` flag would be the second-line check that the new endpoint should consult before mutating ticketing state.
 
 Operators using the read-only invariant for compliance evidence (HIPAA minimum-necessary, GDPR purpose limitation) should confirm in their per-deployment audit that the `readOnly: true` flag is present in the decrypted ticketing config. The flag's presence is sufficient evidence that R3j-or-later FireAlive is enforcing the contract.
+
+## Contract 4: Ticketing activity-events push (burnout-signal feed)
+
+The activity-events feed was added in B5d1 (v1.0.56) to give FireAlive's burnout-signal collector real operational inputs. After an analyst acts on a ticket in the external ticketing/SOAR platform, the platform pushes that action to FireAlive via `POST /api/integrations/ticketing/activity-events`. FireAlive persists each action as a `ticket_actions` row; the per-analyst behavioral signals (investigation time, dismiss rate, ticket-note quality, escalation rate) are computed from that table. This is the inbound sibling of Contract 3's read-only ticketing channel — Contract 3 governs what FireAlive may read from the ticketing system, Contract 4 governs what the ticketing system reports back about analyst actions. The two are loosely coupled: they join only on `ticket_id`, and this endpoint never writes `ticket_assignments` (the SOAR routing rail owned by Contract 2).
+
+**Auth.** api-key with the `ticketing:events` scope ONLY. A JWT is rejected, exactly like the Contract 2 webhook (`POST /api/routing/soar-events`). The endpoint is mounted ahead of `/api/integrations`, so it is deliberately NOT behind the configuration-lock gate that guards the integration-config routes: a machine-to-machine feed must keep accepting events during a config-lock window rather than dropping burnout data. The handler enforces api-key + scope itself and does not rely on the mount's role list.
+
+**Request shape (required fields in bold):**
+
+```
+{
+  "action_type": "triage" | "comment" | "close" | "escalate" | "dismiss" | "reassign",   [REQUIRED]
+  "ticket_id": <string>,                                                                  [REQUIRED]
+  "analyst_pseudonym": <string>,                                                          [REQUIRED]
+  "external_action_id": <string>,                                                         [REQUIRED]
+  "occurred_at": <ISO timestamp, optional; stored as the action's created_at>,
+  "category": <string, optional>,
+  "response_time_min": <number, optional>,
+  "notes": <string, optional>
+}
+```
+
+### Privacy invariants enforced at the server
+
+1. **Pseudonym is the analyst key on the request.** The platform sends `analyst_pseudonym` (the same string it received in Contract 1's `analysts[].pseudonym`). The handler resolves it to `user.id` server-side via `SELECT id FROM users WHERE pseudonym = ? AND active = 1`; an unknown or stale pseudonym (rotated since the platform last polled) returns HTTP 404 with a hint to re-poll `GET /api/routing/variables`. The resolved `user.id` is stored on the local `ticket_actions` row but is never echoed back, and the handler never accepts an analyst id from the request body — the pseudonym is the only analyst key it honors.
+
+2. **Audit log uses pseudonym, and never the note text.** The handler writes an `ACTIVITY_EVENT_RECEIVED` audit row whose detail carries `action_type`, `ticket_id`, `analyst_pseudonym`, and `external_action_id` — never the contents of `notes`. Note text exists only to feed the analyst's own on-device ticket-note-quality scoring; it is not surfaced to management and not written to the audit trail.
+
+3. **`dismiss` is a distinct action type, not a flavor of `close`.** The accepted `action_type` values are `triage`, `comment`, `close`, `escalate`, `dismiss`, and `reassign`. Keeping `dismiss` separate from `close` is what lets the false-positive dismiss rate and the notes-based ticket-note quality remain distinct signals, rather than conflating "closed with a resolution" with "dismissed as a false positive."
+
+4. **Idempotent on `external_action_id`, not de-duplicated by analyst.** `ticket_actions` carries a partial UNIQUE index on `external_action_id` (`WHERE external_action_id IS NOT NULL`), so a re-delivered event is a no-op: the handler uses `INSERT OR IGNORE`, returning 200 `{idempotent: true}` when the row already exists and 201 when it is newly stored. This does NOT de-duplicate by analyst — one analyst performs many actions, each a distinct event row with its own `external_action_id`.
+
+### What the behavioral signals do with this data
+
+The activity feed is the source of the four behavioral signals, but those signals never leave the analyst in identifiable form: they are computed, sealed to the analyst's own key, and stored de-identified for any team-level view, with no server path that decrypts a named analyst's behavioral value. The operational pressure signals derived alongside them — including `shift_overtime`, which combines the roster's scheduled hours with actual after-hours activity seen in `ticket_actions` — are lead-visible by design because they drive routing capacity, but they are workload measures, not the sealed behavioral set. See `FEATURE-GUIDE.md` for the analyst-facing "My Signals" view and the pressure/behavior split.
 
 ## Auth surface matrix
 
