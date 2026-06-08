@@ -37,9 +37,23 @@ router.post('/', (req, res) => {
   insertAction.run(retroId, 'Peer support availability published');
   insertAction.run(retroId, 'Check-ins scheduled: 24hr, 72hr, 2 weeks');
 
-  // Reduce routing caps for involved analysts
-  const capStmt = db.prepare('UPDATE routing_caps SET max_complexity = MIN(max_complexity, 2), updated_at = datetime("now") WHERE analyst_id = ?');
-  for (const aid of analystIds) capStmt.run(aid);
+  // Reduce routing caps for involved analysts. A post-incident reduction is a
+  // deliberate, protected override (is_override = 1) so the collector's per-cycle
+  // pressure recompute -- which skips overridden rows -- will not raise it back
+  // during recovery; it is cleared when the retro completes. Upsert so an analyst
+  // with no existing cap row still gets one, and never raise an already-lower cap.
+  const capReason = `Post-incident recovery: ${incident}`.slice(0, 500);
+  const capStmt = db.prepare(
+    "INSERT INTO routing_caps (analyst_id, max_complexity, is_override, override_reason, override_by, updated_at) " +
+      "VALUES (?, 2, 1, ?, ?, datetime('now')) " +
+      "ON CONFLICT(analyst_id) DO UPDATE SET " +
+      "max_complexity = MIN(max_complexity, excluded.max_complexity), " +
+      "is_override = 1, " +
+      "override_reason = excluded.override_reason, " +
+      "override_by = excluded.override_by, " +
+      "updated_at = datetime('now')"
+  );
+  for (const aid of analystIds) capStmt.run(aid, capReason, req.user.id);
 
   db.close();
   auditLog(req.user.id, 'RETRO_ACTIVATED', `${incident} — ${analystIds.length} analysts`, req.ip);
@@ -70,7 +84,7 @@ router.put('/:id/complete', (req, res) => {
 
   // Restore routing caps for involved analysts
   const analystRows = db.prepare('SELECT ra.analyst_id, u.tier FROM retro_analysts ra JOIN users u ON ra.analyst_id = u.id WHERE ra.retro_id = ?').all(req.params.id);
-  const restoreCap = db.prepare('UPDATE routing_caps SET max_complexity = ?, is_override = 0, updated_at = datetime("now") WHERE analyst_id = ?');
+  const restoreCap = db.prepare("UPDATE routing_caps SET max_complexity = ?, is_override = 0, override_reason = NULL, override_by = NULL, updated_at = datetime('now') WHERE analyst_id = ?");
   for (const a of analystRows) restoreCap.run(a.tier === 3 ? 5 : a.tier === 2 ? 3 : 2, a.analyst_id);
 
   db.close();

@@ -18,6 +18,7 @@ const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const ca = require('../services/ca');
 const { encryptConfig, decryptConfig } = require('../services/encryption');
+const { cryptoEraseAnalyst } = require('../services/crypto-erase');
 const { runOffboardingDetection } = require('../services/account-review');
 
 // ── List analysts due for IAM recertification ────────────────────────────────
@@ -82,6 +83,61 @@ router.post('/confirm-status', (req, res) => {
   } catch (err) {
     logger.error('IAM confirm-status error', { error: err.message });
     res.status(500).json({ error: 'Failed to update analyst status' });
+  }
+});
+
+// ── Crypto-erase an offboarded analyst's keys (manual, immediate) ────────────
+// The grace sweep erases automatically once the offboarding grace period passes;
+// this lets an admin erase a confirmed departure immediately instead of waiting.
+// Guarded to an already-offboarded analyst so an active analyst's recovery path
+// can never be destroyed by mistake.
+router.post('/crypto-erase', (req, res) => {
+  const { analyst_id: analystId } = req.body || {};
+  if (!analystId || typeof analystId !== 'string') {
+    return res.status(400).json({ error: 'analyst_id is required' });
+  }
+  try {
+    const db = getDb();
+    const user = db.prepare('SELECT id, role, active FROM users WHERE id = ?').get(analystId);
+    if (!user) { db.close(); return res.status(404).json({ error: 'Analyst not found' }); }
+    if (user.role !== 'analyst') { db.close(); return res.status(400).json({ error: 'User is not an analyst' }); }
+    if (user.active !== 0) { db.close(); return res.status(409).json({ error: 'Analyst is active; offboard before crypto-erase' }); }
+    const result = cryptoEraseAnalyst(db, analystId);
+    db.close();
+    auditLog(req.user?.id, 'CRYPTO_ERASE', `analyst=${analystId} key_erased=${result.keyErased} wraps=${result.wrapsDeleted} sealed=${result.sealedDeleted}`, req.ip);
+    res.json({ erased: true, ...result });
+  } catch (err) {
+    logger.error('IAM crypto-erase error', { error: err.message });
+    res.status(500).json({ error: 'Failed to crypto-erase analyst' });
+  }
+});
+
+// ── Re-activate an offboarded analyst (undo an offboarding) ──────────────────
+// Clearing offboarded_at also cancels the pending grace-delayed crypto-erase
+// (the sweep keys off offboarded_at), so a fraudulent or mistaken offboarding
+// caught within the grace window is fully reversible. If the grace already
+// elapsed and the key was erased, the account returns but the analyst must
+// re-enroll a new key -- their prior sealed history is gone.
+router.post('/reactivate', (req, res) => {
+  const { analyst_id: analystId } = req.body || {};
+  if (!analystId || typeof analystId !== 'string') {
+    return res.status(400).json({ error: 'analyst_id is required' });
+  }
+  try {
+    const db = getDb();
+    const user = db.prepare('SELECT id, role, active, offboarded_at FROM users WHERE id = ?').get(analystId);
+    if (!user) { db.close(); return res.status(404).json({ error: 'Analyst not found' }); }
+    if (user.role !== 'analyst') { db.close(); return res.status(400).json({ error: 'User is not an analyst' }); }
+    if (user.active === 1 && !user.offboarded_at) { db.close(); return res.status(409).json({ error: 'Analyst is already active' }); }
+    db.prepare("UPDATE users SET active = 1, available = 1, offboarded_at = NULL WHERE id = ?").run(analystId);
+    const key = db.prepare('SELECT status FROM analyst_keys WHERE analyst_id = ?').get(analystId);
+    db.close();
+    const keyIntact = !!(key && key.status === 'active');
+    auditLog(req.user?.id, 'IAM_REACTIVATED', `analyst=${analystId} key_intact=${keyIntact}`, req.ip);
+    res.json({ reactivated: true, analystId, keyIntact, reenrollRequired: !keyIntact });
+  } catch (err) {
+    logger.error('IAM reactivate error', { error: err.message });
+    res.status(500).json({ error: 'Failed to reactivate analyst' });
   }
 });
 

@@ -179,6 +179,7 @@ app.get('/api/system/health', require('./routes/system')); // health check is pu
 
 // Authenticated routes
 app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team'));
+app.use('/api/enrollment-reconciliation', authMiddleware(['lead', 'admin']), require('./routes/enrollment-reconciliation'));
 app.use('/api/analysts', authMiddleware(['analyst']), require('./routes/analysts'));
 app.use('/api/signals', authMiddleware(['analyst']), require('./routes/signals'));
 app.use('/api/analyst-keys', authMiddleware(['analyst']), require('./routes/analyst-keys'));
@@ -442,16 +443,28 @@ async function start() {
     // and upserts into analyst_availability for the upskilling auto-assigner)
     schedulingSyncService.start();
 
-    // Scheduled jobs: account review (03:00), retention purge (04:00),
-    // recert check (09:00). Log integrity (chain verify + signed checkpoint +
-    // gap check) runs on its own cadence via startAuditIntegrityScheduler below.
+    // Scheduled jobs: account review (03:00), retention purge + offboarding
+    // crypto-erase sweep (04:00), recert check (09:00). Log integrity (chain
+    // verify + signed checkpoint + gap check) runs on its own cadence via
+    // startAuditIntegrityScheduler below.
     const { runAccountReview } = require('./services/account-review');
     const { runRetentionPurge } = require('./services/retention');
     const { checkRecertDue } = require('./services/recertification');
+    const { sweepDueErasures } = require('./services/crypto-erase');
     setInterval(() => {
       const hour = new Date().getHours();
       if (hour === 3) runAccountReview();
       if (hour === 4) runRetentionPurge();
+      if (hour === 4) {
+        const eraseDb = getDb();
+        try {
+          sweepDueErasures(eraseDb);
+        } catch (e) {
+          logger.warn('crypto-erase sweep failed', { error: e.message });
+        } finally {
+          try { eraseDb.close(); } catch (e) { /* ignore */ }
+        }
+      }
       if (hour === 9) checkRecertDue();
     }, 3600000);
 

@@ -10,7 +10,6 @@ const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
 
 const DEFAULT_RETENTION = {
-  analyst_signals_days: 90,
   audit_log_days: 365,
   sla_measurements_days: 180,
   peer_messages_days: 0,      // deleted on session close, purge stragglers
@@ -23,7 +22,6 @@ const DEFAULT_RETENTION = {
   // expires_at (a short window); this 7-day purge is a physical backstop
   // that removes orphaned rows — departed analysts, conditions that stopped
   // firing, or rows left behind if the precompute scheduler stops running.
-  analyst_interpretations_days: 7,
   team_intervention_prompts_days: 7,
 };
 
@@ -54,17 +52,14 @@ function runRetentionPurge() {
       // date column, or the purge will throw 'Invalid table' and
       // abort the entire purge cycle.
       const SAFE_TABLES = {
-        'analyst_signals': 'recorded_at',
         'audit_log': 'timestamp',
         'sla_measurements': 'measured_at',
         'peer_messages': 'created_at',
         'reports': 'generated_at',
         'analyst_consent_log': 'created_at',
         'sessions': 'expires_at',
-        'signal_readings': 'recorded_at',
         'notifications': 'created_at',
         'peer_sessions': 'created_at',
-        'analyst_interpretations': 'generated_at',
         'team_intervention_prompts': 'generated_at',
       };
       if (!SAFE_TABLES[table] || SAFE_TABLES[table] !== dateCol) throw new Error('Invalid table');
@@ -72,14 +67,12 @@ function runRetentionPurge() {
       results[label] = r.changes;
     };
 
-    purge('analyst_signals', 'recorded_at', config.analyst_signals_days, 'signals');
     purge('audit_log', 'timestamp', config.audit_log_days, 'audit');
     purge('sla_measurements', 'measured_at', config.sla_measurements_days, 'sla');
     purge('peer_messages', 'created_at', Math.max(config.peer_messages_days, 1), 'messages');
     purge('reports', 'generated_at', config.reports_days, 'reports');
     purge('analyst_consent_log', 'created_at', config.consent_log_days, 'consent');
     purge('sessions', 'expires_at', config.sessions_days, 'sessions');
-    purge('analyst_interpretations', 'generated_at', config.analyst_interpretations_days, 'ai_interpretations');
     purge('team_intervention_prompts', 'generated_at', config.team_intervention_prompts_days, 'ai_team_prompts');
 
     const totalPurged = Object.values(results).reduce((s, v) => s + v, 0);

@@ -5,9 +5,6 @@
 // parameter, by design — that would defeat the Tier-3 invariant.
 //
 // GET /api/signals/me — analyst-self view combining:
-//   • current     — latest decrypted snapshot from analyst_signals (current state)
-//   • readings    — time-series rows from signal_readings (for trend rendering,
-//                   written by services/ai-burnout-engine.js)
 //   • sealed_readings — B5d1 per-analyst snapshots sealed to the analyst's own
 //                   X25519 public key (analyst_private_data, kind='reading').
 //                   Opaque ciphertext; decrypted only on the Analyst Client.
@@ -23,7 +20,6 @@
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
-const { decryptTier3 } = require('../services/encryption');
 const { logger } = require('../services/logger');
 const { computeAnalystPressure } = require('../services/signal-collector');
 
@@ -84,64 +80,10 @@ router.get('/me', (req, res) => {
 
   const db = getDb();
   try {
-    // ── Current snapshot — latest analyst_signals row, decrypted ─────────────
-    let current = null;
-    const latestRow = db.prepare(
-      'SELECT signals_encrypted, risk_tier, recorded_at FROM analyst_signals WHERE analyst_id = ? ORDER BY recorded_at DESC LIMIT 1'
-    ).get(analystId);
-
-    if (latestRow) {
-      try {
-        const decrypted = decryptTier3(latestRow.signals_encrypted);
-        current = {
-          investigationTime: decrypted && decrypted.investigationTime,
-          dismissRate: decrypted && decrypted.dismissRate,
-          ticketQuality: decrypted && decrypted.ticketQuality,
-          escalationRate: decrypted && decrypted.escalationRate,
-          riskTier: latestRow.risk_tier,
-          recordedAt: latestRow.recorded_at,
-        };
-      } catch (decryptErr) {
-        // Decryption failure is real (e.g., key rotated without re-encryption,
-        // or corrupted row) but should not 500 the whole endpoint — the readings
-        // path can still serve historical data. Log and surface a typed error
-        // in the current field so the client can render a clear state.
-        logger.warn('signals/me decrypt failed', {
-          analystId,
-          recordedAt: latestRow.recorded_at,
-          error: decryptErr.message,
-        });
-        current = {
-          error: 'decryption_failed',
-          riskTier: latestRow.risk_tier,
-          recordedAt: latestRow.recorded_at,
-        };
-      }
-    }
-
-    // ── Historical readings — signal_readings filtered by analyst + time ─────
-    // datetime() is applied on both sides because signal_readings.recorded_at
-    // is stored in SQLite's "YYYY-MM-DD HH:MM:SS" format (via datetime('now'))
-    // while incoming ISO 8601 strings carry T separators and a Z suffix. The
-    // datetime() function normalises both to a comparable canonical form.
-    let readingsSql = `
-      SELECT signal, value, recorded_at
-      FROM signal_readings
-      WHERE analyst_id = ?
-        AND datetime(recorded_at) >= datetime(?)
-        AND datetime(recorded_at) <= datetime(?)
-    `;
-    const params = [analystId, sinceDate.toISOString(), untilDate.toISOString()];
-
-    if (signalFilter) {
-      readingsSql += ' AND signal = ?';
-      params.push(signalFilter);
-    }
-
-    readingsSql += ' ORDER BY recorded_at DESC LIMIT ?';
-    params.push(limit);
-
-    const readings = db.prepare(readingsSql).all(...params);
+    // The legacy plaintext paths (current from analyst_signals, readings from
+    // signal_readings) are retired: the analyst's own signal history now lives
+    // only in the sealed per-analyst snapshots below, decrypted on-device.
+    // Operational pressure is computed live further down.
 
     // -- Sealed readings -- the analyst's own private snapshots (B5d1) ----------
     // analyst_private_data holds one snapshot per collection cycle, sealed to
@@ -149,10 +91,10 @@ router.get('/me', (req, res) => {
     // opaque ciphertext and holds no key to open it. The Analyst Client decrypts
     // each blob on-device (burnout key custody) to render its own trend and
     // compute its own baseline and drift. Self-scoped by the same JWT analyst id
-    // used above; time-filtered to match the readings window. Snapshots carry
-    // all signals at once, so the ?signal= filter does not apply here -- the
-    // client filters after decrypting. Served alongside the legacy plaintext
-    // readings until the client is migrated to this sealed source.
+    // used above; time-filtered to the requested window. Snapshots carry all
+    // signals at once, so the ?signal= filter does not apply here -- the client
+    // filters after decrypting. This is the sole source of the analyst's own
+    // signal history.
     const sealedReadings = db.prepare(
       `SELECT id, ciphertext, key_version, recorded_at
        FROM analyst_private_data
@@ -174,18 +116,15 @@ router.get('/me', (req, res) => {
 
     res.json({
       analyst_id: analystId,
-      current,
-      readings,
       sealed_readings: sealedReadings,
       pressure,
       meta: {
-        count: readings.length,
         sealed_count: sealedReadings.length,
         since: sinceDate.toISOString(),
         until: untilDate.toISOString(),
         signal: signalFilter || null,
         limit,
-        truncated: readings.length === limit,
+        truncated: sealedReadings.length === limit,
       },
     });
   } catch (err) {

@@ -9,13 +9,12 @@
 //     The server stores opaque ciphertext it cannot open; only the analyst's own
 //     device, holding the private key, can read it. This is the B5d1 model and
 //     supersedes the old server-decryptable Tier-3 signals path.
-//   - /lighter-queue, /consent: Tier-3 (the analyst's id is encrypted for
-//     anonymity), an anonymous routing-cap reduction, and a consent trail.
+//   - /lighter-queue, /consent: an anonymous routing-cap reduction (no analyst
+//     identity is stored with the request) and a consent trail.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
-const { encryptTier3 } = require('../services/encryption');
 const { parseSealed } = require('../services/analyst-crypto');
 const { auditLog } = require('../middleware/audit');
 
@@ -114,17 +113,14 @@ router.post('/lighter-queue', (req, res) => {
   const db = getDb();
   const crypto = require('crypto');
 
-  // Encrypt analyst ID so management can never see who requested
-  const analystEncrypted = encryptTier3(req.user.id);
-
   // Calculate expiry
   const durationMap = { '1_shift': 8, '24hr': 24, '72hr': 72, '1_week': 168 };
   const hours = durationMap[duration] || 8;
   const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
 
   db.prepare(
-    'INSERT INTO lighter_queue_requests (duration, max_complexity, analyst_id_encrypted, expires_at) VALUES (?, ?, ?, ?)'
-  ).run(duration, maxComplexity || 2, analystEncrypted, expiresAt);
+    'INSERT INTO lighter_queue_requests (duration, max_complexity, expires_at) VALUES (?, ?, ?)'
+  ).run(duration, maxComplexity || 2, expiresAt);
 
   // Lower the routing cap through the same model the collector uses: an upsert
   // (so the reduction also lands for an analyst with no routing_caps row yet —

@@ -15,6 +15,8 @@ const { logger } = require('../services/logger');
 const { version } = require('../lib/version');
 const { buildReportPdf, buildReportDocx } = require('../services/report-doc-builder');
 const { signReport, getInstanceLabel } = require('../services/report-signer');
+const { computeTeamHealth } = require('../services/team-health');
+const { computeTeamBehavioral } = require('../services/team-behavioral');
 
 // ── Report model transform (structured sections -> doc-builder model) ────────
 function humanize(key) {
@@ -145,12 +147,25 @@ router.post('/generate', async (req, res) => {
     // Team Health (depersonalized)
     if (sections.teamHealth !== false) {
       const analysts = db.prepare("SELECT COUNT(*) AS total FROM users WHERE role = 'analyst'").get();
-      const signals = db.prepare(`
-        SELECT risk_tier, COUNT(*) AS count FROM analyst_signals
-        WHERE recorded_at = (SELECT MAX(recorded_at) FROM analyst_signals AS sub WHERE sub.analyst_id = analyst_signals.analyst_id)
-        GROUP BY risk_tier
-      `).all();
-      report.sections.teamHealth = { totalAnalysts: analysts.total, riskDistribution: signals };
+      const pressure = computeTeamHealth(db);
+      const behavioral = computeTeamBehavioral(db);
+      report.sections.teamHealth = {
+        totalAnalysts: analysts.total,
+        pressure: {
+          score: pressure.score,
+          status: pressure.status,
+          avgUtilization: pressure.avgUtil,
+          overCapacity: pressure.oc,
+          extendedOverCapacity: pressure.ext,
+          teamSize: pressure.size,
+        },
+        behavioral: {
+          windowHours: behavioral.windowHours,
+          minCohort: behavioral.k,
+          signalsHidden: behavioral.suppressed,
+        },
+        behavioralAggregate: (behavioral.available ? behavioral.signals : []).map((s) => ({ signal: s.label, mean: s.mean })),
+      };
       sectionCount++;
     }
 

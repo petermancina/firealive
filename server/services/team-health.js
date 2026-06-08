@@ -15,9 +15,11 @@
 // dataset the MC used.
 //
 // Inputs, all from canonical sources (the collector's pressure inputs):
-//   - roster: analysts currently on shift (active + available). The MC demo
-//     filtered a hardcoded "day" cohort; the available flag generalizes this
-//     without baking in time-of-day shift assumptions.
+//   - roster: ENROLLED analysts currently on shift (active + available + an
+//     active analyst_keys row -- FireAlive aggregates only analysts enrolled
+//     for monitoring, so roster membership alone never enters team pressure).
+//     The MC demo filtered a hardcoded "day" cohort; the available flag
+//     generalizes this without baking in time-of-day shift assumptions.
 //   - tk (ticket count, last hour): COUNT(*) from ticket_actions.
 //   - wo (overtime hours): config key 'overtime_<analyst_id>'.
 //   - util (0-1): the collector's canonical pressure/load metric reused here —
@@ -36,7 +38,10 @@ function computeTeamHealth(db) {
   let roster = [];
   try {
     roster = db
-      .prepare("SELECT id FROM users WHERE role='analyst' AND active=1 AND available=1")
+      .prepare(
+        "SELECT id FROM users WHERE role='analyst' AND active=1 AND available=1 " +
+          "AND id IN (SELECT analyst_id FROM analyst_keys WHERE status='active')"
+      )
       .all();
   } catch {
     roster = [];

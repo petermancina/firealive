@@ -23,7 +23,7 @@ A regional **Server** sits behind the AC/MC/ARC. A separate **GD Server** aggreg
 
 The whole thing is built on four privacy commitments:
 
-- **Tier-3 data** (individual burnout signals) is encrypted on the analyst’s client and never seen by the lead
+- **Tier-3 data** (individual burnout signals) is sealed to the analyst’s own key — the server stores only ciphertext it cannot read, it is decrypted only on the analyst’s own device, and the lead never sees it
 - **Tier-1 data** (team-level aggregates) is what the lead sees — averages, never individuals
 - **Pseudonyms** decouple analyst identity from burnout data at the database layer
 - **Abuse-report zero-access:** abuse reports (peer-session, board-post, lead-chat) are sealed on the reporter’s device to the active reviewer recipient set before they leave the app. The server, management, team leads, and admins (who handle only public keys) cannot decrypt them — only a designated independent reviewer can.
@@ -390,14 +390,14 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 
 ### Sync Interval
 
-**What it’s for:** Control how often analyst clients transmit burnout metrics to the server. Default is every 15 minutes (batch mode) — continuous sync wastes bandwidth and provides no real benefit. Adaptive mode ramps up sync frequency during incidents and slows down when stable.
+**What it’s for:** Control how often each analyst client refreshes its own view of its burnout signals. Analyst clients do not send burnout metrics to the server — the signals are computed server-side from the operational activity the ticketing/SOAR platform pushes in, sealed to each analyst, and every client only retrieves and decrypts its own sealed view. This setting governs that retrieval cadence: a longer interval is gentler on a bandwidth-constrained deployment, a shorter one shows fresher signals. Adaptive mode refreshes more often while an incident is active and relaxes when things are stable.
 
 **Workflow:**
 
 1. Lead opens Sync Interval tab once during setup
-1. Sets base interval (15 minutes default)
-1. Toggles adaptive mode (recommended — speeds up during incidents)
-1. Sets urgent event threshold — for panic events / critical incidents, push immediately rather than wait for next interval
+1. Sets the base refresh interval
+1. Toggles adaptive mode (recommended — refreshes more often during incidents)
+1. Sets the urgent event threshold — for panic events / critical incidents, refresh immediately rather than wait for the next interval
 1. Saves — applies to all connected analyst clients
 
 ### Client Notifications
@@ -1337,7 +1337,7 @@ The “Request Reduced Tickets” button is two-state: when reduced routing is O
 
 ### My Signals
 
-**What it’s for:** The analyst’s own burnout signals. Investigation time, dismiss rate, ticket quality, escalation rate — all compared to the analyst’s OWN baseline (not team comparisons). Click any signal for research-backed interventions. Privacy-critical: only the analyst sees this; the lead never does.
+**What it’s for:** The analyst’s own burnout signals. Investigation time, dismiss rate, ticket quality, escalation rate, and break compliance — the analyst’s behavioral signals, each compared to the analyst’s OWN baseline (not team comparisons) — alongside a separate operational section for the workload pressure on them (cognitive load, task-switching, queue pressure, shift overtime). Click any signal for research-backed interventions. Privacy-critical: the behavioral signals are sealed to the analyst, so only they see their own values, never the lead.
 
 **Workflow:**
 

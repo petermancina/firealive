@@ -17,6 +17,7 @@ const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
 const { computeTeamHealth } = require('../services/team-health');
+const { computeTeamBehavioral } = require('../services/team-behavioral');
 const teamConditions = require('../services/team-conditions');
 const researchKb = require('../services/research-kb');
 
@@ -65,6 +66,7 @@ router.get('/team-intervention-prompts', requireRole('lead', 'admin'), (req, res
   const db = getDb();
   try {
     const th = computeTeamHealth(db);
+    const tb = computeTeamBehavioral(db);
     const active = teamConditions.getActive(th);
     const fallback = unavailableReason(db);
     const conditions = active.map((c) => {
@@ -96,7 +98,7 @@ router.get('/team-intervention-prompts', requireRole('lead', 'admin'), (req, res
         generated_at: row.generated_at,
       };
     });
-    res.json({ teamHealth: th, conditions, kbVersion: researchKb.KB_VERSION });
+    res.json({ teamHealth: th, teamBehavioral: tb, conditions, kbVersion: researchKb.KB_VERSION });
   } catch (err) {
     logger.error('ai-burnout: team-intervention-prompts failed', { error: err.message });
     res.status(500).json({ error: 'internal error' });

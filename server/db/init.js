@@ -439,9 +439,6 @@ CREATE TABLE IF NOT EXISTS lighter_queue_requests (
   duration TEXT NOT NULL,
   max_complexity INTEGER NOT NULL DEFAULT 2,
   status TEXT DEFAULT 'active' CHECK (status IN ('active', 'expired', 'cancelled')),
-  -- NOTE: analyst_id stored but NEVER exposed to management console
-  -- Management sees only: "1 active lighter queue request" (anonymous)
-  analyst_id_encrypted BLOB,  -- encrypted with Tier-3 key
   created_at TEXT DEFAULT (datetime('now')),
   expires_at TEXT
 );
@@ -479,18 +476,6 @@ CREATE TABLE IF NOT EXISTS delegations (
 -- ═══════════════════════════════════════════════════════════════════════════
 -- TIER-3: Analyst private data (encrypted, never visible to management)
 -- ═══════════════════════════════════════════════════════════════════════════
-
-CREATE TABLE IF NOT EXISTS analyst_signals (
-  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- All signal values are encrypted with the Tier-3 key
-  -- Management console can NEVER access these values
-  signals_encrypted BLOB NOT NULL,
-  -- Only the aggregate risk tier is derived and stored in Tier-1
-  -- This is computed by the server and is one of: stable, watch, elevated
-  risk_tier TEXT DEFAULT 'stable',
-  recorded_at TEXT DEFAULT (datetime('now'))
-);
 
 CREATE TABLE IF NOT EXISTS analyst_consent_log (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -1395,14 +1380,6 @@ CREATE TABLE IF NOT EXISTS analyst_baselines (
   sample_count INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS signal_readings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  analyst_id TEXT,
-  signal TEXT,
-  value REAL,
-  recorded_at TEXT DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS analyst_impacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   analyst_id TEXT,
@@ -1460,6 +1437,19 @@ CREATE TABLE IF NOT EXISTS analyst_metrics_deidentified (
 );
 CREATE INDEX IF NOT EXISTS idx_analyst_metrics_deid_group
   ON analyst_metrics_deidentified (team_tag, shift_tag, signal, recorded_at);
+
+-- Enrollment reconciliation: analysts the Lead/Admin has explicitly excluded
+-- from the "scheduled but not enrolled" prompt (someone in the HR schedule who
+-- is intentionally not monitored by FireAlive, e.g. not a SOC analyst). A row
+-- here suppresses the prompt for that user and confirms they are never
+-- aggregated; removing the row re-includes them. Enrollment itself remains the
+-- monitoring gate -- this table only governs the reconciliation alert.
+CREATE TABLE IF NOT EXISTS analyst_enrollment_exclusions (
+  analyst_id TEXT PRIMARY KEY REFERENCES users(id),
+  excluded_by TEXT REFERENCES users(id),
+  reason TEXT,
+  excluded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 -- end B5d1 ----------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -2190,31 +2180,6 @@ CREATE INDEX IF NOT EXISTS idx_ai_inference_status
 -- then reports the reason from ai_inference_log. Rows are AI-generated only —
 -- there is no template/source column because no canned content is ever stored.
 
--- Per-analyst signal interpretations (Tier-3). The interpretation text
--- describes the analyst's own encrypted signal values, so it is encrypted at
--- rest with the Tier-3 envelope (encryptTier3) and is readable only by the
--- owning analyst. The management console can NEVER access these rows.
-CREATE TABLE IF NOT EXISTS analyst_interpretations (
-  analyst_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Keyed to the four signals the analyst's My Signals tab displays
-  signal_key TEXT NOT NULL CHECK (signal_key IN (
-    'investigationTime', 'dismissRate', 'ticketQuality', 'escalationRate'
-  )),
-  interpretation_encrypted BLOB NOT NULL,
-  -- The model that produced this row (rows are AI-generated only)
-  model_name TEXT NOT NULL,
-  -- JSON array of cited KB R-refs (a subset of the 42 KB entries)
-  kb_refs TEXT,
-  generated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  -- Freshness deadline = generated_at + freshness window. Reads serve a row
-  -- only while datetime('now') < expires_at; otherwise AI-unavailable.
-  expires_at TEXT NOT NULL,
-  PRIMARY KEY (analyst_id, signal_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_analyst_interp_analyst
-  ON analyst_interpretations(analyst_id, generated_at DESC);
-
 -- Team intervention prompts (Tier-1 aggregate; not encrypted). Keyed by team
 -- condition. Generated from team-level aggregates only — no individual analyst
 -- is named or referenced. Which conditions are currently active is recomputed
@@ -2910,6 +2875,29 @@ function initDb() {
 
   // Execute schema
   db.exec(SCHEMA);
+
+  // Migration (B5d1): drop retired analyst-private burnout tables. The
+  // server-decryptable per-analyst burnout path is fully retired -- behavioral
+  // detail now lives sealed on the analyst's own device (analyst_private_data)
+  // and the only server-side views are the de-identified team aggregates.
+  // analyst_signals, signal_readings, and analyst_interpretations are no longer
+  // written or read by any code path, so they are dropped here. DROP IF EXISTS
+  // is a no-op on fresh installs (the SCHEMA above no longer creates them) and
+  // removes them from upgraded databases. The write-only analyst_id_encrypted
+  // column on lighter_queue_requests is also retired: a lighter-queue request
+  // stores no analyst identifier. PRAGMA-guarded so re-running initDb no-ops.
+  try {
+    db.exec('DROP TABLE IF EXISTS analyst_signals');
+    db.exec('DROP TABLE IF EXISTS signal_readings');
+    db.exec('DROP TABLE IF EXISTS analyst_interpretations');
+    const lqCols = db.prepare("PRAGMA table_info(lighter_queue_requests)").all().map((c) => c.name);
+    if (lqCols.includes('analyst_id_encrypted')) {
+      db.exec('ALTER TABLE lighter_queue_requests DROP COLUMN analyst_id_encrypted');
+      console.log('lighter_queue_requests migration (B5d1): dropped analyst_id_encrypted column');
+    }
+  } catch (e) {
+    console.error('B5d1 retired-table drop migration failed:', e.message);
+  }
 
   // ── Migration: peer board KV → peer_board_messages (U2) ──────────────────
   // The prototype board (retired v022-features route) stored each post as a

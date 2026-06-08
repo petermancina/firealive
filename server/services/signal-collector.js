@@ -111,29 +111,32 @@ class SignalCollector {
     } catch (e) {
       console.error('[signal-collector] shift-overtime compute failed:', e.message);
     }
+    // FireAlive monitors only ENROLLED analysts -- those who have registered an
+    // active key from their AC. Roster (HR/IAM) membership alone never enrolls
+    // anyone: a stale or wrong HR entry must not feed the team aggregates or the
+    // routing cap. Un-enrolled scheduled analysts surface separately as an MC
+    // enrollment prompt; here they are simply excluded from collection.
     const analysts = this.db
-      .prepare("SELECT id, tier, shift FROM users WHERE role='analyst' AND active=1")
+      .prepare(
+        "SELECT id, tier, shift FROM users WHERE role='analyst' AND active=1 " +
+          "AND id IN (SELECT analyst_id FROM analyst_keys WHERE status='active')"
+      )
       .all();
     const results = [];
-    const { AiBurnoutEngine } = require('./ai-burnout-engine');
-    const engine = new AiBurnoutEngine(this.db);
     for (const analyst of analysts) {
       const signals = this._generateSignals(analyst);
       const behavior = signals.filter((s) => BEHAVIOR_SIGNALS.includes(s.signal));
       const pressure = signals.filter((s) => PRESSURE_SIGNALS.includes(s.signal));
 
-      // Pressure signals are operational and lead-visible (workload/capacity);
-      // they stay on the plaintext operational path. Behavioral signals are
-      // deliberately NOT written in the clear here -- they are sealed to the
-      // analyst only (below). This plaintext path is retired later in the phase.
-      for (const sig of pressure) {
-        engine.recordSignal(analyst.id, sig.signal, sig.value);
-      }
+      // Pressure signals are operational and lead-visible, but no per-analyst
+      // pressure is persisted: it is recomputed live each cycle (computeAnalystPressure)
+      // for the routing cap below and for the analyst's My Signals pressure section.
+      // Behavioral signals are sealed to the analyst only (a) and never written in the clear.
 
       // (a) Seal ONLY the behavioral signals (the analyst's burnout response)
       // to the analyst's own public key. The server stores only ciphertext it
-      // cannot open. Skipped when the analyst has not yet enrolled a key; that
-      // pre-cutover history is resealed at enrollment in a later sub-phase.
+      // cannot open. The roster query above restricts this loop to enrolled
+      // analysts, so an active key is always present here.
       this._sealReading(analyst.id, behavior);
 
       // (b) De-identified copy of ONLY the behavioral signals, for team

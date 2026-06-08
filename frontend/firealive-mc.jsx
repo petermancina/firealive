@@ -1247,6 +1247,42 @@ function ManagementConsole() {
     });
     return () => { cancelled = true; };
   }, [tab]);
+  // Enrollment reconciliation: which rostered analysts are not yet enrolled (and
+  // are therefore invisible to every per-analyst feature), plus any a lead has
+  // intentionally excluded. Refetched when the Actions tab opens and after each
+  // exclude/include so the list stays in sync.
+  const [enrollPending, setEnrollPending] = useState(null);
+  const [enrollExcluded, setEnrollExcluded] = useState(null);
+  const [enrollBusy, setEnrollBusy] = useState(false);
+  const [showEnrollExcluded, setShowEnrollExcluded] = useState(false);
+  function loadEnroll() {
+    api.get("/api/enrollment-reconciliation/pending").then((d) => {
+      setEnrollPending(d && Array.isArray(d.pending) ? d.pending : []);
+    });
+    api.get("/api/enrollment-reconciliation/excluded").then((d) => {
+      setEnrollExcluded(d && Array.isArray(d.excluded) ? d.excluded : []);
+    });
+  }
+  useEffect(() => {
+    if (tab !== "actions") return;
+    loadEnroll();
+  }, [tab]);
+  function excludeEnroll(id, name) {
+    if (!window.confirm("Exclude " + name + " from FireAlive monitoring? They will not be aggregated or prompted to enroll until you include them again.")) return;
+    setEnrollBusy(true);
+    api.post("/api/enrollment-reconciliation/exclude", { analyst_id: id }).then(() => {
+      setEnrollBusy(false);
+      loadEnroll();
+    });
+  }
+  function includeEnroll(id) {
+    setEnrollBusy(true);
+    api.post("/api/enrollment-reconciliation/include", { analyst_id: id }).then(() => {
+      setEnrollBusy(false);
+      loadEnroll();
+    });
+  }
+
   // Initial audit entries for first-run demo. In production, populated from server.
   // Audit log populated from real events.
   const [audit, setAudit] = useState([]);
@@ -3801,6 +3837,67 @@ function ManagementConsole() {
             <M style={{color:C.tm}}>Prompt depth:</M>
             <div style={{display:"flex",gap:4}}>{["full","compact","minimal"].map(d=><button key={d} onClick={()=>{setGD(d===gDepth?null:d);addA("GLOBAL_DEPTH",d);}} style={{padding:"4px 12px",background:gDepth===d?C.ad:"transparent",border:`1px solid ${gDepth===d?C.a+"50":C.b}`,borderRadius:6,color:gDepth===d?C.a:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{d}</button>)}{gDepth&&<button onClick={()=>setGD(null)} style={{padding:"4px 8px",background:"transparent",border:"none",color:C.td,fontSize:10,cursor:"pointer"}}>×</button>}</div>
           </div>
+          {aiTeam&&aiTeam.teamBehavioral&&aiTeam.teamBehavioral.available&&(
+            <Card style={{marginBottom:20,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:8}}>
+                <L>Team behavioral trend</L>
+                <M style={{color:C.td,fontSize:10}}>de-identified aggregate, {aiTeam.teamBehavioral.windowHours}h window, min cohort {aiTeam.teamBehavioral.k}</M>
+              </div>
+              <M style={{color:C.td,display:"block",marginBottom:12,fontSize:11,lineHeight:1.6}}>All-team aggregate, never individual. A signal appears only when at least {aiTeam.teamBehavioral.k} analysts contribute.</M>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))",gap:10}}>
+                {aiTeam.teamBehavioral.signals.map(s=>(
+                  <div key={s.signal} style={{textAlign:"center",padding:"10px 8px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8}}>
+                    <div style={{fontSize:20,fontWeight:300,color:C.t,fontFamily:"'Fraunces',serif"}}>{s.mean}</div>
+                    <M style={{color:C.td,letterSpacing:1,textTransform:"uppercase",marginTop:4,fontSize:10}}>{s.label}</M>
+                  </div>
+                ))}
+              </div>
+              {aiTeam.teamBehavioral.suppressed>0&&<M style={{color:C.td,display:"block",marginTop:10,fontSize:10}}>{aiTeam.teamBehavioral.suppressed} signal{aiTeam.teamBehavioral.suppressed>1?"s":""} hidden to protect small groups.</M>}
+            </Card>
+          )}
+          {((enrollPending&&enrollPending.length>0)||(enrollExcluded&&enrollExcluded.length>0))&&(
+            <Card style={{marginBottom:20,padding:16,borderLeft:`3px solid ${C.w}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:8}}>
+                <L>Enrollment</L>
+                {enrollPending&&<M style={{color:C.td,fontSize:10}}>{enrollPending.length} not enrolled</M>}
+              </div>
+              {enrollPending&&enrollPending.length>0&&(
+                <div>
+                  <M style={{color:C.td,display:"block",marginBottom:12,fontSize:11,lineHeight:1.6}}>FireAlive only monitors analysts who have set up their Analyst Client. These rostered analysts are not yet enrolled, so they are absent from every team aggregate and from burnout support. Ask them to open their Analyst Client and enroll, or exclude anyone who should not be monitored.</M>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {enrollPending.map(p=>(
+                      <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",background:C.s,border:`1px solid ${C.b}`,borderRadius:8,flexWrap:"wrap",gap:8}}>
+                        <div>
+                          <M style={{color:C.t}}>{p.name}</M>
+                          <M style={{color:C.td,fontSize:10,display:"block"}}>{(p.shift||"no shift")+" / "+(p.scheduledWeeks>0?(p.scheduledWeeks+" week"+(p.scheduledWeeks>1?"s":"")+" scheduled"):"not scheduled")}</M>
+                        </div>
+                        <button disabled={enrollBusy} onClick={()=>excludeEnroll(p.id,p.name)} style={{padding:"4px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:6,color:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:enrollBusy?"default":"pointer"}}>Exclude</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {enrollExcluded&&enrollExcluded.length>0&&(
+                <div style={{marginTop:enrollPending&&enrollPending.length>0?14:6}}>
+                  <button onClick={()=>setShowEnrollExcluded(!showEnrollExcluded)} style={{padding:"4px 8px",background:"transparent",border:"none",color:C.td,fontSize:10,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{(showEnrollExcluded?"Hide":"Show")+" excluded ("+enrollExcluded.length+")"}</button>
+                  {showEnrollExcluded&&(
+                    <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:6}}>
+                      {enrollExcluded.map(x=>(
+                        <div key={x.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:8,flexWrap:"wrap",gap:8}}>
+                          <div>
+                            <M style={{color:C.tm}}>{x.name}</M>
+                            <M style={{color:C.td,fontSize:10,display:"block"}}>{(x.reason||"no reason given")+(x.excludedByName?(" / by "+x.excludedByName):"")}</M>
+                          </div>
+                          <button disabled={enrollBusy} onClick={()=>includeEnroll(x.id)} style={{padding:"4px 12px",background:"transparent",border:`1px solid ${C.b}`,borderRadius:6,color:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:enrollBusy?"default":"pointer"}}>Include</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </Card>
+          )}
+
           {aiTeam&&aiTeam.kbVersion&&<M style={{color:C.td,display:"block",marginBottom:12,fontSize:11,lineHeight:1.6}}>Guidance is AI-generated and grounded only in the research KB (v{aiTeam.kbVersion}). When AI is unavailable, the detected condition is still shown.</M>}
           {!aiTeam&&<M style={{color:C.td,display:"block"}}>Loading team guidance…</M>}
           {aiTeam&&activeP.length===0&&<M style={{color:C.td,display:"block"}}>No active team conditions right now.</M>}
@@ -7883,17 +7980,17 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* ══════════ v1.0.0 — SYNC INTERVAL ══════════ */}
         {tab==="sync_interval"&&(<div>
-          <L>Burnout Stats Sync Interval</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure how often analyst clients transmit burnout metrics to the server. Default: every 15 minutes in batch mode. Continuous sync is unnecessary and wastes bandwidth. Adaptive sync reduces frequency when metrics are stable and increases it during active incidents.</M>
+          <L>Burnout Signal Refresh Interval</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure how often each analyst client refreshes its own view of its burnout signals. Clients do not send burnout metrics to the server — signals are computed server-side and sealed to each analyst, and a client only retrieves and decrypts its own sealed view. A longer interval is gentler on constrained links; a shorter one shows fresher signals. Adaptive refresh speeds up during active incidents and relaxes when stable.</M>
           <Card style={{marginBottom:16}}>
-            <Input label="Base sync interval (minutes)" value={syncIntervalCfg.intervalMin} onChange={e=>setSyncIntervalCfg(prev=>({...prev,intervalMin:parseInt(e.target.value)||15}))} type="number"/>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" checked={syncIntervalCfg.adaptiveSync} onChange={e=>setSyncIntervalCfg(prev=>({...prev,adaptiveSync:e.target.checked}))}/><M style={{color:C.t}}>Adaptive sync — speed up during incidents, slow down when stable</M></label>
-            <Input label="Urgent event threshold (seconds) — immediate push for panic/critical events" value={syncIntervalCfg.urgentThresholdSec} onChange={e=>setSyncIntervalCfg(prev=>({...prev,urgentThresholdSec:parseInt(e.target.value)||30}))} type="number"/>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={syncIntervalCfg.batchMode} onChange={e=>setSyncIntervalCfg(prev=>({...prev,batchMode:e.target.checked}))}/><M style={{color:C.t}}>Batch mode — accumulate metrics and send in single compressed payload</M></label>
+            <Input label="Base refresh interval (minutes)" value={syncIntervalCfg.intervalMin} onChange={e=>setSyncIntervalCfg(prev=>({...prev,intervalMin:parseInt(e.target.value)||15}))} type="number"/>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" checked={syncIntervalCfg.adaptiveSync} onChange={e=>setSyncIntervalCfg(prev=>({...prev,adaptiveSync:e.target.checked}))}/><M style={{color:C.t}}>Adaptive refresh — refresh more often during incidents, less often when stable</M></label>
+            <Input label="Urgent event threshold (seconds) — refresh immediately on panic/critical events" value={syncIntervalCfg.urgentThresholdSec} onChange={e=>setSyncIntervalCfg(prev=>({...prev,urgentThresholdSec:parseInt(e.target.value)||30}))} type="number"/>
+            <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={syncIntervalCfg.batchMode} onChange={e=>setSyncIntervalCfg(prev=>({...prev,batchMode:e.target.checked}))}/><M style={{color:C.t}}>Batch mode — refresh on the interval in one request rather than a live stream</M></label>
           </Card>
           <Card style={{padding:12,borderColor:C.i+"30",marginBottom:16}}>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Bandwidth Estimate</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>Each sync payload: ~2-5 KB compressed (burnout signals, ticket metrics, delegation events). At 15-min intervals with 6 analysts: ~2.4 KB × 6 × 96 syncs/day ≈ 1.4 MB/day total. At 5-min intervals: ~4.1 MB/day. Negligible compared to SIEM/SOAR traffic. Adaptive sync during a major incident may temporarily increase to every 2 minutes for affected analysts.</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>Each refresh fetches a small sealed signal payload per analyst (~2-5 KB compressed). At a 15-min interval with 6 analysts that is roughly 1.4 MB/day of retrieval traffic; at 5 minutes, roughly 4.1 MB/day — negligible next to SIEM/SOAR volume. Adaptive refresh during a major incident may briefly shorten the interval for affected analysts.</M>
           </Card>
           <Btn primary onClick={()=>addA("SYNC_INTERVAL_SAVED","Sync interval config saved — base: "+syncIntervalCfg.intervalMin+"min")}>Save Sync Config</Btn>
         </div>)}
