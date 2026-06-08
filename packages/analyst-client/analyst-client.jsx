@@ -220,6 +220,134 @@ const SIGNAL_INTERVENTIONS = {
   ]},
 };
 
+// ── B5d1 PR D: My Signals metadata + on-device baseline/drift engine ─────────
+// Behavioral signals are sealed to the analyst's own X25519 key and decrypted
+// ONLY on this device (burnout:decrypt). From each analyst's own decrypted
+// history we compute two anchors, shown side by side:
+//   1. A FROZEN personal baseline -- the median over the first FA_ESTABLISH_DAYS
+//      of history, then frozen. Later data can RE-ESTABLISH IT DOWNWARD (a recent
+//      in-band window that settles lower), but a sustained-high window can NEVER
+//      raise it. A rolling/auto-raising baseline would silently normalise
+//      persistent strain and hide a worsening analyst.
+//   2. A normative HEALTHY-RANGE band per signal (FireAlive-set, configurable,
+//      research-informed). It flags an analyst whose own "normal" already sits
+//      outside the band even while their personal drift is flat.
+// Until FA_ESTABLISH_DAYS of history exist the personal baseline is withheld
+// (status 'establishing') and only the band comparison is shown.
+const FA_ESTABLISH_DAYS = 90;   // history required before a personal baseline is trusted
+const FA_CURRENT_DAYS = 14;     // recent window summarised as "current"
+const FA_DAY_MS = 86400000;
+const FA_DRIFT_NOTABLE = 15;    // |drift %| beyond which a worsening change is highlighted
+
+// hib = "higher is better" (documentation quality, break compliance). band is the
+// healthy range; for hib the concern is falling BELOW low, otherwise rising ABOVE high.
+const BEHAVIORAL_META = {
+  investigationTime: { label: "Avg time per alert",    u: "min", hib: false, band: { low: 0,  high: 30  } },
+  dismissRate:       { label: "Closed without notes",  u: "%",   hib: false, band: { low: 0,  high: 30  } },
+  ticketQuality:     { label: "Documentation quality", u: "%",   hib: true,  band: { low: 65, high: 100 } },
+  escalationRate:    { label: "Escalation rate",       u: "%",   hib: false, band: { low: 0,  high: 25  } },
+  break_compliance:  { label: "Break compliance",      u: "%",   hib: true,  band: { low: 60, high: 100 } },
+};
+const BEHAVIORAL_ORDER = ["investigationTime", "dismissRate", "ticketQuality", "escalationRate", "break_compliance"];
+
+function faMedian(arr) {
+  if (!arr || arr.length === 0) return null;
+  const s = arr.slice().sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+// 'within' | 'above' | 'below' relative to the normative band (only the harmful side is named).
+function faBandStatus(v, band, hib) {
+  if (v == null || !band) return "within";
+  if (hib) return v < band.low ? "below" : "within";
+  return v > band.high ? "above" : "within";
+}
+function faInBand(v, band, hib) { return faBandStatus(v, band, hib) === "within"; }
+// Per-signal view from a chronological series of {t (ms), v}.
+// Returns { status:'no_data'|'establishing'|'established', n, cur, base, driftPct, band }.
+function faComputeSignal(series, band, hib) {
+  if (!series || series.length === 0) return { status: "no_data", n: 0 };
+  const asc = series.slice().sort((a, b) => a.t - b.t);
+  const t0 = asc[0].t, tEnd = asc[asc.length - 1].t;
+  const spanDays = (tEnd - t0) / FA_DAY_MS;
+  const cur = faMedian(asc.filter((p) => p.t >= tEnd - FA_CURRENT_DAYS * FA_DAY_MS).map((p) => p.v));
+  const bandStatus = faBandStatus(cur, band, hib);
+  if (spanDays < FA_ESTABLISH_DAYS) {
+    return { status: "establishing", n: asc.length, cur, band: bandStatus, spanDays: Math.floor(spanDays) };
+  }
+  const estBase = faMedian(asc.filter((p) => p.t <= t0 + FA_ESTABLISH_DAYS * FA_DAY_MS).map((p) => p.v));
+  const recentBase = faMedian(asc.filter((p) => p.t >= tEnd - FA_ESTABLISH_DAYS * FA_DAY_MS).map((p) => p.v));
+  let base = estBase;
+  if (recentBase != null && estBase != null && recentBase < estBase && faInBand(recentBase, band, hib)) base = recentBase;
+  const driftPct = (base != null && base !== 0 && cur != null) ? ((cur - base) / Math.abs(base)) * 100 : 0;
+  return { status: "established", n: asc.length, cur, base, driftPct, band: bandStatus };
+}
+// Display: round to a tidy number; em-dash placeholder when absent.
+function faNum(x) { return x == null ? "\u2014" : (Math.round(x * 10) / 10); }
+
+// ── B5d1 PR D: aggregate burnout-proximity (on-device, deterministic) ────────
+// One overall read across ALL signals. Behavioral strain (the original
+// computeRisk ratios, with break_compliance folded in) is blended with
+// operational pressure; a single severe signal lifts the score (max blend) so a
+// real problem is not diluted by calm signals. Establishing/no-data signals do
+// not invent strain. Drives the My Signals overall card and the home status
+// banner, and frames the holistic on-device interpretation.
+const FA_BEHAVIORAL_WEIGHTS = { dismissRate: 0.30, ticketQuality: 0.26, investigationTime: 0.22, escalationRate: 0.09, break_compliance: 0.13 };
+const FA_DRIFT_FULL = 50;             // a 50% bad-direction drift -> full per-signal drift strain
+const FA_BAND_BREACH_STRAIN = 0.7;    // current value outside the healthy band, on the harmful side
+const FA_AVG_VS_MAX = 0.55;           // behavioral = 0.55*weighted average + 0.45*worst signal
+const FA_BEHAVIORAL_VS_PRESSURE = 0.6;// overall = 0.6*behavioral + 0.4*pressure (renormalized if one absent)
+const FA_PRESSURE_THRESHOLDS = { cognitive_load: [60, 80], task_switching: [6, 10], queue_pressure: [8, 12], shift_overtime: [4, 8] };
+const FA_STAGE_BANDS = [[0.25, "healthy"], [0.50, "watch"], [0.75, "strained"], [Infinity, "elevated"]];
+const STAGE_COPY = {
+  healthy:  { hl: "Your signals look steady.",                   sub: "Nothing standing out right now.",                                 c: C.a },
+  watch:    { hl: "A few signals are drifting.",                 sub: "Worth noticing, not worrying about yet.",                         c: C.w },
+  strained: { hl: "Several signals are trending toward strain.", sub: "A good moment to ease your load or talk to someone.",             c: C.w },
+  elevated: { hl: "Your signals point to sustained strain.",     sub: "Reducing your queue or a 1-on-1 is exactly what support is for.", c: C.d },
+};
+function faSignalStrain(s) {
+  if (!s || s.status === "no_data") return { strain: 0, usable: false };
+  const breach = (s.band === "above") || (s.band === "below");
+  if (s.status === "establishing") return { strain: breach ? FA_BAND_BREACH_STRAIN : 0, usable: true };
+  const badMag = s.hib ? Math.max(0, -(s.driftPct || 0)) : Math.max(0, (s.driftPct || 0));
+  const driftStrain = Math.min(1, badMag / FA_DRIFT_FULL);
+  return { strain: Math.min(1, Math.max(driftStrain, breach ? FA_BAND_BREACH_STRAIN : 0)), usable: true };
+}
+function faBehavioralScore(signals) {
+  let wsum = 0, acc = 0, worst = 0, any = false;
+  for (const k of Object.keys(FA_BEHAVIORAL_WEIGHTS)) {
+    const r = faSignalStrain(signals[k]); if (!r.usable) continue;
+    any = true; wsum += FA_BEHAVIORAL_WEIGHTS[k]; acc += FA_BEHAVIORAL_WEIGHTS[k] * r.strain; if (r.strain > worst) worst = r.strain;
+  }
+  if (!any || wsum === 0) return { score: null, usable: false };
+  return { score: FA_AVG_VS_MAX * (acc / wsum) + (1 - FA_AVG_VS_MAX) * worst, usable: true };
+}
+function faPressureScore(pressure) {
+  if (!pressure) return { score: null, usable: false };
+  let n = 0, acc = 0;
+  for (const k of Object.keys(FA_PRESSURE_THRESHOLDS)) {
+    const v = pressure[k]; if (typeof v !== "number" || !Number.isFinite(v)) continue;
+    const r = FA_PRESSURE_THRESHOLDS[k]; acc += v >= r[1] ? 1 : v >= r[0] ? 0.5 : 0; n++;
+  }
+  if (n === 0) return { score: null, usable: false };
+  return { score: acc / n, usable: true };
+}
+function faAggregate(signals, pressure) {
+  const b = faBehavioralScore(signals || {});
+  const p = faPressureScore(pressure);
+  const parts = [];
+  if (b.usable) parts.push([FA_BEHAVIORAL_VS_PRESSURE, b.score]);
+  if (p.usable) parts.push([1 - FA_BEHAVIORAL_VS_PRESSURE, p.score]);
+  let overall = 0;
+  if (parts.length) { const ws = parts.reduce((a, x) => a + x[0], 0); overall = parts.reduce((a, x) => a + x[0] * x[1], 0) / ws; }
+  const established = Object.keys(signals || {}).some((k) => signals[k] && signals[k].status === "established");
+  let stage = "healthy";
+  for (const sb of FA_STAGE_BANDS) { if (overall < sb[0]) { stage = sb[1]; break; } }
+  return { score: overall, stage, behavioral: b.score, pressure: p.score, established, hasBehavioral: b.usable, hasPressure: p.usable };
+}
+// 'low' | 'elevated' | 'high' word for the pressure score (for the interpretation prompt).
+function faPressureWord(p) { return p == null ? "unknown" : p >= 0.66 ? "high" : p >= 0.33 ? "elevated" : "low"; }
+
 // ── Shared UI ────────────────────────────────────────────────────────────────
 const M = ({children,style,...p}) => <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:10,...style}} {...p}>{children}</span>;
 const L = ({children,style}) => <div style={{fontSize:10,color:C.td,fontFamily:"'IBM Plex Mono',monospace",letterSpacing:1.5,textTransform:"uppercase",marginBottom:10,...style}}>{children}</div>;
@@ -1353,14 +1481,13 @@ export default function AnalystClientApp() {
   ];
 
   // ── Signals ──
-  // ── Signals (R3l C10): DEFAULT preserves UI metadata; cur/base populated from /api/signals/me on mount ──
-  const DEFAULT_SIGNALS = {
-    investigationTime: {base:20, cur:26, u:"min", label:"Avg time per alert"},
-    dismissRate:       {base:15, cur:19, u:"%",   label:"Closed without notes"},
-    ticketQuality:     {base:82, cur:76, u:"%",   label:"Documentation quality", hib:true},
-    escalationRate:    {base:11, cur:14, u:"%",   label:"Escalation rate"},
-  };
-  const [signals, setSignals] = useState(DEFAULT_SIGNALS);
+  // ── My Signals (B5d1 PR D): every value is derived on-device by decrypting the
+  // analyst's own sealed snapshots -- no placeholders. `signals` is keyed by
+  // BEHAVIORAL_ORDER; each entry is BEHAVIORAL_META plus the computed
+  // { status, n, cur, base, driftPct, band }. `pressure` is live operational load
+  // (lead-visible), returned in the clear by /api/signals/me. ──
+  const [signals, setSignals] = useState({});
+  const [pressure, setPressure] = useState(null);
   const [kbEntry, setKbEntry] = useState(null);
   const [kbFilter, setKbFilter] = useState("all");
   const [kbChatMsgs, setKbChatMsgs] = useState([]);
@@ -1383,9 +1510,10 @@ export default function AnalystClientApp() {
   // model as private grounding background. Never sent to any server.
   const buildSignalsContext = () => {
     try {
-      return Object.keys(signals).map((k) => {
+      return BEHAVIORAL_ORDER.filter((k) => signals[k] && signals[k].cur != null).map((k) => {
         const s = signals[k];
-        return `${s.label}: ${s.cur}${s.u} (baseline ${s.base}${s.u})`;
+        if (s.status === "established" && s.base != null) return `${s.label}: ${faNum(s.cur)}${s.u} (your baseline ${faNum(s.base)}${s.u})`;
+        return `${s.label}: ${faNum(s.cur)}${s.u} (baseline establishing)`;
       }).join("; ");
     } catch (_e) { return ""; }
   };
@@ -1432,65 +1560,106 @@ export default function AnalystClientApp() {
     else setKbChatMsgs((m) => [...m, { role: "assistant", text: r.answer, citedEntries: r.citedEntries || [] }]);
   };
   useEffect(() => { if (tab === "kb" && kbModelStatus === null) refreshKbModelStatus(); }, [tab]);
-  const [signalsLoadState, setSignalsLoadState] = useState({loaded:false, error:null, riskTier:null, recordedAt:null});
+  const [signalsLoadState, setSignalsLoadState] = useState({ loaded: false, error: null, locked: false, decrypted: 0, sealedCount: 0 });
   useEffect(() => {
+    if (!burnoutReady) return;
     let cancelled = false;
-    api.get('/api/signals/me').then((data) => {
+    (async () => {
+      const data = await api.get('/api/signals/me');
       if (cancelled) return;
-      if (data.error) {
-        setSignalsLoadState({loaded:false, error:data.error, riskTier:null, recordedAt:null});
+      if (!data || data.error) {
+        setSignalsLoadState({ loaded: false, error: (data && data.error) || 'error', locked: false, decrypted: 0, sealedCount: 0 });
         return;
       }
-      const cur = data.current || {};
-      const decryptOk = !cur.error;
-      setSignals((prev) => {
-        const next = {};
-        for (const key of Object.keys(prev)) {
-          const merged = {...prev[key]};
-          if (decryptOk && typeof cur[key] === 'number') merged.cur = cur[key];
-          next[key] = merged;
-        }
-        if (Array.isArray(data.readings) && data.readings.length > 0) {
-          const byKey = {};
-          for (const r of data.readings) {
-            if (typeof r.signal === 'string' && typeof r.value === 'number') {
-              (byKey[r.signal] = byKey[r.signal] || []).push(r.value);
-            }
-          }
-          for (const key of Object.keys(next)) {
-            const arr = byKey[key];
-            if (arr && arr.length > 0) {
-              const sorted = [...arr].sort((a,b) => a-b);
-              next[key].base = Math.round(sorted[Math.floor(sorted.length/2)]);
-            }
-          }
-        }
-        return next;
-      });
-      setSignalsLoadState({
-        loaded: true,
-        error: cur.error || null,
-        riskTier: cur.riskTier || null,
-        recordedAt: cur.recordedAt || null,
-      });
-    });
-    return () => { cancelled = true; };
-  }, []);
+      if (data.pressure && typeof data.pressure === 'object') setPressure(data.pressure);
 
-  // ── AI signal interpretations (N1b): from /api/ai-burnout/analyst-interpretations.
-  // Precomputed server-side, Tier-3, KB-cited. Refetched whenever the Signals
-  // tab opens so the analyst sees the latest cached interpretation. null until
-  // the first load resolves; {} or a per-signal map afterward.
-  const [aiInterp, setAiInterp] = useState(null);
-  useEffect(() => {
-    if (tab !== "signals") return;
-    let cancelled = false;
-    api.get('/api/ai-burnout/analyst-interpretations').then((data) => {
+      // Decrypt each sealed snapshot on-device and rebuild a per-signal series.
+      const sealed = Array.isArray(data.sealed_readings) ? data.sealed_readings : [];
+      const bridge = (typeof window !== "undefined") ? window.firealive : null;
+      const seriesByKey = {};
+      for (const k of BEHAVIORAL_ORDER) seriesByKey[k] = [];
+      let decrypted = 0, lockedSeen = false;
+      if (bridge && bridge.invoke && sealed.length > 0) {
+        for (const row of sealed) {
+          if (cancelled) return;
+          if (!row || typeof row.ciphertext !== 'string') continue;
+          let res;
+          try { res = await bridge.invoke("burnout:decrypt", { sealed: row.ciphertext }); } catch (_e) { res = null; }
+          if (!res || res.ok !== true || typeof res.plaintext !== 'string') { lockedSeen = true; break; }
+          let snap;
+          try { snap = JSON.parse(res.plaintext); } catch (_e) { snap = null; }
+          if (!snap || typeof snap.signals !== 'object' || !snap.recorded_at) continue;
+          const t = new Date(snap.recorded_at).getTime();
+          if (!Number.isFinite(t)) continue;
+          for (const k of BEHAVIORAL_ORDER) {
+            const v = snap.signals[k];
+            if (typeof v === 'number' && Number.isFinite(v)) seriesByKey[k].push({ t, v });
+          }
+          decrypted++;
+        }
+      }
       if (cancelled) return;
-      setAiInterp(data && data.interpretations ? data.interpretations : {});
-    });
+      const next = {};
+      for (const k of BEHAVIORAL_ORDER) {
+        const meta = BEHAVIORAL_META[k];
+        next[k] = { ...meta, ...faComputeSignal(seriesByKey[k], meta.band, meta.hib) };
+      }
+      setSignals(next);
+      setSignalsLoadState({ loaded: true, error: null, locked: lockedSeen, decrypted, sealedCount: sealed.length });
+    })();
     return () => { cancelled = true; };
-  }, [tab]);
+  }, [burnoutReady]);
+
+  // ── On-device signal interpretation (B5d1 PR D) ──────────────────────────────
+  // Replaces the server-precomputed interpretations: when a signal card is
+  // expanded we ask the on-device model to interpret that signal's drift, grounded
+  // in the local research KB with every citation validated (burnout:interpret).
+  // Cached per signal for the session in `interp`. The drift we pass is computed
+  // on-device; no raw private value leaves this process.
+  const [interp, setInterp] = useState({});
+  const requestInterp = async (key) => {
+    const s = signals[key];
+    if (!s || s.status === "no_data") return;
+    if (interp[key] && !interp[key].error) return;
+    setInterp((m) => ({ ...m, [key]: { loading: true } }));
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setInterp((m) => ({ ...m, [key]: { unavailable: true, reason: "no_bridge" } })); return; }
+    let res;
+    try {
+      res = await bridge.invoke("burnout:interpret", { signal: { key, label: s.label, driftPct: s.driftPct || 0, bandStatus: s.band || "within" } });
+    } catch (_e) { res = null; }
+    setInterp((m) => {
+      if (!res || res.error) return { ...m, [key]: { error: true } };
+      if (res.unavailable) return { ...m, [key]: { unavailable: true, reason: res.reason || "unavailable" } };
+      return { ...m, [key]: { interpretation: res.interpretation, citedEntries: res.citedEntries || [] } };
+    });
+  };
+
+  // ── Holistic overall interpretation (B5d1 PR D) ──────────────────────────────
+  // One on-device synthesis across all signals + operational load, requested when
+  // the Signals tab opens and cached for the session. The deterministic stage shows
+  // instantly; this narrative fills in. The overview is built from on-device
+  // values; no raw private number is sent.
+  const [overallInterp, setOverallInterp] = useState(null);
+  const requestOverallInterp = async () => {
+    const order = BEHAVIORAL_ORDER.filter((k) => signals[k] && signals[k].status !== "no_data");
+    if (order.length === 0) { setOverallInterp({ unavailable: true, reason: "no_retrieval" }); return; }
+    const agg = faAggregate(signals, pressure);
+    setOverallInterp({ loading: true });
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || !bridge.invoke) { setOverallInterp({ unavailable: true, reason: "no_bridge" }); return; }
+    const overview = {
+      stage: agg.stage,
+      pressure: faPressureWord(agg.pressure),
+      signals: order.map((k) => ({ label: signals[k].label, driftPct: signals[k].driftPct || 0, bandStatus: signals[k].band || "within", status: signals[k].status })),
+    };
+    let res;
+    try { res = await bridge.invoke("burnout:interpretOverall", { overview }); } catch (_e) { res = null; }
+    if (!res || res.error) setOverallInterp({ error: true });
+    else if (res.unavailable) setOverallInterp({ unavailable: true, reason: res.reason || "unavailable" });
+    else setOverallInterp({ interpretation: res.interpretation, citedEntries: res.citedEntries || [] });
+  };
+  useEffect(() => { if (tab === "signals" && signalsLoadState.loaded && !signalsLoadState.locked && !overallInterp) requestOverallInterp(); }, [tab, signalsLoadState.loaded, signalsLoadState.locked]);
 
   // ── Training Recommendations (R3l C11): from /api/training-recommendations/me ──
   const [trainingRecs, setTrainingRecs] = useState({recommendations: [], meta: null});
@@ -2194,8 +2363,9 @@ export default function AnalystClientApp() {
 
 
   // Main render
-  const stageLabel = "watch";
-  const sc = {watch:{hl:"A few signals are drifting.",sub:"Worth noticing — not worrying about yet.",c:C.w}}[stageLabel];
+  const aggregate = faAggregate(signals, pressure);
+  const stageLabel = aggregate.stage;
+  const sc = STAGE_COPY[stageLabel] || STAGE_COPY.healthy;
 
   // ── BreathingExercise Component ──
   const BreathingExercise = () => {
@@ -2362,34 +2532,118 @@ export default function AnalystClientApp() {
         {/* ══════════ SIGNALS with drill-down resources ══════════ */}
         {tab==="signals"&&(<div>
           <L>My Signals</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16}}>Your work patterns compared to YOUR OWN baseline. Only you see the details. Click any signal for research-backed resources.</M>
-          {Object.entries(signals).map(([key,s])=>{const drift=s.hib?(s.base-s.cur):(s.cur-s.base);const bad=drift>0&&!s.hib||drift<0&&s.hib;return(
-            <Card key={key} style={{marginBottom:10,borderLeft:`3px solid ${Math.abs(drift)>5?C.w:C.a}`,cursor:"pointer"}} onClick={()=>setShowSig(showSig===key?null:key)}>
-              <div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t,fontWeight:500}}>{s.label}</M><M style={{color:bad?C.w:C.a,fontWeight:600}}>{s.cur}{s.u} <span style={{fontWeight:400,color:C.td}}>(baseline: {s.base}{s.u})</span></M></div>
-              {showSig===key&&(<div style={{marginTop:12,padding:"12px 14px",background:"rgba(0,0,0,0.2)",borderRadius:8}}>
-                <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:8}}>What this means & what you can do:</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16}}>Your work patterns, computed on this device from data only you can decrypt. Each signal is compared to your own frozen baseline and to a healthy range. Click any signal for what it may mean and what can help.</M>
+
+          {signalsLoadState.loaded&&!signalsLoadState.locked&&(<Card style={{marginBottom:16,borderLeft:`3px solid ${sc.c}`}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <span style={{display:"inline-block",width:6,height:6,borderRadius:"50%",background:sc.c,boxShadow:`0 0 6px ${sc.c}`}}/>
+              <M style={{color:C.t,fontWeight:600}}>{sc.hl}</M>
+            </div>
+            <M style={{color:C.tm,display:"block",marginBottom:10}}>{sc.sub}</M>
+            {(() => {
+              const oi=overallInterp;
+              if(!oi||oi.loading) return <M style={{color:C.td,lineHeight:1.7}}>Summarizing your overall picture on this device...</M>;
+              if(oi.interpretation){
+                const refs=(oi.citedEntries||[]).map((e)=>e.id).filter(Boolean);
+                return(
+                  <div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                      <Badge color={C.i}>ON-DEVICE AI</Badge>
+                      {refs.length>0&&<M style={{color:C.td,fontSize:11}}>Research-grounded: {refs.join(", ")}</M>}
+                    </div>
+                    <M style={{color:C.tm,lineHeight:1.8}}>{oi.interpretation}</M>
+                  </div>
+                );
+              }
+              const why=oi.reason==="model_unavailable"?" The on-device model isn't loaded on this machine.":oi.reason==="no_retrieval"?" Not enough signal history yet for an overall read.":oi.reason==="citation_check_failed"?" A grounded answer couldn't be verified.":oi.reason==="no_bridge"?" The on-device bridge is unavailable.":"";
+              return <M style={{color:C.td,lineHeight:1.7}}>{"An overall summary isn't available right now."+why+" Your signals below are accurate."}</M>;
+            })()}
+          </Card>)}
+
+          {!signalsLoadState.loaded&&!signalsLoadState.error&&(<M style={{color:C.td,display:"block"}}>Decrypting your signals on this device...</M>)}
+          {signalsLoadState.error&&(<M style={{color:C.w,display:"block"}}>Could not load your signals ({signalsLoadState.error}). Your data is unaffected.</M>)}
+          {signalsLoadState.locked&&(<Card style={{marginBottom:10,borderLeft:`3px solid ${C.w}`}}><M style={{color:C.t,fontWeight:500,display:"block",marginBottom:4}}>Your private key is locked</M><M style={{color:C.tm}}>Unlock your burnout key to decrypt and view your signals. Only you hold it.</M></Card>)}
+
+          {signalsLoadState.loaded&&!signalsLoadState.locked&&BEHAVIORAL_ORDER.map((key)=>{
+            const s=signals[key]; if(!s) return null;
+            const interventions=SIGNAL_INTERVENTIONS[key];
+            const established=s.status==="established";
+            const driftBad=established&&(s.hib?(s.driftPct<0):(s.driftPct>0));
+            const bandBad=s.band==="above"||s.band==="below";
+            const notable=(established&&Math.abs(s.driftPct)>FA_DRIFT_NOTABLE&&driftBad)||bandBad;
+            const accent=notable?C.w:C.a;
+            const driftArrow=!established?"":(s.driftPct>0?"\u25B2":s.driftPct<0?"\u25BC":"");
+            return(
+            <Card key={key} style={{marginBottom:10,borderLeft:`3px solid ${s.status==="no_data"?C.b:accent}`,cursor:s.status==="no_data"?"default":"pointer"}} onClick={s.status==="no_data"?undefined:()=>{const open=showSig===key?null:key;setShowSig(open);if(open)requestInterp(open);}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8}}>
+                <M style={{color:C.t,fontWeight:500}}>{s.label}</M>
+                {s.status==="no_data"?(
+                  <M style={{color:C.td}}>No data yet</M>
+                ):s.status==="establishing"?(
+                  <M style={{color:bandBad?C.w:C.tm,fontWeight:500,textAlign:"right"}}>{faNum(s.cur)}{s.u} <span style={{fontWeight:400,color:C.td}}>(baseline establishing)</span></M>
+                ):(
+                  <M style={{color:driftBad?C.w:C.a,fontWeight:600,textAlign:"right"}}>{faNum(s.cur)}{s.u} {driftArrow&&<span>{driftArrow}{Math.abs(Math.round(s.driftPct))}%</span>} <span style={{fontWeight:400,color:C.td}}>(your baseline: {faNum(s.base)}{s.u})</span></M>
+                )}
+              </div>
+              {(bandBad||s.status==="establishing")&&(
+                <div style={{marginTop:6,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                  {bandBad&&<Badge color={C.w}>{s.band==="above"?"above healthy range":"below healthy range"}</Badge>}
+                  {s.status==="establishing"&&<Badge color={C.i}>{"establishing - "+s.n+" readings, "+(s.spanDays||0)+"/"+FA_ESTABLISH_DAYS+" days"}</Badge>}
+                </div>
+              )}
+              {showSig===key&&s.status!=="no_data"&&(<div style={{marginTop:12,padding:"12px 14px",background:"rgba(0,0,0,0.2)",borderRadius:8}} onClick={(e)=>e.stopPropagation()}>
+                <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:8}}>What this means</M>
                 {(() => {
-                  const ai = aiInterp && aiInterp[key];
-                  if (ai && ai.status === "ai") {
-                    return (
+                  const it=interp[key];
+                  if(!it||it.loading) return <M style={{color:C.td,lineHeight:1.7}}>Interpreting on this device...</M>;
+                  if(it.interpretation){
+                    const refs=(it.citedEntries||[]).map((e)=>e.id).filter(Boolean);
+                    return(
                       <div>
                         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-                          <span style={{fontSize:10,fontWeight:700,letterSpacing:0.5,color:C.i,border:"1px solid "+C.i+"55",borderRadius:4,padding:"1px 6px"}}>AI</span>
-                          <M style={{color:C.td,fontSize:11}}>Research-grounded{(ai.kb_refs&&ai.kb_refs.length)?(" · "+ai.kb_refs.join(", ")):""}</M>
+                          <Badge color={C.i}>ON-DEVICE AI</Badge>
+                          {refs.length>0&&<M style={{color:C.td,fontSize:11}}>Research-grounded: {refs.join(", ")}</M>}
                         </div>
-                        <M style={{color:C.tm,lineHeight:1.8}}>{ai.text}</M>
+                        <M style={{color:C.tm,lineHeight:1.8}}>{it.interpretation}</M>
                       </div>
                     );
                   }
-                  const reason = ai && ai.reason;
-                  const why = reason==="model_not_loaded" ? " The local AI model isn't loaded yet." : reason==="not_configured" ? " No AI provider is configured." : reason==="decryption_failed" ? " The stored interpretation couldn't be read." : "";
-                  return (
-                    <M style={{color:C.td,lineHeight:1.7}}>{aiInterp===null ? "Loading your interpretation..." : ("AI interpretation unavailable right now." + why + " Your signal values above are accurate.")}</M>
-                  );
+                  const why=it.reason==="model_unavailable"?" The on-device model isn't loaded on this machine.":it.reason==="no_retrieval"?" No matching research was found.":it.reason==="citation_check_failed"?" A grounded answer couldn't be verified.":it.reason==="no_bridge"?" The on-device bridge is unavailable.":"";
+                  return <M style={{color:C.td,lineHeight:1.7}}>{"On-device interpretation unavailable right now."+why+" Your values above are accurate."}</M>;
                 })()}
+                {interventions&&interventions.paths&&interventions.paths.length>0&&(<div style={{marginTop:14}}>
+                  <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:8}}>What you can do</M>
+                  {interventions.paths.map((p,i)=>{
+                    const act=(p.type==="platform"&&p.pid)?(()=>setShowPlatform(p.pid)):p.type==="peer"?(()=>setTab("peers")):p.type==="ai"?(()=>setShowPlatform("claude-ai")):null;
+                    return(
+                    <div key={i} onClick={act||undefined} style={{marginBottom:8,paddingLeft:10,borderLeft:`2px solid ${act?C.i:C.b}`,cursor:act?"pointer":"default"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2,flexWrap:"wrap"}}>
+                        <Badge color={p.type==="structural"?C.a:p.type==="peer"?C.p:p.type==="ai"?C.i:C.tm}>{p.type}</Badge>
+                        <M style={{color:act?C.i:C.t,fontWeight:500}}>{p.title}{act?" \u2197":""}</M>
+                      </div>
+                      <M style={{color:C.tm,lineHeight:1.6}}>{p.desc}</M>
+                    </div>
+                    );
+                  })}
+                </div>)}
               </div>)}
             </Card>
           );})}
+
+          {/* ── Operational pressure (D10): live load used for routing; visible to your lead. NOT part of your private baseline. ── */}
+          {pressure&&(<Card style={{marginTop:18,marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+              <M style={{color:C.t,fontWeight:600,letterSpacing:0.5}}>OPERATIONAL LOAD</M>
+              <M style={{color:C.td}}>visible to your lead - for routing</M>
+            </div>
+            {[{k:"cognitive_load",label:"Cognitive load",u:"/100",hint:"recent ticket volume"},{k:"task_switching",label:"Context switches",u:"",hint:"categories handled, last hour"},{k:"queue_pressure",label:"Open in your queue",u:"",hint:"tickets assigned, pending"},{k:"shift_overtime",label:"Overtime",u:"h",hint:"hours over schedule"}].map((row)=>(
+              <div key={row.k} style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",padding:"5px 0",borderTop:`1px solid ${C.b}`}}>
+                <div><M style={{color:C.tm,fontWeight:500}}>{row.label}</M> <M style={{color:C.td}}>{row.hint}</M></div>
+                <M style={{color:C.t,fontWeight:600}}>{typeof pressure[row.k]==="number"?pressure[row.k]:0}{row.u}</M>
+              </div>
+            ))}
+          </Card>)}
+
           <div style={{display:"flex",gap:8,marginTop:16}}>
             <Btn primary disabled={featureToggles.lighter_queue===false} onClick={()=>{setShowLQ(true);logC("lighter_queue_opened","Requesting reduced ticket load");}}>{stageLabel==="healthy"?"Request Reduced Tickets":"Request Reduced Tickets (recommended)"}</Btn>
             <Btn disabled={featureToggles.lead_chat_identified===false} onClick={()=>{setShowLeadMsg(true);logC("lead_1on1_request","Requesting 1-on-1 with Team Lead");}}>Request 1-on-1 with Lead</Btn>

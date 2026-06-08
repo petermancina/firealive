@@ -3,14 +3,17 @@
 // Data sources: ticket velocity from ticketing adapter, session duration,
 // break patterns, overtime tracking
 //
-// B5d1 (analyst-private data architecture): the six collected signals divide
-// into two kinds, handled differently.
-//   - Behavioral signals (response_latency, break_compliance) are the
-//     analyst's own burnout response. They are sealed to the analyst's own
-//     public key (analyst_private_data; the server can write but cannot read
-//     them back) and a de-identified copy is written for team aggregation.
-//     They never appear in server-readable plaintext and never drive a
-//     lead-visible control.
+// B5d1 (analyst-private data architecture): the collected signals divide into
+// two kinds, handled differently.
+//   - Behavioral signals (investigationTime, dismissRate, ticketQuality,
+//     escalationRate, break_compliance) are the analyst's own burnout
+//     response. The first four are computed statistically from the pushed
+//     ticket_actions feed over a trailing 7-day window (B5d1-F + PR D);
+//     break_compliance is computed at read time from proactive_break_events.
+//     They are sealed to the analyst's own public key (analyst_private_data;
+//     the server can write but cannot read them back) and a de-identified
+//     copy is written for team aggregation. They never appear in
+//     server-readable plaintext and never drive a lead-visible control.
 //   - Pressure signals (cognitive_load, task_switching, queue_pressure,
 //     shift_overtime) are workload/force applied to the analyst by routing.
 //     They stay on the operational, lead-visible path so a lead can reduce
@@ -25,7 +28,7 @@ const { sealToPublicKey } = require('./analyst-crypto');
 // pressure as imposed demand, R005 and R033 on behavior as the analyst's
 // response). Behavioral signals are sealed + de-identified and never enter
 // server-readable plaintext; pressure signals stay operational and lead-visible.
-const BEHAVIOR_SIGNALS = ['response_latency', 'break_compliance'];
+const BEHAVIOR_SIGNALS = ['investigationTime', 'dismissRate', 'ticketQuality', 'escalationRate', 'break_compliance'];
 const PRESSURE_SIGNALS = ['cognitive_load', 'task_switching', 'queue_pressure', 'shift_overtime'];
 
 // Fixed operating-range thresholds per signal mapped to a 0/1/2 strain
@@ -38,7 +41,6 @@ function signalSeverity(signal, value) {
     case 'cognitive_load':   return value >= 80 ? 2 : value >= 60 ? 1 : 0;
     case 'queue_pressure':   return value >= 12 ? 2 : value >= 8  ? 1 : 0;
     case 'shift_overtime':   return value >= 8  ? 2 : value >= 4  ? 1 : 0;
-    case 'response_latency': return value >= 10 ? 2 : value >= 6  ? 1 : 0;
     case 'task_switching':   return value >= 10 ? 2 : value >= 6  ? 1 : 0;
     case 'break_compliance': return value <= 50 ? 2 : value <= 70 ? 1 : 0; // low = strain
     default: return 0;
@@ -64,6 +66,36 @@ function recommendedCap(tierBase, signals) {
   if (cap < 1) return 1;
   if (cap > tierBase) return tierBase;
   return cap;
+}
+
+// Compute the four pressure signals for one analyst from live operational data.
+// Shared by the collector (which derives the routing cap from these) and the
+// analyst's own My Signals pressure section served by /api/signals/me, so both
+// read a single source rather than drifting apart. Pure read; never throws.
+function computeAnalystPressure(db, analystId) {
+  let ticketCount = 0, switchCount = 0, queueDepth = 0, overtime = 0;
+  try {
+    const r = db.prepare("SELECT COUNT(*) AS c FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-1 hour')").get(analystId);
+    ticketCount = (r && r.c) || 0;
+  } catch (_e) {}
+  try {
+    const r = db.prepare("SELECT COUNT(DISTINCT category) AS c FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-1 hour')").get(analystId);
+    switchCount = (r && r.c) || 0;
+  } catch (_e) {}
+  try {
+    const r = db.prepare("SELECT COUNT(*) AS c FROM ticket_assignments WHERE analyst_id=? AND status='open'").get(analystId);
+    queueDepth = (r && r.c) || 0;
+  } catch (_e) {}
+  try {
+    const r = db.prepare("SELECT value FROM config WHERE key='overtime_' || ?").get(analystId);
+    overtime = r ? (parseFloat(r.value) || 0) : 0;
+  } catch (_e) {}
+  return {
+    cognitive_load: Math.min(100, ticketCount * 8),
+    task_switching: switchCount,
+    queue_pressure: queueDepth,
+    shift_overtime: overtime,
+  };
 }
 
 class SignalCollector {
@@ -181,51 +213,111 @@ class SignalCollector {
 
   _generateSignals(analyst) {
     const signals = [];
-    // Cognitive load: derived from ticket count in last hour
-    const ticketCount = this._getTicketCount(analyst.id);
-    signals.push({ signal: 'cognitive_load', value: Math.min(100, ticketCount * 8) });
-    // Task switching: count of different ticket types handled
-    const switchCount = this._getTaskSwitchCount(analyst.id);
-    signals.push({ signal: 'task_switching', value: switchCount });
-    // Queue pressure: pending tickets assigned
-    const queueDepth = this._getQueueDepth(analyst.id);
-    signals.push({ signal: 'queue_pressure', value: queueDepth });
-    // Response latency: avg time to first action on ticket
-    const latency = this._getResponseLatency(analyst.id);
-    signals.push({ signal: 'response_latency', value: latency });
-    // Break compliance: % of offered breaks actually taken (null when no breaks
-    // were decided in the window — skip rather than fabricate a value).
+
+    // ── Pressure signals (operational, lead-visible; drive the routing cap) ──
+    // Computed from live operational data by the shared computeAnalystPressure
+    // helper, the same source the analyst's My Signals pressure section reads.
+    const pressure = computeAnalystPressure(this.db, analyst.id);
+    signals.push({ signal: 'cognitive_load', value: pressure.cognitive_load });
+    signals.push({ signal: 'task_switching', value: pressure.task_switching });
+    signals.push({ signal: 'queue_pressure', value: pressure.queue_pressure });
+    signals.push({ signal: 'shift_overtime', value: pressure.shift_overtime });
+
+    // ── Behavioral signals (the analyst's own response; sealed + de-identified, ──
+    // never lead-visible). The four ticket-derived signals are computed
+    // statistically from the pushed ticket_actions feed over a trailing 7-day
+    // window (D11). Each is skipped — not fabricated — when the analyst has no
+    // qualifying activity in the window, so absent data never pollutes the
+    // on-device baseline. break_compliance is computed at read from break events.
+    const investigationTime = this._getInvestigationTime(analyst.id);
+    if (investigationTime !== null) signals.push({ signal: 'investigationTime', value: investigationTime });
+    const dismissRate = this._getDismissRate(analyst.id);
+    if (dismissRate !== null) signals.push({ signal: 'dismissRate', value: dismissRate });
+    const ticketQuality = this._getTicketQuality(analyst.id);
+    if (ticketQuality !== null) signals.push({ signal: 'ticketQuality', value: ticketQuality });
+    const escalationRate = this._getEscalationRate(analyst.id);
+    if (escalationRate !== null) signals.push({ signal: 'escalationRate', value: escalationRate });
     const breaks = this._getBreakCompliance(analyst.id);
     if (breaks !== null) signals.push({ signal: 'break_compliance', value: breaks });
-    // Shift overtime: hours past shift end
-    const overtime = this._getOvertime(analyst.id);
-    signals.push({ signal: 'shift_overtime', value: overtime });
+
     return signals;
   }
 
-  _getTicketCount(analystId) {
+  // ── Behavioral signal computations (statistical; sealed + de-identified) ──
+  // All four read the pushed ticket_actions feed over a trailing 7-day window
+  // and return null when the analyst has no qualifying activity, so the signal
+  // is skipped rather than fabricated.
+
+  // investigationTime: average minutes to first action per ticket (absorbs the
+  // retired response_latency). Higher = slower triage under load.
+  _getInvestigationTime(analystId) {
     try {
-      const r = this.db.prepare("SELECT COUNT(*) as c FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-1 hour')").get(analystId);
-      return r?.c || 0;
-    } catch { return 0; }
+      const r = this.db.prepare(
+        "SELECT AVG(response_time_min) AS v, COUNT(response_time_min) AS n FROM ticket_actions " +
+        "WHERE analyst_id=? AND response_time_min IS NOT NULL AND created_at > datetime('now','-7 days')"
+      ).get(analystId);
+      if (!r || !r.n) return null;
+      return Math.round(r.v * 10) / 10;
+    } catch { return null; }
   }
-  _getTaskSwitchCount(analystId) {
+
+  // dismissRate: share of closures resolved as a dismissal/false-positive,
+  // dismiss / (close + dismiss), as a percentage. dismiss is a distinct action
+  // type (kept separate from close), so this does not conflate with quality.
+  _getDismissRate(analystId) {
     try {
-      const r = this.db.prepare("SELECT COUNT(DISTINCT category) as c FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-1 hour')").get(analystId);
-      return r?.c || 0;
-    } catch { return 0; }
+      const r = this.db.prepare(
+        "SELECT " +
+        "SUM(CASE WHEN action_type='dismiss' THEN 1 ELSE 0 END) AS dismissed, " +
+        "SUM(CASE WHEN action_type IN ('close','dismiss') THEN 1 ELSE 0 END) AS closures " +
+        "FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-7 days')"
+      ).get(analystId);
+      const closures = r?.closures || 0;
+      if (closures === 0) return null;
+      return Math.round(((r.dismissed || 0) / closures) * 1000) / 10;
+    } catch { return null; }
   }
-  _getQueueDepth(analystId) {
+
+  // escalationRate: share of all actions that were escalations, as a percentage.
+  _getEscalationRate(analystId) {
     try {
-      const r = this.db.prepare("SELECT COUNT(*) as c FROM ticket_assignments WHERE analyst_id=? AND status='open'").get(analystId);
-      return r?.c || 0;
-    } catch { return 0; }
+      const r = this.db.prepare(
+        "SELECT " +
+        "SUM(CASE WHEN action_type='escalate' THEN 1 ELSE 0 END) AS escalated, " +
+        "COUNT(*) AS total " +
+        "FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-7 days')"
+      ).get(analystId);
+      const total = r?.total || 0;
+      if (total === 0) return null;
+      return Math.round(((r.escalated || 0) / total) * 1000) / 10;
+    } catch { return null; }
   }
-  _getResponseLatency(analystId) {
+
+  // ticketQuality: statistical documentation-thoroughness score (0-100, higher
+  // is better) over notes the analyst recorded in the window. Combines note
+  // length with the presence of distinct IOC/enrichment marker categories
+  // (IPv4, file hash, CVE id, enrichment keywords). Purely statistical, no LLM.
+  _getTicketQuality(analystId) {
     try {
-      const r = this.db.prepare("SELECT AVG(response_time_min) as avg FROM ticket_actions WHERE analyst_id=? AND created_at > datetime('now','-1 hour')").get(analystId);
-      return Math.round((r?.avg || 3) * 10) / 10;
-    } catch { return 3.0; }
+      const rows = this.db.prepare(
+        "SELECT notes FROM ticket_actions WHERE analyst_id=? AND notes IS NOT NULL " +
+        "AND TRIM(notes) <> '' AND created_at > datetime('now','-7 days')"
+      ).all(analystId);
+      if (!rows.length) return null;
+      let sum = 0;
+      for (const row of rows) {
+        const note = String(row.notes);
+        const lengthFactor = Math.min(1, note.length / 240);
+        let cats = 0;
+        if (/\b\d{1,3}(?:\.\d{1,3}){3}\b/.test(note)) cats++;                                                       // IPv4
+        if (/\b[a-f0-9]{32,64}\b/i.test(note)) cats++;                                                              // file hash
+        if (/\bCVE-\d{4}-\d{4,7}\b/i.test(note)) cats++;                                                            // CVE id
+        if (/(enrich|correlat|mitre|att&ck|\bIOC\b|indicator|virustotal|sandbox|threat intel)/i.test(note)) cats++; // enrichment
+        const markerFactor = Math.min(1, cats / 2);
+        sum += 100 * (0.6 * lengthFactor + 0.4 * markerFactor);
+      }
+      return Math.round((sum / rows.length) * 10) / 10;
+    } catch { return null; }
   }
   _getBreakCompliance(analystId) {
     // Computed at read time from proactive_break_events: taken / decided over a
@@ -247,12 +339,6 @@ class SignalCollector {
       return Math.round(((r.taken || 0) / decided) * 1000) / 10;
     } catch { return null; }
   }
-  _getOvertime(analystId) {
-    try {
-      const r = this.db.prepare("SELECT value FROM config WHERE key='overtime_' || ?").get(analystId);
-      return r ? parseFloat(r.value) : 0;
-    } catch { return 0; }
-  }
 }
 
-module.exports = { SignalCollector };
+module.exports = { SignalCollector, computeAnalystPressure };

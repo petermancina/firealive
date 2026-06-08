@@ -11,6 +11,9 @@
 //   • sealed_readings — B5d1 per-analyst snapshots sealed to the analyst's own
 //                   X25519 public key (analyst_private_data, kind='reading').
 //                   Opaque ciphertext; decrypted only on the Analyst Client.
+//   • pressure    — the analyst's own operational pressure signals, computed
+//                   live (shared with the routing cap); operational/lead-visible,
+//                   returned in the clear for the My Signals pressure card.
 //   • meta        — pagination + filter echo
 //
 // This is the new canonical analyst-self endpoint. The pre-existing
@@ -22,6 +25,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { decryptTier3 } = require('../services/encryption');
 const { logger } = require('../services/logger');
+const { computeAnalystPressure } = require('../services/signal-collector');
 
 const DEFAULT_LOOKBACK_DAYS = 7;
 const DEFAULT_LIMIT = 500;
@@ -160,11 +164,20 @@ router.get('/me', (req, res) => {
        LIMIT ?`
     ).all(analystId, sinceDate.toISOString(), untilDate.toISOString(), limit);
 
+    // ── Pressure (operational workload) — computed live, self-scoped ──────────
+    // The analyst's own pressure signals, from the same shared helper that feeds
+    // the routing cap. No per-analyst pressure is persisted, so this is always
+    // current and survives the retirement of the plaintext readings path.
+    // Pressure is operational/lead-visible (not part of the sealed behavioral
+    // set), so it is returned here in the clear for the My Signals pressure card.
+    const pressure = computeAnalystPressure(db, analystId);
+
     res.json({
       analyst_id: analystId,
       current,
       readings,
       sealed_readings: sealedReadings,
+      pressure,
       meta: {
         count: readings.length,
         sealed_count: sealedReadings.length,

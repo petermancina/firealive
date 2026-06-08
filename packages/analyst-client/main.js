@@ -450,6 +450,59 @@ function acClampK(k, def, max) {
   return (Number.isInteger(k) && k > 0) ? Math.min(k, max) : def;
 }
 
+// ── B5d1 PR D: on-device burnout-signal interpretation grounding ─────────────
+// Interprets the analyst's own behavioral-signal drift in plain language,
+// grounded ONLY in retrieved KB research entries, on the same local model as the
+// research assistant. The analyst's signal values are private background and are
+// never cited. Non-clinical, non-diagnostic; never asserts the analyst is burned
+// out. Citations are validated against the retrieved entries (anti-hallucination).
+const BURNOUT_INTERPRET_SYSTEM = [
+  "You are FireAlive's wellbeing assistant, running on the analyst's own device.",
+  "The analyst will share how one of their own work-pattern signals has drifted from their personal baseline.",
+  "In 2-4 sentences, explain what this kind of drift can mean for wellbeing and what may help, using ONLY the numbered research entries below.",
+  "Cite every claim with the entry's identifier in square brackets, e.g. [R024]. Use only the identifiers listed; never invent a study.",
+  "Be supportive and matter-of-fact. This is wellbeing education grounded in research — NOT therapy, diagnosis, or a clinical judgement, and not a statement that the analyst is burned out.",
+  "Address the analyst as 'you'. Do not repeat the raw numbers; interpret the direction and what it may reflect.",
+].join("\n");
+
+function buildInterpretPrompt(signal, entries) {
+  const dir = signal.driftPct > 0 ? 'risen' : signal.driftPct < 0 ? 'fallen' : 'held steady';
+  const band = signal.bandStatus ? ` and is currently ${signal.bandStatus} the healthy range` : '';
+  const ctx = `Signal: ${signal.label}. It has ${dir} about ${Math.abs(Math.round(signal.driftPct || 0))}% versus your established baseline${band}.`;
+  let p = BURNOUT_INTERPRET_SYSTEM + "\n\nRESEARCH ENTRIES:\n" + acEntriesBlock(entries);
+  p += "\n\nYOUR SIGNAL (private background — do NOT cite this; cite only the research entries above):\n" + ctx;
+  p += "\n\nInterpretation (2-4 sentences, cite every claim with a bracketed identifier from the entries above):";
+  return p;
+}
+
+// Holistic counterpart to BURNOUT_INTERPRET_SYSTEM: one synthesis across every
+// signal at once plus operational load, rather than a single-signal read.
+const BURNOUT_OVERALL_SYSTEM = [
+  "You are FireAlive's wellbeing assistant, running on the analyst's own device.",
+  "The analyst will share a summary of ALL their work-pattern signals at once, plus their current operational load and an overall state label.",
+  "In 3-5 sentences, give ONE holistic read of how they appear to be doing overall and what may help, using ONLY the numbered research entries below.",
+  "Synthesise across the signals -- note where several point the same way -- rather than describing each one in turn.",
+  "Cite every claim with the entry's identifier in square brackets, e.g. [R024]. Use only the identifiers listed; never invent a study.",
+  "Be supportive and matter-of-fact. This is wellbeing education grounded in research -- NOT therapy, diagnosis, or a clinical judgement, and never a statement that the analyst is burned out.",
+  "Address the analyst as 'you'. Do not repeat raw numbers; interpret direction and what it may reflect.",
+].join("\n");
+
+function buildOverallInterpretPrompt(overview, entries) {
+  const lines = (Array.isArray(overview.signals) ? overview.signals : []).map((s) => {
+    const dir = s.driftPct > 0 ? 'up' : s.driftPct < 0 ? 'down' : 'steady';
+    const band = (s.bandStatus === 'above' || s.bandStatus === 'below') ? `, ${s.bandStatus} the healthy range` : '';
+    const est = s.status === 'establishing' ? ' (baseline still forming)' : '';
+    return `- ${s.label}: ${dir} ~${Math.abs(Math.round(s.driftPct || 0))}% vs baseline${band}${est}`;
+  });
+  const stageWord = typeof overview.stage === 'string' ? overview.stage : 'unclear';
+  const pressureWord = typeof overview.pressure === 'string' ? overview.pressure : 'unclear';
+  const ctx = `Overall state estimate: ${stageWord}. Operational load: ${pressureWord}.\nSignals:\n${lines.join("\n")}`;
+  let p = BURNOUT_OVERALL_SYSTEM + "\n\nRESEARCH ENTRIES:\n" + acEntriesBlock(entries);
+  p += "\n\nYOUR SIGNALS (private background -- do NOT cite this; cite only the research entries above):\n" + ctx;
+  p += "\n\nHolistic read (3-5 sentences, cite every claim with a bracketed identifier from the entries above):";
+  return p;
+}
+
 // -- B5d1: Analyst-private burnout key custody (X25519 seal-open, main) --------
 // The analyst owns an X25519 keypair. The server holds only the PUBLIC key and
 // seals burnout detail to it (services/analyst-crypto.js); the PRIVATE key is
@@ -715,6 +768,85 @@ ipcMain.handle('kbChat:provisioningInfo', async () => {
 ipcMain.handle('kbChat:modelScanStatus', async (_e, { which } = {}) => {
   try { return localLlm.getModelSafetyStatus(which === 'chat' || which === 'embed' ? which : undefined); }
   catch (err) { return { error: (err.message || 'scan status failed').slice(0, 200), code: err.code || null }; }
+});
+
+// On-device interpretation of one behavioral signal's drift. The renderer
+// supplies the drift it computed from on-device-decrypted values (no raw private
+// values are persisted here); grounding is retrieved with the same semantic
+// search the research assistant uses, and the answer's citations are validated
+// against the retrieved entries before returning. Mirrors kbChat:ask, including
+// the honest "unavailable on this device" path with no server fallback.
+ipcMain.handle('burnout:interpret', async (_e, { signal } = {}) => {
+  if (!signal || typeof signal.key !== 'string') return { error: 'signal required' };
+  const label = (typeof signal.label === 'string' && signal.label ? signal.label : signal.key).slice(0, 120);
+  try {
+    const query = `${label} ${signal.key} change from baseline burnout wellbeing analyst`.slice(0, 200);
+    const ranked = await localLlm.search(query, 6);
+    const byId = new Map(kbLocal.getAll().map((x) => [x.id, x]));
+    const entries = ranked.map((r) => byId.get(r.id)).filter(Boolean);
+    if (entries.length === 0) return { interpretation: null, citedEntries: [], unavailable: true, reason: 'no_retrieval' };
+    const allowed = entries.map((e) => e.id);
+    const base = buildInterpretPrompt({
+      key: signal.key,
+      label,
+      driftPct: Number(signal.driftPct) || 0,
+      bandStatus: typeof signal.bandStatus === 'string' ? signal.bandStatus.slice(0, 24) : null,
+    }, entries);
+    let text = null, okCheck = null;
+    for (let attempt = 0; attempt < 2 && text === null; attempt++) {
+      const prompt = attempt === 0 ? base : base + acRetrySuffix(allowed, okCheck ? okCheck.offending : []);
+      const gen = await localLlm.generate(prompt, { maxTokens: 320, temperature: 0.3 });
+      const check = kbLocal.validateCitations(gen.text, allowed);
+      if (check.ok) { text = gen.text; okCheck = check; } else { okCheck = check; }
+    }
+    if (text === null) return { interpretation: null, citedEntries: [], unavailable: true, reason: 'citation_check_failed' };
+    return { interpretation: text, citedEntries: kbLocal.getByRefs(okCheck.cited), unavailable: false };
+  } catch (err) {
+    if (err && err.code === 'AC_LOCAL_UNAVAILABLE') return { interpretation: null, citedEntries: [], unavailable: true, reason: 'model_unavailable', detail: (err.message || '').slice(0, 200) };
+    return { error: 'interpretation failed' };
+  }
+});
+
+// Holistic counterpart to burnout:interpret: one synthesis across ALL signals
+// plus operational load. Same on-device model, KB grounding, and citation
+// validation. Inputs are the analyst's own private background and never cited.
+ipcMain.handle('burnout:interpretOverall', async (_e, { overview } = {}) => {
+  if (!overview || typeof overview !== 'object') return { error: 'overview required' };
+  try {
+    const sigs = Array.isArray(overview.signals) ? overview.signals : [];
+    const drifting = sigs
+      .filter((s) => s && (s.bandStatus === 'above' || s.bandStatus === 'below' || Math.abs(Number(s.driftPct) || 0) >= 10))
+      .map((s) => s.label).filter(Boolean);
+    const query = `analyst wellbeing burnout overall ${typeof overview.stage === 'string' ? overview.stage : ''} ${drifting.join(' ')} exhaustion workload recovery`.slice(0, 200);
+    const ranked = await localLlm.search(query, 8);
+    const byId = new Map(kbLocal.getAll().map((x) => [x.id, x]));
+    const entries = ranked.map((r) => byId.get(r.id)).filter(Boolean);
+    if (entries.length === 0) return { interpretation: null, citedEntries: [], unavailable: true, reason: 'no_retrieval' };
+    const allowed = entries.map((e) => e.id);
+    const safeOverview = {
+      stage: typeof overview.stage === 'string' ? overview.stage.slice(0, 24) : null,
+      pressure: typeof overview.pressure === 'string' ? overview.pressure.slice(0, 24) : null,
+      signals: sigs.slice(0, 8).map((s) => ({
+        label: (typeof s.label === 'string' ? s.label : '').slice(0, 60),
+        driftPct: Number(s.driftPct) || 0,
+        bandStatus: typeof s.bandStatus === 'string' ? s.bandStatus.slice(0, 24) : null,
+        status: typeof s.status === 'string' ? s.status.slice(0, 24) : null,
+      })),
+    };
+    const base = buildOverallInterpretPrompt(safeOverview, entries);
+    let text = null, okCheck = null;
+    for (let attempt = 0; attempt < 2 && text === null; attempt++) {
+      const prompt = attempt === 0 ? base : base + acRetrySuffix(allowed, okCheck ? okCheck.offending : []);
+      const gen = await localLlm.generate(prompt, { maxTokens: 400, temperature: 0.3 });
+      const check = kbLocal.validateCitations(gen.text, allowed);
+      if (check.ok) { text = gen.text; okCheck = check; } else { okCheck = check; }
+    }
+    if (text === null) return { interpretation: null, citedEntries: [], unavailable: true, reason: 'citation_check_failed' };
+    return { interpretation: text, citedEntries: kbLocal.getByRefs(okCheck.cited), unavailable: false };
+  } catch (err) {
+    if (err && err.code === 'AC_LOCAL_UNAVAILABLE') return { interpretation: null, citedEntries: [], unavailable: true, reason: 'model_unavailable', detail: (err.message || '').slice(0, 200) };
+    return { error: 'interpretation failed' };
+  }
 });
 
 // ── B4: Compromise self-scan engine (device-signed 10-point AC self-scan) ────
