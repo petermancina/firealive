@@ -14,7 +14,7 @@ const ALLOWED_CHANNELS = [
   'abuse:seal', 'abuse:hold-for-export', 'abuse:finalize-export', 'abuse:cancel-export',
   'kb:search', 'kb:entry', 'kbChat:ask', 'kbChat:modelStatus', 'kbChat:verifyModel', 'kbChat:provisioningInfo', 'kbChat:modelScanStatus',
   'selfscan:getPublicKey', 'selfscan:run',
-  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:interpret',
+  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:interpret', 'burnout:interpretOverall',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
