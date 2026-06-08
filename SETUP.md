@@ -27,6 +27,8 @@
 2. Click "Provision New Client" for each analyst joining the platform.
 3. Distribute the Analyst Client installer to your analysts (download link from GitHub Releases).
 
+**Provision every analyst in the SOC, not only those you think are at risk.** FireAlive monitors an analyst only after they enroll a key from their Analyst Client — an analyst who is on the roster but not enrolled is invisible to every team aggregate, to the routing cap, and to burnout interventions. More importantly, burnout prevention and intervention are effective at the team level: the interventions FireAlive supports (workload rebalancing, lighter queues, proactive breaks, post-incident recovery) act on whole teams, not on singled-out individuals, so selectively enrolling only the analysts you suspect are at risk both distorts the team picture and weakens the interventions. The Management Console's Actions tab surfaces any scheduled analyst who has not yet enrolled, so you can prompt them; exclude someone there only if they are genuinely not a monitored member of the SOC.
+
 ### Step 5: Designate an Independent Abuse Reviewer
 Before abuse reporting in the Analyst Client and Management Console becomes available, at least one independent abuse reviewer must be designated and their public key registered.
 1. Identify the person (or people) who will serve as independent abuse reviewer. The role is **separate from team leadership** — a lead may be the subject of a report, so a lead cannot review their own abuse cases. Where the deployment cannot maintain strict separation (for example, where one person holds both team-lead and platform-admin duties), draw the reviewer from HR, an ethics committee, or another independent function.
