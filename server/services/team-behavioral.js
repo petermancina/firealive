@@ -83,7 +83,10 @@ function resolveMinCohort(db) {
   let enrolled = 0;
   try {
     const r = db
-      .prepare("SELECT COUNT(*) AS n FROM users WHERE role='analyst' AND active=1")
+      .prepare(
+        "SELECT COUNT(*) AS n FROM users WHERE role='analyst' AND active=1 " +
+          "AND id IN (SELECT analyst_id FROM analyst_keys WHERE status='active')"
+      )
       .get();
     enrolled = (r && r.n) || 0;
   } catch {
