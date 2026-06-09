@@ -64,7 +64,25 @@ if (process.env.TRUST_PROXY) {
 }
 
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true }));
+// CORS policy. Browsers enforce CORS, so this gates cross-origin requests
+// from malicious sites in a user's browser; it does not affect server-to-
+// server ingest from Regional Servers or other non-browser clients, which
+// send no Origin header and are allowed through. Trusted browser origins
+// (for example a hosted CISO dashboard) are configured at deployment time
+// via GD_ALLOWED_ORIGINS, a comma-separated list. When it is unset, no
+// cross-origin browser access is granted. Credentials stay enabled so that
+// allow-listed origins can send authentication.
+const GD_ALLOWED_ORIGINS = (process.env.GD_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || GD_ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  credentials: true,
+}));
 app.use(compression());
 app.use(express.json({
   limit: '10mb',

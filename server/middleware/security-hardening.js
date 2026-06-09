@@ -31,16 +31,33 @@ const sanitizeInput = (req, res, next) => {
     if (typeof obj === 'string') {
       // Strip null bytes (anti-canonicalization)
       let s = obj.replace(/\0/g, '');
-      // Strip HTML tags (anti-XSS)
-      s = s.replace(/<[^>]*>/g, '');
-      // Strip javascript: protocol
-      s = s.replace(/javascript:/gi, '');
-      // Strip data: protocol (except in controlled contexts)
-      s = s.replace(/data:/gi, '');
+      // Strip HTML tags (anti-XSS). Repeat the pass until the string stops
+      // changing so a tag reconstructed by an earlier removal (for example
+      // "<scr<script>ipt>") cannot survive, then drop any leftover angle
+      // bracket so an unclosed tag like "<script" with no '>' cannot remain.
+      let prevHtml;
+      do {
+        prevHtml = s;
+        s = s.replace(/<[^>]*>/g, '');
+      } while (s !== prevHtml);
+      s = s.replace(/[<>]/g, '');
+      // Strip dangerous URL schemes (anti-XSS). Repeat until stable so a
+      // scheme reconstructed by an earlier removal cannot survive.
+      let prevScheme;
+      do {
+        prevScheme = s;
+        s = s.replace(/(?:javascript|data|vbscript):/gi, '');
+      } while (s !== prevScheme);
       // Strip CRLF injection
       s = s.replace(/[\r\n]/g, '');
-      // Anti-path-traversal
-      s = s.replace(/\.\.\//g, '').replace(/\.\.\\/g, '');
+      // Anti-path-traversal. Repeat until stable so a sequence reconstructed
+      // by an earlier removal (for example "....//" collapsing to "../")
+      // cannot survive a single pass.
+      let prevPath;
+      do {
+        prevPath = s;
+        s = s.replace(/\.\.[\/\\]/g, '');
+      } while (s !== prevPath);
       // Anti-SQL injection (belt-and-suspenders with prepared statements)
       s = s.replace(/['";\\]/g, (c) => '\\' + c);
       // Anti-XML injection / XXE

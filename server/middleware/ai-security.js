@@ -40,12 +40,15 @@ const sanitizeAiInput = (input) => {
 // ── AI Output Validation ────────────────────────────────────────────────────
 const validateAiOutput = (output) => {
   if (typeof output !== 'string') return output;
-  // Strip any code execution attempts in AI output
-  let s = output.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
-  s = s.replace(/javascript:/gi, '');
-  // Strip any leaked system prompt indicators
-  s = s.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, '[REDACTED]');
-  // Strip PII patterns the AI might hallucinate
+  // Redact leaked system-prompt indicators first, while the markers are
+  // still intact (removing the angle brackets below would break the match).
+  let s = output.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, '[REDACTED]');
+  // Neutralize any HTML and executable URL schemes. Removing the angle
+  // brackets themselves -- single characters -- cannot reconstruct a tag,
+  // so no <script (or any other element) survives, unlike removing whole
+  // <script>...</script> spans which a crafted input can reassemble.
+  s = s.replace(/[<>]/g, '').replace(/(?:javascript|data|vbscript):/gi, '');
+  // Redact PII the model might emit.
   s = s.replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[SSN-REDACTED]');
   s = s.replace(/\b\d{16}\b/g, '[CC-REDACTED]');
   return s;

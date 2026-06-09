@@ -278,8 +278,21 @@ app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso', 'abuse_revie
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));
 
-// SPA fallback — serve index.html for all non-API routes
-app.get('*', (req, res) => {
+// SPA fallback: serve index.html for all non-API routes.
+// Rate-limit this handler: it performs a file-system read (sendFile) and,
+// unlike the API routes guarded by apiLimiter, is reachable without auth.
+// Keyed by client IP like apiLimiter, with the same trusted-scanner skip.
+const staticLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: (req) => isAuthorizedScannerIp(req.ip),
+  keyGenerator: rateLimitKeyGenerator,
+  validate: true,
+});
+app.get('*', staticLimiter, (req, res) => {
   if (!req.path.startsWith('/api/')) {
     res.sendFile(path.join(__dirname, '../frontend/index.html'));
   }

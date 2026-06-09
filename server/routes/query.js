@@ -67,7 +67,7 @@ router.get('/siem/templates', (req, res) => {
 router.post('/internal', (req, res) => {
   if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can run queries' });
 
-  const { dataSource, dateFrom, dateTo, regexFilter, limit = 100 } = req.body;
+  const { dataSource, dateFrom, dateTo, textFilter, regexFilter, limit = 100 } = req.body;
 
   const validSources = ['audit_log', 'sla_measurements', 'reports', 'assessment_results'];
   if (!validSources.includes(dataSource)) {
@@ -90,14 +90,16 @@ router.post('/internal', (req, res) => {
     let rows = db.prepare(sql).all(...params);
     db.close();
 
-    // Apply regex filter client-side (SQLite doesn't have native regex)
-    if (regexFilter) {
-      try {
-        const regex = new RegExp(regexFilter, 'i');
-        rows = rows.filter(r => regex.test(JSON.stringify(r)));
-      } catch (e) {
-        return res.status(400).json({ error: `Invalid regex: ${e.message}` });
-      }
+    // Apply a literal, case-insensitive text filter client-side (SQLite
+    // has no native regex). The value is matched as a plain substring
+    // against each row's JSON and is never compiled into a RegExp, so a
+    // user-controlled pattern cannot cause regex injection or catastrophic
+    // backtracking (ReDoS). textFilter is the field name; regexFilter is
+    // accepted as a backward-compatible alias.
+    const filterText = (textFilter !== undefined && textFilter !== '') ? textFilter : regexFilter;
+    if (filterText) {
+      const needle = String(filterText).toLowerCase();
+      rows = rows.filter((r) => JSON.stringify(r).toLowerCase().includes(needle));
     }
 
     res.json({ dataSource, resultCount: rows.length, results: rows });
