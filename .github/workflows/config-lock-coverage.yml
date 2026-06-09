@@ -1,0 +1,23 @@
+name: Config-Lock Coverage
+
+# Runs the config-lock coverage guard on every push and pull request. The guard
+# is fast and dependency-free (Node builtins only), so it does not install
+# packages or build anything -- it just verifies that every config-write
+# endpoint is gated by the lock. This is separate from the tag-triggered
+# Build & Release workflow so contributors get coverage feedback on each commit.
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  config-lock-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify config-lock registry coverage
+        run: node scripts/check-config-lock-coverage.js
