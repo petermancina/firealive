@@ -50,7 +50,7 @@ const validateAiOutput = (output) => {
   do {
     prev = s;
     s = s
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<script[^>]*>[\s\S]*?<\/script\s*>/gi, '')
       .replace(/<\/?\s*script[^>]*>?/gi, '')
       .replace(/javascript:/gi, '');
   } while (s !== prev);
