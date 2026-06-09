@@ -8,7 +8,18 @@ permissions:
   contents: write
 
 jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify config-lock registry coverage
+        run: node scripts/check-config-lock-coverage.js
+
   build-mac:
+    needs: coverage
     runs-on: macos-latest
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: false
@@ -35,6 +46,7 @@ jobs:
           if-no-files-found: warn
 
   build-windows:
+    needs: coverage
     runs-on: windows-latest
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: false
@@ -64,6 +76,7 @@ jobs:
           if-no-files-found: warn
 
   build-linux:
+    needs: coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
