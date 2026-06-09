@@ -25,13 +25,13 @@ jobs:
         with:
           node-version: '22'
       - name: Resolve dependencies and rewrite the lockfile (overrides applied)
-        run: npm install --package-lock-only
+        run: npm install --ignore-scripts
       - name: Open a PR if the lockfile changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet -- package-lock.json; then
-            echo "package-lock.json is already up to date; nothing to do."
+            echo "package-ok lock.json is already up to date; nothing to do."
             exit 0
           fi
           branch="chore/regenerate-lockfile-${{ github.run_id }}"
