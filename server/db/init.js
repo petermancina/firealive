@@ -4746,6 +4746,11 @@ function initDb() {
   //                          install (no MFA-gated action has occurred
   //                          yet); set on first POST /api/config/lock
   //                          success.
+  //   auto_relock_at         ms-epoch at which an idle unlocked platform
+  //                          automatically re-locks. Set on unlock and slid
+  //                          forward on each config write; NULL while locked.
+  //   idle_minutes           Admin-configurable sliding idle window in
+  //                          minutes before auto-relock (default 15).
   //
   // Idempotent: CREATE TABLE IF NOT EXISTS for fresh installs; INSERT
   // ... ON CONFLICT DO NOTHING for the singleton seed so server
@@ -4756,12 +4761,28 @@ function initDb() {
       lock_active INTEGER NOT NULL DEFAULT 0 CHECK (lock_active IN (0, 1)),
       locked_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
       locked_at INTEGER,
-      last_mfa_verified_at INTEGER
+      last_mfa_verified_at INTEGER,
+      auto_relock_at INTEGER,
+      idle_minutes INTEGER NOT NULL DEFAULT 15
     );
     INSERT INTO config_lock_state (id, lock_active)
       VALUES (1, 0)
       ON CONFLICT(id) DO NOTHING;
   `);
+
+  // v1.0.57 (B5d2): idle auto-relock columns. Idempotent ADD COLUMN for
+  // databases created before this release. auto_relock_at is the ms-epoch at
+  // which an idle unlocked platform automatically re-locks; idle_minutes is
+  // the admin-configurable sliding idle window (default 15).
+  {
+    const clsCols = db.prepare("PRAGMA table_info(config_lock_state)").all().map((c) => c.name);
+    if (!clsCols.includes('auto_relock_at')) {
+      db.exec('ALTER TABLE config_lock_state ADD COLUMN auto_relock_at INTEGER');
+    }
+    if (!clsCols.includes('idle_minutes')) {
+      db.exec('ALTER TABLE config_lock_state ADD COLUMN idle_minutes INTEGER NOT NULL DEFAULT 15');
+    }
+  }
 
   // ── R3i schema additions (v1.0.35) — Backup Multi-Schedule with Regulatory Presets ──
   //

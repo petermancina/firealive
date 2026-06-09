@@ -132,6 +132,8 @@ router.get('/lock', authMiddleware(), (req, res) => {
         cls.locked_by_user_id,
         cls.locked_at,
         cls.last_mfa_verified_at,
+        cls.auto_relock_at,
+        cls.idle_minutes,
         u.name AS locked_by_name
       FROM config_lock_state cls
       LEFT JOIN users u ON u.id = cls.locked_by_user_id
@@ -146,12 +148,37 @@ router.get('/lock', authMiddleware(), (req, res) => {
       });
     }
 
+    const now = Date.now();
+    // Idle auto-relock reconciliation: an unlocked platform whose sliding
+    // window has elapsed re-locks here too, so the reported state stays
+    // accurate even when no config write has occurred since expiry.
+    if (
+      row.lock_active === 0 &&
+      row.auto_relock_at !== null &&
+      row.auto_relock_at !== undefined &&
+      now >= row.auto_relock_at
+    ) {
+      db.prepare(
+        'UPDATE config_lock_state SET lock_active = 1, locked_at = ?, ' +
+          'auto_relock_at = NULL, locked_by_user_id = NULL WHERE id = 1'
+      ).run(now);
+      auditLog(null, 'CONFIG_LOCK_AUTO_RELOCK',
+        `idle_minutes=${row.idle_minutes} relocked_at=${now} source=status`, req.ip);
+      row.lock_active = 1;
+      row.locked_at = now;
+      row.auto_relock_at = null;
+      row.locked_by_user_id = null;
+      row.locked_by_name = null;
+    }
+
     return res.json({
       lock_active: row.lock_active === 1,
       locked_by_user_id: row.locked_by_user_id,
       locked_by_name: row.locked_by_name,
       locked_at: row.locked_at,
       last_mfa_verified_at: row.last_mfa_verified_at,
+      auto_relock_at: row.auto_relock_at,
+      idle_minutes: row.idle_minutes,
     });
   } catch (err) {
     logger.error('config-lock GET error', { error: err.message });
@@ -196,10 +223,22 @@ router.post('/lock',
       });
     }
 
+    // Optional admin-configurable idle window (minutes) before auto-relock.
+    let idleMinutes = null;
+    if (req.body && req.body.idle_minutes !== undefined && req.body.idle_minutes !== null) {
+      idleMinutes = Number(req.body.idle_minutes);
+      if (!Number.isInteger(idleMinutes) || idleMinutes < 1 || idleMinutes > 1440) {
+        return res.status(400).json({
+          error: 'idle_minutes must be an integer between 1 and 1440',
+          code: 'INVALID_IDLE_MINUTES',
+        });
+      }
+    }
+
     const db = getDb();
     try {
       const current = db.prepare(
-        'SELECT lock_active FROM config_lock_state WHERE id = 1'
+        'SELECT lock_active, auto_relock_at, idle_minutes FROM config_lock_state WHERE id = 1'
       ).get();
 
       if (!current) {
@@ -210,33 +249,52 @@ router.post('/lock',
         });
       }
 
-      const currentlyLocked = current.lock_active === 1;
+      const now = Date.now();
+      // Effective lock state accounts for an elapsed idle window: an unlocked
+      // platform past its auto_relock_at is already effectively locked.
+      const effectivelyLocked =
+        current.lock_active === 1 ||
+        (current.auto_relock_at !== null &&
+          current.auto_relock_at !== undefined &&
+          now >= current.auto_relock_at);
       const wantsLocked = action === 'lock';
 
-      if (currentlyLocked === wantsLocked) {
+      if (effectivelyLocked === wantsLocked) {
         return res.status(409).json({
-          error: `Config is already ${currentlyLocked ? 'locked' : 'unlocked'}`,
+          error: `Config is already ${effectivelyLocked ? 'locked' : 'unlocked'}`,
           code: 'ALREADY_IN_STATE',
         });
       }
 
-      const now = Date.now();
+      // Idle window to apply: the explicit override if supplied, else the
+      // currently stored value (default 15).
+      const effectiveIdle = idleMinutes !== null
+        ? idleMinutes
+        : (Number(current.idle_minutes) || 15);
+      const autoRelockAt = wantsLocked ? null : now + effectiveIdle * 60 * 1000;
+
       db.prepare(`
         UPDATE config_lock_state
         SET lock_active = ?,
             locked_by_user_id = ?,
             locked_at = ?,
-            last_mfa_verified_at = ?
+            last_mfa_verified_at = ?,
+            auto_relock_at = ?,
+            idle_minutes = ?
         WHERE id = 1
       `).run(
         wantsLocked ? 1 : 0,
         wantsLocked ? req.user.id : null,
         wantsLocked ? now : null,
-        now
+        now,
+        autoRelockAt,
+        effectiveIdle
       );
 
       const eventName = wantsLocked ? 'CONFIG_LOCK_ENABLED' : 'CONFIG_LOCK_DISABLED';
-      const eventDetail = `method=${req.mfaStepUp.method}`;
+      const eventDetail = wantsLocked
+        ? `method=${req.mfaStepUp.method}`
+        : `method=${req.mfaStepUp.method} idle_minutes=${effectiveIdle}`;
       auditLog(req.user.id, eventName, eventDetail, req.ip);
 
       const updated = db.prepare(`
@@ -245,6 +303,8 @@ router.post('/lock',
           cls.locked_by_user_id,
           cls.locked_at,
           cls.last_mfa_verified_at,
+          cls.auto_relock_at,
+          cls.idle_minutes,
           u.name AS locked_by_name
         FROM config_lock_state cls
         LEFT JOIN users u ON u.id = cls.locked_by_user_id
@@ -257,6 +317,8 @@ router.post('/lock',
         locked_by_name: updated.locked_by_name,
         locked_at: updated.locked_at,
         last_mfa_verified_at: updated.last_mfa_verified_at,
+        auto_relock_at: updated.auto_relock_at,
+        idle_minutes: updated.idle_minutes,
       });
     } catch (err) {
       logger.error('config-lock POST error', {

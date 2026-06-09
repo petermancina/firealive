@@ -46,6 +46,23 @@ function issueJwt(db, user, ipAddress, userAgent) {
   const refreshToken = crypto.randomBytes(64).toString('hex');
   const refreshHash = bcrypt.hashSync(refreshToken, 10);
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000).toISOString();
+  // Enforce max concurrent sessions (access-control config); evict the oldest beyond the limit.
+  let maxSessions = 3;
+  try {
+    const acRow = db.prepare("SELECT value FROM team_config WHERE key = 'access_control_config'").get();
+    if (acRow) {
+      const m = parseInt(JSON.parse(acRow.value).maxConcurrentSessions, 10);
+      if (m >= 1 && m <= 10) maxSessions = m;
+    }
+  } catch (e) { /* fall back to the default */ }
+  const activeSessions = db.prepare(
+    "SELECT id FROM sessions WHERE user_id = ? AND expires_at > datetime('now') ORDER BY created_at ASC"
+  ).all(user.id);
+  const overflow = activeSessions.length - (maxSessions - 1);
+  if (overflow > 0) {
+    const delSession = db.prepare("DELETE FROM sessions WHERE id = ?");
+    for (const r of activeSessions.slice(0, overflow)) delSession.run(r.id);
+  }
   db.prepare(`
     INSERT INTO sessions (user_id, refresh_token_hash, ip_address, user_agent, expires_at)
     VALUES (?, ?, ?, ?, ?)

@@ -1,8 +1,8 @@
 {
   "name": "firealive",
-  "version": "1.0.56",
-  "fuseCounter": 49,
-  "buildId": "20260608.1",
+  "version": "1.0.57",
+  "fuseCounter": 50,
+  "buildId": "20260609.1",
   "description": "FireAlive — SOC Analyst Wellbeing Platform. Burnout-aware ticket routing, peer skill-share, post-incident wellness, skills assessments, and team health monitoring with privacy-first architecture.",
   "main": "server/index.js",
   "directories": {

@@ -35,11 +35,11 @@ const API_BASE = 'https://localhost:3000';
 const api = {
   _token: null,
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
-  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   // download(path, filename, opts?) — fetches a binary response (CSV, PDF,
   // DOCX, etc.) and triggers a browser download via an anchor click. Use
   // for endpoints that return a blob rather than JSON; the get/post/put
@@ -2502,6 +2502,8 @@ function ManagementConsole() {
   // Pseudonyms generated automatically when analysts are provisioned.
   const [analystPseudonyms, setAnalystPseudonyms] = useState([]);
   // Data sovereignty / geo-fencing
+  const [accessCtrlCfg, setAccessCtrlCfg] = useState({model:"rbac",enforceSessionBinding:true,maxConcurrentSessions:3,sessionTimeoutMinutes:480,requireMfaForAdmin:true,requireMfaForConfig:true});
+  const [recertCfg, setRecertCfg] = useState({intervalDays:90,enabled:true});
   const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,clients:[]});
   const [newGeoClient, setNewGeoClient] = useState({clientId:"",country:"",region:"",dataResidency:"local",regulatoryFramework:"none"});
   // HA enhancements
@@ -3091,6 +3093,27 @@ function ManagementConsole() {
   const [playbookType, setPlaybookType] = useState("app_compromise");
   const [generatedPlaybook, setGenPlaybook] = useState(null);
   const [clientNotifCfg, setClientNotifCfg] = useState({enabled:true,channels:{desktop:true,slack:false,teams:false,email:false},slackWebhook:"",teamsWebhook:"",rules:{peerChatRequest:{enabled:true,realtime:true,channel:"desktop"},weeklyMetricsReminder:{enabled:true,day:"friday",time:"16:00",channel:"desktop"},burnoutSpike:{enabled:false,channel:"desktop"},shiftHandoff:{enabled:true,channel:"desktop"},scheduledChatReminder:{enabled:true,minutesBefore:15,channel:"desktop"}}});
+  // B5d2: hydrate the team_config-backed tabs from their persistence endpoints on mount
+  useEffect(()=>{
+    api.get("/api/edr/config").then(c=>{if(c&&!c.error)setEdrCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/kms/config").then(c=>{if(c&&!c.error)setKmsCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/network/wifi-policy").then(c=>{if(c&&!c.error)setWifiPolicy(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/msp/config").then(c=>{if(c&&!c.error)setMspCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/notifications/client-config").then(c=>{if(c&&!c.error)setClientNotifCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/recert/status").then(st=>{if(st&&!st.error)setRecertCfg(pr=>({intervalDays:st.intervalDays||pr.intervalDays,enabled:st.reason!=="Recertification disabled"}));}).catch(()=>{});
+    api.get("/api/access-control/config").then(c=>{if(c&&!c.error)setAccessCtrlCfg(pr=>({...pr,...c}));}).catch(()=>{});
+  },[]);
+  // B5d2: hydrate the config-table-backed tabs from their persistence endpoints on mount
+  useEffect(()=>{
+    api.get("/api/posture/config").then(c=>{if(c&&!c.error)setPostureCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/proactive/config").then(c=>{if(c&&!c.error)setProactiveCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/auto-disable-routing/config").then(c=>{if(c&&!c.error)setAutoDisableRoutingCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/fail-open/config").then(c=>{if(c&&!c.error)setFailOpenCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/auth-logs/notification-config").then(c=>{if(c&&!c.error)setAuthLogNotifCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/geo-fence/config").then(c=>{if(c&&!c.error)setGeoFenceCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/threat-hunting/config").then(c=>{if(c&&!c.error)setThreatHuntCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/pseudonyms/config").then(c=>{if(c&&!c.error)setPseudonymCfg(pr=>({...pr,...c}));}).catch(()=>{});
+  },[]);
   // ── B1: Cloud Vulnerability Scan — scanner authorization registry + scan-access log ──
   const CLOUD_VULN_SCANNERS = [
     {id:"scoutsuite",l:"ScoutSuite",d:"Multi-cloud posture auditing (AWS, Azure, GCP, OCI)"},
@@ -3311,6 +3334,25 @@ function ManagementConsole() {
   // v1.0.0: inactivity lock
   // Start UNLOCKED — Team Lead sets up MFA first.
   const [configLocked, setConfigLocked] = useState(false);
+  const [lockInfo, setLockInfo] = useState({auto_relock_at: null, idle_minutes: 15});
+  // B5d2: result handler for config saves. Surfaces the config-lock refusal
+  // (HTTP 423 / CONFIG_LOCKED) distinctly from other failures, and never
+  // reports success when a save did not persist.
+  const saved = (r, ty, dt) => {
+    if (r && r.error && (r.code === 'CONFIG_LOCKED' || r._status === 423)) {
+      setConfigLocked(true);
+      api.get('/api/config/lock').then(s2 => { if (s2 && !s2.error) setLockInfo({auto_relock_at: s2.auto_relock_at, idle_minutes: s2.idle_minutes}); });
+      window.alert('Configuration is locked. Unlock all configurations (MFA) from the sidebar before saving.');
+      addA('CONFIG_LOCKED', 'Save blocked: configuration is locked');
+      return;
+    }
+    if (r && r.error) {
+      window.alert('Save failed: ' + r.error);
+      addA(ty + '_FAILED', 'Save failed: ' + r.error);
+      return;
+    }
+    addA(ty, dt);
+  };
   const [padlocks, setPadlocks] = useState({});
   const isPadlocked = (section) => configLocked && (padlocks[section] !== false);
 
@@ -3323,7 +3365,10 @@ function ManagementConsole() {
   // button's own setConfigLocked call, not by this useEffect.
   useEffect(() => {
     api.get('/api/config/lock').then(r => {
-      if (r && !r.error) setConfigLocked(!!r.lock_active);
+      if (r && !r.error) {
+        setConfigLocked(!!r.lock_active);
+        setLockInfo({auto_relock_at: r.auto_relock_at, idle_minutes: r.idle_minutes});
+      }
     });
   }, []);
 
@@ -3736,7 +3781,7 @@ function ManagementConsole() {
             <button onClick={()=>setShowSetupWizard(true)} style={{width:"100%",padding:"8px 12px",background:"rgba(110,231,183,0.08)",border:`1px solid ${C.a}30`,borderRadius:8,color:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Setup Wizard</button>
             <button onClick={()=>{setShowWelcome(true);setWelcomeStep(0);}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(96,165,250,0.08)",border:`1px solid ${C.i}30`,borderRadius:8,color:C.i,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Welcome Guide</button>
             <button onClick={()=>setTab("help_mc")} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(167,139,250,0.08)",border:`1px solid ${C.p}30`,borderRadius:8,color:C.p,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Help</button>
-            <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6){if(code!==null)window.alert("Invalid MFA code. Configurations remain "+(configLocked?"locked":"unlocked")+".");return;}const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);addA(r.lock_active?"MASTER_LOCK":"MASTER_UNLOCK","All configurations "+(r.lock_active?"locked":"unlocked (MFA verified)"));}else{window.alert("Lock toggle failed: "+(r?.error||"unknown error"));addA("MASTER_LOCK_FAIL",r?.error||"unknown");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":"🔓 Configs Unlocked (MFA to lock)"}</button>
+            <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6){if(code!==null)window.alert("Invalid MFA code. Configurations remain "+(configLocked?"locked":"unlocked")+".");return;}const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);setLockInfo({auto_relock_at:r.auto_relock_at,idle_minutes:r.idle_minutes});addA(r.lock_active?"MASTER_LOCK":"MASTER_UNLOCK","All configurations "+(r.lock_active?"locked":"unlocked (MFA verified)"));}else{window.alert("Lock toggle failed: "+(r?.error||"unknown error"));addA("MASTER_LOCK_FAIL",r?.error||"unknown");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":("🔓 Configs Unlocked (MFA to lock)"+(lockInfo&&lockInfo.auto_relock_at?(" - auto-relocks in ~"+Math.max(0,Math.ceil((lockInfo.auto_relock_at-Date.now())/60000))+"m"):""))}</button>
           </div>
         </div>
         <div style={{flex:1,overflowY:"auto"}}>
@@ -5566,7 +5611,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Startup Configuration (Admin/Provisioning)</M>
             <M style={{color:C.tm,lineHeight:1.8}}>The FireAlive client must run at system startup for notifications to work. This should be configured by administrators during workstation provisioning — not by analysts (who typically lack admin privileges). Deploy via Group Policy (Windows), MDM profile (macOS), systemd user service (Linux), or include in the SOC workstation image. See the Onboard tab and README for provisioning instructions.</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_NOTIF_CONFIG",detail:"Client notification configuration saved"}).then(()=>addA("CLIENT_NOTIF_CONFIG","Client notification configuration saved"))}>Save Notification Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/notifications/client-config",clientNotifCfg).then(r=>saved(r,"CLIENT_NOTIF_CONFIG","Client notification configuration saved"))}>Save Notification Config</Btn>
         </div>)}
 
         {/* ══════════ CLOUD VULN SCAN ══════════ */}
@@ -6802,14 +6847,16 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Card style={{textAlign:"center",padding:12}}><div style={{fontSize:20,fontWeight:600,color:C.w}}>{assessments.length}</div><M style={{color:C.td}}>Assessments</M></Card>
             </div>
             <div style={{display:"flex",gap:8}}>
-              <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_COMPLETED",detail:"Recertification review completed"}).then(()=>addA("RECERT_COMPLETED","Recertification review completed"))}>Mark Recertification Complete</Btn>
-              <Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_REPORT",detail:"Recertification report generated"}).then(()=>addA("RECERT_REPORT","Recertification report generated"))}>Generate Report</Btn>
+              <Btn primary onClick={()=>api.post("/api/recert/complete",{}).then(()=>addA("RECERT_COMPLETED","Recertification review completed"))}>Mark Recertification Complete</Btn>
+              <Btn onClick={()=>api.get("/api/recert/report").then(()=>addA("RECERT_REPORT","Recertification report generated"))}>Generate Report</Btn>
             </div>
           </Card>
           <Card><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Schedule</div>
-            <Sel label="Review interval" value="90" onChange={()=>api.post("/api/audit/mc-event",{event_type:"RECERT_INTERVAL",detail:"Interval updated"}).then(()=>addA("RECERT_INTERVAL","Interval updated"))}>
+            <Sel label="Review interval" value={String(recertCfg.intervalDays)} onChange={e=>setRecertCfg(pr=>({...pr,intervalDays:parseInt(e.target.value,10)}))}>
               <option value="30">Monthly (30 days)</option><option value="90">Quarterly (90 days)</option><option value="180">Semi-annual (180 days)</option><option value="365">Annual (365 days)</option>
             </Sel>
+            <label style={{display:"flex",alignItems:"center",gap:8,marginTop:12,fontSize:12,color:C.t}}><input type="checkbox" checked={recertCfg.enabled} onChange={e=>setRecertCfg(pr=>({...pr,enabled:e.target.checked}))}/> Recertification enabled</label>
+            <Btn primary style={{marginTop:12}} onClick={()=>api.put("/api/recert/config",{intervalDays:recertCfg.intervalDays,enabled:recertCfg.enabled}).then(r=>saved(r,"RECERT_CONFIG","Recertification schedule saved"))}>Save Schedule</Btn>
           </Card>
         </div>)}
 
@@ -6838,19 +6885,19 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Access Control Model</div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
               {[{id:"rbac",name:"RBAC",desc:"Role-Based — permissions tied to roles (analyst, lead, admin)"},{id:"abac",name:"ABAC",desc:"Attribute-Based — permissions from user/resource/environment attributes"},{id:"mac",name:"MAC",desc:"Mandatory — system-enforced labels (clearance levels)"},{id:"dac",name:"DAC",desc:"Discretionary — resource owners control access"}].map(m=>(
-                <Card key={m.id} style={{cursor:"pointer",borderColor:C.b,padding:12}} onClick={()=>addA("ACCESS_CTRL_MODEL",m.id)}>
+                <Card key={m.id} style={{cursor:"pointer",borderColor:accessCtrlCfg.model===m.id?C.i:C.b,padding:12}} onClick={()=>setAccessCtrlCfg(pr=>({...pr,model:m.id}))}>
                   <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:4}}>{m.name}</div>
                   <M style={{color:C.tm,lineHeight:1.4}}>{m.desc}</M>
                 </Card>
               ))}
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-              <Input label="Max concurrent sessions" type="number" placeholder="3"/>
-              <Input label="Session timeout (minutes)" type="number" placeholder="480"/>
+              <Input label="Max concurrent sessions" type="number" value={accessCtrlCfg.maxConcurrentSessions} onChange={e=>setAccessCtrlCfg(pr=>({...pr,maxConcurrentSessions:parseInt(e.target.value,10)||1}))}/>
+              <Input label="Session timeout (minutes)" type="number" value={accessCtrlCfg.sessionTimeoutMinutes} onChange={e=>setAccessCtrlCfg(pr=>({...pr,sessionTimeoutMinutes:parseInt(e.target.value,10)||15}))}/>
             </div>
-            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Require MFA for admin actions</M></label>
-            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Bind sessions to IP + user agent</M></label>
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"ACCESS_CTRL_SAVED",detail:"Access control config saved"}).then(()=>addA("ACCESS_CTRL_SAVED","Access control config saved"))}>Save</Btn>
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox" checked={accessCtrlCfg.requireMfaForAdmin} onChange={e=>setAccessCtrlCfg(pr=>({...pr,requireMfaForAdmin:e.target.checked}))}/><M style={{color:C.t}}>Require MFA for admin actions</M></label>
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox" checked={accessCtrlCfg.enforceSessionBinding} onChange={e=>setAccessCtrlCfg(pr=>({...pr,enforceSessionBinding:e.target.checked}))}/><M style={{color:C.t}}>Bind sessions to IP + user agent</M></label>
+            <Btn primary onClick={()=>api.put("/api/access-control/config",accessCtrlCfg).then(r=>saved(r,"ACCESS_CTRL_SAVED","Access control config saved"))}>Save</Btn>
           </Card>
         </div>)}
 
@@ -6942,7 +6989,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={edrCfg.blockOnThreat} onChange={e=>setEdrCfg(prev=>({...prev,blockOnThreat:e.target.checked}))}/><M style={{color:C.d}}>Block processing if threat detected</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={edrCfg.quarantineOnSuspicious} onChange={e=>setEdrCfg(prev=>({...prev,quarantineOnSuspicious:e.target.checked}))}/><M style={{color:C.w}}>Quarantine suspicious files for manual review</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"EDR_CONFIG_SAVED",detail:"EDR file inspection configuration saved"}).then(()=>addA("EDR_CONFIG_SAVED","EDR file inspection configuration saved"))}>Save EDR Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/edr/config",edrCfg).then(r=>saved(r,"EDR_CONFIG_SAVED","EDR file inspection configuration saved"))}>Save EDR Config</Btn>
         </div>)}
 
         {/* ══════════ MALWARE SCANNER INTEGRATION (Phase F4c) ══════════ */}
@@ -7128,7 +7175,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <label key={u.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={kmsCfg.keyUsage[u.k]} onChange={e=>setKmsCfg(prev=>({...prev,keyUsage:{...prev.keyUsage,[u.k]:e.target.checked}}))}/><M style={{color:C.t}}>{u.l}</M></label>
             ))}
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"KMS_CONFIG_SAVED",detail:"Enterprise KMS configuration saved"}).then(()=>addA("KMS_CONFIG_SAVED","Enterprise KMS configuration saved"))}>Save KMS Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/kms/config",kmsCfg).then(r=>saved(r,"KMS_CONFIG_SAVED","Enterprise KMS configuration saved"))}>Save KMS Config</Btn>
         </div>)}
 
         {/* ══════════ WIFI SECURITY POLICY ══════════ */}
@@ -7148,7 +7195,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={wifiPolicy.warnOnInsecure} onChange={e=>setWifiPolicy(prev=>({...prev,warnOnInsecure:e.target.checked}))}/><M style={{color:C.w}}>Warn analyst when WiFi is below policy</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={wifiPolicy.disconnectOnInsecure} onChange={e=>setWifiPolicy(prev=>({...prev,disconnectOnInsecure:e.target.checked}))}/><M style={{color:C.d}}>Disconnect client if WiFi is below policy (strict mode)</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"WIFI_POLICY_SAVED",detail:"WiFi security policy saved"}).then(()=>addA("WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
+          <Btn primary onClick={()=>api.put("/api/network/wifi-policy",wifiPolicy).then(r=>saved(r,"WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
         </div>)}
 
         {/* ══════════ MSP MULTI-TENANCY ══════════ */}
@@ -7172,7 +7219,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             mspCfg.tenants.map(t=><Card key={t.id} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${C.a}`}}><div style={{display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t,fontWeight:500}}>{t.name}</M><br/><M style={{color:C.td}}>{t.domain} · Key: {t.encryptionKeyId?.slice(0,8)}…</M></div><Badge color={C.a}>{t.status}</Badge></div></Card>)}
             <div style={{display:"flex",gap:8,marginTop:10}}><Input label="New tenant name" value={newTenantName} onChange={e=>setNewTenantName(e.target.value)} placeholder="Client org name" maxLength={128}/><Btn primary disabled={!newTenantName.trim()} style={{marginTop:16}} onClick={()=>{const t={id:Math.random().toString(36).slice(2,10),name:newTenantName,domain:"",encryptionKeyId:Math.random().toString(36).slice(2,18),createdAt:new Date().toISOString(),status:"active"};setMspCfg(prev=>({...prev,tenants:[...prev.tenants,t]}));setNewTenantName("");addA("MSP_TENANT_CREATED","Tenant created: "+t.name);}}>Add Tenant</Btn></div>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"MSP_CONFIG_SAVED",detail:"MSP multi-tenancy configuration saved"}).then(()=>addA("MSP_CONFIG_SAVED","MSP multi-tenancy configuration saved"))}>Save MSP Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/msp/config",{enabled:mspCfg.enabled,isolation:mspCfg.isolation,managementOverlay:mspCfg.managementOverlay}).then(r=>saved(r,"MSP_CONFIG_SAVED","MSP multi-tenancy configuration saved"))}>Save MSP Config</Btn>
         </div>)}
 
         {/* ══════════ R3f — MFA SELF-SERVICE + ADMIN POLICY ══════════ */}
@@ -7228,7 +7275,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>What These Integrations Inspect</M>
             <M style={{color:C.tm,lineHeight:1.8}}>Uploaded files (analyst attachments, config imports) · App update packages (before installation) · Application behavior patterns (API call frequency, memory usage, DB access patterns) · Resource consumption metrics (CPU, memory, network I/O anomalies) · All scanning integrations use read-only API tokens scoped to the specific inspection function</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"THREAT_HUNT_CONFIG_SAVED",detail:"Threat hunting integrations saved"}).then(()=>addA("THREAT_HUNT_CONFIG_SAVED","Threat hunting integrations saved"))}>Save All Threat Hunting Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/threat-hunting/config",threatHuntCfg).then(r=>saved(r,"THREAT_HUNT_CONFIG_SAVED","Threat hunting integrations saved"))}>Save All Threat Hunting Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — TRIPWIRE ══════════ */}
@@ -7357,7 +7404,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",cursor:"pointer"}}><input type="checkbox" checked={authLogNotifCfg.missingLogs} onChange={e=>setAuthLogNotifCfg(prev=>({...prev,missingLogs:e.target.checked}))}/><M style={{color:C.w}}>Alert if auth log gaps detected (&gt; 30 min without any entry)</M></label>
             <Input label="Brute-force threshold (failed attempts before alert)" value={authLogNotifCfg.bruteForceThreshold} onChange={e=>setAuthLogNotifCfg(prev=>({...prev,bruteForceThreshold:parseInt(e.target.value)||5}))} type="number"/>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTH_LOG_CONFIG_SAVED",detail:"Auth log notification config saved"}).then(()=>addA("AUTH_LOG_CONFIG_SAVED","Auth log notification config saved"))}>Save Auth Log Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/auth-logs/notification-config",authLogNotifCfg).then(r=>saved(r,"AUTH_LOG_CONFIG_SAVED","Auth log notification config saved"))}>Save Auth Log Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — POSTURE ASSESSMENT ══════════ */}
@@ -7379,7 +7426,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={postureCfg.warnOnFail} onChange={e=>setPostureCfg(prev=>({...prev,warnOnFail:e.target.checked}))}/><M style={{color:C.w}}>Warn user and show remediation steps</M></label>
             <Input label="Grace period (minutes) before blocking" value={postureCfg.gracePeriodMin} onChange={e=>setPostureCfg(prev=>({...prev,gracePeriodMin:parseInt(e.target.value)||0}))} type="number"/>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"POSTURE_CONFIG_SAVED",detail:"Posture assessment config saved"}).then(()=>addA("POSTURE_CONFIG_SAVED","Posture assessment config saved"))}>Save Posture Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/posture/config",postureCfg).then(r=>saved(r,"POSTURE_CONFIG_SAVED","Posture assessment config saved"))}>Save Posture Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — HIGH AVAILABILITY ══════════ */}
@@ -7431,7 +7478,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Input label="Max time in fail-open mode (minutes) before requiring manual intervention" value={failOpenCfg.maxFailOpenMin} onChange={e=>setFailOpenCfg(prev=>({...prev,maxFailOpenMin:parseInt(e.target.value)||60}))} type="number"/>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={failOpenCfg.restoreAuto} onChange={e=>setFailOpenCfg(prev=>({...prev,restoreAuto:e.target.checked}))}/><M style={{color:C.t}}>Auto-restore burnout routing when engine recovers</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"FAILOPEN_CONFIG_SAVED",detail:"Fail-open routing config saved"}).then(()=>addA("FAILOPEN_CONFIG_SAVED","Fail-open routing config saved"))}>Save Fail-Open Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/fail-open/config",failOpenCfg).then(r=>saved(r,"FAILOPEN_CONFIG_SAVED","Fail-open routing config saved"))}>Save Fail-Open Config</Btn>
         </div>)}
 
         {/* ══════════ TROUBLESHOOTER ══════════ */}
@@ -7626,7 +7673,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <div style={{display:"flex",gap:8}}>
-            <Btn primary onClick={()=>{api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_CONFIG_SAVED",detail:"Pseudonym system config saved"}).then(()=>addA("PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
+            <Btn primary onClick={()=>{api.put("/api/pseudonyms/config",pseudonymCfg).then(r=>saved(r,"PSEUDONYM_CONFIG_SAVED","Pseudonym system config saved"));}}>Save Config</Btn>
             {pseudonymCfg.leadExportEnabled&&<Btn onClick={()=>{const mapping=analystPseudonyms.map(a=>({pseudonym:a.pseudonym,realName:a.realName,external_id:a.external_id||null,assignedAt:a.assignedAt}));const data=JSON.stringify({exportType:"pseudonym_mapping",version:appVersion||"unknown",exportedAt:new Date().toISOString(),warning:"CONFIDENTIAL — Store offline. Do not upload to shared drives.",mapping},null,2);const blob=new Blob([data],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="pseudonym-mapping-CONFIDENTIAL-"+new Date().toISOString().slice(0,10)+".json";a.click();api.post("/api/audit/mc-event",{event_type:"PSEUDONYM_MAPPING_EXPORTED",detail:"Identity mapping exported — CONFIDENTIAL"}).then(()=>addA("PSEUDONYM_MAPPING_EXPORTED","Identity mapping exported — CONFIDENTIAL"));}}>Export Mapping (Encrypted)</Btn>}
             <Btn onClick={()=>{const birds=["Phoenix","Merlin","Peregrine","Kestrel","Harrier","Gyrfalcon","Sparrowhawk","Kite","Buzzard","Shrike"];setAnalystPseudonyms(prev=>prev.map((ap,i)=>({...ap,pseudonym:"Analyst-"+birds[i%birds.length]+"-"+Math.floor(Math.random()*99),assignedAt:new Date().toISOString().slice(0,10)})));api.post("/api/audit/mc-event",{event_type:"PSEUDONYMS_ROTATED",detail:"All analyst pseudonyms rotated"}).then(()=>addA("PSEUDONYMS_ROTATED","All analyst pseudonyms rotated"));}}>Rotate All Pseudonyms</Btn>
           </div>
@@ -7669,7 +7716,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Regulatory Impact</M>
             <M style={{color:C.tm,lineHeight:1.8}}>GDPR: Right to erasure, data minimization, 72-hr breach notification, DPO requirement · CCPA: Right to know, right to delete, opt-out of sale · PIPEDA: Consent-based collection, reasonable purpose · The compliance tab's framework scanner already checks against these — this tab ensures the correct framework is applied per analyst location. For complex multi-jurisdictional deployments, consult your DPO or privacy counsel.</M>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"GEO_CONFIG_SAVED",detail:"Data sovereignty config saved"}).then(()=>addA("GEO_CONFIG_SAVED","Data sovereignty config saved"))}>Save Geo Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/geo-fence/config",geoFenceCfg).then(r=>saved(r,"GEO_CONFIG_SAVED","Data sovereignty config saved"))}>Save Geo Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — CLUSTER / SCALING ══════════ */}
@@ -8023,7 +8070,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>What the Analyst Sees</M>
             <M style={{color:C.tm,lineHeight:1.8}}>"You've been investigating high-severity incidents for 4 straight hours. Your work is making a real difference for the team. Your lead has approved a 15-minute break if you'd like one — your queue will be paused. [Take Break] [Continue Working]"</M>
           </Card>
-          <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"PROACTIVE_CONFIG_SAVED",detail:"Proactive intervention config saved"}).then(()=>addA("PROACTIVE_CONFIG_SAVED","Proactive intervention config saved"))}>Save Config</Btn>
+          <Btn primary style={{marginTop:12}} onClick={()=>api.put("/api/proactive/config",proactiveCfg).then(r=>saved(r,"PROACTIVE_CONFIG_SAVED","Proactive intervention config saved"))}>Save Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — UPSKILLING HOUR ══════════ */}
@@ -8212,7 +8259,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <Input label="Cooldown — auto-restore routing after (minutes)" value={autoDisableRoutingCfg.cooldownMin} onChange={e=>setAutoDisableRoutingCfg(prev=>({...prev,cooldownMin:parseInt(e.target.value)||30}))} type="number"/>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={autoDisableRoutingCfg.notifyLead} onChange={e=>setAutoDisableRoutingCfg(prev=>({...prev,notifyLead:e.target.checked}))}/><M style={{color:C.w}}>Notify Team Lead when auto-disable activates</M></label>
           </Card>
-          <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTO_DISABLE_ROUTING_SAVED",detail:"Auto-disable routing config saved"}).then(()=>addA("AUTO_DISABLE_ROUTING_SAVED","Auto-disable routing config saved"))}>Save Config</Btn>
+          <Btn primary onClick={()=>api.put("/api/auto-disable-routing/config",autoDisableRoutingCfg).then(r=>saved(r,"AUTO_DISABLE_ROUTING_SAVED","Auto-disable routing config saved"))}>Save Config</Btn>
         </div>)}
 
         {/* ══════════ Phase F2 — RECOVERY RUNBOOK (FireAlive-specific) ══════════ */}
