@@ -56,7 +56,7 @@ const sanitizeInput = (req, res, next) => {
       let prevPath;
       do {
         prevPath = s;
-        s = s.replace(/\.\.\//g, '').replace(/\.\.\\/g, '');
+        s = s.replace(/\.\.[\/\\]/g, '');
       } while (s !== prevPath);
       // Anti-SQL injection (belt-and-suspenders with prepared statements)
       s = s.replace(/['";\\]/g, (c) => '\\' + c);
