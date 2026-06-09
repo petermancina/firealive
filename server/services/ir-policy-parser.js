@@ -230,7 +230,7 @@ function extractDecisionPoints(text) {
 
 function extractContainmentActions(text) {
   const lines = splitLines(text);
-  const verbPattern = new RegExp(`^\\s*(?:[-*\\d.)\\s]+)?(?:${CONTAINMENT_VERBS.join('|')})\\b`, 'i');
+  const verbPattern = new RegExp(`^[-*\\d.)\\s]*(?:${CONTAINMENT_VERBS.join('|')})\\b`, 'i');
   const matches = [];
   for (const line of lines) {
     const t = line.trim();
