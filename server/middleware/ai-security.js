@@ -52,7 +52,7 @@ const validateAiOutput = (output) => {
     s = s
       .replace(/<script[^>]*>[\s\S]*?<\/script\s*>/gi, '')
       .replace(/<\/?\s*script[^>]*>?/gi, '')
-      .replace(/javascript:/gi, '');
+      .replace(/(?:javascript|data|vbscript):/gi, '');
   } while (s !== prev);
   // Strip any leaked system prompt indicators
   s = s.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, '[REDACTED]');
