@@ -266,6 +266,7 @@ app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-
 app.use('/api/system/connected-clients', authMiddleware(['admin']), require('./routes/system-connected-clients'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
 app.use('/api/compromise', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/compromise-scan-orchestration'));
+app.use('/api/client-ops', authMiddleware(['lead', 'admin']), require('./routes/client-ops'));
 app.use('/api/tripwire', authMiddleware(['lead', 'admin']), require('./routes/tripwire'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
