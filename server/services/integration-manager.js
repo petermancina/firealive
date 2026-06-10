@@ -50,7 +50,10 @@
 //
 // inspectFile() signature is preserved (content, fileName, fileType) →
 // {clean, skipped, threats, scanId, provider, latencyMs, ...} for
-// drop-in compatibility with existing callers in routes/ooda.js.
+// drop-in compatibility with existing callers in routes/ooda.js. An
+// optional 4th argument, opts = { scanMode }, can override the scan mode
+// for a single call (used by the golden-baseline import to force
+// all_configured); omitting it preserves the original behavior.
 //
 // MANDATORY-SCANNER ENFORCEMENT is intentionally NOT in this layer.
 // inspectFile() returns skipped:true when no scanners are configured.
@@ -390,6 +393,21 @@ class IntegrationManager {
       .run('malware_scan_mode', JSON.stringify({ mode, updatedAt: new Date().toISOString() }));
   }
 
+  // Resolve the effective scan mode for a single inspectFile call. An
+  // explicit, valid opts.scanMode override (e.g. a golden-baseline import
+  // forcing all_configured) wins; otherwise the deployment's persisted mode
+  // applies. An invalid override throws -- it is a programming error from a
+  // caller, never user input.
+  _resolveScanMode(opts = {}) {
+    if (opts && typeof opts.scanMode === 'string') {
+      if (!VALID_SCAN_MODES.includes(opts.scanMode)) {
+        throw new Error(`invalid scan mode override: ${opts.scanMode} (valid: ${VALID_SCAN_MODES.join(', ')})`);
+      }
+      return opts.scanMode;
+    }
+    return this.getScanMode();
+  }
+
   // ── File inspection (multi-provider dispatcher) ────────────────────────────
   //
   // Called by upload handlers (routes/ooda.js POST /policies, POST /aar)
@@ -422,8 +440,14 @@ class IntegrationManager {
   //   error: string,          present only on dispatcher-level error
   //   inspectorVersion: string  this module's INSPECTOR_VERSION for audit
   // }
-  async inspectFile(content, fileName, fileType) {
+  // opts (optional): { scanMode } - when set to a valid scan mode, overrides
+  //   the deployment's persisted malware_scan_mode for this one call. The
+  //   golden-baseline import passes { scanMode: 'all_configured' } so every
+  //   configured scanner must return clean regardless of the deployment
+  //   default. Omitting opts preserves the existing behavior exactly.
+  async inspectFile(content, fileName, fileType, opts = {}) {
     const startedAt = Date.now();
+    const mode = this._resolveScanMode(opts);
 
     // Validate input. inspectFile accepts a non-empty string OR Buffer
     // (R3d-5: Buffer support added for restore scans of binary SQLite
@@ -439,7 +463,7 @@ class IntegrationManager {
         scanId: null,
         provider: null,
         scanners: [],
-        mode: this.getScanMode(),
+        mode,
         latencyMs: Date.now() - startedAt,
         error: 'invalid content',
         inspectorVersion: INSPECTOR_VERSION,
@@ -463,14 +487,12 @@ class IntegrationManager {
         scanId: null,
         provider: null,
         scanners: [],
-        mode: DEFAULT_SCAN_MODE,
+        mode,
         latencyMs: Date.now() - startedAt,
         error: 'scanner registry query failed: ' + err.message,
         inspectorVersion: INSPECTOR_VERSION,
       };
     }
-
-    const mode = this.getScanMode();
 
     if (scannerRows.length === 0) {
       // No scanners configured. Return skipped:true; the route layer

@@ -2607,16 +2607,50 @@ CREATE INDEX IF NOT EXISTS idx_gd_push_signing_keys_fingerprint
 -- family taints none of the others.
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- B5d3: gains the backup_signing_keys cross-deployment registration shape
+-- (key_origin + registration metadata, private key relaxed nullable with an
+-- XOR CHECK) so a foreign deployment's report-signing PUBLIC key can be
+-- registered here and used to verify imported golden-baseline bundles.
 CREATE TABLE IF NOT EXISTS report_signing_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
   public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER bytes (64 chars)
-  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  private_key_encrypted TEXT,                       -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}.
+                                                    -- NULL for key_origin='external-registered'
+                                                    -- (we have only the public part of foreign
+                                                    -- deployments' keys).
   is_active INTEGER NOT NULL DEFAULT 0
     CHECK (is_active IN (0, 1)),
+  key_origin TEXT NOT NULL DEFAULT 'local-generated'
+    CHECK (key_origin IN ('local-generated', 'external-registered')),
+  registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                                                    -- who pasted/registered the foreign public
+                                                    -- key (NULL for local-generated rows).
+  registered_at TEXT,                               -- when registered (NULL for local-generated).
+  key_label TEXT,                                   -- operator-friendly description for
+                                                    -- external-registered keys (e.g.
+                                                    -- "prod-east deployment, key from
+                                                    -- 2026-06-09").
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   rotated_out_at TEXT,                              -- when is_active flipped 1 -> 0
-  notes TEXT
+                                                    -- OR when an external-registered key
+                                                    -- was revoked.
+  notes TEXT,
+  -- Local-generated keys MUST have a private key (we created it ourselves).
+  -- External-registered keys MUST NOT have a private key (we only have the
+  -- public part of a foreign deployment's keypair), MUST be inactive
+  -- (verification-only, never used for signing), and MUST carry registration
+  -- metadata (who/when, for audit).
+  CHECK (
+    (key_origin = 'local-generated'
+     AND private_key_encrypted IS NOT NULL)
+    OR
+    (key_origin = 'external-registered'
+     AND private_key_encrypted IS NULL
+     AND is_active = 0
+     AND registered_at IS NOT NULL
+     AND registered_by_user_id IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
@@ -2624,6 +2658,9 @@ CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
 
 CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
   ON report_signing_keys(public_key_fingerprint);
+
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_origin
+  ON report_signing_keys(key_origin);
 
 -- Permanent, append-only verification record. One row per signed report.
 -- subject_ref is the report's own id (compliance / report_engine / helper_pay)
@@ -2866,6 +2903,54 @@ CREATE INDEX IF NOT EXISTS idx_external_restore_sources_enabled
   ON external_restore_sources(enabled);
 CREATE INDEX IF NOT EXISTS idx_external_restore_sources_type
   ON external_restore_sources(source_type);
+
+-- ────────────────────────────────────────────────────────────────────
+-- B5D3: CONFIGURATION SNAPSHOTS (GOLDEN BASELINE)
+-- Dedicated store for configuration snapshots, replacing the legacy
+-- config_snapshot_% JSON rows that lived inside team_config (moved by the
+-- B5d3 migration in initDb). A snapshot's payload is the canonical JSON
+-- produced by services/golden-baseline.js captureBaseline(): the explicit
+-- allowlisted config domain with secret material stripped. Signing keys,
+-- identities, credentials, pseudonym mappings, analyst data, audit rows,
+-- and operational state are never captured.
+--
+-- origin records why the snapshot exists:
+--   manual      operator pressed Save Current
+--   pre-revert  automatic safety snapshot taken before a revert
+--   pre-import  automatic safety snapshot taken before a baseline import
+-- Retention (config key config_snapshot_retention, default 20) prunes the
+-- oldest auto-origin snapshots first and refuses a manual save when only
+-- manual snapshots remain.
+--
+-- baseline_schema_version is the shape version of payload:
+--   0   legacy team_config-era snapshot shape ({teamConfig, reportConfig,
+--       slaConfig, notifConfig}) migrated out of team_config rows
+--   1+  the golden-baseline domain shape (BASELINE_SCHEMA_VERSION in
+--       services/golden-baseline.js)
+-- sha256 is the SHA-256 hex of the stored payload bytes.
+-- ────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS config_snapshots (
+  id TEXT PRIMARY KEY,                              -- short base36 id
+  name TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'manual'
+    CHECK (origin IN ('manual', 'pre-revert', 'pre-import')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  app_version TEXT,                                 -- app version at capture time
+  baseline_schema_version INTEGER NOT NULL DEFAULT 1,
+  payload TEXT NOT NULL,                            -- canonical JSON (see header above)
+  sha256 TEXT NOT NULL                              -- SHA-256 hex of payload bytes
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_snapshots_created
+  ON config_snapshots(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_config_snapshots_origin
+  ON config_snapshots(origin);
+
+-- Retention cap consumed by the snapshot save path.
+INSERT OR IGNORE INTO config (key, value)
+  VALUES ('config_snapshot_retention', '20');
 
 `;
 
@@ -4491,6 +4576,164 @@ function initDb() {
   } catch (r3d5pt2MigrationErr) {
     console.error('backup_signing_keys R3d-5-pt2 migration FAILED:', r3d5pt2MigrationErr.message);
     console.error('The server will start, but cross-deployment external restore (verifying manifests against external-registered keys) may not work until the migration is investigated.');
+  }
+
+  // ── B5d3 migration: extend report_signing_keys for cross-
+  //    deployment golden-baseline verification ──
+  //
+  // Mirrors the R3d-5-pt2 backup_signing_keys shape. Adds:
+  //   key_origin              - 'local-generated' (this deployment's
+  //                              own report-signing keypair) or
+  //                              'external-registered' (a foreign
+  //                              deployment's PUBLIC key we trust to
+  //                              verify imported golden-baseline
+  //                              bundles -- verification only).
+  //   registered_by_user_id   - admin who pasted the foreign key
+  //                              (audit trail for trust establishment,
+  //                              Foundational Rule 22).
+  //   registered_at           - when registered.
+  //   key_label               - operator-friendly description.
+  //
+  // Relaxes private_key_encrypted to NULL for external-registered
+  // keys. The table-level CHECK enforces XOR: local-generated rows
+  // MUST have a private key; external-registered rows MUST NOT, MUST
+  // be inactive, and MUST carry registration metadata.
+  //
+  // No fingerprint backfill is needed (unlike backup_signing_keys):
+  // public_key_fingerprint has been NOT NULL since this table shipped
+  // and is computed by report-signing-keys.js on every insert.
+  //
+  // Idempotent: re-running on an already-migrated database is a no-op
+  // (the column-presence check returns true).
+  try {
+    const rskCols = db.prepare("PRAGMA table_info(report_signing_keys)").all().map(c => c.name);
+    if (rskCols.length && !rskCols.includes('key_origin')) {
+      const existingRskRows = db.prepare("SELECT * FROM report_signing_keys").all();
+      db.pragma('foreign_keys = OFF');
+      try {
+        const migrateRsk = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE report_signing_keys_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              public_key TEXT NOT NULL,
+              public_key_fingerprint TEXT NOT NULL,
+              private_key_encrypted TEXT,
+              is_active INTEGER NOT NULL DEFAULT 0
+                CHECK (is_active IN (0, 1)),
+              key_origin TEXT NOT NULL DEFAULT 'local-generated'
+                CHECK (key_origin IN ('local-generated', 'external-registered')),
+              registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+              registered_at TEXT,
+              key_label TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              rotated_out_at TEXT,
+              notes TEXT,
+              CHECK (
+                (key_origin = 'local-generated'
+                 AND private_key_encrypted IS NOT NULL)
+                OR
+                (key_origin = 'external-registered'
+                 AND private_key_encrypted IS NULL
+                 AND is_active = 0
+                 AND registered_at IS NOT NULL
+                 AND registered_by_user_id IS NOT NULL)
+              )
+            );
+          `);
+
+          const insertRsk = db.prepare(`
+            INSERT INTO report_signing_keys_new
+              (id, public_key, public_key_fingerprint, private_key_encrypted,
+               is_active, key_origin, registered_by_user_id, registered_at,
+               key_label, created_at, rotated_out_at, notes)
+            VALUES (?, ?, ?, ?, ?, 'local-generated', NULL, NULL, NULL, ?, ?, ?)
+          `);
+          for (const row of existingRskRows) {
+            insertRsk.run(
+              row.id,
+              row.public_key,
+              row.public_key_fingerprint,
+              row.private_key_encrypted,
+              row.is_active,
+              row.created_at,
+              row.rotated_out_at,
+              row.notes,
+            );
+          }
+
+          db.exec(`
+            DROP TABLE report_signing_keys;
+            ALTER TABLE report_signing_keys_new RENAME TO report_signing_keys;
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
+              ON report_signing_keys(is_active) WHERE is_active = 1;
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
+              ON report_signing_keys(public_key_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_origin
+              ON report_signing_keys(key_origin);
+          `);
+        });
+        migrateRsk();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+      console.log(`report_signing_keys B5d3 migration: rebuilt with key_origin and registration columns (${existingRskRows.length} existing row(s) carried over as local-generated)`);
+    }
+  } catch (b5d3RskMigrationErr) {
+    console.error('report_signing_keys B5d3 migration FAILED:', b5d3RskMigrationErr.message);
+    console.error('The server will start, but registering external report-signing keys (cross-deployment golden-baseline verification) will not work until the migration is investigated. Local report signing and verification are unaffected.');
+  }
+
+  // ── B5d3 migration: config snapshots move out of team_config ──
+  //
+  // Legacy config snapshots were stored as JSON blobs in team_config
+  // under key prefix 'config_snapshot_<id>'. B5d3 moves them into the
+  // dedicated config_snapshots table so they stop accumulating as
+  // unbounded team_config rows and gain origin + retention semantics.
+  //
+  // Legacy payloads keep their original shape and are marked
+  // baseline_schema_version 0 so the revert path can distinguish them
+  // from golden-baseline-domain snapshots (version 1+). origin is
+  // inferred: the auto-save rows the old config-revert created are
+  // 'pre-revert'; everything else is 'manual'.
+  //
+  // Idempotent: INSERT OR IGNORE on the snapshot id; only rows that
+  // copy successfully are deleted from team_config. Unparseable rows
+  // are left in place rather than dropped.
+  try {
+    const snapRows = db.prepare("SELECT key, value, updated_by FROM team_config WHERE key LIKE 'config_snapshot_%'").all();
+    if (snapRows.length > 0) {
+      const insertSnap = db.prepare(`
+        INSERT OR IGNORE INTO config_snapshots
+          (id, name, origin, created_at, created_by, app_version,
+           baseline_schema_version, payload, sha256)
+        VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)
+      `);
+      const copiedSnapKeys = [];
+      for (const row of snapRows) {
+        try {
+          const d = JSON.parse(row.value);
+          const snapId = row.key.replace('config_snapshot_', '');
+          if (!snapId) continue;
+          const snapName = (typeof d.name === 'string' && d.name) ? d.name : `Legacy snapshot ${snapId}`;
+          const snapOrigin = snapName === 'Auto-save before revert' ? 'pre-revert' : 'manual';
+          const snapCreatedAt = d.createdAt || new Date().toISOString();
+          const snapCreatedBy = d.createdBy || row.updated_by || null;
+          const snapSha = crypto.createHash('sha256').update(row.value).digest('hex');
+          const result = insertSnap.run(snapId, snapName, snapOrigin, snapCreatedAt, snapCreatedBy, row.value, snapSha);
+          if (result.changes > 0) copiedSnapKeys.push(row.key);
+        } catch (parseErr) {
+          continue;
+        }
+      }
+      if (copiedSnapKeys.length > 0) {
+        console.log(`config_snapshots migration: moved ${copiedSnapKeys.length} snapshot(s) out of team_config`);
+        const deleteSnap = db.prepare("DELETE FROM team_config WHERE key = ?");
+        for (const k of copiedSnapKeys) deleteSnap.run(k);
+      }
+    }
+  } catch (b5d3SnapMigrationErr) {
+    console.error('config_snapshots B5d3 migration FAILED:', b5d3SnapMigrationErr.message);
+    console.error('The server will start, but legacy config snapshots may remain in team_config until the migration is investigated. New snapshots are unaffected.');
   }
 
   // ── R3f migration: MFA enforcement + recovery codes ──────────────────

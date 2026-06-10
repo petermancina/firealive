@@ -3081,7 +3081,8 @@ function ManagementConsole() {
   const [restorePoints, setRestorePoints] = useState([{id:"bk1",type:"daily-auto",createdAt:"2026-03-27 02:00",sizeMB:"2.4",hash:"a3f8c…"},{id:"bk2",type:"daily-auto",createdAt:"2026-03-26 02:00",sizeMB:"2.3",hash:"b7e2d…"}]);
   const [erSources,setErSources]=useState([]); const [erSelSrc,setErSelSrc]=useState(""); const [erBackups,setErBackups]=useState([]); const [erPreview,setErPreview]=useState(null); const [erReason,setErReason]=useState(""); const [erApproval,setErApproval]=useState(null);
   const [bskKeys,setBskKeys]=useState([]); const [bskShowAdd,setBskShowAdd]=useState(false); const [bskPasteText,setBskPasteText]=useState(""); const [bskValidatedFp,setBskValidatedFp]=useState(null); const [bskValidatedPem,setBskValidatedPem]=useState(null); const [bskLabel,setBskLabel]=useState("");
-  const [configSnapshots, setConfigSnaps] = useState([{id:"cs1",name:"Pre-SOAR integration",createdAt:"2026-03-25 14:00"}]);
+  const [configSnapshots, setConfigSnaps] = useState([]); const [cbRetention, setCbRetention] = useState(null); const [cbBusy, setCbBusy] = useState(false); const [cbDiff, setCbDiff] = useState(null);
+  const [gbkKeys, setGbkKeys] = useState([]); const [gbkShowAdd, setGbkShowAdd] = useState(false); const [gbkPasteText, setGbkPasteText] = useState(""); const [gbkValidatedFp, setGbkValidatedFp] = useState(null); const [gbkValidatedPem, setGbkValidatedPem] = useState(null); const [gbkLabel, setGbkLabel] = useState("");
   // v1.0.0 state
   const [regressionResults, setRegressionResults] = useState(null);
   const [regressionRunning, setRegressionRunning] = useState(false);
@@ -3353,6 +3354,85 @@ function ManagementConsole() {
     }
     addA(ty, dt);
   };
+  // ----- Config snapshots + golden baseline (B5d3) -----
+  const loadConfigBaseline = async () => {
+    const r = await api.get("/api/config-baseline");
+    if (r && !r.error) { setConfigSnaps(Array.isArray(r.snapshots) ? r.snapshots : []); setCbRetention(r.retention != null ? r.retention : null); }
+    const k = await api.get("/api/config-baseline/keys");
+    if (k && !k.error) setGbkKeys(Array.isArray(k.keys) ? k.keys : []);
+  };
+  // Obtain a fresh WebAuthn step-up assertion for a sensitive action; returns
+  // the stepup object to place in the request body, or null if cancelled.
+  const getStepUp = async () => {
+    const opt = await api.post("/api/mfa/stepup/options", {});
+    if (!opt || opt.error || !opt.options || !opt.challengeToken) { window.alert("Could not start MFA step-up: " + ((opt && opt.error) || "no challenge issued")); return null; }
+    let cred;
+    try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
+    catch (_e) { return null; }
+    if (!cred) return null;
+    return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
+  };
+  const cbSaveSnapshot = async () => {
+    const name = window.prompt("Snapshot name (optional):");
+    if (name === null) return;
+    setCbBusy(true);
+    const r = await api.post("/api/config-baseline", { name: name || "" });
+    setCbBusy(false);
+    if (!r || r.error) { window.alert("Save failed: " + ((r && r.error) || "unknown error")); addA("CONFIG_SNAPSHOT_SAVE_FAILED", (r && r.error) || ""); return; }
+    addA("CONFIG_SNAPSHOT_SAVED", "id=" + r.id); loadConfigBaseline();
+  };
+  const cbRevert = async (s) => {
+    if (!window.confirm('Revert configuration to "' + s.name + '"? The current configuration is auto-saved first, and this requires an MFA step-up.')) return;
+    const stepup = await getStepUp(); if (!stepup) return;
+    setCbBusy(true);
+    const r = await api.post("/api/config-baseline/" + s.id + "/revert", { stepup });
+    setCbBusy(false);
+    if (!r || r.error) { window.alert("Revert failed: " + ((r && r.error) || "unknown error")); addA("CONFIG_SNAPSHOT_REVERT_FAILED", (r && r.error) || ""); return; }
+    const need = (r.requiresCredentials || []).length;
+    addA("CONFIG_SNAPSHOT_REVERTED", "id=" + s.id + (need ? " (" + need + " need credentials)" : ""));
+    if (need) window.alert("Reverted. " + need + " integration(s) were restored disabled and need their credentials re-entered.");
+    loadConfigBaseline();
+  };
+  const cbDelete = async (s) => {
+    if (!window.confirm('Delete snapshot "' + s.name + '"?')) return;
+    const r = await api.del("/api/config-baseline/" + s.id);
+    if (!r || r.error) { window.alert("Delete failed: " + ((r && r.error) || "unknown error")); return; }
+    addA("CONFIG_SNAPSHOT_DELETED", "id=" + s.id); loadConfigBaseline();
+  };
+  const cbExport = async (s) => {
+    const ok = await api.download("/api/config-baseline/" + s.id + "/export", "firealive-baseline-" + s.id + ".fa-gb1.json");
+    addA(ok ? "CONFIG_SNAPSHOT_EXPORTED" : "CONFIG_SNAPSHOT_EXPORT_FAILED", "id=" + s.id);
+    if (!ok) window.alert("Export failed. Legacy snapshots cannot be exported as a golden baseline.");
+  };
+  const cbShowDiff = async (s) => {
+    const r = await api.get("/api/config-baseline/" + s.id + "/diff");
+    if (!r || r.error) { window.alert("Change report unavailable: " + ((r && r.error) || "unknown error")); return; }
+    setCbDiff({ snapshot: s, diff: r.diff || { added: [], removed: [], changed: [] } });
+  };
+  const cbImport = () => {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const file = input.files && input.files[0]; if (!file) return;
+      let bundle;
+      try { bundle = JSON.parse(await file.text()); }
+      catch (_e) { window.alert("That file is not valid JSON."); return; }
+      if (!bundle || bundle.format !== "FA-GB1" || !bundle.signingKey || !bundle.signingKey.fingerprint) { window.alert("That file is not a FireAlive golden-baseline (FA-GB1) bundle."); return; }
+      const fp = String(bundle.signingKey.fingerprint).slice(0, 16);
+      if (!window.confirm("Import a golden baseline from " + (bundle.instanceLabel || "an unknown instance") + " (app " + (bundle.appVersion || "?") + "), signed by key " + fp + "? The current configuration is auto-saved first, then fully replaced. This requires an MFA step-up.")) return;
+      const stepup = await getStepUp(); if (!stepup) return;
+      setCbBusy(true);
+      const r = await api.post("/api/config-baseline/import", { bundle, stepup });
+      setCbBusy(false);
+      if (!r || r.error) { window.alert("Import rejected (" + ((r && r.code) || "error") + "): " + ((r && r.error) || "unknown error")); addA("CONFIG_SNAPSHOT_IMPORT_FAILED", ((r && r.code) || "") + " " + ((r && r.error) || "")); return; }
+      const need = (r.requiresCredentials || []).length;
+      addA("CONFIG_SNAPSHOT_IMPORTED", "fp=" + fp + (need ? " (" + need + " need credentials)" : ""));
+      window.alert("Baseline imported." + (need ? " " + need + " integration(s) were imported disabled and need credentials re-entered." : "") + " A pre-import snapshot was saved for rollback.");
+      loadConfigBaseline();
+    };
+    input.click();
+  };
+  useEffect(() => { if (tab === "backup") loadConfigBaseline(); }, [tab]);
   const [padlocks, setPadlocks] = useState({});
   const isPadlocked = (section) => configLocked && (padlocks[section] !== false);
 
@@ -6824,13 +6904,61 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div><div style={{display:"flex",gap:6}}><Btn small primary onClick={()=>{const name=window.prompt("Snapshot name:");if(name){setConfigSnaps(prev=>[{id:"cs-"+Date.now(),name,createdAt:new Date().toISOString()},...prev]);addA("CONFIG_SNAPSHOT_SAVED",`"${name}"`);}}}>Save Current</Btn><Btn small onClick={()=>{const data=JSON.stringify({exportType:"firealive_config",version:appVersion||"unknown",exportedAt:new Date().toISOString()},null,2);const blob=new Blob([data],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="firealive-config-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(url);api.post("/api/audit/mc-event",{event_type:"CONFIG_EXPORTED",detail:"Configuration file downloaded"}).then(()=>addA("CONFIG_EXPORTED","Configuration file downloaded"));}}>Export Config</Btn><Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"CHANGE_REPORT",detail:"Configuration change report generated"}).then(()=>addA("CHANGE_REPORT","Configuration change report generated"))}>Change Report</Btn></div></div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configuration Snapshots</div>
+              <div style={{display:"flex",gap:6}}>
+                <Btn small onClick={loadConfigBaseline}>Refresh</Btn>
+                <Btn small primary disabled={cbBusy} onClick={cbSaveSnapshot}>Save Current</Btn>
+                <Btn small disabled={cbBusy} onClick={cbImport}>Import Baseline</Btn>
+              </div>
+            </div>
+            {cbRetention!=null&&(<M style={{color:C.td,display:"block",fontSize:11,marginBottom:8}}>Keeping up to {cbRetention} snapshots; saving past the cap prunes the oldest manual snapshot.</M>)}
+            {configSnapshots.length===0&&(<M style={{color:C.td,display:"block",padding:"8px 0"}}>No snapshots yet. Save the current configuration to create one.</M>)}
             {configSnapshots.map(s=>(
-              <div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <div><M style={{color:C.t}}>{s.name}</M><br/><M style={{color:C.td}}>{s.createdAt}</M></div>
-                <Btn small onClick={()=>{if(window.confirm(`Revert to "${s.name}"? Current config will be auto-saved first.`)){addA("CONFIG_REVERTED",`Reverted to "${s.name}"`);}}}>Revert</Btn>
+              <div key={s.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <M style={{color:C.t}}>{s.name||"(unnamed)"}</M>
+                  {s.origin&&s.origin!=="manual"&&(<span style={{marginLeft:6}}><Badge color={C.w}>{s.origin.toUpperCase()}</Badge></span>)}
+                  <br/><M style={{color:C.td}}>{s.createdAt}{s.secretsPresent?"  includes integrations":""}</M>
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn small onClick={()=>cbShowDiff(s)}>Change Report</Btn>
+                  <Btn small onClick={()=>cbExport(s)}>Export</Btn>
+                  <Btn small disabled={cbBusy} onClick={()=>cbRevert(s)}>Revert</Btn>
+                  <Btn small danger onClick={()=>cbDelete(s)}>Delete</Btn>
+                </div>
               </div>
             ))}
+          </Card>
+          {cbDiff&&(
+          <Card style={{marginBottom:16,borderColor:C.i+"40"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Change Report: current vs "{cbDiff.snapshot.name}"</div>
+              <Btn small onClick={()=>setCbDiff(null)}>Close</Btn>
+            </div>
+            {cbDiff.diff.added.length===0&&cbDiff.diff.removed.length===0&&cbDiff.diff.changed.length===0&&(<M style={{color:C.g,display:"block"}}>No differences. The current configuration matches this snapshot.</M>)}
+            {cbDiff.diff.changed.map((d,i)=>(<div key={"c"+i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.w,fontFamily:"monospace",fontSize:11}}>changed {d.path}</M><br/><M style={{color:C.td,fontSize:11}}>now {String(d.current)} -- baseline {String(d.baseline)}</M></div>))}
+            {cbDiff.diff.added.map((d,i)=>(<div key={"a"+i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.g,fontFamily:"monospace",fontSize:11}}>added {d.path}</M><br/><M style={{color:C.td,fontSize:11}}>baseline {String(d.baseline)}</M></div>))}
+            {cbDiff.diff.removed.map((d,i)=>(<div key={"r"+i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.r,fontFamily:"monospace",fontSize:11}}>removed {d.path}</M><br/><M style={{color:C.td,fontSize:11}}>now {String(d.current)}</M></div>))}
+          </Card>)}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:600,color:"#9c5cff"}}>Trusted Baseline Signing Keys</div>
+              <Btn small onClick={loadConfigBaseline}>Refresh</Btn>
+            </div>
+            <M style={{color:C.tm,display:"block",fontSize:11,marginBottom:10,lineHeight:1.5}}>Register another deployment's report-signing public key to verify and import golden baselines exported by it. Confirm the fingerprint out-of-band before registering.</M>
+            {gbkKeys.length>0&&(<div style={{maxHeight:280,overflowY:"auto",border:`1px solid ${C.b}`,borderRadius:6,marginBottom:10}}>{gbkKeys.map((k,i)=>(<div key={k.id} style={{padding:"10px 12px",borderTop:i===0?"none":`1px solid ${C.b}`,display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",gap:6,marginBottom:4,flexWrap:"wrap"}}><Badge color={k.keyOrigin==="local-generated"?C.d:"#9c5cff"}>{k.keyOrigin==="local-generated"?"LOCAL":"EXTERNAL"}</Badge>{k.isActive&&(<Badge color={C.g}>ACTIVE</Badge>)}{k.rotatedOutAt&&(<Badge color={C.r}>{k.keyOrigin==="local-generated"?"ROTATED OUT":"REVOKED"}</Badge>)}</div><M style={{color:C.t,fontSize:11,fontFamily:"monospace",wordBreak:"break-all"}}>fp {k.publicKeyFingerprint||"(none)"}</M>{k.keyLabel&&(<M style={{color:C.tm,display:"block",fontSize:11,marginTop:2}}>{k.keyLabel}</M>)}<M style={{color:C.td,display:"block",fontSize:11,marginTop:2}}>id {k.id}{k.registeredByUserId?"  registered by "+k.registeredByUserId+" at "+k.registeredAt:""}</M></div>{k.keyOrigin==="external-registered"&&!k.rotatedOutAt&&(<Btn small danger onClick={async()=>{if(window.confirm("Revoke external key id "+k.id+"? After revocation, baselines signed by this key can no longer be imported. Fingerprint "+k.publicKeyFingerprint)){const r=await api.del("/api/config-baseline/keys/"+k.id);if(r&&r.error){window.alert("Revoke failed: "+r.error);return;}addA("BASELINE_KEY_REVOKED","id="+k.id);loadConfigBaseline();}}}>Revoke</Btn>)}</div>))}</div>)}
+            {!gbkShowAdd&&(<Btn small onClick={()=>setGbkShowAdd(true)}>Register External Key</Btn>)}
+            {gbkShowAdd&&(<div style={{marginTop:6}}>
+              <textarea value={gbkPasteText} onChange={e=>{setGbkPasteText(e.target.value);setGbkValidatedFp(null);setGbkValidatedPem(null);}} placeholder="Paste the PEM public key" style={{width:"100%",minHeight:90,fontFamily:"monospace",fontSize:11,background:"rgba(0,0,0,0.3)",color:C.t,border:`1px solid ${C.b}`,borderRadius:4,padding:8,boxSizing:"border-box"}}/>
+              <input value={gbkLabel} onChange={e=>setGbkLabel(e.target.value)} placeholder="Label (optional)" style={{width:"100%",marginTop:8,fontSize:12,background:"rgba(0,0,0,0.3)",color:C.t,border:`1px solid ${C.b}`,borderRadius:4,padding:"8px 10px",boxSizing:"border-box"}}/>
+              {gbkValidatedFp&&(<div style={{marginTop:8,padding:10,background:"rgba(0,0,0,0.3)",border:`1px solid ${C.g}40`,borderRadius:4}}><M style={{color:C.tm,display:"block",fontSize:11,marginBottom:4}}>Computed fingerprint (confirm out-of-band before registering):</M><M style={{color:C.g,fontFamily:"monospace",fontSize:12,wordBreak:"break-all"}}>{gbkValidatedFp}</M></div>)}
+              <div style={{display:"flex",gap:6,marginTop:8}}>
+                {!gbkValidatedFp&&(<Btn small disabled={!gbkPasteText.trim()} onClick={async()=>{const r=await api.post("/api/config-baseline/keys/validate",{public_key_pem:gbkPasteText});if(r&&r.error){window.alert("Validation failed: "+r.error);return;}setGbkValidatedFp(r.publicKeyFingerprint);setGbkValidatedPem(r.publicKeyPem);}}>Validate and Show Fingerprint</Btn>)}
+                {gbkValidatedFp&&(<Btn small primary onClick={async()=>{if(!window.confirm("Register this public key? Fingerprint "+gbkValidatedFp+". Only proceed if you have confirmed it matches the originating deployment out-of-band.")){return;}const r=await api.post("/api/config-baseline/keys",{public_key_pem:gbkValidatedPem,key_label:gbkLabel||null});if(r&&r.error){window.alert("Registration failed: "+r.error);return;}addA("BASELINE_KEY_REGISTERED","id="+r.id);setGbkShowAdd(false);setGbkPasteText("");setGbkValidatedFp(null);setGbkValidatedPem(null);setGbkLabel("");loadConfigBaseline();}}>Confirm and Register</Btn>)}
+                <Btn small onClick={()=>{setGbkShowAdd(false);setGbkPasteText("");setGbkValidatedFp(null);setGbkValidatedPem(null);setGbkLabel("");}}>Cancel</Btn>
+              </div>
+            </div>)}
           </Card>
         </div>)}
 

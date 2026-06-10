@@ -1164,6 +1164,63 @@ class RegressionRunner {
       return 'weeklyScheduledHours sums durations (5x 8h -> 40.0h); inverted/invalid slots -> 0; localWallClockToUtc resolves a UTC Date for the after-hours fold';
     });
 
+    // ── Golden baseline + config snapshots (B5d3) ──
+    await check('golden-baseline', 'config_snapshots table + retention seed', () => {
+      const gb = require('./golden-baseline');
+      if (!tableExists('config_snapshots')) throw new Error('missing config_snapshots table');
+      const row = this.db.prepare('SELECT value FROM config WHERE key = ?').get(gb.RETENTION_CONFIG_KEY);
+      if (!row) throw new Error('retention seed (' + gb.RETENTION_CONFIG_KEY + ') missing from config');
+      const ret = gb.readRetention(this.db);
+      if (!Number.isInteger(ret) || ret < 1) throw new Error('readRetention returned an invalid value: ' + ret);
+      return 'config_snapshots present; retention=' + ret;
+    });
+    await check('golden-baseline', 'captureBaseline produces a deterministic digest', () => {
+      const gb = require('./golden-baseline');
+      const a = gb.captureBaseline(this.db).sha256;
+      const b = gb.captureBaseline(this.db).sha256;
+      if (a !== b) throw new Error('two captures of the same config produced different digests');
+      if (!/^[0-9a-f]{64}$/.test(a)) throw new Error('digest is not 64 hex chars: ' + a);
+      return 'stable digest ' + a.slice(0, 12);
+    });
+    await check('golden-baseline', 'baseline allowlist tables exist', () => {
+      const gb = require('./golden-baseline');
+      const missing = gb.TABLE_SECTIONS.map(s => s.table).filter(t => !tableExists(t));
+      if (missing.length) throw new Error('allowlist references missing table(s): ' + missing.join(', '));
+      return gb.TABLE_SECTIONS.length + ' allowlisted section table(s) present';
+    });
+    await check('golden-baseline', 'baseline domain covers sla + notification config', () => {
+      const gb = require('./golden-baseline');
+      const secTables = gb.TABLE_SECTIONS.map(s => s.table);
+      const missing = ['sla_config', 'notification_config'].filter(t => !secTables.includes(t));
+      if (missing.length) throw new Error('revert/import domain is missing: ' + missing.join(', '));
+      return 'sla_config + notification_config are in the revert/import domain';
+    });
+    await check('golden-baseline', 'import scan fails closed without a scanner', async () => {
+      const { IntegrationManager } = require('./integration-manager');
+      const enabled = this.db.prepare('SELECT COUNT(*) AS n FROM malware_scanner_integrations WHERE enabled = 1').get().n;
+      if (enabled > 0) return SKIP('a malware scanner is enabled; the no-scanner path is not exercised here');
+      const mgr = new IntegrationManager(this.db);
+      const r = await mgr.inspectFile('{}', 'probe.json', 'application/json', { scanMode: 'all_configured' });
+      if (!r.skipped) throw new Error('expected skipped=true so the import route returns MALWARE_SCANNER_REQUIRED');
+      return 'no scanner -> inspectFile skipped (import gate fails closed)';
+    });
+    await check('golden-baseline', 'baseline export sign / fingerprint-verify round-trip', () => {
+      const rk = require('./report-signing-keys');
+      const { sha256Hex } = require('./report-signer');
+      rk.ensureActiveReportKeypair(this.db);
+      const digest = Buffer.from(sha256Hex('golden-baseline-regression-probe'), 'hex');
+      const signed = rk.signReportDigest(this.db, digest);
+      if (!rk.verifyReportDigest(this.db, digest, signed.signature, signed.keyFingerprint)) {
+        throw new Error('a freshly produced signature failed to verify');
+      }
+      const tampered = Buffer.from(signed.signature);
+      tampered[0] = tampered[0] ^ 0xff;
+      if (rk.verifyReportDigest(this.db, digest, tampered, signed.keyFingerprint)) {
+        throw new Error('a tampered signature verified');
+      }
+      return 'sign + verify-by-fingerprint ok; tamper rejected (' + signed.keyFingerprint.slice(0, 12) + ')';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

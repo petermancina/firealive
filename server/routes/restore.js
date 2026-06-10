@@ -1552,95 +1552,13 @@ router.post('/execute-chain/:id', async (req, res) => {
   }
 });
 
-// ── Configuration Snapshots ──────────────────────────────────────────────────
+// ── Configuration Snapshots (moved) ──
 //
-// Unchanged from v1.0.29. Config snapshots are orthogonal to backup
-// format and stay the same shape across the v1 -> v2 transition.
-// The R3d-4 approval gate is NOT applied here; see scope note in the
-// file header.
-router.get('/configs', (req, res) => {
-  try {
-    const db = getDb();
-    const rows = db.prepare("SELECT key, value FROM team_config WHERE key LIKE 'config_snapshot_%' ORDER BY key DESC").all();
-    db.close();
-    const snapshots = rows.map(r => { try { const d = JSON.parse(r.value); return { id: r.key.replace('config_snapshot_', ''), name: d.name, createdAt: d.createdAt }; } catch { return null; } }).filter(Boolean);
-    res.json({ snapshots });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to list config snapshots' });
-  }
-});
-
-router.post('/config-save', (req, res) => {
-  const { name } = req.body;
-  if (!name || name.length > 100) return res.status(400).json({ error: 'name required (max 100 chars)' });
-
-  try {
-    const db = getDb();
-    const allConfig = db.prepare("SELECT key, value FROM team_config WHERE key NOT LIKE 'config_snapshot_%' AND key NOT LIKE 'pending_user_%' AND key NOT LIKE 'lockout_%' AND key NOT LIKE 'reset_%' AND key NOT LIKE 'peer_request_%' AND key NOT LIKE 'peer_session_%'").all();
-    const reportConfig = db.prepare('SELECT * FROM report_config WHERE id = ?').get('default');
-    const slaConfig = db.prepare('SELECT * FROM sla_config WHERE id = ?').get('default');
-    const notifConfig = db.prepare('SELECT * FROM notification_config WHERE id = ?').get('default');
-
-    const id = Date.now().toString(36);
-    const snapshot = {
-      name: name.slice(0, 100),
-      createdAt: new Date().toISOString(),
-      createdBy: req.user.id,
-      teamConfig: allConfig,
-      reportConfig,
-      slaConfig,
-      notifConfig,
-    };
-
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(`config_snapshot_${id}`, JSON.stringify(snapshot), req.user.id);
-    db.close();
-
-    auditLog(req.user.id, 'CONFIG_SNAPSHOT_SAVED', `name="${name}"`, req.ip);
-    res.status(201).json({ id, name });
-  } catch (err) {
-    logger.error('Save config snapshot error', { error: err.message });
-    res.status(500).json({ error: 'Failed to save config snapshot' });
-  }
-});
-
-router.post('/config-revert/:id', (req, res) => {
-  try {
-    const db = getDb();
-    const row = db.prepare("SELECT value FROM team_config WHERE key = ?").get(`config_snapshot_${req.params.id}`);
-    if (!row) { db.close(); return res.status(404).json({ error: 'Snapshot not found' }); }
-
-    const snapshot = JSON.parse(row.value);
-
-    // Save current state first
-    const currentId = Date.now().toString(36);
-    const currentConfig = db.prepare("SELECT key, value FROM team_config WHERE key NOT LIKE 'config_snapshot_%'").all();
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(
-      `config_snapshot_${currentId}`,
-      JSON.stringify({ name: 'Auto-save before revert', createdAt: new Date().toISOString(), createdBy: req.user.id, teamConfig: currentConfig }),
-      req.user.id
-    );
-
-    // Restore team_config entries
-    for (const { key, value } of snapshot.teamConfig) {
-      if (key.startsWith('config_snapshot_')) continue;
-      db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(key, value, req.user.id);
-    }
-
-    // Restore report/SLA/notification configs
-    if (snapshot.reportConfig) {
-      db.prepare("INSERT OR REPLACE INTO report_config (id, schedule, day_of_week, time_of_day, format, recipients, siem_feed, sections) VALUES ('default', ?, ?, ?, ?, ?, ?, ?)").run(
-        snapshot.reportConfig.schedule, snapshot.reportConfig.day_of_week, snapshot.reportConfig.time_of_day,
-        snapshot.reportConfig.format, snapshot.reportConfig.recipients, snapshot.reportConfig.siem_feed, snapshot.reportConfig.sections
-      );
-    }
-
-    db.close();
-    auditLog(req.user.id, 'CONFIG_REVERTED', `to snapshot "${snapshot.name}" (${req.params.id})`, req.ip);
-    res.json({ ok: true, revertedTo: snapshot.name, autoSavedAs: currentId });
-  } catch (err) {
-    logger.error('Config revert error', { error: err.message });
-    res.status(500).json({ error: 'Failed to revert config' });
-  }
-});
+// The configuration snapshot endpoints that used to live here
+// (GET /configs, POST /config-save, POST /config-revert/:id) were
+// superseded in Phase B5d3 by routes/config-baseline.js, mounted at
+// /api/config-baseline. That is the single canonical surface: snapshot
+// list/save/diff/revert/delete plus signed FA-GB1 export/import and the
+// trusted-key endpoints.
 
 module.exports = router;

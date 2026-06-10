@@ -22,7 +22,11 @@ const { getDb } = require('../db/init');
 const { sanitize } = require('./content-sanitizer');
 const { IntegrationManager } = require('./integration-manager');
 
-async function runUploadScans(content, fileName, fileType) {
+// opts (optional): { scanMode } - forwarded to layer 2 (inspectFile) to
+// override the deployment's malware scan mode for this upload. The golden-
+// baseline import passes { scanMode: 'all_configured' } so every configured
+// scanner must clear it; omit opts for the default behavior.
+async function runUploadScans(content, fileName, fileType, opts = {}) {
   // Layer 1 — sanitizer (sync, deterministic, network-free)
   const layer1 = sanitize(content, { fileName, fileType });
   if (!layer1.clean) {
@@ -36,7 +40,7 @@ async function runUploadScans(content, fileName, fileType) {
   let layer2;
   try {
     const mgr = new IntegrationManager(db);
-    layer2 = await mgr.inspectFile(content, fileName, fileType);
+    layer2 = await mgr.inspectFile(content, fileName, fileType, opts);
   } finally {
     db.close();
   }

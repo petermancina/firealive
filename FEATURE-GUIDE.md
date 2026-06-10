@@ -948,6 +948,43 @@ The external mode is for compromise recovery. If an AC, MC, or GD has been compr
 1. Verifies integrity of the external backup, executes restore
 1. System rebuilds from the trusted external backup with original configurations, integrations, and data
 
+### Configuration Snapshots & Golden Baseline
+
+**What it’s for:** Capture the management console’s entire configuration as a named snapshot, roll back to an earlier one, and move a known-good configuration between deployments. A snapshot covers the team’s settings, SLA and notification policy, scheduling, reporting, and which integrations are configured — but never any secrets. API keys, credentials, and signing-key material are deliberately left out.
+
+**Snapshots and rollback.**
+
+1. The lead opens the Backup tab and finds the Configuration Snapshots card
+1. **Save Current** captures the live configuration as a named snapshot
+1. **Change Report** shows exactly what differs between the current configuration and any snapshot
+1. **Revert** rolls the configuration back to a snapshot; the current configuration is automatically saved first, so a revert is itself reversible, and the action requires an MFA step-up
+1. Older snapshots are pruned automatically once the retention limit is reached
+
+Because secrets are never stored in a snapshot, reverting restores every setting but leaves any affected integration disabled until its credentials are re-entered — the console says which ones.
+
+**Golden baseline (moving a configuration between deployments).** A snapshot can be exported as a single signed baseline file, and a freshly installed or sister deployment can import that file to adopt the same configuration.
+
+1. **Export** downloads the snapshot as a signed baseline file
+1. On the receiving deployment, the lead first registers the originating deployment’s signing key (see Trusted Baseline Signing Keys, below)
+1. **Import Baseline** selects the file; the console confirms where it came from, then requires an MFA step-up
+1. The file is scanned for malware, its signature is verified against the registered key, and the configuration is validated before anything is applied — any failure stops the import with a clear reason
+1. The current configuration is auto-saved first, then fully replaced; as with revert, integrations come back disabled until their credentials are re-entered
+
+An import is refused unless a malware scanner is configured, the file’s signature matches a key the lead has explicitly trusted, and the file is intact. A tampered or untrusted file cannot be applied.
+
+### Trusted Baseline Signing Keys
+
+**What it’s for:** Establish trust in another deployment’s signing key so its golden baselines can be imported. This is a deliberate, one-time decision per partner deployment.
+
+**Workflow:**
+
+1. Obtain the originating deployment’s signing-key fingerprint through a trusted out-of-band channel, not from the baseline file itself
+1. In the Trusted Baseline Signing Keys card, paste that deployment’s public key and choose **Validate** to see the fingerprint the console computes
+1. Confirm the computed fingerprint matches the one obtained out of band, then **Register** it
+1. Baselines signed by that key can now be imported; revoking the key later immediately stops any further baselines signed by it from being imported
+
+Keys are shown with their origin (local or external) and status, so the lead can see at a glance which external deployments are trusted.
+
 ### Data Sovereignty / Geo-Fencing
 
 **What it’s for:** Multinational SOC support. Each analyst client gets a country tag and the regulatory framework that applies (GDPR, PIPEDA, LGPD, etc.). Enforces data residency, blocks logins from unexpected countries, applies the right framework to that client’s data.

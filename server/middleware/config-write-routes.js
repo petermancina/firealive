@@ -47,6 +47,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/ai-provider',
   '/api/iam',
   '/api/cloud-vuln',
+  '/api/config-baseline',  // snapshots + golden-baseline (mount-gated to cover the :id routes)
 ];
 
 // Exact config-write endpoints inside the mixed feature routers (v021-v030).
