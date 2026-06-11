@@ -17,6 +17,8 @@ const ALLOWED_CHANNELS = [
   'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:interpret', 'burnout:interpretOverall',
   // B5d4: per-client recovery + fleet ops
   'clientop:run', 'recovery:wipeLocal', 'burnout:recoverAndRewrap',
+  // B5e: AC-side anti-cloning ratchet (present + check server ratchet)
+  'anticlone:ratchetState', 'anticlone:recordRatchet',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
