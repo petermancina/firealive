@@ -234,6 +234,15 @@ router.put('/sync-interval/config', (req, res) => {
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('sync_interval_config', ?)").run(JSON.stringify(req.body));
     auditLog(req.user?.id || 'system', 'SYNC_INTERVAL_UPDATED', `Interval: ${req.body.intervalMin}min, adaptive: ${req.body.adaptiveSync}`);
     db.close();
+    // B5d4: push the new cadence to every connected analyst client so the
+    // refresh timer updates live (the on-connect push lives in the WS auth
+    // handler). Best-effort; the config is already persisted.
+    try {
+      const wsServer = req.app && req.app.locals && req.app.locals.wsServer;
+      if (wsServer && typeof wsServer.broadcastSyncCadence === 'function') {
+        wsServer.broadcastSyncCadence(req.body);
+      }
+    } catch (refreshErr) { /* non-fatal */ }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save sync interval config' }); }
 });

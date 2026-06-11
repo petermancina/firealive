@@ -3372,6 +3372,61 @@ function ManagementConsole() {
     if (!cred) return null;
     return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
   };
+  // ── B5d4: fleet operations + per-client recovery ────────────────────────────
+  // Real dispatch + signed-result readback (client_ops_*) and the admin recovery
+  // surface (/api/client-recovery, MFA step-up via getStepUp). Identity is
+  // pseudonym-only throughout.
+  const loadFleetRuns = async () => {
+    const r = await api.get("/api/client-ops/runs");
+    if (!r || r.error) return;
+    const runs = Array.isArray(r.runs) ? r.runs : [];
+    if (runs.length === 0) { setLastFleetRun(null); setClientMetrics([]); return; }
+    setLastFleetRun(runs[0]);
+    const d = await api.get("/api/client-ops/runs/" + runs[0].id);
+    if (d && !d.error) setClientMetrics(Array.isArray(d.results) ? d.results : []);
+  };
+  const dispatchFleetOp = async (opType, label) => {
+    setFleetBusy(true);
+    const r = await api.post("/api/client-ops/dispatch", { op_type: opType, targets: "all" });
+    setFleetBusy(false);
+    if (r && !r.error) {
+      addA("CLIENT_OP_DISPATCHED", (label || opType) + " dispatched to " + (r.targetCount || 0) + " client(s), " + (r.dispatched || 0) + " online");
+      setTimeout(loadFleetRuns, 1500);
+    } else {
+      addA("CLIENT_OP_FAILED", (label || opType) + " dispatch failed: " + ((r && r.error) || "unknown"));
+    }
+  };
+  const loadRecoveryClients = async () => {
+    const r = await api.get("/api/client-recovery/connected");
+    if (r && !r.error) setRecoveryClients({ initialized: !!r.initialized, clients: Array.isArray(r.clients) ? r.clients : [] });
+  };
+  const doTeardown = async (client) => {
+    const label = client.pseudonym || "this client";
+    if (!window.confirm("Tear down " + label + "? This revokes its certificates, retires its device key, and deletes its passkey. The analyst's wellbeing data is preserved and recoverable on re-provision. This cannot be undone.")) return;
+    const stepup = await getStepUp(); if (!stepup) return;
+    const r = await api.post("/api/client-recovery/teardown", { userId: client.userId, reason: "manual MC teardown", stepup });
+    if (r && !r.error) {
+      addA("AC_TEARDOWN", "Tore down " + label + " (certs " + (r.certsRevoked || 0) + ", passkey " + (r.passkeysDeleted || 0) + ", wipe " + (r.wipeDispatched ? "sent" : "queued") + ")");
+      loadRecoveryClients();
+    } else {
+      window.alert("Tear down failed: " + ((r && r.error) || "unknown"));
+      addA("AC_TEARDOWN_FAILED", label + ": " + ((r && r.error) || "unknown"));
+    }
+  };
+  const doReprovision = async (client) => {
+    const label = client.pseudonym || "this client";
+    const stepup = await getStepUp(); if (!stepup) return;
+    const r = await api.post("/api/client-recovery/reprovision", { userId: client.userId, stepup });
+    if (r && !r.error && r.enrollmentToken) {
+      setReprovInfo({ pseudonym: label, token: r.enrollmentToken, expiresAt: r.expiresAt || null });
+      addA("AC_REPROVISION_TOKEN_ISSUED", "Issued re-provision token for " + label + " (expires " + (r.expiresAt || "soon") + ")");
+      loadRecoveryClients();
+    } else {
+      window.alert("Re-provision failed: " + ((r && r.error) || "unknown"));
+      addA("AC_REPROVISION_FAILED", label + ": " + ((r && r.error) || "unknown"));
+    }
+  };
+  useEffect(() => { if (tab === "monitoring") { loadFleetRuns(); loadRecoveryClients(); } }, [tab]);
   const cbSaveSnapshot = async () => {
     const name = window.prompt("Snapshot name (optional):");
     if (name === null) return;
@@ -3745,14 +3800,13 @@ function ManagementConsole() {
   const [riskRegisterOutput, setRiskRegisterOutput] = useState(null);
   // ── v1.0.0 CONTINUED — Cross-app management state ────────────────────
   // Client runtime metrics aggregation
-  const [clientMetrics, setClientMetrics] = useState([
-    {id:"jordan-p-ws",cpu:8,memMB:120,heapMB:72,uptime:28800,status:"healthy",lastSync:"2026-04-10T14:00:00Z",logIntegrity:"ok"},
-    {id:"priya-s-ws",cpu:12,memMB:145,heapMB:89,uptime:28800,status:"healthy",lastSync:"2026-04-10T14:02:00Z",logIntegrity:"ok"},
-    {id:"alex-k-ws",cpu:22,memMB:198,heapMB:134,uptime:28800,status:"warning",lastSync:"2026-04-10T14:01:00Z",logIntegrity:"ok"},
-    {id:"maya-c-ws",cpu:6,memMB:110,heapMB:68,uptime:28800,status:"healthy",lastSync:"2026-04-10T14:03:00Z",logIntegrity:"ok"},
-    {id:"fatima-a-ws",cpu:9,memMB:130,heapMB:78,uptime:28800,status:"healthy",lastSync:"2026-04-10T14:00:30Z",logIntegrity:"ok"},
-    {id:"sam-r-ws",cpu:15,memMB:155,heapMB:95,uptime:28800,status:"healthy",lastSync:"2026-04-10T13:59:00Z",logIntegrity:"ok"},
-  ]);
+  // B5d4: fleet operations + per-client recovery state. clientMetrics now holds
+  // the latest fleet-op run's per-client signed results (was mock data).
+  const [clientMetrics, setClientMetrics] = useState([]);
+  const [lastFleetRun, setLastFleetRun] = useState(null);
+  const [fleetBusy, setFleetBusy] = useState(false);
+  const [recoveryClients, setRecoveryClients] = useState({ initialized: false, clients: [] });
+  const [reprovInfo, setReprovInfo] = useState(null);
   // Client log collection
   const [clientLogCollection, setClientLogCollection] = useState({autoCollect:true,intervalMin:15,destinations:["server","siem"],collectAudit:true,collectForensics:true,collectRuntime:true});
   // Client backup triggering
@@ -6775,30 +6829,57 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {connectedClients.clients.length===0 && <M style={{color:C.tm,fontStyle:"italic"}}>No clients connected.</M>}
             </div>}
           </Card>
-          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Client Metrics</div>
+          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Per-Client Recovery</div>
           <Card>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
+              <M style={{color:C.td,lineHeight:1.5}}>Tear down a compromised client (revoke certs, retire device key, delete passkey; the analyst's wellbeing data is preserved and recoverable on re-provision) or issue a one-time re-provision token. Admin only; each action requires an MFA step-up. Identity is pseudonym-only.</M>
+              <Btn small onClick={loadRecoveryClients}>Refresh</Btn>
+            </div>
+            {reprovInfo&&<div style={{padding:"10px 12px",background:"rgba(110,231,183,0.06)",border:"1px solid "+C.a+"40",borderRadius:8,marginBottom:10}}>
+              <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:4}}>Re-provision token for {reprovInfo.pseudonym}</M>
+              <div style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:C.t,wordBreak:"break-all",marginBottom:4}}>{reprovInfo.token}</div>
+              <M style={{color:C.td}}>Shown once. Deliver to the analyst out of band{reprovInfo.expiresAt?(" - expires "+new Date(reprovInfo.expiresAt).toLocaleString()):""}. <span style={{cursor:"pointer",color:C.i}} onClick={()=>setReprovInfo(null)}>Dismiss</span></M>
+            </div>}
+            {!recoveryClients.initialized&&<M style={{color:C.tm,fontStyle:"italic"}}>Real-time sessions unavailable (WebSocket server not initialized).</M>}
+            {recoveryClients.initialized&&recoveryClients.clients.length===0&&<M style={{color:C.tm,fontStyle:"italic"}}>No analyst clients connected.</M>}
+            {recoveryClients.initialized&&recoveryClients.clients.length>0&&<div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>{["Analyst","Session","Actions"].map(h=><th key={h} style={{padding:"6px",textAlign:"left",color:C.td,fontWeight:500}}>{h}</th>)}</tr></thead>
+                <tbody>{recoveryClients.clients.map((c,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.b}`}}>
+                    <td style={{padding:"6px",color:C.t}}>{c.pseudonym||"(unmapped)"}</td>
+                    <td style={{padding:"6px"}}><Badge color={c.isAlive?C.a:C.w}>{c.isAlive?"alive":"stale"}</Badge></td>
+                    <td style={{padding:"6px"}}><div style={{display:"flex",gap:6}}><Btn small danger onClick={()=>doTeardown(c)}>Tear Down</Btn><Btn small onClick={()=>doReprovision(c)}>Re-provision</Btn></div></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>}
+          </Card>
+          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Fleet Operations</div>
+          <Card>
+            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+              <Btn small primary disabled={fleetBusy} onClick={()=>dispatchFleetOp("refresh_metrics","Refresh metrics")}>Refresh Metrics</Btn>
+              <Btn small disabled={fleetBusy} onClick={()=>dispatchFleetOp("log_integrity","Log integrity check")}>Log Integrity Check</Btn>
+              <Btn small disabled={fleetBusy} onClick={()=>dispatchFleetOp("regression","Regression test")}>Regression Test (All)</Btn>
+              <Btn small disabled={fleetBusy} onClick={()=>dispatchFleetOp("vuln_scan","Vulnerability scan")}>Vuln Scan (All)</Btn>
+              <Btn small onClick={loadFleetRuns}>Refresh Results</Btn>
+            </div>
+            {lastFleetRun&&<M style={{color:C.td,display:"block",marginBottom:8}}>Last run: {lastFleetRun.op_type} - {lastFleetRun.status} ({lastFleetRun.completed_count||0}/{lastFleetRun.target_count||0} reported{lastFleetRun.unreachable_count?(", "+lastFleetRun.unreachable_count+" offline"):""})</M>}
             <div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:"'IBM Plex Mono',monospace"}}>
-                <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>{["Client","CPU","Mem","Status","Log Integrity","Last Sync"].map(h=><th key={h} style={{padding:"6px",textAlign:"left",color:C.td,fontWeight:500}}>{h}</th>)}</tr></thead>
-                <tbody>{clientMetrics.map(cm=>(
-                  <tr key={cm.id} style={{borderBottom:`1px solid ${C.b}`}}>
-                    <td style={{padding:"6px",color:C.t}}>{cm.id}</td>
-                    <td style={{padding:"6px",color:cm.cpu>50?C.d:cm.cpu>25?C.w:C.a}}>{cm.cpu}%</td>
-                    <td style={{padding:"6px",color:C.tm}}>{cm.memMB}MB</td>
-                    <td style={{padding:"6px"}}><Badge color={cm.status==="healthy"?C.a:C.w}>{cm.status}</Badge></td>
-                    <td style={{padding:"6px"}}><Badge color={cm.logIntegrity==="ok"?C.a:C.d}>{cm.logIntegrity}</Badge></td>
-                    <td style={{padding:"6px",color:C.td}}>{new Date(cm.lastSync).toLocaleTimeString()}</td>
+                <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>{["Analyst","Op","Status","Signature","Reported"].map(h=><th key={h} style={{padding:"6px",textAlign:"left",color:C.td,fontWeight:500}}>{h}</th>)}</tr></thead>
+                <tbody>{clientMetrics.map((cm,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.b}`}}>
+                    <td style={{padding:"6px",color:C.t}}>{cm.pseudonym_at_op||"(unmapped)"}</td>
+                    <td style={{padding:"6px",color:C.tm}}>{cm.op_type}</td>
+                    <td style={{padding:"6px"}}><Badge color={cm.status==="ok"||cm.status==="ack"?C.a:cm.status==="warning"?C.w:C.d}>{cm.status}</Badge></td>
+                    <td style={{padding:"6px"}}>{cm.status==="ack"?<M style={{color:C.td}}>n/a</M>:<Badge color={cm.signature_verified?C.a:C.d}>{cm.signature_verified?"verified":"unverified"}</Badge>}</td>
+                    <td style={{padding:"6px",color:C.td}}>{cm.received_at?new Date(cm.received_at).toLocaleTimeString():"-"}</td>
                   </tr>
                 ))}</tbody>
               </table>
             </div>
-            <div style={{display:"flex",gap:8,marginTop:12,flexWrap:"wrap"}}>
-              <Btn small primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"CLIENT_METRICS_REFRESH",detail:"Refreshed metrics from all clients"}).then(()=>addA("CLIENT_METRICS_REFRESH","Refreshed metrics from all clients"))}>Refresh All</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"LOG_INTEGRITY_ALL",detail:"Log integrity check triggered on all clients"}).then(()=>addA("LOG_INTEGRITY_ALL","Log integrity check triggered on all clients"))}>Log Integrity Check</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"REGRESSION_ALL_CLIENTS",detail:"Regression tests triggered on all clients"}).then(()=>addA("REGRESSION_ALL_CLIENTS","Regression tests triggered on all clients"))}>Regression Test (All)</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"VULN_SCAN_ALL_CLIENTS",detail:"Vulnerability scan triggered on all clients"}).then(()=>addA("VULN_SCAN_ALL_CLIENTS","Vulnerability scan triggered on all clients"))}>Vuln Scan (All)</Btn>
-              <Btn small onClick={()=>api.post("/api/audit/mc-event",{event_type:"BACKUP_ALL_CLIENTS",detail:"Backup triggered on all clients"}).then(()=>addA("BACKUP_ALL_CLIENTS","Backup triggered on all clients"))}>Backup All Clients</Btn>
-            </div>
+            {clientMetrics.length===0&&<M style={{color:C.tm,fontStyle:"italic",display:"block",marginTop:8}}>No results yet. Dispatch a fleet operation; connected clients return signed results within a moment.</M>}
           </Card>
           <Card style={{marginTop:12}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Cross-App Log Collection & Update Push</div>
@@ -6809,7 +6890,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </Sel>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}><input type="checkbox" checked={updatePushCfg.requireLabTest} onChange={e=>setUpdatePushCfg(prev=>({...prev,requireLabTest:e.target.checked}))}/><M style={{color:C.t}}>Require lab testing before production push</M></label>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}><input type="checkbox" checked={updatePushCfg.rollbackOnFail} onChange={e=>setUpdatePushCfg(prev=>({...prev,rollbackOnFail:e.target.checked}))}/><M style={{color:C.t}}>Auto-rollback if health check fails post-update</M></label>
-            <Btn primary style={{marginTop:8}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"UPDATE_PUSH",detail:"Update push initiated to all clients — staggered deployment"}).then(()=>addA("UPDATE_PUSH","Update push initiated to all clients — staggered deployment"))}>Push Update to All Clients</Btn>
+            <Btn primary style={{marginTop:8}} disabled={fleetBusy} onClick={()=>dispatchFleetOp("update_push","Update push")}>Push Update to All Clients</Btn>
           </Card>
         </div>)}
 

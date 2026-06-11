@@ -88,6 +88,12 @@ class FireAliveWebSocket {
           this._send(ws, { type: 'auth_ok', userId: decoded.id });
           // B4: deliver any compromise-scan commands queued while offline.
           this._deliverQueuedScans(ws, decoded.id);
+          // B5d4: push the current signal-refresh cadence to analysts and
+          // deliver any fleet-op commands queued while offline.
+          if (decoded.role === 'analyst') {
+            this._send(ws, { type: 'sync_cadence', cadence: this._currentSyncCadence() });
+          }
+          this._deliverQueuedClientOps(ws, decoded.id);
         } catch (err) {
           const code = err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
           this._send(ws, { type: 'auth_error', error: err.message, code });
@@ -122,6 +128,11 @@ class FireAliveWebSocket {
       case 'scan_result': {
         // B4: ingest a device-signed compromise self-scan report from an AC.
         this._ingestScanResult(ws, msg);
+        break;
+      }
+      case 'client_op_result': {
+        // B5d4: ingest a device-signed fleet-op result from an AC.
+        this._ingestClientOpResult(ws, msg);
         break;
       }
     }
@@ -328,6 +339,193 @@ class FireAliveWebSocket {
   }
 
 
+  // ── B5d4: Per-client recovery + fleet operations over the WebSocket channel ─
+  // Mirrors the B4 compromise-scan substrate: dispatch a command to connected
+  // ACs (offline targets queue and replay on reconnect), ingest the device-
+  // signed result, advance run completion, and push pseudonym-only progress to
+  // leads. Plus the best-effort local-wipe signal for recovery, the signal-
+  // refresh cadence push, and the urgent-refresh broadcast.
+
+  // Fan out a fleet-op command to the connected target ACs. Offline targets are
+  // queued by the service and delivered on reconnect via _deliverQueuedClientOps.
+  dispatchClientOp(runId, userIds, opts = {}) {
+    const opType = opts.opType || null;
+    const params = opts.params || null;
+    for (const userId of userIds) {
+      const ws = this.clients.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'client_op', runId, opType, params });
+      }
+    }
+  }
+
+  // Best-effort local wipe of a compromised AC's on-device files. Used by the
+  // recovery service after server-side eviction; the real guarantee is the
+  // server-side credential revocation, so this is fire-and-forget. Returns true
+  // only if the AC was connected and the signal was queued for send.
+  dispatchWipeLocal(userId) {
+    const ws = this.clients.get(userId);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      this._send(ws, { type: 'wipe_local' });
+      return true;
+    }
+    return false;
+  }
+
+  // Read the lead-set signal-refresh cadence from config (falls back to the
+  // same defaults the v025 route serves).
+  _currentSyncCadence() {
+    try {
+      const row = this.db.prepare("SELECT value FROM config WHERE key = 'sync_interval_config'").get();
+      if (row && row.value) return JSON.parse(row.value);
+    } catch (e) { /* fall through to defaults */ }
+    return { intervalMin: 15, adaptiveSync: true, urgentThresholdSec: 30, batchMode: true };
+  }
+
+  // Push the current cadence to every connected analyst client (used when a lead
+  // saves the Sync Interval; the on-connect push lives in the auth handler).
+  broadcastSyncCadence(cadence) {
+    const payload = cadence || this._currentSyncCadence();
+    let count = 0;
+    this.clients.forEach((ws) => {
+      if (ws.userRole === 'analyst' && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'sync_cadence', cadence: payload });
+        count++;
+      }
+    });
+    return count;
+  }
+
+  // Tell every connected analyst client to refresh its signals immediately
+  // (panic engaged, or an alert-router critical). Analysts only -- the cadence
+  // consumer lives on the AC. Returns the number of clients signalled.
+  broadcastUrgentRefresh(reason) {
+    const r = reason || null;
+    let count = 0;
+    this.clients.forEach((ws) => {
+      if (ws.userRole === 'analyst' && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'urgent_refresh', reason: r });
+        count++;
+      }
+    });
+    return count;
+  }
+
+  // Deliver fleet-op commands queued while an AC was offline (called after auth).
+  // Expired entries are closed out; live ones are dispatched (with their op type)
+  // and marked delivered. Params are not replayed.
+  _deliverQueuedClientOps(ws, userId) {
+    try {
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE client_ops_queue SET status = 'expired' WHERE user_id = ? AND status = 'queued' AND expires_at <= ?").run(userId, now);
+      const pending = this.db.prepare(
+        "SELECT q.id AS id, q.run_id AS run_id, r.op_type AS op_type FROM client_ops_queue q " +
+          "JOIN client_ops_runs r ON r.id = q.run_id " +
+          "WHERE q.user_id = ? AND q.status = 'queued' AND q.expires_at > ?"
+      ).all(userId, now);
+      for (const q of pending) {
+        this._send(ws, { type: 'client_op', runId: q.run_id, opType: q.op_type, params: null });
+        this.db.prepare("UPDATE client_ops_queue SET status = 'delivered', delivered_at = ? WHERE id = ?").run(now, q.id);
+      }
+    } catch (e) { try { console.error('[WS] queued-client-op delivery error:', e.message); } catch (e2) {} }
+  }
+
+  // Canonical bytes the AC device key signed for a fleet-op result. MUST match
+  // the analyst-client main-process canonicalClientOpString exactly (fixed field
+  // order; newline = 0x0A). Command + ack ops carry status 'ack' and no signature.
+  _canonicalClientOp(r) {
+    return [
+      r.runId || '',
+      r.opType || '',
+      r.started_at || '',
+      String(r.duration_ms),
+      r.status,
+      r.detail_json,
+    ].join(String.fromCharCode(10));
+  }
+
+  // Ingest a signed fleet-op result: verify the device signature, store the
+  // (verified-or-not) result, advance run completion, close out the queue, and
+  // push progress to leads. Results for a run the caller is not a target of are
+  // never stored.
+  _ingestClientOpResult(ws, msg) {
+    try {
+      if (!ws.userId) return;
+      const result = msg && msg.result;
+      if (!result || typeof result !== 'object' || typeof result.detail_json !== 'string') return;
+      if (!['ok', 'warning', 'fail', 'inconclusive', 'ack'].includes(result.status)) return;
+      const opType = typeof result.opType === 'string' ? result.opType : null;
+      if (!opType) return;
+
+      let verified = false;
+      const keyRow = this.db.prepare("SELECT public_key FROM ac_device_signing_keys WHERE user_id = ? AND active = 1").get(ws.userId);
+      if (keyRow && result.signature) {
+        try {
+          const pub = crypto.createPublicKey(keyRow.public_key);
+          verified = crypto.verify(null, Buffer.from(this._canonicalClientOp(result), 'utf8'), pub, Buffer.from(result.signature, 'base64'));
+        } catch (e) { verified = false; }
+      }
+
+      const runId = (typeof msg.runId === 'string' && msg.runId) ? msg.runId : null;
+      if (!runId) return; // fleet ops are always run-scoped
+      const run = this.db.prepare("SELECT op_type, targets_json, target_count FROM client_ops_runs WHERE id = ?").get(runId);
+      if (!run) return;
+      let ids = [];
+      try { ids = (JSON.parse(run.targets_json).ids) || []; } catch (e) {}
+      if (!ids.includes(ws.userId)) return; // not a target -- never store injected results
+      const targetCount = run.target_count || ids.length || 1;
+
+      const pseudoRow = this.db.prepare("SELECT pseudonym FROM users WHERE id = ?").get(ws.userId);
+      const pseudonym = pseudoRow ? pseudoRow.pseudonym : null;
+
+      this.db.prepare(
+        "INSERT INTO client_ops_results (run_id, user_id, pseudonym_at_op, op_type, status, detail_json, signature, signature_verified, signed_at, started_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(
+        runId, ws.userId, pseudonym, opType, result.status,
+        result.detail_json, result.signature || null, verified ? 1 : 0,
+        result.signed_at || null, result.started_at || null, result.duration_ms | 0
+      );
+
+      this.db.prepare("UPDATE client_ops_queue SET status = 'delivered', delivered_at = datetime('now') WHERE run_id = ? AND user_id = ? AND status IN ('queued', 'delivered')").run(runId, ws.userId);
+
+      // A state-asserting result counts toward completion only if its signature
+      // verified; a command-only op counts on its 'ack'.
+      const completed = this.db.prepare("SELECT COUNT(*) AS c FROM client_ops_results WHERE run_id = ? AND (signature_verified = 1 OR status = 'ack')").get(runId).c;
+      if (completed >= targetCount) {
+        this.db.prepare("UPDATE client_ops_runs SET completed_count = ?, status = 'complete', completed_at = datetime('now') WHERE id = ?").run(completed, runId);
+      } else {
+        this.db.prepare("UPDATE client_ops_runs SET completed_count = ? WHERE id = ?").run(completed, runId);
+      }
+
+      this._pushClientOpProgress(runId, pseudonym, opType, result.status, verified);
+
+      // Route fail / unverified results through the alert router (best-effort).
+      let sev = null, type = null;
+      if (!verified && result.status !== 'ack') { sev = 'high'; type = 'CLIENT_OP_UNVERIFIED'; }
+      else if (result.status === 'fail') { sev = 'critical'; type = 'CLIENT_OP_FAIL'; }
+      else if (result.status === 'warning') { sev = 'warning'; type = 'CLIENT_OP_WARNING'; }
+      if (sev) {
+        try {
+          const { routeAlert } = require('./alert-router');
+          const label = pseudonym || 'an analyst client';
+          const m = !verified
+            ? 'Fleet op ' + opType + ' result from ' + label + ' failed device-signature verification (possible tampering or key mismatch)'
+            : 'Fleet op ' + opType + ' ' + result.status + ' for ' + label;
+          Promise.resolve(routeAlert(this.db, { type: type, severity: sev, message: m, timestamp: new Date().toISOString() })).catch(() => {});
+        } catch (e) { /* alert routing is best-effort */ }
+      }
+    } catch (e) { try { console.error('[WS] client_op_result ingest error:', e.message); } catch (e2) {} }
+  }
+
+  // Push per-client fleet-op progress to leads/admins. Pseudonym only.
+  _pushClientOpProgress(runId, pseudonym, opType, status, verified) {
+    this.clients.forEach((ws) => {
+      if ((ws.userRole === 'lead' || ws.userRole === 'admin') && ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'client_op_progress', runId, pseudonym, opType, status, verified });
+      }
+    });
+  }
+
   _send(ws, data) {
     try { ws.send(JSON.stringify(data)); } catch {}
   }
@@ -395,4 +593,14 @@ function sendDesktopNotification(userId, payload) {
   return _instance.sendDesktopNotification(userId, payload);
 }
 
-module.exports = { FireAliveWebSocket, sendDesktopNotification };
+// B5d4: module-level forwarder so routing.js and alert-router.js can trigger an
+// urgent signal-refresh broadcast without the Express app.locals reference. If
+// the server is not yet constructed, returns a safe not-initialized result.
+function broadcastUrgentRefresh(reason) {
+  if (!_instance) {
+    return { sent: false, reason: 'ws_server_not_initialized' };
+  }
+  return { sent: true, count: _instance.broadcastUrgentRefresh(reason) };
+}
+
+module.exports = { FireAliveWebSocket, sendDesktopNotification, broadcastUrgentRefresh };

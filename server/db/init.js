@@ -7437,7 +7437,7 @@ function initDb() {
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         token_hash TEXT NOT NULL,
         scope TEXT NOT NULL DEFAULT 'first-credential'
-          CHECK (scope IN ('first-credential')),
+          CHECK (scope IN ('first-credential', 're-provision')),
         created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL,
@@ -7452,6 +7452,144 @@ function initDb() {
   } catch (b5bIamMigrationErr) {
     console.error('B5b IAM/auth migration FAILED:', b5bIamMigrationErr.message);
     console.error('The server will start, but client-certificate and FIDO2 passkey authentication cannot be provisioned: cert enrollment, passkey registration, the offboarding detector, and break-glass recovery will be unavailable. No other feature is affected. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.');
+  }
+
+  // ── B5d4: Per-Client AC Recovery + Fleet Operations schema ─────────────────
+  // The per-AC recovery lifecycle (tear-down + re-provision-and-rebind of a
+  // single compromised analyst client) and the per-client fleet operations that
+  // ride the same B4 WebSocket dispatch substrate (config re-sync, refresh
+  // metrics, log integrity, regression, vuln scan, staged update push). One row
+  // per recovery (updated as it progresses), a runs table + an offline-delivery
+  // queue + device-signed result rows for the fleet ops, all mirroring the B4
+  // compromise-scan tables. Idempotent (CREATE IF NOT EXISTS), safe on existing
+  // DBs. enrollment_token_id is a plain reference id (no FK) because tokens are
+  // single-use and pruned; the recovery run keeps the linkage for audit only.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS client_recovery_runs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pseudonym_at_run TEXT,
+        status TEXT NOT NULL DEFAULT 'initiated'
+          CHECK (status IN ('initiated', 'torn_down', 'token_issued', 'complete', 'cancelled')),
+        initiated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        reason TEXT,
+        certs_revoked_json TEXT,
+        device_key_retired INTEGER NOT NULL DEFAULT 0 CHECK (device_key_retired IN (0, 1)),
+        passkey_deleted INTEGER NOT NULL DEFAULT 0 CHECK (passkey_deleted IN (0, 1)),
+        wipe_dispatched INTEGER NOT NULL DEFAULT 0 CHECK (wipe_dispatched IN (0, 1)),
+        enrollment_token_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_recovery_runs_user
+        ON client_recovery_runs(user_id, status);
+
+      CREATE TABLE IF NOT EXISTS client_ops_runs (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        op_type TEXT NOT NULL
+          CHECK (op_type IN ('config_resync', 'refresh_metrics', 'log_integrity', 'regression', 'vuln_scan', 'update_push')),
+        trigger TEXT NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual', 'api')),
+        initiated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        targets_json TEXT NOT NULL DEFAULT '"all"',
+        target_count INTEGER NOT NULL DEFAULT 0,
+        completed_count INTEGER NOT NULL DEFAULT 0,
+        unreachable_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'complete', 'partial')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_ops_runs_created_at
+        ON client_ops_runs(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS client_ops_queue (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        run_id TEXT NOT NULL REFERENCES client_ops_runs(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'delivered', 'expired')),
+        queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        delivered_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_ops_queue_user
+        ON client_ops_queue(user_id, status);
+
+      CREATE TABLE IF NOT EXISTS client_ops_results (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        run_id TEXT NOT NULL REFERENCES client_ops_runs(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pseudonym_at_op TEXT,
+        op_type TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ok', 'warning', 'fail', 'inconclusive', 'ack')),
+        detail_json TEXT,
+        signature TEXT,
+        signature_verified INTEGER NOT NULL DEFAULT 0 CHECK (signature_verified IN (0, 1)),
+        signed_at TEXT,
+        started_at TEXT,
+        duration_ms INTEGER,
+        received_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_ops_results_run
+        ON client_ops_results(run_id);
+    `);
+    console.log('B5d4 migration: client_recovery_runs + client_ops_runs + client_ops_queue + client_ops_results ready');
+  } catch (b5d4SchemaErr) {
+    console.error('B5d4 per-client recovery/ops schema migration FAILED:', b5d4SchemaErr.message);
+  }
+
+  // ── Migration: widen enrollment_tokens.scope CHECK (B5d4) ──────────────────
+  // Per-client recovery (B5d4) mints a re-enrollment token under a new
+  // 're-provision' scope. Fresh DBs get the widened CHECK from the B5b block
+  // above; existing DBs (v1.0.58 and earlier) carry the single-value CHECK and
+  // are rebuilt here. SQLite cannot ALTER a CHECK in place, so the table is
+  // recreated with the widened constraint and rows copied verbatim. Foreign
+  // keys toggle OFF for the rebuild and back ON afterward. Idempotent: skipped
+  // once the stored CHECK already lists 're-provision'.
+  try {
+    const etRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='enrollment_tokens'").get();
+    if (etRow && etRow.sql && !etRow.sql.includes('re-provision')) {
+      console.log('enrollment_tokens migration (B5d4): widening scope CHECK to include re-provision');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE enrollment_tokens_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'first-credential'
+              CHECK (scope IN ('first-credential', 're-provision')),
+            created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            revoked_at TEXT
+          )
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM enrollment_tokens').get().n;
+        db.exec(`
+          INSERT INTO enrollment_tokens_new
+            (id, user_id, token_hash, scope, created_by, created_at, expires_at, used_at, revoked_at)
+          SELECT
+            id, user_id, token_hash, scope, created_by, created_at, expires_at, used_at, revoked_at
+          FROM enrollment_tokens
+        `);
+        db.exec('DROP TABLE enrollment_tokens');
+        db.exec('ALTER TABLE enrollment_tokens_new RENAME TO enrollment_tokens');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_user ON enrollment_tokens(user_id)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_hash ON enrollment_tokens(token_hash)');
+        db.exec('COMMIT');
+        console.log(`enrollment_tokens migration (B5d4): rebuilt, preserved ${copied} token(s)`);
+      } catch (rebuildErr) {
+        db.exec('ROLLBACK');
+        throw rebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (etMigErr) {
+    console.error('enrollment_tokens migration (B5d4) failed (non-fatal):', etMigErr.message);
   }
 
   console.log('Database initialized at', DB_PATH);

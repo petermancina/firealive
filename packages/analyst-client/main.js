@@ -705,6 +705,61 @@ ipcMain.handle('burnout:lock', async () => {
   return { ok: true };
 });
 
+// B5d4: recover the analyst burnout key on a re-provisioned device. The local
+// store was wiped at teardown; the analyst presents the offline recovery code
+// and the recovery-wrap blob the server holds (analyst_key_recovery_wraps). We
+// unwrap the SAME private key (never re-mint -- server seals are bound to its
+// public key), verify it matches the expected public key, re-wrap it under the
+// new authenticator's PRF, and hand back a fresh prf_primary wrap for the
+// server to store. The recovered key is left unlocked for the session.
+ipcMain.handle('burnout:recoverAndRewrap', async (_e, { userId, recoveryWrap = null, recoveryCode = null, newPrfSecret = null, newPassphrase = null, expectedPublicKey = null, keyVersion = 1 } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    if (!recoveryWrap || !recoveryCode) return { error: 'recoveryWrap and recoveryCode required' };
+    if (!newPrfSecret && !newPassphrase) return { error: 'a new authenticator factor (PRF or passphrase) is required' };
+    const uid = String(userId);
+
+    // Unwrap the same private key with the offline recovery code (scrypt wrap).
+    let privPkcs8;
+    try {
+      privPkcs8 = burnoutUnwrapPrivateKey(recoveryWrap, recoveryCode);
+    } catch (e) {
+      return { error: 'recovery code did not unwrap the key (wrong code or corrupted wrap)' };
+    }
+    const privateKey = crypto.createPrivateKey({ key: privPkcs8, format: 'der', type: 'pkcs8' });
+    const derivedPub = crypto.createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).toString('base64');
+    if (expectedPublicKey && derivedPub !== expectedPublicKey) {
+      return { error: 'recovered key does not match the expected public key' };
+    }
+
+    // Re-wrap locally under the new authenticator and write fresh meta.
+    const store = burnoutStore();
+    let mode;
+    if (newPrfSecret) {
+      mode = 'prf';
+      await store.set(uid + ':wrapped', burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_PRF, Buffer.from(newPrfSecret, 'base64')));
+    } else {
+      mode = 'passphrase';
+      await store.set(uid + ':wrapped', burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_SCRYPT, newPassphrase));
+    }
+    await store.delete(uid + ':private');
+    const kv = Number.isInteger(keyVersion) ? keyVersion : 1;
+    await store.set(uid + ':meta', { mode, keyVersion: kv, publicKey: derivedPub, enrolledAt: new Date().toISOString(), reprovisioned: true });
+
+    // Fresh prf_primary recovery wrap for the server to replace the dead one.
+    const recoveryWraps = [];
+    if (newPrfSecret) {
+      recoveryWraps.push({ factor: 'prf_primary', wrapped_sk: burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_PRF, Buffer.from(newPrfSecret, 'base64')), label: 'primary authenticator (re-provisioned)' });
+    }
+
+    _burnoutKey = { privateKey, publicKeyB64: derivedPub, keyVersion: kv, userId: uid };
+    return { ok: true, public_key: derivedPub, recovery_wraps: recoveryWraps, mode, key_version: kv };
+  } catch (err) {
+    return { error: (err.message || 'recovery re-wrap failed').slice(0, 200) };
+  }
+});
+
+
 
 ipcMain.handle('kb:search', async (_e, { query, k } = {}) => {
   const q = (typeof query === 'string' ? query.trim() : '');
@@ -1070,6 +1125,158 @@ ipcMain.handle('selfscan:run', async (_e, { runId = null, manifest = null, expec
     return { error: (err.message || 'self-scan failed').slice(0, 200) };
   }
 });
+
+// ── B5d4: Per-client fleet operations + local-wipe recovery ──────────────────
+// The same Ed25519 device key that signs compromise self-scan reports signs
+// fleet-op results, so the renderer registers the key once via
+// selfscan:getPublicKey. canonicalClientOpString MUST match the server's
+// _canonicalClientOp exactly (fixed field order; newline = 0x0A).
+function canonicalClientOpString(r) {
+  return [
+    r.runId || '',
+    r.opType || '',
+    r.started_at || '',
+    String(r.duration_ms),
+    r.status,
+    r.detail_json,
+  ].join(String.fromCharCode(10));
+}
+
+// Run one fleet op in the main process (the renderer is sandboxed) and return a
+// { status, detail } pair. status is one of ok / warning / fail / inconclusive.
+// Checks are local and honest: anything not conclusively verifiable in-process
+// returns inconclusive rather than a false pass. config_resync and update_push
+// are command-only and never reach here -- the renderer acks them directly.
+async function runFleetOp(opType, params = {}) {
+  const p = params && typeof params === 'object' ? params : {};
+  const trunc = (s) => String(s || '').slice(0, 200);
+
+  if (opType === 'log_integrity') {
+    // Tamper-evidence: the sealed local stores must decrypt without error
+    // (safeStorage + AES-GCM auth fail if modified). Absent stores are nothing
+    // to verify (inconclusive); a decrypt failure is tampering (fail).
+    if (!safeStorage.isEncryptionAvailable()) {
+      return { status: 'fail', detail: { osSealing: false, note: 'OS secure storage unavailable' } };
+    }
+    const stores = [
+      ['device_key', deviceKeyFile()],
+      ['burnout_key', burnoutKeyFile()],
+      ['e2ee_store', path.join(app.getPath('userData'), 'e2ee-store.bin')],
+    ];
+    const checked = {};
+    let tampered = 0;
+    let present = 0;
+    for (const [name, file] of stores) {
+      if (!fs.existsSync(file)) { checked[name] = 'absent'; continue; }
+      present++;
+      try {
+        const store = createSealedStore(file);
+        await store.list('');
+        checked[name] = 'intact';
+      } catch (e) { checked[name] = 'tampered'; tampered++; }
+    }
+    const status = tampered ? 'fail' : present ? 'ok' : 'inconclusive';
+    return { status, detail: { osSealing: true, stores: checked } };
+  }
+
+  if (opType === 'regression') {
+    // Local subsystems must be functional; connectivity probes (if the renderer
+    // supplied them) fold in as a warning when any leg is unreachable.
+    const detail = {};
+    let broken = 0;
+    detail.osSealing = safeStorage.isEncryptionAvailable();
+    if (!detail.osSealing) broken++;
+    try { await getDeviceScanKey(); detail.deviceKey = 'ok'; } catch (e) { detail.deviceKey = 'fail'; broken++; }
+    const conn = p.connectivity && typeof p.connectivity === 'object' ? p.connectivity : null;
+    let unreachable = 0;
+    if (conn) {
+      detail.connectivity = {};
+      for (const leg of ['server', 'mc', 'integrations']) {
+        if (leg in conn) { detail.connectivity[leg] = conn[leg] === true; if (conn[leg] !== true) unreachable++; }
+      }
+    }
+    const status = broken ? 'fail' : unreachable ? 'warning' : 'ok';
+    return { status, detail };
+  }
+
+  if (opType === 'vuln_scan') {
+    // Posture report: platform, version, sealing, and EDR per management policy.
+    const os = require('os');
+    const edrPresent = p.edrPresent === true || (p.expectedConfig && p.expectedConfig.edr_present === true);
+    const detail = {
+      platform: process.platform,
+      arch: process.arch,
+      osRelease: trunc(os.release()),
+      appVersion: app.getVersion(),
+      osSealing: safeStorage.isEncryptionAvailable(),
+      edrPresent: !!edrPresent,
+    };
+    const status = (!detail.osSealing || !edrPresent) ? 'warning' : 'ok';
+    return { status, detail };
+  }
+
+  if (opType === 'refresh_metrics') {
+    const m = process.memoryUsage();
+    const detail = {
+      rssMb: Math.round(m.rss / 1048576),
+      heapUsedMb: Math.round(m.heapUsed / 1048576),
+      uptimeSec: Math.round(process.uptime()),
+      appVersion: app.getVersion(),
+      platform: process.platform,
+    };
+    return { status: 'ok', detail };
+  }
+
+  return { status: 'inconclusive', detail: { note: trunc('unhandled fleet op: ' + opType) } };
+}
+
+ipcMain.handle('clientop:run', async (_e, { runId = null, opType = null, params = null } = {}) => {
+  const startedAt = new Date().toISOString();
+  const t0 = Date.now();
+  try {
+    if (!opType || typeof opType !== 'string') return { error: 'opType required' };
+    const { status, detail } = await runFleetOp(opType, params || {});
+    const result = {
+      runId: runId || '',
+      opType,
+      started_at: startedAt,
+      duration_ms: Date.now() - t0,
+      status,
+      detail_json: JSON.stringify(detail || {}),
+    };
+    const key = await getDeviceScanKey();
+    const signature = crypto.sign(null, Buffer.from(canonicalClientOpString(result), 'utf8'), key.privateKey).toString('base64');
+    return { ...result, device_fingerprint: key.fingerprint, signed_at: new Date().toISOString(), signature };
+  } catch (err) {
+    return { error: (err.message || 'fleet op failed').slice(0, 200) };
+  }
+});
+
+// recovery:wipeLocal -- clear the four machine-local files after a server-side
+// teardown (best-effort; the real guarantee is the server credential
+// revocation). The analyst key itself is preserved server-side and recovered on
+// re-provision via the recovery code, so wiping the local burnout wrap is safe.
+ipcMain.handle('recovery:wipeLocal', async () => {
+  const files = [
+    ['e2ee_store', path.join(app.getPath('userData'), 'e2ee-store.bin')],
+    ['burnout_key', burnoutKeyFile()],
+    ['device_key', deviceKeyFile()],
+    ['ca_pin', caPinPath()],
+  ];
+  const wiped = {};
+  for (const [name, file] of files) {
+    try {
+      if (fs.existsSync(file)) { fs.rmSync(file, { force: true }); wiped[name] = 'removed'; }
+      else wiped[name] = 'absent';
+    } catch (e) { wiped[name] = 'error'; }
+  }
+  // Drop in-memory caches so the session holds no unlocked key material.
+  _burnoutKey = null;
+  _deviceScanKey = null;
+  e2ee = null;
+  return { ok: true, wiped };
+});
+
 
 
 app.whenReady().then(() => {

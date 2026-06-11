@@ -832,6 +832,9 @@ function BurnoutKeyGate({ userId, onReady, logC }) {
   const [passphrase, setPassphrase] = useState("");
   const [recoveryCode, setRecoveryCode] = useState("");
   const [acked, setAcked] = useState(false);
+  const [recoveryCodeInput, setRecoveryCodeInput] = useState("");
+  const [serverKey, setServerKey] = useState(null); // server key + wraps, set when recovering on a re-provisioned device
+
   const bridge = (typeof window !== "undefined") ? window.firealive : null;
   const done = useRef(false);
   const finish = function () { if (!done.current) { done.current = true; onReady(); } };
@@ -865,7 +868,15 @@ function BurnoutKeyGate({ userId, onReady, logC }) {
     if (!st || st.error) { setPhase("error"); setMsg(st && st.error ? st.error : "Could not check your key status."); return; }
     if (st.enrolled && st.unlocked) { finish(); return; }
     if (st.enrolled) { setMode(st.mode || null); if (st.mode === "safestorage") { autoUnlockSafeStorage(); } else { setPhase("unlock"); } }
-    else { setPhase("enroll"); }
+    else {
+      // Not enrolled on THIS device. If the server already holds a key for this
+      // analyst (a re-provisioned machine), recover and re-wrap it rather than
+      // minting a new key that would orphan the server's sealed data.
+      const sk = await api.get("/api/analyst-keys/me").catch(function () { return null; });
+      if (sk && !sk.error && sk.enrolled && sk.public_key) { setServerKey(sk); setPhase("recover"); }
+      else { setPhase("enroll"); }
+    }
+
   };
 
   useEffect(function () { recheck(); }, []);
@@ -882,6 +893,28 @@ function BurnoutKeyGate({ userId, onReady, logC }) {
     if (res.recoveryCode) { setRecoveryCode(res.recoveryCode); setPhase("recovery"); }
     else { finish(); }
   }
+
+  async function doRecover() {
+    setBusy(true); setMsg("");
+    const code = (recoveryCodeInput || "").trim();
+    if (!code) { setBusy(false); setMsg("Enter your recovery code."); return; }
+    const wraps = (serverKey && Array.isArray(serverKey.recovery_wraps)) ? serverKey.recovery_wraps : [];
+    const rcWrap = wraps.find(function (w) { return w && w.factor === "recovery_code"; });
+    if (!rcWrap || !rcWrap.wrapped_sk) { setBusy(false); setMsg("No recovery-code factor is registered for your account. Contact your administrator."); return; }
+    const prfSecret = await tryPrf();
+    if (!prfSecret) { setBusy(false); setMsg("Could not get a passkey response. Confirm with your passkey and try again."); return; }
+    const rec = await bridge.invoke("burnout:recoverAndRewrap", { userId: userId, recoveryWrap: rcWrap.wrapped_sk, recoveryCode: code, newPrfSecret: prfSecret, expectedPublicKey: serverKey.public_key, keyVersion: serverKey.key_version || 1 });
+    if (!rec || rec.error) { setBusy(false); setMsg(rec && rec.error ? String(rec.error) : "Recovery failed."); return; }
+    // Replace the dead prf_primary wrap server-side, keeping the still-valid
+    // recovery-code and backup wraps (same key, so they remain usable).
+    const kept = wraps.filter(function (w) { return w && w.factor !== "prf_primary"; }).map(function (w) { return { factor: w.factor, wrapped_sk: w.wrapped_sk, label: w.label, key_version: w.key_version }; });
+    const newWraps = (rec.recovery_wraps || []).concat(kept);
+    const reg = await api.post("/api/analyst-keys/register", { public_key: rec.public_key, recovery_wraps: newWraps });
+    if (!reg || reg.error) { setBusy(false); setMsg(reg && reg.error ? String(reg.error) : "Recovered on this device but could not update the server. Please try again."); return; }
+    if (logC) logC("BURNOUT_KEY_RECOVERED", "Recovered and re-wrapped analyst-private key on a re-provisioned device");
+    setBusy(false); finish();
+  }
+
 
   async function doUnlock() {
     setBusy(true); setMsg("");
@@ -915,10 +948,19 @@ function BurnoutKeyGate({ userId, onReady, logC }) {
 
   if (phase === "recovery") return Shell(<div>
     <L>Save your recovery code</L>
-    <M style={{color:C.tm,display:"block",margin:"12px 0 14px",lineHeight:1.7}}>This one-time code can restore access to your wellbeing data if you set up FireAlive on a new device or lose your authenticator. It is shown once and is never stored anywhere in readable form. Write it down and keep it somewhere safe.</M>
+    <M style={{color:C.tm,display:"block",margin:"12px 0 12px",lineHeight:1.7}}>This one-time code is the only way to restore your sealed wellbeing data if you move to a new device or lose your authenticator. It is shown once and is stored nowhere in readable form -- not by you, not by the server, not by your administrator.</M>
+    <div style={{padding:"12px 14px",background:C.dd,border:"1px solid "+C.d,borderRadius:10,marginBottom:14}}><M style={{color:C.d,display:"block",lineHeight:1.6,fontWeight:600}}>If you lose this code and also lose access to this device's passkey, your burnout history and baseline cannot be recovered by anyone. Your helper-pay points and training records are unaffected and return regardless.</M></div>
     <div style={{padding:14,background:"rgba(255,255,255,0.04)",border:"1px solid "+C.b,borderRadius:10,fontFamily:"'IBM Plex Mono',monospace",fontSize:15,letterSpacing:1,color:C.t,wordBreak:"break-all",marginBottom:16}}>{recoveryCode}</div>
     <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:16,cursor:"pointer"}}><input type="checkbox" checked={acked} onChange={function (e) { setAcked(e.target.checked); }}/><M style={{color:C.tm}}>I have saved my recovery code.</M></label>
     <Btn primary disabled={!acked} onClick={finish}>Continue</Btn>
+  </div>);
+
+  if (phase === "recover") return Shell(<div>
+    <L>Restore your wellbeing data</L>
+    <M style={{color:C.tm,display:"block",margin:"12px 0 14px",lineHeight:1.7}}>This device was re-provisioned, so your private-data key is not on it yet. Enter the one-time recovery code you saved when you first set up FireAlive, then confirm with your passkey. Your existing sealed wellbeing history is restored -- the key is recovered, not replaced.</M>
+    <Input label="Recovery code" value={recoveryCodeInput} onChange={function (e) { setRecoveryCodeInput(e.target.value); }} disabled={busy}/>
+    {msg ? <M style={{color:C.d,display:"block",margin:"12px 0",lineHeight:1.5}}>{msg}</M> : null}
+    <Btn primary disabled={busy} onClick={doRecover}>{busy ? "Restoring..." : "Restore with recovery code"}</Btn>
   </div>);
 
   return Shell(<div>
@@ -1312,6 +1354,12 @@ export default function AnalystClientApp() {
   // analysts cannot change toggles) and adopt live broadcasts in the WS handler.
   const [featureToggles, setFT] = useState({});
   React.useEffect(() => { api.get("/api/features").then(r => { if (r && r.features) setFT(r.features); }).catch(() => {}); }, []);
+  // B5d4: lead-set signal-refresh cadence (pushed over WS on connect and on
+  // save) plus a counter the cadence timer and urgent-refresh bump to re-pull
+  // signals. intervalMin drives the timer; the rest is forward-compatible.
+  const [syncCadence, setSyncCadence] = useState({ intervalMin: 15, adaptiveSync: true, urgentThresholdSec: 30, batchMode: true });
+  const [signalRefreshTrigger, setSignalRefreshTrigger] = useState(0);
+
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
   // B4: live socket handle so a manually-run self-scan can report its signed
@@ -1381,6 +1429,46 @@ export default function AnalystClientApp() {
               }
             }).catch(() => {});
         }
+        // B5d4: MC-orchestrated fleet op. config_resync and update_push are
+        // command-only (acked without a signature); the rest run in the main
+        // process and return a device-signed result over this socket.
+        if (msg && msg.type === "client_op") {
+          const opType = msg.opType || null;
+          if (opType === "config_resync" || opType === "update_push") {
+            if (opType === "config_resync") {
+              try { api.get("/api/features").then((r) => { if (r && r.features) setFT(r.features); }).catch(() => {}); } catch (_e) {}
+              setSignalRefreshTrigger((n) => n + 1);
+            }
+            try { ws.send(JSON.stringify({ type: "client_op_result", runId: msg.runId || null, result: { runId: msg.runId || "", opType: opType, started_at: new Date().toISOString(), duration_ms: 0, status: "ack", detail_json: "{}" } })); } catch (_e) {}
+          } else {
+            const sendResult = (params) => bridge.invoke("clientop:run", { runId: msg.runId || null, opType: opType, params: params })
+              .then((result) => { if (result && !result.error) { try { ws.send(JSON.stringify({ type: "client_op_result", runId: msg.runId || null, result: result })); } catch (_e) {} } }).catch(() => {});
+            if (opType === "regression") {
+              (async () => {
+                const conn = {};
+                try { const r = await fetch(API_BASE + "/api/heartbeat", { method: "POST", headers: api._headers() }); conn.server = r.ok; } catch (_e) { conn.server = false; }
+                sendResult(Object.assign({}, msg.params || {}, { connectivity: conn }));
+              })();
+            } else {
+              sendResult(msg.params || {});
+            }
+          }
+        }
+        // B5d4: server-side teardown wipe. Best-effort local wipe of the four
+        // machine-local files; the server credential revocation is the real
+        // guarantee.
+        if (msg && msg.type === "wipe_local") {
+          try { bridge.invoke("recovery:wipeLocal").catch(() => {}); } catch (_e) {}
+        }
+        // B5d4: lead-set signal-refresh cadence (on connect and on save).
+        if (msg && msg.type === "sync_cadence" && msg.cadence) {
+          setSyncCadence(msg.cadence);
+        }
+        // B5d4: urgent refresh (panic engaged or a critical alert) -- re-pull now.
+        if (msg && msg.type === "urgent_refresh") {
+          setSignalRefreshTrigger((n) => n + 1);
+        }
+
       };
       ws.onclose = () => { acScanWsRef.current = null; if (!closedByUnmount) scheduleReconnect(); };
       ws.onerror = () => { try { ws.close(); } catch (_e) {} };
@@ -1608,7 +1696,18 @@ export default function AnalystClientApp() {
       setSignalsLoadState({ loaded: true, error: null, locked: lockedSeen, decrypted, sealedCount: sealed.length });
     })();
     return () => { cancelled = true; };
-  }, [burnoutReady]);
+  }, [burnoutReady, signalRefreshTrigger]);
+  // B5d4: cadence-driven signal refresh. The interval follows the lead-set
+  // cadence pushed over WS; each tick bumps the trigger so the signals effect
+  // above re-pulls and re-decrypts. Panic and critical alerts bump it out of
+  // band via the urgent_refresh WS message.
+  React.useEffect(() => {
+    if (!burnoutReady) return;
+    const mins = (syncCadence && Number(syncCadence.intervalMin) > 0) ? Number(syncCadence.intervalMin) : 15;
+    const handle = setInterval(() => setSignalRefreshTrigger((n) => n + 1), mins * 60000);
+    return () => clearInterval(handle);
+  }, [burnoutReady, syncCadence]);
+
 
   // ── On-device signal interpretation (B5d1 PR D) ──────────────────────────────
   // Replaces the server-precomputed interpretations: when a signal card is

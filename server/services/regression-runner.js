@@ -202,6 +202,16 @@ class RegressionRunner {
       throw new Error('missing idx_ac_device_signing_keys_one_active');
     });
 
+    await check('schema', 'B5d4 per-client recovery + fleet-ops tables', () => {
+      return requireAll(['client_recovery_runs', 'client_ops_runs', 'client_ops_queue', 'client_ops_results']);
+    });
+    await check('schema', 'B5d4 enrollment-token re-provision scope', () => {
+      const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='enrollment_tokens'").get();
+      if (!row || !row.sql) throw new Error('enrollment_tokens table missing');
+      if (row.sql.indexOf('re-provision') === -1) throw new Error("enrollment_tokens scope CHECK does not allow re-provision");
+      return 'scope CHECK includes re-provision';
+    });
+
     // ── Category: Compromise scan + reduced-routing tripwire (B4) ───
     await check('compromise', 'Orchestration route loads', () => {
       const r = require('../routes/compromise-scan-orchestration');
@@ -235,6 +245,47 @@ class RegressionRunner {
       const row = this.db.prepare("SELECT value FROM team_config WHERE key = 'compromise_scan_retention_days'").get();
       if (!row) return SKIP('compromise_scan_retention_days not present');
       return 'retention config present';
+    });
+
+    // ── Category: Per-client recovery + fleet operations (B5d4) ───
+    await check('client_ops', 'Recovery route loads', () => {
+      const r = require('../routes/client-recovery');
+      if (typeof r !== 'function') throw new Error('route is not an express router');
+      return 'router exported';
+    });
+    await check('client_ops', 'Fleet-ops route loads', () => {
+      const r = require('../routes/client-ops');
+      if (typeof r !== 'function') throw new Error('route is not an express router');
+      return 'router exported';
+    });
+    await check('client_ops', 'Recovery service API present', () => {
+      const svc = require('./client-recovery');
+      if (typeof svc.teardownAc !== 'function' || typeof svc.reprovisionAc !== 'function') throw new Error('teardownAc / reprovisionAc missing');
+      return 'teardownAc + reprovisionAc present';
+    });
+    await check('client_ops', 'Fleet-ops dispatch service present', () => {
+      const svc = require('./client-ops');
+      if (typeof svc.dispatchClientOp !== 'function') throw new Error('dispatchClientOp missing');
+      if (!svc.VALID_OPS || typeof svc.VALID_OPS.has !== 'function' || !svc.VALID_OPS.has('log_integrity')) throw new Error('VALID_OPS set missing or incomplete');
+      return 'dispatchClientOp + VALID_OPS present';
+    });
+    await check('client_ops', 'WebSocket dispatch + broadcast methods present', () => {
+      const ws = require('./websocket-server');
+      if (typeof ws.broadcastUrgentRefresh !== 'function') throw new Error('module broadcastUrgentRefresh forwarder missing');
+      const proto = ws.FireAliveWebSocket && ws.FireAliveWebSocket.prototype;
+      if (!proto) throw new Error('FireAliveWebSocket not exported');
+      const methods = ['dispatchClientOp', 'dispatchWipeLocal', 'broadcastSyncCadence', 'broadcastUrgentRefresh', '_ingestClientOpResult', '_canonicalClientOp', '_deliverQueuedClientOps'];
+      const missing = methods.filter((m) => typeof proto[m] !== 'function');
+      if (missing.length) throw new Error('missing WS methods: ' + missing.join(', '));
+      return methods.length + ' WS methods present';
+    });
+    await check('client_ops', 'Canonical fleet-op signing string shape', () => {
+      const ws = require('./websocket-server');
+      const proto = ws.FireAliveWebSocket.prototype;
+      const canon = proto._canonicalClientOp({ runId: 'r', opType: 'log_integrity', started_at: 't', duration_ms: 5, status: 'ok', detail_json: '{}' });
+      const parts = canon.split(String.fromCharCode(10));
+      if (parts.length !== 6) throw new Error('expected 6 newline-joined fields, got ' + parts.length);
+      return '6-field canonical string (0x0A joined)';
     });
 
     // ── Category 2: Crypto ─────────────────────────────────────────

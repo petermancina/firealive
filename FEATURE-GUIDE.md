@@ -400,6 +400,8 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 1. Sets the urgent event threshold — for panic events / critical incidents, refresh immediately rather than wait for the next interval
 1. Saves — applies to all connected analyst clients
 
+**How it reaches the client:** the cadence is pushed to each analyst client over the authenticated WebSocket — once when the client connects, and again whenever the lead saves a change — so a connected client adopts a new interval live without a restart. Between ticks the client re-pulls and re-decrypts only its own sealed signals. The urgent-event threshold is honoured server-side too: engaging panic mode or an alert-router critical broadcasts an immediate refresh to every connected analyst client, so the heightened state surfaces on-device at once rather than at the next interval.
+
 ### Client Notifications
 
 **What it’s for:** Configure how each user (lead and analyst) receives notifications from FireAlive. Per notification type, each user chooses delivery: email, SMS, desktop notification, in-app inbox, multiple, or off. The inbox is one channel option among many — for users who want a place to find missed notifications. It’s not mandatory.
@@ -644,6 +646,8 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 
 **Note — scanning the Global Dashboard:** this surface scans *analyst clients*. The GD inspecting *itself* for compromise is a separate GD self-scan, scoped to a later phase; the MC does not reach into or scan the GD.
 
+**See also — Per-Client Recovery:** when a scan (or a tripwire trip) confirms a compromised client, the recovery workflow lives under System Health → Per-Client Recovery & Fleet Operations: tear the client down (revoke its certificates, retire its device key, delete its passkey) and issue a one-time re-provision token. The analyst's sealed wellbeing data is preserved and restored on the rebuilt client.
+
 ### Log Integrity
 
 **What it’s for:** The audit log is tamper-evident, not merely append-only. Three independent legs back that claim: (1) a per-row SHA-256 hash chain — each entry’s hash covers its content plus the previous entry’s hash, so any edit, reorder, or deletion breaks the chain; (2) Ed25519-signed checkpoints that periodically notarize the chain head — an attacker who edits a row and recomputes every downstream hash still cannot forge a signed head; and (3) the existing SIEM/SOAR ship-out, which anchors a copy of each event outside the database. Deletion is also blocked at the database level (triggers reject UPDATE/DELETE on the table). This tab verifies all of that and reports the result.
@@ -828,7 +832,7 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 
 **Legacy compatibility:** Legacy single-schedule installs that configured a single backup schedule via /api/backup/config (the singleton-only legacy endpoint) get their singleton automatically migrated to a “Legacy default” row in backup_schedules on first boot post-upgrade. The /api/backup/config endpoint stays live as a deprecated read/write shim over the first row of backup_schedules for one version of deprecation grace — external tooling that still calls it sees a deprecated:true response with a replacement: ‘/api/backup-schedules’ hint. Operators should migrate clients to the modern endpoint when convenient. The v100 stub route POST /api/v1/backup/schedule/add also remains live and now delegates to the canonical service via BackupService.addSchedule (preserves the v100 public contract).
 
-**MC orchestrating AC backups** is a separate concern from this feature and out of scope for the current release. The “Backup All Clients” button on the Client Provisioning tab remains a placeholder pending a future phase that builds AC-side backup orchestration.
+**MC orchestrating AC backups:** there is no separate per-AC backup artifact. The full-suite server backup (Data & Backup group) is canonical — it already holds every analyst's sealed private data, helper-pay ledger, training records, and analyst-key recovery wraps, so one server backup captures the whole fleet's recoverable state. The former "Backup All Clients" button is retired; the analyst-client lifecycle is now managed through Per-Client Recovery & Fleet Operations (System Health tab) — see that section for tear-down, re-provision, and the fleet-op checks.
 
 ### Incremental and differential backups
 
@@ -1279,6 +1283,24 @@ The tab exposes two admin-configurable control panels:
 1. Lead glances at System Health daily — metrics, connected sessions, and the last integration-health probe
 1. Spikes or failed probes investigated immediately — could be load, an integration outage, or an attack
 1. Alerts fan out by severity to audit, SIEM, SOAR, in-app notification, email, and webhook per the routing matrix; the metric stream and forwarded client logs feed the broader SOC monitoring stack
+
+### Per-Client Recovery & Fleet Operations
+
+**What it’s for:** The admin surface for managing the lifecycle of individual analyst clients and for running operational checks across the fleet — both on the same authenticated WebSocket dispatch channel the compromise scan uses. Identity is pseudonym-only throughout; the console never shows a real name. This is where you recover a compromised or lost client and where you pull live, signed health from the fleet.
+
+**Per-client recovery (admin, MFA step-up):**
+
+- **Tear Down** evicts a client server-side: it revokes the client's active certificates, retires its device signing key, and deletes its passkey, then sends a best-effort local-wipe signal if the client is still connected. The analyst's private key and recovery wraps are deliberately preserved — recovery is not offboarding, so the sealed wellbeing history survives. The real guarantee is the server-side revocation; the local wipe is a courtesy on a possibly-compromised machine.
+- **Re-provision** issues a one-time enrollment token (same analyst, same pseudonym) for binding a fresh, clean install. The token is shown once for out-of-band delivery and expires in seven days. On the rebuilt client the analyst recovers their existing key from the offline recovery code and re-wraps it under the new passkey — the key is recovered, never re-minted, so the server's sealed data stays readable.
+
+**Fleet operations (lead/admin):** dispatch one of four state-asserting checks — Refresh Metrics, Log Integrity, Regression, Vuln Scan — to all connected clients. Each client runs the check in its isolated main process and returns an Ed25519 device-signed result the server verifies; results render per-client (pseudonym, op, status, signature-verified, reported-at) and unverified or failed results route through the alert router. Two further commands — config resync and update push — are command-and-acknowledge (no signed result). There is no per-AC backup operation; the full-suite server backup is canonical (see the Data & Backup group).
+
+**Workflow:**
+
+1. Open System Health; the Per-Client Recovery and Fleet Operations cards list the connected analyst clients by pseudonym.
+1. To recover a client, choose Tear Down (confirm the destructive action and complete the MFA step-up), then Re-provision to issue the enrollment token; deliver the token to the analyst out of band.
+1. To check the fleet, dispatch a fleet operation; connected clients return signed results within a moment, and offline clients are queued for delivery on reconnect within a 15-minute window.
+1. Failed or unverified results raise alerts through the router; investigate, and recover the affected client if compromise is confirmed.
 
 ### Vulnerability Scan
 

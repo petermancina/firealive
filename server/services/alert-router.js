@@ -179,6 +179,18 @@ async function routeAlert(db, alert, opts = {}) {
       return out;
     }
 
+    // B5d4: a critical alert also nudges every connected analyst client to pull
+    // its signals immediately (independent of the channel matrix). Fires only
+    // for non-deduped criticals so repeats within the de-dup window do not spam
+    // refreshes. Best-effort and non-fatal.
+    if (severity === 'critical') {
+      try {
+        require('./websocket-server').broadcastUrgentRefresh('critical');
+      } catch (refreshErr) {
+        logger.warn('alert-router: urgent-refresh broadcast failed (non-fatal)', { error: refreshErr.message });
+      }
+    }
+
     const matrix = loadMatrix(db)[severity] || {};
     for (const ch of CHANNELS) {
       if (matrix[ch]) out.channels.push(await _run(handlers[ch], ch, db, alert));

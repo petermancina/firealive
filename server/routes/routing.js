@@ -698,6 +698,15 @@ router.post('/panic', (req, res) => {
         logger.error('Panic activate: broadcast failed (non-fatal)', { error: broadcastErr.message });
       }
 
+      // B5d4: nudge every connected analyst client to pull its signals now, so
+      // the heightened pressure surfaces on-device without waiting for the next
+      // cadence tick. Best-effort; the panic state itself is already persisted.
+      try {
+        require('../services/websocket-server').broadcastUrgentRefresh('panic');
+      } catch (refreshErr) {
+        logger.warn('Panic activate: urgent-refresh broadcast failed (non-fatal)', { error: refreshErr.message });
+      }
+
       return res.json({ ok: true, mode: 'panic', message: 'Wellness routing disabled. All analysts at maximum capacity.', notified: notifiedCount });
     } else {
       // Restore saved caps
