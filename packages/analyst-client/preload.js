@@ -19,6 +19,8 @@ const ALLOWED_CHANNELS = [
   'clientop:run', 'recovery:wipeLocal', 'burnout:recoverAndRewrap',
   // B5e: AC-side anti-cloning ratchet (present + check server ratchet)
   'anticlone:ratchetState', 'anticlone:recordRatchet',
+  // B5e (D25): AC-side server anchor pinning + per-connect verification
+  'anticlone:anchorNonce', 'anticlone:verifyAnchor', 'anticlone:pinAnchor', 'anticlone:anchorState',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
