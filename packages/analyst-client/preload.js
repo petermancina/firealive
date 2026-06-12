@@ -14,7 +14,7 @@ const ALLOWED_CHANNELS = [
   'abuse:seal', 'abuse:hold-for-export', 'abuse:finalize-export', 'abuse:cancel-export',
   'kb:search', 'kb:entry', 'kbChat:ask', 'kbChat:modelStatus', 'kbChat:verifyModel', 'kbChat:provisioningInfo', 'kbChat:modelScanStatus',
   'selfscan:getPublicKey', 'selfscan:run',
-  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:interpret', 'burnout:interpretOverall',
+  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:addHwFactor', 'burnout:removeHwFactor', 'burnout:interpret', 'burnout:interpretOverall',
   // B5d4: per-client recovery + fleet ops
   'clientop:run', 'recovery:wipeLocal', 'burnout:recoverAndRewrap',
   // B5e: AC-side anti-cloning ratchet (present + check server ratchet)
