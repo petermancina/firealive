@@ -151,6 +151,10 @@ app.use('/api/', apiLimiter);
 
 // Audit logging on all API requests
 app.use('/api/', auditMiddleware);
+// B5e (D11): mode-gated pre-auth VM attestation. No-op in bare-metal; in
+// virtualized mode it refuses the whole API surface when the instance is
+// quarantined. Placed after audit logging and before per-route auth.
+app.use('/api/', require('./middleware/vm-attestation').vmAttestation());
 
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
@@ -184,6 +188,8 @@ app.use('/api/instance', authMiddleware(['analyst', 'lead', 'admin']), require('
 // D24: MC operators register their hardware device key here; destructive
 // recovery actions must carry a signature from it (verified downstream).
 app.use('/api/mc-device-key', authMiddleware(['lead', 'admin']), require('./routes/mc-device-key'));
+// D9: report/provision the hardware-sealed deployment mode (bare-metal vs VM).
+app.use('/api/deployment', authMiddleware(['lead', 'admin']), require('./routes/deployment'));
 app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team'));
 app.use('/api/enrollment-reconciliation', authMiddleware(['lead', 'admin']), require('./routes/enrollment-reconciliation'));
 app.use('/api/analysts', authMiddleware(['analyst']), require('./routes/analysts'));
@@ -246,6 +252,7 @@ app.use('/api/mfa', authMiddleware(['analyst', 'lead', 'admin']), require('./rou
 app.use('/api/config', require('./routes/config-lock'));
 app.use('/api/kms-providers', authMiddleware(['admin']), configLockChokepoint(), require('./routes/kms-providers'));
 app.use('/api/external-restore', authMiddleware(['admin']), configLockChokepoint(), require('./routes/external-restore'));
+app.use('/api/migration', authMiddleware(['admin']), configLockChokepoint(), require('./routes/migration'));
 app.use('/api/ai-provider', authMiddleware(['lead', 'admin']), configLockChokepoint(), require('./routes/ai-provider'));
 app.use('/api/ai-burnout', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/ai-burnout'));
 app.use('/api/kb', authMiddleware(['lead', 'admin']), require('./routes/kb'));
@@ -424,6 +431,70 @@ async function start() {
       logger.error('Instance identity establishment failed; refusing to start (fail-closed, D26)', { error: instanceIdentityErr.message });
       logger.error('FireAlive requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
       process.exit(1);
+    }
+
+    // B5e: resolve and seal the deployment mode (D9) now that the instance
+    // anchor exists. On first run FIREALIVE_DEPLOYMENT_MODE provisions and
+    // hardware-seals the mode; thereafter the sealed value is authoritative and
+    // a divergent env var is ignored (and logged). Expose a snapshot on
+    // app.locals for downstream virtualization gating; the mode is
+    // provisioning-only, so a snapshot holds for the process lifetime.
+    try {
+      const deploymentMode = require('./services/deployment-mode');
+      const modeDb = getDb();
+      try {
+        const envMode = process.env.FIREALIVE_DEPLOYMENT_MODE;
+        if (envMode && !deploymentMode.isConfigured(modeDb)) {
+          if (deploymentMode.MODES.indexOf(envMode) === -1) {
+            logger.warn('Ignoring invalid FIREALIVE_DEPLOYMENT_MODE', { value: envMode, valid: deploymentMode.MODES });
+          } else {
+            deploymentMode.setMode(modeDb, envMode);
+            logger.info('Deployment mode provisioned and sealed', { mode: envMode });
+          }
+        } else if (envMode && deploymentMode.getMode(modeDb) !== envMode) {
+          logger.warn('FIREALIVE_DEPLOYMENT_MODE differs from the sealed mode; the sealed mode is authoritative', { env: envMode, sealed: deploymentMode.getMode(modeDb) });
+        }
+        app.locals.deploymentMode = deploymentMode.summary(modeDb);
+        logger.info('Deployment mode', app.locals.deploymentMode);
+      } finally {
+        modeDb.close();
+      }
+    } catch (deploymentModeErr) {
+      logger.warn('Deployment mode resolution failed; defaulting to bare-metal (strict)', { error: deploymentModeErr.message });
+      app.locals.deploymentMode = { mode: 'bare-metal', configured: false, recordPresent: false, virtualized: false, hypervisor: null };
+    }
+
+    // B5e: record this instance's host for vMotion-vs-clone tracking (D10/D11).
+    // The anchor is verified above; in virtualized mode the anchor (vTPM)
+    // moving to a new host is an authorized relocation we audit, while a
+    // bare-metal host change is flagged. Concurrent duplication remains a clone
+    // via the observer path; this only tracks sequential relocation.
+    try {
+      const os = require('os');
+      const instanceRegistry = require('./services/instance-registry');
+      const { auditLog } = require('./middleware/audit');
+      const hostDb = getDb();
+      try {
+        const mode = app.locals.deploymentMode || {};
+        const presence = instanceRegistry.recordHostPresence(hostDb, {
+          host: os.hostname(),
+          virtualized: mode.virtualized === true,
+          hypervisor: mode.hypervisor || null
+        });
+        if (presence.migration) {
+          logger.warn('Instance relocated to a new host (authorized vMotion in virtualized mode)', { from: presence.previousHost, to: presence.host });
+          auditLog(null, 'INSTANCE_MIGRATED', 'authorized vMotion from ' + presence.previousHost + ' to ' + presence.host, null);
+        } else if (presence.unexpected) {
+          logger.error('Instance host changed in bare-metal mode (the anchor should be machine-bound); investigate', { from: presence.previousHost, to: presence.host });
+          auditLog(null, 'INSTANCE_HOST_CHANGED', 'unexpected bare-metal host change from ' + presence.previousHost + ' to ' + presence.host, null);
+        } else if (presence.firstSeen) {
+          logger.info('Instance host recorded', { host: presence.host });
+        }
+      } finally {
+        hostDb.close();
+      }
+    } catch (hostPresenceErr) {
+      logger.warn('Host-presence tracking failed (non-fatal)', { error: hostPresenceErr.message });
     }
 
     // B5e: anti-rollback high-water gate (decision D7). A running build whose

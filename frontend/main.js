@@ -35,6 +35,18 @@ app.on('web-contents-created', (event, contents) => {
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 const caPinPath = () => path.join(app.getPath('userData'), 'firealive-ca.pem');
+
+// D9: per-installation deployment-mode selection (advisory; the server's
+// anchor-sealed mode is authoritative). Stored as a plain JSON file under
+// userData, like the CA pin. Created lazily so app paths are ready.
+const { makeLocalMode } = require('../packages/shared/deployment-mode-local');
+let _localMode = null;
+function localMode() {
+  if (!_localMode) {
+    _localMode = makeLocalMode(path.join(app.getPath('userData'), 'firealive-deployment-mode.json'));
+  }
+  return _localMode;
+}
 let pinnedCaPem = null; // loaded at window creation (after app is ready)
 
 function loadPinnedCaPem() {
@@ -151,6 +163,26 @@ ipcMain.handle('device:signAction', async (_e, { action, target } = {}) => {
     const jti = crypto.randomBytes(16).toString('hex');
     const sig = k.sign(mcActionMessage(action, target || '', iat, jti));
     return { signature: sig.toString('base64'), iat, jti, fingerprint: k.fingerprint };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// D9: report / set this installation's deployment-mode selection (first-run).
+ipcMain.handle('deployment:getLocalMode', async () => {
+  try {
+    const lm = localMode();
+    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized() };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('deployment:setLocalMode', async (_e, { mode } = {}) => {
+  try {
+    const lm = localMode();
+    lm.setMode(mode);
+    return { ok: true, mode: lm.getMode() };
   } catch (e) {
     return { error: e.message };
   }

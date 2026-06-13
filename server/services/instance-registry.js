@@ -169,6 +169,65 @@ function currentStatus(db) {
   return self ? self.status : null;
 }
 
+// ──── Host presence / vMotion-vs-clone (D10, D11) ────────────────────────────
+// The hardware anchor binds this identity. In VIRTUALIZED mode the anchor (a
+// vTPM) migrates with the VM, so the same anchor reappearing on a new host is
+// an authorized relocation (vMotion) that we record and audit. In BARE-METAL
+// the anchor is bound to the physical machine, so a host change is unexpected
+// and flagged. This is ORTHOGONAL to the clone guard: two CONCURRENT sources
+// under one identity remain a clone (see classify, sameIdentityDifferentSource)
+// regardless of mode -- a relocation is sequential, a clone is simultaneous, so
+// recording a relocation here never relaxes clone detection.
+const HOST_KEY = 'instance_host';
+
+function getHomeHost(db) {
+  try {
+    const row = db.prepare("SELECT value FROM config WHERE key = ?").get(HOST_KEY);
+    return row && row.value ? JSON.parse(row.value) : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function writeHomeHost(db, rec) {
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(HOST_KEY, JSON.stringify(rec));
+}
+
+// Record the host this instance is running on and classify any change. The
+// caller passes virtualized (from the sealed deployment mode) and a best-effort
+// host descriptor and hypervisor hint. Returns:
+//   { changed, migration, unexpected, host, previousHost, firstSeen }
+// migration  = authorized vMotion (host changed, virtualized mode)
+// unexpected = host changed in bare-metal mode (anchor should be machine-bound)
+function recordHostPresence(db, opts) {
+  opts = opts || {};
+  const host = opts.host || 'unknown';
+  const virtualized = opts.virtualized === true;
+  const prev = getHomeHost(db);
+  const rec = {
+    host: host,
+    virtualized: virtualized,
+    hypervisor: opts.hypervisor || null,
+    since: new Date().toISOString()
+  };
+  if (!prev || !prev.host) {
+    writeHomeHost(db, rec);
+    return { changed: false, migration: false, unexpected: false, host: host, previousHost: null, firstSeen: true };
+  }
+  if (prev.host === host) {
+    return { changed: false, migration: false, unexpected: false, host: host, previousHost: host, firstSeen: false };
+  }
+  writeHomeHost(db, rec);
+  return {
+    changed: true,
+    migration: virtualized,
+    unexpected: !virtualized,
+    host: host,
+    previousHost: prev.host,
+    firstSeen: false
+  };
+}
+
 module.exports = {
   VERDICT_OK,
   VERDICT_FORK,
@@ -183,4 +242,7 @@ module.exports = {
   evaluateAndRecord,
   quarantine,
   currentStatus,
+  recordHostPresence,
+  getHomeHost,
+  HOST_KEY,
 };

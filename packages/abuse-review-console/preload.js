@@ -8,6 +8,8 @@ const pkg = require('./package.json');
 // private key. The main-process handlers for these channels land in F5b.
 const ALLOWED_CHANNELS = [
   'abuse:hasKey', 'abuse:generateKey', 'abuse:unlock', 'abuse:lock', 'abuse:open', 'abuse:cisoKeyStatus', 'abuse:pinCisoKey', 'abuse:verifyExportToken',
+  // B5e (D9): deployment-mode first-run selection
+  'deployment:getLocalMode', 'deployment:setLocalMode',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

@@ -49,6 +49,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/cloud-vuln',
   '/api/config-baseline',  // snapshots + golden-baseline (mount-gated to cover the :id routes)
   '/api/client-recovery',  // B5d4: per-client AC teardown + re-provision (POST writes gated)
+  '/api/migration',  // B5e: FA-MIG1 deployment migration export + import (POST writes gated)
 ];
 
 // Exact config-write endpoints inside the mixed feature routers (v021-v030).

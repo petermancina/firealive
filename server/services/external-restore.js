@@ -102,6 +102,7 @@ const { logger } = require('./logger');
 const approvalsSvc = require('./restore-approvals');
 const keyWrapSvc = require('./backup-key-wrapping');
 const archiveSvc = require('./backup-archive');
+const dbRestoreSwap = require('./db-restore-swap');
 const manifestSvc = require('./backup-manifest');
 const signingKeysSvc = require('./backup-signing-keys');
 const chainSvc = require('./backup-chain');
@@ -777,118 +778,34 @@ async function executeRestore(db, args) {
   //     last_used_at) silently land in nowhere.
   db.close();
 
-  // 11. Unwrap DEK via the registry dispatcher
-  let ephemeralKey;
-  try {
-    ephemeralKey = await keyWrapSvc.unwrapKey(
-      wrappedKeyBytes,
-      manifest.key_wrapping.scheme,
-      manifest.key_wrapping.kek_reference,
-    );
-  } catch (err) {
-    throw new ExternalRestoreError(CODES.KEY_UNWRAP_FAILED,
-      `DEK unwrap failed (scheme=${manifest.key_wrapping.scheme}, kek=${manifest.key_wrapping.kek_reference}): ${err.message}`,
-      { hint: 'Most often this means the KEK has been rotated or the kms_providers row has changed since this backup was created. Restoring requires the same KEK that wrapped the DEK.' });
-  }
-
-  // 12. Decrypt + decompress + untar
-  let extracted;
-  try {
-    extracted = await archiveSvc.extractArchive(archiveBytes, ephemeralKey);
-  } catch (err) {
-    throw new ExternalRestoreError(CODES.EXTRACT_FAILED,
-      `archive extraction failed: ${err.message}`);
-  }
-
-  // 13. Confirm extracted file is the expected SQLite database
-  if (extracted.name !== 'firealive.db') {
-    throw new ExternalRestoreError(CODES.EXTRACT_UNEXPECTED_FILE,
-      `extracted archive contains '${extracted.name}', expected 'firealive.db'`);
-  }
-
-  // 14. Layer-2 EDR scan of the extracted SQLite bytes. Defense-in-
-  //     depth: catches the case where an attacker tampered with backup
-  //     files between creation and restore even though the chain
-  //     signature passed (signing-key compromise scenario). The scan
-  //     uses a temporary db handle (the orchestrator's own db was
-  //     closed at step 10 to release the file lock for atomic-rename
-  //     in step 16, and IntegrationManager queries the
-  //     malware_scanner_integrations table for configured scanners).
-  //     Three failure modes, all FATAL:
-  //       skipped:true     -> SCANNER_NOT_CONFIGURED (refuse restore;
-  //                           operator must enable a scanner)
-  //       clean:false +
-  //         threats:[...]  -> MALWARE_DETECTED (refuse restore;
-  //                           backup is malicious)
-  //       clean:false +
-  //         no threats     -> SCAN_FAILED (scanners errored without
-  //                           authoritative result; refuse restore --
-  //                           fail-safe rather than fail-open)
-  let scanResult = null;
-  {
-    const scanDb = require('../db/init').getDb();
-    try {
-      const mgr = new IntegrationManager(scanDb);
-      try {
-        scanResult = await mgr.inspectFile(
-          extracted.payload,
-          'firealive.db',
-          'application/x-sqlite3',
-        );
-      } catch (err) {
-        throw new ExternalRestoreError(CODES.SCAN_FAILED,
-          `malware scan threw: ${err.message}`);
-      }
-    } finally {
-      try { scanDb.close(); } catch { /* best effort */ }
-    }
-  }
-  if (scanResult.skipped === true) {
-    throw new ExternalRestoreError(CODES.SCANNER_NOT_CONFIGURED,
-      'restore requires at least one configured malware scanner. ' +
-      'Configure one under MC > Malware Scanners and retry.');
-  }
-  if (scanResult.clean !== true) {
-    const threats = Array.isArray(scanResult.threats) ? scanResult.threats : [];
-    if (threats.length > 0) {
-      throw new ExternalRestoreError(CODES.MALWARE_DETECTED,
-        `malware detected in extracted backup bytes: ${threats.join(', ')}`,
-        { scan_id: scanResult.scanId || null,
-          provider: scanResult.provider || null,
-          threats,
-          scanners: scanResult.scanners || [] });
-    }
-    throw new ExternalRestoreError(CODES.SCAN_FAILED,
-      'malware scan did not produce an authoritative clean result ' +
-      '(all configured scanners errored)',
-      { scan_id: scanResult.scanId || null,
-        scanners: scanResult.scanners || [] });
-  }
-
-  // 15. Pre-restore snapshot of CURRENT live DB
+  // 11-16. Restore the source database through the shared, EDR-scanned swap
+  //        primitive -- the single security-reviewed path used by both
+  //        external restore and migration import. It unwraps the DEK,
+  //        extracts and validates the archive, runs the mandatory malware
+  //        scan, snapshots the current database, and atomic-renames the
+  //        restored bytes over DB_PATH. The original db was closed at step 10;
+  //        getDb opens a fresh connection per call (reopened at step 17).
+  //        DbRestoreError is remapped to ExternalRestoreError so the routes
+  //        layer's existing code-to-status mapping is unchanged.
   const { DB_PATH, getDb: getDbFresh } = require('../db/init');
-  const dbDir = path.dirname(DB_PATH);
-  const preRestorePath = path.join(dbDir, `pre-external-restore-${Date.now()}.db`);
+  let swap;
   try {
-    fs.copyFileSync(DB_PATH, preRestorePath);
+    swap = await dbRestoreSwap.restoreDatabaseFromArchive({
+      archiveBytes,
+      wrappedKeyBytes,
+      scheme: manifest.key_wrapping.scheme,
+      kekReference: manifest.key_wrapping.kek_reference,
+      label: 'external-restore',
+    });
   } catch (err) {
-    throw new ExternalRestoreError(CODES.PRE_RESTORE_SNAPSHOT_FAILED,
-      `failed to snapshot current DB to ${preRestorePath}: ${err.message}`);
+    if (err instanceof dbRestoreSwap.DbRestoreError) {
+      throw new ExternalRestoreError(err.code, err.message, err.detail);
+    }
+    throw err;
   }
-
-  // 16. Atomic-rename extracted bytes over DB_PATH
-  const tempDbPath = path.join(dbDir, `.external-restore-${Date.now()}.db.tmp`);
-  try {
-    fs.writeFileSync(tempDbPath, extracted.payload);
-    fs.renameSync(tempDbPath, DB_PATH);
-  } catch (err) {
-    // If the atomic apply fails, the pre-restore snapshot is the
-    // recovery path. Operator restores from preRestorePath via
-    // direct file copy.
-    try { fs.unlinkSync(tempDbPath); } catch { /* best effort */ }
-    throw new ExternalRestoreError(CODES.ATOMIC_APPLY_FAILED,
-      `atomic apply failed: ${err.message} -- recover from ${preRestorePath}`);
-  }
+  const preRestorePath = swap.preRestorePath;
+  const scanResult = swap.scan;
+  const restoredDbSizeBytes = fs.statSync(DB_PATH).size;
 
   // 17-20. Open a fresh connection against the now-restored DB and
   //        write the post-restore audit markers. The original db
@@ -921,7 +838,7 @@ async function executeRestore(db, args) {
           pre_restore_snapshot_path: preRestorePath,
           source_chain_request_entry_id: restoreRequestChainId,
           restored_at: new Date().toISOString(),
-          restored_db_size_bytes: extracted.payload.length,
+          restored_db_size_bytes: restoredDbSizeBytes,
           malware_scan: {
             clean: scanResult.clean === true,
             scan_id: scanResult.scanId || null,
@@ -976,7 +893,7 @@ async function executeRestore(db, args) {
     pre_restore_snapshot_path: preRestorePath,
     restore_request_chain_id: restoreRequestChainId,
     restore_complete_chain_id: restoreCompleteChainId || null,
-    restored_db_size_bytes: extracted.payload.length,
+    restored_db_size_bytes: restoredDbSizeBytes,
   };
 }
 

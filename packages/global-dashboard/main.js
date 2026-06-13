@@ -36,6 +36,18 @@ app.on('web-contents-created', (event, contents) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const caPinPath = () => path.join(app.getPath('userData'), 'firealive-gd-ca.pem');
+
+// D9: per-installation deployment-mode selection (advisory; the server's
+// anchor-sealed mode is authoritative). Stored as a plain JSON file under
+// userData, like the CA pin. Created lazily so app paths are ready.
+const { makeLocalMode } = require('../shared/deployment-mode-local');
+let _localMode = null;
+function localMode() {
+  if (!_localMode) {
+    _localMode = makeLocalMode(path.join(app.getPath('userData'), 'firealive-deployment-mode.json'));
+  }
+  return _localMode;
+}
 let pinnedCaPem = null; // loaded at window creation (after app is ready)
 
 function loadPinnedCaPem() {
@@ -75,6 +87,26 @@ ipcMain.handle('auth:caStatus', () => {
     const x = new crypto.X509Certificate(pinnedCaPem);
     return { pinned: true, subject: x.subject, validTo: x.validTo, fingerprint256: x.fingerprint256 };
   } catch (_) { return { pinned: true }; }
+});
+
+// D9: report / set this installation's deployment-mode selection (first-run).
+ipcMain.handle('deployment:getLocalMode', async () => {
+  try {
+    const lm = localMode();
+    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized() };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('deployment:setLocalMode', async (_e, { mode } = {}) => {
+  try {
+    const lm = localMode();
+    lm.setMode(mode);
+    return { ok: true, mode: lm.getMode() };
+  } catch (e) {
+    return { error: e.message };
+  }
 });
 
 // Present an OS-store client certificate (e.g. a PIV/CAC smart-card cert) when

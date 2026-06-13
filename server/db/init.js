@@ -2952,6 +2952,34 @@ CREATE INDEX IF NOT EXISTS idx_config_snapshots_origin
 INSERT OR IGNORE INTO config (key, value)
   VALUES ('config_snapshot_retention', '20');
 
+-- Migration bundle ledger (B5e Stage 4, FA-MIG1). One row per exported
+-- deployment-migration bundle. The bundle itself is a file on disk (a composed
+-- golden-baseline plus full-suite backup); this table records its metadata,
+-- hashes, signing-key fingerprint, and lifecycle. Identity is NOT carried in
+-- the ledger: a migration re-establishes instance identity fresh on import.
+CREATE TABLE IF NOT EXISTS migration_bundles (
+  id TEXT PRIMARY KEY,                              -- 'mig-' + uuid
+  created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  format TEXT NOT NULL DEFAULT 'FA-MIG1',
+  bundle_schema_version INTEGER NOT NULL DEFAULT 1,
+  app_version TEXT,                                 -- app version at export time
+  status TEXT NOT NULL DEFAULT 'building'
+    CHECK (status IN ('building', 'complete', 'failed')),
+  bundle_path TEXT,                                 -- composed FA-MIG1 archive on disk
+  manifest_path TEXT,
+  manifest_sig_path TEXT,
+  bundle_sha256 TEXT,                               -- SHA-256 hex of the composed archive
+  size_bytes INTEGER,
+  baseline_sha256 TEXT,                             -- FA-GB1 golden-baseline component hash
+  backup_ref TEXT,                                  -- full-suite backup component (dir or id)
+  signing_key_fingerprint TEXT,                     -- Ed25519 signer fingerprint
+  completed_at TEXT,
+  error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_migration_bundles_created
+  ON migration_bundles(created_at DESC);
+
 `;
 
 function initDb() {
@@ -7636,9 +7664,11 @@ function initDb() {
   }
 
   // ── B5e migration: instance identity + anti-cloning + deployment mode ──────
-  // Creates instance_identity / instance_observations / migration_bundles,
-  // adds the per-AC ratchet columns to ac_device_signing_keys, and seeds the
-  // deployment_mode + fuse_high_water system_meta rows. All idempotent.
+  // Creates instance_identity / instance_observations (migration_bundles is
+  // created by the schema above; this block only rebuilds it when an older
+  // database carries the pre-c139 placeholder shape), adds the per-AC ratchet
+  // columns to ac_device_signing_keys, and seeds the deployment_mode +
+  // fuse_high_water system_meta rows. All idempotent.
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS instance_identity (
@@ -7665,17 +7695,6 @@ function initDb() {
           CHECK (verdict IN ('ok', 'fork', 'clone', 'rollback')),
         detail_json TEXT,
         seen_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      CREATE TABLE IF NOT EXISTS migration_bundles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        direction TEXT NOT NULL CHECK (direction IN ('export', 'import')),
-        bundle_format TEXT NOT NULL DEFAULT 'FA-MIG1',
-        source_instance_fingerprint TEXT,
-        created_by TEXT,
-        status TEXT NOT NULL DEFAULT 'pending',
-        manifest_json TEXT,
-        error_message TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_instance_identity_fingerprint
         ON instance_identity(fingerprint);
@@ -7719,6 +7738,47 @@ function initDb() {
       });
       rebuildInstanceIdentity();
       console.log('B5e migration: instance_identity anchor_kind CHECK widened to include hardware (existing table rebuilt)');
+    }
+    // migration_bundles predates c139 on some databases with a placeholder
+    // shape (INTEGER id, direction / manifest_json). The canonical FA-MIG1
+    // ledger created by the schema uses a TEXT 'mig-' id and per-component
+    // columns. When the recorded schema lacks the canonical bundle_path column,
+    // replace it. The ledger holds only local export / import bookkeeping (no
+    // analyst data, no cross-table references), so the stale table is dropped
+    // and recreated in canonical shape.
+    const migrationBundlesSchema = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'migration_bundles'")
+      .get();
+    if (migrationBundlesSchema && migrationBundlesSchema.sql && migrationBundlesSchema.sql.indexOf('bundle_path') === -1) {
+      const rebuildMigrationBundles = db.transaction(() => {
+        db.exec(`
+          DROP TABLE migration_bundles;
+          CREATE TABLE migration_bundles (
+            id TEXT PRIMARY KEY,
+            created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            format TEXT NOT NULL DEFAULT 'FA-MIG1',
+            bundle_schema_version INTEGER NOT NULL DEFAULT 1,
+            app_version TEXT,
+            status TEXT NOT NULL DEFAULT 'building'
+              CHECK (status IN ('building', 'complete', 'failed')),
+            bundle_path TEXT,
+            manifest_path TEXT,
+            manifest_sig_path TEXT,
+            bundle_sha256 TEXT,
+            size_bytes INTEGER,
+            baseline_sha256 TEXT,
+            backup_ref TEXT,
+            signing_key_fingerprint TEXT,
+            completed_at TEXT,
+            error_message TEXT
+          );
+          CREATE INDEX IF NOT EXISTS idx_migration_bundles_created
+            ON migration_bundles(created_at DESC);
+        `);
+      });
+      rebuildMigrationBundles();
+      console.log('B5e migration: migration_bundles rebuilt to canonical FA-MIG1 ledger shape (stale placeholder replaced)');
     }
     const acDeviceCols = db
       .prepare("PRAGMA table_info(ac_device_signing_keys)")

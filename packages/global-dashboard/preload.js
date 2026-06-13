@@ -12,6 +12,8 @@ const ALLOWED_CHANNELS = [
   'device:getPublicKey', 'device:signLoginChallenge', 'device:signPopProof',
   // B5e (D25): GD-app-side server anchor pinning + per-connect verification
   'anticlone:anchorNonce', 'anticlone:verifyAnchor', 'anticlone:pinAnchor', 'anticlone:anchorState',
+  // B5e (D9): deployment-mode first-run selection
+  'deployment:getLocalMode', 'deployment:setLocalMode',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

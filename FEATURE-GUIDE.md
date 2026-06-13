@@ -631,6 +631,20 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 1. The lead can run the detector read-only (“Run Detector Now”) to see the live verdict and per-signal strengths without firing any response.
 1. Resolving the lockout is gated on a clean scan — the linked scan must have no failed or unverified results and all reachable clients must have reported clean. An admin may force-resolve after out-of-band investigation; the resolving user is recorded on the event.
 
+### Instance Identity & Anti-Cloning
+
+**What it’s for:** Every FireAlive deployment carries a single, hardware-rooted instance identity — an anchor key sealed to the host’s TPM 2.0 (Linux and Windows) or Secure Enclave (macOS) that never leaves the hardware and will not unseal on a different machine. That anchor underpins the deployment’s certificate authority, its server certificates, every analyst-client device registration, and enrollment. It is fail-closed: with no hardware root of trust the deployment refuses to start rather than dropping to a software key — there is no software path to downgrade to, in production, CI, or dev alike. The result is that a copied disk or VM image cannot reconstitute a working deployment on different hardware.
+
+**What catches a clone:**
+
+- **The sealed anchor** — a copied deployment cannot unseal the anchor key off its original hardware, so it cannot act as the instance.
+- **Per-connect server attestation** — each analyst client pins the authentic server’s anchor fingerprint at enrollment and, on every connect, challenges the server to sign a nonce with the anchor key; a clone cannot produce that signature on different hardware, so the client refuses it with no Global Dashboard involvement.
+- **Hardware-bound client device keys plus an anti-rollback ratchet** — analyst-client device keys are hardware-bound and carry a monotonic ratchet counter, so a copied or rolled-back key is rejected.
+- **Duplication and rollback verdicts** — the instance observer records ok / fork / clone / rollback verdicts, so two copies running at once, or a snapshot rollback, are caught independently of the hardware seal.
+- **Bounded compromised-MC blast radius** — privileged Management Console actions are bound to the MC’s own hardware device key, and destructive recovery (teardown / reprovision) requires dual control plus a burst limit, so a compromised console cannot quietly rebind the fleet.
+
+**See also:** Compromise Scan and Per-Client Recovery (System Health) are the operator surfaces; the full model and the bare-metal-versus-virtualized differences are documented in `docs/anti-cloning-and-virtualization.md`.
+
 ### Compromise Scan
 
 **What it’s for:** Orchestrate the analyst-client self-scan across connected clients. Each AC runs ten integrity checks in its isolated Electron main process — binary integrity (against a signed release manifest), memory analysis, network connections, configuration drift, audit-log continuity, EDR/XDR status, API token scope, TLS pinning, filesystem integrity, encryption keys — and returns a report signed by a per-device Ed25519 key the server verifies. Results are tri-state (pass / inconclusive / fail) and never faked: a check that can’t be determined returns inconclusive rather than a false pass. Reports use pseudonyms and carry NO burnout data — only system-health metrics. Use after a tripwire event or any time client compromise is suspected.
@@ -713,6 +727,18 @@ The Global Dashboard carries the same hash-chain + signed-checkpoint integrity o
 1. Lead picks deployment target type
 1. Enters API endpoint for hypervisor or K8s control plane
 1. FireAlive deploys into the configured virtualization infrastructure with the right resource constraints
+
+### Virtualization Mode
+
+**What it’s for:** A deployment-wide mode — bare-metal or virtualized — chosen once at first boot, before any identity is established, and sealed to the hardware root so it cannot be silently flipped afterward. Virtualized mode turns on additive, VM-aware adaptations so every feature works correctly under a hypervisor without weakening the anti-cloning posture. (This is distinct from the Virtualization integration above, which configures a hypervisor or orchestration target; Virtualization Mode is the security posture of the deployment itself.)
+
+**What virtualized mode changes:**
+
+- **vMotion / live migration versus a clone** — the anchor (a virtual TPM) relocating to a new host is treated as an authorized, audited move, while concurrent duplication is still caught as a clone. On bare metal, a host change for the same identity is flagged instead.
+- **Clock-integrity, the snapshot-rollback defense** — FireAlive watches wall-clock against monotonic time; a detected backward jump (a VM rolled back to an earlier snapshot, which would also roll back the database) makes time untrusted and fails closed for privileged recovery actions and for enrollment / break-glass authentication until time re-stabilizes. Bare-metal deployments are never gated on clock divergence.
+- **Backup independence** — local backup destinations are refused, because a VM snapshot or clone would capture them; an external destination (SFTP, S3, Azure, or GCS) is required. All backups are signed and KEK-wrapped regardless of mode.
+
+Step-up user verification stays required in every mode — there is no VDI or virtualized relaxation. Confidential computing (AMD SEV-SNP / Intel TDX) is a documented deployment recommendation, not a runtime gate. The full picture is in `docs/anti-cloning-and-virtualization.md`.
 
 ### SDN
 
@@ -988,6 +1014,23 @@ An import is refused unless a malware scanner is configured, the file’s signat
 1. Baselines signed by that key can now be imported; revoking the key later immediately stops any further baselines signed by it from being imported
 
 Keys are shown with their origin (local or external) and status, so the lead can see at a glance which external deployments are trusted.
+
+### Deployment Migration
+
+**What it’s for:** Move an entire FireAlive deployment to new hardware or a new host — a hardware refresh, a bare-metal-to-VM move, or a data-center relocation — without cloning it. A migration deliberately does NOT copy the source’s instance identity (a verbatim identity restore would be indistinguishable from a clone); instead it carries the data and configuration forward and re-establishes a fresh identity on the target. Three layers are reconciled: instance identity (CA, server keys, analyst-client device keys, certificates, enrollment) is re-established fresh; analyst keys (per-analyst, recoverable through the offline recovery code) are preserved; and data (audit, forensic, and legal-hold chains, configuration, sealed history, training and helper-pay records) is preserved. Analyst clients re-bind afterward through the Per-Client Recovery ceremony.
+
+The migration bundle (format FA-MIG1) is a self-contained, signed package: a manifest, the golden-baseline configuration capture, and a signed, KEK-wrapped full-suite backup — bound together by SHA-256 and signed with the source deployment’s Ed25519 backup signing key.
+
+**Workflow:**
+
+1. On the source deployment: Data & Backup → Deployment Migration → **Export** (MFA step-up). The bundle is composed on the server; note the source’s backup-signing-key fingerprint.
+1. Transfer the bundle directory to the target — a fresh install on the new hardware.
+1. On the target: register the source’s signing key as trusted, confirming the fingerprint out of band (see Trusted Baseline Signing Keys).
+1. Deployment Migration → **Import** → **Preview** (a dry run): review the reconciliation plan — confirm the source key is trusted, the bundle is proceedable, and the three layers read as expected.
+1. **Import** → **Apply** (MFA step-up): the target verifies the signatures, restores the data through the same EDR-scanned swap the external Restore uses (a pre-import snapshot is taken automatically), re-establishes identity fresh, and re-baselines the configuration.
+1. Restart the target, then re-provision the analyst clients against it via Per-Client Recovery.
+
+**Security properties:** an unsigned or untrusted bundle is refused; the restored database bytes are malware-scanned before they replace the live database, and the apply fails closed if no scanner is configured, a threat is found, or the scan is inconclusive; the automatic pre-import snapshot is the rollback path; and because identity is re-minted rather than copied, the migrated deployment is a distinct, authentic instance — not a clone. The full procedure is in `docs/anti-cloning-and-virtualization.md`.
 
 ### Data Sovereignty / Geo-Fencing
 

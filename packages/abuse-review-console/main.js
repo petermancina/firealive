@@ -78,6 +78,18 @@ function startBeaconListener() {
 // PUBLIC key (to register) and decrypted plaintext (to display).
 const reviewerKeyFile = () => path.join(app.getPath('userData'), 'reviewer-key.enc');
 
+// D9: per-installation deployment-mode selection (advisory; the server's
+// anchor-sealed mode is authoritative). Stored as a plain JSON file under
+// userData. Created lazily so app paths are ready.
+const { makeLocalMode } = require('../shared/deployment-mode-local');
+let _localMode = null;
+function localMode() {
+  if (!_localMode) {
+    _localMode = makeLocalMode(path.join(app.getPath('userData'), 'firealive-deployment-mode.json'));
+  }
+  return _localMode;
+}
+
 // The unwrapped private key is held ONLY in this main-process variable, only for
 // the duration of an unlocked session. It is set by abuse:unlock and cleared by
 // abuse:lock (the F13 hard-lock) and on shutdown -- never written unwrapped, never
@@ -118,6 +130,26 @@ function createWindow() {
 // Does a sealed reviewer key already exist on this device? Drives bootstrap vs ready.
 ipcMain.handle('abuse:hasKey', () => {
   try { return fs.existsSync(reviewerKeyFile()); } catch { return false; }
+});
+
+// D9: report / set this installation's deployment-mode selection (first-run).
+ipcMain.handle('deployment:getLocalMode', async () => {
+  try {
+    const lm = localMode();
+    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized() };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+ipcMain.handle('deployment:setLocalMode', async (_e, { mode } = {}) => {
+  try {
+    const lm = localMode();
+    lm.setMode(mode);
+    return { ok: true, mode: lm.getMode() };
+  } catch (e) {
+    return { error: e.message };
+  }
 });
 
 // Minimum reviewer passphrase length. A passphrase (length over composition) is

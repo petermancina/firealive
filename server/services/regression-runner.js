@@ -1272,6 +1272,150 @@ class RegressionRunner {
       return 'sign + verify-by-fingerprint ok; tamper rejected (' + signed.keyFingerprint.slice(0, 12) + ')';
     });
 
+    // Reads a table's recorded CREATE statement (for CHECK-vocabulary asserts).
+    const tableSql = (name) => {
+      const r = this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get(name);
+      return r && r.sql ? r.sql : '';
+    };
+
+    // ── Category: Instance identity (anti-cloning, D24/D25/D26) ────
+    await check('instance_identity', 'Instance-identity + observations tables', () => {
+      return requireAll(['instance_identity', 'instance_observations']);
+    });
+    await check('instance_identity', 'Anchor kind allows a hardware root (D26)', () => {
+      const sql = tableSql('instance_identity');
+      if (sql.indexOf('hardware') === -1) {
+        throw new Error('instance_identity.anchor_kind CHECK does not include hardware (D26 cutover missing)');
+      }
+      return 'anchor_kind CHECK includes hardware';
+    });
+    await check('instance_identity', 'Clone / fork / rollback verdict vocabulary', () => {
+      const sql = tableSql('instance_observations');
+      const need = ['ok', 'fork', 'clone', 'rollback'];
+      const missing = need.filter(v => sql.indexOf("'" + v + "'") === -1);
+      if (missing.length > 0) {
+        throw new Error('instance_observations.verdict CHECK missing: ' + missing.join(', '));
+      }
+      return 'verdict CHECK covers ok / fork / clone / rollback';
+    });
+    await check('instance_identity', 'Instance-anchor service API (D25)', () => {
+      const anchor = require('./instance-anchor');
+      const need = ['establish', 'load', 'sign', 'verify', 'fingerprint', 'ratchet', 'sealState', 'unsealState'];
+      const missing = need.filter(k => typeof anchor[k] !== 'function');
+      if (missing.length > 0) throw new Error('instance-anchor missing: ' + missing.join(', '));
+      return 'establish / load / sign / verify / fingerprint / ratchet / seal / unseal present';
+    });
+    await check('instance_identity', 'Hardware-keystore seam fail-closed, no software fallback (D26)', () => {
+      const ks = require('./instance-anchor/hardware-keystore');
+      if (typeof ks.isAvailable !== 'function' || typeof ks.describe !== 'function') {
+        throw new Error('hardware-keystore seam missing isAvailable / describe');
+      }
+      if (typeof ks.HardwareKeystoreUnavailableError !== 'function') {
+        throw new Error('hardware-keystore missing HardwareKeystoreUnavailableError (the fail-closed signal)');
+      }
+      const d = ks.describe();
+      if (!d || typeof d.available !== 'boolean') throw new Error('describe() did not report availability');
+      // The seal / sign / NV leaf ops are platform-validation-pending (no TPM or
+      // Secure Enclave in CI). What is asserted here is the seam, its
+      // availability gate, and the fail-closed error class; there is no
+      // software-anchor path to fall back to (D26 retired it).
+      return 'hardware seam present; available=' + d.available + '; fail-closed error class present';
+    });
+    await check('instance_identity', 'AC device-key ratchet columns (anti-rollback)', () => {
+      const missing = ['ratchet_counter', 'ratchet_updated_at'].filter(c => !columnExists('ac_device_signing_keys', c));
+      if (missing.length > 0) throw new Error('ac_device_signing_keys missing: ' + missing.join(', '));
+      return 'ratchet_counter + ratchet_updated_at present';
+    });
+    await check('instance_identity', 'MC device-signing key, one active per user (D24)', () => {
+      if (!tableExists('mc_device_signing_keys')) throw new Error('missing table mc_device_signing_keys');
+      if (!indexExists('idx_mc_device_signing_keys_one_active')) {
+        throw new Error('missing one-active-per-user index idx_mc_device_signing_keys_one_active');
+      }
+      return 'mc_device_signing_keys present; one-active-per-user UNIQUE index enforced';
+    });
+    await check('instance_identity', 'Recovery dual-control approval ledger (D24)', () => {
+      if (!tableExists('recovery_action_approvals')) throw new Error('missing table recovery_action_approvals');
+      const sql = tableSql('recovery_action_approvals');
+      if (sql.indexOf("'teardown'") === -1 || sql.indexOf("'reprovision'") === -1) {
+        throw new Error('recovery_action_approvals.action CHECK missing teardown / reprovision');
+      }
+      if (sql.indexOf("'operator'") === -1 || sql.indexOf("'gd'") === -1) {
+        throw new Error('recovery_action_approvals.approval_kind CHECK missing operator / gd');
+      }
+      if (!indexExists('idx_recovery_action_approvals_one_pending')) {
+        throw new Error('missing single-pending guard idx_recovery_action_approvals_one_pending');
+      }
+      return 'teardown / reprovision actions; operator / gd approval; single-pending guard present';
+    });
+    await check('instance_identity', 'Migration bundle ledger is the canonical FA-MIG1 shape', () => {
+      if (!tableExists('migration_bundles')) throw new Error('missing table migration_bundles');
+      const need = ['bundle_path', 'baseline_sha256', 'signing_key_fingerprint', 'manifest_sig_path'];
+      const missing = need.filter(c => !columnExists('migration_bundles', c));
+      if (missing.length > 0) {
+        throw new Error('migration_bundles is not the FA-MIG1 ledger (missing ' + missing.join(', ') + ')');
+      }
+      const idCol = this.db.prepare('PRAGMA table_info(migration_bundles)').all().find(c => c.name === 'id');
+      if (!idCol || String(idCol.type).toUpperCase() !== 'TEXT') {
+        throw new Error('migration_bundles.id is not TEXT (expected the FA-MIG1 mig- id)');
+      }
+      return 'FA-MIG1 ledger columns present; id is TEXT';
+    });
+
+    // ── Category: Virtualization mode + migration (D9/D10/D14) ─────
+    await check('virtualization_mode', 'Deployment-mode service API present', () => {
+      const dm = require('./deployment-mode');
+      const need = ['getMode', 'setMode', 'isConfigured', 'isVirtualized', 'detectHypervisor', 'summary'];
+      const missing = need.filter(k => typeof dm[k] !== 'function');
+      if (missing.length > 0) throw new Error('deployment-mode missing: ' + missing.join(', '));
+      if (!dm.BARE_METAL || !dm.VIRTUALIZED) throw new Error('deployment-mode mode constants missing');
+      return 'getMode / setMode / isConfigured / isVirtualized / detectHypervisor / summary present';
+    });
+    await check('virtualization_mode', 'Deployment mode seeded in system_meta', () => {
+      const row = this.db.prepare("SELECT value FROM system_meta WHERE key = 'deployment_mode'").get();
+      if (!row) throw new Error('no deployment_mode row in system_meta (B5e seed missing)');
+      return 'deployment_mode = ' + row.value;
+    });
+    await check('virtualization_mode', 'Clock-integrity monitor present (snapshot-rollback defense)', () => {
+      const ci = require('./clock-integrity');
+      if (typeof ci.checkClockIntegrity !== 'function' || typeof ci.status !== 'function') {
+        throw new Error('clock-integrity missing checkClockIntegrity / status');
+      }
+      if (typeof ci.MAX_DRIFT_MS !== 'number') throw new Error('clock-integrity missing MAX_DRIFT_MS');
+      const s = ci.status();
+      if (!s || typeof s !== 'object') throw new Error('status() did not return a state object');
+      return 'checkClockIntegrity / status present; MAX_DRIFT_MS = ' + ci.MAX_DRIFT_MS;
+    });
+    await check('virtualization_mode', 'Anti-rollback fuse high-water seeded', () => {
+      const row = this.db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_high_water'").get();
+      if (!row) throw new Error('no fuse_high_water row in system_meta (B5e seed missing)');
+      return 'fuse_high_water = ' + row.value;
+    });
+    await check('virtualization_mode', 'Migration export / import service surface (FA-MIG1)', () => {
+      const bundle = require('./migration-bundle');
+      if (typeof bundle.composeMigrationBundle !== 'function') throw new Error('migration-bundle missing composeMigrationBundle');
+      const reconcile = require('./migration-reconcile');
+      if (typeof reconcile.verifyBundle !== 'function' || typeof reconcile.planReconciliation !== 'function') {
+        throw new Error('migration-reconcile missing verifyBundle / planReconciliation');
+      }
+      const identity = require('./migration-identity');
+      if (typeof identity.clearSourceIdentity !== 'function' || typeof identity.reestablishIdentityFresh !== 'function') {
+        throw new Error('migration-identity missing clearSourceIdentity / reestablishIdentityFresh');
+      }
+      const apply = require('./migration-apply');
+      if (typeof apply.applyReconciliation !== 'function') throw new Error('migration-apply missing applyReconciliation');
+      return 'compose / verify / plan / clear / reestablish / apply present';
+    });
+    await check('virtualization_mode', 'Shared DB-restore-swap primitive present (EDR-scanned)', () => {
+      const swap = require('./db-restore-swap');
+      if (typeof swap.restoreDatabaseFromArchive !== 'function') throw new Error('db-restore-swap missing restoreDatabaseFromArchive');
+      if (typeof swap.scanExtractedBytes !== 'function') throw new Error('db-restore-swap missing scanExtractedBytes (mandatory EDR scan)');
+      if (typeof swap.DbRestoreError !== 'function') throw new Error('db-restore-swap missing DbRestoreError');
+      if (!swap.EXPECTED_DB_FILENAME) throw new Error('db-restore-swap missing EXPECTED_DB_FILENAME guard');
+      return 'restoreDatabaseFromArchive + scanExtractedBytes + DbRestoreError + filename guard present';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

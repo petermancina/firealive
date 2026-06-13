@@ -816,9 +816,59 @@ function Shell({ user, onSignOut }) {
   );
 }
 
+// ── First-run deployment-mode selection (D9) ────────────────────────────────
+// Shown once, before login, when no local deployment-mode selection exists.
+// The choice is advisory and stored locally (the server's anchor-sealed mode
+// is authoritative); it lets the app apply the right virtualization tolerances.
+function DeploymentSetup({ onComplete }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const choose = async (mode) => {
+    setErr(""); setBusy(true);
+    try {
+      const bridge = (typeof window !== "undefined") ? window.firealive : null;
+      if (!bridge || typeof bridge.invoke !== "function") { onComplete(); return; }
+      const r = await bridge.invoke("deployment:setLocalMode", { mode: mode });
+      if (r && r.error) { setErr(r.error); setBusy(false); return; }
+      onComplete();
+    } catch (e) {
+      setErr(e && e.message ? e.message : "could not save selection");
+      setBusy(false);
+    }
+  };
+  const card = (mode, title, desc) => (
+    <button key={mode} onClick={()=>choose(mode)} disabled={busy} style={{textAlign:"left",padding:"18px 20px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,color:C.t,cursor:busy?"default":"pointer",opacity:busy?0.6:1,display:"flex",flexDirection:"column",gap:6,maxWidth:420}}>
+      <span style={{fontSize:13,fontWeight:600,color:C.t}}>{title}</span>
+      <span style={{fontFamily:MONO,color:C.tm,fontSize:10,lineHeight:1.5}}>{desc}</span>
+    </button>
+  );
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:18,padding:24}}>
+      <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
+        <span style={{fontFamily:MONO,color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP</span>
+        <div style={{color:C.t,fontSize:20,fontWeight:600}}>Select deployment mode</div>
+        <span style={{fontFamily:MONO,color:C.tm,fontSize:11,lineHeight:1.6}}>Choose how this deployment runs. This sets local virtualization tolerances and is confirmed against the server.</span>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
+        {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
+      </div>
+      {err && <span style={{fontFamily:MONO,color:C.d,fontSize:10}}>{err}</span>}
+    </div>
+  );
+}
+
 function App() {
   const [user, setUser] = useState(null);
   const [locked, setLocked] = useState(false);
+  const [deployMode, setDeployMode] = useState(undefined); // undefined = checking
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") { setDeployMode({ configured: true, unmanaged: true }); return; }
+    bridge.invoke("deployment:getLocalMode")
+      .then(d=>setDeployMode(d || { configured: false }))
+      .catch(()=>setDeployMode({ configured: true, unmanaged: true }));
+  },[]);
   function signOut() { api.setToken(null); setUser(null); setLocked(false); }
   function lock() { api.setToken(null); setUser(null); setLocked(true); }
 
@@ -835,6 +885,9 @@ function App() {
     reset();
     return () => { clearTimeout(t); events.forEach(e => window.removeEventListener(e, reset)); };
   }, [user]);
+
+  if (deployMode === undefined) return null;
+  if (!deployMode.configured) return <DeploymentSetup onComplete={()=>setDeployMode({ configured: true })} />;
 
   return (
     <div>

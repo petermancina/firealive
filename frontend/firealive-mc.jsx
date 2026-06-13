@@ -1222,6 +1222,113 @@ function IamPanel() {
   </div>);
 }
 
+function MigrationPanel() {
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState(null);
+  const [exportError, setExportError] = useState(null);
+  const [bundleDir, setBundleDir] = useState('');
+  const [commonName, setCommonName] = useState('');
+  const [previewing, setPreviewing] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [applying, setApplying] = useState(false);
+  const [applyResult, setApplyResult] = useState(null);
+  const [applyError, setApplyError] = useState(null);
+
+  const getStepUp = async () => {
+    const opt = await api.post('/api/mfa/stepup/options', {});
+    if (!opt || opt.error || !opt.options || !opt.challengeToken) { window.alert('Could not start MFA step-up: ' + ((opt && opt.error) || 'no challenge issued')); return null; }
+    let cred;
+    try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
+    catch (_e) { return null; }
+    if (!cred) return null;
+    return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
+  };
+
+  const doExport = async () => {
+    setExporting(true); setExportError(null); setExportResult(null);
+    const stepup = await getStepUp();
+    if (!stepup) { setExporting(false); return; }
+    const r = await api.post('/api/migration/export', { stepup });
+    setExporting(false);
+    if (r.error) { setExportError(r.error + (r.code ? ' (' + r.code + ')' : '')); return; }
+    setExportResult(r);
+  };
+
+  const doPreview = async () => {
+    setPreviewing(true); setPreview(null);
+    const r = await api.post('/api/migration/import/preview', { bundleDir });
+    setPreviewing(false);
+    setPreview(r);
+  };
+
+  const doApply = async () => {
+    if (!window.confirm('Apply this migration? This restores the source data and re-establishes this deployment identity fresh. A restart is recommended afterward.')) return;
+    setApplying(true); setApplyError(null); setApplyResult(null);
+    const stepup = await getStepUp();
+    if (!stepup) { setApplying(false); return; }
+    const body = { bundleDir, stepup };
+    if (commonName.trim()) body.commonName = commonName.trim();
+    const r = await api.post('/api/migration/import/apply', body);
+    setApplying(false);
+    if (r.error) { setApplyError(r.error + (r.code ? ' (' + r.code + ')' : '')); return; }
+    setApplyResult(r);
+  };
+
+  const plan = preview && preview.plan ? preview.plan : null;
+  const canApply = !!(preview && preview.ok && plan && plan.proceedable);
+
+  return (
+    <div>
+      <L>Deployment Migration (FA-MIG1)</L>
+      <M style={{color:C.tm,display:'block',marginBottom:16,lineHeight:1.6}}>Export this deployment as a signed FA-MIG1 bundle, or import one onto this host. A migration restores the source data (audit, forensic, and legal-hold chains, config, and analyst keys) and re-establishes this deployment instance identity fresh -- the source identity is never carried, so a migration is not a clone. Analyst clients re-bind through the recovery ceremony afterward.</M>
+      <Card style={{marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:500,color:'#E8EDF5',marginBottom:8}}>Export</div>
+        <M style={{color:C.tm,display:'block',marginBottom:12,lineHeight:1.6}}>Composes a golden-baseline plus a signed, encrypted full-suite backup into a portable bundle on this server. Requires MFA step-up.</M>
+        <Btn primary disabled={exporting} onClick={doExport}>{exporting ? 'Exporting...' : 'Export migration bundle'}</Btn>
+        {exportError && <M style={{color:C.d,display:'block',marginTop:10}}>{exportError}</M>}
+        {exportResult && (<Card style={{marginTop:12,borderColor:C.a+'30'}}>
+          <M style={{color:C.a,fontWeight:500,display:'block',marginBottom:4}}>Bundle composed</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>ID: {exportResult.id}</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>Path: {exportResult.bundle_dir}</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>SHA-256: {exportResult.bundle_sha256}</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>Size: {exportResult.size_bytes} bytes</M>
+          <M style={{color:C.tm,display:'block',marginTop:6,lineHeight:1.6}}>Collect this directory from the server and transfer it to the target host.</M>
+        </Card>)}
+      </Card>
+      <Card style={{marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:500,color:'#E8EDF5',marginBottom:8}}>Import</div>
+        <M style={{color:C.tm,display:'block',marginBottom:12,lineHeight:1.6}}>Place the extracted bundle on this host, enter its directory path, and preview before applying. The source deployment backup signing key must be registered as a trusted key first (confirm its fingerprint out of band).</M>
+        <Input label='Bundle directory (server-side path)' value={bundleDir} onChange={e=>setBundleDir(e.target.value)} placeholder='/data/migration-imports/mig-...' maxLength={1024}/>
+        <Input label='Server certificate common name (optional)' value={commonName} onChange={e=>setCommonName(e.target.value)} placeholder='soc.example.com' maxLength={255}/>
+        <div style={{display:'flex',gap:8,marginTop:4}}>
+          <Btn disabled={previewing || !bundleDir.trim()} onClick={doPreview}>{previewing ? 'Previewing...' : 'Preview (dry run)'}</Btn>
+          <Btn danger disabled={applying || !canApply} onClick={doApply}>{applying ? 'Applying...' : 'Apply migration'}</Btn>
+        </div>
+        {preview && preview.error && <M style={{color:C.d,display:'block',marginTop:10}}>{preview.error}{preview.code ? ' (' + preview.code + ')' : ''}</M>}
+        {preview && preview.ok && (<Card style={{marginTop:12}}>
+          <M style={{color:C.t,fontWeight:500,display:'block',marginBottom:6}}>Reconciliation plan</M>
+          <M style={{color: preview.sourceKeyTrusted ? C.a : C.w, display:'block',lineHeight:1.8}}>Source signing key: {preview.sourceSigningFingerprint || 'unknown'} -- {preview.sourceKeyTrusted ? 'trusted' : 'NOT registered as trusted'}</M>
+          <M style={{color: canApply ? C.a : C.w, display:'block',lineHeight:1.8,marginBottom:8}}>{canApply ? 'Verified -- ready to apply' : 'Not proceedable (verify signatures and register the source key)'}</M>
+          {plan && plan.layers && Object.keys(plan.layers).map(k=>(
+            <div key={k} style={{marginBottom:6}}>
+              <M style={{color: plan.layers[k].preserved ? C.i : C.w, fontWeight:500, display:'block'}}>{k}: {plan.layers[k].action}</M>
+              <M style={{color:C.tm,display:'block',lineHeight:1.6}}>{plan.layers[k].detail}</M>
+            </div>
+          ))}
+          {plan && Array.isArray(plan.warnings) && plan.warnings.map((w,i)=><M key={i} style={{color:C.w,display:'block',lineHeight:1.6}}>Warning: {w}</M>)}
+        </Card>)}
+        {applyError && <M style={{color:C.d,display:'block',marginTop:10}}>{applyError}</M>}
+        {applyResult && (<Card style={{marginTop:12,borderColor:C.a+'30'}}>
+          <M style={{color:C.a,fontWeight:500,display:'block',marginBottom:4}}>Migration applied</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>New anchor: {applyResult.identity && applyResult.identity.newAnchorFingerprint}</M>
+          <M style={{color:C.tm,display:'block',lineHeight:1.8}}>Pre-import snapshot: {applyResult.preRestorePath}</M>
+          {applyResult.restartRecommended && <M style={{color:C.w,display:'block',marginTop:6,lineHeight:1.6}}>Restart this deployment to refresh caches and complete schema migration. Analyst clients must re-bind through the recovery ceremony.</M>}
+        </Card>)}
+      </Card>
+    </div>
+  );
+}
+
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
   // Abuse-reviewer recipient set: list of active reviewer public keys, register
@@ -3352,7 +3459,7 @@ function ManagementConsole() {
       {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cluster",label:"Cluster / Scaling"},{id:"cicd",label:"CI/CD"},
     ]},
     {cat:"data",label:"Data & Backup",items:[
-      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},
+      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},{id:"migration",label:"Deployment Migration"},
     ]},
     {cat:"reports",label:"Reports & Compliance",items:[
       {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},
@@ -8887,6 +8994,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — RISK REGISTER ASSET ══════════ */}
+        {tab==="migration"&&<MigrationPanel/>}
         {tab==="risk_register"&&(<div>
           <L>Risk Register Asset Generator</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate a risk register entry for FireAlive as an organizational asset, including quantitative risk metrics (AV, EF, SLE, ARO, ALE) and qualitative impact/likelihood assessments. Factors in the app's integrations and the human capital risk of NOT using burnout prevention.</M>
@@ -9587,18 +9695,70 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 // ║  APP SHELL                                                              ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
+// ── First-run deployment-mode selection (D9) ────────────────────────────────
+// Shown once, before login, when no local deployment-mode selection exists.
+// The choice is advisory and stored locally (the server's anchor-sealed mode
+// is authoritative); it lets the app apply the right virtualization tolerances.
+function DeploymentSetup({ onComplete }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const choose = async (mode) => {
+    setErr(""); setBusy(true);
+    try {
+      const bridge = (typeof window !== "undefined") ? window.firealive : null;
+      if (!bridge || typeof bridge.invoke !== "function") { onComplete(); return; }
+      const r = await bridge.invoke("deployment:setLocalMode", { mode: mode });
+      if (r && r.error) { setErr(r.error); setBusy(false); return; }
+      onComplete();
+    } catch (e) {
+      setErr(e && e.message ? e.message : "could not save selection");
+      setBusy(false);
+    }
+  };
+  const card = (mode, title, desc) => (
+    <button key={mode} onClick={()=>choose(mode)} disabled={busy} style={{textAlign:"left",padding:"18px 20px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,color:C.t,cursor:busy?"default":"pointer",opacity:busy?0.6:1,display:"flex",flexDirection:"column",gap:6,maxWidth:420}}>
+      <span style={{fontSize:13,fontWeight:600,color:C.t}}>{title}</span>
+      <M style={{color:C.tm,fontSize:10,lineHeight:1.5}}>{desc}</M>
+    </button>
+  );
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:18,padding:24}}>
+      <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
+        <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP</M>
+        <div style={{color:C.t,fontSize:20,fontWeight:600}}>Select deployment mode</div>
+        <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>Choose how this deployment runs. This sets local virtualization tolerances and is confirmed against the server.</M>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
+        {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
+      </div>
+      {err && <M style={{color:C.d,fontSize:10}}>{err}</M>}
+    </div>
+  );
+}
+
 export default function App() {
   const [stage, setStage] = useState("login"); // login → app (no role selection — this IS the MC)
   const [activeRole, setActiveRole] = useState(null);
   const [sysHealth, setSysHealth] = useState({cpu:"—",memory:"—",heap:"—",db:"—",uptime:"—"});
   const [integrationStatus, setIntStatus] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [deployMode, setDeployMode] = useState(undefined); // undefined = checking
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") { setDeployMode({ configured: true, unmanaged: true }); return; }
+    bridge.invoke("deployment:getLocalMode")
+      .then(d=>setDeployMode(d || { configured: false }))
+      .catch(()=>setDeployMode({ configured: true, unmanaged: true }));
+  },[]);
 
   const handleSignOut = () => {
     if(window.FireAliveAPI) window.FireAliveAPI.logout().catch(()=>{});
     setStage("login");setActiveRole(null);
   };
 
+  if (deployMode === undefined) return null;
+  if (!deployMode.configured) return <DeploymentSetup onComplete={()=>setDeployMode({ configured: true })} />;
   if (stage==="login") return <LoginScreen role="manager" onLogin={()=>{setActiveRole("manager");setStage("app");}} onBack={()=>{}}/>;
 
   return (

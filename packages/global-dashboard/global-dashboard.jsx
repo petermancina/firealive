@@ -543,8 +543,58 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
   );
 }
 
+// ── First-run deployment-mode selection (D9) ────────────────────────────────
+// Shown once, before login, when no local deployment-mode selection exists.
+// The choice is advisory and stored locally (the server's anchor-sealed mode
+// is authoritative); it lets the app apply the right virtualization tolerances.
+function DeploymentSetup({ onComplete }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const choose = async (mode) => {
+    setErr(""); setBusy(true);
+    try {
+      const bridge = (typeof window !== "undefined") ? window.firealive : null;
+      if (!bridge || typeof bridge.invoke !== "function") { onComplete(); return; }
+      const r = await bridge.invoke("deployment:setLocalMode", { mode: mode });
+      if (r && r.error) { setErr(r.error); setBusy(false); return; }
+      onComplete();
+    } catch (e) {
+      setErr(e && e.message ? e.message : "could not save selection");
+      setBusy(false);
+    }
+  };
+  const card = (mode, title, desc) => (
+    <button key={mode} onClick={()=>choose(mode)} disabled={busy} style={{textAlign:"left",padding:"18px 20px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,color:C.t,cursor:busy?"default":"pointer",opacity:busy?0.6:1,display:"flex",flexDirection:"column",gap:6,maxWidth:420}}>
+      <span style={{fontSize:13,fontWeight:600,color:C.t}}>{title}</span>
+      <M style={{color:C.tm,fontSize:10,lineHeight:1.5}}>{desc}</M>
+    </button>
+  );
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:18,padding:24}}>
+      <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
+        <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP</M>
+        <div style={{color:C.t,fontSize:20,fontWeight:600}}>Select deployment mode</div>
+        <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>Choose how this deployment runs. This sets local virtualization tolerances and is confirmed against the server.</M>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
+        {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
+      </div>
+      {err && <M style={{color:C.d,fontSize:10}}>{err}</M>}
+    </div>
+  );
+}
+
 export default function GlobalDashboard() {
   const [stage, setStage] = useState("login");
+  const [deployMode, setDeployMode] = useState(undefined); // undefined = checking
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") { setDeployMode({ configured: true, unmanaged: true }); return; }
+    bridge.invoke("deployment:getLocalMode")
+      .then(d=>setDeployMode(d || { configured: false }))
+      .catch(()=>setDeployMode({ configured: true, unmanaged: true }));
+  },[]);
   const [gdServerUrl, setGdServerUrl] = useState("https://localhost:4001");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -1558,6 +1608,8 @@ export default function GlobalDashboard() {
   ];
 
   // LOGIN
+  if (deployMode === undefined) return null;
+  if (!deployMode.configured) return <DeploymentSetup onComplete={()=>setDeployMode({ configured: true })} />;
   if(stage==="login") return <GdLoginScreen onLoggedIn={()=>setStage(firstLaunch?"welcome":"app")} firstLaunch={firstLaunch} gdServerUrl={gdServerUrl} setGdServerUrl={setGdServerUrl} />;
 
   if(stage==="welcome") return(

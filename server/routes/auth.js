@@ -23,6 +23,8 @@ const { logger } = require('../services/logger');
 const { verifyPeerCertificate } = require('../middleware/network-security');
 const ca = require('../services/ca');
 const webauthn = require('../services/webauthn');
+const { isVirtualized } = require('../services/deployment-mode');
+const { checkClockIntegrity } = require('../services/clock-integrity');
 const rateLimit = require('express-rate-limit');
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -394,6 +396,20 @@ router.post('/break-glass', breakglassLimiter, (req, res) => {
 // user. Returns { ok:true, userId, kind, tokenRow? } or { ok:false, status, error }.
 function resolveEnrollmentAuth(db, body) {
   body = body || {};
+  // Clock integrity: both authorization paths below trust time-based
+  // validity (the enrollment token's SQL expiry check and the break-glass
+  // token's signed expiry). Neither survives a VM snapshot rollback as a
+  // defense, because a rollback restores the database too, so a used or
+  // expired token can be revived. In virtualized mode a jumped clock cannot
+  // be trusted to enforce expiry, so refuse session-less enrollment
+  // authorization. Bare-metal is never gated.
+  if (body.enrollment_token || body.breakglass_token) {
+    const clock = checkClockIntegrity({ virtualized: isVirtualized(db) });
+    if (!clock.ok) {
+      auditLog(null, 'ENROLL_AUTH_CLOCK_UNTRUSTED', 'enrollment authorization refused: clock integrity check failed', null);
+      return { ok: false, status: 503, error: 'server clock unverified; retry' };
+    }
+  }
   if (body.enrollment_token) {
     const hash = crypto.createHash('sha256').update(String(body.enrollment_token)).digest('hex');
     const row = db.prepare(`

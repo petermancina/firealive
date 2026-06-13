@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('./audit');
+const { checkClockIntegrity } = require('../services/clock-integrity');
 
 const MC_ACTION_SIGNING_PREFIX = 'firealive-mc-device-action-v1:';
 const MC_ACTION_SEP = String.fromCharCode(10);
@@ -72,6 +73,19 @@ function requireDeviceAction(action, targetOf) {
     if (!/^[a-f0-9]{64}$/.test(fingerprint) || !/^[a-f0-9]{16,64}$/.test(jti)) {
       return res.status(400).json({ error: 'malformed device action proof' });
     }
+
+    // Clock integrity: a signed action's freshness is judged against the wall
+    // clock below, so a virtualized instance whose clock has jumped (snapshot
+    // restore, pause/resume, migration) cannot be trusted to validate the iat
+    // window. Fail closed in that case; bare-metal is never gated.
+    const mode = (req.app && req.app.locals && req.app.locals.deploymentMode) || {};
+    const clock = checkClockIntegrity({ virtualized: !!mode.virtualized });
+    if (!clock.ok) {
+      auditLog(uid, 'MC_DEVICE_ACTION_CLOCK_UNTRUSTED', action, req.ip);
+      logger.error('mc device-action refused: clock integrity check failed', { reason: clock.reason, skewMs: clock.skewMs });
+      return res.status(503).json({ error: 'server clock unverified; retry' });
+    }
+
     const iat = Number(iatRaw);
     const now = Math.floor(Date.now() / 1000);
     if (!Number.isInteger(iat) || iat > now + CLOCK_SKEW_SECONDS || iat < now - ACTION_TTL_SECONDS) {
