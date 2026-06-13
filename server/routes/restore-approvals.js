@@ -45,6 +45,7 @@ const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const approvalsSvc = require('../services/restore-approvals');
 const { mfaStepUp } = require('../middleware/mfa-stepup');
+const { quarantineGuard } = require('../middleware/quarantine-guard');
 
 // ── Validation + helpers ─────────────────────────────────────────────────────
 
@@ -319,7 +320,7 @@ function approveAdminGate(req, res, next) {
   next();
 }
 
-router.post('/:id/approve', approveAdminGate, mfaStepUp(), (req, res) => {
+router.post('/:id/approve', approveAdminGate, quarantineGuard(), mfaStepUp(), (req, res) => {
   const db = getDb();
   const ip = req.ip || null;
 

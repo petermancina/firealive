@@ -210,6 +210,28 @@ NODE_ENV=production
 PORT=3000
 ```
 
+### Provision the Tier-1 KEK (hardware-sealed)
+
+Before the Regional Server starts for the first time, seal the **Tier-1
+key-encryption-key** — which protects server-side secrets at rest (integration
+credentials, signing-key private keys, the CA key) — to the host's TPM 2.0
+(Linux, Windows) or Secure Enclave (macOS). On the server host, run:
+```bash
+node scripts/provision-tier1-kek.js
+```
+Set the printed value as `TIER1_ENCRYPTION_KEY` in your environment or secrets
+manager, and store the one-time **recovery code** offline. The server fails
+closed: it will not start unless `TIER1_ENCRYPTION_KEY` is a hardware-sealed
+value, and a raw key is refused. (`TIER3_ENCRYPTION_KEY`, for analyst data,
+remains a raw 32-byte hex key set in `.env`.)
+
+**Recovering after hardware loss requires BOTH a server backup AND the offline
+recovery code — neither alone is sufficient.** A backup is encrypted under the
+Tier-1 KEK and does not contain it. If the TPM / Secure Enclave is ever
+replaced, run `node scripts/recover-tier1-kek.js` with your recovery code to
+re-establish the key, then restore from backup. Full details:
+`docs/tier1-kek-hardware-sealing.md`.
+
 ---
 
 ## Troubleshooting

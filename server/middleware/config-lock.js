@@ -102,6 +102,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('./audit');
 const { logger } = require('../services/logger');
 const { isConfigWriteRequest } = require('./config-write-routes');
+const { readInstanceStatus } = require('./quarantine-guard');
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -123,6 +124,29 @@ function configLockGate(options = {}) {
     // Safe methods always pass through.
     if (SAFE_METHODS.has(req.method)) {
       return next();
+    }
+
+    // B5e (decision D5): a quarantined deployment -- one where a clone, fork,
+    // or rollback was detected -- must not change configuration. Placing this
+    // inside the config-write chokepoint covers every config-write route at
+    // once. Fail-open on a status-read error (logged): do not block config
+    // writes on a transient read fault; the boot halt and quarantine alert are
+    // the primary controls.
+    try {
+      if (readInstanceStatus() === 'quarantined') {
+        auditLog(
+          req.user ? req.user.id : null,
+          'CONFIG_WRITE_REFUSED_QUARANTINED',
+          `path=${req.method} ${req.path}` + (eventDetail ? ` ${eventDetail}` : ''),
+          req.ip
+        );
+        return res.status(403).json({
+          error: 'This deployment is quarantined because a possible clone, fork, or rollback was detected. Configuration changes are disabled until the instance identity is re-established.',
+          code: 'INSTANCE_QUARANTINED',
+        });
+      }
+    } catch (quarantineErr) {
+      logger.warn('Quarantine status check failed in config-lock gate; allowing', { error: quarantineErr.message });
     }
 
     const db = getDb();

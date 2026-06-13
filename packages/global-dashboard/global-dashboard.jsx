@@ -60,15 +60,54 @@ const api = {
   _token: null,
   _baseUrl: 'https://localhost:4001',
   setBaseUrl(url) { this._baseUrl = url; },
+  setToken(t) { this._token = t; },
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
-  async post(path, data) { try { const r = await fetch(this._baseUrl + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async get(path) { try { const r = await fetch(this._baseUrl + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async put(path, data) { try { const r = await fetch(this._baseUrl + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async patch(path, data) { try { const r = await fetch(this._baseUrl + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async del(path) { try { const r = await fetch(this._baseUrl + path, { method: 'DELETE', headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  // The GD operator app's bridge to the main process, where the hardware device
+  // key lives. Null outside Electron (e.g. tests).
+  _bridge() { return (typeof window !== 'undefined' && window.firealive) ? window.firealive : null; },
+  // Obtain a fresh on-chip proof-of-possession for this request (D28). The server
+  // binds req.path without its query string, so the proof is signed over the path
+  // alone. Returns null when no bridge or key is available; the server then rejects
+  // the request if a proof is required, and the renderer re-authenticates.
+  async _popHeader(method, path) {
+    const b = this._bridge();
+    if (!b || typeof b.invoke !== 'function') return null;
+    try {
+      const res = await b.invoke('device:signPopProof', { method, path: String(path).split('?')[0] });
+      return res && res.proof ? res.proof : null;
+    } catch (_) { return null; }
+  },
+  // Single request path: bearer token, a fresh PoP proof, and (added transparently
+  // by Electron's select-client-certificate) the mTLS client cert. On a gate
+  // rejection the JSON body's error/code are surfaced so the renderer can re-auth.
+  async _send(method, path, data) {
+    const headers = this._headers();
+    const pop = await this._popHeader(method, path);
+    if (pop) headers['x-fa-device-pop'] = pop;
+    const init = { method, headers };
+    if (data !== undefined) init.body = JSON.stringify(data);
+    try {
+      const r = await fetch(this._baseUrl + path, init);
+      if (r.ok) return await r.json();
+      let body = {};
+      try { body = await r.json(); } catch (_) { /* non-JSON error response */ }
+      return { error: body.error || r.statusText, code: body.code, status: r.status };
+    } catch (e) {
+      console.warn('[API]', path, e.message);
+      return { error: e.message };
+    }
+  },
+  async post(path, data) { return this._send('POST', path, data); },
+  async get(path) { return this._send('GET', path); },
+  async put(path, data) { return this._send('PUT', path, data); },
+  async patch(path, data) { return this._send('PATCH', path, data); },
+  async del(path) { return this._send('DELETE', path); },
   async download(path, filename, opts) {
     const method = (opts && opts.method) || 'GET';
-    const init = { method, headers: this._headers() };
+    const headers = this._headers();
+    const pop = await this._popHeader(method, path);
+    if (pop) headers['x-fa-device-pop'] = pop;
+    const init = { method, headers };
     if (opts && opts.body !== undefined) init.body = JSON.stringify(opts.body);
     try {
       const r = await fetch(this._baseUrl + path, init);
@@ -88,7 +127,6 @@ const api = {
       return false;
     }
   },
-  setToken(t) { this._token = t; },
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -273,6 +311,8 @@ function serializeAttestation(cred) {
 // the first CISO/VP passkey on a fresh deployment using the recovery credential.
 function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
   const [error, setError] = useState("");
+  // B5e (D25): set when the GD-server fails hardware-anchor attestation (clone)
+  const [anchorBlocked, setAnchorBlocked] = useState(null);
   const [busy, setBusy] = useState(false);
   const [caStatus, setCaStatus] = useState(null);   // null=checking; {pinned, unmanaged?}
   const [caPem, setCaPem] = useState("");
@@ -290,40 +330,131 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
   },[]);
 
   const base = () => { api.setBaseUrl((gdServerUrl || "").replace(/\/+$/, "")); };
-  const finish = (r) => {
-    if (!r || r.error || !(r.token || r.accessToken) || !r.user) {
-      setError(r && typeof r.error === "string" ? r.error : "Sign-in failed.");
-      return false;
-    }
-    api.setToken(r.token || r.accessToken);
-    onLoggedIn();
-    return true;
+  // Decode a JWT's cnf binding to distinguish a device-bound session from a
+  // first-login bootstrap session (no cnf), which every gated endpoint rejects
+  // until this station's device key is registered.
+  const isDeviceBound = (token) => {
+    try {
+      const seg = String(token).split('.')[1];
+      if (!seg) return false;
+      let b = seg.replace(/-/g, '+').replace(/_/g, '/');
+      while (b.length % 4) b += '=';
+      const payload = JSON.parse(atob(b));
+      return !!(payload && payload.cnf && payload.cnf.jkt);
+    } catch (_e) { return false; }
   };
 
-  const handlePasskeyLogin = async () => {
-    if (!gdServerUrl || !gdServerUrl.trim()) { setError("Enter the GD-Server URL."); return; }
-    setBusy(true); setError(""); base();
+  // Register this station's hardware device key with the GD-Server. Idempotent
+  // server-side, and runs on the bootstrap session whose registration endpoint
+  // is proof-exempt.
+  const registerDeviceKey = async () => {
+    const bridge = (typeof window !== 'undefined') ? window.firealive : null;
+    if (!bridge || !bridge.invoke) return;
     try {
-      const opt = await api.post("/api/auth/login-webauthn/options", {});
-      if (!opt || opt.error || !opt.options || !opt.challengeToken) { setBusy(false); setError("Could not start passkey sign-in. Is the GD-Server CA trusted?"); return; }
+      const pub = await bridge.invoke('device:getPublicKey');
+      if (!pub || !pub.publicKey || !pub.fingerprint) return;
+      await api.post('/api/auth/device-key', { publicKey: pub.publicKey, fingerprint: pub.fingerprint });
+    } catch (_e) { /* best-effort; a bound login still gates access */ }
+  };
+
+  // Build an account-agnostic device-key login proof: fetch a single-use
+  // challenge and sign it on-chip. Null when no key is present yet (pre-
+  // registration) so the server issues a bootstrap session.
+  const buildDeviceKeyProof = async () => {
+    const bridge = (typeof window !== 'undefined') ? window.firealive : null;
+    if (!bridge || !bridge.invoke) return null;
+    try {
+      const ch = await api.post('/api/auth/device-key/challenge', {});
+      if (!ch || ch.error || !ch.challenge || !ch.challengeToken) return null;
+      const signed = await bridge.invoke('device:signLoginChallenge', { challenge: ch.challenge });
+      if (!signed || !signed.signature) return null;
+      return { challengeToken: ch.challengeToken, signature: signed.signature };
+    } catch (_e) { return null; }
+  };
+
+  // Finalize a login response. Registers the device key (first login is a
+  // cnf-less bootstrap) and returns 'bootstrap' so the caller re-runs the login
+  // once for a device-bound token, 'ok' once bound, or 'fail'.
+  // B5e (D25): challenge the GD-server to prove control of its hardware instance
+  // anchor. Mint a nonce, have the server sign it, and verify via main against the
+  // pinned fingerprint. First enrollment pins trust-on-first-use. "ok"/"unpinned"
+  // are safe to proceed; "mismatch"/"invalid" must block.
+  const verifyServerAnchor = async () => {
+    const bridge = (typeof window !== 'undefined') ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== 'function') return { verdict: 'ok', skipped: true };
+    let nonceRes;
+    try { nonceRes = await bridge.invoke('anticlone:anchorNonce'); }
+    catch (_e) { return { verdict: 'ok', skipped: true }; }
+    const nonce = nonceRes && nonceRes.nonce;
+    if (!nonce) return { verdict: 'ok', skipped: true };
+    const resp = await api.post('/api/instance/anchor-challenge', { nonce: nonce });
+    if (!resp || resp.error || !resp.signature || !resp.publicKey || !resp.fingerprint) {
+      return { verdict: 'invalid', reason: 'no anchor-challenge response' };
+    }
+    let v;
+    try {
+      v = await bridge.invoke('anticlone:verifyAnchor', { nonce: nonce, fingerprint: resp.fingerprint, publicKey: resp.publicKey, signature: resp.signature });
+    } catch (_e) {
+      return { verdict: 'invalid', reason: 'anchor verification error' };
+    }
+    if (v && v.verdict === 'unpinned') {
+      try { await bridge.invoke('anticlone:pinAnchor', { fingerprint: resp.fingerprint }); } catch (_e) {}
+      return { verdict: 'ok', pinned: true };
+    }
+    return v || { verdict: 'invalid', reason: 'no verdict' };
+  };
+
+  const finish = async (r) => {
+    if (!r || r.error || !(r.token || r.accessToken) || !r.user) {
+      setError(r && typeof r.error === 'string' ? r.error : 'Sign-in failed.');
+      return 'fail';
+    }
+    const token = r.token || r.accessToken;
+    api.setToken(token);
+    await registerDeviceKey();
+    if (!isDeviceBound(token)) return 'bootstrap';
+    // B5e (D25): verify the GD-server's hardware anchor before granting access.
+    // The session is device-bound here, so the per-request PoP proof is in place;
+    // a cloned GD-server cannot sign the anchor nonce and is refused.
+    const anchor = await verifyServerAnchor();
+    if (anchor && (anchor.verdict === 'mismatch' || anchor.verdict === 'invalid')) {
+      api.setToken(null);
+      setAnchorBlocked({ verdict: anchor.verdict, reason: anchor.reason || null });
+      return 'fail';
+    }
+    onLoggedIn();
+    return 'ok';
+  };
+
+  const handlePasskeyLogin = async (isRetry) => {
+    if (!gdServerUrl || !gdServerUrl.trim()) { setError('Enter the GD-Server URL.'); return; }
+    setBusy(true); setError(''); base();
+    try {
+      const opt = await api.post('/api/auth/login-webauthn/options', {});
+      if (!opt || opt.error || !opt.options || !opt.challengeToken) { setBusy(false); setError('Could not start passkey sign-in. Is the GD-Server CA trusted?'); return; }
       let cred;
       try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
-      catch (_e) { setBusy(false); setError("Passkey sign-in was cancelled, or no passkey was available."); return; }
-      if (!cred) { setBusy(false); setError("No passkey assertion was produced."); return; }
-      const r = await api.post("/api/auth/login-webauthn/verify", { response: serializeAssertion(cred), challengeToken: opt.challengeToken });
-      setBusy(false); finish(r);
-    } catch (e) { setBusy(false); setError(e.message || "Passkey sign-in failed."); }
+      catch (_e) { setBusy(false); setError('Passkey sign-in was cancelled, or no passkey was available.'); return; }
+      if (!cred) { setBusy(false); setError('No passkey assertion was produced.'); return; }
+      const deviceKeyProof = await buildDeviceKeyProof();
+      const r = await api.post('/api/auth/login-webauthn/verify', { response: serializeAssertion(cred), challengeToken: opt.challengeToken, deviceKeyProof });
+      setBusy(false);
+      const st = await finish(r);
+      if (st === 'bootstrap' && !isRetry) return handlePasskeyLogin(true);
+    } catch (e) { setBusy(false); setError(e.message || 'Passkey sign-in failed.'); }
   };
 
-  const handleCertLogin = async () => {
-    if (!gdServerUrl || !gdServerUrl.trim()) { setError("Enter the GD-Server URL."); return; }
-    setBusy(true); setError(""); base();
+  const handleCertLogin = async (isRetry) => {
+    if (!gdServerUrl || !gdServerUrl.trim()) { setError('Enter the GD-Server URL.'); return; }
+    setBusy(true); setError(''); base();
     try {
-      const r = await api.post("/api/auth/login-cert", {});
+      const deviceKeyProof = await buildDeviceKeyProof();
+      const r = await api.post('/api/auth/login-cert', { deviceKeyProof });
       setBusy(false);
-      if (!r || r.error || !(r.token || r.accessToken) || !r.user) { setError(r && typeof r.error === "string" ? r.error : "Certificate sign-in failed. Ensure a client certificate is installed and selected."); return; }
-      api.setToken(r.token || r.accessToken); onLoggedIn();
-    } catch (e) { setBusy(false); setError(e.message || "Certificate sign-in failed."); }
+      if (!r || r.error || !(r.token || r.accessToken) || !r.user) { setError(r && typeof r.error === 'string' ? r.error : 'Certificate sign-in failed. Ensure a client certificate is installed and selected.'); return; }
+      const st = await finish(r);
+      if (st === 'bootstrap' && !isRetry) return handleCertLogin(true);
+    } catch (e) { setBusy(false); setError(e.message || 'Certificate sign-in failed.'); }
   };
 
   const handleImportCa = async () => {
@@ -361,6 +492,18 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
 
   const caUnpinned = caStatus && caStatus.pinned === false;
 
+  if (anchorBlocked) {
+    return (
+      <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif",padding:20}}>
+        <Card style={{maxWidth:520,padding:24,border:"1px solid #7f1d1d"}}>
+          <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Server identity check failed -- session blocked</M>
+          <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This GD-Server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this console will not trust it.</M>
+          <M style={{color:C.td,display:"block"}}>Do not proceed. Contact your platform administrator and report a possible cloned GD-Server.{anchorBlocked.reason ? " Detail: " + anchorBlocked.reason + "." : ""}</M>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{maxWidth:480,width:"100%",padding:"0 24px"}}>
@@ -379,8 +522,8 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
           ) : (
             <div>
               <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Sign in with your passkey or hardware certificate. There is no password.</M>
-              <Btn primary style={{width:"100%",marginBottom:8}} onClick={handlePasskeyLogin} disabled={busy}>{busy?"Working...":"Sign in with a passkey"}</Btn>
-              <Btn style={{width:"100%"}} onClick={handleCertLogin} disabled={busy}>Sign in with a certificate</Btn>
+              <Btn primary style={{width:"100%",marginBottom:8}} onClick={() => handlePasskeyLogin()} disabled={busy}>{busy?"Working...":"Sign in with a passkey"}</Btn>
+              <Btn style={{width:"100%"}} onClick={() => handleCertLogin()} disabled={busy}>Sign in with a certificate</Btn>
             </div>
           )}
           {error&&<M style={{color:C.d,display:"block",marginTop:12}}>{error}</M>}

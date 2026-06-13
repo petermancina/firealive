@@ -78,6 +78,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { encryptConfig, decryptConfig } = require('./encryption');
+const { requireIdentityEstablished } = require('./entropy');
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 const CA_SUBJECT = 'CN=FireAlive Internal CA';
@@ -175,6 +176,10 @@ function loadCaKeyPem(db) {
 function initCa(db) {
   const existing = getActiveCaRow(db);
   if (existing) return { created: false, caCertPem: existing.ca_cert_pem };
+
+  // B5e: do not mint the root CA before this deployment's instance identity is
+  // established (anti-cloning gate, D6). Loading an existing CA above is exempt.
+  requireIdentityEstablished(db);
 
   return withTempDir((dir) => {
     const keyPath = path.join(dir, 'ca.key');

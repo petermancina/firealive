@@ -8,12 +8,19 @@
 const crypto = require('crypto');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
+const tier1Kek = require('./tier1-kek');
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
 
 function getKey(envVar) {
+  // Tier-1 secrets at rest are protected by the hardware-sealed, fail-closed
+  // KEK (decision D26): TIER1_ENCRYPTION_KEY is unsealed on this hardware and
+  // never read as a raw key. All other tiers keep the raw-hex env-var path.
+  if (envVar === 'TIER1_ENCRYPTION_KEY') {
+    return tier1Kek.resolveTier1Kek();
+  }
   const hex = process.env[envVar];
   if (!hex || hex === 'CHANGE_ME' || hex.startsWith('CHANGE_ME')) {
     throw new Error(`${envVar} is not configured. Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`);

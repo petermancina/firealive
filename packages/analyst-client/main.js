@@ -76,6 +76,209 @@ ipcMain.handle('auth:caStatus', () => {
   } catch (_) { return { pinned: true }; }
 });
 
+// B5e: AC-side anti-cloning ratchet. The AC remembers the highest ratchet
+// counter the server has echoed (sealed at rest under userData). It presents that
+// counter on auth (anticlone:ratchetState) and checks the server's echo
+// (anticlone:recordRatchet): a server that returns a counter BELOW what the AC
+// already saw has rolled back or been cloned, and must not be trusted.
+let antiCloneStore = null;
+function getAntiCloneStore() {
+  if (!antiCloneStore) {
+    antiCloneStore = createSealedStore(path.join(app.getPath('userData'), 'anticlone-store.bin'));
+  }
+  return antiCloneStore;
+}
+const SERVER_RATCHET_KEY = 'serverRatchetHighWater';
+
+ipcMain.handle('anticlone:ratchetState', async () => {
+  try {
+    const v = await getAntiCloneStore().get(SERVER_RATCHET_KEY);
+    return { lastSeen: (v === null || v === undefined) ? null : Number(v) };
+  } catch (err) {
+    return { lastSeen: null, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('anticlone:recordRatchet', async (_e, { echoedCounter } = {}) => {
+  const store = getAntiCloneStore();
+  let lastSeen = null;
+  try {
+    const v = await store.get(SERVER_RATCHET_KEY);
+    lastSeen = (v === null || v === undefined) ? null : Number(v);
+  } catch (err) {
+    lastSeen = null;
+  }
+  const echoed = (echoedCounter === null || echoedCounter === undefined) ? null : Number(echoedCounter);
+  if (echoed === null || !Number.isFinite(echoed)) {
+    return { verdict: 'ok', lastSeen: lastSeen, echoed: null };
+  }
+  if (lastSeen !== null && echoed < lastSeen) {
+    return { verdict: 'rollback', lastSeen: lastSeen, echoed: echoed };
+  }
+  const next = (lastSeen === null) ? echoed : Math.max(lastSeen, echoed);
+  try {
+    await store.set(SERVER_RATCHET_KEY, next);
+  } catch (err) {
+    return { verdict: 'ok', lastSeen: next, echoed: echoed, persistError: err && err.message ? err.message : String(err) };
+  }
+  return { verdict: 'ok', lastSeen: next, echoed: echoed };
+});
+
+// B5e (D25): server -> client deployment attestation. The AC pins the Regional
+// server's hardware instance-anchor fingerprint at enrollment and, on each
+// connect, challenges the server to sign a fresh nonce with that anchor. A clone
+// holds the same database and CA but cannot unseal the anchor on different
+// hardware, so it cannot sign the nonce -> the AC refuses it as a possible cloned
+// server. The pinned fingerprint is sealed at rest alongside the ratchet counter;
+// re-pinning is deliberate (the re-provision ceremony), never silent.
+const SERVER_ANCHOR_FP_KEY = 'serverAnchorFingerprint';
+const ANCHOR_CHALLENGE_PREFIX = 'firealive-instance-anchor-challenge-v1:';
+
+// Fresh challenge nonce (32 bytes of CSPRNG). The renderer sends it to
+// POST /api/instance/anchor-challenge and returns the response here to check.
+ipcMain.handle('anticlone:anchorNonce', async () => {
+  return { nonce: crypto.randomBytes(32).toString('base64') };
+});
+
+// Verify an anchor-challenge response. Always checks crypto integrity first (the
+// published key matches its claimed fingerprint, and the signature over
+// <prefix || nonce> is valid), then compares the fingerprint to the pin. Verdicts:
+// 'ok' (pinned + matches), 'mismatch' (pinned but a different anchor -> refuse),
+// 'unpinned' (valid but nothing pinned yet -> caller may pin TOFU), 'invalid'
+// (crypto failed -> refuse).
+ipcMain.handle('anticlone:verifyAnchor', async (_e, payload = {}) => {
+  const nonce = payload.nonce;
+  const fingerprint = payload.fingerprint;
+  const publicKey = payload.publicKey;
+  const signature = payload.signature;
+  if (typeof nonce !== 'string' || typeof fingerprint !== 'string' || typeof publicKey !== 'string' || typeof signature !== 'string') {
+    return { verdict: 'invalid', reason: 'incomplete anchor-challenge response' };
+  }
+  let derFp;
+  try {
+    const der = crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' });
+    derFp = crypto.createHash('sha256').update(der).digest('hex');
+  } catch (_) {
+    return { verdict: 'invalid', reason: 'unreadable public key' };
+  }
+  if (derFp !== fingerprint) {
+    return { verdict: 'invalid', reason: 'fingerprint does not match public key' };
+  }
+  let sigOk = false;
+  try {
+    const message = Buffer.from(ANCHOR_CHALLENGE_PREFIX + nonce, 'utf8');
+    sigOk = crypto.verify('sha256', message, { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64'));
+  } catch (_) {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    return { verdict: 'invalid', reason: 'anchor signature did not verify' };
+  }
+  let pinned = null;
+  try {
+    pinned = await getAntiCloneStore().get(SERVER_ANCHOR_FP_KEY);
+  } catch (_) {
+    pinned = null;
+  }
+  if (pinned === null || pinned === undefined) {
+    return { verdict: 'unpinned', fingerprint: fingerprint };
+  }
+  if (pinned === fingerprint) {
+    return { verdict: 'ok', fingerprint: fingerprint };
+  }
+  return { verdict: 'mismatch', fingerprint: fingerprint, pinned: pinned };
+});
+
+// Pin the server's anchor fingerprint (trust-on-first-use at enrollment). Refuses
+// to silently overwrite an existing, different pin; the re-provision ceremony
+// passes force to deliberately re-pin (D19).
+ipcMain.handle('anticlone:pinAnchor', async (_e, { fingerprint, force } = {}) => {
+  if (typeof fingerprint !== 'string' || !(/^[0-9a-f]{64}$/.test(fingerprint))) {
+    return { pinned: false, error: 'a 64-hex-character anchor fingerprint is required' };
+  }
+  const store = getAntiCloneStore();
+  let existing = null;
+  try { existing = await store.get(SERVER_ANCHOR_FP_KEY); } catch (_) { existing = null; }
+  if (existing && existing !== fingerprint && !force) {
+    return { pinned: false, conflict: true, error: 'anchor already pinned to a different fingerprint; re-pin requires re-provision' };
+  }
+  try {
+    await store.set(SERVER_ANCHOR_FP_KEY, fingerprint);
+  } catch (err) {
+    return { pinned: false, error: err && err.message ? err.message : String(err) };
+  }
+  return { pinned: true, fingerprint: fingerprint, firstPin: !existing };
+});
+
+// Report whether a server anchor fingerprint is pinned (for the connect flow).
+ipcMain.handle('anticlone:anchorState', async () => {
+  try {
+    const v = await getAntiCloneStore().get(SERVER_ANCHOR_FP_KEY);
+    return { pinned: !!v, fingerprint: (v === null || v === undefined) ? null : v };
+  } catch (_) {
+    return { pinned: false, fingerprint: null };
+  }
+});
+
+// B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
+// the signed beacons FireAlive regional servers broadcast and warns the analyst
+// if a cloned or forked server identity appears on the local subnet. The client
+// announces nothing (it has no identity of its own). Anchor-pinned detection
+// arrives with the Block K anchor challenge; until then this runs unpinned, where
+// a concurrent second server identity for the role is the signal.
+let beaconListener = null;
+
+function startBeaconListener() {
+  let beaconLib;
+  try {
+    beaconLib = require('./beacon-listener');
+  } catch {
+    beaconLib = require('../shared/beacon-listener');
+  }
+  try {
+    beaconListener = beaconLib.start({
+      expectedRole: 'regional-server',
+      onDetection: (detection) => {
+        const verdict = detection && detection.verdict ? detection.verdict : 'conflict';
+        try {
+          const notif = new Notification({
+            title: 'FireAlive security alert',
+            body: 'A possible cloned or rogue server was detected on your network. Do not continue and contact your team lead.',
+            urgency: 'critical',
+            silent: false,
+          });
+          notif.show();
+        } catch {
+          // native notification unavailable; the renderer event below is the fallback
+        }
+        try {
+          const wins = BrowserWindow.getAllWindows();
+          if (wins && wins.length) {
+            wins[0].webContents.send('anticlone:serverConflict', {
+              verdict: verdict,
+              role: detection ? detection.role : null,
+              from: detection ? detection.from : null,
+            });
+          }
+        } catch (_e) {
+          // renderer not ready; the notification already fired
+        }
+        try {
+          console.warn('[anticlone] subnet server ' + verdict + ' detected');
+        } catch (_e) {
+          // ignore
+        }
+      },
+    });
+  } catch (err) {
+    try {
+      console.warn('[anticlone] beacon listener failed to start: ' + (err && err.message ? err.message : String(err)));
+    } catch (_e) {
+      // ignore
+    }
+  }
+}
+
 // Present an OS-store client certificate (e.g. a PIV/CAC smart-card cert) when
 // the server requests one at the TLS handshake. If none is available, proceed
 // without a client cert — the server permits app-layer (passkey) authentication.
@@ -598,6 +801,95 @@ function burnoutStore() {
   return createSealedStore(burnoutKeyFile());
 }
 
+// -- B5e: optional hardware-bound at-rest wrap factor for the burnout key (D27) ----
+//
+// An ADDITIVE factor alongside the PRF/scrypt wraps: the burnout private key is also
+// wrapped under a key-encryption key derived by ECDH against a non-exportable P-256
+// key held in this machine TPM / Secure Enclave (the shared hardware-wrap seam). The
+// wrapped blob carries an ephemeral public point; unwrapping recomputes the shared
+// secret on-chip via agree(), so the blob is useless on other hardware. The factor is
+// optional -- with no hardware root the PRF/scrypt factors remain the recovery path, so
+// recoverability is unchanged. The hardware-wrap key is per-user.
+let hwwrap = null;
+try {
+  hwwrap = require('../shared/hardware-wrap');
+} catch (err) {
+  hwwrap = null;
+}
+
+const BURNOUT_HW_WRAP_VERSION = 1;
+const BURNOUT_MODE_HW = 3;
+const BURNOUT_HW_LABEL_PREFIX = 'fa-ac-burnout-hwwrap-';
+
+function burnoutHwLabel(uid) {
+  return BURNOUT_HW_LABEL_PREFIX + String(uid).replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function burnoutHwAvailable() {
+  try {
+    return !!hwwrap && hwwrap.isAvailable() === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Wrap a PKCS8 private key under a KEK derived by ECDH against the per-user hardware
+// wrap key (ECIES). Returns base64: version | mode(HW) | salt(16) | iv(12) | tag(16) |
+// ephLen(2) | ephemeralPublicSpkiDer | ciphertext. Unwrapping needs the hardware.
+function burnoutHwWrapPrivateKey(uid, privPkcs8) {
+  const label = burnoutHwLabel(uid);
+  if (!hwwrap.hasWrapKey(label)) {
+    hwwrap.createWrapKey(label);
+  }
+  const hwPub = crypto.createPublicKey({ key: hwwrap.getWrapPublicKey(label), format: 'der', type: 'spki' });
+  const eph = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const z = crypto.diffieHellman({ privateKey: eph.privateKey, publicKey: hwPub });
+  const salt = crypto.randomBytes(BURNOUT_SALT_LEN);
+  const kek = Buffer.from(crypto.hkdfSync('sha256', z, salt, BURNOUT_WRAP_INFO, 32));
+  const iv = crypto.randomBytes(BURNOUT_IV_LEN);
+  const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);
+  const ct = Buffer.concat([cipher.update(privPkcs8), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const ephPub = eph.publicKey.export({ format: 'der', type: 'spki' });
+  const ephLen = Buffer.alloc(2);
+  ephLen.writeUInt16BE(ephPub.length, 0);
+  return Buffer.concat([Buffer.from([BURNOUT_HW_WRAP_VERSION, BURNOUT_MODE_HW]), salt, iv, tag, ephLen, ephPub, ct]).toString('base64');
+}
+
+function burnoutHwUnwrapPrivateKey(uid, blobB64) {
+  const buf = Buffer.from(String(blobB64 || ''), 'base64');
+  const fixed = 2 + BURNOUT_SALT_LEN + BURNOUT_IV_LEN + BURNOUT_TAG_LEN + 2;
+  if (buf.length < fixed) throw new Error('hardware wrap blob too short');
+  if (buf[0] !== BURNOUT_HW_WRAP_VERSION || buf[1] !== BURNOUT_MODE_HW) throw new Error('unsupported hardware wrap');
+  let p = 2;
+  const salt = buf.subarray(p, p + BURNOUT_SALT_LEN); p += BURNOUT_SALT_LEN;
+  const iv = buf.subarray(p, p + BURNOUT_IV_LEN); p += BURNOUT_IV_LEN;
+  const tag = buf.subarray(p, p + BURNOUT_TAG_LEN); p += BURNOUT_TAG_LEN;
+  const ephLen = buf.readUInt16BE(p); p += 2;
+  if (buf.length < p + ephLen) throw new Error('hardware wrap blob truncated');
+  const ephPub = buf.subarray(p, p + ephLen); p += ephLen;
+  const ct = buf.subarray(p);
+  const z = hwwrap.agree(burnoutHwLabel(uid), ephPub);
+  const kek = Buffer.from(crypto.hkdfSync('sha256', z, salt, BURNOUT_WRAP_INFO, 32));
+  const d = crypto.createDecipheriv('aes-256-gcm', kek, iv);
+  d.setAuthTag(tag);
+  return Buffer.concat([d.update(ct), d.final()]);
+}
+
+// Best-effort: add the optional hardware wrap factor for a known private key. Never
+// throws into the caller -- the hardware factor is additive and the PRF/scrypt factors
+// remain the recovery path. Returns true if the factor was written.
+async function burnoutTryAddHwFactor(store, uid, privPkcs8) {
+  if (!burnoutHwAvailable()) return false;
+  try {
+    await store.set(uid + ':hwwrapped', burnoutHwWrapPrivateKey(uid, privPkcs8));
+    return true;
+  } catch (err) {
+    try { await store.delete(uid + ':hwwrapped'); } catch (err2) { /* ignore */ }
+    return false;
+  }
+}
+
 ipcMain.handle('burnout:status', async (_e, { userId } = {}) => {
   try {
     if (!userId) return { error: 'userId required' };
@@ -606,6 +898,8 @@ ipcMain.handle('burnout:status', async (_e, { userId } = {}) => {
       enrolled: !!meta,
       mode: meta ? meta.mode : null,
       keyVersion: meta ? meta.keyVersion : null,
+      hwFactor: meta ? !!meta.hwFactor : false,
+      hwAvailable: burnoutHwAvailable(),
       unlocked: !!(_burnoutKey && _burnoutKey.userId === String(userId)),
     };
   } catch (err) {
@@ -638,7 +932,8 @@ ipcMain.handle('burnout:enrollKey', async (_e, { userId, prfSecret = null, prfBa
       await store.set(uid + ':private', privPkcs8.toString('base64'));
     }
     const keyVersion = 1;
-    await store.set(uid + ':meta', { mode, keyVersion, publicKey: pubB64, enrolledAt: new Date().toISOString() });
+    const hwFactor = await burnoutTryAddHwFactor(store, uid, privPkcs8);
+    await store.set(uid + ':meta', { mode, keyVersion, publicKey: pubB64, hwFactor, enrolledAt: new Date().toISOString() });
 
     const recoveryWraps = [];
     if (prfSecret) {
@@ -655,7 +950,7 @@ ipcMain.handle('burnout:enrollKey', async (_e, { userId, prfSecret = null, prfBa
 
     _burnoutKey = { privateKey: kp.privateKey, publicKeyB64: pubB64, keyVersion, userId: uid };
 
-    const result = { ok: true, public_key: pubB64, recovery_wraps: recoveryWraps, mode, key_version: keyVersion };
+    const result = { ok: true, public_key: pubB64, recovery_wraps: recoveryWraps, mode, key_version: keyVersion, hw_factor: hwFactor };
     if (recoveryCode) result.recoveryCode = recoveryCode; // shown once; never stored in clear
     return result;
   } catch (err) {
@@ -671,6 +966,20 @@ ipcMain.handle('burnout:unlockKey', async (_e, { userId, prfSecret = null, passp
     const store = burnoutStore();
     const meta = await store.get(uid + ':meta');
     if (!meta) return { error: 'no burnout key enrolled on this device' };
+
+    // Hardware fast path: if a hardware wrap factor is present and this machine has a
+    // hardware root, unlock without the passkey. Additive -- on any failure we fall
+    // through to the PRF/scrypt path, which remains the recovery layer.
+    const hwBlob = await store.get(uid + ':hwwrapped');
+    if (hwBlob && burnoutHwAvailable()) {
+      try {
+        const hwPriv = crypto.createPrivateKey({ key: burnoutHwUnwrapPrivateKey(uid, hwBlob), format: 'der', type: 'pkcs8' });
+        _burnoutKey = { privateKey: hwPriv, publicKeyB64: meta.publicKey, keyVersion: meta.keyVersion, userId: uid };
+        return { ok: true, mode: 'hardware', key_version: meta.keyVersion };
+      } catch (err) {
+        // fall through to the passkey / passphrase path
+      }
+    }
 
     let privPkcs8;
     if (meta.mode === 'prf') {
@@ -703,6 +1012,53 @@ ipcMain.handle('burnout:decrypt', async (_e, { sealed } = {}) => {
 ipcMain.handle('burnout:lock', async () => {
   _burnoutKey = null;
   return { ok: true };
+});
+
+// Add the optional hardware wrap factor to an already-unlocked key (an enrollment
+// that predates the factor, or one moved to new hardware). The key must be unlocked;
+// the PRF/scrypt factors are untouched.
+ipcMain.handle('burnout:addHwFactor', async (_e, { userId } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    const uid = String(userId);
+    if (!_burnoutKey || _burnoutKey.userId !== uid) return { error: 'unlock the burnout key first' };
+    if (!burnoutHwAvailable()) return { error: 'no hardware root of trust on this device' };
+    const store = burnoutStore();
+    const meta = await store.get(uid + ':meta');
+    if (!meta) return { error: 'no burnout key enrolled on this device' };
+    const privPkcs8 = _burnoutKey.privateKey.export({ format: 'der', type: 'pkcs8' });
+    await store.set(uid + ':hwwrapped', burnoutHwWrapPrivateKey(uid, privPkcs8));
+    meta.hwFactor = true;
+    await store.set(uid + ':meta', meta);
+    return { ok: true, hw_factor: true };
+  } catch (err) {
+    return { error: (err.message || 'add hardware factor failed').slice(0, 200) };
+  }
+});
+
+// Remove the hardware wrap factor (and its per-user hardware key). The PRF/scrypt
+// factors remain, so the key stays recoverable.
+ipcMain.handle('burnout:removeHwFactor', async (_e, { userId } = {}) => {
+  try {
+    if (!userId) return { error: 'userId required' };
+    const uid = String(userId);
+    const store = burnoutStore();
+    const meta = await store.get(uid + ':meta');
+    if (!meta) return { error: 'no burnout key enrolled on this device' };
+    await store.delete(uid + ':hwwrapped');
+    if (meta.hwFactor) {
+      meta.hwFactor = false;
+      await store.set(uid + ':meta', meta);
+    }
+    try {
+      if (hwwrap && hwwrap.hasWrapKey(burnoutHwLabel(uid))) hwwrap.deleteWrapKey(burnoutHwLabel(uid));
+    } catch (err2) {
+      // best-effort
+    }
+    return { ok: true, hw_factor: false };
+  } catch (err) {
+    return { error: (err.message || 'remove hardware factor failed').slice(0, 200) };
+  }
 });
 
 // B5d4: recover the analyst burnout key on a re-provisioned device. The local
@@ -743,8 +1099,10 @@ ipcMain.handle('burnout:recoverAndRewrap', async (_e, { userId, recoveryWrap = n
       await store.set(uid + ':wrapped', burnoutWrapPrivateKey(privPkcs8, BURNOUT_MODE_SCRYPT, newPassphrase));
     }
     await store.delete(uid + ':private');
+    await store.delete(uid + ':hwwrapped');
     const kv = Number.isInteger(keyVersion) ? keyVersion : 1;
-    await store.set(uid + ':meta', { mode, keyVersion: kv, publicKey: derivedPub, enrolledAt: new Date().toISOString(), reprovisioned: true });
+    const hwFactor = await burnoutTryAddHwFactor(store, uid, privPkcs8);
+    await store.set(uid + ':meta', { mode, keyVersion: kv, publicKey: derivedPub, hwFactor, enrolledAt: new Date().toISOString(), reprovisioned: true });
 
     // Fresh prf_primary recovery wrap for the server to replace the dead one.
     const recoveryWraps = [];
@@ -906,7 +1264,7 @@ ipcMain.handle('burnout:interpretOverall', async (_e, { overview } = {}) => {
 
 // ── B4: Compromise self-scan engine (device-signed 10-point AC self-scan) ────
 // The analyst client owns an Ed25519 device key. The private key is sealed at
-// rest in the OS keychain (safeStorage) and never leaves this machine; the
+// rest in the TPM / Secure Enclave (B5e: hardware-bound, fail-closed) and never leaves this machine; the
 // public key is registered with the server so it can verify the authenticity
 // and tamper-evidence of a stored scan report. selfscan:run executes the ten
 // checks in the main process (the renderer is sandboxed). Checks that cannot be
@@ -914,27 +1272,37 @@ ipcMain.handle('burnout:interpretOverall', async (_e, { overview } = {}) => {
 // conclusiveness improves as the orchestrate command supplies a signed release
 // manifest, an expected-config baseline, and the caller's session token.
 const deviceKeyFile = () => path.join(app.getPath('userData'), 'device-scan-key.bin');
+const DEVICE_KEY_LABEL = 'fa-ac-device';
 let _deviceScanKey = null;
+// B5e (D21/D26): the device signing key is hardware-bound. Its private half is
+// a non-exportable ECDSA P-256 key held in the TPM / Secure Enclave via the
+// shared client keystore seam; it is minted on first use and re-minted on
+// re-provision. There is NO safeStorage fallback -- if no hardware root is
+// present the client fails closed and refuses to produce a device key. Only the
+// public key (SPKI DER, and its PEM) and the fingerprint are cached here; all
+// signing happens on-chip through the seam.
 async function getDeviceScanKey() {
   if (_deviceScanKey) return _deviceScanKey;
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('OS secure storage is unavailable; refusing to store the device signing key unsealed');
+  const hwkey = require('../shared/hardware-key');
+  if (!hwkey.isAvailable()) {
+    throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the device signing key; this client fails closed and will not run without it');
   }
-  const store = createSealedStore(deviceKeyFile());
-  let priv = await store.get('privateKeyPem');
-  let pub = await store.get('publicKeyPem');
-  if (!priv || !pub) {
-    const kp = crypto.generateKeyPairSync('ed25519');
-    priv = kp.privateKey.export({ type: 'pkcs8', format: 'pem' });
-    pub = kp.publicKey.export({ type: 'spki', format: 'pem' });
-    await store.set('privateKeyPem', priv);
-    await store.set('publicKeyPem', pub);
+  let der = hwkey.hasSigningKey(DEVICE_KEY_LABEL)
+    ? hwkey.getSigningPublicKey(DEVICE_KEY_LABEL)
+    : hwkey.createSigningKey(DEVICE_KEY_LABEL);
+  if (!der) {
+    der = hwkey.createSigningKey(DEVICE_KEY_LABEL);
   }
-  const fingerprint = crypto
-    .createHash('sha256')
-    .update(crypto.createPublicKey(pub).export({ type: 'spki', format: 'der' }))
-    .digest('hex');
-  _deviceScanKey = { privateKey: crypto.createPrivateKey(priv), publicKeyPem: pub, fingerprint };
+  const publicKeyPem = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' })
+    .export({ type: 'spki', format: 'pem' });
+  const fingerprint = crypto.createHash('sha256').update(der).digest('hex');
+  _deviceScanKey = {
+    sign: (data) => hwkey.sign(DEVICE_KEY_LABEL, Buffer.isBuffer(data) ? data : Buffer.from(data)),
+    publicKeyPem,
+    publicKeyDer: der,
+    fingerprint,
+    label: DEVICE_KEY_LABEL,
+  };
   return _deviceScanKey;
 }
 
@@ -1098,6 +1466,25 @@ ipcMain.handle('selfscan:getPublicKey', async () => {
   }
 });
 
+// B5e (D20): sign the WebSocket session challenge with the hardware-bound
+// device key. The server issues a nonce on auth_challenge; the renderer relays
+// it here, this signs the canonical, domain-separated payload on-chip, and the
+// base64 signature goes back in the auth_proof frame. The prefix MUST match the
+// server's AC_SESSION_CHALLENGE_PREFIX byte for byte.
+ipcMain.handle('device:signSessionChallenge', async (_e, { nonce = null } = {}) => {
+  try {
+    if (!nonce || typeof nonce !== 'string') {
+      return { error: 'nonce required' };
+    }
+    const key = await getDeviceScanKey();
+    const payload = Buffer.from('firealive-ac-session-challenge-v1:' + nonce, 'utf8');
+    const signature = key.sign(payload).toString('base64');
+    return { signature, fingerprint: key.fingerprint };
+  } catch (err) {
+    return { error: (err.message || 'session challenge signing failed').slice(0, 200) };
+  }
+});
+
 ipcMain.handle('selfscan:run', async (_e, { runId = null, manifest = null, expectedConfig = null, token = null } = {}) => {
   const startedAt = new Date().toISOString();
   const t0 = Date.now();
@@ -1119,7 +1506,7 @@ ipcMain.handle('selfscan:run', async (_e, { runId = null, manifest = null, expec
       details_json: JSON.stringify(checks),
     };
     const key = await getDeviceScanKey();
-    const signature = crypto.sign(null, Buffer.from(canonicalScanString(result), 'utf8'), key.privateKey).toString('base64');
+    const signature = key.sign(Buffer.from(canonicalScanString(result), 'utf8')).toString('base64');
     return { ...result, device_fingerprint: key.fingerprint, signed_at: new Date().toISOString(), signature };
   } catch (err) {
     return { error: (err.message || 'self-scan failed').slice(0, 200) };
@@ -1245,7 +1632,7 @@ ipcMain.handle('clientop:run', async (_e, { runId = null, opType = null, params 
       detail_json: JSON.stringify(detail || {}),
     };
     const key = await getDeviceScanKey();
-    const signature = crypto.sign(null, Buffer.from(canonicalClientOpString(result), 'utf8'), key.privateKey).toString('base64');
+    const signature = key.sign(Buffer.from(canonicalClientOpString(result), 'utf8')).toString('base64');
     return { ...result, device_fingerprint: key.fingerprint, signed_at: new Date().toISOString(), signature };
   } catch (err) {
     return { error: (err.message || 'fleet op failed').slice(0, 200) };
@@ -1270,6 +1657,12 @@ ipcMain.handle('recovery:wipeLocal', async () => {
       else wiped[name] = 'absent';
     } catch (e) { wiped[name] = 'error'; }
   }
+  // B5e: also retire the hardware-bound device key so a clone of this machine
+  // cannot use it (the private key lives in the TPM / Secure Enclave, not on disk).
+  try {
+    const removed = require('../shared/hardware-key').deleteSigningKey(DEVICE_KEY_LABEL);
+    wiped['device_hw_key'] = removed ? 'removed' : 'absent';
+  } catch (e) { wiped['device_hw_key'] = 'error'; }
   // Drop in-memory caches so the session holds no unlocked key material.
   _burnoutKey = null;
   _deviceScanKey = null;
@@ -1282,8 +1675,12 @@ ipcMain.handle('recovery:wipeLocal', async () => {
 app.whenReady().then(() => {
   try { localLlm.setModelRoot(path.join(app.getPath('userData'), 'models')); } catch (_e) {}
   createWindow();
+  startBeaconListener();
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 // Stop the isolated model utilityProcess cleanly when the app quits.
-app.on('before-quit', () => { try { localLlm.shutdownUtil(); } catch (_e) { /* ignore */ } });
+app.on('before-quit', () => {
+  try { localLlm.shutdownUtil(); } catch (_e) { /* ignore */ }
+  try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ }
+});

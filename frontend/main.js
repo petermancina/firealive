@@ -88,6 +88,74 @@ app.on('select-client-certificate', (event, webContents, url, certificateList, c
   }
 });
 
+// B5e (D24): MC device key + privileged-action signing. The Management Console
+// mints a hardware-bound device key (TPM 2.0 / Secure Enclave) on the shared
+// keystore seam, fingerprint-registered with the server. Destructive recovery
+// actions (teardown / reprovision) are signed on-chip so the server can bind each
+// such action to this MC's hardware identity and apply dual-control / GD co-
+// approval / rate limits. The private key never leaves the hardware; the app
+// fails closed without a hardware root of trust.
+const MC_DEVICE_KEY_LABEL = 'fa-mc-device';
+const MC_ACTION_SIGNING_PREFIX = 'firealive-mc-device-action-v1:';
+const MC_ACTION_SEP = String.fromCharCode(10);
+let _mcDeviceKey = null;
+
+async function getMcDeviceKey() {
+  if (_mcDeviceKey) return _mcDeviceKey;
+  const hwkey = require('../packages/shared/hardware-key');
+  if (!hwkey.isAvailable()) {
+    throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the MC device signing key; this app fails closed and will not run without it');
+  }
+  let der = hwkey.hasSigningKey(MC_DEVICE_KEY_LABEL)
+    ? hwkey.getSigningPublicKey(MC_DEVICE_KEY_LABEL)
+    : hwkey.createSigningKey(MC_DEVICE_KEY_LABEL);
+  if (!der) {
+    der = hwkey.createSigningKey(MC_DEVICE_KEY_LABEL);
+  }
+  const publicKeyPem = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' })
+    .export({ type: 'spki', format: 'pem' });
+  const fingerprint = crypto.createHash('sha256').update(der).digest('hex');
+  _mcDeviceKey = {
+    sign: (data) => hwkey.sign(MC_DEVICE_KEY_LABEL, Buffer.isBuffer(data) ? data : Buffer.from(data)),
+    publicKeyPem,
+    fingerprint,
+    label: MC_DEVICE_KEY_LABEL,
+  };
+  return _mcDeviceKey;
+}
+
+// Domain-separated message bound by a privileged-action signature. The server
+// reconstructs the identical message to verify (same field order + separator).
+function mcActionMessage(action, target, iat, jti) {
+  return Buffer.from(MC_ACTION_SIGNING_PREFIX + [action, target, String(iat), jti].join(MC_ACTION_SEP), 'utf8');
+}
+
+// Public key + fingerprint, for registering the MC device key with the server.
+ipcMain.handle('device:getPublicKey', async () => {
+  try {
+    const k = await getMcDeviceKey();
+    return { publicKey: k.publicKeyPem, fingerprint: k.fingerprint };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// Sign a privileged action on-chip (D24). Returns the signature plus the iat/jti
+// the server needs to reconstruct the message, check the freshness window, and
+// enforce single-use. action is required; target identifies the object acted on.
+ipcMain.handle('device:signAction', async (_e, { action, target } = {}) => {
+  try {
+    if (typeof action !== 'string' || !action) return { error: 'action required' };
+    const k = await getMcDeviceKey();
+    const iat = Math.floor(Date.now() / 1000);
+    const jti = crypto.randomBytes(16).toString('hex');
+    const sig = k.sign(mcActionMessage(action, target || '', iat, jti));
+    return { signature: sig.toString('base64'), iat, jti, fingerprint: k.fingerprint };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
 function startServer() {
   const serverPath = path.join(__dirname, '..', 'server', 'index.js');
   serverProcess = spawn('node', [serverPath], {
@@ -228,6 +296,65 @@ try {
   ({ buildAbuseExportPdf } = require('./abuse-export-pdf'));
 } catch {
   ({ buildAbuseExportPdf } = require('../packages/shared/abuse-export-pdf'));
+}
+
+// B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
+// the signed beacons FireAlive regional servers broadcast and warns the operator
+// if a cloned or forked server identity appears on the local subnet. The console
+// announces nothing (it has no identity of its own). Anchor-pinned detection
+// arrives with the Block K anchor challenge; until then this runs unpinned, where
+// a concurrent second server identity for the role is the signal.
+let beaconListener = null;
+
+function startBeaconListener() {
+  let beaconLib;
+  try {
+    beaconLib = require('./beacon-listener');
+  } catch {
+    beaconLib = require('../packages/shared/beacon-listener');
+  }
+  try {
+    beaconListener = beaconLib.start({
+      expectedRole: 'regional-server',
+      onDetection: (detection) => {
+        const verdict = detection && detection.verdict ? detection.verdict : 'conflict';
+        try {
+          const notif = new Notification({
+            title: 'FireAlive security alert',
+            body: 'A possible cloned or rogue server was detected on your network. Do not continue and contact your security team.',
+            urgency: 'critical',
+            silent: false,
+          });
+          notif.show();
+        } catch {
+          // native notification unavailable; the renderer event below is the fallback
+        }
+        try {
+          const wins = BrowserWindow.getAllWindows();
+          if (wins && wins.length) {
+            wins[0].webContents.send('anticlone:serverConflict', {
+              verdict: verdict,
+              role: detection ? detection.role : null,
+              from: detection ? detection.from : null,
+            });
+          }
+        } catch (_e) {
+          // renderer not ready; the notification already fired
+        }
+        try {
+          console.warn('[anticlone] subnet server ' + verdict + ' detected');
+        } catch (_e) {
+          // ignore
+        }
+      },
+    });
+  } catch (err) {
+    try {
+      console.warn('[anticlone] beacon listener failed to start: ' + (err && err.message ? err.message : String(err)));
+    } catch (_e) {
+      // ignore
+    }
+  }
 }
 
 // libsignal is a native ESM module; load it dynamically and normalize the shape
@@ -417,9 +544,14 @@ app.whenReady().then(() => {
   startServer();
   // Wait for server to be ready
   setTimeout(createWindow, 2000);
+  startBeaconListener();
 });
 
 app.on('window-all-closed', () => {
   if (serverProcess) serverProcess.kill();
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ }
 });

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain } = require('electron');
+const { app, BrowserWindow, session, ipcMain, Notification } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -89,6 +89,200 @@ app.on('select-client-certificate', (event, webContents, url, certificateList, c
   }
 });
 
+// === Operator device key (Block K, D20/D28) ================================
+// The hardware-bound, non-exportable signing key this GD operator's app mints on
+// the shared sign-only seam (TPM 2.0 / Secure Enclave; fail-closed, no software
+// fallback). Its public half is registered with the GD server at enrollment; it
+// signs the single-use login challenge and a fresh proof-of-possession on every
+// API request. The signing prefixes and the PoP field order below are copied
+// verbatim from the GD server's gd-device-key and gd-pop modules; they MUST stay
+// in lockstep or signatures will not verify.
+const GD_DEVICE_KEY_LABEL = 'fa-gd-device';
+const GD_LOGIN_SIGNING_PREFIX = 'firealive-gd-device-key-login-v1:';
+const GD_POP_SIGNING_PREFIX = 'firealive-gd-device-pop-v1:';
+const GD_POP_FIELD_SEP = String.fromCharCode(10);
+let _gdDeviceKey = null;
+
+// RFC 7638 JWK SHA-256 thumbprint (base64url) of the device public key. Matches
+// the GD server's jwkThumbprint, so the value the app signs into a PoP equals the
+// session token's cnf.jkt binding.
+function gdJwkThumbprint(publicKeyPem) {
+  const jwk = crypto.createPublicKey(publicKeyPem).export({ format: 'jwk' });
+  let members;
+  if (jwk.kty === 'EC') {
+    members = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
+  } else if (jwk.kty === 'OKP') {
+    members = { crv: jwk.crv, kty: jwk.kty, x: jwk.x };
+  } else {
+    throw new Error('unsupported key type for thumbprint');
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(members)).digest('base64url');
+}
+
+// The exact bytes signed for a per-request proof (mirror of gd-pop.popMessage).
+function gdPopMessage(method, path, iat, jti, jkt) {
+  const fields = [String(method).toUpperCase(), String(path), String(iat), String(jti), String(jkt)];
+  return Buffer.from(GD_POP_SIGNING_PREFIX + fields.join(GD_POP_FIELD_SEP), 'utf8');
+}
+
+// Mint or load the device key. Fails closed when no hardware root is present.
+async function getGdDeviceKey() {
+  if (_gdDeviceKey) return _gdDeviceKey;
+  const hwkey = require('../shared/hardware-key');
+  if (!hwkey.isAvailable()) {
+    throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the GD operator device signing key; this app fails closed and will not run without it');
+  }
+  let der = hwkey.hasSigningKey(GD_DEVICE_KEY_LABEL)
+    ? hwkey.getSigningPublicKey(GD_DEVICE_KEY_LABEL)
+    : hwkey.createSigningKey(GD_DEVICE_KEY_LABEL);
+  if (!der) {
+    der = hwkey.createSigningKey(GD_DEVICE_KEY_LABEL);
+  }
+  const publicKeyPem = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' })
+    .export({ type: 'spki', format: 'pem' });
+  const fingerprint = crypto.createHash('sha256').update(der).digest('hex');
+  _gdDeviceKey = {
+    sign: (data) => hwkey.sign(GD_DEVICE_KEY_LABEL, Buffer.isBuffer(data) ? data : Buffer.from(data)),
+    publicKeyPem,
+    fingerprint,
+    jkt: gdJwkThumbprint(publicKeyPem),
+    label: GD_DEVICE_KEY_LABEL,
+  };
+  return _gdDeviceKey;
+}
+
+// Public key + fingerprint, for registering the device key at enrollment.
+ipcMain.handle('device:getPublicKey', async () => {
+  try {
+    const k = await getGdDeviceKey();
+    return { publicKey: k.publicKeyPem, fingerprint: k.fingerprint };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// Sign the single-use login challenge on-chip (proof of possession at login).
+ipcMain.handle('device:signLoginChallenge', async (_e, { challenge } = {}) => {
+  try {
+    if (typeof challenge !== 'string' || !challenge) return { error: 'challenge required' };
+    const k = await getGdDeviceKey();
+    const sig = k.sign(Buffer.from(GD_LOGIN_SIGNING_PREFIX + challenge, 'utf8'));
+    return { signature: sig.toString('base64'), fingerprint: k.fingerprint };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// Sign a fresh per-request proof-of-possession on-chip. Returns the opaque
+// base64url(JSON({ iat, jti, sig })) value the request wrapper sends as the
+// x-fa-device-pop header.
+ipcMain.handle('device:signPopProof', async (_e, { method, path } = {}) => {
+  try {
+    if (typeof method !== 'string' || typeof path !== 'string') return { error: 'method and path required' };
+    const k = await getGdDeviceKey();
+    const iat = Math.floor(Date.now() / 1000);
+    const jti = crypto.randomBytes(16).toString('hex');
+    const sig = k.sign(gdPopMessage(method, path, iat, jti, k.jkt));
+    const proof = Buffer.from(JSON.stringify({ iat, jti, sig: sig.toString('base64') })).toString('base64url');
+    return { proof };
+  } catch (e) {
+    return { error: e.message };
+  }
+});
+
+// B5e (D25): server -> client deployment attestation, GD-server side. The GD app
+// pins the GD-server's hardware instance-anchor fingerprint at enrollment and, on
+// each connect, challenges the server to sign a fresh nonce with that anchor. A
+// clone holds the same database and CA but cannot unseal the anchor on different
+// hardware -> it cannot sign, and the app refuses it. The fingerprint is public
+// (like the pinned CA), so it is kept as a plain JSON file under userData; re-
+// pinning is deliberate (the re-provision ceremony), never silent.
+const GD_ANCHOR_CHALLENGE_PREFIX = 'firealive-gd-instance-anchor-challenge-v1:';
+const anchorPinPath = () => path.join(app.getPath('userData'), 'firealive-gd-anchor-pin.json');
+
+function loadAnchorPin() {
+  try {
+    const f = anchorPinPath();
+    if (!fs.existsSync(f)) return null;
+    const o = JSON.parse(fs.readFileSync(f, 'utf8'));
+    return o && typeof o.fingerprint === 'string' ? o.fingerprint : null;
+  } catch (_) { return null; }
+}
+function saveAnchorPin(fingerprint) {
+  fs.writeFileSync(anchorPinPath(), JSON.stringify({ fingerprint: fingerprint }), { mode: 0o600 });
+}
+
+// Fresh 32-byte challenge nonce. The renderer sends it to the GD-server's
+// POST /api/instance/anchor-challenge and returns the response here to check.
+ipcMain.handle('anticlone:anchorNonce', async () => {
+  return { nonce: crypto.randomBytes(32).toString('base64') };
+});
+
+// Verify a GD anchor-challenge response: the published key matches its claimed
+// fingerprint, the signature over <prefix || nonce> verifies, then the fingerprint
+// is compared to the pin. Verdicts: 'ok', 'mismatch', 'unpinned', 'invalid'.
+ipcMain.handle('anticlone:verifyAnchor', async (_e, payload = {}) => {
+  const nonce = payload.nonce;
+  const fingerprint = payload.fingerprint;
+  const publicKey = payload.publicKey;
+  const signature = payload.signature;
+  if (typeof nonce !== 'string' || typeof fingerprint !== 'string' || typeof publicKey !== 'string' || typeof signature !== 'string') {
+    return { verdict: 'invalid', reason: 'incomplete anchor-challenge response' };
+  }
+  let derFp;
+  try {
+    const der = crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' });
+    derFp = crypto.createHash('sha256').update(der).digest('hex');
+  } catch (_) {
+    return { verdict: 'invalid', reason: 'unreadable public key' };
+  }
+  if (derFp !== fingerprint) {
+    return { verdict: 'invalid', reason: 'fingerprint does not match public key' };
+  }
+  let sigOk = false;
+  try {
+    const message = Buffer.from(GD_ANCHOR_CHALLENGE_PREFIX + nonce, 'utf8');
+    sigOk = crypto.verify('sha256', message, { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64'));
+  } catch (_) {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    return { verdict: 'invalid', reason: 'anchor signature did not verify' };
+  }
+  const pinned = loadAnchorPin();
+  if (pinned === null) {
+    return { verdict: 'unpinned', fingerprint: fingerprint };
+  }
+  if (pinned === fingerprint) {
+    return { verdict: 'ok', fingerprint: fingerprint };
+  }
+  return { verdict: 'mismatch', fingerprint: fingerprint, pinned: pinned };
+});
+
+// Pin the GD-server's anchor fingerprint (trust-on-first-use at enrollment).
+// Refuses to silently overwrite a different pin; re-provision passes force (D19).
+ipcMain.handle('anticlone:pinAnchor', async (_e, { fingerprint, force } = {}) => {
+  if (typeof fingerprint !== 'string' || !(/^[0-9a-f]{64}$/.test(fingerprint))) {
+    return { pinned: false, error: 'a 64-hex-character anchor fingerprint is required' };
+  }
+  const existing = loadAnchorPin();
+  if (existing && existing !== fingerprint && !force) {
+    return { pinned: false, conflict: true, error: 'anchor already pinned to a different fingerprint; re-pin requires re-provision' };
+  }
+  try {
+    saveAnchorPin(fingerprint);
+  } catch (err) {
+    return { pinned: false, error: err && err.message ? err.message : String(err) };
+  }
+  return { pinned: true, fingerprint: fingerprint, firstPin: !existing };
+});
+
+// Report whether a GD-server anchor fingerprint is pinned (for the connect flow).
+ipcMain.handle('anticlone:anchorState', async () => {
+  const v = loadAnchorPin();
+  return { pinned: !!v, fingerprint: v || null };
+});
+
 function startGdServer() {
   const serverPath = path.join(__dirname, '..', 'global-dashboard-server', 'index.js');
   gdServerProcess = spawn('node', [serverPath], {
@@ -125,5 +319,65 @@ function createWindow() {
   win.loadFile('index.html');
 }
 
-app.whenReady().then(() => { startGdServer(); setTimeout(createWindow, 2000); });
+// B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
+// the signed beacons the FireAlive GD server broadcasts and warns the operator
+// if a cloned or forked server identity appears on the local subnet. The
+// dashboard announces nothing (it has no identity of its own). Anchor-pinned
+// detection arrives with the Block K anchor challenge; until then this runs
+// unpinned, where a concurrent second server identity for the role is the signal.
+let beaconListener = null;
+
+function startBeaconListener() {
+  let beaconLib;
+  try {
+    beaconLib = require('./beacon-listener');
+  } catch {
+    beaconLib = require('../shared/beacon-listener');
+  }
+  try {
+    beaconListener = beaconLib.start({
+      expectedRole: 'gd-server',
+      onDetection: (detection) => {
+        const verdict = detection && detection.verdict ? detection.verdict : 'conflict';
+        try {
+          const notif = new Notification({
+            title: 'FireAlive security alert',
+            body: 'A possible cloned or rogue server was detected on your network. Do not continue and contact your security team.',
+            urgency: 'critical',
+            silent: false,
+          });
+          notif.show();
+        } catch {
+          // native notification unavailable; the renderer event below is the fallback
+        }
+        try {
+          const wins = BrowserWindow.getAllWindows();
+          if (wins && wins.length) {
+            wins[0].webContents.send('anticlone:serverConflict', {
+              verdict: verdict,
+              role: detection ? detection.role : null,
+              from: detection ? detection.from : null,
+            });
+          }
+        } catch (_e) {
+          // renderer not ready; the notification already fired
+        }
+        try {
+          console.warn('[anticlone] subnet server ' + verdict + ' detected');
+        } catch (_e) {
+          // ignore
+        }
+      },
+    });
+  } catch (err) {
+    try {
+      console.warn('[anticlone] beacon listener failed to start: ' + (err && err.message ? err.message : String(err)));
+    } catch (_e) {
+      // ignore
+    }
+  }
+}
+
+app.whenReady().then(() => { startGdServer(); setTimeout(createWindow, 2000); startBeaconListener(); });
 app.on('window-all-closed', () => { if (gdServerProcess) gdServerProcess.kill(); if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', () => { try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ } });

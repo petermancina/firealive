@@ -73,6 +73,7 @@
 
 const crypto = require('crypto');
 const base = require('./base');
+const tier1Kek = require('../tier1-kek');
 
 const PROVIDER_NAME = 'env-var';
 const SECURITY_TIER = 3;
@@ -97,6 +98,22 @@ function readEnvVarKek(envVarName, operation) {
       `env_var_name '${envVarName}' is not a valid env var name`,
       { provider: PROVIDER_NAME, operation, retryable: false },
     );
+  }
+  // The FireAlive Tier-1 KEK is hardware-sealed and fail-closed (decision D26):
+  // resolve TIER1_ENCRYPTION_KEY by unsealing it on this hardware rather than
+  // reading a raw hex key. A backup wrapped under it can only be unwrapped with
+  // the same KEK -- from the original hardware or the offline recovery code.
+  // Return a copy: the resolver caches the KEK, and wrap/unwrap zero their local
+  // reference after use, which must not corrupt that cache.
+  if (envVarName === 'TIER1_ENCRYPTION_KEY') {
+    try {
+      return Buffer.from(tier1Kek.resolveTier1Kek());
+    } catch (err) {
+      throw new base.KeyWrappingError(
+        err && err.message ? err.message : String(err),
+        { provider: PROVIDER_NAME, operation, retryable: false, detail: { reason: 'hardware-sealed-kek' } },
+      );
+    }
   }
   const hex = process.env[envVarName];
   if (!hex) {

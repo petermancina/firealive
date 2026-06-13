@@ -11,6 +11,33 @@ const crypto = require('crypto');
 // forwarder at the bottom of this file returns a safe { sent: false } result.
 let _instance = null;
 
+// B5e (D26): verify a device signature with the key's native algorithm. A legacy
+// Ed25519 device key (software custody) uses the null digest; a hardware-bound
+// ECDSA P-256 key -- the new default after Block L -- uses SHA-256 with the raw
+// r||s / IEEE P1363 encoding. Any other key type fails closed. This lets the
+// server accept both across the device-key cutover, mirroring the key-type-aware
+// beacon verifier in peer-beacon.js.
+function verifyDeviceSignature(publicKey, data, signature) {
+  const keyType = publicKey.asymmetricKeyType;
+  if (keyType === 'ed25519') {
+    return crypto.verify(null, data, publicKey, signature);
+  }
+  if (keyType === 'ec') {
+    return crypto.verify('sha256', data, { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
+  }
+  return false;
+}
+
+// B5e (D20): the canonical payload an AC signs to prove possession of its active
+// device key when a session is established. Domain-separated from the scan-result
+// and fleet-op signatures (distinct prefixes) so a session proof can never be
+// replayed as a scan result, or the reverse.
+const AC_SESSION_CHALLENGE_PREFIX = 'firealive-ac-session-challenge-v1:';
+
+function sessionChallengeBytes(nonce) {
+  return Buffer.from(AC_SESSION_CHALLENGE_PREFIX + String(nonce), 'utf8');
+}
+
 class FireAliveWebSocket {
   constructor(server, db) {
     this.db = db;
@@ -66,13 +93,82 @@ class FireAliveWebSocket {
     });
   }
 
+  // B5e (D20): the active device key for a user, or null. The session gate needs
+  // a signature from this key; /device-key and ac-ratchet maintain exactly one
+  // active row per user.
+  _activeDeviceKey(userId) {
+    try {
+      return this.db.prepare("SELECT public_key, fingerprint FROM ac_device_signing_keys WHERE user_id = ? AND active = 1 ORDER BY id LIMIT 1").get(userId) || null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  // B5e (D22): a second genuinely-live session presenting the same active device
+  // key is the signature of a running clone. Raise a loud server-side alert; the
+  // caller refuses the newcomer and leaves the incumbent session untouched.
+  _alertDuplicateActive(userId, observedFrom) {
+    try {
+      console.warn('[anti-clone] duplicate active device session refused for user ' + userId + (observedFrom ? ' from ' + observedFrom : '') + ' at ' + new Date().toISOString());
+    } catch (err) {
+      // best-effort: the refusal is the enforcement; this log is advisory
+    }
+  }
+
+  // B5e (D20, D22): finish authenticating a socket once identity is established --
+  // either no device-key gate applies, or the device-key proof verified. Refuses a
+  // duplicate active session (D22), then registers the client, advances the
+  // anti-cloning ratchet, and delivers any queued work.
+  _completeSession(ws, decoded, presentedRatchet, observedFrom) {
+    // D22: refuse only a genuinely-live duplicate. isAlive is driven by the
+    // heartbeat loop (pong -> true; each cycle sets it false then terminates if
+    // still false), so a stale socket pending termination is replaced -- no false
+    // refusal on a legitimate reconnect -- while a live clone is refused.
+    const existing = this.clients.get(decoded.id);
+    if (existing && existing !== ws && existing.readyState === WebSocket.OPEN && existing.isAlive === true) {
+      this._alertDuplicateActive(decoded.id, observedFrom);
+      this._send(ws, { type: 'auth_error', error: 'a session for this device identity is already active', code: 'DUPLICATE_ACTIVE' });
+      ws.close(1008, 'duplicate active session');
+      return;
+    }
+    ws.userId = decoded.id;
+    ws.userRole = decoded.role;
+    this.clients.set(decoded.id, ws);
+    this._updateHeartbeat(decoded.id, true);
+    // B5e: advance this device's anti-cloning ratchet and echo the new value. An
+    // AC presenting a counter ahead of the server signals a rolled-back or forked
+    // server -> quarantine.
+    let acRatchetCounter = null;
+    try {
+      const acRatchet = require('./ac-ratchet');
+      const instanceRegistry = require('./instance-registry');
+      const ratchetResult = acRatchet.advanceForUser(this.db, { userId: decoded.id, presentedCounter: presentedRatchet, observedFrom: observedFrom });
+      acRatchetCounter = ratchetResult.counter;
+      if (ratchetResult.quarantineRecommended) {
+        instanceRegistry.quarantine(this.db, { reason: 'AC presented a ratchet ahead of the server', verdict: ratchetResult.verdict, observerKind: instanceRegistry.OBSERVER_AC, observedFrom: observedFrom });
+        this.broadcastReenrollRequired('instance quarantined: ' + ratchetResult.verdict);
+      }
+    } catch (acRatchetErr) {
+      // ratchet is non-fatal to auth; identity detection degrades gracefully
+    }
+    this._send(ws, { type: 'auth_ok', userId: decoded.id, acRatchet: acRatchetCounter });
+    // B4: deliver any compromise-scan commands queued while offline.
+    this._deliverQueuedScans(ws, decoded.id);
+    // B5d4: push the current signal-refresh cadence to analysts and deliver any
+    // fleet-op commands queued while offline.
+    if (decoded.role === 'analyst') {
+      this._send(ws, { type: 'sync_cadence', cadence: this._currentSyncCadence() });
+    }
+    this._deliverQueuedClientOps(ws, decoded.id);
+  }
+
   _handleMessage(ws, msg) {
     switch (msg.type) {
       case 'auth':
-        // JWT verification — reject connections that don't present a
-        // valid, non-expired token. The client-supplied msg.userId
-        // is intentionally ignored; ws.userId is set from the verified
-        // token payload so a spoofed userId cannot be substituted.
+        // JWT verification -- reject connections that do not present a valid,
+        // non-expired token. The client-supplied msg.userId is intentionally
+        // ignored; identity is taken from the verified token payload so a spoofed
+        // userId cannot be substituted.
         if (!msg.token || typeof msg.token !== 'string') {
           this._send(ws, { type: 'auth_error', error: 'Token required' });
           ws.close(1008, 'auth required');
@@ -81,19 +177,24 @@ class FireAliveWebSocket {
         try {
           const { verifyToken } = require('../middleware/auth');
           const decoded = verifyToken(msg.token);
-          ws.userId = decoded.id;
-          ws.userRole = decoded.role;
-          this.clients.set(decoded.id, ws);
-          this._updateHeartbeat(decoded.id, true);
-          this._send(ws, { type: 'auth_ok', userId: decoded.id });
-          // B4: deliver any compromise-scan commands queued while offline.
-          this._deliverQueuedScans(ws, decoded.id);
-          // B5d4: push the current signal-refresh cadence to analysts and
-          // deliver any fleet-op commands queued while offline.
-          if (decoded.role === 'analyst') {
-            this._send(ws, { type: 'sync_cadence', cadence: this._currentSyncCadence() });
+          const observedFrom = (ws._socket && ws._socket.remoteAddress) ? ws._socket.remoteAddress : null;
+          // B5e (D20): bind the session to a device-key proof. A user with an
+          // active device key MUST sign a server nonce before the session forms;
+          // an analyst with no active key is refused (fail closed). Leads and
+          // management hold no device key yet (deferred to Block N) and pass
+          // straight through.
+          const deviceKey = this._activeDeviceKey(decoded.id);
+          if (deviceKey) {
+            const nonce = crypto.randomBytes(32).toString('base64');
+            ws._pendingAuth = { userId: decoded.id, role: decoded.role, nonce: nonce, publicKeyPem: deviceKey.public_key, presentedRatchet: msg.acRatchet, observedFrom: observedFrom };
+            this._send(ws, { type: 'auth_challenge', nonce: nonce });
+          } else if (decoded.role === 'analyst') {
+            this._send(ws, { type: 'auth_error', error: 'no active device key registered for this analyst', code: 'DEVICE_KEY_REQUIRED' });
+            ws.close(1008, 'device key required');
+            return;
+          } else {
+            this._completeSession(ws, decoded, msg.acRatchet, observedFrom);
           }
-          this._deliverQueuedClientOps(ws, decoded.id);
         } catch (err) {
           const code = err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
           this._send(ws, { type: 'auth_error', error: err.message, code });
@@ -101,6 +202,38 @@ class FireAliveWebSocket {
           return;
         }
         break;
+      case 'auth_proof': {
+        // B5e (D20): second step of the device-key session gate. The client signed
+        // the auth_challenge nonce with its active device key; verify it with the
+        // key's native algorithm (Ed25519, or hardware ECDSA P-256 after Block L)
+        // before the session forms. Any failure closes the socket unauthenticated.
+        const pending = ws._pendingAuth;
+        if (!pending) {
+          this._send(ws, { type: 'auth_error', error: 'no challenge in progress', code: 'NO_CHALLENGE' });
+          ws.close(1008, 'no challenge');
+          return;
+        }
+        ws._pendingAuth = null;
+        if (!msg.signature || typeof msg.signature !== 'string') {
+          this._send(ws, { type: 'auth_error', error: 'signature required', code: 'DEVICE_PROOF_FAILED' });
+          ws.close(1008, 'device proof failed');
+          return;
+        }
+        let proofOk = false;
+        try {
+          const pub = crypto.createPublicKey(pending.publicKeyPem);
+          proofOk = verifyDeviceSignature(pub, sessionChallengeBytes(pending.nonce), Buffer.from(msg.signature, 'base64')) === true;
+        } catch (proofErr) {
+          proofOk = false;
+        }
+        if (!proofOk) {
+          this._send(ws, { type: 'auth_error', error: 'device key proof failed', code: 'DEVICE_PROOF_FAILED' });
+          ws.close(1008, 'device proof failed');
+          return;
+        }
+        this._completeSession(ws, { id: pending.userId, role: pending.role }, pending.presentedRatchet, pending.observedFrom);
+        break;
+      }
       case 'heartbeat':
         ws.isAlive = true;
         this._updateHeartbeat(ws.userId, true);
@@ -199,6 +332,20 @@ class FireAliveWebSocket {
     });
   }
 
+  // B5e (decision D5): tell connected analyst clients that this deployment was
+  // quarantined and re-enrollment is required, routing the affected analysts
+  // into the B5d4 recovery flow rather than silently trusting a possibly-cloned
+  // server. Informational only -- the actual re-enrollment is operator-driven
+  // (client-recovery reprovision, behind admin MFA); this surfaces the
+  // requirement. Sent to all authenticated clients.
+  broadcastReenrollRequired(reason) {
+    this.clients.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        this._send(ws, { type: 'reenroll_required', reason: reason || null, at: new Date().toISOString() });
+      }
+    });
+  }
+
   // ── B4: Compromise scan orchestration over the WebSocket channel ─────────
   // Fan out an orchestrate_scan command to the connected target ACs. Offline
   // targets are handled by the route (queued) and delivered on reconnect via
@@ -260,7 +407,7 @@ class FireAliveWebSocket {
       if (keyRow && result.signature) {
         try {
           const pub = crypto.createPublicKey(keyRow.public_key);
-          verified = crypto.verify(null, Buffer.from(this._canonicalScan(result), 'utf8'), pub, Buffer.from(result.signature, 'base64'));
+          verified = verifyDeviceSignature(pub, Buffer.from(this._canonicalScan(result), 'utf8'), Buffer.from(result.signature, 'base64'));
         } catch { verified = false; }
       }
 
@@ -462,7 +609,7 @@ class FireAliveWebSocket {
       if (keyRow && result.signature) {
         try {
           const pub = crypto.createPublicKey(keyRow.public_key);
-          verified = crypto.verify(null, Buffer.from(this._canonicalClientOp(result), 'utf8'), pub, Buffer.from(result.signature, 'base64'));
+          verified = verifyDeviceSignature(pub, Buffer.from(this._canonicalClientOp(result), 'utf8'), Buffer.from(result.signature, 'base64'));
         } catch (e) { verified = false; }
       }
 

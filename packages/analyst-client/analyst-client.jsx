@@ -687,10 +687,48 @@ function AcLoginScreen({ onLoggedIn, logC }) {
   };
 
   // Persist the JWT, store the refresh token, bring up E2EE, and advance.
-  const finalize = (loginResponse, method) => {
+  // B5e (D25): challenge the server to prove control of its hardware instance
+  // anchor. Mint a nonce, have the server sign it, and verify the response against
+  // the pinned fingerprint via main. First enrollment pins trust-on-first-use.
+  // "ok"/"unpinned" are safe to proceed; "mismatch"/"invalid" must block.
+  const verifyServerAnchor = async () => {
+    const bridge = bridgeRef();
+    if (!bridge || typeof bridge.invoke !== "function") return { verdict: "ok", skipped: true };
+    let nonceRes;
+    try { nonceRes = await bridge.invoke("anticlone:anchorNonce"); }
+    catch (_e) { return { verdict: "ok", skipped: true }; }
+    const nonce = nonceRes && nonceRes.nonce;
+    if (!nonce) return { verdict: "ok", skipped: true };
+    const resp = await api.post("/api/instance/anchor-challenge", { nonce: nonce });
+    if (!resp || resp.error || !resp.signature || !resp.publicKey || !resp.fingerprint) {
+      return { verdict: "invalid", reason: "no anchor-challenge response" };
+    }
+    let v;
+    try {
+      v = await bridge.invoke("anticlone:verifyAnchor", { nonce: nonce, fingerprint: resp.fingerprint, publicKey: resp.publicKey, signature: resp.signature });
+    } catch (_e) {
+      return { verdict: "invalid", reason: "anchor verification error" };
+    }
+    if (v && v.verdict === "unpinned") {
+      try { await bridge.invoke("anticlone:pinAnchor", { fingerprint: resp.fingerprint }); } catch (_e) {}
+      return { verdict: "ok", pinned: true };
+    }
+    return v || { verdict: "invalid", reason: "no verdict" };
+  };
+
+  const finalize = async (loginResponse, method) => {
     if (loginResponse && loginResponse.accessToken) api.setToken(loginResponse.accessToken);
     if (loginResponse && loginResponse.refreshToken) {
       try { localStorage.setItem("fa_ac_refresh_token", loginResponse.refreshToken); } catch (_e) {}
+    }
+    // B5e (D25): verify the server hardware anchor before trusting it with data.
+    // A clone holds the same credentials but cannot sign with the anchor.
+    const anchor = await verifyServerAnchor();
+    if (anchor && (anchor.verdict === "mismatch" || anchor.verdict === "invalid")) {
+      api.setToken(null);
+      setAnchorMismatch({ verdict: anchor.verdict, reason: anchor.reason || null });
+      logC("SERVER_ANCHOR_REJECTED", "Server failed hardware-anchor attestation (" + anchor.verdict + ")");
+      return;
     }
     logC("LOGIN_SUCCESS", "Authenticated via " + method);
     const selfId = loginResponse && loginResponse.user ? loginResponse.user.id : null;
@@ -714,7 +752,7 @@ function AcLoginScreen({ onLoggedIn, logC }) {
       const r = await api.post("/api/auth/login-webauthn/verify", { response: serializeAssertion(assertion), challengeToken: opt.challengeToken });
       setBusy(false);
       if (!r || r.error || !r.accessToken) { setError(r && r.error ? String(r.error) : "Passkey sign-in failed."); return; }
-      finalize(r, "passkey");
+      await finalize(r, "passkey");
     } catch (e) { setBusy(false); setError(e.message || "Passkey sign-in failed."); }
   };
 
@@ -724,7 +762,7 @@ function AcLoginScreen({ onLoggedIn, logC }) {
       const r = await api.post("/api/auth/login-cert", {});
       setBusy(false);
       if (!r || r.error || !r.accessToken) { setError(r && r.error ? String(r.error) : "Certificate sign-in failed. Ensure your client certificate is installed."); return; }
-      finalize(r, "certificate");
+      await finalize(r, "certificate");
     } catch (e) { setBusy(false); setError(e.message || "Certificate sign-in failed."); }
   };
 
@@ -1359,6 +1397,12 @@ export default function AnalystClientApp() {
   // signals. intervalMin drives the timer; the rest is forward-compatible.
   const [syncCadence, setSyncCadence] = useState({ intervalMin: 15, adaptiveSync: true, urgentThresholdSec: 30, batchMode: true });
   const [signalRefreshTrigger, setSignalRefreshTrigger] = useState(0);
+  // B5e: set when the server echoes a ratchet behind what this AC saw (clone/rollback)
+  const [serverRollback, setServerRollback] = useState(null);
+  // B5e: set when the server signals this deployment was quarantined (re-enroll)
+  const [reenrollRequired, setReenrollRequired] = useState(null);
+  // B5e (D25): set when the server fails hardware-anchor attestation (clone)
+  const [anchorMismatch, setAnchorMismatch] = useState(null);
 
   React.useEffect(() => { const iv = setInterval(() => api.post("/api/heartbeat", {}), 30000); return () => clearInterval(iv); }, []);
 
@@ -1386,6 +1430,7 @@ export default function AnalystClientApp() {
     let ws = null;
     let reconnectTimer = null;
     let closedByUnmount = false;
+    let serverRollbackHalt = false;
     let backoffMs = 1000;
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws";
 
@@ -1407,11 +1452,58 @@ export default function AnalystClientApp() {
       ws.onopen = () => {
         backoffMs = 1000;
         acScanWsRef.current = ws;
-        try { ws.send(JSON.stringify({ type: "auth", token: api._token })); } catch (_e) {}
+        // B5e: present the highest server ratchet this AC has seen so the server
+        // can detect a cloned or forked AC. Fall back to a plain auth if the
+        // bridge has no invoke (older preload) so login still works.
+        const sendAuth = (acRatchet) => {
+          try { ws.send(JSON.stringify({ type: "auth", token: api._token, acRatchet: acRatchet })); } catch (_e) {}
+        };
+        if (bridge && typeof bridge.invoke === "function") {
+          bridge.invoke("anticlone:ratchetState")
+            .then((r) => { sendAuth(r && r.lastSeen != null ? r.lastSeen : null); })
+            .catch(() => { sendAuth(null); });
+        } else {
+          sendAuth(null);
+        }
       };
       ws.onmessage = (evt) => {
         let msg;
         try { msg = JSON.parse(evt.data); } catch (_e) { return; }
+        // B5e (D20): the server gates the session on a device-key proof. On an
+        // auth_challenge, sign the nonce on-chip through main and answer with an
+        // auth_proof frame. If signing is unavailable or fails, close the socket;
+        // the session must not form without the proof (fail closed).
+        if (msg && msg.type === "auth_challenge") {
+          if (bridge && typeof bridge.invoke === "function") {
+            bridge.invoke("device:signSessionChallenge", { nonce: msg.nonce })
+              .then((res) => {
+                if (res && res.signature) {
+                  try { ws.send(JSON.stringify({ type: "auth_proof", signature: res.signature })); } catch (_e) {}
+                } else {
+                  try { ws.close(4002, "device key proof unavailable"); } catch (_e) {}
+                }
+              })
+              .catch(() => { try { ws.close(4002, "device key proof failed"); } catch (_e) {} });
+          } else {
+            try { ws.close(4002, "device key proof unavailable"); } catch (_e) {}
+          }
+        }
+
+        // B5e: on auth_ok the server echoes its ratchet counter. A value BELOW
+        // what this AC last saw means the server rolled back or was cloned --
+        // halt reconnects, block the session, and refuse to trust this server.
+        if (msg && msg.type === "auth_ok") {
+          if (bridge && typeof bridge.invoke === "function") {
+            bridge.invoke("anticlone:recordRatchet", { echoedCounter: msg.acRatchet != null ? msg.acRatchet : null })
+              .then((res) => {
+                if (res && res.verdict === "rollback") {
+                  serverRollbackHalt = true;
+                  setServerRollback({ lastSeen: res.lastSeen, echoed: res.echoed });
+                  try { ws.close(4001, "server ratchet rollback"); } catch (_e) {}
+                }
+              }).catch(() => {});
+          }
+        }
         if (msg && msg.type === "desktop_notify" && msg.payload) {
           try { bridge.send("notify:desktop", msg.payload); } catch (_e) {}
         }
@@ -1468,9 +1560,15 @@ export default function AnalystClientApp() {
         if (msg && msg.type === "urgent_refresh") {
           setSignalRefreshTrigger((n) => n + 1);
         }
+        // B5e: the server reports this deployment was quarantined (a clone, fork,
+        // or rollback was detected). Surface a blocking notice routing the analyst
+        // to re-enroll via their team lead.
+        if (msg && msg.type === "reenroll_required") {
+          setReenrollRequired({ reason: msg.reason || null, at: msg.at || null });
+        }
 
       };
-      ws.onclose = () => { acScanWsRef.current = null; if (!closedByUnmount) scheduleReconnect(); };
+      ws.onclose = () => { acScanWsRef.current = null; if (!closedByUnmount && !serverRollbackHalt) scheduleReconnect(); };
       ws.onerror = () => { try { ws.close(); } catch (_e) {} };
     }
 
@@ -2544,6 +2642,34 @@ export default function AnalystClientApp() {
   return(
     <div style={{minHeight:"100vh",background:"#060A10",color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
+      {serverRollback && (
+        <div style={{position:"fixed",inset:0,background:"rgba(8,2,2,0.94)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100000,padding:20}}>
+          <Card style={{maxWidth:520,padding:24,border:"1px solid #7f1d1d"}}>
+            <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Server identity check failed -- session blocked</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This client connected to a server presenting an anti-rollback counter behind one it has already seen. That indicates the server was restored from an older snapshot or cloned, and this client will not trust it.</M>
+            <M style={{color:C.td,display:"block",marginBottom:6}}>Do not enter credentials or data. Contact your team lead and report a possible server clone or rollback.</M>
+            <M style={{color:C.td,display:"block"}}>Counter last seen {serverRollback.lastSeen != null ? String(serverRollback.lastSeen) : "n/a"}; server offered {serverRollback.echoed != null ? String(serverRollback.echoed) : "n/a"}.</M>
+          </Card>
+        </div>
+      )}
+      {anchorMismatch && (
+        <div style={{position:"fixed",inset:0,background:"rgba(8,2,2,0.94)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100001,padding:20}}>
+          <Card style={{maxWidth:520,padding:24,border:"1px solid #7f1d1d"}}>
+            <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Server identity check failed -- session blocked</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this client will not trust it.</M>
+            <M style={{color:C.td,display:"block"}}>Do not enter data. Contact your team lead and report a possible server clone.{anchorMismatch.reason ? " Detail: " + anchorMismatch.reason + "." : ""}</M>
+          </Card>
+        </div>
+      )}
+      {reenrollRequired && (
+        <div style={{position:"fixed",inset:0,background:"rgba(20,12,2,0.94)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:99999,padding:20}}>
+          <Card style={{maxWidth:520,padding:24,border:"1px solid #b45309"}}>
+            <M style={{color:"#fcd34d",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Re-enrollment required -- deployment quarantined</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This deployment reported that its identity was quarantined because a possible clone, fork, or rollback was detected. This client must be re-enrolled before it can be trusted again.</M>
+            <M style={{color:C.td,display:"block"}}>Stop work and contact your team lead to complete re-enrollment.{reenrollRequired.reason ? " Reason: " + reenrollRequired.reason + "." : ""}</M>
+          </Card>
+        </div>
+      )}
       {exportPrompt && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
           <Card style={{maxWidth:460,padding:22}}>

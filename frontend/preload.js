@@ -12,6 +12,8 @@ const ALLOWED_CHANNELS = [
   'notify:desktop',
   'e2ee:init', 'e2ee:publishBundle', 'e2ee:replenishPrekeys', 'e2ee:processBundle', 'e2ee:hasSession', 'e2ee:encrypt', 'e2ee:decrypt', 'e2ee:safetyNumber',
   'abuse:seal', 'abuse:hold-for-export', 'abuse:finalize-export', 'abuse:cancel-export',
+  // B5e (D24): MC device key registration + privileged-action signing
+  'device:getPublicKey', 'device:signAction',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

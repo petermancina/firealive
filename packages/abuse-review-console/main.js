@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, safeStorage } = require('electron');
+const { app, BrowserWindow, session, ipcMain, safeStorage, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -11,6 +11,65 @@ try {
   ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey, unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('./abuse-seal'));
 } catch {
   ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey, unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('../shared/abuse-seal'));
+}
+
+// B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
+// the signed beacons FireAlive regional servers broadcast and warns the reviewer
+// if a cloned or forked server identity appears on the local subnet. The console
+// announces nothing (it has no identity of its own). Anchor-pinned detection
+// arrives with the Block K anchor challenge; until then this runs unpinned, where
+// a concurrent second server identity for the role is the signal.
+let beaconListener = null;
+
+function startBeaconListener() {
+  let beaconLib;
+  try {
+    beaconLib = require('./beacon-listener');
+  } catch {
+    beaconLib = require('../shared/beacon-listener');
+  }
+  try {
+    beaconListener = beaconLib.start({
+      expectedRole: 'regional-server',
+      onDetection: (detection) => {
+        const verdict = detection && detection.verdict ? detection.verdict : 'conflict';
+        try {
+          const notif = new Notification({
+            title: 'FireAlive security alert',
+            body: 'A possible cloned or rogue server was detected on your network. Do not continue and contact your security team.',
+            urgency: 'critical',
+            silent: false,
+          });
+          notif.show();
+        } catch {
+          // native notification unavailable; the renderer event below is the fallback
+        }
+        try {
+          const wins = BrowserWindow.getAllWindows();
+          if (wins && wins.length) {
+            wins[0].webContents.send('anticlone:serverConflict', {
+              verdict: verdict,
+              role: detection ? detection.role : null,
+              from: detection ? detection.from : null,
+            });
+          }
+        } catch (_e) {
+          // renderer not ready; the notification already fired
+        }
+        try {
+          console.warn('[anticlone] subnet server ' + verdict + ' detected');
+        } catch (_e) {
+          // ignore
+        }
+      },
+    });
+  } catch (err) {
+    try {
+      console.warn('[anticlone] beacon listener failed to start: ' + (err && err.message ? err.message : String(err)));
+    } catch (_e) {
+      // ignore
+    }
+  }
 }
 
 // The reviewer PRIVATE key never leaves this main process unencrypted: it is
@@ -206,7 +265,7 @@ ipcMain.handle('abuse:verifyExportToken', (_e, args) => {
   return { ok: true, decision: parsed.decision, decidedAt: parsed.decided_at, nonce: parsed.nonce };
 });
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => { createWindow(); startBeaconListener(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 app.on('window-all-closed', () => { unlockedPrivB64 = null; if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => { unlockedPrivB64 = null; });
+app.on('before-quit', () => { unlockedPrivB64 = null; try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ } });

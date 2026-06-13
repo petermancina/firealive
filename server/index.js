@@ -178,6 +178,12 @@ app.use('/api/auth', require('./routes/auth'));
 app.get('/api/system/health', require('./routes/system')); // health check is public
 
 // Authenticated routes
+// D25: clients challenge the server to prove control of its hardware instance
+// anchor (POST /api/instance/anchor-challenge); a clone cannot sign and is refused.
+app.use('/api/instance', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/instance-identity'));
+// D24: MC operators register their hardware device key here; destructive
+// recovery actions must carry a signature from it (verified downstream).
+app.use('/api/mc-device-key', authMiddleware(['lead', 'admin']), require('./routes/mc-device-key'));
 app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team'));
 app.use('/api/enrollment-reconciliation', authMiddleware(['lead', 'admin']), require('./routes/enrollment-reconciliation'));
 app.use('/api/analysts', authMiddleware(['analyst']), require('./routes/analysts'));
@@ -391,6 +397,114 @@ async function start() {
     // Initialize database
     initDb();
     logger.info('Database initialized');
+
+    // B5e: establish this deployment's instance identity (anti-cloning) before
+    // the CA and other long-lived keys are minted. Verify entropy first, then
+    // mint the identity in the platform hardware root of trust. Idempotent --
+    // re-boots load the existing identity. Fail-closed (D26): if no hardware
+    // root is present, establishment refuses and the server halts (there is no
+    // software fallback).
+    try {
+      const entropy = require('./services/entropy');
+      const instanceAnchor = require('./services/instance-anchor');
+      const identityDb = getDb();
+      try {
+        entropy.ensureFirstBootEntropy(identityDb, { logger });
+        const identity = instanceAnchor.establish({ db: identityDb, logger: logger });
+        logger.info('Instance identity ready', {
+          instanceId: identity.instanceId,
+          anchorKind: identity.anchorKind,
+          status: identity.status,
+          fingerprint: identity.fingerprint,
+        });
+      } finally {
+        identityDb.close();
+      }
+    } catch (instanceIdentityErr) {
+      logger.error('Instance identity establishment failed; refusing to start (fail-closed, D26)', { error: instanceIdentityErr.message });
+      logger.error('FireAlive requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
+      process.exit(1);
+    }
+
+    // B5e: anti-rollback high-water gate (decision D7). A running build whose
+    // fuse counter is below the highest this deployment has recorded means the
+    // binary was downgraded or an older snapshot was restored. Mark the instance
+    // quarantined and, in production, halt; otherwise log loudly (matching the
+    // source-integrity check). The broader quarantine response is wired later.
+    try {
+      const fuseHighWater = require('./services/fuse-high-water');
+      const hwDb = getDb();
+      try {
+        const rollbackVerdict = fuseHighWater.checkAndAdvance(hwDb);
+        if (rollbackVerdict.rollback) {
+          logger.error('ANTI-ROLLBACK VIOLATION: running fuse is below the recorded high-water', {
+            currentFuse: rollbackVerdict.currentFuse,
+            highWater: rollbackVerdict.highWater,
+          });
+          try {
+            hwDb.prepare(
+              "UPDATE instance_identity SET status = 'quarantined', last_attested_at = datetime('now') " +
+              "WHERE id = (SELECT id FROM instance_identity ORDER BY id LIMIT 1)"
+            ).run();
+          } catch (markErr) {
+            logger.error('Marking instance quarantined after rollback failed', { error: markErr.message });
+          }
+          if (process.env.NODE_ENV === 'production') {
+            logger.error('HALTING: anti-rollback high-water check failed. Deploy the current or a newer build.');
+            process.exit(1);
+          }
+        } else {
+          logger.info('Anti-rollback high-water ok', {
+            fuse: rollbackVerdict.currentFuse,
+            highWater: rollbackVerdict.highWater,
+          });
+        }
+      } finally {
+        hwDb.close();
+      }
+    } catch (highWaterErr) {
+      logger.error('Anti-rollback high-water check failed to run', { error: highWaterErr.message });
+    }
+
+    // B5e (Block C, decision D4): start the signed subnet peer-beacon. A clone
+    // or fork seen on the local subnet quarantines this instance, which raises
+    // the loud alert. Best-effort; a beacon failure must never stop startup. A
+    // dedicated long-lived connection backs the background socket (it outlives
+    // this block by design, so it is not closed here). The beacon channel is
+    // deployment-configured (services/beacon-config.js); when disabled the AC
+    // ratchet, anti-rollback high-water, and GD collision detections still run.
+    try {
+      const beaconConfig = require('./services/beacon-config').getBeaconConfig();
+      if (!beaconConfig.enabled) {
+        logger.info('Subnet peer-beacon disabled by configuration; AC ratchet, anti-rollback high-water, and GD collision detections remain active');
+      } else {
+        const peerBeacon = require('./services/peer-beacon');
+        const beaconDb = getDb();
+        peerBeacon.start(beaconDb, {
+          role: 'regional-server',
+          port: beaconConfig.port,
+          broadcastAddress: beaconConfig.broadcastAddress,
+          intervalMs: beaconConfig.intervalMs,
+          onDetection: (detection) => {
+            try {
+              const instanceRegistry = require('./services/instance-registry');
+              instanceRegistry.quarantine(beaconDb, {
+                reason: 'subnet peer-beacon detected a ' + detection.verdict + (detection.from ? ' from ' + detection.from : ''),
+                verdict: detection.verdict,
+                observerKind: 'peer-beacon',
+                observedFrom: detection.from || null,
+              });
+              logger.error('Subnet peer-beacon detected a ' + detection.verdict, { from: detection.from, fingerprint: detection.fingerprint });
+            } catch (quarErr) {
+              logger.error('Quarantine after peer-beacon detection failed', { error: quarErr.message });
+            }
+          },
+        });
+        logger.info('Subnet peer-beacon started');
+      }
+    } catch (beaconErr) {
+      logger.warn('Subnet peer-beacon failed to start', { error: beaconErr.message });
+    }
 
     // B5b: built-in CA + HTTPS/WSS material (fail-closed; no plaintext listener).
     const tlsMaterial = bootstrapTlsMaterial();

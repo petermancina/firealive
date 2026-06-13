@@ -7244,6 +7244,49 @@ function initDb() {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_ac_device_signing_keys_one_active
         ON ac_device_signing_keys(user_id) WHERE active = 1;
 
+      CREATE TABLE IF NOT EXISTS mc_device_signing_keys (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        public_key TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        retired_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_mc_device_signing_keys_user
+        ON mc_device_signing_keys(user_id, active);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_mc_device_signing_keys_one_active
+        ON mc_device_signing_keys(user_id) WHERE active = 1;
+
+      CREATE TABLE IF NOT EXISTS recovery_action_approvals (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        action TEXT NOT NULL CHECK (action IN ('teardown', 'reprovision')),
+        target_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'approved', 'executed', 'rejected', 'expired', 'cancelled')),
+        requested_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        requester_fingerprint TEXT NOT NULL,
+        requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        approval_kind TEXT CHECK (approval_kind IN ('operator', 'gd')),
+        approved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        approver_fingerprint TEXT,
+        decided_at TEXT,
+        recovery_run_id TEXT REFERENCES client_recovery_runs(id) ON DELETE SET NULL,
+        executed_at TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recovery_action_approvals_status
+        ON recovery_action_approvals(status, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_recovery_action_approvals_target
+        ON recovery_action_approvals(target_user_id, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_action_approvals_one_pending
+        ON recovery_action_approvals(target_user_id, action) WHERE status = 'pending';
+
       CREATE TABLE IF NOT EXISTS compromise_scan_queue (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
         run_id TEXT NOT NULL REFERENCES compromise_scan_runs(id) ON DELETE CASCADE,
@@ -7590,6 +7633,115 @@ function initDb() {
     }
   } catch (etMigErr) {
     console.error('enrollment_tokens migration (B5d4) failed (non-fatal):', etMigErr.message);
+  }
+
+  // ── B5e migration: instance identity + anti-cloning + deployment mode ──────
+  // Creates instance_identity / instance_observations / migration_bundles,
+  // adds the per-AC ratchet columns to ac_device_signing_keys, and seeds the
+  // deployment_mode + fuse_high_water system_meta rows. All idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS instance_identity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_id TEXT NOT NULL,
+        anchor_kind TEXT NOT NULL DEFAULT 'software'
+          CHECK (anchor_kind IN ('software', 'vtpm', 'hardware')),
+        anchor_public TEXT NOT NULL,
+        anchor_seal TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        ratchet_counter INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'quarantined')),
+        established_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_attested_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS instance_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observer_kind TEXT NOT NULL
+          CHECK (observer_kind IN ('ac', 'gd', 'peer-beacon')),
+        observed_instance_fingerprint TEXT,
+        observed_from TEXT,
+        verdict TEXT NOT NULL
+          CHECK (verdict IN ('ok', 'fork', 'clone', 'rollback')),
+        detail_json TEXT,
+        seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS migration_bundles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        direction TEXT NOT NULL CHECK (direction IN ('export', 'import')),
+        bundle_format TEXT NOT NULL DEFAULT 'FA-MIG1',
+        source_instance_fingerprint TEXT,
+        created_by TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        manifest_json TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_instance_identity_fingerprint
+        ON instance_identity(fingerprint);
+      CREATE INDEX IF NOT EXISTS idx_instance_observations_verdict
+        ON instance_observations(verdict, seen_at);
+    `);
+    // Widen the anchor_kind CHECK to include 'hardware' (D26) on databases
+    // created before this migration. SQLite cannot ALTER a CHECK, so rebuild the
+    // table when its recorded schema lacks 'hardware'. Idempotent: once the table
+    // carries 'hardware' (rebuilt here, or freshly created above), this is a
+    // no-op. Existing rows ('software' / 'vtpm') all satisfy the wider CHECK.
+    const instanceIdentitySchema = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instance_identity'")
+      .get();
+    if (instanceIdentitySchema && instanceIdentitySchema.sql && instanceIdentitySchema.sql.indexOf('hardware') === -1) {
+      const rebuildInstanceIdentity = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE instance_identity_b5e_hw (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id TEXT NOT NULL,
+            anchor_kind TEXT NOT NULL DEFAULT 'software'
+              CHECK (anchor_kind IN ('software', 'vtpm', 'hardware')),
+            anchor_public TEXT NOT NULL,
+            anchor_seal TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            ratchet_counter INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active', 'quarantined')),
+            established_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_attested_at TEXT
+          );
+          INSERT INTO instance_identity_b5e_hw
+            (id, instance_id, anchor_kind, anchor_public, anchor_seal, fingerprint, ratchet_counter, status, established_at, last_attested_at)
+            SELECT id, instance_id, anchor_kind, anchor_public, anchor_seal, fingerprint, ratchet_counter, status, established_at, last_attested_at
+            FROM instance_identity;
+          DROP TABLE instance_identity;
+          ALTER TABLE instance_identity_b5e_hw RENAME TO instance_identity;
+          CREATE INDEX IF NOT EXISTS idx_instance_identity_fingerprint
+            ON instance_identity(fingerprint);
+        `);
+      });
+      rebuildInstanceIdentity();
+      console.log('B5e migration: instance_identity anchor_kind CHECK widened to include hardware (existing table rebuilt)');
+    }
+    const acDeviceCols = db
+      .prepare("PRAGMA table_info(ac_device_signing_keys)")
+      .all()
+      .map((c) => c.name);
+    if (!acDeviceCols.includes('ratchet_counter')) {
+      db.exec("ALTER TABLE ac_device_signing_keys ADD COLUMN ratchet_counter INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!acDeviceCols.includes('ratchet_updated_at')) {
+      db.exec("ALTER TABLE ac_device_signing_keys ADD COLUMN ratchet_updated_at TEXT");
+    }
+    const setMetaB5e = db.prepare("INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)");
+    setMetaB5e.run('deployment_mode', 'bare-metal');
+    const fuseHwRow = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_counter'").get();
+    const fuseHwSeed = fuseHwRow && fuseHwRow.value !== null && fuseHwRow.value !== undefined
+      ? String(fuseHwRow.value)
+      : '0';
+    setMetaB5e.run('fuse_high_water', fuseHwSeed);
+    const instanceIdentityCount = db.prepare("SELECT COUNT(*) AS c FROM instance_identity").get().c;
+    console.log(`B5e migration: instance_identity + instance_observations + migration_bundles ready; ac_device_signing_keys ratchet columns ensured; deployment_mode + fuse_high_water seeded (${instanceIdentityCount} identity row(s) present)`);
+  } catch (b5eInstanceIdentityMigrationErr) {
+    console.error('B5e instance-identity migration FAILED:', b5eInstanceIdentityMigrationErr.message);
+    console.error('The server will start, but anti-cloning hardening cannot persist state: instance identity establishment, duplicate/fork detection, and the anti-rollback high-water mark are inactive. No other feature is affected. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB, then restart.');
   }
 
   console.log('Database initialized at', DB_PATH);

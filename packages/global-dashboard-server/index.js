@@ -20,6 +20,8 @@ const { getDb, initDb, DB_PATH } = require('./db-init');
 const https = require('https');
 const gdCa = require('./services/gd-ca');
 const gdWebauthn = require('./services/gd-webauthn');
+const gdDeviceKey = require('./services/gd-device-key');
+const gdPop = require('./services/gd-pop');
 const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
 const cloudIacBundle = require('./services/cloud-iac-bundle');
@@ -151,16 +153,62 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auth middleware
-const authMiddleware = (roles) => (req, res, next) => {
+// Device-key proof-of-possession gate (D28). For a device-bound session (the
+// token carries an RFC 7800 cnf.jkt), every request must present a fresh,
+// single-use proof that the caller still holds the bound hardware key: the
+// active key is looked up, its thumbprint must still match the token binding (so
+// a rotated-away key cannot keep using an old token), and the proof must verify.
+// A cnf-less bootstrap token (issued before the operator registered a key) is
+// refused on gated endpoints; the operator must register a key and sign in again.
+function gdEnforceDevicePop(req, decoded) {
+  const cnf = decoded && decoded.cnf;
+  if (!cnf || !cnf.jkt) {
+    return { ok: false, status: 401, code: 'device_binding_required', error: 'a device-key-bound session is required; register a device key and sign in again' };
+  }
+  const proof = req.headers[gdPop.POP_HEADER];
+  const db = getDb();
+  try {
+    const active = db.prepare("SELECT public_key FROM gd_device_signing_keys WHERE user_id = ? AND active = 1 LIMIT 1").get(decoded.id);
+    if (!active) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'the bound device key is no longer active; sign in again' };
+    }
+    if (gdDeviceKey.jwkThumbprint(active.public_key) !== cnf.jkt) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'the device key has changed since this session was issued; sign in again' };
+    }
+    const result = gdPop.verifyPopProof({ method: req.method, path: req.path, proof: proof, publicKeyPem: active.public_key, jkt: cnf.jkt });
+    if (!result.ok) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'device-key proof-of-possession: ' + result.reason };
+    }
+    if (cnf['x5t#S256']) {
+      const certTp = gdPeerCertThumbprint(req);
+      if (!certTp || certTp !== cnf['x5t#S256']) {
+        return { ok: false, status: 401, code: 'device_pop_required', error: 'mutual-TLS client certificate does not match the bound session' };
+      }
+    }
+    return { ok: true };
+  } finally {
+    try { db.close(); } catch (_) { /* ignore */ }
+  }
+}
+
+// Auth middleware. A valid GD bearer JWT is required; roles (if given) are
+// enforced; and unless a route opts out (popExempt, used only by device-key
+// registration, which must run before a key exists) the device-key proof gate
+// above runs on every request (D28).
+const authMiddleware = (roles, options) => (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Authentication required' });
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (roles && !roles.includes(decoded.role)) return res.status(403).json({ error: 'Insufficient permissions' });
-    req.user = decoded;
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (e) { return res.status(401).json({ error: 'Invalid or expired token' }); }
+  if (roles && !roles.includes(decoded.role)) return res.status(403).json({ error: 'Insufficient permissions' });
+  req.user = decoded;
+  if (!(options && options.popExempt)) {
+    const gate = gdEnforceDevicePop(req, decoded);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
+  }
+  next();
 };
 
 // ── B1: Cloud Vulnerability Scan (GD-server's own authorization config) ──────
@@ -168,6 +216,10 @@ const authMiddleware = (roles) => (req, res, next) => {
 // scan access (append-only hash chain). Management is ciso/vp; the scan-access
 // recorder is token + source-IP gated (a scanner presents its bearer token, so
 // it is not behind authMiddleware). Not a vulnerability aggregate/dashboard.
+// D25: the GD app challenges the GD-server to prove control of its hardware
+// instance anchor (POST /api/instance/anchor-challenge); a clone cannot sign and
+// is refused. Any authenticated operator; the per-request PoP proof still applies.
+app.use('/api/instance', authMiddleware(null), require('./routes/instance-identity'));
 app.use('/api/cloud-vuln', authMiddleware(['ciso', 'vp']), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
 
@@ -207,14 +259,64 @@ function verifyGdPeerCertificate(req, db) {
   return gdCa.verifyClientCert(db, pem);
 }
 
+// RFC 8705 certificate thumbprint (x5t#S256) of the presented mutual-TLS client
+// certificate: base64url(SHA-256(DER)), or null when no client cert is present.
+// Used to certificate-bind the session token (the stronger variant where a
+// hardware client cert is deployed) and to re-check that binding per request.
+function gdPeerCertThumbprint(req) {
+  const sock = req && req.socket;
+  const peer = sock && typeof sock.getPeerCertificate === 'function' ? sock.getPeerCertificate() : null;
+  if (!peer || !peer.raw || Object.keys(peer).length === 0) return null;
+  return crypto.createHash('sha256').update(peer.raw).digest('base64url');
+}
+
+// Resolve the device-key binding for a login. If the operator has an active
+// hardware device key (D20), a valid proof-of-possession is REQUIRED: the login
+// request must carry deviceKeyProof { challengeToken, signature }, the challenge
+// must have been issued for this operator, and the signature must verify against
+// the active key. On success the RFC 7638 thumbprint is returned for the session
+// token's RFC 7800 cnf.jkt binding. If the operator has no active key yet
+// (bootstrap, before first registration) the login proceeds unbound.
+function gdResolveLoginDeviceKey(db, user, req) {
+  const active = db.prepare("SELECT public_key FROM gd_device_signing_keys WHERE user_id = ? AND active = 1 LIMIT 1").get(user.id);
+  if (!active) return { ok: true, cnf: null };
+  const proof = req.body && req.body.deviceKeyProof;
+  if (!proof || typeof proof.challengeToken !== 'string' || typeof proof.signature !== 'string') {
+    return { ok: false, status: 401, error: 'device-key proof required' };
+  }
+  // The challenge is account-agnostic. The binding to this operator comes from
+  // the signature check below against their active device key, not from the
+  // challenge subject; consuming the token also enforces single-use.
+  let consumed;
+  try {
+    consumed = gdDeviceKey.consumeDeviceKeyChallenge(proof.challengeToken, gdDeviceKey.DEVICE_KEY_LOGIN_PURPOSE);
+  } catch (_) {
+    return { ok: false, status: 401, error: 'invalid or expired device-key challenge' };
+  }
+  let sig;
+  try { sig = Buffer.from(proof.signature, 'base64'); } catch (_) { sig = Buffer.alloc(0); }
+  const message = gdDeviceKey.loginChallengeMessage(consumed.challenge);
+  if (!gdDeviceKey.verifyDeviceKeySignature(active.public_key, message, sig)) {
+    return { ok: false, status: 401, error: 'device-key proof failed' };
+  }
+  const cnf = { jkt: gdDeviceKey.jwkThumbprint(active.public_key) };
+  const certTp = gdPeerCertThumbprint(req);
+  if (certTp) cnf['x5t#S256'] = certTp;
+  return { ok: true, cnf };
+}
+
 // Issue a GD session for a passwordless login. A cert or a user-verifying passkey
 // is MFA-complete, so there is no second-factor bridge — the GD is always-MFA by
-// virtue of the method itself.
-function gdIssuePasswordlessSession(db, user, req, method) {
-  const token = jwt.sign({ id: user.id, username: user.username, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '8h' });
+// virtue of the method itself. When a device-key binding (cnf) is supplied the
+// session token is sender-constrained to that key (D28); every later /api/
+// request must prove possession of it.
+function gdIssuePasswordlessSession(db, user, req, method, cnf) {
+  const claims = { id: user.id, username: user.username, role: user.role, name: user.name };
+  if (cnf) claims.cnf = cnf;
+  const token = jwt.sign(claims, JWT_SECRET, { expiresIn: '8h' });
   db.prepare("INSERT INTO auth_log (username, action, ip, method) VALUES (?, 'LOGIN_SUCCESS', ?, ?)").run(user.username, req.ip, method);
   db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(user.id);
-  try { appendGdAuditEntry(db, { userId: user.id, eventType: 'LOGIN_SUCCESS', detail: `user=${user.username} role=${user.role} method=${method} aal=high`, ip: req.ip, severity: 'info' }); } catch (_) { /* audit best-effort */ }
+  try { appendGdAuditEntry(db, { userId: user.id, eventType: 'LOGIN_SUCCESS', detail: `user=${user.username} role=${user.role} method=${method} aal=high devicebound=${!!cnf}`, ip: req.ip, severity: 'info' }); } catch (_) { /* audit best-effort */ }
   return { token, user: { id: user.id, name: user.name, role: user.role } };
 }
 
@@ -245,7 +347,12 @@ app.post('/api/auth/login-cert', (req, res) => {
       db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (NULL, 'LOGIN_CERT_NO_USER', ?, 'cert valid, no matching user')").run(req.ip);
       return res.status(401).json({ error: 'certificate valid but no matching user' });
     }
-    return res.json(gdIssuePasswordlessSession(db, user, req, 'cert'));
+    const dk = gdResolveLoginDeviceKey(db, user, req);
+    if (!dk.ok) {
+      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_DEVICE_KEY_FAILED', ?, ?)").run(user.username, req.ip, dk.error);
+      return res.status(dk.status).json({ error: dk.error });
+    }
+    return res.json(gdIssuePasswordlessSession(db, user, req, 'cert', dk.cnf));
   } catch (e) { return res.status(500).json({ error: 'Authentication error' }); }
   finally { try { db.close(); } catch (_) { /* ignore */ } }
 });
@@ -292,9 +399,32 @@ app.post('/api/auth/login-webauthn/verify', async (req, res) => {
     if (cred.is_passwordless !== 1) return res.status(403).json({ error: 'this passkey is not enrolled for passwordless login' });
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(cred.user_id);
     if (!user) return res.status(401).json({ error: 'user no longer exists' });
-    return res.json(gdIssuePasswordlessSession(db, user, req, 'webauthn'));
+    const dk = gdResolveLoginDeviceKey(db, user, req);
+    if (!dk.ok) {
+      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_DEVICE_KEY_FAILED', ?, ?)").run(user.username, req.ip, dk.error);
+      return res.status(dk.status).json({ error: dk.error });
+    }
+    return res.json(gdIssuePasswordlessSession(db, user, req, 'webauthn', dk.cnf));
   } catch (e) { return res.status(500).json({ error: 'Authentication error' }); }
   finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// POST /api/auth/device-key/challenge -- single-use login proof challenge.
+// Issues a single-use challenge the operator's app signs with its hardware
+// device key to prove possession at login (D28). Pre-auth: the caller names the
+// account it is about to authenticate; the challenge is bound to that operator
+// and verified in gdResolveLoginDeviceKey once the passkey or cert identifies
+// them. A well-formed challenge is always returned so the response reveals
+// nothing about whether the account exists or holds a device key.
+app.post('/api/auth/device-key/challenge', (req, res) => {
+  // Account-agnostic login challenge. No username binding is required: the
+  // proof returned at login is verified against the authenticated operator's
+  // own active device key (the signature is the binding), so a generic
+  // challenge signed by operator A only ever verifies inside A's login. This
+  // lets the usernameless passkey and client-certificate login paths obtain a
+  // challenge before the credential identifies the account server-side.
+  const { challenge, challengeToken } = gdDeviceKey.issueDeviceKeyChallenge('login');
+  return res.json({ challenge, challengeToken });
 });
 
 // ── POST /api/auth/enroll/cert — break-glass first-cert bootstrap ────────────
@@ -353,6 +483,56 @@ app.post('/api/auth/enroll/passkey/verify', async (req, res) => {
     return res.status(201).json({ enrolled: true, passwordless: true, credential_id: c.credentialId });
   } catch (e) { return res.status(500).json({ error: 'enrollment error' }); }
   finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
+// POST /api/auth/device-key -- register/rotate the operator's device key.
+// The authenticated operator registers (or rotates) ITS OWN hardware device
+// key; the client-supplied identity is ignored and the key binds to
+// req.user.id. The GD session token is bound to this key's thumbprint and
+// every /api/ request must prove possession of it (D28). This bootstrap
+// registration runs before that gate is wired, so it stays exempt from the
+// proof-of-possession requirement (resolved when authMiddleware enforces PoP,
+// commit 82).
+app.post('/api/auth/device-key', authMiddleware(null, { popExempt: true }), (req, res) => {
+  const { publicKey, fingerprint } = req.body || {};
+  if (typeof publicKey !== 'string' || !publicKey || typeof fingerprint !== 'string' || !fingerprint) {
+    return res.status(400).json({ error: 'publicKey and fingerprint required' });
+  }
+  if (!/-----BEGIN PUBLIC KEY-----/.test(publicKey) || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+    return res.status(400).json({ error: 'invalid key material' });
+  }
+  // Recompute the fingerprint server-side (sha256 of the SPKI DER, the house
+  // format) and require it to match, so the stored fingerprint provably binds
+  // the registered key rather than being a client-asserted label.
+  let computed;
+  try {
+    const der = crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' });
+    computed = crypto.createHash('sha256').update(der).digest('hex');
+  } catch (_) {
+    return res.status(400).json({ error: 'unparseable public key' });
+  }
+  if (computed !== fingerprint) {
+    return res.status(400).json({ error: 'fingerprint does not match public key' });
+  }
+  const db = getDb();
+  try {
+    const uid = req.user.id;
+    const existing = db.prepare("SELECT id, public_key FROM gd_device_signing_keys WHERE user_id = ? AND active = 1").get(uid);
+    if (existing && existing.public_key === publicKey) {
+      return res.json({ ok: true, rotated: false });
+    }
+    const rotate = db.transaction(() => {
+      db.prepare("UPDATE gd_device_signing_keys SET active = 0, retired_at = datetime('now') WHERE user_id = ? AND active = 1").run(uid);
+      db.prepare("INSERT INTO gd_device_signing_keys (user_id, public_key, fingerprint) VALUES (?, ?, ?)").run(uid, publicKey, fingerprint);
+    });
+    rotate();
+    try { appendGdAuditEntry(db, { userId: uid, eventType: 'DEVICE_KEY_REGISTERED', detail: 'fingerprint=' + fingerprint.slice(0, 16) + ' rotated=' + (!!existing), ip: req.ip, severity: 'info' }); } catch (_) { /* best-effort */ }
+    res.json({ ok: true, rotated: !!existing });
+  } catch (err) {
+    return res.status(500).json({ error: 'registration failed' });
+  } finally {
+    try { db.close(); } catch (_) { /* ignore */ }
+  }
 });
 
 // ── Self-service credential management (authenticated CISO / VP) ─────────────
@@ -502,6 +682,27 @@ app.post('/api/ingest/metrics', (req, res) => {
         error: sigResult.error,
         code: sigResult.code,
       });
+    }
+
+    // B5e: bind this MC's instance fingerprint and detect a clone (decision D4).
+    // The fingerprint is part of the signed body verified above. A collision
+    // (the same fingerprint under a different mc_id) raises a critical audit
+    // event and a CISO notification; ingest still proceeds so metrics are not
+    // lost. A changed fingerprint is logged as a warning (re-provision vs clone).
+    const instanceFingerprint = req.body && req.body.instanceFingerprint;
+    if (instanceFingerprint) {
+      try {
+        const collisionResult = require('./services/instance-collision').evaluateBinding(db, { mcId: mc.id, fingerprint: instanceFingerprint });
+        if (collisionResult.collision) {
+          appendGdAuditEntry(db, { eventType: 'INSTANCE_COLLISION_DETECTED', detail: `mc=${mc.name} mc_id=${mc.id} fingerprint=${instanceFingerprint} conflicting_mc_id=${collisionResult.conflictingMcId}`, severity: 'critical' });
+          db.prepare("INSERT INTO notifications (type, mc_id, message, severity) VALUES ('instance_collision', ?, ?, 'critical')")
+            .run(mc.id, `${mc.name}: instance identity also reported by another MC (possible clone). Conflicting MC id ${collisionResult.conflictingMcId}.`);
+        } else if (collisionResult.rebind) {
+          appendGdAuditEntry(db, { eventType: 'INSTANCE_FINGERPRINT_CHANGED', detail: `mc=${mc.name} mc_id=${mc.id} fingerprint=${instanceFingerprint}`, severity: 'warning' });
+        }
+      } catch (collisionErr) {
+        appendGdAuditEntry(db, { eventType: 'INSTANCE_COLLISION_CHECK_FAILED', detail: `mc_id=${mc.id} error=${collisionErr.message}`, severity: 'warning' });
+      }
     }
 
     // Store the aggregate metrics
@@ -5637,6 +5838,30 @@ function bootstrapGdTlsMaterial() {
   } finally {
     try { db.close(); } catch (_) { /* ignore */ }
   }
+}
+
+// B5e: establish the GD Server's own instance identity (anti-cloning) before
+// the CA and TLS material are minted. The identity is minted in the platform
+// hardware root of trust (TPM 2.0 / Secure Enclave). Idempotent -- re-boots
+// load the existing identity. Fail-closed (D26): if no hardware root is
+// present, establishment refuses and the GD Server halts (there is no software
+// fallback).
+try {
+  const gdInstanceAnchor = require('./services/gd-instance-anchor');
+  const identityDb = getDb();
+  try {
+    const identity = gdInstanceAnchor.establish({
+      db: identityDb,
+      logger: { info: function (m, meta) { console.log(m, meta || ''); } },
+    });
+    console.log('GD instance identity ready (' + identity.anchorKind + ', fingerprint ' + identity.fingerprint.slice(0, 16) + ')');
+  } finally {
+    identityDb.close();
+  }
+} catch (gdInstanceIdentityErr) {
+  console.error('GD instance identity establishment failed; refusing to start (fail-closed, D26): ' + gdInstanceIdentityErr.message);
+  console.error('The GD Server requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
+  process.exit(1);
 }
 
 const gdTlsMaterial = bootstrapGdTlsMaterial();

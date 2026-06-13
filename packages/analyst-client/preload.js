@@ -13,10 +13,14 @@ const ALLOWED_CHANNELS = [
   'e2ee:init', 'e2ee:publishBundle', 'e2ee:replenishPrekeys', 'e2ee:processBundle', 'e2ee:hasSession', 'e2ee:encrypt', 'e2ee:decrypt', 'e2ee:safetyNumber',
   'abuse:seal', 'abuse:hold-for-export', 'abuse:finalize-export', 'abuse:cancel-export',
   'kb:search', 'kb:entry', 'kbChat:ask', 'kbChat:modelStatus', 'kbChat:verifyModel', 'kbChat:provisioningInfo', 'kbChat:modelScanStatus',
-  'selfscan:getPublicKey', 'selfscan:run',
-  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:interpret', 'burnout:interpretOverall',
+  'selfscan:getPublicKey', 'selfscan:run', 'device:signSessionChallenge',
+  'burnout:status', 'burnout:enrollKey', 'burnout:unlockKey', 'burnout:decrypt', 'burnout:lock', 'burnout:addHwFactor', 'burnout:removeHwFactor', 'burnout:interpret', 'burnout:interpretOverall',
   // B5d4: per-client recovery + fleet ops
   'clientop:run', 'recovery:wipeLocal', 'burnout:recoverAndRewrap',
+  // B5e: AC-side anti-cloning ratchet (present + check server ratchet)
+  'anticlone:ratchetState', 'anticlone:recordRatchet',
+  // B5e (D25): AC-side server anchor pinning + per-connect verification
+  'anticlone:anchorNonce', 'anticlone:verifyAnchor', 'anticlone:pinAnchor', 'anticlone:anchorState',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

@@ -35,7 +35,7 @@ const API_BASE = 'https://localhost:3000';
 const api = {
   _token: null,
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
-  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async post(path, data, extraHeaders) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: Object.assign({}, this._headers(), extraHeaders || {}), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
@@ -72,6 +72,42 @@ const api = {
   },
   setToken(t) { this._token = t; },
 };
+
+// Register (or rotate) this Management Console's hardware device key with the
+// server after login (D24), so privileged recovery actions can be bound to it.
+// Best-effort and non-fatal: a failure is logged, and the server fail-closes
+// (refusing device-bound actions) until a key is registered.
+async function registerMcDeviceKey() {
+  try {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") return;
+    const pub = await bridge.invoke("device:getPublicKey");
+    if (!pub || pub.error || !pub.publicKey || !pub.fingerprint) return;
+    const r = await api.post("/api/mc-device-key/register", { publicKey: pub.publicKey, fingerprint: pub.fingerprint });
+    if (r && r.error) { try { console.warn("[MC device-key] registration failed:", r.error); } catch (_e) {} }
+  } catch (e) {
+    try { console.warn("[MC device-key] registration error:", e && e.message ? e.message : e); } catch (_e) {}
+  }
+}
+
+// Sign a privileged MC action on the hardware device key (D24) and return the
+// x-fa-device-action-* request headers the server's verifier expects. Returns
+// null when no device key is available, in which case the server refuses the
+// action (fail-closed) rather than proceeding unsigned.
+async function deviceActionHeaders(action, target) {
+  try {
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if (!bridge || typeof bridge.invoke !== "function") return null;
+    const proof = await bridge.invoke("device:signAction", { action: action, target: target || "" });
+    if (!proof || proof.error || !proof.signature) return null;
+    return {
+      "x-fa-device-action-signature": proof.signature,
+      "x-fa-device-action-iat": String(proof.iat),
+      "x-fa-device-action-jti": proof.jti,
+      "x-fa-device-action-fingerprint": proof.fingerprint
+    };
+  } catch (_e) { return null; }
+}
 
 // Phase U3: per-thread monotonic counter for relay ordering of the lead's
 // outgoing reply messages (the analyst's stream is counted on the analyst side).
@@ -532,6 +568,7 @@ function LoginScreen({role, onLogin, onBack}) {
   const finalizeLogin = (loginResponse) => {
     if (loginResponse && loginResponse.accessToken) {
       api.setToken(loginResponse.accessToken);
+      registerMcDeviceKey();
     }
     if (loginResponse && loginResponse.refreshToken) {
       try { localStorage.setItem('fa_refresh_token', loginResponse.refreshToken); } catch (_e) {}
@@ -3402,31 +3439,77 @@ function ManagementConsole() {
   };
   const doTeardown = async (client) => {
     const label = client.pseudonym || "this client";
-    if (!window.confirm("Tear down " + label + "? This revokes its certificates, retires its device key, and deletes its passkey. The analyst's wellbeing data is preserved and recoverable on re-provision. This cannot be undone.")) return;
+    if (!window.confirm("Request tear-down of " + label + "? This revokes its certificates, retires its device key, and deletes its passkey. The analyst's wellbeing data is preserved and recoverable on re-provision. Tear-down requires a second operator to co-approve before it runs.")) return;
     const stepup = await getStepUp(); if (!stepup) return;
-    const r = await api.post("/api/client-recovery/teardown", { userId: client.userId, reason: "manual MC teardown", stepup });
+    const headers = await deviceActionHeaders("recovery.teardown", client.userId);
+    if (!headers) { window.alert("A registered hardware device key is required to request this action."); return; }
+    const r = await api.post("/api/client-recovery/teardown", { userId: client.userId, reason: "manual MC teardown", stepup }, headers);
     if (r && !r.error) {
-      addA("AC_TEARDOWN", "Tore down " + label + " (certs " + (r.certsRevoked || 0) + ", passkey " + (r.passkeysDeleted || 0) + ", wipe " + (r.wipeDispatched ? "sent" : "queued") + ")");
+      addA("AC_TEARDOWN_REQUESTED", "Requested tear-down of " + label + " (approval " + ((r.approval && r.approval.id) || "?") + "); awaiting second-operator co-approval");
+      window.alert("Tear-down requested for " + label + ". A second operator must co-approve it before it runs.");
       loadRecoveryClients();
     } else {
-      window.alert("Tear down failed: " + ((r && r.error) || "unknown"));
+      window.alert("Tear-down request failed: " + ((r && r.error) || "unknown"));
       addA("AC_TEARDOWN_FAILED", label + ": " + ((r && r.error) || "unknown"));
     }
   };
   const doReprovision = async (client) => {
     const label = client.pseudonym || "this client";
     const stepup = await getStepUp(); if (!stepup) return;
-    const r = await api.post("/api/client-recovery/reprovision", { userId: client.userId, stepup });
-    if (r && !r.error && r.enrollmentToken) {
-      setReprovInfo({ pseudonym: label, token: r.enrollmentToken, expiresAt: r.expiresAt || null });
-      addA("AC_REPROVISION_TOKEN_ISSUED", "Issued re-provision token for " + label + " (expires " + (r.expiresAt || "soon") + ")");
+    const headers = await deviceActionHeaders("recovery.reprovision", client.userId);
+    if (!headers) { window.alert("A registered hardware device key is required to request this action."); return; }
+    const r = await api.post("/api/client-recovery/reprovision", { userId: client.userId, stepup }, headers);
+    if (r && !r.error) {
+      addA("AC_REPROVISION_REQUESTED", "Requested re-provision of " + label + " (approval " + ((r.approval && r.approval.id) || "?") + "); awaiting second-operator co-approval");
+      window.alert("Re-provision requested for " + label + ". A second operator must co-approve it; the enrollment token is shown to the approver once they approve.");
       loadRecoveryClients();
     } else {
-      window.alert("Re-provision failed: " + ((r && r.error) || "unknown"));
+      window.alert("Re-provision request failed: " + ((r && r.error) || "unknown"));
       addA("AC_REPROVISION_FAILED", label + ": " + ((r && r.error) || "unknown"));
     }
   };
-  useEffect(() => { if (tab === "monitoring") { loadFleetRuns(); loadRecoveryClients(); } }, [tab]);
+  const loadRecoveryApprovals = async () => {
+    const r = await api.get("/api/client-recovery/approvals");
+    if (r && !r.error) setRecoveryApprovals(Array.isArray(r.pending) ? r.pending : []);
+  };
+  // Resolve a pending request to a pseudonym via the connected-clients list,
+  // falling back to a short opaque id (identity is pseudonym-only).
+  const apLabel = (ap) => {
+    const c = recoveryClients.clients.find((x) => x.userId === ap.target_user_id);
+    return (c && c.pseudonym) || ((ap.target_user_id || "") + "").slice(0, 8) || "unknown";
+  };
+  const doApproveRecovery = async (ap) => {
+    const what = (ap.action === "reprovision" ? "re-provision" : "tear-down") + " of " + apLabel(ap);
+    if (!window.confirm("Co-approve " + what + "? You must be a different operator than the requester; this runs the action immediately.")) return;
+    const stepup = await getStepUp(); if (!stepup) return;
+    const headers = await deviceActionHeaders("recovery.approve", ap.id);
+    if (!headers) { window.alert("A registered hardware device key is required to approve."); return; }
+    const r = await api.post("/api/client-recovery/approvals/" + ap.id + "/approve", { stepup }, headers);
+    if (r && !r.error) {
+      if (r.action === "reprovision" && r.enrollmentToken) {
+        setReprovInfo({ pseudonym: apLabel(ap), token: r.enrollmentToken, expiresAt: r.expiresAt || null });
+      }
+      addA("AC_RECOVERY_APPROVED", "Co-approved " + what + " (approval " + ap.id + ")");
+      loadRecoveryApprovals(); loadRecoveryClients();
+    } else {
+      window.alert("Approval failed: " + ((r && r.error) || "unknown"));
+      addA("AC_RECOVERY_APPROVE_FAILED", ap.id + ": " + ((r && r.error) || "unknown"));
+    }
+  };
+  const doRejectRecovery = async (ap) => {
+    if (!window.confirm("Reject this " + (ap.action === "reprovision" ? "re-provision" : "tear-down") + " request?")) return;
+    const stepup = await getStepUp(); if (!stepup) return;
+    const headers = await deviceActionHeaders("recovery.reject", ap.id);
+    if (!headers) { window.alert("A registered hardware device key is required to reject."); return; }
+    const r = await api.post("/api/client-recovery/approvals/" + ap.id + "/reject", { stepup }, headers);
+    if (r && !r.error) {
+      addA("AC_RECOVERY_REJECTED", "Rejected approval " + ap.id);
+      loadRecoveryApprovals();
+    } else {
+      window.alert("Reject failed: " + ((r && r.error) || "unknown"));
+    }
+  };
+  useEffect(() => { if (tab === "monitoring") { loadFleetRuns(); loadRecoveryClients(); loadRecoveryApprovals(); } }, [tab]);
   const cbSaveSnapshot = async () => {
     const name = window.prompt("Snapshot name (optional):");
     if (name === null) return;
@@ -3807,6 +3890,7 @@ function ManagementConsole() {
   const [fleetBusy, setFleetBusy] = useState(false);
   const [recoveryClients, setRecoveryClients] = useState({ initialized: false, clients: [] });
   const [reprovInfo, setReprovInfo] = useState(null);
+  const [recoveryApprovals, setRecoveryApprovals] = useState([]);
   // Client log collection
   const [clientLogCollection, setClientLogCollection] = useState({autoCollect:true,intervalMin:15,destinations:["server","siem"],collectAudit:true,collectForensics:true,collectRuntime:true});
   // Client backup triggering
@@ -6839,6 +6923,21 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:4}}>Re-provision token for {reprovInfo.pseudonym}</M>
               <div style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:12,color:C.t,wordBreak:"break-all",marginBottom:4}}>{reprovInfo.token}</div>
               <M style={{color:C.td}}>Shown once. Deliver to the analyst out of band{reprovInfo.expiresAt?(" - expires "+new Date(reprovInfo.expiresAt).toLocaleString()):""}. <span style={{cursor:"pointer",color:C.i}} onClick={()=>setReprovInfo(null)}>Dismiss</span></M>
+            </div>}
+            {recoveryApprovals.length>0&&<div style={{marginBottom:10}}>
+              <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:6}}>Pending approvals ({recoveryApprovals.length})</M>
+              {recoveryApprovals.map((ap,i)=>(
+                <div key={ap.id||i} style={{padding:"8px 10px",background:"rgba(255,255,255,0.02)",border:"1px solid "+C.b,borderRadius:8,marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  <div>
+                    <M style={{color:C.t,fontWeight:500}}>{ap.action==="reprovision"?"Re-provision":"Tear-down"} - {apLabel(ap)}</M>
+                    <M style={{color:C.td,display:"block",fontSize:11}}>requested by {((ap.requested_by||"")+"").slice(0,8)} - needs a different operator to co-approve</M>
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <Btn small primary onClick={()=>doApproveRecovery(ap)}>Approve</Btn>
+                    <Btn small onClick={()=>doRejectRecovery(ap)}>Reject</Btn>
+                  </div>
+                </div>
+              ))}
             </div>}
             {!recoveryClients.initialized&&<M style={{color:C.tm,fontStyle:"italic"}}>Real-time sessions unavailable (WebSocket server not initialized).</M>}
             {recoveryClients.initialized&&recoveryClients.clients.length===0&&<M style={{color:C.tm,fontStyle:"italic"}}>No analyst clients connected.</M>}

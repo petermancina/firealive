@@ -525,8 +525,19 @@ class GdPushService {
   _buildIngestBody(apiKey) {
     const db = getDb();
     let snapshot;
+    let instanceFingerprint = null;
     try {
       snapshot = new MetricsCollector(db).collect();
+      // B5e: read this deployment's instance fingerprint while the DB is open
+      // so the GD can bind it per-MC and detect a clone (the same fingerprint
+      // under two mc_ids). Defensive: any failure sends null (the GD treats an
+      // absent fingerprint as not-yet-reporting).
+      try {
+        const idRow = db.prepare("SELECT fingerprint FROM instance_identity ORDER BY id LIMIT 1").get();
+        instanceFingerprint = idRow ? idRow.fingerprint : null;
+      } catch (idErr) {
+        instanceFingerprint = null;
+      }
     } finally {
       db.close();
     }
@@ -551,7 +562,7 @@ class GdPushService {
       upskillingHoursUsed: snapshot.upskilling?.scheduledAnalysts || 0,
     };
 
-    return { apiKey, metrics };
+    return { apiKey, instanceFingerprint, metrics };
   }
 
   // ── Field helpers ────────────────────────────────────────────────────────

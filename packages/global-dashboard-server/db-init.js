@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS sessions (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+-- GD app device keys (B5e Block K, D20/D28): the hardware-bound device key each GD
+-- operator's app mints in its TPM / Secure Enclave. A direct mirror of the regional
+-- server's ac_device_signing_keys: one active row per operator, sign-only, the public
+-- half registered at enrollment. The GD session token is bound to the active key's
+-- thumbprint and every /api/ request must prove possession of it (D28). The partial
+-- unique index enforces at most one active key per operator at the DB layer
+-- (registration retires the old active row before inserting a new one), matching the
+-- audit_chain_signing_keys active-key pattern.
+CREATE TABLE IF NOT EXISTS gd_device_signing_keys (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+  retired_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gd_device_signing_keys_active ON gd_device_signing_keys(user_id) WHERE active = 1;
+
 -- Connected Management Consoles (regional)
 CREATE TABLE IF NOT EXISTS management_consoles (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
@@ -856,6 +875,61 @@ CREATE TABLE IF NOT EXISTS auth_recovery (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_recovery_one_active
   ON auth_recovery(is_active) WHERE is_active = 1;
+
+-- ── B5e: GD SERVER OWN INSTANCE IDENTITY (HARDWARE-SEALED) ───────────────
+-- The GD Server hardware-bound instance identity (decision D26), mirroring
+-- the regional server instance_identity. The signing key is sealed to this
+-- host TPM 2.0 / Secure Enclave; anchor_public is the SPKI public key (PEM),
+-- anchor_seal is a non-secret marker (the backend kind and the key label), and
+-- fingerprint is the SHA-256 hex of the anchor SPKI DER. Exactly one row, the
+-- GD identity. Hardware-only by construction: the CHECK admits only hardware.
+CREATE TABLE IF NOT EXISTS gd_instance_identity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  instance_id TEXT NOT NULL,
+  anchor_kind TEXT NOT NULL DEFAULT 'hardware'
+    CHECK (anchor_kind IN ('hardware')),
+  anchor_public TEXT NOT NULL,
+  anchor_seal TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  ratchet_counter INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'quarantined')),
+  established_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_attested_at TEXT
+);
+
+-- ── B5e: PER-MC INSTANCE-IDENTITY BINDING (ANTI-CLONING) ─────────────────
+-- Binds each MC instance-anchor fingerprint (the MC
+-- instance_identity.fingerprint, SHA-256 hex of the anchor SPKI DER) to its
+-- mc_id. One instance identity must map to exactly one MC. The same
+-- fingerprint presented under a different mc_id means two deployments share
+-- one identity -- a clone. An mc_id presenting a fingerprint different from
+-- the one on file means its instance identity changed (a re-provision, or a
+-- clone that minted a fresh identity).
+CREATE TABLE IF NOT EXISTS mc_instance_bindings (
+  mc_id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  first_seen_at TEXT DEFAULT (datetime('now')),
+  last_seen_at TEXT DEFAULT (datetime('now')),
+  status TEXT DEFAULT 'bound' CHECK (status IN ('bound', 'collision', 'rebound')),
+  FOREIGN KEY (mc_id) REFERENCES management_consoles(id) ON DELETE CASCADE
+);
+-- Reverse lookup: every mc_id a fingerprint is bound to (collision check).
+CREATE INDEX IF NOT EXISTS idx_mc_instance_bindings_fingerprint
+  ON mc_instance_bindings(fingerprint);
+
+-- Append-only log of instance-fingerprint anomalies seen at ingest (audit
+-- trail for the collision/rebind detector; the live binding is the table
+-- above). conflicting_mc_id is the OTHER mc_id when a fingerprint is reused.
+CREATE TABLE IF NOT EXISTS mc_instance_collisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mc_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  conflicting_mc_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('fingerprint-reused', 'fingerprint-changed')),
+  detail TEXT,
+  seen_at TEXT DEFAULT (datetime('now'))
+);
 
 INSERT OR IGNORE INTO config (key, value)
   VALUES ('instance_label', 'FireAlive Global Dashboard (unconfigured)');
