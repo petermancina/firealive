@@ -165,7 +165,9 @@ On the SOURCE deployment:
 
 On the TARGET deployment (a fresh install on the new hardware):
 
-4. Place the bundle directory on the target server's filesystem.
+4. Place the bundle directory under the target's migration-bundles root (the
+   MIGRATION_BUNDLE_DIR directory, default data/migration-bundles). The
+   importer accepts only a bundle path inside that root.
 5. Register the source's backup signing key as a trusted verification key,
    confirming the fingerprint out of band against the value from step 2. An
    unregistered key is refused.
@@ -190,6 +192,9 @@ On the TARGET deployment (a fresh install on the new hardware):
   live database; the apply fails closed if no scanner is configured, if a
   threat is found, or if the scan is inconclusive.
 - The pre-import snapshot is the rollback path if anything goes wrong.
+- The importer confines the supplied bundle path to the migration-bundles
+  root; a path that resolves outside it is rejected, so the import cannot be
+  pointed at an arbitrary location on the server.
 - Because identity is re-minted rather than copied, the migrated deployment
   is a distinct authentic instance, not a clone, and the source (once
   decommissioned) leaves no usable duplicate.
