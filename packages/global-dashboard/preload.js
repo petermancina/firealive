@@ -10,6 +10,8 @@ const ALLOWED_CHANNELS = [
   'config:get', 'config:set',
   'audit:log', 'audit:export',
   'device:getPublicKey', 'device:signLoginChallenge', 'device:signPopProof',
+  // B5e (D25): GD-app-side server anchor pinning + per-connect verification
+  'anticlone:anchorNonce', 'anticlone:verifyAnchor', 'anticlone:pinAnchor', 'anticlone:anchorState',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
