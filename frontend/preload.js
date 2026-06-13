@@ -14,6 +14,8 @@ const ALLOWED_CHANNELS = [
   'abuse:seal', 'abuse:hold-for-export', 'abuse:finalize-export', 'abuse:cancel-export',
   // B5e (D24): MC device key registration + privileged-action signing
   'device:getPublicKey', 'device:signAction',
+  // B5e (D9): deployment-mode first-run selection
+  'deployment:getLocalMode', 'deployment:setLocalMode',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {
