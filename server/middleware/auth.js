@@ -133,7 +133,7 @@ function enforceDevicePop(req, decoded, options) {
       return { ok: false, status: 401, code: 'device_pop_required', error: 'the device key has changed since this session was issued; sign in again' };
     }
     const proof = req.headers[devicePop.POP_HEADER];
-    const result = devicePop.verifyPopProof({ method: req.method, path: req.path, proof: proof, publicKeyPem: active.public_key, jkt: cnf.jkt });
+    const result = devicePop.verifyPopProof({ method: req.method, path: (req.originalUrl || req.url || '').split('?')[0], proof: proof, publicKeyPem: active.public_key, jkt: cnf.jkt });
     if (!result.ok) {
       return { ok: false, status: 401, code: 'device_pop_required', error: 'device-key proof-of-possession: ' + result.reason };
     }
