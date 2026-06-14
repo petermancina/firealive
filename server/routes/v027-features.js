@@ -9,6 +9,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 const { version } = require('../lib/version');
 
@@ -22,7 +23,7 @@ router.get('/proactive/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load proactive config' }); }
 });
 
-router.put('/proactive/config', (req, res) => {
+router.put('/proactive/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('proactive_config', ?)").run(JSON.stringify(req.body));
@@ -77,7 +78,7 @@ router.get('/upskilling-hour/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load upskilling config' }); }
 });
 
-router.put('/upskilling-hour/config', (req, res) => {
+router.put('/upskilling-hour/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('upskilling_hour_config', ?)").run(JSON.stringify(req.body));
@@ -97,7 +98,7 @@ router.get('/auto-disable-routing/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load auto-disable config' }); }
 });
 
-router.put('/auto-disable-routing/config', (req, res) => {
+router.put('/auto-disable-routing/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('auto_disable_routing_config', ?)").run(JSON.stringify(req.body));

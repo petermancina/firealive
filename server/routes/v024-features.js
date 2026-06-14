@@ -9,6 +9,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 
@@ -56,7 +57,7 @@ router.get('/threat-hunting/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load threat hunting config' }); }
 });
 
-router.put('/threat-hunting/config', (req, res) => {
+router.put('/threat-hunting/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('threat_hunting_config', ?)").run(JSON.stringify(req.body));
@@ -76,7 +77,7 @@ router.get('/tripwire/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load tripwire config' }); }
 });
 
-router.put('/tripwire/config', (req, res) => {
+router.put('/tripwire/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('tripwire_config', ?)").run(JSON.stringify(req.body));
@@ -217,7 +218,7 @@ router.get('/auth-logs/anomalies', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to check auth anomalies' }); }
 });
 
-router.put('/auth-logs/notification-config', (req, res) => {
+router.put('/auth-logs/notification-config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('auth_log_notif_config', ?)").run(JSON.stringify(req.body));
@@ -236,7 +237,7 @@ router.get('/posture/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load posture config' }); }
 });
 
-router.put('/posture/config', (req, res) => {
+router.put('/posture/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('posture_config', ?)").run(JSON.stringify(req.body));
@@ -293,7 +294,7 @@ router.get('/ha/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load HA config' }); }
 });
 
-router.put('/ha/config', (req, res) => {
+router.put('/ha/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(req.body));
@@ -318,7 +319,7 @@ router.get('/fail-open/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load fail-open config' }); }
 });
 
-router.put('/fail-open/config', (req, res) => {
+router.put('/fail-open/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('fail_open_config', ?)").run(JSON.stringify(req.body));

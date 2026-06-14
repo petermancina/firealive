@@ -8,7 +8,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
-const { requireArrayBody } = require('../middleware/body-validation');
+const { requireArrayBody, requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 
 // ── Pseudonym System ────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ router.get('/pseudonyms/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load pseudonym config' }); }
 });
 
-router.put('/pseudonyms/config', (req, res) => {
+router.put('/pseudonyms/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('pseudonym_config', ?)").run(JSON.stringify(req.body));
@@ -95,7 +95,7 @@ router.get('/geo-fence/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load geo-fence config' }); }
 });
 
-router.put('/geo-fence/config', (req, res) => {
+router.put('/geo-fence/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('geo_fence_config', ?)").run(JSON.stringify(req.body));
@@ -141,7 +141,7 @@ router.get('/cluster/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load cluster config' }); }
 });
 
-router.put('/cluster/config', (req, res) => {
+router.put('/cluster/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cluster_config', ?)").run(JSON.stringify(req.body));
@@ -161,7 +161,7 @@ router.get('/global-dashboard/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load global dashboard config' }); }
 });
 
-router.put('/global-dashboard/config', (req, res) => {
+router.put('/global-dashboard/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('global_dashboard_config', ?)").run(JSON.stringify(req.body));
@@ -228,7 +228,7 @@ router.get('/sync-interval/config', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to load sync interval config' }); }
 });
 
-router.put('/sync-interval/config', (req, res) => {
+router.put('/sync-interval/config', requireObjectBody, (req, res) => {
   try {
     const db = getDb();
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('sync_interval_config', ?)").run(JSON.stringify(req.body));
