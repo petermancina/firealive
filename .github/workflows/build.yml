@@ -17,6 +17,8 @@ jobs:
           node-version: '22'
       - name: Verify config-lock registry coverage
         run: node scripts/check-config-lock-coverage.js
+      - name: Verify request-body validation coverage
+        run: node scripts/check-body-validation-coverage.js
 
   build-mac:
     needs: coverage
