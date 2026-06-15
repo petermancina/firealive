@@ -242,6 +242,36 @@ ipcMain.handle('anticlone:pinAnchor', async (_e, { fingerprint, force } = {}) =>
   return { pinned: true, fingerprint: fingerprint, firstPin: !existing };
 });
 
+ipcMain.handle('anticlone:confirmAnchorPin', async (_e, { fingerprint } = {}) => {
+  if (typeof fingerprint !== 'string' || !(/^[0-9a-f]{64}$/.test(fingerprint))) {
+    return { confirmed: false, error: 'a 64-hex-character anchor fingerprint is required' };
+  }
+  const NL = String.fromCharCode(10);
+  const grouped = fingerprint.replace(/(.{8})/g, '$1 ').trim();
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+  const opts = {
+    type: 'warning',
+    buttons: ['Cancel', 'Confirm and pin'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Confirm server identity (first connection)',
+    message: 'Trust this FireAlive deployment on first connection?',
+    detail: 'Server anchor fingerprint:' + NL + NL + grouped + NL + NL
+      + 'Compare this with the DEPLOYMENT ANCHOR FINGERPRINT the server prints '
+      + 'at startup, obtained out of band from your administrator. Confirm only '
+      + 'if it matches exactly. A clone of this deployment cannot reproduce this '
+      + 'fingerprint, so a value that does not match is the signal to refuse.',
+  };
+  let result;
+  try {
+    result = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+  } catch (err) {
+    return { confirmed: false, error: err && err.message ? err.message : String(err) };
+  }
+  return { confirmed: !!(result && result.response === 1) };
+});
+
 // Report whether a server anchor fingerprint is pinned (for the connect flow).
 ipcMain.handle('anticlone:anchorState', async () => {
   try {

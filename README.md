@@ -88,7 +88,7 @@ Six components:
 
 All four Electron apps (AC, MC, ARC, GD) are self-contained: their UI is precompiled in CI via esbuild into one `app.js` per app, React/ReactDOM are bundled in, every `index.html` loads only that single file, both CSP layers (meta tag + response header) are locked to `script-src 'self'`, and there are no runtime CDN fetches and no runtime transpiler. The apps run in restricted and air-gapped networks and make no external network calls for UI code.
 
-### Backend Services (37 files)
+### Backend Services
 
 |Service               |Purpose                                                                                   |
 |----------------------|------------------------------------------------------------------------------------------|
@@ -96,26 +96,34 @@ All four Electron apps (AC, MC, ARC, GD) are self-contained: their UI is precomp
 |Assessment Service    |Create/assign/submit assessments, skill tracking, gap analysis                            |
 |Backup Service        |Real filesystem backups, SHA-256 integrity verification, scheduling                       |
 |Compliance Scanner    |Real checks against actual app state for 16+ frameworks                                   |
-|Regression Runner     |35 real tests checking DB tables, crypto, integrations, middleware                        |
+|Regression Runner     |Broad real-test suite over DB tables, crypto, integrations, and middleware                |
 |Integration Manager   |SOAR/Ticketing/SIEM/IAM connection testing and config storage                             |
 |Notification Service  |Proactive break alerts, shift handoff notifications, assessment assignments               |
 |System Health Monitor |Real CPU/memory/heap/DB metrics via Node.js APIs                                          |
-|Feature Toggle Service|Enable/disable 20 features without removing code                                          |
+|Feature Toggle Service|Enable/disable platform features without removing code                                    |
 |Metrics Collector     |Full-suite metrics for monitoring + CEF output for SIEM                                   |
 
-### Security Middleware (9 modules, 877 lines)
+### Security Middleware
 
-|Module            |Protections                                                                                          |
-|------------------|-----------------------------------------------------------------------------------------------------|
-|security-hardening|Headers, input sanitization, CSRF, anti-replay, rate limiting, SSRF, TLS                             |
-|auth-hardening    |Constant-time comparison, CSPRNG, account lockout, JWT rotation, suspicious input detection          |
-|ai-security       |Prompt injection (12 patterns), context limits, output validation, data firewall                     |
-|network-security  |DDoS/slowloris, DNS size limits, client heartbeat, mTLS, anti-pivot                                  |
-|cors-policy       |Zero-trust CORS, known origins only                                                                  |
-|pentest-hardening |Token storage (memory only), safe errors, request correlation, content-type enforcement, idle timeout|
-|audit             |Tamper-evident: per-row SHA-256 hash chain + Ed25519-signed checkpoints                              |
-|auth              |JWT + RBAC                                                                                           |
-|network-hardening |Additional network protections                                                                       |
+|Module             |Protections                                                                                          |
+|-------------------|-----------------------------------------------------------------------------------------------------|
+|auth               |JWT + RBAC; sessions bound to a hardware device key via per-request proof-of-possession              |
+|auth-hardening     |Constant-time comparison, CSPRNG, account lockout, JWT rotation, suspicious input detection          |
+|mfa-stepup         |Fresh WebAuthn step-up assertion gate for sensitive and config actions                               |
+|security-hardening |Headers, input sanitization, CSRF, anti-replay, rate limiting, SSRF, TLS                             |
+|body-validation    |Request-body shape validation (type-confusion / CWE-843 defense) on config writes                    |
+|pentest-hardening  |Token storage (memory only), safe errors, request correlation, content-type enforcement, idle timeout|
+|ai-security        |Prompt injection (12 patterns), context limits, output validation, data firewall                     |
+|network-security   |DDoS/slowloris, DNS size limits, client heartbeat, mTLS, anti-pivot                                  |
+|network-hardening  |Additional network-layer protections                                                                 |
+|cors-policy        |Zero-trust CORS, known origins only                                                                  |
+|config-lock        |Config-write lockout (HTTP 423) with WebAuthn step-up and sliding auto-relock                        |
+|config-write-routes|Endpoint registry backing the config-lock chokepoint and its CI coverage guard                       |
+|vm-attestation     |Virtualized-mode VM and clock-integrity attestation, fail-closed                                     |
+|quarantine-guard   |Refuses a quarantined (suspected-clone) deployment until operator re-enrollment                      |
+|mc-device-action   |Binds privileged Management Console actions to the console hardware device key                       |
+|recovery-rate-limit|Burst limiter on destructive client-recovery (teardown / reprovision) actions                        |
+|audit              |Tamper-evident: per-row SHA-256 hash chain + Ed25519-signed checkpoints                              |
 
 ### API Routes
 
@@ -139,9 +147,9 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 
 **AI Burnout API (/api/ai-burnout, 3 endpoints):** Read/refresh access to the precomputed burnout-message caches. Analysts retrieve their own per-signal interpretations (Tier-3, decrypted only for the owning analyst); team leads retrieve team-level intervention prompts (Tier-1 aggregate, with active conditions recomputed live) and can trigger a refresh (rate-limited and audited). No inference runs in the request path — the scheduler precomputes and caches content, and these endpoints serve fresh cached rows or an honest AI-unavailable state, never canned advice. All AI content is strictly grounded in the research KB: every citation is validated against the 42-entry KB and any off-KB reference is rejected rather than served, so a hallucinated citation cannot reach a user. Backed by `server/services/burnout-message-generator.js` (orchestration + citation gate), `server/services/research-kb.js` (authoritative KB + validator), `server/services/team-health.js` and `server/services/team-conditions.js` (server-side team-state computation), with two scheduled precompute jobs in `server/services/scheduler.js`.
 
-**IR Simulator API (/api/ooda, 15 endpoints):** OODA-loop incident response training generator. Team leads upload IR policies, playbooks, and after-action reports; the system generates choose-your-own-adventure decision-tree training scenarios calibrated to a chosen scenario type (8 categories: ransomware, phishing, data exfil, insider threat, APT, DDoS, supply chain, credential compromise) and difficulty (beginner / intermediate / advanced). Analysts work through the scenarios node-by-node, getting explanations on each correct or incorrect choice. Backed by `server/services/ooda-scenario-generator.js` (orchestration), `server/services/ir-policy-parser.js` (rule-based extraction of detection signals, decision points, escalation paths, roles, containment actions, and communications obligations from uploaded policy text), `server/services/ooda-generation-jobs.js` (background worker for async batched generation; bounded in-process concurrency with crash recovery and per-scenario persistence), and the AI Provider dispatcher (the LLM call). The scenario generator validates every model output structurally — node count bounds, OODA-phase progression, exactly-one-correct-choice per decision node, all `nextNodeId` references resolve to real nodes, exactly one resolution node — and rejects malformed responses rather than persisting a broken scenario. Per-policy replenishment configuration drives auto-generation: threshold mode auto-refills when an analyst’s unplayed pool drops below a configured floor, scheduled mode generates batches at fixed times, manual mode disables auto-generation. Per-analyst progress tracked in the canonical `ooda_progress` table; aggregated training metrics (completion rate by scenario type, by difficulty, recent activity feed) available via `GET /api/ooda/mastery` (analyst-only access).
+**IR Simulator API (/api/ooda, 15 endpoints):** OODA-loop incident-response training generator. Team leads upload IR policies, playbooks, and after-action reports; FireAlive parses them (rule-based) and generates choose-your-own-adventure decision-tree scenarios calibrated to a scenario type (8 categories — ransomware, phishing, data exfil, insider threat, APT, DDoS, supply chain, credential compromise) and difficulty (beginner / intermediate / advanced). Analysts work through scenarios node-by-node with an explanation on every choice. The generator validates each model output structurally — node-count bounds, OODA-phase progression, exactly one correct choice per decision node, all node references resolving, exactly one resolution node — and rejects malformed scenarios rather than persisting them. Per-policy replenishment (threshold / scheduled / manual) drives auto-generation, and aggregated mastery metrics are available via `GET /api/ooda/mastery` (analyst-only). See **FEATURE-GUIDE.md** for the full workflow and the backing services.
 
-**Upload security (defense in depth, applies to /api/ooda/policies and /api/ooda/aar):** Two scan layers run on every uploaded policy and after-action report before any database write. Layer 1 (`server/services/content-sanitizer.js`) is a deterministic FireAlive-specific scanner — it catches threats that originate from how FireAlive uses the uploaded content, particularly LLM prompt injection (instruction-override patterns, role-switching jailbreaks, chat-template token injection, output-shape hijacking), embedded executables (shell shebangs, PowerShell IEX, VBA macros, reverse-shell signatures, pipe-to-shell installers, suspicious base64 blobs), and encoding attacks (null bytes, RTL override, zero-width invisibles, Unicode tag-character smuggling). Layer 2 (`server/services/integration-manager.js inspectFile()`) routes through the multi-vendor malware scanner system — 15 supported vendors (ClamAV, VirusTotal, CrowdStrike Falcon Sandbox, Microsoft Defender for Endpoint, SentinelOne, Cisco Secure Endpoint, Fortinet FortiSandbox, Trellix ATD, Sophos Intelix, Joe Sandbox, Hybrid Analysis, Palo Alto WildFire, BlackBerry Cylance, Trend Micro DDAN, Kaspersky Sandbox) — catching novel malware signatures and threat-intel matches that the internal sanitizer cannot stay current on. Both layers fail-closed: either layer’s rejection blocks the upload. **IR Simulator uploads (/policies and /aar) require at least one enabled scanner**: if no scanner is configured, layer 2 returns “skipped” and the upload is rejected with HTTP 422 and code MALWARE_SCANNER_REQUIRED. Other upload paths in the codebase may still tolerate skipped EDR; this hard gate is local to the IR Simulator routes because their content becomes LLM context for scenario generation.
+**Upload security (defense in depth, applies to /api/ooda/policies and /api/ooda/aar):** Every uploaded policy and after-action report passes two fail-closed scan layers before any database write. Layer 1 is a deterministic FireAlive-specific scanner targeting the threats that arise from feeding uploaded text to an LLM — prompt injection, embedded executables, and encoding / Unicode-smuggling attacks. Layer 2 routes the file through the multi-vendor malware scanner system (15 supported vendors — see **Integrations**) for novel-signature and threat-intel matches the internal scanner cannot stay current on. Either layer’s rejection blocks the upload, and the IR Simulator routes additionally hard-gate on at least one enabled scanner: with none configured, the upload is refused with HTTP 422 and code MALWARE_SCANNER_REQUIRED. That hard gate is local to the IR Simulator routes because their content becomes LLM context for scenario generation.
 
 -----
 
@@ -156,6 +164,16 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 1. First shift: AI Burnout Engine records 8 signal readings → baseline established
 1. After baseline: AI generates real-time drift detection + training recommendations
 1. CISO installs GD → registers regional MCs → sees cross-region health
+
+### Hardware-Rooted Identity, Anti-Cloning & Sender-Constrained Sessions
+
+FireAlive treats a running deployment as something that must continuously prove it is the genuine, un-cloned instance — not only at install time, but on every client connection and every request.
+
+- **Hardware-rooted instance identity.** Each server derives a non-exportable identity anchor from the host hardware root of trust — TPM 2.0 on Windows and Linux, the Secure Enclave on macOS. The anchor key never leaves hardware, and identity establishment is fail-closed: no anchor, no serving.
+- **Anti-cloning.** A byte-for-byte copy of a deployment — database, keys, and disk — cannot reconstitute the anchor on different hardware, so a lifted clone is detectable rather than silently authoritative. Every Analyst Client and Global Dashboard verifies the server’s anchor fingerprint on each connect; the **first** connection requires an explicit out-of-band operator confirmation of that fingerprint (the server prints it at startup), and any later fingerprint change blocks the client instead of trusting it.
+- **Virtualized deployments.** Bare-metal installs bind to the physical TPM; virtualized installs additionally run a VM-attestation and clock-integrity gate, so a paused, rolled-back, snapshotted, or migrated VM is caught fail-closed rather than serving forked or stale state. See [`docs/anti-cloning-and-virtualization.md`](docs/anti-cloning-and-virtualization.md).
+- **Sender-constrained sessions.** Session tokens are bound to a per-device key — the token carries that key’s thumbprint — and every authenticated request carries a short-lived, replay-protected proof-of-possession signed by the device’s private key. A stolen session token is therefore useless on its own: without the device’s hardware-held key it cannot be replayed. See [`docs/iam-and-authentication.md`](docs/iam-and-authentication.md).
+- **Per-client recovery.** A lost or compromised Analyst Client can be torn down and re-provisioned individually — rate-limited and fully audited — without re-keying the whole deployment. See [`docs/client-recovery.md`](docs/client-recovery.md).
 
 ### Locking Configuration (Required Hardening)
 

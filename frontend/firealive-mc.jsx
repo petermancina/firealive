@@ -35,11 +35,24 @@ const API_BASE = 'https://localhost:3000';
 const api = {
   _token: null,
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
-  async post(path, data, extraHeaders) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: Object.assign({}, this._headers(), extraHeaders || {}), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: this._headers(), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: this._headers() }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  // B5f: a fresh per-request proof-of-possession header, bound to this exact
+  // method and path (query stripped), signed by the hardware device key in the
+  // main process. Returns no header when no key is available; the server then
+  // refuses the bound session, which is the correct fail-closed behavior.
+  async _popHeader(method, path) {
+    try {
+      const b = (typeof window !== 'undefined') ? window.firealive : null;
+      if (!b || typeof b.invoke !== 'function') return {};
+      const res = await b.invoke('device:signPopProof', { method: method, path: String(path).split('?')[0] });
+      return (res && res.proof) ? { 'x-fa-device-pop': res.proof } : {};
+    } catch (_e) { return {}; }
+  },
+  async authHeaders(method, path) { return Object.assign({}, this._headers(), await this._popHeader(method, path)); },
+  async post(path, data, extraHeaders) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: Object.assign({}, await this.authHeaders('POST', path), extraHeaders || {}), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async get(path) { try { const r = await fetch(API_BASE + path, { headers: await this.authHeaders('GET', path) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: await this.authHeaders('PUT', path), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: await this.authHeaders('PATCH', path), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: await this.authHeaders('DELETE', path) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   // download(path, filename, opts?) — fetches a binary response (CSV, PDF,
   // DOCX, etc.) and triggers a browser download via an anchor click. Use
   // for endpoints that return a blob rather than JSON; the get/post/put
@@ -50,7 +63,7 @@ const api = {
   // Returns a Promise that resolves to true on success, false on error.
   async download(path, filename, opts) {
     const method = (opts && opts.method) || 'GET';
-    const init = { method, headers: this._headers() };
+    const init = { method, headers: await this.authHeaders(method, path) };
     if (opts && opts.body !== undefined) init.body = JSON.stringify(opts.body);
     try {
       const r = await fetch(API_BASE + path, init);
@@ -1680,7 +1693,7 @@ function ManagementConsole() {
       // CONTACT_STORAGE_BLOCKED separately from network errors.
       (async () => {
         try {
-          const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+          const headers = await api.authHeaders('GET', '/api/users/me/lead-contacts');
           const r = await fetch(API_BASE + '/api/users/me/lead-contacts', { headers });
           const json = await r.json().catch(() => null);
           if (r.ok) {
@@ -3312,7 +3325,7 @@ function ManagementConsole() {
     if (refreshing) return;
     setRefreshing(true); setRefreshMsg("");
     try {
-      const r = await fetch(API_BASE + "/api/ai-burnout/refresh", { method: "POST", headers: api._headers() });
+      const r = await fetch(API_BASE + "/api/ai-burnout/refresh", { method: "POST", headers: await api.authHeaders("POST", "/api/ai-burnout/refresh") });
       if (r.status === 429) {
         let sec = 60; try { const b = await r.json(); if (b && b.retryAfterSec) sec = b.retryAfterSec; } catch (e) {}
         setRefreshMsg("Please wait " + sec + "s before refreshing again.");
@@ -5138,7 +5151,7 @@ function ManagementConsole() {
                 setSmsTestSending(true);
                 setSmsTestResult(null);
                 try {
-                  const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+                  const headers = await api.authHeaders('POST', '/api/notifications/sms/test');
                   const r = await fetch(API_BASE + '/api/notifications/sms/test', { method: 'POST', headers, body: '{}' });
                   const json = await r.json().catch(()=>null);
                   if (r.ok) {
@@ -9220,7 +9233,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     setLeadContactErrors(null);
                     setLeadContactSaved(false);
                     try {
-                      const headers = { 'Content-Type': 'application/json', ...(api._token ? { 'Authorization': 'Bearer ' + api._token } : {}) };
+                      const headers = await api.authHeaders('PUT', '/api/users/me/lead-contacts');
                       const r = await fetch(API_BASE + '/api/users/me/lead-contacts', {
                         method: 'PUT',
                         headers,

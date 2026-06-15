@@ -434,6 +434,76 @@ class RegressionRunner {
       return 'filter-escape + group mapping present (directory-only; bind not exercised)';
     });
 
+    // B5f: sender-constrained session checks (per-request proof-of-possession).
+    await check('auth', 'Device proof-of-possession verifier (B5f: valid / tampered / expired / replay)', () => {
+      const devicePop = require('./device-pop');
+      const dk = require('./device-key');
+      if (devicePop.POP_SIGNING_PREFIX !== 'firealive-device-pop-v1:') {
+        throw new Error('regional PoP signing prefix is not domain-separated (firealive-device-pop-v1:)');
+      }
+      if (devicePop.POP_HEADER !== 'x-fa-device-pop') throw new Error('unexpected PoP header name');
+      const pair = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const pem = pair.publicKey.export({ type: 'spki', format: 'pem' });
+      const jkt = dk.jwkThumbprint(pem);
+      const rid = crypto.randomBytes(8).toString('hex');
+      const mkProof = (method, path, iat, jti) => {
+        const msg = devicePop.popMessage(method, path, iat, jti, jkt);
+        const sig = crypto.sign('sha256', msg, { key: pair.privateKey, dsaEncoding: 'ieee-p1363' });
+        return Buffer.from(JSON.stringify({ iat: iat, jti: jti, sig: sig.toString('base64') })).toString('base64url');
+      };
+      const now = Math.floor(Date.now() / 1000);
+      const good = devicePop.verifyPopProof({ method: 'GET', path: '/api/probe', proof: mkProof('GET', '/api/probe', now, 'rr-ok-' + rid), publicKeyPem: pem, jkt: jkt });
+      if (!good.ok) throw new Error('a valid proof was rejected: ' + good.reason);
+      const tampered = devicePop.verifyPopProof({ method: 'POST', path: '/api/probe', proof: mkProof('GET', '/api/probe', now, 'rr-tamper-' + rid), publicKeyPem: pem, jkt: jkt });
+      if (tampered.ok) throw new Error('a proof signed for a different method was accepted');
+      const expired = devicePop.verifyPopProof({ method: 'GET', path: '/api/probe', proof: mkProof('GET', '/api/probe', now - 120, 'rr-exp-' + rid), publicKeyPem: pem, jkt: jkt });
+      if (expired.ok) throw new Error('an expired proof was accepted');
+      const replay = mkProof('GET', '/api/probe', now, 'rr-replay-' + rid);
+      const first = devicePop.verifyPopProof({ method: 'GET', path: '/api/probe', proof: replay, publicKeyPem: pem, jkt: jkt });
+      const second = devicePop.verifyPopProof({ method: 'GET', path: '/api/probe', proof: replay, publicKeyPem: pem, jkt: jkt });
+      if (!first.ok || second.ok) throw new Error('the replay guard did not reject a reused proof');
+      return 'valid accepted; tampered / expired / replayed rejected; signing prefix domain-separated';
+    });
+    await check('auth', 'Device-key crypto core (B5f: EC + Ed25519 verify, RFC 7638 thumbprint)', () => {
+      const dk = require('./device-key');
+      if (typeof dk.verifyDeviceSignature !== 'function' || typeof dk.jwkThumbprint !== 'function') {
+        throw new Error('device-key missing verifyDeviceSignature / jwkThumbprint');
+      }
+      const msg = Buffer.from('device-key-selftest', 'utf8');
+      const ec = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const ecPem = ec.publicKey.export({ type: 'spki', format: 'pem' });
+      const ecSig = crypto.sign('sha256', msg, { key: ec.privateKey, dsaEncoding: 'ieee-p1363' });
+      if (!dk.verifyDeviceSignature(ecPem, msg, ecSig)) throw new Error('EC P-256 device signature did not verify');
+      if (dk.verifyDeviceSignature(ecPem, Buffer.from('tampered', 'utf8'), ecSig)) throw new Error('EC verify accepted a tampered message');
+      const ed = crypto.generateKeyPairSync('ed25519');
+      const edPem = ed.publicKey.export({ type: 'spki', format: 'pem' });
+      const edSig = crypto.sign(null, msg, ed.privateKey);
+      if (!dk.verifyDeviceSignature(edPem, msg, edSig)) throw new Error('Ed25519 device signature did not verify');
+      const t1 = dk.jwkThumbprint(ecPem); const t2 = dk.jwkThumbprint(ecPem);
+      if (t1 !== t2 || !/^[A-Za-z0-9_-]{43}$/.test(t1)) throw new Error('jwkThumbprint is not a stable base64url SHA-256');
+      return 'EC + Ed25519 verify; tamper rejected; RFC 7638 thumbprint stable';
+    });
+    await check('auth', 'Session device-binding enforced (B5f: cnf-less session refused)', () => {
+      let mw;
+      try { mw = require('../middleware/auth'); } catch (e) { throw new Error('cannot load auth middleware: ' + e.message); }
+      for (const fn of ['authMiddleware', 'signToken', 'getClientCertThumbprint']) {
+        if (typeof mw[fn] !== 'function') throw new Error('auth middleware does not export ' + fn);
+      }
+      const payloadOf = (t) => JSON.parse(Buffer.from(String(t).split('.')[1], 'base64url').toString('utf8'));
+      const bound = payloadOf(mw.signToken({ id: 1, role: 'analyst' }, { jkt: 'TESTJKT' }));
+      if (!bound || !bound.cnf || bound.cnf.jkt !== 'TESTJKT') throw new Error('signToken did not bind cnf.jkt into the token');
+      const cnfless = mw.signToken({ id: 1, role: 'analyst' });
+      const req = { headers: { authorization: 'Bearer ' + cnfless }, method: 'GET', originalUrl: '/api/regression-probe', path: '/api/regression-probe' };
+      let captured = null; let nextCalled = false;
+      const res = { status: function (c) { captured = { code: c }; return this; }, json: function (o) { captured.body = o; return this; } };
+      mw.authMiddleware(['analyst'])(req, res, function () { nextCalled = true; });
+      if (nextCalled) throw new Error('a cnf-less session was allowed through (device binding not enforced)');
+      if (!captured || captured.code !== 401 || !captured.body || captured.body.code !== 'device_binding_required') {
+        throw new Error('cnf-less session not refused with device_binding_required');
+      }
+      return 'signToken binds cnf.jkt; a cnf-less session is refused with device_binding_required';
+    });
+
     // ── Category: IAM ──────────────────────────────────────────────
     await check('iam', 'IAM offboarding columns + detector (B5b)', () => {
       // Forward-aware + auto-activating. R0 added the offboarding columns; the

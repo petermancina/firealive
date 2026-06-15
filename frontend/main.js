@@ -168,6 +168,59 @@ ipcMain.handle('device:signAction', async (_e, { action, target } = {}) => {
   }
 });
 
+// ── B5f: per-request proof-of-possession signing ────────────────────────────
+//
+// Every authenticated /api/ request to the regional server carries a fresh,
+// single-use proof signed by this console's hardware device key (the same
+// fa-mc-device key that signs privileged actions), so a stolen session token is
+// useless without the chip. Mirrors server/services/device-pop.js, with the
+// regional signing prefix (distinct from the device-action prefix above).
+const MC_POP_SIGNING_PREFIX = 'firealive-device-pop-v1:';
+const MC_POP_FIELD_SEP = String.fromCharCode(10);
+
+// RFC 7638 JWK SHA-256 thumbprint (base64url) of the device key's public key,
+// the value the server bound into the session token's cnf.jkt claim. Must match
+// server/services/device-key.js jwkThumbprint exactly.
+function mcJwkThumbprint(publicKeyPem) {
+  const jwk = crypto.createPublicKey(publicKeyPem).export({ format: 'jwk' });
+  let members;
+  if (jwk.kty === 'EC') {
+    members = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
+  } else if (jwk.kty === 'OKP') {
+    members = { crv: jwk.crv, kty: jwk.kty, x: jwk.x };
+  } else {
+    throw new Error('unsupported key type for thumbprint');
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(members)).digest('base64url');
+}
+
+// The exact bytes the device key signs for a per-request proof (mirror of
+// server/services/device-pop.js popMessage). Field order is fixed.
+function mcPopMessage(method, path, iat, jti, jkt) {
+  const fields = [String(method).toUpperCase(), String(path), String(iat), String(jti), String(jkt)];
+  return Buffer.from(MC_POP_SIGNING_PREFIX + fields.join(MC_POP_FIELD_SEP), 'utf8');
+}
+
+// Sign a per-request proof. The renderer calls this with the method and full
+// path of the request it is about to make and attaches the returned proof as the
+// x-fa-device-pop header.
+ipcMain.handle('device:signPopProof', async (_e, { method, path } = {}) => {
+  try {
+    if (typeof method !== 'string' || typeof path !== 'string') {
+      return { error: 'method and path required' };
+    }
+    const k = await getMcDeviceKey();
+    const jkt = mcJwkThumbprint(k.publicKeyPem);
+    const iat = Math.floor(Date.now() / 1000);
+    const jti = crypto.randomBytes(16).toString('hex');
+    const sig = k.sign(mcPopMessage(method, path, iat, jti, jkt)).toString('base64');
+    const proof = Buffer.from(JSON.stringify({ iat: iat, jti: jti, sig: sig })).toString('base64url');
+    return { proof: proof };
+  } catch (err) {
+    return { error: (err.message || 'proof-of-possession signing failed').slice(0, 200) };
+  }
+});
+
 // D9: report / set this installation's deployment-mode selection (first-run).
 ipcMain.handle('deployment:getLocalMode', async () => {
   try {

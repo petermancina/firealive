@@ -187,7 +187,10 @@ app.get('/api/system/health', require('./routes/system')); // health check is pu
 app.use('/api/instance', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/instance-identity'));
 // D24: MC operators register their hardware device key here; destructive
 // recovery actions must carry a signature from it (verified downstream).
-app.use('/api/mc-device-key', authMiddleware(['lead', 'admin']), require('./routes/mc-device-key'));
+// /register is the MC keyless bootstrap (an operator registers the hardware
+// device key before the session is bound), so it is popExempt; any other route
+// under this mount would require a bound, proven session (B5f).
+app.use('/api/mc-device-key', (req, res, next) => authMiddleware(['lead', 'admin'], { popExempt: req.path === '/register' })(req, res, next), require('./routes/mc-device-key'));
 // D9: report/provision the hardware-sealed deployment mode (bare-metal vs VM).
 app.use('/api/deployment', authMiddleware(['lead', 'admin']), require('./routes/deployment'));
 app.use('/api/team', authMiddleware(['lead', 'admin']), require('./routes/team'));
@@ -278,7 +281,10 @@ app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoi
 app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-monitoring'));
 app.use('/api/system/connected-clients', authMiddleware(['admin']), require('./routes/system-connected-clients'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
-app.use('/api/compromise', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/compromise-scan-orchestration'));
+// /device-key is the AC keyless bootstrap (an analyst registers the hardware
+// device key before the session is bound), so it is popExempt; every other
+// compromise route requires a bound, proven session (B5f).
+app.use('/api/compromise', (req, res, next) => authMiddleware(['analyst', 'lead', 'admin'], { popExempt: req.path === '/device-key' })(req, res, next), require('./routes/compromise-scan-orchestration'));
 app.use('/api/client-ops', authMiddleware(['lead', 'admin']), require('./routes/client-ops'));
 app.use('/api/tripwire', authMiddleware(['lead', 'admin']), require('./routes/tripwire'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
