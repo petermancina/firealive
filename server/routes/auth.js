@@ -17,7 +17,9 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../db/init');
-const { signToken } = require('../middleware/auth');
+const { signToken, getClientCertThumbprint } = require('../middleware/auth');
+const devicePop = require('../services/device-pop');
+const deviceKey = require('../services/device-key');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { verifyPeerCertificate } = require('../middleware/network-security');
@@ -38,13 +40,37 @@ const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_INSECURE_DEFAULT';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// ── Device-key session binding (B5f) ───────────────────────────────────────────
+
+// The operator's active hardware device key row, or null. Analysts bind to the
+// Analyst Client key table, admins and leads to the Management Console table.
+function getActiveDeviceKey(db, user) {
+  return (user.role === 'analyst')
+    ? db.prepare('SELECT public_key FROM ac_device_signing_keys WHERE user_id = ? AND active = 1').get(user.id)
+    : db.prepare('SELECT public_key FROM mc_device_signing_keys WHERE user_id = ? AND active = 1').get(user.id);
+}
+
+// The RFC 7800 cnf binding for a session: the active device key's RFC 7638
+// thumbprint, plus the mutual-TLS client-certificate thumbprint (x5t#S256) when
+// a client certificate is present. Returns null when the operator has no active
+// device key, which yields a transitional, bootstrap-only session the auth
+// middleware accepts only on the device-key registration routes.
+function computeCnf(db, user, req) {
+  const active = getActiveDeviceKey(db, user);
+  if (!active) return null;
+  const cnf = { jkt: deviceKey.jwkThumbprint(active.public_key) };
+  const certThumbprint = getClientCertThumbprint(req);
+  if (certThumbprint) cnf['x5t#S256'] = certThumbprint;
+  return cnf;
+}
+
 /**
  * Issue accessToken + refreshToken + sessions row for the given
  * authenticated user. Centralized so the cert and passkey login paths share it.
  * Returns the response shape sent to the client.
  */
-function issueJwt(db, user, ipAddress, userAgent) {
-  const accessToken = signToken(user);
+function issueJwt(db, user, ipAddress, userAgent, cnf) {
+  const accessToken = signToken(user, cnf);
   const refreshToken = crypto.randomBytes(64).toString('hex');
   const refreshHash = bcrypt.hashSync(refreshToken, 10);
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_SECONDS * 1000).toISOString();
@@ -132,13 +158,37 @@ router.post('/refresh', (req, res) => {
         code: 'ACCOUNT_INACTIVE',
       });
     }
-    const accessToken = signToken({
+    const refreshUser = {
       id: matched.user_id,
       role: matched.role,
       name: matched.name,
       tier: matched.tier,
       shift: matched.shift,
-    });
+    };
+    // Proof-of-possession on refresh (B5f): if the account has an active device
+    // key, the refresh request must carry a fresh device-key proof, so a stolen
+    // refresh token alone cannot mint a usable session. A keyless account (no
+    // device key registered yet) refreshes without a proof, into a cnf-less
+    // bootstrap session.
+    const activeKey = getActiveDeviceKey(db, refreshUser);
+    if (activeKey) {
+      const proof = req.headers[devicePop.POP_HEADER];
+      const popResult = devicePop.verifyPopProof({
+        method: req.method,
+        path: (req.originalUrl || req.url || '').split('?')[0],
+        proof: proof,
+        publicKeyPem: activeKey.public_key,
+        jkt: deviceKey.jwkThumbprint(activeKey.public_key),
+      });
+      if (!popResult.ok) {
+        return res.status(401).json({
+          error: 'device-key proof-of-possession: ' + popResult.reason,
+          code: 'device_pop_required',
+        });
+      }
+    }
+    const cnf = computeCnf(db, refreshUser, req);
+    const accessToken = signToken(refreshUser, cnf);
     return res.json({ accessToken });
   } catch (err) {
     logger.error('Token refresh error', { error: err.message });
@@ -210,7 +260,8 @@ function finishPasswordlessLogin(db, user, req, res, method) {
     auditLog(user.id, 'LOGIN_OFFBOARDED', `method=${method}`, req.ip);
     return res.status(403).json({ error: 'account offboarded' });
   }
-  const result = issueJwt(db, user, req.ip, req.headers['user-agent']);
+  const cnf = computeCnf(db, user, req);
+  const result = issueJwt(db, user, req.ip, req.headers['user-agent'], cnf);
   auditLog(user.id, 'LOGIN_SUCCESS', `role=${user.role} method=${method} aal=high`, req.ip);
   return res.json(result);
 }

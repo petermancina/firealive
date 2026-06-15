@@ -424,6 +424,26 @@ async function start() {
           status: identity.status,
           fingerprint: identity.fingerprint,
         });
+        // B5f (D-B5f-4): print the deployment anchor fingerprint in a prominent
+        // operator-facing banner -- the same style as the break-glass banner
+        // above -- so the operator can verify it out of band against the value
+        // each Analyst Client and the Global Dashboard app display on first
+        // contact, and confirm the trust pin only when the two match. A cloned
+        // deployment cannot reproduce this fingerprint, so a mismatch at pin
+        // time is the signal to refuse. Built without backslash escapes (joined
+        // on a newline character) per house style; ASCII-only.
+        const anchorFpBar = '================================================================';
+        const anchorFpNL = String.fromCharCode(10);
+        logger.warn([
+          '',
+          anchorFpBar,
+          ' DEPLOYMENT ANCHOR FINGERPRINT -- verify out of band before pinning',
+          '   ' + identity.fingerprint,
+          ' Compare this with the fingerprint each Analyst Client and the Global',
+          ' Dashboard app show on first connection; confirm the trust pin only',
+          ' if they match. A clone cannot reproduce this value.',
+          anchorFpBar,
+        ].join(anchorFpNL));
       } finally {
         identityDb.close();
       }

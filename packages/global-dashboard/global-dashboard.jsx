@@ -398,7 +398,22 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
       return { verdict: 'invalid', reason: 'anchor verification error' };
     }
     if (v && v.verdict === 'unpinned') {
-      try { await bridge.invoke('anticlone:pinAnchor', { fingerprint: resp.fingerprint }); } catch (_e) {}
+      // B5f (D-B5f-4): first contact pins trust-on-first-use, but only after a
+      // blocking operator confirmation. The operator compares this fingerprint
+      // out of band with the value the GD server prints at startup; a deliberate
+      // confirm pins it, and a declined or failed confirmation refuses.
+      let confirm;
+      try { confirm = await bridge.invoke('anticlone:confirmAnchorPin', { fingerprint: resp.fingerprint }); }
+      catch (_e) { confirm = null; }
+      if (!confirm || !confirm.confirmed) {
+        return { verdict: 'declined', reason: 'operator did not confirm the GD server anchor fingerprint' };
+      }
+      let pin;
+      try { pin = await bridge.invoke('anticlone:pinAnchor', { fingerprint: resp.fingerprint }); }
+      catch (_e) { pin = null; }
+      if (!pin || !pin.pinned) {
+        return { verdict: 'invalid', reason: (pin && pin.error) ? pin.error : 'anchor pin failed' };
+      }
       return { verdict: 'ok', pinned: true };
     }
     return v || { verdict: 'invalid', reason: 'no verdict' };
@@ -417,7 +432,7 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
     // The session is device-bound here, so the per-request PoP proof is in place;
     // a cloned GD-server cannot sign the anchor nonce and is refused.
     const anchor = await verifyServerAnchor();
-    if (anchor && (anchor.verdict === 'mismatch' || anchor.verdict === 'invalid')) {
+    if (anchor && (anchor.verdict === 'mismatch' || anchor.verdict === 'invalid' || anchor.verdict === 'declined')) {
       api.setToken(null);
       setAnchorBlocked({ verdict: anchor.verdict, reason: anchor.reason || null });
       return 'fail';
@@ -496,9 +511,9 @@ function GdLoginScreen({onLoggedIn, firstLaunch, gdServerUrl, setGdServerUrl}) {
     return (
       <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Sans',sans-serif",padding:20}}>
         <Card style={{maxWidth:520,padding:24,border:"1px solid #7f1d1d"}}>
-          <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Server identity check failed -- session blocked</M>
-          <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This GD-Server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this console will not trust it.</M>
-          <M style={{color:C.td,display:"block"}}>Do not proceed. Contact your platform administrator and report a possible cloned GD-Server.{anchorBlocked.reason ? " Detail: " + anchorBlocked.reason + "." : ""}</M>
+          <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>{anchorBlocked.verdict === "declined" ? "Server identity not confirmed -- session blocked" : "Server identity check failed -- session blocked"}</M>
+          <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>{anchorBlocked.verdict === "declined" ? "You did not confirm that this GD-Server's anchor fingerprint matches the value provided to you out of band. Until you confirm it, this console will not trust the server." : "This GD-Server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this console will not trust it."}</M>
+          <M style={{color:C.td,display:"block"}}>{(anchorBlocked.verdict === "declined" ? "Obtain the GD deployment anchor fingerprint from your administrator, then sign in again and confirm it when prompted." : "Do not proceed. Contact your platform administrator and report a possible cloned GD-Server.") + (anchorBlocked.reason ? " Detail: " + anchorBlocked.reason + "." : "")}</M>
         </Card>
       </div>
     );

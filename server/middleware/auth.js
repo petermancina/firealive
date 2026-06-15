@@ -5,16 +5,16 @@
 
 const jwt = require('jsonwebtoken');
 const { logger } = require('../services/logger');
+const devicePop = require('../services/device-pop');
+const deviceKey = require('../services/device-key');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_INSECURE_DEFAULT';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '15m';
 
-function signToken(user) {
-  return jwt.sign(
-    { id: user.id, role: user.role, name: user.name, tier: user.tier, shift: user.shift },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRY, algorithm: 'HS256' }
-  );
+function signToken(user, cnf) {
+  const claims = { id: user.id, role: user.role, name: user.name, tier: user.tier, shift: user.shift };
+  if (cnf) claims.cnf = cnf;
+  return jwt.sign(claims, JWT_SECRET, { expiresIn: JWT_EXPIRY, algorithm: 'HS256' });
 }
 
 /**
@@ -57,7 +57,7 @@ function verifyToken(token) {
  * Express middleware factory. Returns middleware that checks JWT and role.
  * @param {string[]} allowedRoles - roles that can access this route
  */
-function authMiddleware(allowedRoles = []) {
+function authMiddleware(allowedRoles = [], options = {}) {
   return (req, res, next) => {
     // Check for API key authentication first
     const apiKey = req.headers['x-api-key'];
@@ -82,6 +82,15 @@ function authMiddleware(allowedRoles = []) {
         return res.status(403).json({ error: 'Insufficient permissions' });
       }
 
+      // Per-request proof-of-possession (B5f): a bound session must prove it
+      // still holds the hardware device key on every call; a cnf-less session is
+      // refused except on the bootstrap routes marked popExempt.
+      const popCheck = enforceDevicePop(req, decoded, options);
+      if (!popCheck.ok) {
+        logger.warn('Device proof-of-possession refused', { userId: decoded.id, path: req.path, code: popCheck.code });
+        return res.status(popCheck.status).json({ error: popCheck.error, code: popCheck.code });
+      }
+
       next();
     } catch (err) {
       if (err.name === 'TokenExpiredError') {
@@ -91,6 +100,68 @@ function authMiddleware(allowedRoles = []) {
       return res.status(401).json({ error: 'Invalid token' });
     }
   };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Per-request proof-of-possession enforcement (B5f). A device-bound session
+// (its token carries an RFC 7800 cnf.jkt) must present a fresh device-key proof
+// on every request; a cnf-less session is refused except on the bootstrap routes
+// marked popExempt (device-key registration and the self endpoints), which let a
+// client register its key before its session is bound. Opportunistic mutual-TLS
+// binding (cnf x5t#S256) is checked when present. The API-key path never reaches
+// here. The active key is looked up by role: an analyst binds to the Analyst
+// Client key table, an admin or lead to the Management Console key table.
+// ══════════════════════════════════════════════════════════════════════════════
+function enforceDevicePop(req, decoded, options) {
+  if (options && options.popExempt) {
+    return { ok: true };
+  }
+  const cnf = decoded && decoded.cnf;
+  if (!cnf || !cnf.jkt) {
+    return { ok: false, status: 401, code: 'device_binding_required', error: 'this session is not bound to a device key; sign in again' };
+  }
+  const { getDb } = require('../db/init');
+  const db = getDb();
+  try {
+    const active = (decoded.role === 'analyst')
+      ? db.prepare('SELECT public_key FROM ac_device_signing_keys WHERE user_id = ? AND active = 1').get(decoded.id)
+      : db.prepare('SELECT public_key FROM mc_device_signing_keys WHERE user_id = ? AND active = 1').get(decoded.id);
+    if (!active) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'the bound device key is no longer active; sign in again' };
+    }
+    if (deviceKey.jwkThumbprint(active.public_key) !== cnf.jkt) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'the device key has changed since this session was issued; sign in again' };
+    }
+    const proof = req.headers[devicePop.POP_HEADER];
+    const result = devicePop.verifyPopProof({ method: req.method, path: (req.originalUrl || req.url || '').split('?')[0], proof: proof, publicKeyPem: active.public_key, jkt: cnf.jkt });
+    if (!result.ok) {
+      return { ok: false, status: 401, code: 'device_pop_required', error: 'device-key proof-of-possession: ' + result.reason };
+    }
+    if (cnf['x5t#S256']) {
+      const certTp = getClientCertThumbprint(req);
+      if (!certTp || certTp !== cnf['x5t#S256']) {
+        return { ok: false, status: 401, code: 'device_pop_required', error: 'mutual-TLS client certificate does not match the bound session' };
+      }
+    }
+    return { ok: true };
+  } finally {
+    db.close();
+  }
+}
+
+// The mutual-TLS client-certificate thumbprint for the request, or null when no
+// client certificate is present. Lowercase hex of the certificate SHA-256
+// fingerprint, matching the value bound into cnf x5t#S256 at login.
+function getClientCertThumbprint(req) {
+  try {
+    const sock = req.socket;
+    if (!sock || typeof sock.getPeerCertificate !== 'function') return null;
+    const cert = sock.getPeerCertificate();
+    if (!cert || !cert.fingerprint256) return null;
+    return cert.fingerprint256.split(':').join('').toLowerCase();
+  } catch (_) {
+    return null;
+  }
 }
 
 /**
@@ -135,4 +206,4 @@ function handleApiKeyAuth(apiKey, req, res, next) {
   }
 }
 
-module.exports = { authMiddleware, signToken, verifyToken };
+module.exports = { authMiddleware, signToken, verifyToken, getClientCertThumbprint };

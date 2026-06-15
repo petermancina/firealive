@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, Notification } = require('electron');
+const { app, BrowserWindow, session, ipcMain, Notification, dialog } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -307,6 +307,44 @@ ipcMain.handle('anticlone:pinAnchor', async (_e, { fingerprint, force } = {}) =>
     return { pinned: false, error: err && err.message ? err.message : String(err) };
   }
   return { pinned: true, fingerprint: fingerprint, firstPin: !existing };
+});
+
+// B5f (D-B5f-4): blocking operator confirmation before the first anchor pin
+// (trust-on-first-use). On first contact the renderer calls this with the GD
+// server's anchor fingerprint; the operator must compare it out of band with
+// the GD DEPLOYMENT ANCHOR FINGERPRINT the GD server prints at startup and
+// explicitly confirm before the app trusts and pins it. A native modal dialog
+// makes the confirmation blocking and harder to spoof than a renderer modal;
+// the default button is Cancel, so an accidental Enter or a closed dialog
+// refuses. Returns confirmed:true only on a deliberate confirm.
+ipcMain.handle('anticlone:confirmAnchorPin', async (_e, { fingerprint } = {}) => {
+  if (typeof fingerprint !== 'string' || !(/^[0-9a-f]{64}$/.test(fingerprint))) {
+    return { confirmed: false, error: 'a 64-hex-character anchor fingerprint is required' };
+  }
+  const NL = String.fromCharCode(10);
+  const grouped = fingerprint.replace(/(.{8})/g, '$1 ').trim();
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+  const opts = {
+    type: 'warning',
+    buttons: ['Cancel', 'Confirm and pin'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Confirm Global Dashboard server identity (first connection)',
+    message: 'Trust this Global Dashboard server on first connection?',
+    detail: 'GD server anchor fingerprint:' + NL + NL + grouped + NL + NL
+      + 'Compare this with the GD DEPLOYMENT ANCHOR FINGERPRINT the GD server '
+      + 'prints at startup, obtained out of band from your administrator. Confirm '
+      + 'only if it matches exactly. A clone of this deployment cannot reproduce '
+      + 'this fingerprint, so a value that does not match is the signal to refuse.',
+  };
+  let result;
+  try {
+    result = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+  } catch (err) {
+    return { confirmed: false, error: err && err.message ? err.message : String(err) };
+  }
+  return { confirmed: !!(result && result.response === 1) };
 });
 
 // Report whether a GD-server anchor fingerprint is pinned (for the connect flow).

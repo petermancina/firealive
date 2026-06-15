@@ -50,8 +50,21 @@ const API_BASE = window.FIREALIVE_SERVER || 'https://localhost:3000';
 const api = {
   _token: null,
   _headers() { return { 'Content-Type': 'application/json', ...(this._token ? { 'Authorization': 'Bearer ' + this._token } : {}) }; },
-  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: this._headers(), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { return { error: e.message }; } },
-  async get(path) { try { const r = await fetch(API_BASE + path, { headers: this._headers() }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { return { error: e.message }; } },
+  // B5f: a fresh per-request proof-of-possession header, bound to this exact
+  // method and path (query stripped), signed by the hardware device key in the
+  // main process. Returns no header when no key is available; the server then
+  // refuses a bound session, which is the correct fail-closed behavior.
+  async _popHeader(method, path) {
+    try {
+      const b = (typeof window !== 'undefined') ? window.firealive : null;
+      if (!b || typeof b.invoke !== 'function') return {};
+      const res = await b.invoke('device:signPopProof', { method: method, path: String(path).split('?')[0] });
+      return (res && res.proof) ? { 'x-fa-device-pop': res.proof } : {};
+    } catch (_e) { return {}; }
+  },
+  async authHeaders(method, path) { return { ...this._headers(), ...(await this._popHeader(method, path)) }; },
+  async post(path, data) { try { const r = await fetch(API_BASE + path, { method: 'POST', headers: await this.authHeaders('POST', path), body: JSON.stringify(data) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { return { error: e.message }; } },
+  async get(path) { try { const r = await fetch(API_BASE + path, { headers: await this.authHeaders('GET', path) }); return r.ok ? await r.json() : { error: r.statusText }; } catch (e) { return { error: e.message }; } },
   setToken(t) { this._token = t; },
 };
 
@@ -710,7 +723,22 @@ function AcLoginScreen({ onLoggedIn, logC }) {
       return { verdict: "invalid", reason: "anchor verification error" };
     }
     if (v && v.verdict === "unpinned") {
-      try { await bridge.invoke("anticlone:pinAnchor", { fingerprint: resp.fingerprint }); } catch (_e) {}
+      // B5f (D-B5f-4): first contact pins trust-on-first-use, but only after a
+      // blocking operator confirmation. The operator compares this fingerprint
+      // out of band with the value the server prints at startup; a deliberate
+      // confirm pins it, and a declined or failed confirmation refuses.
+      let confirm;
+      try { confirm = await bridge.invoke("anticlone:confirmAnchorPin", { fingerprint: resp.fingerprint }); }
+      catch (_e) { confirm = null; }
+      if (!confirm || !confirm.confirmed) {
+        return { verdict: "declined", reason: "operator did not confirm the server anchor fingerprint" };
+      }
+      let pin;
+      try { pin = await bridge.invoke("anticlone:pinAnchor", { fingerprint: resp.fingerprint }); }
+      catch (_e) { pin = null; }
+      if (!pin || !pin.pinned) {
+        return { verdict: "invalid", reason: (pin && pin.error) ? pin.error : "anchor pin failed" };
+      }
       return { verdict: "ok", pinned: true };
     }
     return v || { verdict: "invalid", reason: "no verdict" };
@@ -724,10 +752,10 @@ function AcLoginScreen({ onLoggedIn, logC }) {
     // B5e (D25): verify the server hardware anchor before trusting it with data.
     // A clone holds the same credentials but cannot sign with the anchor.
     const anchor = await verifyServerAnchor();
-    if (anchor && (anchor.verdict === "mismatch" || anchor.verdict === "invalid")) {
+    if (anchor && (anchor.verdict === "mismatch" || anchor.verdict === "invalid" || anchor.verdict === "declined")) {
       api.setToken(null);
       setAnchorMismatch({ verdict: anchor.verdict, reason: anchor.reason || null });
-      logC("SERVER_ANCHOR_REJECTED", "Server failed hardware-anchor attestation (" + anchor.verdict + ")");
+      logC("SERVER_ANCHOR_REJECTED", "Server anchor not trusted (" + anchor.verdict + ")");
       return;
     }
     logC("LOGIN_SUCCESS", "Authenticated via " + method);
@@ -1588,7 +1616,7 @@ export default function AnalystClientApp() {
             if (opType === "regression") {
               (async () => {
                 const conn = {};
-                try { const r = await fetch(API_BASE + "/api/heartbeat", { method: "POST", headers: api._headers() }); conn.server = r.ok; } catch (_e) { conn.server = false; }
+                try { const r = await fetch(API_BASE + "/api/heartbeat", { method: "POST", headers: await api.authHeaders("POST", "/api/heartbeat") }); conn.server = r.ok; } catch (_e) { conn.server = false; }
                 sendResult(Object.assign({}, msg.params || {}, { connectivity: conn }));
               })();
             } else {
@@ -2707,9 +2735,9 @@ export default function AnalystClientApp() {
       {anchorMismatch && (
         <div style={{position:"fixed",inset:0,background:"rgba(8,2,2,0.94)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100001,padding:20}}>
           <Card style={{maxWidth:520,padding:24,border:"1px solid #7f1d1d"}}>
-            <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>Server identity check failed -- session blocked</M>
-            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>This server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this client will not trust it.</M>
-            <M style={{color:C.td,display:"block"}}>Do not enter data. Contact your team lead and report a possible server clone.{anchorMismatch.reason ? " Detail: " + anchorMismatch.reason + "." : ""}</M>
+            <M style={{color:"#fca5a5",fontWeight:700,fontSize:16,display:"block",marginBottom:10}}>{anchorMismatch.verdict === "declined" ? "Server identity not confirmed -- session blocked" : "Server identity check failed -- session blocked"}</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>{anchorMismatch.verdict === "declined" ? "You did not confirm that this server's anchor fingerprint matches the value provided to you out of band. Until you confirm it, this client will not trust the server." : "This server could not prove control of its hardware instance anchor. That indicates it was cloned or restored onto different hardware, and this client will not trust it."}</M>
+            <M style={{color:C.td,display:"block"}}>{(anchorMismatch.verdict === "declined" ? "Obtain the deployment anchor fingerprint from your administrator, then sign in again and confirm it when prompted." : "Do not enter data. Contact your team lead and report a possible server clone.") + (anchorMismatch.reason ? " Detail: " + anchorMismatch.reason + "." : "")}</M>
           </Card>
         </div>
       )}
@@ -3293,9 +3321,9 @@ export default function AnalystClientApp() {
               <div style={{fontSize:10,fontWeight:500,color:C.tm,marginBottom:8,letterSpacing:1.5,textTransform:"uppercase"}}>Your Records</div>
               <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Download a copy of your points statement - your balance, the full points ledger, and your redemptions - to keep for your own records.</M>
               <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=pdf", { headers: api._headers() }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const blob = await resp.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".pdf"; a.click(); URL.revokeObjectURL(a.href); logC("helper_statement_exported","Exported points statement (PDF)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download PDF</Btn>
-                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=docx", { headers: api._headers() }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const blob = await resp.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".docx"; a.click(); URL.revokeObjectURL(a.href); logC("helper_statement_exported","Exported points statement (DOCX)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download DOCX</Btn>
-                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=csv", { headers: api._headers() }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const text = await resp.text(); const blob = new Blob([text], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".csv"; a.click(); logC("helper_statement_exported","Exported points statement (CSV)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download CSV</Btn>
+                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=pdf", { headers: await api.authHeaders("GET", "/api/helper-pay/my-statement?format=pdf") }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const blob = await resp.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".pdf"; a.click(); URL.revokeObjectURL(a.href); logC("helper_statement_exported","Exported points statement (PDF)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download PDF</Btn>
+                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=docx", { headers: await api.authHeaders("GET", "/api/helper-pay/my-statement?format=docx") }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const blob = await resp.blob(); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".docx"; a.click(); URL.revokeObjectURL(a.href); logC("helper_statement_exported","Exported points statement (DOCX)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download DOCX</Btn>
+                <Btn onClick={async()=>{ try { const resp = await fetch(API_BASE + "/api/helper-pay/my-statement?format=csv", { headers: await api.authHeaders("GET", "/api/helper-pay/my-statement?format=csv") }); if (!resp.ok) { logC("helper_statement_failed","Points statement export failed"); return; } const text = await resp.text(); const blob = new Blob([text], { type: "text/csv" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "helper-pay-statement-" + new Date().toISOString().slice(0,10) + ".csv"; a.click(); logC("helper_statement_exported","Exported points statement (CSV)"); } catch (e) { logC("helper_statement_failed","Points statement export failed"); } }}>Download CSV</Btn>
               </div>
             </Card>
 

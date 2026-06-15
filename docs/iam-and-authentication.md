@@ -62,6 +62,19 @@ A handful of consequential actions require a **fresh** proof of presence — a n
 
 Step-up uses a distinct challenge purpose bound to the acting user’s credential; a stale or replayed assertion will not satisfy it.
 
+## Sender-constrained sessions
+
+A successful sign-in mints a short-lived **session token** (a bearer JWT). A bare bearer token has a classic weakness: anyone who copies it — off the wire, from a log, from process memory — can replay it from another machine until it expires. FireAlive removes that weakness by **binding the session token to the operator’s hardware device key** and requiring a fresh proof of that key on **every** request, following the shape of DPoP (RFC 9449):
+
+- **The token is bound at issue.** Each operator’s app holds a non-exportable hardware device key. At sign-in the token carries an RFC 7800 confirmation claim (`cnf.jkt`) set to that key’s RFC 7638 JWK thumbprint, so the token names the one key entitled to wield it.
+- **Every request proves possession.** Alongside the token, each authenticated request carries a one-time proof header (`x-fa-device-pop`): a compact object in which the device key signs the request method, the request path, a timestamp, a unique id, and the bound key’s thumbprint. The server looks up the operator’s active key, confirms its thumbprint still matches the token, and verifies the signature.
+- **Tight freshness and single use.** A proof is accepted only within a 60-second window (with a small clock-skew tolerance) and only once — its unique id is remembered until the window closes, so a captured proof cannot be replayed even within that minute.
+- **Per-realm domain separation.** The regional server and the Global Dashboard sign their proofs under distinct, versioned prefixes, so a proof minted for one server can never be replayed against the other.
+- **Opportunistic channel binding.** When the operator also presents a mutual-TLS client certificate, that certificate’s thumbprint is bound into the token as well (`cnf` `x5t#S256`) and checked on each request, tying the session to the transport too.
+- **A narrow bootstrap.** Registering a device key necessarily happens before a key exists, so the registration endpoints are the only ones exempt from the proof. Once an operator has a key, every request is gated.
+
+The effect: the token alone is not a credential. Without the hardware key — which never leaves the machine — a copied token cannot produce the per-request proof, so it is refused. This holds uniformly for the Analyst Client and Management Console on the regional server, and for the Global Dashboard in its own realm. (API keys for headless integrations are a separate, machine-credential path: they have no hardware key, so they stay on their scoped, hashed, IP-allow-listed model rather than carrying a device-key proof.)
+
 ## LDAP / Active Directory — directory, not authentication
 
 LDAP/AD is used **only as a directory source**, never as a login method. Over LDAPS, FireAlive reads group membership and presence to drive the **offboarding detector**: when a user disappears from the directory (or their certificate is revoked or expired, or their account goes stale), they surface as an offboarding *candidate* for a human to confirm — the detector never deactivates anyone automatically. LDAP filter inputs are escaped (RFC 4515) to prevent filter injection.
@@ -85,7 +98,7 @@ A new analyst is **provisioned** from the MC, which mints a **one-time enrollmen
 The guarantees rest on cryptography, not on trusting the channel, the server, or any administrator:
 
 - A **network attacker / AitM** cannot phish a credential: there is no password or TOTP to capture, and the passkey/certificate ceremonies are bound to the real server.
-- A **stolen session token** cannot perform a sensitive action: config-lock and restore approvals require a fresh user-verified assertion.
+- A **stolen session token** is useless off the operator’s machine: every authenticated request must carry a fresh, single-use proof signed by the bound hardware device key, so a token lifted from the wire or from memory cannot be replayed elsewhere. Sensitive actions add a second gate on top — a fresh user-verified assertion for config-lock and restore approvals.
 - A **revoked or expired certificate** cannot authenticate: it is rejected at the TLS handshake against the local revocation list.
 - A **lost authenticator** does not lock an organization out, and recovery does not weaken the system: break-glass is one-time, hashed, rate-limited, audited, and single-purpose.
 - A **plaintext downgrade** cannot happen: there is no non-TLS path.

@@ -5854,7 +5854,26 @@ try {
       db: identityDb,
       logger: { info: function (m, meta) { console.log(m, meta || ''); } },
     });
-    console.log('GD instance identity ready (' + identity.anchorKind + ', fingerprint ' + identity.fingerprint.slice(0, 16) + ')');
+    console.log('GD instance identity ready (' + identity.anchorKind + ')');
+    // B5f (D-B5f-4): print the GD deployment anchor fingerprint in full, in a
+    // prominent operator-facing banner -- the same style as the GD break-glass
+    // banner above -- so the operator can verify it out of band against the
+    // value the Global Dashboard app shows on first connection, and confirm the
+    // trust pin only when the two match. A cloned GD deployment cannot reproduce
+    // this fingerprint, so a mismatch at pin time is the signal to refuse. Built
+    // without backslash escapes (joined on a newline character); ASCII-only.
+    const gdAnchorFpBar = '================================================================';
+    const gdAnchorFpNL = String.fromCharCode(10);
+    console.warn([
+      '',
+      gdAnchorFpBar,
+      ' GD DEPLOYMENT ANCHOR FINGERPRINT -- verify out of band before pinning',
+      '   ' + identity.fingerprint,
+      ' Compare this with the fingerprint the Global Dashboard app shows on',
+      ' first connection; confirm the trust pin only if they match. A clone',
+      ' cannot reproduce this value.',
+      gdAnchorFpBar,
+    ].join(gdAnchorFpNL));
   } finally {
     identityDb.close();
   }
