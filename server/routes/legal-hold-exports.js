@@ -76,6 +76,7 @@ const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
 const legalHoldExport = require('../services/legal-hold-export');
+const exportEncryption = require('../services/export-encryption');
 const { canonicalSerialize, sliceSha256 } = require('../services/audit-export-shared');
 const { decryptConfig } = require('../services/encryption');
 
@@ -151,7 +152,7 @@ function appendChainEntryFromRoute(db, opts) {
 
 // ── POST / — create + run a legal hold ────────────────────────────────────
 
-router.post('/', requireJwtAdminOrCiso, (req, res) => {
+router.post('/', requireJwtAdminOrCiso, async (req, res) => {
   const {
     caseId,
     rationale,
@@ -184,7 +185,7 @@ router.post('/', requireJwtAdminOrCiso, (req, res) => {
 
   try {
     const db = getDb();
-    const result = legalHoldExport.createLegalHold(db, {
+    const result = await legalHoldExport.createLegalHold(db, {
       requestedByUserId: req.user.id,
       caseId: caseId.trim(),
       rationale: rationale.trim(),
@@ -259,7 +260,7 @@ router.get('/', requireJwtAdminOrCiso, (req, res) => {
 
 // ── GET /:id/download — stream the tar.gz archive ─────────────────────────
 
-router.get('/:id/download', requireJwtAdminOrCiso, (req, res) => {
+router.get('/:id/download', requireJwtAdminOrCiso, async (req, res) => {
   try {
     const db = getDb();
     const row = db
@@ -301,7 +302,21 @@ router.get('/:id/download', requireJwtAdminOrCiso, (req, res) => {
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Disposition', 'attachment; filename="' + row.id + '.tar.gz"');
     if (row.size_bytes) res.setHeader('Content-Length', String(row.size_bytes));
-    fs.createReadStream(row.archive_path).pipe(res);
+    // Decrypt-on-download: if the on-disk artifact is sealed (FA-ENC1), unwrap
+    // and decrypt it (buffered: GCM verifies the whole tag before any bytes are
+    // sent), then deliver the standard plaintext tar.gz (its length equals the
+    // size_bytes already set above). Legacy plaintext archives (pre-B5g) stream
+    // as before. The delivered bytes are byte-identical either way.
+    const magicFd = fs.openSync(row.archive_path, 'r');
+    const magicProbe = Buffer.alloc(6);
+    const magicRead = fs.readSync(magicFd, magicProbe, 0, 6, 0);
+    fs.closeSync(magicFd);
+    if (magicRead === 6 && exportEncryption.isFramed(magicProbe)) {
+      const plaintext = await exportEncryption.openArtifact(fs.readFileSync(row.archive_path), { db });
+      res.send(plaintext);
+    } else {
+      fs.createReadStream(row.archive_path).pipe(res);
+    }
   } catch (err) {
     logger.error('legal hold download failed', { error: err.message });
     if (!res.headersSent) {
@@ -312,7 +327,7 @@ router.get('/:id/download', requireJwtAdminOrCiso, (req, res) => {
 
 // ── GET /:id/manifest — return manifest.json contents ─────────────────────
 
-router.get('/:id/manifest', requireJwtAdminOrCiso, (req, res) => {
+router.get('/:id/manifest', requireJwtAdminOrCiso, async (req, res) => {
   try {
     const db = getDb();
     const row = db
@@ -324,10 +339,18 @@ router.get('/:id/manifest', requireJwtAdminOrCiso, (req, res) => {
     if (!row.manifest_path || !fs.existsSync(row.manifest_path)) {
       return res.status(404).json({ error: 'manifest file not found on disk' });
     }
-    const manifestBytes = fs.readFileSync(row.manifest_path);
+    const manifestRaw = fs.readFileSync(row.manifest_path);
     auditLog(req.user.id, 'LEGAL_HOLD_MANIFEST_FETCHED', 'id=' + row.id + ' case=' + row.case_id, req.ip);
     res.setHeader('Content-Type', 'application/json');
-    res.send(manifestBytes);
+    // The manifest sidecar is sealed at rest (it carries case_id, custodian
+    // filter, and retention metadata). Decrypt it for the authenticated reader;
+    // legacy plaintext manifests (pre-B5g) are sent as is.
+    if (exportEncryption.isFramed(manifestRaw)) {
+      const plaintext = await exportEncryption.openArtifact(manifestRaw, { db });
+      res.send(plaintext);
+    } else {
+      res.send(manifestRaw);
+    }
   } catch (err) {
     logger.error('legal hold manifest fetch failed', { error: err.message });
     res.status(500).json({ error: 'manifest fetch failed', message: err.message });

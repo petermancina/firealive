@@ -7804,6 +7804,36 @@ function initDb() {
     console.error('The server will start, but anti-cloning hardening cannot persist state: instance identity establishment, duplicate/fork detection, and the anti-rollback high-water mark are inactive. No other feature is affected. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB, then restart.');
   }
 
+  // ── B5g: forensic_exports / legal_hold_exports at-rest encryption columns ──
+  // FA-ENC1 export-at-rest sealing records, per artifact, which KEK scheme and
+  // reference protect the on-disk archive. at_rest_scheme is the canonical
+  // "this artifact is encrypted at rest" signal: NULL means a legacy plaintext
+  // archive (pre-B5g) that the boot migration will re-seal; a non-NULL scheme
+  // (env-var, or a cloud-KMS scheme) means the archive and its manifest sidecar
+  // are sealed. at_rest_kek_ref is the env var name for env-var, the
+  // kms_providers row id for cloud schemes, or NULL. Each ALTER is guarded by a
+  // PRAGMA table_info check, so the migration is idempotent and re-running
+  // initDb on an already-migrated DB is a no-op. Its own try/catch keeps a
+  // failure here from masking earlier migrations and vice versa.
+  try {
+    const addAtRestCols = (table) => {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+      if (!cols.includes('at_rest_scheme')) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN at_rest_scheme TEXT`);
+        console.log(`${table} migration (B5g): added at_rest_scheme column`);
+      }
+      if (!cols.includes('at_rest_kek_ref')) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN at_rest_kek_ref TEXT`);
+        console.log(`${table} migration (B5g): added at_rest_kek_ref column`);
+      }
+    };
+    addAtRestCols('forensic_exports');
+    addAtRestCols('legal_hold_exports');
+  } catch (b5gExportAtRestMigrationErr) {
+    console.error('B5g export-at-rest column migration FAILED:', b5gExportAtRestMigrationErr.message);
+    console.error('The server will start, but forensic-export and legal-hold-export artifacts cannot be sealed or re-encrypted at rest until the at_rest_scheme / at_rest_kek_ref columns exist. Recovery: run the two ALTER TABLE ADD COLUMN statements in a SQLite shell against the production DB, then restart.');
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

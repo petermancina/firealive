@@ -102,6 +102,7 @@ const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
 const forensicExport = require('../services/forensic-export');
+const exportEncryption = require('../services/export-encryption');
 const { canonicalSerialize, sliceSha256 } = require('../services/audit-export-shared');
 const { decryptConfig } = require('../services/encryption');
 
@@ -189,7 +190,7 @@ function appendChainEntryFromRoute(db, opts) {
 
 // ── POST / — create + run ──────────────────────────────────────────────
 
-router.post('/', requireJwtAdmin, (req, res) => {
+router.post('/', requireJwtAdmin, async (req, res) => {
   const {
     rationale,
     timeWindowStart,
@@ -209,7 +210,7 @@ router.post('/', requireJwtAdmin, (req, res) => {
 
   try {
     const db = getDb();
-    const result = forensicExport.createForensicExport(db, {
+    const result = await forensicExport.createForensicExport(db, {
       requestedByUserId: req.user.id,
       rationale: rationale || null,
       timeWindowStart: timeWindowStart || null,
@@ -279,7 +280,7 @@ router.get('/', requireAdminOrCiso, (req, res) => {
 
 // ── GET /:id/download — stream the tar.gz ──────────────────────────────
 
-router.get('/:id/download', requireJwtAdmin, (req, res) => {
+router.get('/:id/download', requireJwtAdmin, async (req, res) => {
   try {
     const db = getDb();
     const row = db
@@ -322,7 +323,21 @@ router.get('/:id/download', requireJwtAdmin, (req, res) => {
     const downloadName = 'firealive-forensic-' + row.id + '.tar.gz';
     res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
     res.setHeader('Content-Type', 'application/gzip');
-    fs.createReadStream(row.archive_path).pipe(res);
+    // Decrypt-on-download: if the on-disk artifact is sealed (FA-ENC1), unwrap
+    // and decrypt it (buffered: GCM verifies the whole tag before any bytes are
+    // sent), then deliver the standard plaintext tar.gz. Legacy plaintext
+    // archives (pre-B5g, not yet re-sealed by the boot migration) stream as
+    // before. The delivered bytes are byte-identical either way.
+    const magicFd = fs.openSync(row.archive_path, 'r');
+    const magicProbe = Buffer.alloc(6);
+    const magicRead = fs.readSync(magicFd, magicProbe, 0, 6, 0);
+    fs.closeSync(magicFd);
+    if (magicRead === 6 && exportEncryption.isFramed(magicProbe)) {
+      const plaintext = await exportEncryption.openArtifact(fs.readFileSync(row.archive_path), { db });
+      res.send(plaintext);
+    } else {
+      fs.createReadStream(row.archive_path).pipe(res);
+    }
   } catch (err) {
     logger.error('forensic export download failed', { error: err.message });
     res.status(500).json({ error: 'download failed', message: err.message });
@@ -331,7 +346,7 @@ router.get('/:id/download', requireJwtAdmin, (req, res) => {
 
 // ── GET /:id/manifest — fetch the manifest JSON ────────────────────────
 
-router.get('/:id/manifest', requireJwtAdmin, (req, res) => {
+router.get('/:id/manifest', requireJwtAdmin, async (req, res) => {
   try {
     const db = getDb();
     const row = db
@@ -349,7 +364,16 @@ router.get('/:id/manifest', requireJwtAdmin, (req, res) => {
 
     auditLog(req.user.id, 'FORENSIC_EXPORT_MANIFEST_READ', 'id=' + row.id, req.ip);
     res.setHeader('Content-Type', 'application/json');
-    fs.createReadStream(row.manifest_path).pipe(res);
+    // The manifest sidecar is sealed at rest (it carries scope metadata such as
+    // the slice hashes, counts, and time window). Decrypt it for the
+    // authenticated reader; legacy plaintext manifests (pre-B5g) are sent as is.
+    const manifestRaw = fs.readFileSync(row.manifest_path);
+    if (exportEncryption.isFramed(manifestRaw)) {
+      const plaintext = await exportEncryption.openArtifact(manifestRaw, { db });
+      res.send(plaintext);
+    } else {
+      res.send(manifestRaw);
+    }
   } catch (err) {
     logger.error('forensic export manifest fetch failed', { error: err.message });
     res.status(500).json({ error: 'manifest fetch failed', message: err.message });

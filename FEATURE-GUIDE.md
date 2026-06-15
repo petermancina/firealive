@@ -829,6 +829,8 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 
 **Full-suite backup.** A separate `POST /api/backup/full-suite` endpoint captures the entire instance — database, configuration rows, signing-key material, and a version manifest — into one tar.gz archive. The Backup tab’s **Trigger Full Backup Now** button calls this endpoint; the resulting archive is suitable for disaster-recovery restoration of the full instance (vs. the standard `POST /api/backup` which captures only the database). MC-side bundles use the v2 four-file layout (manifest + archive + Cosign signature + KEK-wrapped key); GD-side bundles use a v1-shape single-archive layout with SHA-256 tamper-detect. See `docs/full-suite-backup.md` for the full architecture, manifest schemas, and restoration semantics.
 
+**Exports are encrypted at rest, too.** Forensic-export and legal-hold archives are stored encrypted on the server’s own disk from the moment they are written — independent of whether they are also backed up — so the export files on the host are not readable without the deployment’s encryption key. Downloading an export is unchanged: the standard package streams to the browser and verifies the same way.
+
 ### Backup Schedules
 
 **What it’s for:** Configure multiple backup schedules with optional regulatory-framework presets. Each schedule fires independently on its own cadence (hourly / daily / weekly / monthly) at a configured time, to a configured destination, with a configured retention. Picking a regulatory preset (HIPAA, SOX, PCI-DSS, GDPR, NIST CSF, ISO 27001, SOC 2) applies that framework’s compliance floor — minimum retention and required encryption — to the schedule. The operator can set retention HIGHER than the floor (legal-hold scenarios, longer compliance windows) but cannot reduce below the floor. Schedules without a preset have full operator flexibility.
@@ -1090,6 +1092,8 @@ The migration bundle (format FA-MIG1) is a self-contained, signed package: a man
 All three must agree. The schema is the final backstop and the reason this workflow is admissible in court.
 
 **Cryptographic isolation:** legal hold signing keys are DISTINCT from forensic-export signing keys on each server. Plus MC and GD each maintain their own Tier-1 KEK and their own legal hold signing keys. Four independent key sets across the platform (MC forensic, MC legal-hold, GD forensic, GD legal-hold), each rotatable independently. Compromise of any one key does not taint the others.
+
+**Encrypted at rest:** while a forensic export or a legal hold sits on the server’s disk — the archive and its manifest alike — it is stored encrypted, so the files cannot be read by anyone who merely reaches the bytes (a stolen disk, a copied snapshot, an exfiltrated backup) without the deployment’s encryption key. The protection is transparent in use: downloading a hold or an export returns the same standard package as always, and counsel verifies its signatures exactly as described above.
 
 -----
 

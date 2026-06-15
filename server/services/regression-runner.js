@@ -1486,6 +1486,67 @@ class RegressionRunner {
       return 'restoreDatabaseFromArchive + scanExtractedBytes + DbRestoreError + filename guard present';
     });
 
+    // B5g: export encryption at rest. Exercises the keyless AES-256-GCM core
+    // (no KEK / hardware needed in CI) and asserts the production seal path is
+    // wired to the shared backup-key-wrapping registry.
+    await check('export_at_rest', 'FA-ENC1 seal/open round-trip (keyless AEAD core)', () => {
+      const ee = require('./export-encryption');
+      const zlib = require('zlib');
+      const key = crypto.randomBytes(32);
+      const plain = zlib.gzipSync(Buffer.from('regression export archive'.repeat(64)));
+      const framed = ee.sealWithKey(plain, key, { exportId: 'rr-' + crypto.randomBytes(4).toString('hex'), role: ee.ROLE_ARCHIVE });
+      if (!ee.openWithKey(framed, key).equals(plain)) throw new Error('seal/open did not round-trip');
+      return 'AES-256-GCM seal then open returns the original archive bytes';
+    });
+    await check('export_at_rest', 'FA-ENC1 artifact is not gunzip-able (encrypted at rest)', () => {
+      const ee = require('./export-encryption');
+      const zlib = require('zlib');
+      const framed = ee.sealWithKey(zlib.gzipSync(Buffer.from('evidence')), crypto.randomBytes(32), { exportId: 'rr-ng', role: ee.ROLE_ARCHIVE });
+      if (framed.subarray(0, 6).toString('latin1') !== ee.MAGIC_STRING) throw new Error('sealed artifact lacks the FA-ENC1 magic');
+      if (framed[0] === 0x1f && framed[1] === 0x8b) throw new Error('sealed artifact still carries the gzip magic');
+      let gunzipThrew = false;
+      try { zlib.gunzipSync(framed); } catch (e) { gunzipThrew = true; }
+      if (!gunzipThrew) throw new Error('sealed artifact was gunzip-able (not encrypted at rest)');
+      return 'on-disk bytes carry the FA-ENC1 magic and are not gunzip-able';
+    });
+    await check('export_at_rest', 'FA-ENC1 AAD binds export_id and role (tamper / substitution rejected)', () => {
+      const ee = require('./export-encryption');
+      const key = crypto.randomBytes(32);
+      const framed = ee.sealWithKey(Buffer.from('payload bytes'), key, { exportId: 'rr-a', role: ee.ROLE_ARCHIVE });
+      let wrongKey = false;
+      try { ee.openWithKey(framed, crypto.randomBytes(32)); } catch (e) { wrongKey = true; }
+      if (!wrongKey) throw new Error('a wrong key was accepted');
+      const hlen = framed.readUInt32BE(8);
+      const hdr = JSON.parse(framed.subarray(12, 12 + hlen).toString('utf-8'));
+      hdr.export_id = 'rr-OTHER';
+      const nh = Buffer.from(JSON.stringify(hdr), 'utf-8');
+      const len = Buffer.alloc(4); len.writeUInt32BE(nh.length, 0);
+      const tampered = Buffer.concat([framed.subarray(0, 8), len, nh, framed.subarray(12 + hlen)]);
+      let tamperRejected = false;
+      try { ee.openWithKey(tampered, key); } catch (e) { tamperRejected = true; }
+      if (!tamperRejected) throw new Error('an export_id-swapped artifact was accepted (AAD not bound)');
+      return 'wrong key and export_id-swapped artifact both rejected by the GCM tag';
+    });
+    await check('export_at_rest', 'Export seal path is wired to the backup-key-wrapping registry', () => {
+      const ee = require('./export-encryption');
+      if (typeof ee.sealArtifact !== 'function' || typeof ee.openArtifact !== 'function') {
+        throw new Error('export-encryption missing sealArtifact / openArtifact');
+      }
+      if (ee.DEFAULT_SCHEME !== 'env-var' || ee.DEFAULT_KEK_REFERENCE !== 'TIER1_ENCRYPTION_KEY') {
+        throw new Error('export-encryption default KEK scheme/ref drifted from env-var / TIER1_ENCRYPTION_KEY');
+      }
+      const bkw = require('./backup-key-wrapping');
+      if (typeof bkw.wrapKey !== 'function' || typeof bkw.unwrapKey !== 'function') {
+        throw new Error('backup-key-wrapping wrap/unwrap not available to the export seal path');
+      }
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, 'export-encryption.js'), 'utf-8');
+      if (src.indexOf("require('./backup-key-wrapping')") < 0) {
+        throw new Error('export-encryption does not require backup-key-wrapping (KEK path not shared)');
+      }
+      return 'sealArtifact/openArtifact present; default KEK env-var/TIER1; wraps via backup-key-wrapping';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

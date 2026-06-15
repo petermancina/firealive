@@ -31,6 +31,8 @@ const legalHoldExport = require('./services/legal-hold-export');
 const abuseExportApproval = require('./services/abuse-export-approval-keys');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
+const exportEncryption = require('./services/export-encryption');
+const { migrateExportsAtRest } = require('./services/export-encryption-migration');
 const {
   appendGdAuditEntry,
   verifyFull,
@@ -3678,6 +3680,57 @@ function runGdRegression(db) {
     }
   });
 
+  // ── Export encryption at rest (4) ──────────────
+  record('export_at_rest', 'FA-ENC1 seal/open round-trip (keyless AEAD core)', () => {
+    const zlib = require('zlib');
+    const key = crypto.randomBytes(32);
+    const plain = zlib.gzipSync(Buffer.from('gd regression export archive'.repeat(64)));
+    const framed = exportEncryption.sealWithKey(plain, key, { exportId: 'gd-rr-' + crypto.randomBytes(4).toString('hex'), role: exportEncryption.ROLE_ARCHIVE });
+    if (!exportEncryption.openWithKey(framed, key).equals(plain)) throw new Error('seal/open did not round-trip');
+    return 'AES-256-GCM seal then open returns the original archive bytes';
+  });
+  record('export_at_rest', 'FA-ENC1 artifact is not gunzip-able (encrypted at rest)', () => {
+    const zlib = require('zlib');
+    const framed = exportEncryption.sealWithKey(zlib.gzipSync(Buffer.from('evidence')), crypto.randomBytes(32), { exportId: 'gd-rr-ng', role: exportEncryption.ROLE_ARCHIVE });
+    if (framed.subarray(0, 6).toString('latin1') !== exportEncryption.MAGIC_STRING) throw new Error('sealed artifact lacks the FA-ENC1 magic');
+    if (framed[0] === 0x1f && framed[1] === 0x8b) throw new Error('sealed artifact still carries the gzip magic');
+    let gunzipThrew = false;
+    try { zlib.gunzipSync(framed); } catch (e) { gunzipThrew = true; }
+    if (!gunzipThrew) throw new Error('sealed artifact was gunzip-able (not encrypted at rest)');
+    return 'on-disk bytes carry the FA-ENC1 magic and are not gunzip-able';
+  });
+  record('export_at_rest', 'FA-ENC1 AAD binds export_id and role (tamper / substitution rejected)', () => {
+    const key = crypto.randomBytes(32);
+    const framed = exportEncryption.sealWithKey(Buffer.from('payload bytes'), key, { exportId: 'gd-rr-a', role: exportEncryption.ROLE_ARCHIVE });
+    let wrongKey = false;
+    try { exportEncryption.openWithKey(framed, crypto.randomBytes(32)); } catch (e) { wrongKey = true; }
+    if (!wrongKey) throw new Error('a wrong key was accepted');
+    const hlen = framed.readUInt32BE(8);
+    const hdr = JSON.parse(framed.subarray(12, 12 + hlen).toString('utf-8'));
+    hdr.export_id = 'gd-rr-OTHER';
+    const nh = Buffer.from(JSON.stringify(hdr), 'utf-8');
+    const len = Buffer.alloc(4); len.writeUInt32BE(nh.length, 0);
+    const tampered = Buffer.concat([framed.subarray(0, 8), len, nh, framed.subarray(12 + hlen)]);
+    let tamperRejected = false;
+    try { exportEncryption.openWithKey(tampered, key); } catch (e) { tamperRejected = true; }
+    if (!tamperRejected) throw new Error('an export_id-swapped artifact was accepted (AAD not bound)');
+    return 'wrong key and export_id-swapped artifact both rejected by the GCM tag';
+  });
+  record('export_at_rest', 'Export seal path wraps via gd-encryption (GD KEK)', () => {
+    if (typeof exportEncryption.sealArtifact !== 'function' || typeof exportEncryption.openArtifact !== 'function') {
+      throw new Error('export-encryption missing sealArtifact / openArtifact');
+    }
+    if (exportEncryption.DEFAULT_SCHEME !== 'gd-tier1' || exportEncryption.DEFAULT_KEK_REFERENCE !== null) {
+      throw new Error('GD export-encryption default scheme/ref drifted from gd-tier1 / null');
+    }
+    const fsx = require('fs'); const pathx = require('path');
+    const src = fsx.readFileSync(pathx.join(__dirname, 'services', 'export-encryption.js'), 'utf-8');
+    if (src.indexOf("require('./gd-encryption')") < 0) {
+      throw new Error('GD export-encryption does not require gd-encryption (KEK path not wired)');
+    }
+    return 'sealArtifact/openArtifact present; default scheme gd-tier1; wraps via gd-encryption';
+  });
+
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;
   const skipped = tests.filter(t => t.status === 'skip').length;
@@ -5051,7 +5104,7 @@ function appendForensicChainEntry(db, opts) {
 // ── POST /api/forensic-exports — create + run ─────────────────────────────
 // VP only (creator role for the separate-actor pair)
 
-app.post('/api/forensic-exports', authMiddleware(['vp']), (req, res) => {
+app.post('/api/forensic-exports', authMiddleware(['vp']), async (req, res) => {
   const {
     rationale,
     timeWindowStart, timeWindowEnd,
@@ -5067,7 +5120,7 @@ app.post('/api/forensic-exports', authMiddleware(['vp']), (req, res) => {
 
   try {
     const db = getDb();
-    const result = forensicExport.createForensicExport(db, {
+    const result = await forensicExport.createForensicExport(db, {
       requestedByUserId: req.user.id,
       rationale: rationale || null,
       timeWindowStart: timeWindowStart || null,
@@ -5156,7 +5209,7 @@ app.get('/api/forensic-exports/chain', authMiddleware(['vp', 'ciso']), (req, res
 // VP only (initiator can retrieve; ciso reads chain/manifest for verification
 // instead of downloading the archive)
 
-app.get('/api/forensic-exports/:id/download', authMiddleware(['vp']), (req, res) => {
+app.get('/api/forensic-exports/:id/download', authMiddleware(['vp']), async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare(
@@ -5187,7 +5240,20 @@ app.get('/api/forensic-exports/:id/download', authMiddleware(['vp']), (req, res)
     const downloadName = 'firealive-forensic-' + row.id + '.tar.gz';
     res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
     res.setHeader('Content-Type', 'application/gzip');
-    fs.createReadStream(row.archive_path).pipe(res);
+    // Decrypt-on-read: FA-ENC1 artifacts are buffered, verified (GCM tag over
+    // the whole file), and sent decrypted under the KEK; legacy plaintext
+    // archives (not yet re-sealed by the boot migration) stream as before.
+    // Delivered bytes are byte-identical either way.
+    const magicFd = fs.openSync(row.archive_path, 'r');
+    const magicProbe = Buffer.alloc(6);
+    const magicRead = fs.readSync(magicFd, magicProbe, 0, 6, 0);
+    fs.closeSync(magicFd);
+    if (magicRead === 6 && exportEncryption.isFramed(magicProbe)) {
+      const plaintext = await exportEncryption.openArtifact(fs.readFileSync(row.archive_path), { db: db });
+      res.send(plaintext);
+    } else {
+      fs.createReadStream(row.archive_path).pipe(res);
+    }
   } catch (err) {
     console.error('forensic export download failed:', err.message);
     res.status(500).json({ error: 'download failed', message: err.message });
@@ -5197,7 +5263,7 @@ app.get('/api/forensic-exports/:id/download', authMiddleware(['vp']), (req, res)
 // ── GET /api/forensic-exports/:id/manifest — fetch manifest JSON ──────────
 // VP only
 
-app.get('/api/forensic-exports/:id/manifest', authMiddleware(['vp']), (req, res) => {
+app.get('/api/forensic-exports/:id/manifest', authMiddleware(['vp']), async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare(
@@ -5210,7 +5276,13 @@ app.get('/api/forensic-exports/:id/manifest', authMiddleware(['vp']), (req, res)
     }
     auditLogForensic(req.user.id, 'FORENSIC_EXPORT_MANIFEST_READ', 'id=' + row.id, req.ip, 'info');
     res.setHeader('Content-Type', 'application/json');
-    fs.createReadStream(row.manifest_path).pipe(res);
+    const manifestRaw = fs.readFileSync(row.manifest_path);
+    if (exportEncryption.isFramed(manifestRaw)) {
+      const plaintext = await exportEncryption.openArtifact(manifestRaw, { db: db });
+      res.send(plaintext);
+    } else {
+      res.send(manifestRaw);
+    }
   } catch (err) {
     console.error('forensic export manifest fetch failed:', err.message);
     res.status(500).json({ error: 'manifest fetch failed', message: err.message });
@@ -5343,7 +5415,7 @@ function appendLegalHoldChainEntry(db, opts) {
 // VP OR CISO (broader than forensic's vp-only — legal counsel CISOs may
 // initiate holds)
 
-app.post('/api/legal-hold-exports', authMiddleware(['vp', 'ciso']), (req, res) => {
+app.post('/api/legal-hold-exports', authMiddleware(['vp', 'ciso']), async (req, res) => {
   const {
     caseId, rationale,
     timeWindowStart, timeWindowEnd,
@@ -5368,7 +5440,7 @@ app.post('/api/legal-hold-exports', authMiddleware(['vp', 'ciso']), (req, res) =
 
   try {
     const db = getDb();
-    const result = legalHoldExport.createLegalHold(db, {
+    const result = await legalHoldExport.createLegalHold(db, {
       requestedByUserId: req.user.id,
       caseId: caseId.trim(),
       rationale: rationale.trim(),
@@ -5448,7 +5520,7 @@ app.get('/api/legal-hold-exports/chain', authMiddleware(['vp', 'ciso']), (req, r
 
 // ── GET /api/legal-hold-exports/:id/download — stream tar.gz ──────────────
 
-app.get('/api/legal-hold-exports/:id/download', authMiddleware(['vp', 'ciso']), (req, res) => {
+app.get('/api/legal-hold-exports/:id/download', authMiddleware(['vp', 'ciso']), async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare(
@@ -5476,7 +5548,18 @@ app.get('/api/legal-hold-exports/:id/download', authMiddleware(['vp', 'ciso']), 
     res.setHeader('Content-Type', 'application/gzip');
     res.setHeader('Content-Disposition', 'attachment; filename="' + row.id + '.tar.gz"');
     if (row.size_bytes) res.setHeader('Content-Length', String(row.size_bytes));
-    fs.createReadStream(row.archive_path).pipe(res);
+    // Decrypt-on-read (see forensic download). The decrypted plaintext length
+    // equals size_bytes, so the Content-Length set above stays correct.
+    const magicFd = fs.openSync(row.archive_path, 'r');
+    const magicProbe = Buffer.alloc(6);
+    const magicRead = fs.readSync(magicFd, magicProbe, 0, 6, 0);
+    fs.closeSync(magicFd);
+    if (magicRead === 6 && exportEncryption.isFramed(magicProbe)) {
+      const plaintext = await exportEncryption.openArtifact(fs.readFileSync(row.archive_path), { db: db });
+      res.send(plaintext);
+    } else {
+      fs.createReadStream(row.archive_path).pipe(res);
+    }
   } catch (err) {
     console.error('legal hold download failed:', err.message);
     if (!res.headersSent) res.status(500).json({ error: 'download failed', message: err.message });
@@ -5485,7 +5568,7 @@ app.get('/api/legal-hold-exports/:id/download', authMiddleware(['vp', 'ciso']), 
 
 // ── GET /api/legal-hold-exports/:id/manifest — fetch manifest JSON ────────
 
-app.get('/api/legal-hold-exports/:id/manifest', authMiddleware(['vp', 'ciso']), (req, res) => {
+app.get('/api/legal-hold-exports/:id/manifest', authMiddleware(['vp', 'ciso']), async (req, res) => {
   try {
     const db = getDb();
     const row = db.prepare(
@@ -5499,7 +5582,12 @@ app.get('/api/legal-hold-exports/:id/manifest', authMiddleware(['vp', 'ciso']), 
     auditLogLegalHold(req.user.id, 'LEGAL_HOLD_MANIFEST_FETCHED',
       'id=' + row.id + ' case=' + row.case_id, req.ip, 'info');
     res.setHeader('Content-Type', 'application/json');
-    res.send(manifestBytes);
+    if (exportEncryption.isFramed(manifestBytes)) {
+      const plaintext = await exportEncryption.openArtifact(manifestBytes, { db: db });
+      res.send(plaintext);
+    } else {
+      res.send(manifestBytes);
+    }
   } catch (err) {
     console.error('legal hold manifest fetch failed:', err.message);
     res.status(500).json({ error: 'manifest fetch failed', message: err.message });
@@ -5882,6 +5970,24 @@ try {
   console.error('The GD Server requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
   process.exit(1);
 }
+
+// B5g: re-seal any legacy plaintext forensic / legal-hold export artifacts at
+// rest. Fire-and-forget at startup (the GD uses short-lived DB connections);
+// idempotent and guarded, so a failure logs and never blocks the listener.
+// Atomic-replace writes keep any concurrent download consistent. Requires the
+// at-rest columns from the init-db step; a missing column is skipped, not fatal.
+(async () => {
+  let migDb;
+  try {
+    migDb = getDb();
+    const summary = await migrateExportsAtRest(migDb);
+    console.log('export-encryption migration (B5g):', JSON.stringify(summary));
+  } catch (migErr) {
+    console.error('export-encryption migration (B5g) failed:', migErr.message);
+  } finally {
+    if (migDb) { try { migDb.close(); } catch (_e) { /* ignore */ } }
+  }
+})();
 
 const gdTlsMaterial = bootstrapGdTlsMaterial();
 https.createServer({

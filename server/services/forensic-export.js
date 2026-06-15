@@ -68,6 +68,7 @@ const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 
 const { encryptConfig, decryptConfig } = require('./encryption');
+const exportEncryption = require('./export-encryption');
 const {
   canonicalSerialize,
   sliceSha256,
@@ -397,12 +398,22 @@ function maybeInvokeCosign(archivePath) {
   return { ok: true, sigPath };
 }
 
+// Atomically replace a file with new bytes: write a sibling .enc.tmp and rename
+// over the target (rename is atomic within a filesystem). Used to overwrite the
+// transient plaintext archive with FA-ENC1 ciphertext, and to write the sealed
+// manifest sidecar without leaving a partial file behind on a crash mid-write.
+function atomicReplace(targetPath, buf) {
+  const tmp = targetPath + '.enc.tmp';
+  fs.writeFileSync(tmp, buf);
+  fs.renameSync(tmp, targetPath);
+}
+
 // ── Main orchestrator ─────────────────────────────────────────────────────
 
 /**
  * createForensicExport(db, request, opts?)
  *
- * Synchronously produces a forensic export package. Returns the completed
+ * Produces a forensic export package (async; seals artifacts at rest). Returns the completed
  * forensic_exports row id and the artifact paths.
  *
  * request: {
@@ -421,7 +432,7 @@ function maybeInvokeCosign(archivePath) {
  *   pending -> in_progress -> complete  (happy path)
  *   pending -> in_progress -> failed    (on error)
  */
-function createForensicExport(db, request, opts) {
+async function createForensicExport(db, request, opts) {
   if (!db) throw new Error('createForensicExport: db required');
   if (!request || !request.requestedByUserId) {
     throw new Error('createForensicExport: requestedByUserId required');
@@ -529,20 +540,42 @@ function createForensicExport(db, request, opts) {
     tarEntries.push({ name: 'manifest.json', payload: manifestBytes });
     tarEntries.push({ name: 'manifest.sig', payload: Buffer.from(manifestSignature, 'hex') });
 
-    // Step 5: build tar.gz
+    // Step 5: build the tar.gz and hash the PLAINTEXT archive (the delivered
+    // package and its archive_sha256 are unchanged from pre-B5g).
     const tarBytes = buildMultiEntryTar(tarEntries);
     const gzBytes = zlib.gzipSync(tarBytes);
+    const archiveSha256 = sliceSha256(gzBytes);
     archivePath = path.join(exportDir, exportId + '.tar.gz');
     manifestPath = path.join(exportDir, exportId + '.manifest.json');
     manifestSigPath = path.join(exportDir, exportId + '.manifest.sig');
-    fs.writeFileSync(archivePath, gzBytes);
-    fs.writeFileSync(manifestPath, manifestBytes);
-    fs.writeFileSync(manifestSigPath, Buffer.from(manifestSignature, 'hex'));
-    const archiveSha256 = sliceSha256(gzBytes);
 
-    // Step 6: optional Cosign
+    // Step 6: Cosign the PLAINTEXT archive (optional), then seal the archive and
+    // the manifest sidecar at rest under the configured KEK (FA-ENC1). The
+    // Ed25519 and Cosign signatures are over the plaintext, so the downloaded
+    // package stays byte-identical; only the on-disk bytes become ciphertext.
+    // The plaintext archive is written transiently so cosign sign-blob can read
+    // it, then overwritten in place by the sealed ciphertext. The detached
+    // .cosign.sig and .manifest.sig are signatures (no confidential content) and
+    // stay plaintext. Each fresh per-artifact data key is wrapped under the KEK
+    // and embedded in its FA-ENC1 header; the raw key never persists.
+    fs.writeFileSync(archivePath, gzBytes);
     const cosignResult = maybeInvokeCosign(archivePath);
     const cosignPath = cosignResult && cosignResult.ok ? cosignResult.sigPath : null;
+    const sealedArchive = await exportEncryption.sealArtifact(gzBytes, {
+      exportId: exportId,
+      role: exportEncryption.ROLE_ARCHIVE,
+      db: db,
+    });
+    atomicReplace(archivePath, sealedArchive.framed);
+    const sealedManifest = await exportEncryption.sealArtifact(manifestBytes, {
+      exportId: exportId,
+      role: exportEncryption.ROLE_MANIFEST,
+      db: db,
+    });
+    atomicReplace(manifestPath, sealedManifest.framed);
+    fs.writeFileSync(manifestSigPath, Buffer.from(manifestSignature, 'hex'));
+    const atRestScheme = sealedArchive.scheme;
+    const atRestKekRef = sealedArchive.kekRef;
 
     // Step 7: append EXPORT_CREATED chain entry
     appendChainEntry(db, {
@@ -555,7 +588,7 @@ function createForensicExport(db, request, opts) {
 
     // Step 8: stamp row with artifact paths, hashes, status='complete'
     db.prepare(
-      'UPDATE forensic_exports SET status = \'complete\', manifest_path = ?, archive_path = ?, manifest_sig_path = ?, manifest_signing_key_id = ?, manifest_signing_key_fingerprint = ?, cosign_signature_path = ?, archive_sha256 = ?, size_bytes = ?, completed_at = ? WHERE id = ?'
+      "UPDATE forensic_exports SET status = 'complete', manifest_path = ?, archive_path = ?, manifest_sig_path = ?, manifest_signing_key_id = ?, manifest_signing_key_fingerprint = ?, cosign_signature_path = ?, archive_sha256 = ?, size_bytes = ?, at_rest_scheme = ?, at_rest_kek_ref = ?, completed_at = ? WHERE id = ?"
     ).run(
       manifestPath,
       archivePath,
@@ -565,6 +598,8 @@ function createForensicExport(db, request, opts) {
       cosignPath,
       archiveSha256,
       gzBytes.length,
+      atRestScheme,
+      atRestKekRef,
       new Date().toISOString().replace('T', ' ').substring(0, 19),
       exportId
     );
@@ -582,7 +617,7 @@ function createForensicExport(db, request, opts) {
     };
   } catch (err) {
     // Cleanup partial files, stamp failure, and rethrow.
-    for (const p of [archivePath, manifestPath, manifestSigPath]) {
+    for (const p of [archivePath, manifestPath, manifestSigPath, archivePath && archivePath + '.enc.tmp', manifestPath && manifestPath + '.enc.tmp']) {
       if (p) try { fs.unlinkSync(p); } catch (_e) { /* ignore */ }
     }
     try { db.exec('ROLLBACK'); } catch (_e) { /* not in tx */ }

@@ -607,6 +607,18 @@ async function start() {
     const tlsMaterial = bootstrapTlsMaterial();
     logger.info('TLS material ready (built-in CA)');
 
+    // B5g: re-seal any legacy plaintext forensic / legal-hold export artifacts
+    // at rest (idempotent; rows already sealed are skipped). The DB schema and
+    // the Tier-1 KEK are ready by this point. Guarded so a failure logs and does
+    // not abort startup; any unsealed rows are retried on the next boot.
+    try {
+      const { migrateExportsAtRest } = require('./services/export-encryption-migration');
+      const exportSealSummary = await migrateExportsAtRest(getDb());
+      logger.info('Export at-rest migration complete', exportSealSummary);
+    } catch (exportSealErr) {
+      logger.warn('Export at-rest migration failed', { error: exportSealErr.message });
+    }
+
     // Start scheduled jobs (report generation, backup, signal aggregation)
     schedulerService.start();
     logger.info('Scheduler started');

@@ -75,6 +75,7 @@ const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 
 const { encryptConfig, decryptConfig } = require('./encryption');
+const exportEncryption = require('./export-encryption');
 const {
   canonicalSerialize,
   sliceSha256,
@@ -466,6 +467,16 @@ function maybeInvokeCosign(archivePath) {
   return { ok: true, sigPath };
 }
 
+// Atomically replace a file with new bytes: write a sibling .enc.tmp and rename
+// over the target (rename is atomic within a filesystem). Used to overwrite the
+// transient plaintext archive with FA-ENC1 ciphertext, and to write the sealed
+// manifest sidecar without leaving a partial file behind on a crash mid-write.
+function atomicReplace(targetPath, buf) {
+  const tmp = targetPath + '.enc.tmp';
+  fs.writeFileSync(tmp, buf);
+  fs.renameSync(tmp, targetPath);
+}
+
 // ── Custom error: SeparateActorViolation ──────────────────────────────────
 
 class SeparateActorViolation extends Error {
@@ -481,7 +492,7 @@ class SeparateActorViolation extends Error {
 /**
  * createLegalHold(db, request, opts?)
  *
- * Synchronously produces a legal hold export package. Returns the created
+ * Produces a legal hold export package (async; seals artifacts at rest). Returns the created
  * legal_hold_exports row id and artifact paths.
  *
  * request: {
@@ -503,7 +514,7 @@ class SeparateActorViolation extends Error {
  *   pending -> in_progress -> failed  (on error)
  * Subsequent: active -> released  (only via releaseLegalHold)
  */
-function createLegalHold(db, request, opts) {
+async function createLegalHold(db, request, opts) {
   if (!db) throw new Error('createLegalHold: db required');
   if (!request || !request.requestedByUserId) {
     throw new Error('createLegalHold: requestedByUserId required');
@@ -619,18 +630,42 @@ function createLegalHold(db, request, opts) {
     tarEntries.push({ name: 'manifest.json', payload: manifestBytes });
     tarEntries.push({ name: 'manifest.sig', payload: Buffer.from(manifestSignature, 'hex') });
 
+    // Build the tar.gz and hash the PLAINTEXT archive (the delivered package
+    // and its archive_sha256 are unchanged from pre-B5g).
     const tarBytes = buildMultiEntryTar(tarEntries);
     const gzBytes = zlib.gzipSync(tarBytes);
+    const archiveSha256 = sliceSha256(gzBytes);
     archivePath = path.join(holdDir, holdId + '.tar.gz');
     manifestPath = path.join(holdDir, holdId + '.manifest.json');
     manifestSigPath = path.join(holdDir, holdId + '.manifest.sig');
-    fs.writeFileSync(archivePath, gzBytes);
-    fs.writeFileSync(manifestPath, manifestBytes);
-    fs.writeFileSync(manifestSigPath, Buffer.from(manifestSignature, 'hex'));
-    const archiveSha256 = sliceSha256(gzBytes);
 
+    // Cosign the PLAINTEXT archive (optional), then seal the archive and the
+    // manifest sidecar at rest under the configured KEK (FA-ENC1). The Ed25519
+    // and Cosign signatures are over the plaintext, so the downloaded package
+    // stays byte-identical; only the on-disk bytes become ciphertext. The
+    // plaintext archive is written transiently so cosign sign-blob can read it,
+    // then overwritten in place by the sealed ciphertext. The detached
+    // .cosign.sig and .manifest.sig are signatures (no confidential content) and
+    // stay plaintext. Each fresh per-artifact data key is wrapped under the KEK
+    // and embedded in its FA-ENC1 header; the raw key never persists.
+    fs.writeFileSync(archivePath, gzBytes);
     const cosignResult = maybeInvokeCosign(archivePath);
     const cosignPath = cosignResult && cosignResult.ok ? cosignResult.sigPath : null;
+    const sealedArchive = await exportEncryption.sealArtifact(gzBytes, {
+      exportId: holdId,
+      role: exportEncryption.ROLE_ARCHIVE,
+      db: db,
+    });
+    atomicReplace(archivePath, sealedArchive.framed);
+    const sealedManifest = await exportEncryption.sealArtifact(manifestBytes, {
+      exportId: holdId,
+      role: exportEncryption.ROLE_MANIFEST,
+      db: db,
+    });
+    atomicReplace(manifestPath, sealedManifest.framed);
+    fs.writeFileSync(manifestSigPath, Buffer.from(manifestSignature, 'hex'));
+    const atRestScheme = sealedArchive.scheme;
+    const atRestKekRef = sealedArchive.kekRef;
 
     appendChainEntry(db, {
       holdId,
@@ -643,7 +678,7 @@ function createLegalHold(db, request, opts) {
     // Status='active' (NOT 'complete') — the preservation mandate is now
     // in force and will remain so until releaseLegalHold() fires.
     db.prepare(
-      'UPDATE legal_hold_exports SET status = \'active\', manifest_path = ?, archive_path = ?, manifest_sig_path = ?, manifest_signing_key_id = ?, manifest_signing_key_fingerprint = ?, cosign_signature_path = ?, archive_sha256 = ?, size_bytes = ?, completed_at = ? WHERE id = ?'
+      "UPDATE legal_hold_exports SET status = 'active', manifest_path = ?, archive_path = ?, manifest_sig_path = ?, manifest_signing_key_id = ?, manifest_signing_key_fingerprint = ?, cosign_signature_path = ?, archive_sha256 = ?, size_bytes = ?, at_rest_scheme = ?, at_rest_kek_ref = ?, completed_at = ? WHERE id = ?"
     ).run(
       manifestPath,
       archivePath,
@@ -653,6 +688,8 @@ function createLegalHold(db, request, opts) {
       cosignPath,
       archiveSha256,
       gzBytes.length,
+      atRestScheme,
+      atRestKekRef,
       new Date().toISOString().replace('T', ' ').substring(0, 19),
       holdId
     );
@@ -683,7 +720,7 @@ function createLegalHold(db, request, opts) {
       indefiniteRetention: indefiniteRetention === 1,
     };
   } catch (err) {
-    for (const p of [archivePath, manifestPath, manifestSigPath]) {
+    for (const p of [archivePath, manifestPath, manifestSigPath, archivePath && archivePath + '.enc.tmp', manifestPath && manifestPath + '.enc.tmp']) {
       if (p) try { fs.unlinkSync(p); } catch (_e) { /* ignore */ }
     }
     try { db.exec('ROLLBACK'); } catch (_e) { /* not in tx */ }

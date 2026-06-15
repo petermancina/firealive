@@ -1352,6 +1352,31 @@ function initDb() {
     console.error('Audit log integrity verification will be unavailable until this succeeds; re-run `npm run init-db` after setting the Tier-1 encryption key.');
   }
 
+  // B5g: forensic_exports / legal_hold_exports at-rest encryption columns.
+  // Records, per artifact, which KEK scheme (gd-tier1 on the GD) and reference
+  // protect the on-disk archive. at_rest_scheme is the canonical "encrypted at
+  // rest" signal: NULL means a legacy plaintext archive (pre-B5g) that the boot
+  // migration will re-seal. Guarded by PRAGMA table_info so re-running initDb is
+  // a no-op; its own try/catch keeps a failure from masking other migrations.
+  try {
+    const addAtRestCols = (table) => {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+      if (!cols.some(c => c.name === 'at_rest_scheme')) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN at_rest_scheme TEXT;`);
+        console.log(`${table} migration (B5g): added at_rest_scheme column`);
+      }
+      if (!cols.some(c => c.name === 'at_rest_kek_ref')) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN at_rest_kek_ref TEXT;`);
+        console.log(`${table} migration (B5g): added at_rest_kek_ref column`);
+      }
+    };
+    addAtRestCols('forensic_exports');
+    addAtRestCols('legal_hold_exports');
+  } catch (b5gExportAtRestMigrationErr) {
+    console.error('B5g export-at-rest column migration failed:', b5gExportAtRestMigrationErr.message);
+    console.error('The GD will start, but forensic-export and legal-hold-export artifacts cannot be sealed or re-encrypted at rest until the at_rest_scheme / at_rest_kek_ref columns exist. Recovery: run the two ALTER TABLE ADD COLUMN statements in a SQLite shell against the GD DB, then restart.');
+  }
+
   console.log('Global Dashboard database initialized at', DB_PATH);
   db.close();
 }
