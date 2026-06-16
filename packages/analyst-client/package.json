@@ -18,8 +18,8 @@
     "pdfkit": "^0.19.0"
   },
   "devDependencies": {
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
     "esbuild": "0.28.1",
     "electron": "^42.4.0",
     "electron-builder": "^26.8.1"
