@@ -3269,7 +3269,7 @@ app.post('/api/compromise-scan', authMiddleware(['ciso']), (req, res) => {
 //                     all reachable
 //   backup (3):       backups v2-aware, backup_schedules accessible,
 //                     latest backup status sane
-//   system (3):       Node version >= 18, process RSS sanity,
+//   system (3):       Node version >= 20, process RSS sanity,
 //                     SQLite version check
 //
 // Each check returns {name, category, status: 'pass'|'fail'|'skip',
@@ -3644,9 +3644,9 @@ function runGdRegression(db) {
   }
 
   // ── System (3) ─────────────────────────────────────────────────────────
-  record('system', 'Node.js >= 18', () => {
+  record('system', 'Node.js >= 20', () => {
     const major = parseInt((process.versions.node || '0').split('.')[0], 10);
-    if (!(major >= 18)) throw new Error(`Node major version ${major} < 18`);
+    if (!(major >= 20)) throw new Error(`Node major version ${major} < 20`);
     return `Node ${process.versions.node}`;
   });
   record('system', 'process RSS sanity', () => {
