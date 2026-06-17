@@ -294,7 +294,6 @@ app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
 app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
-app.use('/api/legal-hold-exports', authMiddleware(['admin', 'ciso']), require('./routes/legal-hold-exports'));
 app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso', 'abuse_reviewer']), require('./routes/report-verification'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
@@ -788,21 +787,6 @@ async function start() {
       }
       if (hour === 9) checkRecertDue();
     }, 3600000);
-
-    // Relay the two-person legal-hold export across the regional <-> GD channel:
-    // push pending requests to the GD and poll back the CISO's signed decision.
-    // A few-minute cadence keeps approval latency reasonable without hammering
-    // the GD. Fresh db per tick; runSyncTick is a no-op when GD push is not
-    // configured. Failures are logged and non-fatal. unref() so the timer never
-    // blocks process shutdown.
-    const abuseExportSync = require('./services/abuse-export-sync');
-    const abuseExportRelayTimer = setInterval(() => {
-      const relayDb = getDb();
-      Promise.resolve(abuseExportSync.runSyncTick(relayDb))
-        .catch((e) => logger.warn('abuse-export relay tick failed', { error: e.message }))
-        .finally(() => { try { relayDb.close(); } catch (e) {} });
-    }, 120000);
-    abuseExportRelayTimer.unref();
 
     const server = https.createServer({
       key: tlsMaterial.key,

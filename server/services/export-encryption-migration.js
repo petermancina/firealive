@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE -- Export Encryption At-Rest Migration (boot-time, idempotent)
 //
-// Re-seals any legacy plaintext forensic-export / legal-hold-export artifacts
+// Re-seals any legacy plaintext forensic-export artifacts
 // left on disk before B5g (or by a crashed prior run). It selects rows whose
 // at_rest_scheme is still NULL and that have an archive on record, then seals
 // the archive and the manifest sidecar in place IF either is still plaintext
@@ -26,7 +26,6 @@ const NL = String.fromCharCode(10);
 
 const EXPORT_TABLES = [
   { table: 'forensic_exports', label: 'forensic export' },
-  { table: 'legal_hold_exports', label: 'legal hold' },
 ];
 
 // Atomically replace a file with new bytes: write a sibling .enc.tmp and rename

@@ -605,91 +605,6 @@ CREATE TABLE IF NOT EXISTS forensic_export_chain_signing_keys (
 
 CREATE INDEX IF NOT EXISTS idx_forensic_export_chain_signing_keys_active ON forensic_export_chain_signing_keys(active) WHERE active = 1;
 
--- ── Legal Hold Export (R3l C47 — GD parity with MC C37) ─────────────────
--- Litigation-grade evidence export with separate-actor release invariant.
--- Same schema as MC's legal_hold_exports (C37) — the CHECK constraints
--- are structural and role-agnostic; route-layer policy maps GD's role set
--- (vp creator / ciso releaser) to the same separate-actor invariant.
--- Indefinite retention default + append-only chain triggers + distinct
--- signing keys from forensic_export_chain_signing_keys all match MC.
-
-CREATE TABLE IF NOT EXISTS legal_hold_exports (
-  id TEXT PRIMARY KEY,
-  case_id TEXT NOT NULL,
-  requested_by_user_id TEXT NOT NULL REFERENCES users(id),
-  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
-  rationale TEXT NOT NULL,
-  time_window_start TEXT,
-  time_window_end TEXT,
-  custodian_filter TEXT,
-  output_formats TEXT NOT NULL,
-  include_audit_log INTEGER DEFAULT 1,
-  include_backup_chain INTEGER DEFAULT 1,
-  include_incident_records INTEGER DEFAULT 1,
-  include_authentication_logs INTEGER DEFAULT 1,
-  include_user_access_logs INTEGER DEFAULT 1,
-  manifest_path TEXT,
-  archive_path TEXT,
-  manifest_sig_path TEXT,
-  manifest_signing_key_id TEXT,
-  manifest_signing_key_fingerprint TEXT,
-  cosign_signature_path TEXT,
-  archive_sha256 TEXT,
-  size_bytes INTEGER,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_progress','active','released','failed')),
-  error_message TEXT,
-  completed_at TEXT,
-  indefinite_retention INTEGER NOT NULL DEFAULT 1,
-  hold_released_at TEXT,
-  hold_released_by_user_id TEXT REFERENCES users(id),
-  hold_release_rationale TEXT,
-  downloaded_at TEXT,
-  downloaded_by_user_id TEXT REFERENCES users(id),
-  CHECK (hold_released_by_user_id IS NULL OR hold_released_by_user_id != requested_by_user_id),
-  CHECK ((hold_released_at IS NULL AND hold_released_by_user_id IS NULL) OR (hold_released_at IS NOT NULL AND hold_released_by_user_id IS NOT NULL))
-);
-
-CREATE INDEX IF NOT EXISTS idx_legal_hold_exports_case_id ON legal_hold_exports(case_id);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_exports_requested_by ON legal_hold_exports(requested_by_user_id);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_exports_status ON legal_hold_exports(status);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_exports_requested_at ON legal_hold_exports(requested_at DESC);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_exports_active ON legal_hold_exports(status) WHERE status = 'active';
-
-CREATE TABLE IF NOT EXISTS legal_hold_chain (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  prev_hash TEXT,
-  this_hash TEXT NOT NULL,
-  signature TEXT NOT NULL,
-  event_type TEXT NOT NULL CHECK (event_type IN ('HOLD_CREATED','HOLD_COMPLETED','HOLD_DOWNLOADED','HOLD_RELEASED','CHAIN_VERIFIED')),
-  hold_ref TEXT NOT NULL REFERENCES legal_hold_exports(id),
-  actor_user_id TEXT NOT NULL REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_hold_ref ON legal_hold_chain(hold_ref);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_created_at ON legal_hold_chain(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_event_type ON legal_hold_chain(event_type);
-
-CREATE TRIGGER IF NOT EXISTS legal_hold_chain_no_update
-  BEFORE UPDATE ON legal_hold_chain
-  BEGIN SELECT RAISE(ABORT, 'legal_hold_chain is append-only'); END;
-
-CREATE TRIGGER IF NOT EXISTS legal_hold_chain_no_delete
-  BEFORE DELETE ON legal_hold_chain
-  BEGIN SELECT RAISE(ABORT, 'legal_hold_chain is append-only'); END;
-
-CREATE TABLE IF NOT EXISTS legal_hold_chain_signing_keys (
-  id TEXT PRIMARY KEY,
-  public_key TEXT NOT NULL,
-  private_key_encrypted TEXT NOT NULL,
-  fingerprint TEXT NOT NULL UNIQUE,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  rotated_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_signing_keys_active ON legal_hold_chain_signing_keys(active) WHERE active = 1;
-
 -- ═══════════════════════════════════════════════════════════════════════════
 -- U4: REPORT SIGNING + VERIFICATION (GD-server)
 --
@@ -702,7 +617,7 @@ CREATE INDEX IF NOT EXISTS idx_legal_hold_chain_signing_keys_active ON legal_hol
 -- report_signing_keys / report_verifications so the ported services
 -- (report-signing-keys.js, report-signer.js, report-watermark.js,
 -- report-doc-builder.js) run unchanged. report signing keys are a DISTINCT key
--- family from the GD's forensic / legal-hold / signing_keys families.
+-- family from the GD's forensic / signing_keys families.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS report_signing_keys (
@@ -1352,7 +1267,7 @@ function initDb() {
     console.error('Audit log integrity verification will be unavailable until this succeeds; re-run `npm run init-db` after setting the Tier-1 encryption key.');
   }
 
-  // B5g: forensic_exports / legal_hold_exports at-rest encryption columns.
+  // B5g: forensic_exports at-rest encryption columns.
   // Records, per artifact, which KEK scheme (gd-tier1 on the GD) and reference
   // protect the on-disk archive. at_rest_scheme is the canonical "encrypted at
   // rest" signal: NULL means a legacy plaintext archive (pre-B5g) that the boot
@@ -1371,10 +1286,9 @@ function initDb() {
       }
     };
     addAtRestCols('forensic_exports');
-    addAtRestCols('legal_hold_exports');
   } catch (b5gExportAtRestMigrationErr) {
     console.error('B5g export-at-rest column migration failed:', b5gExportAtRestMigrationErr.message);
-    console.error('The GD will start, but forensic-export and legal-hold-export artifacts cannot be sealed or re-encrypted at rest until the at_rest_scheme / at_rest_kek_ref columns exist. Recovery: run the two ALTER TABLE ADD COLUMN statements in a SQLite shell against the GD DB, then restart.');
+    console.error('The GD will start, but forensic-export artifacts cannot be sealed or re-encrypted at rest until the at_rest_scheme / at_rest_kek_ref columns exist. Recovery: run the two ALTER TABLE ADD COLUMN statements in a SQLite shell against the GD DB, then restart.');
   }
 
   console.log('Global Dashboard database initialized at', DB_PATH);
