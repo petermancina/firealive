@@ -1,17 +1,30 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Cloud & IaC Templates: Pulumi TypeScript (R3k C14)
+// FIREALIVE — Cloud & IaC Templates: Pulumi TypeScript (R3k C14, Cloud Mode B5h)
 //
-// Per-provider Pulumi templates emitting index.ts + Pulumi.yaml +
-// package.json. Operators run `npm install && pulumi up`.
+// Per-provider Pulumi templates emitting index.ts + Pulumi.yaml + package.json.
+// Operators run `npm install && pulumi up`. Each template provisions FireAlive
+// on a CONFIDENTIAL VM with a vTPM hardware root of trust: AMD SEV-SNP +
+// NitroTPM on AWS, an Azure Confidential VM with Trusted Launch (vTPM + secure
+// boot), and a GCP Confidential VM with Shielded VM (vTPM). Cloud mode REQUIRES
+// confidential computing and is attested at boot, so managed-container compute
+// (ECS, Container Instances, Cloud Run) is intentionally not emitted.
+//
+// Secrets live in the provider key/secret store and are fetched at boot by the
+// instance identity (IAM role / managed identity / service account); they are
+// never placed in user_data in cleartext, because the confidential-VM model
+// assumes the provider can read instance metadata but not guest memory.
+//
+// Content is built as arrays of lines joined by NL (a literal newline). Emitted
+// cloud-init is a TS template literal with real newlines, so the templates
+// carry no backslash escapes.
 // ═══════════════════════════════════════════════════════════════════════════════
+
+const NL = String.fromCharCode(10);
 
 const PROVIDER_FNS = {
   aws: renderAws,
   azure: renderAzure,
   gcp: renderGcp,
-  hetzner: renderHetzner,
-  ovhcloud: renderOvhcloud,
-  exoscale: renderExoscale,
 };
 
 function render(snapshot, provider) {
@@ -27,17 +40,14 @@ function pulumiYaml(provider) {
     'description: FireAlive deployment (Pulumi / TypeScript)',
     `# Provider: ${provider}`,
     '',
-  ].join('\n');
+  ].join(NL);
 }
 
 function packageJson(provider) {
   const deps = {
-    aws:      '"@pulumi/aws": "^6.0.0"',
-    azure:    '"@pulumi/azure-native": "^2.0.0"',
-    gcp:      '"@pulumi/gcp": "^7.0.0"',
-    hetzner:  '"@pulumi/command": "^0.9.0"',
-    ovhcloud: '"@pulumi/command": "^0.9.0"',
-    exoscale: '"@pulumi/command": "^0.9.0"',
+    aws:   '"@pulumi/aws": "^6.0.0"',
+    azure: '"@pulumi/azure-native": "^2.0.0"',
+    gcp:   '"@pulumi/gcp": "^7.0.0"',
   };
   return [
     '{',
@@ -53,7 +63,7 @@ function packageJson(provider) {
     '  }',
     '}',
     '',
-  ].join('\n');
+  ].join(NL);
 }
 
 function renderAws(snapshot) {
@@ -65,6 +75,8 @@ function renderAws(snapshot) {
     'const tier1Key = cfg.requireSecret("tier1EncryptionKey");',
     'const jwtSecret = cfg.requireSecret("jwtSecret");',
     'const imageRef = cfg.get("firealiveImage") ?? "ghcr.io/petermancina/firealive:latest";',
+    '// SEV-SNP-capable instance type (for example m6a / c6a / r6a).',
+    'const instanceSize = cfg.require("instanceSize");',
     '',
     'const tier1Secret = new aws.secretsmanager.Secret("firealive-tier1", { name: "firealive/tier1-encryption-key" });',
     'new aws.secretsmanager.SecretVersion("firealive-tier1-v", {',
@@ -78,13 +90,60 @@ function renderAws(snapshot) {
     '    secretString: jwtSecret,',
     '});',
     '',
-    'const cluster = new aws.ecs.Cluster("firealive", { name: "firealive" });',
+    '// UEFI AMI with TPM 2.0 support; NitroTPM presents as the guest TPM.',
+    'const ami = aws.ec2.getAmiOutput({',
+    '    mostRecent: true,',
+    '    owners: ["amazon"],',
+    '    filters: [',
+    '        { name: "name", values: ["al2023-ami-*-x86_64"] },',
+    '        { name: "tpm-support", values: ["v2.0"] },',
+    '    ],',
+    '});',
     '',
-    'export const clusterArn = cluster.arn;',
-    'export const note = "Production deployment requires VPC + subnets + ALB + ECS service + IAM execution role + CloudWatch logs + persistent EFS or RDS";',
+    'const role = new aws.iam.Role("firealive-instance", {',
+    '    assumeRolePolicy: JSON.stringify({',
+    '        Version: "2012-10-17",',
+    '        Statement: [{ Action: "sts:AssumeRole", Effect: "Allow", Principal: { Service: "ec2.amazonaws.com" } }],',
+    '    }),',
+    '});',
+    'new aws.iam.RolePolicy("firealive-read-secrets", {',
+    '    role: role.id,',
+    '    policy: pulumi.all([tier1Secret.arn, jwtSecretRes.arn]).apply(([a, b]) => JSON.stringify({',
+    '        Version: "2012-10-17",',
+    '        Statement: [{ Action: "secretsmanager:GetSecretValue", Effect: "Allow", Resource: [a, b] }],',
+    '    })),',
+    '});',
+    'const profile = new aws.iam.InstanceProfile("firealive-instance", { role: role.name });',
+    '',
+    '// On-demand only: cloud mode refuses spot / autoscaled / ephemeral-fleet',
+    '// instances, so do NOT place this in an autoscaling group or spot request.',
+    'const userData = `#cloud-config',
+    'runcmd:',
+    '  - mkdir -p /etc/firealive',
+    '  - TIER1=$(aws secretsmanager get-secret-value --secret-id firealive/tier1-encryption-key --query SecretString --output text)',
+    '  - JWT=$(aws secretsmanager get-secret-value --secret-id firealive/jwt-secret --query SecretString --output text)',
+    '  - umask 077',
+    '  - echo "TIER1_ENCRYPTION_KEY=$TIER1" > /etc/firealive/.env',
+    '  - echo "JWT_SECRET=$JWT" >> /etc/firealive/.env',
+    '  - echo "FIREALIVE_DEPLOYMENT_MODE=cloud" >> /etc/firealive/.env',
+    '  - docker run -d --name firealive --restart=always -p 3000:3000 --env-file /etc/firealive/.env -v firealive-data:/data ${imageRef}`;',
+    '',
+    '// AMD SEV-SNP confidential VM with NitroTPM (TPM 2.0 root of trust).',
+    'const server = new aws.ec2.Instance("firealive", {',
+    '    ami: ami.id,',
+    '    instanceType: instanceSize,',
+    '    iamInstanceProfile: profile.name,',
+    '    cpuOptions: { amdSevSnp: "enabled" },',
+    '    metadataOptions: { httpTokens: "required" },',
+    '    userData: userData,',
+    '    tags: { Name: "firealive", DeploymentMode: "cloud" },',
+    '});',
+    '',
+    'export const endpoint = pulumi.interpolate`https://${server.publicIp}:3000`;',
+    'export const note = "Production deployment also needs a VPC, subnet, security group, an EBS data volume or RDS, and Docker preinstalled in the AMI";',
     `// Snapshot at generation: users=${snapshot.users.total}, db_size_bytes=${snapshot.data.db_size_bytes}`,
     '',
-  ].join('\n');
+  ].join(NL);
   return [
     { path: 'index.ts', content: idx },
     { path: 'Pulumi.yaml', content: pulumiYaml('aws') },
@@ -101,23 +160,101 @@ function renderAzure(snapshot) {
     'const tier1Key = cfg.requireSecret("tier1EncryptionKey");',
     'const jwtSecret = cfg.requireSecret("jwtSecret");',
     'const imageRef = cfg.get("firealiveImage") ?? "ghcr.io/petermancina/firealive:latest";',
+    '// Confidential VM size (for example Standard_DC2as_v5).',
+    'const instanceSize = cfg.get("instanceSize") ?? "Standard_DC2as_v5";',
     '',
     'const rg = new azure.resources.ResourceGroup("firealive-rg", { location: "eastus" });',
     '',
     'const kv = new azure.keyvault.Vault("firealive-kv", {',
+    '    vaultName: "firealive-kv",',
     '    resourceGroupName: rg.name,',
     '    properties: {',
     '        sku: { family: "A", name: "standard" },',
     '        tenantId: "<your-tenant-id>",',
     '        accessPolicies: [],',
+    '        enableRbacAuthorization: true,',
     '    },',
     '});',
     '',
-    'export const resourceGroupName = rg.name;',
-    'export const note = "Production deployment requires Container Instance or AKS cluster with secrets bound from the Key Vault above";',
+    '// Store the secrets; the VM managed identity reads them at boot.',
+    'new azure.keyvault.Secret("tier1-encryption-key", {',
+    '    resourceGroupName: rg.name,',
+    '    vaultName: kv.name,',
+    '    secretName: "tier1-encryption-key",',
+    '    properties: { value: tier1Key },',
+    '});',
+    'new azure.keyvault.Secret("jwt-secret", {',
+    '    resourceGroupName: rg.name,',
+    '    vaultName: kv.name,',
+    '    secretName: "jwt-secret",',
+    '    properties: { value: jwtSecret },',
+    '});',
+    '',
+    'const vnet = new azure.network.VirtualNetwork("firealive-vnet", {',
+    '    resourceGroupName: rg.name,',
+    '    addressSpace: { addressPrefixes: ["10.42.0.0/16"] },',
+    '});',
+    'const subnet = new azure.network.Subnet("firealive-subnet", {',
+    '    resourceGroupName: rg.name,',
+    '    virtualNetworkName: vnet.name,',
+    '    addressPrefix: "10.42.1.0/24",',
+    '});',
+    'const pip = new azure.network.PublicIPAddress("firealive-pip", {',
+    '    resourceGroupName: rg.name,',
+    '    publicIPAllocationMethod: "Static",',
+    '});',
+    'const nic = new azure.network.NetworkInterface("firealive-nic", {',
+    '    resourceGroupName: rg.name,',
+    '    ipConfigurations: [{ name: "primary", subnet: { id: subnet.id }, publicIPAddress: { id: pip.id } }],',
+    '});',
+    '',
+    'const cloudConfig = `#cloud-config',
+    'runcmd:',
+    '  - mkdir -p /etc/firealive',
+    '  - az login --identity --allow-no-subscriptions',
+    '  - TIER1=$(az keyvault secret show --vault-name firealive-kv --name tier1-encryption-key --query value -o tsv)',
+    '  - JWT=$(az keyvault secret show --vault-name firealive-kv --name jwt-secret --query value -o tsv)',
+    '  - umask 077',
+    '  - echo "TIER1_ENCRYPTION_KEY=$TIER1" > /etc/firealive/.env',
+    '  - echo "JWT_SECRET=$JWT" >> /etc/firealive/.env',
+    '  - echo "FIREALIVE_DEPLOYMENT_MODE=cloud" >> /etc/firealive/.env',
+    '  - docker run -d --name firealive --restart=always -p 3000:3000 --env-file /etc/firealive/.env -v firealive-data:/data ${imageRef}`;',
+    '',
+    '// Confidential VM (SEV-SNP) with Trusted Launch: vTPM (TPM 2.0 root of',
+    '// trust) + secure boot + VM guest-state disk encryption.',
+    'const vm = new azure.compute.VirtualMachine("firealive", {',
+    '    resourceGroupName: rg.name,',
+    '    networkProfile: { networkInterfaces: [{ id: nic.id }] },',
+    '    identity: { type: "SystemAssigned" },',
+    '    hardwareProfile: { vmSize: instanceSize },',
+    '    securityProfile: {',
+    '        securityType: "ConfidentialVM",',
+    '        uefiSettings: { vTpmEnabled: true, secureBootEnabled: true },',
+    '    },',
+    '    storageProfile: {',
+    '        imageReference: { publisher: "Canonical", offer: "ubuntu-24_04-lts-cvm", sku: "cvm", version: "latest" },',
+    '        osDisk: {',
+    '            createOption: "FromImage",',
+    '            managedDisk: { securityProfile: { securityEncryptionType: "VMGuestStateOnly" } },',
+    '        },',
+    '    },',
+    '    osProfile: {',
+    '        computerName: "firealive",',
+    '        adminUsername: "azureuser",',
+    '        customData: Buffer.from(cloudConfig).toString("base64"),',
+    '        linuxConfiguration: {',
+    '            disablePasswordAuthentication: true,',
+    '            ssh: { publicKeys: [{ keyData: "<your-ssh-public-key>", path: "/home/azureuser/.ssh/authorized_keys" }] },',
+    '        },',
+    '    },',
+    '    tags: { DeploymentMode: "cloud" },',
+    '});',
+    '',
+    'export const publicIpName = pip.name;',
+    'export const note = "Grant the VM managed identity Get access on the Key Vault secrets before first boot";',
     `// Snapshot at generation: users=${snapshot.users.total}, db_size_bytes=${snapshot.data.db_size_bytes}`,
     '',
-  ].join('\n');
+  ].join(NL);
   return [
     { path: 'index.ts', content: idx },
     { path: 'Pulumi.yaml', content: pulumiYaml('azure') },
@@ -134,6 +271,8 @@ function renderGcp(snapshot) {
     'const tier1Key = cfg.requireSecret("tier1EncryptionKey");',
     'const jwtSecret = cfg.requireSecret("jwtSecret");',
     'const imageRef = cfg.get("firealiveImage") ?? "ghcr.io/petermancina/firealive:latest";',
+    '// SEV-SNP-capable machine type (n2d / c2d).',
+    'const instanceSize = cfg.get("instanceSize") ?? "n2d-standard-2";',
     '',
     'const tier1Secret = new gcp.secretmanager.Secret("tier1", {',
     '    secretId: "firealive-tier1-key",',
@@ -143,67 +282,63 @@ function renderGcp(snapshot) {
     '    secret: tier1Secret.id,',
     '    secretData: tier1Key,',
     '});',
-    '',
-    'const service = new gcp.cloudrunv2.Service("firealive", {',
-    '    location: "us-central1",',
-    '    template: {',
-    '        containers: [{',
-    '            image: imageRef,',
-    '            ports: [{ containerPort: 3000 }],',
-    '        }],',
-    '    },',
+    'const jwtSecretRes = new gcp.secretmanager.Secret("jwt", {',
+    '    secretId: "firealive-jwt-secret",',
+    '    replication: { auto: {} },',
+    '});',
+    'new gcp.secretmanager.SecretVersion("jwt-v", {',
+    '    secret: jwtSecretRes.id,',
+    '    secretData: jwtSecret,',
     '});',
     '',
-    'export const url = service.uri;',
+    'const sa = new gcp.serviceaccount.Account("firealive", { accountId: "firealive", displayName: "FireAlive instance" });',
+    'new gcp.secretmanager.SecretIamMember("tier1-access", {',
+    '    secretId: tier1Secret.secretId,',
+    '    role: "roles/secretmanager.secretAccessor",',
+    '    member: pulumi.interpolate`serviceAccount:${sa.email}`,',
+    '});',
+    'new gcp.secretmanager.SecretIamMember("jwt-access", {',
+    '    secretId: jwtSecretRes.secretId,',
+    '    role: "roles/secretmanager.secretAccessor",',
+    '    member: pulumi.interpolate`serviceAccount:${sa.email}`,',
+    '});',
+    '',
+    'const startupScript = `#!/bin/bash',
+    'set -e',
+    'mkdir -p /etc/firealive',
+    'TIER1=$(gcloud secrets versions access latest --secret=firealive-tier1-key)',
+    'JWT=$(gcloud secrets versions access latest --secret=firealive-jwt-secret)',
+    'umask 077',
+    'echo "TIER1_ENCRYPTION_KEY=$TIER1" > /etc/firealive/.env',
+    'echo "JWT_SECRET=$JWT" >> /etc/firealive/.env',
+    'echo "FIREALIVE_DEPLOYMENT_MODE=cloud" >> /etc/firealive/.env',
+    'docker run -d --name firealive --restart=always -p 3000:3000 --env-file /etc/firealive/.env -v firealive-data:/data ${imageRef}`;',
+    '',
+    '// Confidential VM (SEV-SNP) with Shielded VM: vTPM (TPM 2.0 root of trust),',
+    '// secure boot, and integrity monitoring. SEV-SNP terminates (no live',
+    '// migration) on host maintenance.',
+    'const server = new gcp.compute.Instance("firealive", {',
+    '    machineType: instanceSize,',
+    '    zone: "us-central1-a",',
+    '    minCpuPlatform: "AMD Milan",',
+    '    confidentialInstanceConfig: { enableConfidentialCompute: true, confidentialInstanceType: "SEV_SNP" },',
+    '    shieldedInstanceConfig: { enableVtpm: true, enableIntegrityMonitoring: true, enableSecureBoot: true },',
+    '    scheduling: { onHostMaintenance: "TERMINATE", automaticRestart: true, preemptible: false, provisioningModel: "STANDARD" },',
+    '    bootDisk: { initializeParams: { image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64" } },',
+    '    networkInterfaces: [{ network: "default", accessConfigs: [{}] }],',
+    '    serviceAccount: { email: sa.email, scopes: ["cloud-platform"] },',
+    '    metadata: { "startup-script": startupScript },',
+    '    labels: { deployment_mode: "cloud" },',
+    '});',
+    '',
+    'export const endpoint = pulumi.interpolate`https://${server.networkInterfaces[0].accessConfigs[0].natIp}:3000`;',
     `// Snapshot at generation: users=${snapshot.users.total}, db_size_bytes=${snapshot.data.db_size_bytes}`,
     '',
-  ].join('\n');
+  ].join(NL);
   return [
     { path: 'index.ts', content: idx },
     { path: 'Pulumi.yaml', content: pulumiYaml('gcp') },
     { path: 'package.json', content: packageJson('gcp') },
-  ];
-}
-
-function renderHetzner(snapshot) {
-  return renderVmShellOut('hetzner', snapshot);
-}
-function renderOvhcloud(snapshot) {
-  return renderVmShellOut('ovhcloud', snapshot);
-}
-function renderExoscale(snapshot) {
-  return renderVmShellOut('exoscale', snapshot);
-}
-
-function renderVmShellOut(provider, snapshot) {
-  // Hetzner / OVHcloud / Exoscale don't have first-class Pulumi
-  // resource providers in the same way the big-three do; the canonical
-  // pattern is to use @pulumi/command to drive their respective CLIs
-  // or REST APIs from a Pulumi stack.
-  const idx = [
-    'import * as pulumi from "@pulumi/pulumi";',
-    'import * as command from "@pulumi/command";',
-    '',
-    'const cfg = new pulumi.Config();',
-    'const tier1Key = cfg.requireSecret("tier1EncryptionKey");',
-    'const jwtSecret = cfg.requireSecret("jwtSecret");',
-    'const imageRef = cfg.get("firealiveImage") ?? "ghcr.io/petermancina/firealive:latest";',
-    '',
-    `// ${provider}-specific provisioning via the provider's CLI or REST API.`,
-    '// This stub uses @pulumi/command to shell out; replace with the provider-',
-    '// native Pulumi provider when it ships, or with a Terraform-bridge module.',
-    `const provisionVm = new command.local.Command("${provider}-provision", {`,
-    `    create: "echo 'TODO: invoke ${provider} CLI to provision the VM and bootstrap the Docker container'",`,
-    '});',
-    '',
-    'export const provisionStatus = provisionVm.stdout;',
-    `// Snapshot at generation: users=${snapshot.users.total}, db_size_bytes=${snapshot.data.db_size_bytes}`,
-    '',
-  ].join('\n');
-  return [
-    { path: 'index.ts', content: idx },
-    { path: 'Pulumi.yaml', content: pulumiYaml(provider) },
-    { path: 'package.json', content: packageJson(provider) },
   ];
 }
 

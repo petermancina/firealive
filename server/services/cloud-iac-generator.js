@@ -52,13 +52,17 @@
 // ==========================
 //
 // Not every combination is valid. The PROVIDER_TOOL_MATRIX below
-// records the supported pairs:
+// records the supported pairs. Cloud Mode requires a confidential
+// VM, so the provider set is the three that offer one (AWS, Azure,
+// GCP); container formats are not generated (FireAlive needs a
+// per-instance hardware root, which a TPM-less container cannot
+// provide):
 //
 //   - CloudFormation is AWS-only.
 //   - Bicep is Azure-only.
 //   - GCP Deployment Manager is GCP-only.
-//   - Terraform, Pulumi, Docker Compose, Docker manifest, Kubernetes,
-//     Helm are universal (work for every supported provider).
+//   - Terraform and Pulumi are universal (work for every supported
+//     provider).
 //
 // The route handler in C19 validates the combination before invoking
 // generatePackage(); this service does its own validation defensively.
@@ -78,21 +82,15 @@ const signingKeys = require('./cloud-iac-signing-keys');
 // ── Constants ──────────────────────────────────────────────────────────
 
 const PROVIDER_TOOL_MATRIX = {
-  aws:      ['terraform', 'pulumi', 'cloudformation', 'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
-  azure:    ['terraform', 'pulumi', 'bicep',          'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
-  gcp:      ['terraform', 'pulumi', 'gcp-dm',         'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
-  hetzner:  ['terraform', 'pulumi',                   'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
-  ovhcloud: ['terraform', 'pulumi',                   'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
-  exoscale: ['terraform', 'pulumi',                   'docker-compose', 'docker-manifest', 'kubernetes', 'helm'],
+  aws:   ['terraform', 'pulumi', 'cloudformation'],
+  azure: ['terraform', 'pulumi', 'bicep'],
+  gcp:   ['terraform', 'pulumi', 'gcp-dm'],
 };
 
 const SECRETS_MAPPING_BY_PROVIDER = {
-  aws:      'AWS Secrets Manager (recommended) or Systems Manager Parameter Store. The generated IaC references secrets by ARN.',
-  azure:    'Azure Key Vault. The generated IaC references secrets by Key Vault secret URI.',
-  gcp:      'Google Secret Manager. The generated IaC references secrets by resource name (projects/<project>/secrets/<name>/versions/latest).',
-  hetzner:  'Hetzner does not provide a managed secrets store; the generated IaC references secrets via env vars sourced from a deployment-side .env file or HashiCorp Vault instance.',
-  ovhcloud: 'OVHcloud Vault (Hashi-compatible) or environment variables in the manager UI. The generated IaC references secrets via Vault paths.',
-  exoscale: 'Exoscale does not provide a managed secrets store; the generated IaC references secrets via env vars sourced from a deployment-side .env file or HashiCorp Vault instance.',
+  aws:   'AWS Secrets Manager (recommended) or Systems Manager Parameter Store. The generated IaC references secrets by ARN.',
+  azure: 'Azure Key Vault. The generated IaC references secrets by Key Vault secret URI.',
+  gcp:   'Google Secret Manager. The generated IaC references secrets by resource name (projects/<project>/secrets/<name>/versions/latest).',
 };
 
 function resolveCloudPackagesDir(override) {

@@ -1486,6 +1486,98 @@ class RegressionRunner {
       return 'restoreDatabaseFromArchive + scanExtractedBytes + DbRestoreError + filename guard present';
     });
 
+    // ── Category: Cloud Mode (Confidential VM) ─ B5h ─────
+    // No live hardware: confidential-computing detection and attestation are
+    // exercised through an injectable fs probe, the metadata parsers through
+    // fixtures, and the host-relocation classifier on an in-memory config clone.
+    await check('cloud_mode', 'Deployment-mode enum includes cloud (D-B5h-1)', () => {
+      const dm = require('./deployment-mode');
+      if (dm.MODES.indexOf('cloud') === -1) throw new Error('deployment-mode MODES does not include cloud');
+      if (dm.CLOUD !== 'cloud') throw new Error('deployment-mode CLOUD constant missing');
+      if (typeof dm.isCloud !== 'function') throw new Error('deployment-mode missing isCloud');
+      return 'MODES includes cloud; CLOUD constant + isCloud() present';
+    });
+    await check('cloud_mode', 'Confidential-computing detection is structured (D-B5h-2)', () => {
+      const cc = require('./cloud-attestation');
+      const none = { exists: function () { return false; } };
+      const sev = { exists: function (p) { return p === '/dev/sev-guest'; } };
+      const dNone = cc.detectConfidentialComputing(none);
+      if (dNone.present !== false || dNone.tech !== cc.CC_NONE) throw new Error('no-CC probe should report present=false');
+      const dSev = cc.detectConfidentialComputing(sev);
+      if (dSev.present !== true || dSev.tech !== cc.CC_SEV_SNP) throw new Error('SEV-SNP guest device should be detected');
+      return 'detectConfidentialComputing returns {present,tech,source}; SEV-SNP recognized';
+    });
+    await check('cloud_mode', 'Attestation gate is fail-closed (D-B5h-3)', () => {
+      const cc = require('./cloud-attestation');
+      const none = { exists: function () { return false; } };
+      const sev = { exists: function (p) { return p === '/dev/sev-guest'; } };
+      const aNone = cc.verifyAttestation({ probe: none });
+      if (aNone.verified !== false) throw new Error('attestation must fail closed when no confidential guest is present');
+      const aSev = cc.verifyAttestation({ probe: sev });
+      if (aSev.verified !== true || aSev.platformValidationPending !== true) throw new Error('attestation should verify (platform-validation-pending) on a confidential guest');
+      return 'verifyAttestation fails closed without CC; verified + platform-validation-pending with CC';
+    });
+    await check('cloud_mode', 'Spot and autoscaled instances are detected for refusal (D-B5h-4)', () => {
+      const md = require('./cloud-metadata');
+      if (md.buildAwsMetadata({ lifeCycle: 'spot' }).spot !== true) throw new Error('AWS lifeCycle=spot should set spot=true');
+      if (md.buildAwsMetadata({ asgState: 'InService' }).autoscaled !== true) throw new Error('AWS asgState present should set autoscaled=true');
+      if (md.parseAzureInstance({ compute: { priority: 'Spot' } }).spot !== true) throw new Error('Azure priority=Spot should set spot=true');
+      if (md.parseAzureInstance({ compute: { vmScaleSetName: 'vmss-1' } }).autoscaled !== true) throw new Error('Azure vmScaleSetName should set autoscaled=true');
+      const plain = md.buildAwsMetadata({});
+      if (plain.spot !== null || plain.autoscaled !== null) throw new Error('absent signals should be null (unknown), not refused');
+      return 'spot + autoscaled detected across AWS/Azure fixtures; unknown stays null';
+    });
+    await check('cloud_mode', 'Server-cert SAN reconciliation set is canonical (D-B5h-6)', () => {
+      const ca = require('./ca');
+      if (typeof ca.reconcileServerCert !== 'function') throw new Error('ca.reconcileServerCert missing');
+      const san = ca.computeDesiredSan({ stableHostname: 'SOC.Example.Com', instanceIp: '10.0.0.5' });
+      const expected = ['10.0.0.5', '127.0.0.1', '::1', 'localhost', 'soc.example.com'].sort();
+      if (JSON.stringify(san) !== JSON.stringify(expected)) throw new Error('computeDesiredSan is not the canonical sorted set: ' + JSON.stringify(san));
+      const base = ca.computeDesiredSan({});
+      if (base.indexOf('localhost') === -1 || base.indexOf('127.0.0.1') === -1 || base.indexOf('::1') === -1) throw new Error('SAN base must include the loopback set');
+      return 'computeDesiredSan yields a canonical sorted/deduped/lowercased set; reconcileServerCert present';
+    });
+    await check('cloud_mode', 'Cloud backup KEK posture refuses env-var (D-B5h-5)', () => {
+      const bkw = require('./backup-key-wrapping');
+      if (typeof bkw.assertCloudBackupKekPosture !== 'function') throw new Error('backup-key-wrapping missing assertCloudBackupKekPosture');
+      let code = null;
+      try { bkw.assertCloudBackupKekPosture('env-var', true); } catch (e) { code = e.code; }
+      if (code !== 'CLOUD_BACKUP_KEK_REQUIRED') throw new Error('env-var KEK in cloud mode must throw CLOUD_BACKUP_KEK_REQUIRED');
+      bkw.assertCloudBackupKekPosture('aws-kms', true);
+      bkw.assertCloudBackupKekPosture('env-var', false);
+      return 'env-var KEK refused in cloud mode; cloud-KMS allowed; non-cloud unaffected';
+    });
+    await check('cloud_mode', 'Cloud-mode config service API + platforms (D-B5h-8)', () => {
+      const cm = require('./cloud-mode');
+      const missing = ['getCloudConfig', 'setCloudConfig', 'recordAttestation'].filter(k => typeof cm[k] !== 'function');
+      if (missing.length > 0) throw new Error('cloud-mode missing: ' + missing.join(', '));
+      const want = ['aws', 'azure', 'gcp'];
+      if (!Array.isArray(cm.PLATFORMS) || cm.PLATFORMS.length !== want.length || want.some(p => cm.PLATFORMS.indexOf(p) === -1)) {
+        throw new Error('cloud-mode PLATFORMS must be exactly aws/azure/gcp');
+      }
+      return 'getCloudConfig / setCloudConfig / recordAttestation present; PLATFORMS = aws/azure/gcp';
+    });
+    await check('cloud_mode', 'Cloud stop/start is an authorized relocation; concurrent duplicate is a clone', () => {
+      const reg = require('./instance-registry');
+      if (typeof reg.classify !== 'function') throw new Error('instance-registry.classify missing');
+      const Database = this.db.constructor;
+      const mem = new Database(':memory:');
+      try {
+        mem.prepare('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)').run();
+        if (!reg.recordHostPresence(mem, { host: 'host-a', cloud: true }).firstSeen) throw new Error('first presence should be firstSeen');
+        const moved = reg.recordHostPresence(mem, { host: 'host-b', cloud: true });
+        if (moved.migration !== true || moved.unexpected !== false) throw new Error('cloud host change should be an authorized relocation');
+      } finally { mem.close(); }
+      const mem2 = new Database(':memory:');
+      try {
+        mem2.prepare('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)').run();
+        reg.recordHostPresence(mem2, { host: 'bm-a' });
+        const bm = reg.recordHostPresence(mem2, { host: 'bm-b' });
+        if (bm.unexpected !== true || bm.migration !== false) throw new Error('bare-metal host change should be flagged unexpected');
+      } finally { mem2.close(); }
+      return 'cloud relocation authorized; bare-metal host change flagged; classify present';
+    });
+
     // B5g: export encryption at rest. Exercises the keyless AES-256-GCM core
     // (no KEK / hardware needed in CI) and asserts the production seal path is
     // wired to the shared backup-key-wrapping registry.

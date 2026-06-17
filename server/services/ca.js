@@ -254,6 +254,73 @@ function issueServerCert(db, { commonName = 'localhost', hostnames = [] } = {}) 
   });
 }
 
+// ── server certificate SAN reconciliation (Cloud Mode) ─────
+// A cloud instance changes IP/DNS on stop/start or behind a load balancer.
+// Because clients pin the anchor fingerprint, not the leaf certificate, the
+// server cert can be re-issued under the stable anchor whenever its SAN set must
+// change. The desired SAN is the stable hostname (operator DNS, primary), the
+// instance IP (from metadata, secondary), and the loopback base. The last issued
+// set is tracked in config so reconciliation re-issues ONLY on a real change and
+// never widens what the certificate asserts beyond that set.
+const SAN_BASE = ['localhost', '127.0.0.1', '::1'];
+const SAN_STATE_KEY = 'server_cert_san';
+
+function computeDesiredSan({ stableHostname = null, instanceIp = null } = {}) {
+  const entries = SAN_BASE.slice();
+  const host = stableHostname ? String(stableHostname).trim().toLowerCase() : null;
+  const ip = instanceIp ? String(instanceIp).trim() : null;
+  if (host) entries.push(host);
+  if (ip) entries.push(ip);
+  const uniq = [];
+  for (const e of entries) {
+    if (e && uniq.indexOf(e) === -1) uniq.push(e);
+  }
+  uniq.sort();
+  return uniq;
+}
+
+function readSanState(db) {
+  try {
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(SAN_STATE_KEY);
+    return row && row.value ? JSON.parse(row.value) : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function writeSanState(db, sanArray) {
+  db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
+    .run(SAN_STATE_KEY, JSON.stringify(sanArray));
+}
+
+// Re-issue the server certificate only when the desired SAN set differs from the
+// last issued set. Returns { reissued, desiredSan, previousSan, certPem?, keyPem?,
+// caCertPem? }; on reissue the caller persists the new cert/key. Issuing missing
+// or expired certs stays the boot path's job -- this handles SAN changes only.
+function reconcileServerCert(db, { stableHostname = null, instanceIp = null } = {}) {
+  const desired = computeDesiredSan({ stableHostname, instanceIp });
+  const previous = readSanState(db);
+  const same = Array.isArray(previous) &&
+    previous.length === desired.length &&
+    previous.every((v, i) => v === desired[i]);
+  if (same) {
+    return { reissued: false, desiredSan: desired, previousSan: previous };
+  }
+  const hostnames = [];
+  if (stableHostname) hostnames.push(String(stableHostname).trim().toLowerCase());
+  if (instanceIp) hostnames.push(String(instanceIp).trim());
+  const issued = issueServerCert(db, { commonName: 'localhost', hostnames });
+  writeSanState(db, desired);
+  return {
+    reissued: true,
+    desiredSan: desired,
+    previousSan: previous,
+    certPem: issued.certPem,
+    keyPem: issued.keyPem,
+    caCertPem: issued.caCertPem,
+  };
+}
+
 // ── issue a client certificate from an enrollee CSR ───────────────────────────
 // The enrollee generates their own keypair on-device and sends only a CSR
 // (the private key never leaves the device). The authoritative identity this CA
@@ -442,6 +509,8 @@ module.exports = {
   initCa,
   getCaCertPem,
   issueServerCert,
+  reconcileServerCert,
+  computeDesiredSan,
   issueClientCert,
   revokeCert,
   verifyClientCert,

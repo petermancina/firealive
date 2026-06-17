@@ -57,15 +57,18 @@ data survives a hardware change while identity does not migrate.
 - A clone presenting no valid hardware root simply cannot establish or load
   an identity (fail-closed).
 
-## Deployment modes: bare-metal and virtualized
+## Deployment modes: bare-metal, virtualized, and cloud
 
 The deployment mode is chosen once, at install / first boot, before any
 identity is established, via the FIREALIVE_DEPLOYMENT_MODE environment
 variable. The chosen mode is hardware-sealed; thereafter the sealed value is
 authoritative and a divergent environment variable is ignored and logged.
 
-All virtualization behavior below is additive and gated on virtualized mode.
-Bare-metal deployments are unaffected.
+All virtualization behavior below is additive and applies in both virtualized
+mode and cloud mode: the relocation and clock-integrity gates treat a cloud
+instance like a virtualized one. Bare-metal deployments are unaffected. Cloud
+mode adds its own confidential-computing requirements, summarized in the cloud
+mode subsection below and documented in full in docs/cloud-mode.md.
 
 ### vMotion / live migration versus a clone
 
@@ -73,8 +76,10 @@ In virtualized mode the anchor (a virtual TPM) moving to a new host is
 treated as an authorized relocation and is audited. A bare-metal host change
 for the same identity is flagged instead. Classic live migration preserves
 the guest's network identity at the hypervisor layer, so relocation does not
-by itself look like duplication. Concurrent duplication remains a clone via
-the observer path; this only tracks sequential relocation.
+by itself look like duplication. In cloud mode the same rule applies to a
+stopped instance that restarts on a new host or address: it is an authorized
+relocation, not a clone. Concurrent duplication remains a clone via the
+observer path; this only tracks sequential relocation.
 
 ### Clock integrity (snapshot-rollback defense)
 
@@ -98,6 +103,38 @@ writes to local storage, because a VM snapshot or clone would capture those
 local backups along with the data. Use an external destination (SFTP, S3,
 Azure Blob, or GCS). All backups are signed and KEK-wrapped regardless of
 mode.
+
+### Cloud mode (confidential VM)
+
+Cloud mode runs the Regional Server on a confidential VM in a public cloud
+(AWS, Azure, or GCP). It reuses the deployment anchor unchanged: the anchor's
+private key is sealed to the instance vTPM, which a confidential VM presents
+as a TPM 2.0 device. No new identity backend is introduced.
+
+Cloud mode adds three enforcement points on top of the relocation and
+clock-integrity behavior above:
+
+- **Confidential computing is required and attested at boot.** The server
+  verifies a confidential-computing guest is present (the SEV-SNP, TDX, or
+  Nitro guest attestation device) and refuses to start if it is absent. There
+  is no downgrade.
+- **Spot and autoscaled instances are refused.** A single anchored identity is
+  incompatible with an instance the cloud platform can terminate or multiply,
+  so the boot gate halts on a spot, preemptible, autoscaled, or scale-set
+  instance.
+- **The backup KEK must come from the cloud KMS or Vault.** An
+  environment-variable backup KEK is refused for new backups, because it would
+  live in the process memory the confidential VM protects. Restoring an
+  existing backup under any scheme is unaffected.
+
+Because a cloud instance's address can change, the server reconciles its
+certificate SAN at boot against a stable operator DNS name (the primary SAN)
+and the instance IP from metadata (a secondary SAN), re-issuing the leaf under
+the stable anchor when the address set changes. Clients pin the anchor
+fingerprint, not the leaf, so re-issuing on a stop/start or a load-balancer
+change does not break the trust pin. The Tier-1 KEK stays sealed to the
+instance vTPM; keep the recovery code issued at first boot, since a replaced
+host means a new vTPM. The full runbook is docs/cloud-mode.md.
 
 ## Restoring a single client (not a clone)
 

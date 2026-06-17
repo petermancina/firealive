@@ -244,6 +244,45 @@ function loadKmsProviderRow(db, rowId, expectedScheme) {
   return { row, config, credentials };
 }
 
+// ── Cloud Mode backup-KEK posture (D-B5h-5) ─────
+//
+// A backup KEK held in a process environment variable lives in the same memory
+// as the running server, which a confidential VM is meant to protect but which
+// a snapshot/restore or operator misconfiguration could still expose. Cloud
+// Mode therefore refuses an env-var backup KEK for NEW backups and requires a
+// cloud-KMS or Vault provider, so the KEK stays out of process memory. The
+// Tier-1 KEK is unaffected -- it stays sealed to the instance vTPM. This gates
+// WRAPPING only; unwrapKey (restore) accepts any scheme so existing backups
+// remain recoverable.
+
+const CLOUD_BACKUP_KEK_SCHEMES = SUPPORTED_SCHEMES.filter((s) => s !== 'env-var');
+
+function assertCloudBackupKekPosture(scheme, cloud) {
+  if (cloud === true && scheme === 'env-var') {
+    const err = new Error(
+      'backup-key-wrapping: cloud mode requires a cloud-KMS or Vault backup ' +
+      'KEK (one of ' + CLOUD_BACKUP_KEK_SCHEMES.join(', ') + '); an env-var ' +
+      'KEK is refused because it would hold the key in process memory. The ' +
+      'Tier-1 KEK is unaffected and stays sealed to the instance vTPM.',
+    );
+    err.code = 'CLOUD_BACKUP_KEK_REQUIRED';
+    throw err;
+  }
+}
+
+// Lazy, decoupled read of the sealed deployment mode. Returns false when no db
+// is available or the mode cannot be read, so the posture never blocks a
+// non-cloud or db-less wrap.
+function isCloudDeployment(db) {
+  if (!db || typeof db.prepare !== 'function') return false;
+  try {
+    return require('./deployment-mode').isCloud(db) === true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+
 // ── Public: wrapKey ──────────────────────────────────────────────────────────
 
 /**
@@ -285,6 +324,10 @@ async function wrapKey(ephemeralKey, options) {
   if (typeof kekReference !== 'string' || !kekReference) {
     throw new Error('backup-key-wrapping: kekReference required (non-empty string)');
   }
+
+  // Cloud Mode backup-KEK posture (D-B5h-5): refuse an env-var KEK for new
+  // backups in cloud mode. Restore (unwrapKey) is unaffected.
+  assertCloudBackupKekPosture(scheme, isCloudDeployment(db));
 
   ensureProvidersLoaded();
 
@@ -435,6 +478,7 @@ module.exports = {
   // backward compatibility; cloud schemes accept additional options.db)
   wrapKey,
   unwrapKey,
+  assertCloudBackupKekPosture,
 
   // Exported for tests and for diagnostic tools that may want to
   // inspect a wrapped-key.bin without performing crypto.

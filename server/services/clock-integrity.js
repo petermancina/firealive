@@ -7,7 +7,7 @@
 // Time-windowed security checks trust the wall clock: a signed device-action
 // is honored only when its iat falls inside a tight window (now - 120s .. now
 // + 30s in mc-device-action), and short-lived tokens rely on expiry. A virtual
-// machine, however, jumps its wall clock — snapshot restore, pause/resume,
+// machine or cloud instance, however, jumps its wall clock — snapshot restore, pause/resume,
 // live migration, and host scheduling all step Date.now() forward or back. A
 // jumped clock makes "now" untrustworthy: a restored snapshot could replay old
 // signed actions whose iat now reads as current, or revive tokens that should
@@ -18,11 +18,13 @@
 // against how far monotonic time moved since a moving baseline, a wall-clock
 // STEP shows up as divergence, while gradual NTP slew stays within tolerance.
 //
-// In virtualized mode a detected jump fails CLOSED: callers refuse the
+// In virtualized or cloud mode a detected jump fails CLOSED: callers refuse the
 // time-windowed operation rather than trust a clock that just moved. Bare-metal
 // is never gated here — its clock is host-NTP-managed and stable, and the
-// proven bare-metal paths are left exactly as they are. This ADDS a control in
-// the highest-risk environment; it relaxes nothing.
+// proven bare-metal paths are left exactly as they are. A cloud
+// checkpoint/restore steps the clock the same way a VM snapshot does, so cloud
+// is gated like virtualized. This ADDS a control in the highest-risk
+// environments; it relaxes nothing.
 //
 // Scope: this defends against operational clock jumps (snapshot/pause/migrate),
 // which sit inside the guest trust boundary. A malicious hypervisor that sets
@@ -60,14 +62,21 @@ function rebaseline(nowMs, monoNs) {
   baselineMonoNs = monoNs;
 }
 
-// Gate for time-windowed security operations. In virtualized mode a detected
-// wall-clock jump returns ok:false and the caller MUST refuse the operation.
-// Bare-metal always returns ok:true (the anomaly is logged but not gated).
+// Gate for time-windowed security operations. In virtualized or cloud mode a
+// detected wall-clock jump returns ok:false and the caller MUST refuse the
+// operation. Bare-metal always returns ok:true (the anomaly is logged, not
+// gated).
 //
 //   opts.virtualized       boolean; pass app.locals.deploymentMode.virtualized
+//   opts.cloud             boolean; pass app.locals.deploymentMode.cloud
 //   opts.nowMs, opts.monoNs optional injected clocks for deterministic tests
 function checkClockIntegrity(opts) {
   const virtualized = !!(opts && opts.virtualized);
+  const cloud = !!(opts && opts.cloud);
+  // The time-windowed gate applies wherever the wall clock can be checkpoint-
+  // jumped: a VM snapshot (virtualized) or a cloud checkpoint/restore (cloud).
+  const gated = virtualized || cloud;
+  const modeLabel = cloud ? 'cloud' : (virtualized ? 'virtualized' : 'bare-metal');
   const nowMs = (opts && typeof opts.nowMs === 'number') ? opts.nowMs : Date.now();
   const monoNs = (opts && typeof opts.monoNs === 'bigint') ? opts.monoNs : process.hrtime.bigint();
 
@@ -75,8 +84,8 @@ function checkClockIntegrity(opts) {
   // source is untrustworthy and we refuse to vouch for it in virtualized mode.
   if (monoNs < baselineMonoNs) {
     rebaseline(nowMs, monoNs);
-    if (virtualized) {
-      logger.error('Clock integrity: monotonic clock moved backward', { mode: 'virtualized' });
+    if (gated) {
+      logger.error('Clock integrity: monotonic clock moved backward', { mode: modeLabel });
       return { ok: false, jumped: true, skewMs: null, reason: 'monotonic_regressed' };
     }
     return { ok: true, jumped: true, skewMs: null, reason: 'monotonic_regressed_bare_metal' };
@@ -99,11 +108,11 @@ function checkClockIntegrity(opts) {
   logger.warn('Clock integrity: wall-clock jump detected', {
     skewMs: Math.round(skewMs),
     thresholdMs: MAX_DRIFT_MS,
-    mode: virtualized ? 'virtualized' : 'bare-metal',
+    mode: modeLabel,
   });
   rebaseline(nowMs, monoNs);
 
-  if (virtualized) {
+  if (gated) {
     return { ok: false, jumped: true, skewMs: Math.round(skewMs), reason: 'clock_jump_detected' };
   }
   return { ok: true, jumped: true, skewMs: Math.round(skewMs), reason: 'clock_jump_bare_metal_tolerated' };

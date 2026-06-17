@@ -490,6 +490,47 @@ async function start() {
       app.locals.deploymentMode = { mode: 'bare-metal', configured: false, recordPresent: false, virtualized: false, hypervisor: null };
     }
 
+    // B5h: Cloud Mode boot gate (D-B5h-3, D-B5h-4). When the sealed mode is
+    // cloud, confidential computing is REQUIRED and attested before the server
+    // serves any request: verify a confidential-VM guest is present (fail closed
+    // if not), refuse spot / autoscaled / ephemeral-fleet instances, stamp the
+    // attestation, and publish the result on app.locals for the pre-auth gate.
+    // Any error here halts the server -- cloud mode never silently downgrades.
+    if (app.locals.deploymentMode && app.locals.deploymentMode.cloud === true) {
+      try {
+        const cloudAttestation = require('./services/cloud-attestation');
+        const cloudMetadata = require('./services/cloud-metadata');
+        const cloudMode = require('./services/cloud-mode');
+
+        const att = cloudAttestation.verifyAttestation();
+        if (!att.verified) {
+          logger.error('Cloud Mode requires a confidential VM, but confidential computing was not attested; refusing to start (fail-closed, D-B5h-3)', { reason: att.reason });
+          process.exit(1);
+        }
+        logger.info('Confidential computing attested', { tech: att.tech, platformValidationPending: att.platformValidationPending });
+
+        const meta = await cloudMetadata.readCloudMetadata();
+        if (meta && (meta.spot === true || meta.autoscaled === true)) {
+          logger.error('Cloud Mode refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
+          process.exit(1);
+        }
+
+        const attDb = getDb();
+        try {
+          cloudMode.recordAttestation(attDb, { tech: att.tech });
+        } finally {
+          attDb.close();
+        }
+
+        app.locals.cloudAttestation = { verified: true, tech: att.tech, platformValidationPending: att.platformValidationPending, reason: att.reason };
+        app.locals.cloudMetadata = meta || null;
+        logger.info('Cloud Mode attested and sealed', { provider: meta ? meta.provider : null, privateIp: meta ? meta.privateIp : null });
+      } catch (cloudBootErr) {
+        logger.error('Cloud Mode boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
+        process.exit(1);
+      }
+    }
+
     // B5e: record this instance's host for vMotion-vs-clone tracking (D10/D11).
     // The anchor is verified above; in virtualized mode the anchor (vTPM)
     // moving to a new host is an authorized relocation we audit, while a
@@ -505,11 +546,12 @@ async function start() {
         const presence = instanceRegistry.recordHostPresence(hostDb, {
           host: os.hostname(),
           virtualized: mode.virtualized === true,
+          cloud: mode.cloud === true,
           hypervisor: mode.hypervisor || null
         });
         if (presence.migration) {
-          logger.warn('Instance relocated to a new host (authorized vMotion in virtualized mode)', { from: presence.previousHost, to: presence.host });
-          auditLog(null, 'INSTANCE_MIGRATED', 'authorized vMotion from ' + presence.previousHost + ' to ' + presence.host, null);
+          logger.warn('Instance relocated to a new host (authorized relocation in virtualized or cloud mode)', { from: presence.previousHost, to: presence.host });
+          auditLog(null, 'INSTANCE_MIGRATED', 'authorized relocation from ' + presence.previousHost + ' to ' + presence.host, null);
         } else if (presence.unexpected) {
           logger.error('Instance host changed in bare-metal mode (the anchor should be machine-bound); investigate', { from: presence.previousHost, to: presence.host });
           auditLog(null, 'INSTANCE_HOST_CHANGED', 'unexpected bare-metal host change from ' + presence.previousHost + ' to ' + presence.host, null);
@@ -606,6 +648,46 @@ async function start() {
     // B5b: built-in CA + HTTPS/WSS material (fail-closed; no plaintext listener).
     const tlsMaterial = bootstrapTlsMaterial();
     logger.info('TLS material ready (built-in CA)');
+
+    // B5h: in cloud mode, reconcile the server certificate SAN against the
+    // stable operator hostname (primary) and the instance IP from metadata
+    // (secondary), re-issuing under the stable anchor when the address set
+    // changed (D-B5h-6). Clients pin the anchor fingerprint, not the leaf, so
+    // re-issuing on a cloud stop/start or load-balancer change is safe. Guarded:
+    // a reconcile failure keeps the existing cert (still served over the pinned
+    // anchor) rather than halting.
+    if (app.locals.deploymentMode && app.locals.deploymentMode.cloud === true) {
+      try {
+        const cloudMode = require('./services/cloud-mode');
+        const reconcileDb = getDb();
+        try {
+          const cloudCfg = cloudMode.getCloudConfig(reconcileDb) || {};
+          const meta = app.locals.cloudMetadata || {};
+          const reconciled = ca.reconcileServerCert(reconcileDb, {
+            stableHostname: cloudCfg.stableHostname || null,
+            instanceIp: meta.privateIp || null,
+          });
+          if (reconciled.reissued) {
+            const dataDir = path.dirname(DB_PATH);
+            const certPath = path.join(dataDir, 'server-tls.crt');
+            const keyPath = path.join(dataDir, 'server-tls.key');
+            fs.writeFileSync(keyPath, reconciled.keyPem, { mode: 0o600 });
+            fs.writeFileSync(certPath, reconciled.certPem, { mode: 0o644 });
+            try { fs.chmodSync(keyPath, 0o600); } catch (_) { /* best effort */ }
+            tlsMaterial.key = reconciled.keyPem;
+            tlsMaterial.cert = reconciled.certPem;
+            tlsMaterial.ca = reconciled.caCertPem;
+            logger.info('Reconciled server certificate SAN for cloud address', { san: reconciled.desiredSan });
+          } else {
+            logger.info('Server certificate SAN already current for cloud address', { san: reconciled.desiredSan });
+          }
+        } finally {
+          reconcileDb.close();
+        }
+      } catch (reconcileErr) {
+        logger.warn('Cloud SAN reconciliation failed; keeping existing certificate (served over the pinned anchor)', { error: reconcileErr.message });
+      }
+    }
 
     // B5g: re-seal any legacy plaintext forensic / legal-hold export artifacts
     // at rest (idempotent; rows already sealed are skipped). The DB schema and

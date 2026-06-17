@@ -710,7 +710,7 @@ The Global Dashboard carries the same hash-chain + signed-checkpoint integrity o
 
 ### Cloud & IaC
 
-**What it’s for:** Generate Infrastructure-as-Code artifacts to deploy FireAlive on the org’s cloud platform. Supports AWS, Azure, GCP, and **privacy-first European/Swiss providers** (Hetzner Cloud, OVHcloud, Exoscale) for orgs that need data sovereignty (no US CLOUD Act jurisdiction). Outputs span 9 IaC formats (Terraform, Pulumi, CloudFormation, Bicep on Azure, gcp-dm on GCP, docker-compose, docker-manifest, Kubernetes, Helm) across the 6 providers — 39 valid (provider, format) combinations. Bundles are server-rendered, signed with Sigstore Cosign, SBOM-attested via Syft (SPDX-JSON), and persisted in the `cloud_packages` table. A Syft-or-503 / Cosign-or-503 policy means missing tooling fails generation rather than producing an unsigned or unattested bundle. Offline verification uses standard `cosign verify-blob` against the bundle’s public key. See `docs/cloud-iac-generation.md` for the signing pipeline, signing-key rotation procedure, and threat model.
+**What it’s for:** Generate Infrastructure-as-Code artifacts to deploy FireAlive on the org’s cloud platform. Supports AWS, Azure, and GCP. Every generated template provisions FireAlive on a **confidential VM** with a hardware (vTPM) root of trust — an AMD SEV-SNP instance on AWS, an Azure Confidential VM, or a GCP Confidential VM — so the deployment comes up in Cloud Mode with memory encryption and boot attestation rather than as an ordinary cloud instance. Outputs span the per-cloud and portable IaC formats (Terraform, Pulumi, CloudFormation on AWS, Bicep on Azure, gcp-dm on GCP). Bundles are server-rendered, signed, and SBOM-attested, and missing signing tooling fails generation rather than producing an unsigned or unattested bundle. Offline verification works against the bundle’s public key. Managed-container and serverless targets (Kubernetes, Helm, ECS Fargate, Azure Container Instances, Cloud Run) and the European and Swiss providers are no longer generated — those compute models cannot provide the confidential-VM hardware root FireAlive now requires in the cloud. See `docs/cloud-iac-generation.md` and `docs/cloud-mode.md`.
 
 **Workflow:**
 
@@ -719,19 +719,34 @@ The Global Dashboard carries the same hash-chain + signed-checkpoint integrity o
 1. Receives a downloadable bundle with: deployable IaC files, secrets-management mapping (env vars → KMS paths), README with deployment steps
 1. Hands the bundle to platform engineering for deployment
 
+### Cloud Mode
+
+**What it’s for:** Run the FireAlive server on a confidential VM in a public cloud — AWS, Azure, or GCP — with the same anti-cloning identity guarantees as a bare-metal or virtualized install. Cloud Mode is chosen once at first boot, alongside bare-metal and virtualized, and is sealed to the hardware root so it cannot be flipped later.
+
+**What Cloud Mode enforces:**
+
+- **Confidential computing is required.** The server confirms it is running inside a confidential VM (memory-encrypted, hardware-attested) at start-up and refuses to start otherwise. There is no fall-back to an ordinary instance — a cloud deployment that cannot prove confidential computing simply does not come up.
+- **No disposable instances.** Spot, preemptible, autoscaled, and scale-set instances are refused, because a single anchored identity cannot live on an instance the cloud can terminate or clone at will.
+- **Stable trust across changing addresses.** A cloud instance’s IP can change when it stops and restarts or moves behind a load balancer. Cloud Mode anchors trust to a stable operator DNS name you provide, and analyst clients keep trusting the same deployment when the underlying address changes — they never have to re-pin after a routine restart.
+- **Cloud-key-store backups.** Backups must be protected by the cloud’s own key store rather than a key sitting in an environment variable, so backup protection does not depend on the same instance the data lives on.
+
+**Not a container or serverless workload.** Cloud Mode is deliberately *not* Kubernetes, ECS Fargate, Cloud Run, or any managed-container or serverless target. Those compute models do not give FireAlive the per-instance hardware root of trust it depends on, so they are not offered — FireAlive in the cloud is always a confidential VM.
+
+The full operator runbook — platforms, the confidential-VM requirement, the recovery code for instance loss, and the stable-DNS model — is in `docs/cloud-mode.md`.
+
 ### Virtualization
 
-**What it’s for:** Hypervisor / container orchestration integration (VMware vSphere, Hyper-V, Docker, Kubernetes) for orgs that deploy FireAlive in their existing virtual infrastructure. Configures resource pool, datastore, host placement.
+**What it’s for:** Hypervisor integration (VMware vSphere, Hyper-V) for orgs that deploy FireAlive in their existing virtual infrastructure. Configures resource pool, datastore, and host placement.
 
 **Workflow:**
 
 1. Lead picks deployment target type
-1. Enters API endpoint for hypervisor or K8s control plane
+1. Enters the API endpoint for the hypervisor manager
 1. FireAlive deploys into the configured virtualization infrastructure with the right resource constraints
 
 ### Virtualization Mode
 
-**What it’s for:** A deployment-wide mode — bare-metal or virtualized — chosen once at first boot, before any identity is established, and sealed to the hardware root so it cannot be silently flipped afterward. Virtualized mode turns on additive, VM-aware adaptations so every feature works correctly under a hypervisor without weakening the anti-cloning posture. (This is distinct from the Virtualization integration above, which configures a hypervisor or orchestration target; Virtualization Mode is the security posture of the deployment itself.)
+**What it’s for:** A deployment-wide mode — bare-metal, virtualized, or cloud — chosen once at first boot, before any identity is established, and sealed to the hardware root so it cannot be silently flipped afterward. Virtualized mode turns on additive, VM-aware adaptations so every feature works correctly under a hypervisor without weakening the anti-cloning posture; cloud mode builds on those same adaptations and adds the confidential-computing requirements described under Cloud Mode above. (This is distinct from the Virtualization integration above, which configures a hypervisor target; Virtualization Mode is the security posture of the deployment itself.)
 
 **What virtualized mode changes:**
 
@@ -739,7 +754,7 @@ The Global Dashboard carries the same hash-chain + signed-checkpoint integrity o
 - **Clock-integrity, the snapshot-rollback defense** — FireAlive watches wall-clock against monotonic time; a detected backward jump (a VM rolled back to an earlier snapshot, which would also roll back the database) makes time untrusted and fails closed for privileged recovery actions and for enrollment / break-glass authentication until time re-stabilizes. Bare-metal deployments are never gated on clock divergence.
 - **Backup independence** — local backup destinations are refused, because a VM snapshot or clone would capture them; an external destination (SFTP, S3, Azure, or GCS) is required. All backups are signed and KEK-wrapped regardless of mode.
 
-Step-up user verification stays required in every mode — there is no VDI or virtualized relaxation. Confidential computing (AMD SEV-SNP / Intel TDX) is a documented deployment recommendation, not a runtime gate. The full picture is in `docs/anti-cloning-and-virtualization.md`.
+Step-up user verification stays required in every mode — there is no VDI or virtualized relaxation. Confidential computing is a documented recommendation under virtualized mode, but under cloud mode it is a hard runtime gate: a cloud deployment that cannot attest a confidential VM refuses to start. The full picture is in `docs/anti-cloning-and-virtualization.md`.
 
 ### SDN
 

@@ -170,14 +170,16 @@ function currentStatus(db) {
 }
 
 // ──── Host presence / vMotion-vs-clone (D10, D11) ────────────────────────────
-// The hardware anchor binds this identity. In VIRTUALIZED mode the anchor (a
-// vTPM) migrates with the VM, so the same anchor reappearing on a new host is
-// an authorized relocation (vMotion) that we record and audit. In BARE-METAL
-// the anchor is bound to the physical machine, so a host change is unexpected
-// and flagged. This is ORTHOGONAL to the clone guard: two CONCURRENT sources
-// under one identity remain a clone (see classify, sameIdentityDifferentSource)
-// regardless of mode -- a relocation is sequential, a clone is simultaneous, so
-// recording a relocation here never relaxes clone detection.
+// The hardware anchor binds this identity. In VIRTUALIZED or CLOUD mode the
+// anchor (a vTPM, including a cloud vTPM) migrates with the VM or cloud
+// instance, so the same anchor reappearing on a new host -- a vMotion, or a
+// cloud stop/start that returns on a new address -- is an authorized relocation
+// that we record and audit. In BARE-METAL the anchor is bound to the physical
+// machine, so a host change is unexpected and flagged. This is ORTHOGONAL to the
+// clone guard: two CONCURRENT sources under one identity remain a clone (see
+// classify, sameIdentityDifferentSource) regardless of mode -- a relocation is
+// sequential, a clone is simultaneous, so recording a relocation here never
+// relaxes clone detection.
 const HOST_KEY = 'instance_host';
 
 function getHomeHost(db) {
@@ -194,19 +196,24 @@ function writeHomeHost(db, rec) {
 }
 
 // Record the host this instance is running on and classify any change. The
-// caller passes virtualized (from the sealed deployment mode) and a best-effort
-// host descriptor and hypervisor hint. Returns:
+// caller passes virtualized and cloud (from the sealed deployment mode) and a
+// best-effort host descriptor and hypervisor hint. Returns:
 //   { changed, migration, unexpected, host, previousHost, firstSeen }
-// migration  = authorized vMotion (host changed, virtualized mode)
+// migration  = authorized relocation (host changed in virtualized or cloud mode)
 // unexpected = host changed in bare-metal mode (anchor should be machine-bound)
 function recordHostPresence(db, opts) {
   opts = opts || {};
   const host = opts.host || 'unknown';
   const virtualized = opts.virtualized === true;
+  const cloud = opts.cloud === true;
+  // The anchor migrates with the VM (vMotion) or the cloud instance (stop/start),
+  // so a host change in either mode is an authorized relocation, not a clone.
+  const relocatable = virtualized || cloud;
   const prev = getHomeHost(db);
   const rec = {
     host: host,
     virtualized: virtualized,
+    cloud: cloud,
     hypervisor: opts.hypervisor || null,
     since: new Date().toISOString()
   };
@@ -220,8 +227,8 @@ function recordHostPresence(db, opts) {
   writeHomeHost(db, rec);
   return {
     changed: true,
-    migration: virtualized,
-    unexpected: !virtualized,
+    migration: relocatable,
+    unexpected: !relocatable,
     host: host,
     previousHost: prev.host,
     firstSeen: false

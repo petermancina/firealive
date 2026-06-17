@@ -1,12 +1,12 @@
 # Cloud & IaC Bundle Generation
 
-FireAlive ships a server-side cloud-deployment-bundle generator that produces signed, SBOM-attested infrastructure-as-code packages for six cloud providers across nine IaC formats. This document describes the architecture, the signing pipeline, the operating procedures, and the offline verification workflow.
+FireAlive ships a server-side cloud-deployment-bundle generator that produces signed, SBOM-attested infrastructure-as-code packages for three cloud providers (AWS, Azure, and GCP) across five IaC formats. This document describes the architecture, the signing pipeline, the operating procedures, and the offline verification workflow.
 
 ## Why this exists
 
 Operators deploying FireAlive into a new cloud environment historically faced three problems:
 
-- **Template drift.** Hand-written Terraform/Pulumi/Helm files in random GitHub gists rarely match the version of FireAlive being deployed. Operators paste a config from a year ago and silently lose a security control that the current server expects.
+- **Template drift.** Hand-written Terraform, Pulumi, or CloudFormation files in random GitHub gists rarely match the version of FireAlive being deployed. Operators paste a config from a year ago and silently lose a security control that the current server expects.
 - **No supply-chain attestation.** Downloading an IaC bundle from a vendor's website is a download without provenance. There is no way to verify that the bundle was produced by the operator's own FireAlive instance versus altered in transit by a CDN compromise or man-in-the-middle.
 - **No software bill of materials.** Operators applying a bundle have no machine-readable inventory of what's inside — which container images, which package versions, which transitive dependencies — and therefore cannot answer the question "is my deployment vulnerable to CVE-XXXX-YYYY?".
 
@@ -16,7 +16,7 @@ The cloud-iac-bundle generator resolves all three by rendering bundles server-si
 
 The generator lives at two architectural locations:
 
-- **MC-side:** `server/services/cloud-iac-generator.js` (the orchestrator), plus 9 template renderer modules under `server/services/cloud-iac-templates/`, plus `server/services/sbom-generator.js`, `server/services/cosign-signer.js`, and `server/services/cloud-iac-signing-keys.js`. Routes are at `server/routes/cloud.js` mounted at `/api/cloud`.
+- **MC-side:** `server/services/cloud-iac-generator.js` (the orchestrator), plus 5 template renderer modules under `server/services/cloud-iac-templates/`, plus `server/services/sbom-generator.js`, `server/services/cosign-signer.js`, and `server/services/cloud-iac-signing-keys.js`. Routes are at `server/routes/cloud.js` mounted at `/api/cloud`.
 - **GD-side:** `packages/global-dashboard-server/services/cloud-iac-bundle.js` (a consolidated single-file module containing the equivalent orchestrator + 9 renderers + signing-key helpers), plus `packages/global-dashboard-server/services/gd-encryption.js` for the Tier-1 KEK-wrap of stored signing keys. Routes are inlined into `packages/global-dashboard-server/index.js` at `/api/cloud`.
 
 Both sides expose the same `/api/cloud/*` route surface:
@@ -35,18 +35,19 @@ The two surfaces differ only in deployment target: MC bundles target the FireAli
 
 ## The provider × IaC-tool matrix
 
-Six providers, nine IaC tools, 39 combinations:
+Three providers, five IaC formats, nine combinations:
 
-| Provider | Terraform | Pulumi | CloudFormation | Bicep | gcp-dm | docker-compose | docker-manifest | Kubernetes | Helm |
-|----------|-----------|--------|----------------|-------|--------|----------------|-----------------|------------|------|
-| aws      | ✓         | ✓      | ✓              | —     | —      | ✓              | ✓               | ✓          | ✓    |
-| azure    | ✓         | ✓      | —              | ✓     | —      | ✓              | ✓               | ✓          | ✓    |
-| gcp      | ✓         | ✓      | —              | —     | ✓      | ✓              | ✓               | ✓          | ✓    |
-| hetzner  | ✓         | ✓      | —              | —     | —      | ✓              | ✓               | ✓          | ✓    |
-| ovhcloud | ✓         | ✓      | —              | —     | —      | ✓              | ✓               | ✓          | ✓    |
-| exoscale | ✓         | ✓      | —              | —     | —      | ✓              | ✓               | ✓          | ✓    |
+| Provider | Terraform | Pulumi | CloudFormation | Bicep | gcp-dm |
+|----------|-----------|--------|----------------|-------|--------|
+| aws      | ✓         | ✓      | ✓              | —     | —      |
+| azure    | ✓         | ✓      | —              | ✓     | —      |
+| gcp      | ✓         | ✓      | —              | —     | ✓      |
 
-Provider-specific formats — CloudFormation on AWS, Bicep on Azure, gcp-dm on GCP — produce the cloud-native template format that operators using that cloud's official tooling expect. Cross-cloud formats (Terraform, Pulumi, Kubernetes, Helm) produce portable templates that work across all six providers with the same FireAlive deployment.
+Provider-specific formats — CloudFormation on AWS, Bicep on Azure, gcp-dm on GCP — produce the cloud-native template format that operators using that cloud's official tooling expect. Terraform and Pulumi produce portable templates that work across all three providers with the same FireAlive deployment.
+
+Every template provisions FireAlive on a **confidential VM** with a vTPM hardware root of trust — an AMD SEV-SNP instance with NitroTPM on AWS, an Azure Confidential VM with Trusted Launch, or a GCP Confidential VM with Shielded VM — and stamps `deployment_mode = cloud`. Confidential computing is required by Cloud Mode and attested at boot. Managed-container compute (ECS Fargate, Azure Container Instances, Cloud Run, Kubernetes, Helm) and the privacy-focused European and Swiss providers (Hetzner, OVHcloud, Exoscale) are no longer emitted by the Regional Server generator: managed-container services do not provide a vTPM or VM-level memory encryption, and no shared-cloud confidential VM is offered by those providers. See docs/cloud-mode.md.
+
+The matrix above describes the MC (Regional Server) generator. The Global Dashboard server runs its own generator; pruning it to this same confidential-VM set is a planned fast-follow, so until then the GD generator still offers the prior provider and format set.
 
 ## The signing pipeline
 

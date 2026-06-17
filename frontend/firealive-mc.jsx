@@ -2403,14 +2403,15 @@ function ManagementConsole() {
   const [iacTool, setIacTool] = useState("");
   const [iacResult, setIacResult] = useState(null);
   const [iacBusy, setIacBusy] = useState(false);
+  // B5h Cloud Mode: confidential-VM platform + stable DNS for the guide below.
+  const [cloudModeProvider, setCloudModeProvider] = useState("");
+  const [cloudModeDns, setCloudModeDns] = useState("");
   const IAC_TOOLS_BY_PROVIDER = {
-    aws:      ["terraform","pulumi","cloudformation","docker-compose","docker-manifest","kubernetes","helm"],
-    azure:    ["terraform","pulumi","bicep","docker-compose","docker-manifest","kubernetes","helm"],
-    gcp:      ["terraform","pulumi","gcp-dm","docker-compose","docker-manifest","kubernetes","helm"],
-    hetzner:  ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
-    ovhcloud: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
-    exoscale: ["terraform","pulumi","docker-compose","docker-manifest","kubernetes","helm"],
+    aws:   ["terraform","pulumi","cloudformation"],
+    azure: ["terraform","pulumi","bicep"],
+    gcp:   ["terraform","pulumi","gcp-dm"],
   };
+  const CLOUD_MODE_LABELS = { aws:"AWS (SEV-SNP + NitroTPM)", azure:"Azure Confidential VM (Trusted Launch)", gcp:"GCP Confidential VM (Shielded VM)" };
   // R3l C69: mock backups now include backup_strategy + parent chain
   // fields so demo mode shows the new strategy badges and a 2-link chain
   // example. Real backups loaded from /api/backup carry these fields
@@ -5266,87 +5267,40 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* CLOUD */}
         {tab==="cloud"&&(<div>
-          <L>Cloud Architecture & Migration</L>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:20}}>
-            {[{id:"aws",name:"AWS",color:"#FF9900",services:"EKS · Aurora · S3 · KMS · Kinesis · SNS · Lambda · Cognito",serverless:"Fargate + Aurora Serverless v2 + API Gateway"},
-              {id:"gcp",name:"GCP",color:"#4285F4",services:"GKE · Cloud SQL · Storage · KMS · Pub/Sub · Cloud Run · Identity Platform",serverless:"Cloud Run + Cloud SQL + Pub/Sub triggers"},
-              {id:"azure",name:"Azure",color:"#0078D4",services:"AKS · Azure SQL · Blob · Key Vault · Event Hubs · Functions · Entra ID · Sentinel",serverless:"Container Apps + Azure SQL Serverless + Event Grid"},
-            ].map(c=>(
-              <Card key={c.id} style={{borderTop:`3px solid ${c.color}`,cursor:"pointer"}} onClick={()=>setShowCloudWF(c.id)}>
-                <div style={{fontSize:16,fontWeight:600,color:c.color,marginBottom:8}}>{c.name}</div>
-                <M style={{color:C.tm,lineHeight:1.8,display:"block",marginBottom:10}}>{c.services}</M>
-                <div style={{borderTop:`1px solid ${C.b}`,paddingTop:8}}><M style={{color:C.a,fontWeight:500}}>Serverless:</M><br/><M style={{color:C.tm}}>{c.serverless}</M></div>
-                <M style={{color:c.color,display:"block",marginTop:10}}>Click for migration workflow →</M>
-              </Card>
-            ))}
-          </div>
-          <L>Privacy-First Cloud Platforms</L>
-          <M style={{color:C.tm,display:"block",marginBottom:12}}>European/Swiss cloud providers with strong data sovereignty and privacy protections. No US CLOUD Act jurisdiction. Data stays in-country.</M>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:20}}>
-            {[{id:"hetzner",name:"Hetzner Cloud",color:"#D50C2D",country:"Germany",services:"VPS · Block Storage · Load Balancers · Firewalls · Volumes",note:"GDPR-native. No data sharing with non-EU authorities. Cost-effective."},
-              {id:"ovhcloud",name:"OVHcloud",color:"#000E9C",country:"France",services:"Dedicated Servers · Public Cloud · Managed K8s · Object Storage",note:"EU data residency guaranteed. SOC 2 / ISO 27001 / HDS certified."},
-              {id:"exoscale",name:"Exoscale",color:"#DA291C",country:"Switzerland/Austria",services:"Compute · Object Storage · Managed DBaaS · DNS · Load Balancers",note:"Swiss data protection. Built for regulated industries. FINMA compliant."},
-            ].map(c=>(
-              <Card key={c.id} style={{borderTop:`3px solid ${c.color}`,cursor:"pointer"}} onClick={()=>setShowCloudWF(c.id)}>
-                <div style={{fontSize:14,fontWeight:600,color:c.color,marginBottom:4}}>{c.name}</div>
-                <Badge color={C.p}>{c.country}</Badge>
-                <M style={{color:C.tm,lineHeight:1.8,display:"block",marginTop:8,marginBottom:8}}>{c.services}</M>
-                <M style={{color:C.i,display:"block",fontStyle:"italic"}}>{c.note}</M>
-              </Card>
-            ))}
-          </div>
-          <div style={{display:"flex",gap:10,marginBottom:20}}>
-            <Btn primary onClick={()=>setShowIaC(true)}>Generate Infrastructure as Code</Btn>
-            <Btn onClick={()=>setShowCloudWF("data-only")}>Data Export Only (no migration)</Btn>
-          </div>
-          <Card>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Container Specifications</div>
-            <M style={{color:C.t,lineHeight:2}}>
-              • Distroless Docker images · Non-root · Read-only FS<br/>
-              • Helm charts + Terraform modules for all 3 clouds<br/>
-              • Multi-AZ HA · HPA auto-scaling · Blue/green deploys<br/>
-              • mTLS between services (Istio) · Network policies enforce Tier-3 isolation<br/>
-              • Secrets via cloud KMS · Auto-rotated · Never in env vars
-            </M>
+          <L>Cloud Mode (Confidential VM)</L>
+          <Card style={{borderColor:C.a+"40",marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:8}}>Confidential computing required</div>
+            <M style={{color:C.tm,lineHeight:1.7,display:"block"}}>Cloud Mode runs FireAlive on a confidential VM with a vTPM hardware root of trust on AWS, Azure, or GCP. VM memory is encrypted (AMD SEV-SNP) and confidential computing is attested at boot; FireAlive refuses to seal cloud mode if it is absent, and refuses spot, autoscaled, or ephemeral-fleet instances. The Tier-1 key stays sealed to the instance vTPM, and the backup KEK must come from the cloud KMS or Vault, never an environment variable.</M>
           </Card>
-
-          {showCloudWF&&showCloudWF!=="data-only"&&<Modal title={`${showCloudWF.toUpperCase()} Migration Workflow`} onClose={()=>setShowCloudWF(null)} width={560}>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Step-by-step migration. Container images are cloud-agnostic — no recoding needed.</M>
-            {(showCloudWF==="aws"?[
-              {s:1,t:"Create VPC + subnets",d:"Terraform: vpc module. Private subnets for EKS, public for ALB."},
-              {s:2,t:"Deploy EKS cluster",d:"eksctl or Terraform. Enable IRSA for pod-level IAM."},
-              {s:3,t:"Deploy Aurora PostgreSQL",d:"Multi-AZ. Enable encryption. Separate instances for Tier-1 and Tier-3."},
-              {s:4,t:"Configure S3 buckets",d:"Backup bucket (versioned, Object Lock). CEF stream archive."},
-              {s:5,t:"Deploy via Helm",d:"helm install soc-wellbeing ./charts --set cloud=aws"},
-              {s:6,t:"Configure Cognito",d:"SAML federation with corporate AD. MFA enforcement."},
-              {s:7,t:"Set up Kinesis",d:"CEF stream → Kinesis Data Firehose → SIEM or S3."},
-              {s:8,t:"Enable monitoring",d:"CloudWatch Container Insights + GuardDuty + WAF on ALB."},
-            ]:showCloudWF==="gcp"?[
-              {s:1,t:"Create VPC + Cloud NAT",d:"Terraform: google_compute_network. Private GKE cluster."},
-              {s:2,t:"Deploy GKE Autopilot",d:"Managed node pools. Workload Identity for IAM."},
-              {s:3,t:"Deploy Cloud SQL",d:"HA PostgreSQL. Separate instances for Tier-1/Tier-3."},
-              {s:4,t:"Configure Cloud Storage",d:"Dual-region. CMEK encryption. Retention policies."},
-              {s:5,t:"Deploy via Helm",d:"helm install soc-wellbeing ./charts --set cloud=gcp"},
-              {s:6,t:"Configure Identity Platform",d:"SAML/OIDC with corporate AD. MFA required."},
-              {s:7,t:"Set up Pub/Sub",d:"CEF stream → Pub/Sub → Chronicle or BigQuery."},
-              {s:8,t:"Enable monitoring",d:"Cloud Monitoring + Cloud Armor + Security Command Center."},
-            ]:[
-              {s:1,t:"Create Resource Group + VNet",d:"Terraform: azurerm_virtual_network. Private AKS."},
-              {s:2,t:"Deploy AKS",d:"Managed identity. Azure AD pod identity."},
-              {s:3,t:"Deploy Azure SQL",d:"Geo-replicated. TDE encryption. Separate for Tier-1/Tier-3."},
-              {s:4,t:"Configure Blob Storage",d:"Immutable. WORM. RA-GRS for geo-redundancy."},
-              {s:5,t:"Deploy via Helm",d:"helm install soc-wellbeing ./charts --set cloud=azure"},
-              {s:6,t:"Configure Entra ID",d:"SAML SSO with corporate AD. Conditional Access + MFA."},
-              {s:7,t:"Set up Event Hubs",d:"CEF stream → Event Hubs → Sentinel (native integration)."},
-              {s:8,t:"Enable monitoring",d:"Azure Monitor + Application Gateway WAF + Defender for Containers."},
-            ]).map(step=>(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+            <Sel label="Cloud platform" value={cloudModeProvider} onChange={e=>setCloudModeProvider(e.target.value)}>
+              <option value="">Select platform...</option>
+              <option value="aws">AWS (SEV-SNP + NitroTPM)</option>
+              <option value="azure">Azure (Confidential VM + Trusted Launch)</option>
+              <option value="gcp">GCP (Confidential VM + Shielded VM)</option>
+            </Sel>
+            <Input label="Stable DNS hostname" value={cloudModeDns} onChange={e=>setCloudModeDns(e.target.value)} placeholder="soc.example.com" maxLength={253}/>
+          </div>
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Deployment guide</div>
+            {[
+              {s:1,t:"Provision a confidential VM",d:cloudModeProvider?("Launch a "+CLOUD_MODE_LABELS[cloudModeProvider]+" instance. Use an on-demand instance only; spot, autoscaled, and ephemeral-fleet instances are refused."):"Select a platform above, then launch an on-demand confidential VM. Spot and autoscaled instances are refused."},
+              {s:2,t:"Generate and apply IaC",d:"Use Generate Infrastructure as Code below to produce a signed bundle for your platform and format, then apply it."},
+              {s:3,t:"Point stable DNS at the instance",d:cloudModeDns?("Create an A/AAAA record for "+cloudModeDns+". This operator DNS name is the primary certificate SAN; clients reach the server here."):"Create a stable A/AAAA record (operator DNS). It becomes the primary certificate SAN; the instance IP is a secondary SAN."},
+              {s:4,t:"Set the backup KEK to cloud KMS",d:"Configure the v2 backup engine to wrap keys with the provider KMS or Vault. An environment-variable backup KEK is refused in cloud mode."},
+              {s:5,t:"Start FireAlive and seal cloud mode",d:"On first boot the server attests confidential computing, refuses to continue if it is absent, and seals cloud mode to the instance vTPM. Keep the recovery code for instance loss."},
+              {s:6,t:"Clients pin the instance anchor",d:"Clients trust the instance anchor fingerprint, not the leaf certificate, so the server certificate is re-issued automatically when the cloud address changes."},
+            ].map(step=>(
               <div key={step.s} style={{display:"flex",gap:12,marginBottom:12}}>
                 <div style={{width:24,height:24,borderRadius:"50%",background:C.ad,border:`1px solid ${C.a}40`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:C.a,fontWeight:600,flexShrink:0}}>{step.s}</div>
                 <div><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:2}}>{step.t}</div><M style={{color:C.tm}}>{step.d}</M></div>
               </div>
             ))}
-            <Btn primary style={{width:"100%",marginTop:16}} onClick={()=>{addA("MIGRATION_STARTED",`${showCloudWF.toUpperCase()} migration workflow initiated`);setShowCloudWF(null);}}>Start Migration Workflow →</Btn>
-          </Modal>}
+          </Card>
+          <div style={{display:"flex",gap:10,marginBottom:20}}>
+            <Btn primary onClick={()=>setShowIaC(true)}>Generate Infrastructure as Code</Btn>
+            <Btn onClick={()=>setShowCloudWF("data-only")}>Data Export Only (no migration)</Btn>
+          </div>
 
           {showCloudWF==="data-only"&&<Modal title="Data Export Configuration" onClose={()=>setShowCloudWF(null)}>
             <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Send team capacity metrics to a cloud platform without migrating the application. Useful for centralized dashboards or data lakes.</M>
@@ -5363,9 +5317,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <option value="aws">AWS</option>
               <option value="azure">Azure</option>
               <option value="gcp">GCP</option>
-              <option value="hetzner">Hetzner (DE)</option>
-              <option value="ovhcloud">OVHcloud (FR)</option>
-              <option value="exoscale">Exoscale (CH)</option>
             </Sel>
             {iacProvider&&<Sel label="IaC Format" value={iacTool} onChange={e=>{setIacTool(e.target.value);setIacResult(null);}}>
               <option value="">Select format...</option>
@@ -5437,11 +5388,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* VIRTUALIZATION — NEW v0.0.9 */}
         {tab==="virt"&&(<div>
           <L>Virtualization Compatibility</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>The platform is designed to run in virtualized environments. Configure integration with your hypervisor/container orchestration layer.</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>The platform is designed to run in virtualized environments. Configure integration with your hypervisor or virtualization layer.</M>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Supported Environments</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
-              {[{n:"Container Orchestration",items:["Kubernetes (EKS/GKE/AKS)","Docker Swarm","Nomad","OpenShift"],c:C.a},{n:"Hypervisor Platforms",items:["VMware vSphere/ESXi","Hyper-V","KVM/QEMU","Proxmox VE","Nutanix AHV"],c:C.i},{n:"VDI / Remote Desktop",items:["Citrix Virtual Apps","VMware Horizon","AWS WorkSpaces","Azure Virtual Desktop"],c:C.p}].map((cat,i)=>(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              {[{n:"Hypervisor Platforms",items:["VMware vSphere/ESXi","Hyper-V","KVM/QEMU","Proxmox VE","Nutanix AHV"],c:C.i},{n:"VDI / Remote Desktop",items:["Citrix Virtual Apps","VMware Horizon","AWS WorkSpaces","Azure Virtual Desktop"],c:C.p}].map((cat,i)=>(
                 <Card key={i} style={{borderTop:`3px solid ${cat.c}`}}>
                   <div style={{fontSize:12,fontWeight:500,color:cat.c,marginBottom:8}}>{cat.n}</div>
                   {cat.items.map((item,j)=><M key={j} style={{color:C.tm,display:"block",lineHeight:1.8}}>{item}</M>)}
@@ -5450,8 +5401,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </div>
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>VM/Container Configuration</div>
-            <Sel label="Deployment target"><option value="">Select...</option><option value="k8s">Kubernetes cluster</option><option value="docker">Docker Compose</option><option value="vm">Virtual Machine (OVA/QCOW2)</option><option value="vdi">VDI image</option></Sel>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>VM Configuration</div>
+            <Sel label="Deployment target"><option value="">Select...</option><option value="vm">Virtual Machine (OVA/QCOW2)</option><option value="vdi">VDI image</option></Sel>
             <Input label="vCenter / Cluster API endpoint" placeholder="https://vcenter.corp.local/sdk" maxLength={512}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               <Input label="Resource pool" placeholder="SOC-Wellbeing-Pool" maxLength={100}/>
@@ -5459,7 +5410,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </div>
             <Card style={{padding:12,marginTop:8,borderColor:C.a+"30"}}>
               <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Compatibility Notes</M>
-              <M style={{color:C.tm,lineHeight:1.8}}>Platform runs as distroless containers (no shell, no package manager). Compatible with any OCI-compliant runtime. vTPM support required for anti-rollback attestation on VMs. Nested virtualization supported but not required. GPU not required. Minimum: 2 vCPU, 4GB RAM, 20GB storage per service pod.</M>
+              <M style={{color:C.tm,lineHeight:1.8}}>vTPM support is required for anti-rollback attestation on VMs. Nested virtualization is supported but not required. GPU not required. Minimum: 2 vCPU, 4GB RAM, 20GB storage.</M>
             </Card>
             <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"VIRT_CONFIGURED",detail:"Virtualization target configured"}).then(()=>addA("VIRT_CONFIGURED","Virtualization target configured"))}>Save Configuration</Btn>
           </Card>
@@ -9744,6 +9695,7 @@ function DeploymentSetup({ onComplete }) {
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
         {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
+        {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.")}
       </div>
       {err && <M style={{color:C.d,fontSize:10}}>{err}</M>}
     </div>
