@@ -119,7 +119,7 @@ module.exports = (checks) => ({
       id: '§21',
       name: 'Access Obligation',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history). §21 requires organisations to provide individuals with their personal data and information about how it has been used or disclosed within the past year; response workflow is operator-side.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. §21 requires organisations to provide individuals with their personal data and information about how it has been used or disclosed within the past year; the subject can self-serve or an admin can initiate the export.',
     },
     {
       id: '§22',
