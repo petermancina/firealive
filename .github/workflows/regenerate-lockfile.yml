@@ -1,0 +1,48 @@
+# Regenerate the committed root package-lock.json so it matches the current
+# package.json (dependency ranges and any overrides), then open a pull request
+# with the change. Run on demand from the Actions tab (workflow_dispatch).
+#
+# The release build resolves dependencies in an ephemeral runner and never
+# commits the resulting lockfile, so this workflow is how an updated lockfile
+# lands in the repo. main is protected, so the job opens a PR rather than
+# pushing directly -- a PR is the only way an automated job can land a change
+# on a protected branch.
+name: Regenerate lockfile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  regenerate-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Resolve dependencies and rewrite the lockfile
+        run: npm install --ignore-scripts
+      - name: Open a PR if the lockfile changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- package-lock.json; then
+            echo "package-lock.json is already up to date; nothing to do."
+            exit 0
+          fi
+          branch="chore/regenerate-lockfile-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add package-lock.json
+          git commit -m "Regenerate package-lock.json"
+          git push origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Regenerate package-lock.json" \
+            --body "Automated. Regenerates the committed package-lock.json so it matches the current package.json (dependency ranges and any overrides). Review the diff before merging."
