@@ -132,7 +132,7 @@ module.exports = (checks) => ({
       id: 'Art.32',
       name: 'Disclosure to Data Subject',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history). Art.32 (2020 amendments) strengthened the right of disclosure including in electronic form per data subject\'s choice; response workflow is operator-side.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. Art.32 (2020 amendments) strengthened the right of disclosure including in electronic form per the data subject\'s choice; the subject can self-serve or an admin can initiate the export.',
     },
     {
       id: 'Art.33-34',
