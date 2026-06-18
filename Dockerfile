@@ -1,11 +1,13 @@
 FROM node:24-alpine AS builder
 WORKDIR /app
 RUN addgroup -g 1001 firealive && adduser -u 1001 -G firealive -s /bin/sh -D firealive
-COPY package.json ./
-RUN npm ci --production && npm cache clean --force
+COPY package.json package-lock.json ./
+RUN npm ci --production --workspaces=false && npm cache clean --force
+COPY packages/shared/ ./node_modules/@firealive/shared/
 COPY server/ ./server/
 COPY .env.example .env
-RUN find server/ -name "*.js" -exec sha256sum {} \; > /app/integrity-manifest.sha256
+RUN find server/ -name "*.js" -exec sha256sum {} \; > /app/integrity-manifest.sha256 \
+ && find node_modules/@firealive/shared -name "*.js" -exec sha256sum {} \; >> /app/integrity-manifest.sha256
 FROM node:24-alpine
 WORKDIR /app
 # B5b: the built-in CA issues certificates by shelling out to the openssl CLI.

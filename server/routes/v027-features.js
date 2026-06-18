@@ -11,7 +11,6 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
-const { version } = require('../lib/version');
 
 // ── Proactive Break Interventions ───────────────────────────────────────────
 router.get('/proactive/config', (req, res) => {
@@ -236,41 +235,6 @@ router.post('/client/self-scan', (req, res) => {
     db.close();
     res.json(results);
   } catch (e) { res.status(500).json({ error: 'Self-scan failed' }); }
-});
-
-// ── Legal Hold ──────────────────────────────────────────────────────────────
-router.post('/legal-hold/export', (req, res) => {
-  try {
-    const { hashAlgorithm, format, repository } = req.body;
-    const db = getDb();
-
-    // Gather all data for legal hold
-    const auditLogs = db.prepare("SELECT * FROM audit_log ORDER BY timestamp").all();
-    const users = db.prepare("SELECT id, pseudonym, role, created_at FROM users").all(); // No names
-    const config = db.prepare("SELECT * FROM config").all();
-
-    const exportData = {
-      exportType: 'legal_hold',
-      version,
-      exportedAt: new Date().toISOString(),
-      chainOfCustody: {
-        exportedBy: req.user?.id || 'system',
-        purpose: 'Legal hold / e-discovery',
-        retentionPolicy: 'indefinite until hold released',
-      },
-      data: { auditLogs, users, configCount: config.length },
-    };
-
-    // Hash the export
-    const dataStr = JSON.stringify(exportData);
-    const hash = crypto.createHash(hashAlgorithm === 'sha512' ? 'sha512' : 'sha256').update(dataStr).digest('hex');
-    exportData.integrityHash = { algorithm: hashAlgorithm, value: hash };
-
-    auditLog(req.user?.id || 'system', 'LEGAL_HOLD_EXPORT', `Format: ${format}, hash: ${hashAlgorithm}, records: ${auditLogs.length}`);
-    db.close();
-
-    res.json(exportData);
-  } catch (e) { res.status(500).json({ error: 'Legal hold export failed' }); }
 });
 
 // ── Risk Register Asset ─────────────────────────────────────────────────────

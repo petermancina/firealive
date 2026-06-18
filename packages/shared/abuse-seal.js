@@ -1,15 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — reviewer-only sealed envelope for abuse-flag content (multi-reviewer
-// zero-access). Anyone can SEAL to the active reviewer recipient SET (their
-// PUBLIC keys, registered with the server); any one designated reviewer OPENS
+// FIREALIVE — lead-only sealed envelope for abuse-flag content (multi-lead
+// zero-access). Anyone can SEAL to the active lead recipient SET (their
+// PUBLIC keys, registered with the server); any one designated lead OPENS
 // with their OWN private key on their OWN device. The server stores only the
 // sealed bytes and cannot read them, and no shared private key exists -- adding
-// a reviewer is adding another public key to the set, not copying a secret.
+// a lead is adding another public key to the set, not copying a secret.
 //
 // Construction (X25519 ECIES over Node's built-in crypto -- no native or WASM
 // dependency, so it builds in any Electron main process and is fully testable
 // offline; the seal side runs in the AC/MC main process, the open side in the
-// reviewer's Abuse Review Console main process). A random 32-byte content key
+// lead's Management Console main process). A random 32-byte content key
 // (DEK) encrypts the content under AES-256-GCM, and the DEK is separately
 // ECIES-wrapped to each recipient public key (ephemeral X25519 -> HKDF-SHA256
 // -> AES-256-GCM). Each slot is tagged with an 8-byte SHA-256(SPKI) fingerprint
@@ -27,8 +27,8 @@
 //
 // Public keys are X25519 in SPKI DER form (44 bytes), base64 in the registry/API.
 // Both ends share THIS module so the seal and open formats can never diverge.
-// This module also exports a passphrase-wrap layer (FAWK) used by the ARC to
-// protect the reviewer's private key at rest -- see the section near the bottom.
+// This module also exports a passphrase-wrap layer (FAWK) used by the MC to
+// protect the lead's private key at rest -- see the section near the bottom.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
@@ -45,7 +45,7 @@ function pubSpki(keyObj) {
   return keyObj.export({ format: 'der', type: 'spki' });
 }
 
-// Generate a reviewer keypair (used by the ARC at first run; PR F). Returns the
+// Generate a lead keypair (used by the MC at first run; PR F). Returns the
 // public key as SPKI-DER base64 (to register via POST /api/abuse-review-key) and
 // the private key as PKCS8-DER base64 (to seal locally via Electron safeStorage).
 function generateReviewerKeypair() {
@@ -59,7 +59,7 @@ function generateReviewerKeypair() {
 
 // Seal plaintext to MANY recipient public keys at once (multi-recipient envelope).
 // recipientPubB64List is a non-empty array of SPKI-DER base64 keys (the active
-// reviewer set from GET /api/abuse-review-keys). Returns base64.
+// lead set from GET /api/abuse-review-keys). Returns base64.
 
 const MAGIC2 = Buffer.from('FAS2', 'utf8');              // FireAlive Abuse Seal v2 (multi-recipient)
 const INFO2 = Buffer.from('firealive-abuse-seal-v2-wrap', 'utf8');
@@ -69,7 +69,7 @@ const MAX_RECIPIENTS = 255;                              // nRecipients is a sin
 
 // 8-byte fingerprint of a recipient public key (SPKI-DER base64). Used to tag and
 // later locate each recipient's slot in a FAS2 value. Both seal and open derive it
-// the same way, so a reviewer can find their slot from their own key.
+// the same way, so a lead can find their slot from their own key.
 function fingerprintForPubB64(recipientPubB64) {
   const spki = Buffer.from(recipientPubB64, 'base64');
   return crypto.createHash('sha256').update(spki).digest().subarray(0, FP_LEN);
@@ -84,7 +84,7 @@ function publicKeyB64FromPrivate(privateKeyB64) {
 
 // Seal plaintext to MANY recipient public keys at once (multi-recipient envelope).
 // recipientPubB64List is a non-empty array of SPKI-DER base64 keys (the active
-// reviewer set from GET /api/abuse-review-keys). Returns base64.
+// lead set from GET /api/abuse-review-keys). Returns base64.
 function sealToReviewers(recipientPubB64List, plaintext) {
   if (!Array.isArray(recipientPubB64List) || recipientPubB64List.length === 0) {
     throw new Error('at least one recipient public key is required');
@@ -125,12 +125,12 @@ function sealToReviewers(recipientPubB64List, plaintext) {
   return Buffer.concat([MAGIC2, count, ...slots, contentIv, contentTag, contentCt]).toString('base64');
 }
 
-// Open a sealed value with the reviewer's private key (PKCS8-DER base64, a Buffer
-// of the same, or a Node KeyObject). Locates this reviewer's slot by an 8-byte
+// Open a sealed value with the lead's private key (PKCS8-DER base64, a Buffer
+// of the same, or a Node KeyObject). Locates this lead's slot by an 8-byte
 // public-key fingerprint, unwraps the DEK with the private key, and decrypts the
 // content. Returns the plaintext Buffer. Throws on a bad magic, a too-short
 // value, a failed GCM tag (tamper / wrong key), or when no slot matches this
-// reviewer (the value was sealed to a different recipient set).
+// lead (the value was sealed to a different recipient set).
 function openForReviewer(privateKey, sealedB64) {
   const buf = Buffer.from(sealedB64, 'base64');
   if (buf.length < MAGIC2.length + 1 || !buf.subarray(0, MAGIC2.length).equals(MAGIC2)) {
@@ -181,15 +181,15 @@ function openForReviewer(privateKey, sealedB64) {
     cd.setAuthTag(contentTag);
     return Buffer.concat([cd.update(ct), cd.final()]);
   }
-  throw new Error('no recipient slot for this reviewer key');
+  throw new Error('no recipient slot for this lead key');
 }
 
 // ── Passphrase-wrapped private key (U3 PR I) ────────────────────────────────────
-// Defense in depth for the reviewer's private key at rest. Before the key is sealed
-// with Electron safeStorage, the ARC wraps it under a passphrase only the reviewer
+// Defense in depth for the lead's private key at rest. Before the key is sealed
+// with Electron safeStorage, the MC wraps it under a passphrase only the lead
 // knows: scrypt(passphrase, salt) -> AES-256-GCM over the PKCS8 key bytes. So
 // neither device theft nor an OS-keychain compromise alone yields the key -- the
-// reviewer's passphrase is required to unlock it. The KDF params are embedded so a
+// lead's passphrase is required to unlock it. The KDF params are embedded so a
 // blob stays openable if defaults change. Layout (base64):
 //
 //   MAGICW(4) || salt(16) || N(uint32 LE) || r(1) || p(1) || iv(12) || tag(16) || ciphertext
