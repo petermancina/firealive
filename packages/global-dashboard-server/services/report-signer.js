@@ -199,7 +199,7 @@ function recordSignature({ db, reportType, subjectRef, sha256, metadata }) {
  *     signedAt, metadata }
  *
  * Never returns content. Route-layer authorization decides who may call this
- * per report_type (abuse_flag -> abuse_reviewer only).
+ * per report_type (abuse_flag -> lead only).
  */
 function verifyReportByHash(db, sha256Hex) {
   if (typeof sha256Hex !== 'string' || !/^[0-9a-f]{64}$/.test(sha256Hex)) {

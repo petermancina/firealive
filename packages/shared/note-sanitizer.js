@@ -1,6 +1,6 @@
 'use strict';
 
-// FireAlive -- shared sanitizer for abuse-flag reviewer notes.
+// FireAlive -- shared sanitizer for abuse-flag review notes.
 //
 // The reporter's free-text note (the "why is this abusive" description) is the
 // ONLY accuser-authored text that ever enters a sealed flag; the flagged
@@ -14,9 +14,9 @@
 //   - Strips zero-width and bidirectional control characters, defeating
 //     zero-width hiding and Trojan-Source-style bidirectional reordering.
 //   - Neutralizes (defangs) URL schemes and www hosts, so a note can never
-//     carry a live, clickable link to the reviewer or into an exported report.
+//     carry a live, clickable link to the reviewing lead or into an exported report.
 //
-// The Abuse Review Console already renders decrypted notes as inert plain text
+// The Management Console review UI already renders decrypted notes as inert plain text
 // (React text nodes, no HTML/markdown sink), so script execution is impossible
 // there; this input-side pass is the second half of that defense and keeps the
 // sealed evidence clean. The flagged CONTENT is never passed through here --

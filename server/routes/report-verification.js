@@ -7,13 +7,13 @@
 //     Returns the active report-signing public key (PEM + fingerprint) and the
 //     instance label, so an authorized verifier can check report signatures
 //     offline (see docs/report-verification.md). Public key only -- the
-//     private key is never read here. Gated to admin / ciso / abuse_reviewer.
+//     private key is never read here. Gated to admin / ciso / lead.
 //
 //   GET /api/verify/report/:hash
 //     Content-blind verification. Looks a report up by the SHA-256 of its
 //     signed material and re-verifies the recorded Ed25519 signature. Returns
 //     metadata only -- never content. Per-type authorization:
-//       - abuse_flag       -> abuse_reviewer ONLY. Wrong role returns 404
+//       - abuse_flag       -> lead ONLY. Wrong role returns 404
 //                             (not 403) so a lead/admin cannot confirm an
 //                             accusation exists by probing its hash. This is
 //                             the HR/court appeal path: HR asks an independent
@@ -57,8 +57,8 @@ function rejectApiKey(req, res) {
 router.get('/report-signing/key', (req, res) => {
   if (rejectApiKey(req, res)) return;
   const role = req.user && req.user.role;
-  if (role !== 'admin' && role !== 'ciso' && role !== 'abuse_reviewer') {
-    return res.status(403).json({ error: 'admin, ciso, or abuse_reviewer role required' });
+  if (role !== 'admin' && role !== 'ciso' && role !== 'lead') {
+    return res.status(403).json({ error: 'admin, ciso, or lead role required' });
   }
   try {
     const db = getDb();
@@ -105,10 +105,10 @@ router.get('/verify/report/:hash', (req, res) => {
     const type = result.reportType;
 
     if (type === 'abuse_flag') {
-      // Existence is sensitive. Anyone who is not an independent reviewer gets
+      // Existence is sensitive. Anyone who is not a team lead gets
       // 404 -- identical to a genuine miss -- so an accusation cannot be
       // confirmed to exist by probing hashes.
-      if (role !== 'abuse_reviewer') {
+      if (role !== 'lead') {
         return res.status(404).json({ error: 'no report matches that hash' });
       }
     } else if (type === 'compliance' || type === 'report_engine') {

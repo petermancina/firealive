@@ -3,17 +3,18 @@
 //
 // Append-only, hash-chained, Ed25519-signed lifecycle ledger for the abuse
 // evidence vault, plus the dedicated signing-key family that signs it. The
-// chain records VAULT_SEALED for every sealed case and the full two-person
-// legal-hold export lifecycle (LEGAL_HOLD_REQUESTED / APPROVED / DENIED /
-// PRODUCED) plus CHAIN_VERIFIED checks.
+// chain records VAULT_SEALED for every sealed case plus CHAIN_VERIFIED checks.
+// The legal-hold export lifecycle events (LEGAL_HOLD_REQUESTED / APPROVED /
+// DENIED / PRODUCED) are retained in VALID_EVENTS so historical entries still
+// verify, but that export flow has been removed and they are no longer
+// written.
 //
-// INDEPENDENCE FROM THE MANAGEMENT CONSOLE
+// REVIEW MODEL
 //
-// A legal-hold export is a two-person action with NO MC involvement: an
-// independent reviewer (ARC) requests it and a CISO (Global Dashboard)
-// approves it over the dedicated ARC -> regional server -> GD channel. This
-// service only writes the immutable record; the mutable request state lives
-// in abuse_vault_export_requests. The team lead never sees any of it.
+// Sealed abuse cases are reviewed by the Team Lead in the Management Console
+// (Peer Conduct tab); the content is decrypted only on the lead's device with
+// the lead's key. This service only writes the immutable lifecycle record and
+// never sees decrypted content.
 //
 // KEY SEPARATION
 //

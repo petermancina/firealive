@@ -128,17 +128,17 @@ const EVENT_TYPES = {
   abuse_review_case_tier1: {
     label: 'Abuse review — minor conduct case (tier 1)',
     default: { in_app: 1, email: 0, sms: 0, desktop: 1 },
-    description: 'A new tier-1 abuse case (minor conduct) was sealed to the independent review console and assigned to you. Review it in the Abuse Review Console when you have a moment. Content is decrypted only in the console — the server never sees it.',
+    description: 'A new tier-1 abuse case (minor conduct) was sealed to you for review. Open the Peer Conduct tab in the Management Console to review it when you have a moment. Content is decrypted only on your device; the server never sees it.',
   },
   abuse_review_case_tier2: {
     label: 'Abuse review — personal attack case (tier 2)',
     default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
-    description: 'A new tier-2 abuse case (personal attack) was sealed to the independent review console and assigned to you. Open the Abuse Review Console to decrypt and review the sealed evidence. Content is decrypted only in the console — the server never sees it.',
+    description: 'A new tier-2 abuse case (personal attack) was sealed to you for review. Open the Peer Conduct tab in the Management Console to decrypt and review the sealed evidence. Content is decrypted only on your device; the server never sees it.',
   },
   abuse_review_case_tier3: {
     label: 'Abuse review — urgent conduct case (tier 3)',
     default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
-    description: 'A new tier-3 abuse case (urgent conduct: slurs, threats, harassment) was sealed to the independent review console and assigned to you. Review immediately in the Abuse Review Console. Content is decrypted only in the console — the server never sees it. In-app delivery cannot be turned off for this event.',
+    description: 'A new tier-3 abuse case (urgent conduct: slurs, threats, harassment) was sealed to you for review. Review it immediately in the Peer Conduct tab of the Management Console. Content is decrypted only on your device; the server never sees it. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
 };

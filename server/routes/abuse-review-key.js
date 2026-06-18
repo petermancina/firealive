@@ -1,29 +1,30 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Abuse-review public-key endpoints (multi-reviewer zero-access)
+// FIREALIVE — Abuse-review public-key endpoints (Team-Lead zero-access)
 //
-// The server stores and serves PUBLIC key material only. Flag content (peer,
-// board, lead-chat) is sealed by the flagger's client to the active reviewer
-// recipient set (the shared abuse-seal module's multi-recipient envelope)
-// before it leaves the device, so the server holds only opaque ciphertext it
-// cannot open. Each reviewer's PRIVATE key is generated on, and never leaves,
-// that reviewer's own device.
+// The server stores and serves PUBLIC key material only. Flag content (peer
+// session and skill-share board) is sealed by the flagger's client to the
+// active Team-Lead recipient set (the shared abuse-seal module's
+// multi-recipient envelope) before it leaves the device, so the server holds
+// only opaque ciphertext it cannot open. Each lead's PRIVATE key is generated
+// on, and never leaves, that lead's own Management Console device.
 //
 // GET  /api/abuse-review-keys  — fetch ALL active public keys (the recipient
 //                                set), so a flagger's client can seal to every
-//                                reviewer at once. Returns { active:false,
-//                                keys:[] } when none is registered, which keeps
-//                                flagging disabled: with no key, nobody could
-//                                decrypt a flag.
+//                                registered Team Lead at once. Returns
+//                                { active:false, keys:[] } when none is
+//                                registered, which keeps flagging disabled:
+//                                with no key, nobody could decrypt a flag.
 // POST /api/abuse-review-key   — register a public key, ADDING it to the active
-//                                recipient set (admin-only). Does not retire
-//                                existing keys; rejects a key whose fingerprint
-//                                is already active. A label names the key for
-//                                the admin UI; the fingerprint is derived
-//                                server-side.
+//                                recipient set (lead-only). A lead enrolls their
+//                                OWN key; the matching private key is generated
+//                                on and never leaves the lead's device. Does not
+//                                retire existing keys; rejects a key whose
+//                                fingerprint is already active. A label names
+//                                the key; the fingerprint is derived server-side.
 // POST /api/abuse-review-key/:id/revoke
 //                              — remove a key from the active recipient set
-//                                (admin-only). Sets active=0; flags sealed to
-//                                other active reviewers stay openable by them.
+//                                (lead or admin). Sets active=0; flags sealed to
+//                                other active leads stay openable by them.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -42,7 +43,7 @@ function isB64(s, maxLen) {
 
 // GET — ALL active abuse-review public keys (the recipient set), newest first.
 // A flagger's client seals to every key returned here at once, so adding a
-// reviewer simply grows this list. Returns { active:false, keys:[] } when none.
+// Team Lead simply grows this list. Returns { active:false, keys:[] } when none.
 keysRouter.get('/', (req, res) => {
   try {
     const db = getDb();
@@ -67,12 +68,13 @@ keysRouter.get('/', (req, res) => {
 });
 
 // POST — register a new abuse-review PUBLIC key, ADDING it to the active recipient
-// set (admin-only for now). Does NOT retire existing keys: each active key is one
-// independent reviewer and content is sealed to all of them. A label names the key
-// for the admin UI; the fingerprint is derived server-side and used to reject a key
-// already in the active set.
+// set (lead-only). A lead enrolls their OWN key; the matching private key is
+// generated on and never leaves the lead's device. Does NOT retire existing keys:
+// each active key is one Team Lead and content is sealed to all of them. A label
+// names the key for the MC UI; the fingerprint is derived server-side and used to
+// reject a key already in the active set.
 router.post('/', (req, res) => {
-  if (req.user.role !== 'admin') {
+  if (req.user.role !== 'lead') {
     return res.status(403).json({ error: 'forbidden' });
   }
 
@@ -111,12 +113,12 @@ router.post('/', (req, res) => {
   return res.status(201).json({ id: keyId, algo: algoVal, label: labelVal, fingerprint, active: true });
 });
 
-// POST /:id/revoke — remove a key from the active recipient set (admin-only). Sets
-// active=0 so no new flags seal to it; flags already sealed to other active
-// reviewers stay openable by them. Returns 404 when no active key has that id
+// POST /:id/revoke — remove a key from the active recipient set (lead or admin).
+// Sets active=0 so no new flags seal to it; flags already sealed to other active
+// leads stay openable by them. Returns 404 when no active key has that id
 // (unknown or already revoked), so the action is safe to retry.
 router.post('/:id/revoke', (req, res) => {
-  if (req.user.role !== 'admin') {
+  if (req.user.role !== 'lead' && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'forbidden' });
   }
   const { id } = req.params;

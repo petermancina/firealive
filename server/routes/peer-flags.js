@@ -1,20 +1,20 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Peer Abuse Flag Routes (Phase 1.4b; U3 PR G cutover)
+// ═══════════════════════════════════════════════════════════════
+// FIREALIVE — Peer Abuse Flag Routes (Team-Lead review)
 //
 // Tiered abuse flagging for peer skill-share sessions and the peer board. Tiers
-// (1 minor, 2 personal attack, 3 urgent) signal SEVERITY to the independent
-// reviewer; they no longer escalate identity reveal.
+// (1 minor, 2 personal attack, 3 urgent) signal SEVERITY to the Team Lead; they
+// do not escalate identity reveal.
 //
 // POST /api/peer/flags                       — analyst submits a flag
 // GET  /api/peer/flags/review-pending-count  — lead/admin awareness count (no content)
 //
-// All flag content is sealed on the flagger's device to the active reviewer
+// All flag content is sealed on the flagger's device to the active Team-Lead
 // recipient set (the shared abuse-seal module's multi-recipient envelope) before
 // it leaves the device; the server stores only opaque sealed envelopes it cannot
-// read. Review and resolution happen ONLY in the independent Abuse Review Console
-// (server/routes/abuse-review.js), never here and never by team leads -- the MC's
-// old list/resolve/pattern endpoints were removed in the PR G cutover.
-// ═══════════════════════════════════════════════════════════════════════════════
+// read. Review and resolution happen in the Management Console, where a Team Lead
+// decrypts the sealed evidence with their own device-held key. Peer-session and
+// board flagging are analyst-to-analyst.
+// ═══════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
 const crypto = require('crypto');
@@ -22,7 +22,6 @@ const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 const patternDetector = require('../services/abuse-pattern-detector');
-const { canReview } = require('../services/abuse-reviewer-access');
 const avChain = require('../services/abuse-vault-chain');
 const { signReportCanonical, getInstanceLabel } = require('../services/report-signer');
 
@@ -30,53 +29,45 @@ const VALID_TIERS = [1, 2, 3];
 
 // Flags arrive as client-sealed envelopes (base64). A single note/message
 // seals to well under MAX_SEALED_B64; the board context bundles a few messages,
-// so it gets a larger cap. Shared by all three flag-submission paths.
+// so it gets a larger cap. Shared by both flag-submission paths.
 const MAX_SEALED_B64 = 16384;
 const MAX_SEALED_CONTEXT_B64 = 49152;
 function isSealedB64(s, maxLen = MAX_SEALED_B64) {
   return typeof s === 'string' && s.length > 0 && s.length <= maxLen && /^[A-Za-z0-9+/]+={0,2}$/.test(s);
 }
 
-// Notify the assigned reviewer(s) of a new abuse case -- peer session, board
-// post, or lead chat alike. Since the PR G cutover all abuse review is handled
-// by the independent Abuse Review Console (never by leads: a lead may be the
-// accused, and all flag content is reviewer-only sealed), so recipients
-// are the abuse_reviewer(s) whose assignment covers this flag AND who are not a
-// party to it (canReview). The notification carries metadata only; the sealed
-// content is decrypted solely in the Abuse Review Console. notify() is
-// synchronous, so each recipient is wrapped individually -- one bad recipient
-// must not abort the rest.
-function notifyReviewersOfFlag(flagId, tier) {
+// Notify the Team Lead(s) of a new abuse case -- peer session or board post.
+// Abuse review is handled by the Team Lead on the Management Console; peer and
+// board flags are analyst-to-analyst, so a lead is not a party. Recipients are
+// the active leads, with the flagger and the accused excluded defensively so a
+// lead never reviews a case they are party to. The notification carries metadata
+// only; the sealed content is decrypted solely in the Management Console.
+// notify() is synchronous, so each recipient is wrapped individually -- one bad
+// recipient must not abort the rest.
+function notifyLeadsOfFlag(flagId, tier) {
   const eventType = `abuse_review_case_tier${tier}`;
   const titleByTier = {
-    1: 'Abuse review \u2014 minor conduct case',
-    2: 'Abuse review \u2014 personal attack case',
-    3: 'Abuse review \u2014 URGENT conduct case',
+    1: 'Abuse review: minor conduct case',
+    2: 'Abuse review: personal attack case',
+    3: 'Abuse review: URGENT conduct case',
   };
   const bodyByTier = {
-    1: 'A tier-1 abuse case was assigned to you. Review it in the Abuse Review Console when you have a moment.',
-    2: 'A tier-2 abuse case was assigned to you. Open the Abuse Review Console to decrypt and review the sealed evidence.',
-    3: 'A tier-3 abuse case (urgent: slurs, threats, harassment) was assigned to you. Review immediately in the Abuse Review Console.',
+    1: 'A tier-1 abuse case is pending review. Open the abuse review tab in the Management Console when you have a moment.',
+    2: 'A tier-2 abuse case is pending review. Open the abuse review tab in the Management Console to decrypt and review the sealed evidence.',
+    3: 'A tier-3 abuse case (urgent: slurs, threats, harassment) is pending review. Review it immediately in the Management Console.',
   };
   try {
     const db = getDb();
     const flag = db.prepare('SELECT id, flagger_user_id, flagged_user_id FROM peer_abuse_flags WHERE id = ?').get(flagId);
     if (!flag) { db.close(); return; }
-    const reviewers = db.prepare("SELECT id, role, active FROM users WHERE role = 'abuse_reviewer'").all();
-    const recipients = [];
-    for (const rv of reviewers) {
-      const assignments = db.prepare(
-        'SELECT scope, team_id, flag_id FROM abuse_reviewer_assignments WHERE reviewer_user_id = ?'
-      ).all(rv.id);
-      if (canReview({ reviewer: rv, flag: { ...flag, teamIds: [] }, assignments }).allowed) {
-        recipients.push(rv.id);
-      }
-    }
+    const leads = db.prepare(
+      "SELECT id FROM users WHERE role = 'lead' AND active = 1 AND id != ? AND id != ?"
+    ).all(flag.flagger_user_id, flag.flagged_user_id);
     db.close();
-    for (const rid of recipients) {
+    for (const lead of leads) {
       try {
         notifications.notify({
-          recipientId: rid,
+          recipientId: lead.id,
           eventType,
           title: titleByTier[tier],
           body: bodyByTier[tier],
@@ -84,7 +75,7 @@ function notifyReviewersOfFlag(flagId, tier) {
           linkParams: JSON.stringify({ flagId, tier }),
         });
       } catch (err) {
-        logger.error('Failed to deliver abuse-review flag notification', { error: err.message, recipientId: rid, tier });
+        logger.error('Failed to deliver abuse-review flag notification', { error: err.message, recipientId: lead.id, tier });
       }
     }
   } catch (err) {
@@ -93,11 +84,11 @@ function notifyReviewersOfFlag(flagId, tier) {
 }
 
 // Submit a flag against a board post. The flagger's client seals the note, the
-// offending post body, and a small thread-context window to the active reviewer
+// offending post body, and a small thread-context window to the active Team-Lead
 // recipient set (the shared abuse-seal module's multi-recipient envelope) before
 // sending; the server stores those opaque sealed envelopes verbatim and NEVER
-// reads them -- only a designated reviewer's Abuse Review Console, which holds
-// the reviewer's own private key, can. The accused is still resolved from the
+// reads them -- only a Team Lead's Management Console, which holds
+// the lead's own private key, can. The accused is still resolved from the
 // post row server-side (never trusted from the client): the post's author is
 // metadata the flag needs, not content. The post is pulled from the board
 // pending review. Flagging is gated on at least one registered abuse-review key
@@ -132,7 +123,7 @@ function submitBoardFlag(req, res) {
     const activeKey = db.prepare('SELECT id FROM abuse_review_keys WHERE active = 1 LIMIT 1').get();
     if (!activeKey) {
       db.close();
-      return res.status(409).json({ error: 'flagging unavailable: no independent reviewer designated' });
+      return res.status(409).json({ error: 'flagging unavailable: no review key registered' });
     }
 
     // Resolve the accused from the post row (author is metadata, not content).
@@ -187,111 +178,7 @@ function submitBoardFlag(req, res) {
     return res.status(500).json({ error: 'failed to submit flag' });
   }
 
-  notifyReviewersOfFlag(flagId, tier);
-
-  return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
-}
-
-// Submit a flag against a lead-chat message (sealed reviewer-only). Either
-// party may flag the other, so unlike peer flags the accused is NOT required to
-// be an analyst -- a lead can be accused. Lead chat is E2EE, so the server can't
-// read transport ciphertext; the flagger's client decrypts the offending message
-// locally and seals BOTH it and the flagger's note to the active reviewer
-// recipient set (the shared abuse-seal module's multi-recipient envelope) before
-// sending. The server stores those opaque sealed envelopes verbatim and NEVER
-// decrypts them -- only a designated reviewer's Abuse Review Console, which holds
-// the reviewer's own private key, can. encryptTier3 is deliberately NOT used here.
-//
-// Reviewed ONLY by the independent Abuse Review Console (U3 PR F), never by team
-// leads (a lead may be the accused): this path does NOT notify leads, and the
-// lead-facing GET /flags excludes lead_chat. Flagging is gated on a registered
-// abuse-review key -- with none, there is no one who could decrypt a flag.
-function submitLeadChatFlag(req, res) {
-  const { threadId, tier, sealedNote, sealedContent } = req.body || {};
-
-  if (!threadId || typeof threadId !== 'string') {
-    return res.status(400).json({ error: 'threadId required' });
-  }
-  if (!VALID_TIERS.includes(tier)) {
-    return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
-  }
-  if (!isSealedB64(sealedContent)) {
-    return res.status(400).json({ error: 'sealedContent required (base64 sealed envelope of the offending message)' });
-  }
-  if (!isSealedB64(sealedNote)) {
-    return res.status(400).json({ error: 'sealedNote required (base64 sealed envelope of the flagger note)' });
-  }
-
-  let flagId;
-  try {
-    const db = getDb();
-
-    // Gate: a flag can only be reviewed (decrypted) if an abuse-review key is
-    // registered, so refuse to seal one into a void.
-    const activeKey = db.prepare('SELECT id FROM abuse_review_keys WHERE active = 1 LIMIT 1').get();
-    if (!activeKey) {
-      db.close();
-      return res.status(409).json({ error: 'flagging unavailable: no independent reviewer designated' });
-    }
-
-    const thread = db.prepare('SELECT id, analyst_id, lead_id FROM lead_chat_threads WHERE id = ?').get(threadId);
-    if (!thread) { db.close(); return res.status(404).json({ error: 'lead-chat thread not found' }); }
-
-    // The flagger must be a participant; the accused is the counterpart. No
-    // accused-must-be-analyst guard here -- a lead can be the accused.
-    let accusedId = null;
-    if (thread.analyst_id === req.user.id) accusedId = thread.lead_id;
-    else if (thread.lead_id === req.user.id) accusedId = thread.analyst_id;
-    if (!accusedId) { db.close(); return res.status(403).json({ error: 'not a participant in this thread' }); }
-    if (accusedId === req.user.id) { db.close(); return res.status(400).json({ error: 'cannot flag yourself' }); }
-
-    const flaggerU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(req.user.id);
-    const accusedU = db.prepare('SELECT pseudonym FROM users WHERE id = ?').get(accusedId);
-
-    flagId = crypto.randomBytes(16).toString('hex');
-    const flaggerIp = req.ip || (req.connection && req.connection.remoteAddress) || null;
-
-    // Store the client-sealed envelopes verbatim. content_encrypted holds the sealed
-    // note; the vault's sealed_content_encrypted holds the sealed offending text.
-    // Neither is server-decryptable.
-    const noteBox = Buffer.from(sealedNote, 'base64');
-    const contentBox = Buffer.from(sealedContent, 'base64');
-
-    const seal = db.transaction(() => {
-      db.prepare(`
-        INSERT INTO peer_abuse_flags
-          (id, target_type, target_id, session_id, flagger_user_id, flagged_user_id, tier, content_encrypted, flagger_ip)
-        VALUES (?, 'lead_chat', ?, NULL, ?, ?, ?, ?, ?)
-      `).run(flagId, threadId, req.user.id, accusedId, tier, noteBox, flaggerIp);
-
-      db.prepare(`
-        INSERT INTO peer_abuse_evidence_vault
-          (flag_id, target_type, target_id, sealed_content_encrypted, context_encrypted,
-           flagger_user_id, accused_user_id, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, tier_at_seal)
-        VALUES (?, 'lead_chat', ?, ?, NULL, ?, ?, ?, ?, ?)
-      `).run(flagId, threadId, contentBox,
-             req.user.id, accusedId, flaggerU ? flaggerU.pseudonym : null, accusedU ? accusedU.pseudonym : null, tier);
-
-      try { avChain.appendEntry(db, { eventType: 'VAULT_SEALED', flagId, actorUserId: req.user.id }); }
-      catch (avErr) { logger.warn('peer-flags: VAULT_SEALED chain append failed; will backfill at next boot', { error: avErr.message }); }
-    });
-    seal();
-
-    db.close();
-  } catch (err) {
-    logger.error('Failed to submit lead-chat abuse flag', { error: err.message });
-    return res.status(500).json({ error: 'failed to submit flag' });
-  }
-
-  // Lead-chat abuse is ARC-only -- a lead may be the accused, so leads are never
-  // notified here. Instead notify the assigned independent reviewer(s) whose
-  // scope covers this case and who are not a party to it (canReview).
-  notifyReviewersOfFlag(flagId, tier);
-
-  // No pattern-detector call here: the detector writes to peer_abuse_patterns,
-  // which the MC reads, so feeding lead_chat now would surface it to leads. The
-  // lead-chat pattern feed lands at the PR G cutover, together with the MC
-  // pattern removal.
+  notifyLeadsOfFlag(flagId, tier);
 
   return res.status(201).json({ id: flagId, tier, createdAt: new Date().toISOString() });
 }
@@ -314,16 +201,13 @@ function submitLeadChatFlag(req, res) {
 //
 // Side effects:
 //   - Inserts row into peer_abuse_flags with the client-sealed note
-//   - Notifies the assigned independent reviewer(s) via the tier event type
+//   - Notifies the Team Lead(s) via the tier event type
 //   - Audit logs the flag submission (no content in audit — only metadata)
 router.post('/', (req, res) => {
   // Board-post flags take a different shape (no session, accused resolved
   // server-side) and seal evidence to the vault -- handle them separately.
   if ((req.body || {}).target_type === 'board_post') {
     return submitBoardFlag(req, res);
-  }
-  if ((req.body || {}).target_type === 'lead_chat') {
-    return submitLeadChatFlag(req, res);
   }
 
   const { sessionId, tier, sealedNote, sealedContent } = req.body || {};
@@ -335,7 +219,7 @@ router.post('/', (req, res) => {
     return res.status(400).json({ error: 'tier must be 1, 2, or 3' });
   }
   // The client seals the selected peer-chat messages (sealedContent) and the
-  // reporter's note (sealedNote) to the active reviewer recipient set before
+  // reporter's note (sealedNote) to the active Team-Lead recipient set before
   // sending; the server stores the opaque envelopes verbatim and never reads
   // them. sealedContent carries the authentic flagged messages the client
   // copied from the session -- it is required so a peer-session flag can never
@@ -356,7 +240,7 @@ router.post('/', (req, res) => {
     const activeKey = db.prepare('SELECT id FROM abuse_review_keys WHERE active = 1 LIMIT 1').get();
     if (!activeKey) {
       db.close();
-      return res.status(409).json({ error: 'flagging unavailable: no independent reviewer designated' });
+      return res.status(409).json({ error: 'flagging unavailable: no review key registered' });
     }
 
     // Resolve the accused from the session: the flagger must be a participant,
@@ -413,8 +297,8 @@ router.post('/', (req, res) => {
     return res.status(500).json({ error: 'failed to submit flag' });
   }
 
-  // Notify the assigned independent reviewer(s) of the flag.
-  notifyReviewersOfFlag(flagId, tier);
+  // Notify the Team Lead(s) of the flag.
+  notifyLeadsOfFlag(flagId, tier);
 
 
   return res.status(201).json({
@@ -426,16 +310,16 @@ router.post('/', (req, res) => {
 
 // ── POST /api/peer/flags/:id/sign-record — sign a flagger's export record ────
 //
-// After a flag is submitted to the independent reviewer, the flagger's client
+// After a flag is submitted, the flagger's client
 // may build a one-shot, local PDF record of the submission as the flagger's
 // personal backup (for example if the vault is later lost). This endpoint signs
-// a canonical payload describing that submission so an independent reviewer can
+// a canonical payload describing that submission so a Team Lead can
 // later confirm an exported record is genuine and corresponds to a real flag --
 // without the server ever seeing the flagged content.
 //
 // The server derives flag_uuid, target_type and submitted_at from the flag row
 // (authoritative); only content_sha256 -- the SHA-256 of the authentic sealed
-// content the client holds -- is supplied by the client. The reviewer later
+// content the client holds -- is supplied by the client. The Team Lead later
 // recomputes that hash from the content they decrypt from the vault, so a
 // client cannot forge it undetected.
 //
@@ -495,13 +379,11 @@ router.post('/:id/sign-record', (req, res) => {
   return res.status(200).json(result);
 });
 
-// GET /api/peer/flags/review-pending-count -- awareness-only count for the MC.
-// After the PR G cutover the MC no longer reviews abuse (the independent Abuse
-// Review Console does). This read-only count lets a lead/admin see HOW MANY items
-// are pending independent review, with no content, no identities, and no per-item
-// detail -- just a number, so management knows the system is handling reports
-// without being a review surface. Counts all unresolved flags (every target type
-// is reviewer-only once the cutover completes).
+// GET /api/peer/flags/review-pending-count -- awareness count for management.
+// The Team Lead reviews abuse cases in the Management Console; this read-only
+// count lets a lead/admin see HOW MANY items are pending review, with no
+// content, no identities, and no per-item detail -- just a number. Counts all
+// unresolved flags.
 router.get('/review-pending-count', (req, res) => {
   if (!['lead', 'admin'].includes(req.user.role)) {
     return res.status(403).json({ error: 'forbidden' });

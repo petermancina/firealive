@@ -17,10 +17,6 @@ updates:
     schedule:
       interval: "weekly"
   - package-ecosystem: "npm"
-    directory: "/packages/abuse-review-console"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "npm"
     directory: "/packages/global-dashboard-server"
     schedule:
       interval: "weekly"

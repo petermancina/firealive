@@ -237,9 +237,7 @@ app.use('/api/peer-support', authMiddleware(['analyst', 'lead', 'admin']), requi
 app.use('/api/peer/flags', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-flags'));
 app.use('/api/abuse-review-key', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/abuse-review-key'));
 app.use('/api/abuse-review-keys', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/abuse-review-key').keysRouter);
-app.use('/api/abuse-review', authMiddleware(['abuse_reviewer']), require('./routes/abuse-review'));
-app.use('/api/abuse-vault-export', authMiddleware(['abuse_reviewer']), require('./routes/abuse-vault-export'));
-app.use('/api/abuse-reviewer-admin', authMiddleware(['admin']), require('./routes/abuse-reviewer-admin'));
+app.use('/api/lead-abuse-review', authMiddleware(['lead']), require('./routes/lead-abuse-review'));
 app.use('/api/peer-board', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/peer-board'));
 app.use('/api/training/completions-review', authMiddleware(['lead', 'admin']), require('./routes/training-completions-review'));
 app.use('/api/training', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/training'));
@@ -294,7 +292,7 @@ app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
 app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
-app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso', 'abuse_reviewer']), require('./routes/report-verification'));
+app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso']), require('./routes/report-verification'));
 
 // ── Static Frontend ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, '../frontend')));

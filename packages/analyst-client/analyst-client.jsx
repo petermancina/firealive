@@ -2230,14 +2230,6 @@ export default function AnalystClientApp() {
   const [showLeadMsg, setShowLeadMsg] = useState(false);
   const [leadMsgs, setLM] = useState([]);
   const [newLM, setNewLM] = useState("");
-  // Phase U3: lead-chat abuse flag. The flagged message + the note are sealed
-  // on the client to the active reviewer recipient set and posted as a
-  // lead_chat flag. leadFlagMsg holds the message object being reported.
-  const [leadFlagMsg, setLeadFlagMsg] = useState(null);
-  const [leadFlagTier, setLeadFlagTier] = useState(0); // 0=unselected, 1/2/3
-  const [leadFlagNote, setLeadFlagNote] = useState("");
-  const [leadFlagBusy, setLeadFlagBusy] = useState(false);
-  const [leadFlagErr, setLeadFlagErr] = useState("");
   // Phase U3: lead-chat session + receive loop. leadThread is set by the on-shift
   // lead picker (added next); null until a lead is chosen.
   const [leadThread, setLeadThread] = useState(null);
@@ -2268,37 +2260,6 @@ export default function AnalystClientApp() {
       setLM(prev => [...prev, localMsg]);
     } catch (e) {
       logC("lead_send_failed", "Send error: " + (e && e.message ? e.message : "unknown"));
-    }
-  };
-  // Phase U3: submit a lead-chat abuse flag. Fetches the active reviewer
-  // recipient set; if none is registered, flagging is unavailable (no one
-  // could decrypt it). Otherwise seals the offending message and the note to
-  // every active reviewer via the main-process abuse:seal handler -- the
-  // server stores only the opaque sealed envelopes and can never read them --
-  // and posts a lead_chat flag. The accused is resolved server-side.
-  const submitLeadFlag = async () => {
-    const m = leadFlagMsg;
-    if (!m || !leadFlagTier || !leadFlagNote.trim() || !leadThread || !leadThread.threadId) return;
-    const bridge = (typeof window !== "undefined") ? window.firealive : null;
-    if (!bridge || !bridge.invoke) { setLeadFlagErr("Reporting requires the desktop app."); return; }
-    setLeadFlagBusy(true); setLeadFlagErr("");
-    try {
-      const k = await api.get("/api/abuse-review-keys");
-      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
-        setLeadFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
-        setLeadFlagBusy(false); return;
-      }
-      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
-      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim(), sanitize: true });
-      if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
-      const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadThread.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
-      if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
-      logC("lead_chat_flagged", `Tier ${leadFlagTier} report sealed to the independent reviewer`);
-      if (r && r.id) beginExportPrompt(r.id, "lead_chat", m.text, leadFlagNote.trim());
-      setLeadFlagMsg(null); setLeadFlagTier(0); setLeadFlagNote(""); setLeadFlagBusy(false);
-    } catch (e) {
-      setLeadFlagErr("Could not submit the report."); setLeadFlagBusy(false);
     }
   };
   // Poll for incoming lead-chat ciphertext and decrypt it (keyed by threadId),
@@ -2423,11 +2384,10 @@ export default function AnalystClientApp() {
   const [boardFlagBusy, setBoardFlagBusy] = useState(false);
   const openBoardFlag = (postId) => { setBoardFlagPost(postId); setBoardFlagTier(0); setBoardFlagNote(""); setBoardFlagErr(""); };
   // Seal the note, the offending post body, and a short thread-context snippet
-  // to the active reviewer recipient set on this device (main-process
+  // to the active team-lead recipient set on this device (main-process
   // abuse:seal) -- the server stores only opaque sealed envelopes and never
-  // reads them. Mirrors submitLeadFlag. The accused is resolved server-side;
-  // the context snippet lets the reviewer see the flagged post in situ with
-  // identities still pseudonymous.
+  // reads them. Mirrors the peer-session flag. The accused is resolved server-side;
+  // the context snippet lets the reviewing lead see the flagged post in situ.
   const buildBoardContext = (postId, rootId) => {
     const key = (rootId != null) ? rootId : postId;
     const posts = expandedThreads[key];
@@ -2448,7 +2408,7 @@ export default function AnalystClientApp() {
     try {
       const k = await api.get("/api/abuse-review-keys");
       if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
-        setBoardFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
+        setBoardFlagErr("Reporting is unavailable until a team lead sets up abuse review.");
         setBoardFlagBusy(false); return;
       }
       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
@@ -2473,7 +2433,7 @@ export default function AnalystClientApp() {
           loadThread(rootId);
         }
         setBoardFlagPost(null); setBoardFlagTier(0); setBoardFlagNote(""); setBoardFlagErr("");
-        logC("board_post_flagged", `Tier ${boardFlagTier} report sealed to the independent reviewer`);
+        logC("board_post_flagged", `Tier ${boardFlagTier} report sealed for team-lead review`);
       }
       setBoardFlagBusy(false);
     } catch (e) {
@@ -2753,8 +2713,8 @@ export default function AnalystClientApp() {
       {exportPrompt && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
           <Card style={{maxWidth:460,padding:22}}>
-            <M style={{color:C.t,fontWeight:600,fontSize:15,display:"block",marginBottom:8}}>Report submitted to the independent reviewer</M>
-            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>You have a few minutes to save one personal PDF copy as your own backup -- for example, if the reviewer's record is ever lost. After you export or decline, the text is wiped from this device and only the reviewer's vault holds it. This is your only chance to keep a personal copy.</M>
+            <M style={{color:C.t,fontWeight:600,fontSize:15,display:"block",marginBottom:8}}>Report submitted to a team lead</M>
+            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>You have a few minutes to save one personal PDF copy as your own backup -- for example, if the team lead's record is ever lost. After you export or decline, the text is wiped from this device and only the team lead's vault holds it. This is your only chance to keep a personal copy.</M>
             {!exportDone && exportExpiresAt ? <M style={{color:C.td,display:"block",marginBottom:12}}>Window closes at {new Date(exportExpiresAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}.</M> : null}
             {exportMsg ? <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.5}}>{exportMsg}</M> : null}
             <div style={{display:"flex",gap:8}}>
@@ -3233,28 +3193,28 @@ export default function AnalystClientApp() {
                       <input type="radio" name="flagtier" checked={postFlagTier===1} onChange={()=>setPostFlagTier(1)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 — Minor</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness -- unprofessional, not a personal attack. Goes to the independent reviewer and feeds anonymous pattern detection. You and the peer stay pseudonymous to the reviewer.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness -- unprofessional, not a personal attack. Goes to a team lead and feeds anonymous pattern detection.</M>
                       </div>
                     </label>
                     <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                       <input type="radio" name="flagtier" checked={postFlagTier===2} onChange={()=>setPostFlagTier(2)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 — Personal attack</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language aimed at you. Goes to the independent reviewer -- not your lead or management. You and the peer stay pseudonymous to the reviewer.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language aimed at you. Goes to a team lead for review.</M>
                       </div>
                     </label>
                     <label style={{display:"flex",gap:10,padding:"10px 12px",background:postFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${postFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                       <input type="radio" name="flagtier" checked={postFlagTier===3} onChange={()=>setPostFlagTier(3)} style={{marginTop:3}}/>
                       <div style={{flex:1}}>
                         <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 — Urgent</M>
-                        <M style={{color:C.tm,lineHeight:1.5}}>Slurs (racial, gender, orientation, religion, disability), explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for the independent reviewer to handle urgently; identities stay pseudonymous to them. Use only when warranted -- misuse undermines trust in the flagging system.</M>
+                        <M style={{color:C.tm,lineHeight:1.5}}>Slurs (racial, gender, orientation, religion, disability), explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for a team lead to handle urgently. Use only when warranted -- misuse undermines trust in the flagging system.</M>
                       </div>
                     </label>
                   </div>
                 </div>
 
                 <div style={{marginBottom:10}}>
-                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Note for the reviewer \u2014 why is the selected message abusive? (required)</M>
+                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Note for the team lead \u2014 why is the selected message abusive? (required)</M>
                   <textarea value={postFlagText} onChange={e=>setPostFlagText(e.target.value)} rows={3} maxLength={2000} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.d}40`,borderRadius:8,color:C.t,fontSize:12,resize:"vertical"}} placeholder="Explain why the selected text is abusive. The flagged text itself is captured from the chat above -- do not retype it here."/>
                 </div>
 
@@ -3262,7 +3222,7 @@ export default function AnalystClientApp() {
                 <div style={{display:"flex",gap:8}}>
                   <Btn danger disabled={postFlagSel.size===0||!postFlagText.trim()||!postFlagTier||postFlagBusy} onClick={async()=>{
                     // Seal the AUTHENTIC selected messages (sealedContent) and the
-                    // reviewer note (sealedNote) on-device to the active reviewer
+                    // review note (sealedNote) on-device to the active team-lead
                     // recipient set, then post a peer-session flag. The flagged text
                     // is copied by the system from the messages the accuser selected
                     // -- never typed -- so it cannot be altered or fabricated. The
@@ -3276,7 +3236,7 @@ export default function AnalystClientApp() {
                     setPostFlagBusy(true); setPostFlagErr("");
                     try {
                       const k = await api.get("/api/abuse-review-keys");
-                      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) { setPostFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer."); setPostFlagBusy(false); return; }
+                      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) { setPostFlagErr("Reporting is unavailable until a team lead sets up abuse review."); setPostFlagBusy(false); return; }
                       const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
                       const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: contentText });
                       const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: note, sanitize: true });
@@ -3284,7 +3244,7 @@ export default function AnalystClientApp() {
                       const r = await api.post("/api/peer/flags", { sessionId: postSession.sessionId, tier: postFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
                       if (r && r.error) { setPostFlagErr(r.error); setPostFlagBusy(false); return; }
                       if (r && r.id) {
-                        logC("peer_abuse_flagged", `Tier ${postFlagTier} report sealed to the independent reviewer`);
+                        logC("peer_abuse_flagged", `Tier ${postFlagTier} report sealed for team-lead review`);
                         beginExportPrompt(r.id, "peer_session", contentText, note);
                         setPostFlagging(false); setPostFlagTier(0); setPostFlagText(""); setPostFlagErr(""); setPostFlagSel(new Set()); setPostFlagLastIdx(null); setPostSession(null);
                       }
@@ -3497,21 +3457,21 @@ export default function AnalystClientApp() {
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===1} onChange={()=>setBoardFlagTier(1)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:2}}>Tier 1 -- Minor</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness in the post. Goes to the independent reviewer and feeds anonymous pattern detection. Identities stay pseudonymous to the reviewer.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Curt tone, dismissiveness, condescension, or mild rudeness in the post. Goes to a team lead and feeds anonymous pattern detection.</M>
                     </div>
                   </label>
                   <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===2} onChange={()=>setBoardFlagTier(2)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:2}}>Tier 2 -- Personal attack</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language in the post. Goes to the independent reviewer -- not your lead or management. The author and you stay pseudonymous to the reviewer.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Direct insult, name-calling, mockery, or demeaning language in the post. Goes to a team lead for review.</M>
                     </div>
                   </label>
                   <label style={{display:"flex",gap:10,padding:"10px 12px",background:boardFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${boardFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
                     <input type="radio" name={"bflag-"+postId} checked={boardFlagTier===3} onChange={()=>setBoardFlagTier(3)} style={{marginTop:3}}/>
                     <div style={{flex:1}}>
                       <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:2}}>Tier 3 -- Urgent</M>
-                      <M style={{color:C.tm,lineHeight:1.5}}>Slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for the independent reviewer to handle urgently; identities stay pseudonymous to them. Use only when warranted; misuse undermines trust.</M>
+                      <M style={{color:C.tm,lineHeight:1.5}}>Slurs, explicit threats, sexual harassment, or content suggesting imminent harm. Flagged for a team lead to handle urgently. Use only when warranted; misuse undermines trust.</M>
                     </div>
                   </label>
                 </div>
@@ -4068,31 +4028,8 @@ export default function AnalystClientApp() {
           {leadSafetyNum&&<div style={{marginBottom:12,padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderRadius:6}}><M style={{color:C.td,display:"block",marginBottom:2}}>Safety number (read aloud to compare; they must match):</M><M style={{color:C.a,fontFamily:"'Courier New',Courier,monospace",wordBreak:"break-all"}}>{leadSafetyNum}</M></div>}
           <Card style={{maxHeight:200,overflow:"auto",marginBottom:12}}>
             {leadMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
-            leadMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:C.a,fontWeight:500}}>{m.from}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><div style={{display:"flex",gap:8,alignItems:"center"}}><M style={{color:C.td}}>E2EE · {m.ts}</M>{m.from!=="You"&&<button onClick={()=>{setLeadFlagMsg(m);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}} title="Report this message to the independent reviewer" style={{background:"none",border:"none",color:C.d,cursor:"pointer",fontSize:10,fontFamily:"inherit",padding:0}}>Flag</button>}</div></div><div style={{fontSize:12,lineHeight:1.6}}>{m.text}</div></div>)}
+            leadMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:C.a,fontWeight:500}}>{m.from}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><div style={{display:"flex",gap:8,alignItems:"center"}}><M style={{color:C.td}}>E2EE · {m.ts}</M></div></div><div style={{fontSize:12,lineHeight:1.6}}>{m.text}</div></div>)}
           </Card>
-          {leadFlagMsg&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
-            <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:6}}>Report this message to the independent reviewer</M>
-            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:8}}>This goes to an independent abuse reviewer -- not your lead, and not management -- and is encrypted so that only that reviewer can read it. Either party can report a message. Report only genuinely abusive content.</M>
-            <div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,marginBottom:10,fontSize:11,color:C.tm,fontStyle:"italic"}}>{leadFlagMsg.text.slice(0,140)}{leadFlagMsg.text.length>140?"...":""}</div>
-            <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===1?"rgba(96,165,250,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===1?C.i+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-              <input type="radio" name="leadflagtier" checked={leadFlagTier===1} onChange={()=>setLeadFlagTier(1)} style={{marginTop:3}}/>
-              <div><M style={{color:C.t,fontWeight:500}}>Tier 1 -- Minor</M><M style={{color:C.td,display:"block"}}>Unprofessional or dismissive conduct.</M></div>
-            </label>
-            <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-              <input type="radio" name="leadflagtier" checked={leadFlagTier===2} onChange={()=>setLeadFlagTier(2)} style={{marginTop:3}}/>
-              <div><M style={{color:C.t,fontWeight:500}}>Tier 2 -- Personal attack</M><M style={{color:C.td,display:"block"}}>Targeted hostility, intimidation, or retaliation.</M></div>
-            </label>
-            <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:8,background:leadFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-              <input type="radio" name="leadflagtier" checked={leadFlagTier===3} onChange={()=>setLeadFlagTier(3)} style={{marginTop:3}}/>
-              <div><M style={{color:C.t,fontWeight:500}}>Tier 3 -- Urgent</M><M style={{color:C.td,display:"block"}}>Slurs, threats, or harassment.</M></div>
-            </label>
-            <textarea value={leadFlagNote} onChange={e=>setLeadFlagNote(e.target.value)} placeholder="Briefly describe the problem (required)" maxLength={2000} style={{width:"100%",minHeight:60,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit",boxSizing:"border-box",resize:"vertical"}}/>
-            {leadFlagErr&&<M style={{color:C.d,display:"block",marginTop:6}}>{leadFlagErr}</M>}
-            <div style={{display:"flex",gap:8,marginTop:10}}>
-              <Btn danger small disabled={!leadFlagNote.trim()||!leadFlagTier||leadFlagBusy} onClick={submitLeadFlag}>{leadFlagBusy?"Sealing...":"Submit report"}</Btn>
-              <Btn small onClick={()=>{setLeadFlagMsg(null);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}}>Cancel</Btn>
-            </div>
-          </Card>}
           <div style={{display:"flex",gap:8}}><input value={newLM} onChange={e=>setNewLM(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newLM.trim())sendLeadMessage();}} placeholder="Message to your lead..." maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary disabled={!newLM.trim()||!leadThread} onClick={()=>sendLeadMessage()}>Send</Btn></div>
           <button onClick={()=>sendLeadMessage("inperson_1on1_request")} disabled={!leadThread} title="Asks your lead to meet face to face. Type a note above first for context, or send as-is." style={{marginTop:8,width:"100%",padding:"8px 12px",background:"transparent",border:`1px solid ${C.i}40`,borderRadius:8,color:C.i,cursor:leadThread?"pointer":"default",fontFamily:"inherit",fontSize:11}}>Request an in-person 1:1</button>
         </div>)}
@@ -4241,7 +4178,7 @@ export default function AnalystClientApp() {
               </div>
               <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
                 <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Tamper-Evident</M>
-                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Every export is Ed25519-signed and recorded in an append-only chain. Modifying or deleting an export entry after the fact would break the chain&apos;s hash continuity — the tampering would be visible to any reviewer.</M>
+                <M style={{color:C.td,fontSize:11,lineHeight:1.5}}>Every export is Ed25519-signed and recorded in an append-only chain. Modifying or deleting an export entry after the fact would break the chain&apos;s hash continuity — the tampering would be visible to any team lead.</M>
               </div>
               <div style={{padding:8,background:"rgba(255,255,255,0.02)",borderRadius:4,border:`1px solid ${C.b}`}}>
                 <M style={{color:"#E8EDF5",fontWeight:500,fontSize:11,display:"block",marginBottom:3}}>Separate Actors</M>

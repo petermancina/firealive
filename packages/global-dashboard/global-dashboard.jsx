@@ -899,13 +899,6 @@ export default function GlobalDashboard() {
   // stored value; INVALID_STATE on a duplicate-click race; etc.).
   const [approvingKeyId, setApprovingKeyId] = useState(null);
   const [approveError, setApproveError] = useState(null);
-  // U4 PR 5-C: pending legal-hold export approvals (CISO). Mirrors the signing-
-  // key approval queue: sourced from GET /api/abuse-export/pending, ciso-gated.
-  const [pendingExports, setPendingExports] = useState(null);
-  const [pendingExportsLoading, setPendingExportsLoading] = useState(false);
-  const [pendingExportsError, setPendingExportsError] = useState(null);
-  const [exportActionId, setExportActionId] = useState(null);
-  const [exportActionError, setExportActionError] = useState(null);
 
   // Reject-action modal state (added in C14). Reject is a destructive
   // permanent state transition that captures a free-form rationale —
@@ -1035,21 +1028,6 @@ export default function GlobalDashboard() {
         setPendingKeysError(r?.error || 'Failed to load pending signing-key approvals');
       }
     }).finally(() => setPendingKeysLoading(false));
-  }, [stage, tab]);
-
-  // U4 PR 5-C: load pending legal-hold export approvals on the connections tab
-  // (server ciso-gated; VP/readonly see the error state by design).
-  useEffect(() => {
-    if (stage !== "app" || tab !== "connections") return;
-    setPendingExportsLoading(true);
-    setPendingExportsError(null);
-    api.get('/api/abuse-export/pending').then(r => {
-      if (r && !r.error && Array.isArray(r.pending)) {
-        setPendingExports(r.pending);
-      } else {
-        setPendingExportsError(r?.error || 'Failed to load pending export approvals');
-      }
-    }).finally(() => setPendingExportsLoading(false));
   }, [stage, tab]);
 
   // Per-MC signing-keys history fetch (PR4 C12). Fires whenever the
@@ -1226,144 +1204,6 @@ export default function GlobalDashboard() {
         delete next[id];
         return next;
       });
-    }
-  };
-
-  // ── R3l C50: Legal Hold state + helpers (GD parity with MC C48/C49) ──────
-  // Same workflow as forensic-exports but with 2b semantics:
-  //   - caseId + rationale REQUIRED at create (validated client + server)
-  //   - rationale min 20 chars at both create and release
-  //   - 8 legal-hold-specific format IDs (distinct from forensic's 8)
-  //   - Release REPLACES forensic's delete; separate-actor enforced at three
-  //     layers (route, orchestrator, schema CHECK); CISO-only on release
-  //   - Indefinite retention default true; retention job respects the flag
-  const ALL_LEGAL_HOLD_FORMATS = [
-    'edrm-xml', 'eml-mime', 'pst', 'concordance',
-    'relativity', 'json-tarball', 'pdf-bates', 'tiff-bates',
-  ];
-  const [lhForm, setLhForm] = useState({
-    caseId: '',
-    rationale: '',
-    timeWindowStart: '',
-    timeWindowEnd: '',
-    outputFormats: ['edrm-xml', 'eml-mime'],
-    indefiniteRetention: true,
-    includeAuditLog: true,
-    includeBackupChain: true,
-    includeIncidentRecords: true,
-    includeAuthenticationLogs: true,
-    includeUserAccessLogs: true,
-  });
-  const [lhCreateInFlight, setLhCreateInFlight] = useState(false);
-  const [lhCreateError, setLhCreateError] = useState(null);
-  const [lhCreateResult, setLhCreateResult] = useState(null);
-  const [lhExports, setLhExports] = useState([]);
-  const [lhLoadState, setLhLoadState] = useState({ loaded: false, error: null });
-  const [lhChain, setLhChain] = useState(null);
-  const [lhChainOpen, setLhChainOpen] = useState(false);
-  const [lhReleaseModal, setLhReleaseModal] = useState({ open: false, holdId: '', caseId: '', requestedBy: '', rationale: '', submitting: false, error: '' });
-  // Tab-gated list fetch for the legal_hold tab. Mirrors the forensic
-  // useEffect at line 810 — same cancellation guard, same triple-state
-  // (loaded/error).
-  useEffect(() => {
-    if (tab !== 'legal_hold') return;
-    let cancelled = false;
-    api.get('/api/legal-hold-exports').then((r) => {
-      if (cancelled) return;
-      if (!r || r.error) {
-        setLhLoadState({ loaded: false, error: (r && r.error) || 'request_failed' });
-        return;
-      }
-      setLhExports(Array.isArray(r.holds) ? r.holds : []);
-      setLhLoadState({ loaded: true, error: null });
-    }).catch((e) => {
-      if (cancelled) return;
-      setLhLoadState({ loaded: false, error: (e && e.message) || 'request_failed' });
-    });
-    return () => { cancelled = true; };
-  }, [stage, tab]);
-  const toggleLhFormat = (fmt) => {
-    setLhForm((prev) => {
-      const has = prev.outputFormats.includes(fmt);
-      return { ...prev, outputFormats: has ? prev.outputFormats.filter((f) => f !== fmt) : [...prev.outputFormats, fmt] };
-    });
-  };
-  const refreshLhList = async () => {
-    const r = await api.get('/api/legal-hold-exports');
-    if (r && !r.error && Array.isArray(r.holds)) {
-      setLhExports(r.holds);
-    }
-  };
-  const submitLegalHold = async () => {
-    if (lhCreateInFlight) return;
-    if (!lhForm.caseId || !lhForm.caseId.trim()) {
-      setLhCreateError('caseId required — every legal hold must reference a litigation/regulatory matter');
-      return;
-    }
-    if (!lhForm.rationale || lhForm.rationale.trim().length < 20) {
-      setLhCreateError('rationale required, min 20 chars — every legal hold must document why');
-      return;
-    }
-    if (!lhForm.outputFormats || lhForm.outputFormats.length === 0) {
-      setLhCreateError('Select at least one output format');
-      return;
-    }
-    setLhCreateInFlight(true);
-    setLhCreateError(null);
-    setLhCreateResult(null);
-    try {
-      const body = {
-        caseId: lhForm.caseId.trim(),
-        rationale: lhForm.rationale.trim(),
-        timeWindowStart: lhForm.timeWindowStart || null,
-        timeWindowEnd: lhForm.timeWindowEnd || null,
-        outputFormats: lhForm.outputFormats,
-        indefiniteRetention: lhForm.indefiniteRetention,
-        includeAuditLog: lhForm.includeAuditLog,
-        includeBackupChain: lhForm.includeBackupChain,
-        includeIncidentRecords: lhForm.includeIncidentRecords,
-        includeAuthenticationLogs: lhForm.includeAuthenticationLogs,
-        includeUserAccessLogs: lhForm.includeUserAccessLogs,
-      };
-      const r = await api.post('/api/legal-hold-exports', body);
-      if (!r || r.error) {
-        setLhCreateError((r && r.error) || 'request_failed');
-      } else {
-        setLhCreateResult(r);
-        await refreshLhList();
-      }
-    } catch (e) {
-      setLhCreateError((e && e.message) || 'request_failed');
-    } finally {
-      setLhCreateInFlight(false);
-    }
-  };
-  const downloadLegalHold = async (id) => {
-    await api.download('/api/legal-hold-exports/' + encodeURIComponent(id) + '/download', 'firealive-gd-legal-hold-' + id + '.tar.gz');
-  };
-  const viewLhChain = async () => {
-    setLhChain(null);
-    setLhChainOpen(true);
-    const r = await api.get('/api/legal-hold-exports/chain');
-    setLhChain(r);
-  };
-  const submitLhRelease = async () => {
-    if (lhReleaseModal.submitting) return;
-    if (!lhReleaseModal.rationale || lhReleaseModal.rationale.trim().length < 20) return;
-    setLhReleaseModal((prev) => ({ ...prev, submitting: true, error: '' }));
-    try {
-      const r = await api.post(
-        '/api/legal-hold-exports/' + encodeURIComponent(lhReleaseModal.holdId) + '/release',
-        { rationale: lhReleaseModal.rationale.trim() }
-      );
-      if (!r || r.error) {
-        setLhReleaseModal((prev) => ({ ...prev, submitting: false, error: (r && r.error) || 'release_failed' }));
-      } else {
-        setLhReleaseModal({ open: false, holdId: '', caseId: '', requestedBy: '', rationale: '', submitting: false, error: '' });
-        await refreshLhList();
-      }
-    } catch (e) {
-      setLhReleaseModal((prev) => ({ ...prev, submitting: false, error: (e && e.message) || 'release_failed' }));
     }
   };
 
@@ -1619,7 +1459,7 @@ export default function GlobalDashboard() {
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
     {id:"helper_recognition",label:"Helper Recognition"},
     {id:"troubleshooter",label:"Troubleshooter"},{id:"app_updates",label:"App Updates"},
-    {id:"audit_dash",label:"Audit & Forensics"},{id:"forensic_exports",label:"Forensic Exports"},{id:"legal_hold",label:"Legal Hold"},
+    {id:"audit_dash",label:"Audit & Forensics"},{id:"forensic_exports",label:"Forensic Exports"},
   ];
 
   // LOGIN
@@ -1905,38 +1745,6 @@ export default function GlobalDashboard() {
                 </div>)}
                 {approveError&&<M style={{color:C.d,display:"block",marginTop:8,fontSize:10}}>{approveError}</M>}
                 <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>Verify fingerprint OUT OF BAND before approving; reject with rationale captured for the audit log otherwise.</M>
-              </div>}
-            </Card>
-            {/* U4 PR 5-C: Pending Legal-Hold Export Approvals (CISO two-person gate). */}
-            <Card style={{marginBottom:12,borderColor:(pendingExports&&pendingExports.length>0)?C.w+"40":C.b}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",fontFamily:"'Fraunces',serif"}}>Pending Legal-Hold Export Approvals</div>
-                {pendingExports&&<Badge color={pendingExports.length>0?C.w:C.a}>{pendingExports.length}</Badge>}
-              </div>
-              <M style={{color:C.tm,display:"block",marginBottom:10,fontSize:10,lineHeight:1.5}}>A reviewer has requested a two-person legal-hold export of a vaulted abuse case. Approving MINTS a signed approval that the reviewer's device verifies before producing the case file; the file is assembled and decrypted only on the reviewer's device, never here. Verify the legal basis before approving. This is a separate authority from the reviewer (separation of duties).</M>
-              {pendingExportsLoading&&<M style={{color:C.tm,fontStyle:"italic",display:"block"}}>Loading approval queue...</M>}
-              {pendingExportsError&&<M style={{color:C.d,display:"block"}}>{pendingExportsError}</M>}
-              {pendingExports&&!pendingExportsLoading&&pendingExports.length===0&&<M style={{color:C.a,fontStyle:"italic",display:"block"}}>No export requests awaiting review.</M>}
-              {pendingExports&&!pendingExportsLoading&&pendingExports.length>0&&<div>
-                {pendingExports.map((x,i)=><div key={x.id} style={{padding:"10px 0",borderBottom:i<pendingExports.length-1?`1px solid ${C.b}`:"none"}}>
-                  <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:4}}>
-                    <Badge color={C.w}>PENDING</Badge>
-                    <div style={{flex:1,minWidth:0}}>
-                      <M style={{color:C.t,fontWeight:500,display:"block"}}>case {x.flag_id}</M>
-                      <M style={{color:C.td,display:"block",fontSize:10}}>mc: {x.mc_id} · request {x.request_id} · received {x.received_at?new Date(x.received_at).toLocaleString():"—"}</M>
-                    </div>
-                  </div>
-                  <div style={{padding:"6px 8px",background:"rgba(0,0,0,0.25)",borderLeft:`2px solid ${C.w}`,borderRadius:4,marginTop:4}}>
-                    <M style={{color:C.tm,display:"block",fontSize:9,marginBottom:2}}>legal basis</M>
-                    <M style={{color:C.t,fontSize:10,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{x.request_reason||"—"}</M>
-                  </div>
-                  <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
-                    <Btn small primary disabled={exportActionId===x.id} onClick={()=>{ setExportActionId(x.id); setExportActionError(null); api.post('/api/abuse-export/'+x.id+'/approve',{}).then(r=>{ if(r&&!r.error){ api.get('/api/abuse-export/pending').then(p=>{ if(p&&Array.isArray(p.pending)) setPendingExports(p.pending); }); } else { setExportActionError((r&&r.error)||'Approve failed'); } }).finally(()=>setExportActionId(null)); }}>{exportActionId===x.id?"Working...":"Approve"}</Btn>
-                    <Btn small disabled={exportActionId===x.id} onClick={()=>{ const reason=window.prompt('Reason for denying this export request? (recorded)'); if(reason===null) return; setExportActionId(x.id); setExportActionError(null); api.post('/api/abuse-export/'+x.id+'/deny',{reason}).then(r=>{ if(r&&!r.error){ api.get('/api/abuse-export/pending').then(p=>{ if(p&&Array.isArray(p.pending)) setPendingExports(p.pending); }); } else { setExportActionError((r&&r.error)||'Deny failed'); } }).finally(()=>setExportActionId(null)); }}>Deny</Btn>
-                  </div>
-                </div>)}
-                {exportActionError&&<M style={{color:C.d,display:"block",marginTop:8,fontSize:10}}>{exportActionError}</M>}
-                <M style={{color:C.td,display:"block",marginTop:8,fontSize:9,fontStyle:"italic"}}>The reviewer cannot produce an export without this signed approval; you cannot produce one without the reviewer. Two-person control.</M>
               </div>}
             </Card>
             {mcsError&&<Card style={{padding:12,borderColor:C.d+"40",marginBottom:12}}><M style={{color:C.d}}>{mcsError}</M></Card>}
@@ -2242,171 +2050,6 @@ export default function GlobalDashboard() {
                 </tbody>
               </table>
             </Card>)}
-          </div>)}
-
-          {/* ══════════ R3l C50: LEGAL HOLD ══════════ */}
-          {tab==="legal_hold"&&(<div>
-            <L>Legal Hold</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Litigation-grade evidence preservation. Each hold bundles selected data slices into the chosen e-discovery formats (8 supported — EDRM XML, EML/mbox, PST-equivalent, Concordance, Relativity, JSON tarball, PDF-Bates, TIFF-Bates), signs the manifest with Ed25519 from the GD's own Tier-1 KEK (DISTINCT from the forensic export signing key — different cryptographic identity per workflow for litigation admissibility), and records the full lifecycle in the append-only legal_hold_chain.</M>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}><b style={{color:C.t}}>Separate-actor enforcement on release:</b> holds are created by the VP (or CISO); release requires the CISO role AND a different user than the original requester. Enforced at three layers — route handler, orchestrator, schema CHECK constraint. The chain entry persists across the release; HOLD_CREATED, HOLD_COMPLETED, HOLD_DOWNLOADED, HOLD_RELEASED entries all survive forever.</M>
-
-            <Card style={{marginBottom:16}}>
-              <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>New Legal Hold</div>
-              <div style={{marginBottom:12}}>
-                <M style={{color:C.tm,display:"block",marginBottom:4}}>Case ID (required — litigation matter, regulatory inquiry, internal investigation)</M>
-                <input type="text" value={lhForm.caseId} onChange={e=>setLhForm({...lhForm,caseId:e.target.value})} placeholder="Smith-v-Acme-2026, GDPR-Inquiry-Q3, IR-2026-0042" maxLength={200} style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
-                <div>
-                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window start (ISO 8601, optional)</M>
-                  <input type="text" value={lhForm.timeWindowStart} onChange={e=>setLhForm({...lhForm,timeWindowStart:e.target.value})} placeholder="2026-01-01T00:00:00Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
-                </div>
-                <div>
-                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Time window end (ISO 8601, optional)</M>
-                  <input type="text" value={lhForm.timeWindowEnd} onChange={e=>setLhForm({...lhForm,timeWindowEnd:e.target.value})} placeholder="2026-12-31T23:59:59Z" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace"}}/>
-                </div>
-              </div>
-              <div style={{marginBottom:12}}>
-                <M style={{color:C.tm,display:"block",marginBottom:6}}>Rationale (required, min 20 chars — court order ref, regulatory request, investigation context)</M>
-                <textarea value={lhForm.rationale} onChange={e=>setLhForm({...lhForm,rationale:e.target.value})} placeholder="Document why this hold is being placed — court order ref, regulatory request, internal investigation context" rows={3} maxLength={2000} style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"inherit",resize:"vertical"}}/>
-                <M style={{color:lhForm.rationale.trim().length<20?C.d:C.tm,display:"block",marginTop:4}}>{lhForm.rationale.trim().length}/20 minimum chars</M>
-              </div>
-              <div style={{marginBottom:12}}>
-                <M style={{color:C.tm,display:"block",marginBottom:6}}>Output formats (one file per format inside the archive)</M>
-                <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-                  {ALL_LEGAL_HOLD_FORMATS.map(fmt=>(
-                    <button key={fmt} onClick={()=>toggleLhFormat(fmt)} style={{padding:"5px 10px",background:lhForm.outputFormats.includes(fmt)?C.a:"rgba(255,255,255,0.03)",border:`1px solid ${lhForm.outputFormats.includes(fmt)?C.a:C.b}`,borderRadius:4,color:lhForm.outputFormats.includes(fmt)?"#000":C.t,fontSize:11,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>{fmt}</button>
-                  ))}
-                </div>
-              </div>
-              <div style={{marginBottom:12}}>
-                <M style={{color:C.tm,display:"block",marginBottom:6}}>Slices to include</M>
-                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
-                  {[
-                    ["includeAuditLog","Audit log"],
-                    ["includeBackupChain","Backup chain"],
-                    ["includeIncidentRecords","Incident retros"],
-                    ["includeAuthenticationLogs","Auth log"],
-                    ["includeUserAccessLogs","Session log"],
-                  ].map(([key,lbl])=>(
-                    <label key={key} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",color:C.t,fontSize:12}}>
-                      <input type="checkbox" checked={lhForm[key]} onChange={e=>setLhForm({...lhForm,[key]:e.target.checked})}/>
-                      {lbl}
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div style={{marginBottom:12}}>
-                <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",color:C.t,fontSize:12}}>
-                  <input type="checkbox" checked={lhForm.indefiniteRetention} onChange={e=>setLhForm({...lhForm,indefiniteRetention:e.target.checked})}/>
-                  Indefinite retention (default; uncheck for time-bounded preservation orders)
-                </label>
-              </div>
-              {lhCreateError&&(<Card style={{marginBottom:12,borderColor:C.d+"60"}}><M style={{color:C.d}}>Create failed: {lhCreateError}</M></Card>)}
-              {lhCreateResult&&(<Card style={{marginBottom:12,borderColor:C.a+"60"}}><M style={{color:C.a}}>Created hold <code>{lhCreateResult.id}</code> for case <code>{lhCreateResult.caseId}</code> ({lhCreateResult.sizeBytes} bytes, sha256 {(lhCreateResult.archiveSha256||"").slice(0,16)}…)</M></Card>)}
-              <div style={{display:"flex",gap:8}}>
-                <Btn small primary onClick={submitLegalHold} disabled={lhCreateInFlight}>{lhCreateInFlight?"Creating…":"Create Legal Hold"}</Btn>
-                <Btn small onClick={viewLhChain}>View Chain</Btn>
-              </div>
-            </Card>
-
-            {lhChainOpen&&(<Card style={{marginBottom:16,borderColor:C.i+"60"}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-                <div style={{fontSize:13,fontWeight:600,color:"#E8EDF5"}}>Legal Hold Chain</div>
-                <button onClick={()=>setLhChainOpen(false)} style={{background:"transparent",border:"none",color:C.tm,fontSize:14,cursor:"pointer"}}>✕</button>
-              </div>
-              {!lhChain&&(<M style={{color:C.tm,fontStyle:"italic"}}>Loading chain…</M>)}
-              {lhChain&&lhChain.error&&(<M style={{color:C.d}}>Error: {lhChain.error}</M>)}
-              {lhChain&&!lhChain.error&&(<div>
-                {lhChain.active_signing_key&&(<div style={{marginBottom:10,padding:8,background:"rgba(255,255,255,0.02)",border:`1px solid ${C.b}`,borderRadius:4}}>
-                  <M style={{color:C.td,display:"block"}}>Active signing key (DISTINCT from forensic_export signing key)</M>
-                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>id: {lhChain.active_signing_key.id}</M>
-                  <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>fingerprint: {lhChain.active_signing_key.fingerprint}</M>
-                </div>)}
-                <M style={{color:C.tm,display:"block",marginBottom:6}}>{lhChain.chain?lhChain.chain.length:0} chain entries (most recent first)</M>
-                <div style={{maxHeight:280,overflowY:"auto"}}>
-                  {(lhChain.chain||[]).slice(0,30).map(c=>(
-                    <div key={c.id} style={{padding:6,borderBottom:`1px solid ${C.b}`,fontSize:10,fontFamily:"'IBM Plex Mono',monospace"}}>
-                      <span style={{color:C.a}}>{c.event_type}</span> · <span style={{color:C.tm}}>hold {c.hold_ref}</span> · <span style={{color:C.td}}>actor {c.actor_user_id}</span> · <span style={{color:C.td}}>{c.created_at}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>)}
-            </Card>)}
-
-            {lhLoadState.loaded&&lhExports.length===0&&(<Card><M style={{color:C.tm,fontStyle:"italic"}}>No legal holds yet. Use the form above to create one.</M></Card>)}
-            {lhLoadState.error&&(<Card style={{borderColor:C.d+"60"}}><M style={{color:C.d}}>Load failed: {lhLoadState.error}</M></Card>)}
-            {lhLoadState.loaded&&lhExports.length>0&&(<Card style={{padding:0,overflow:"hidden"}}>
-              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead>
-                  <tr style={{background:"rgba(255,255,255,0.02)"}}>
-                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Case ID / Hold ID</th>
-                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Requested</th>
-                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
-                    <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Manifest Key</th>
-                    <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {lhExports.map(h=>{
-                    const statusColor = h.status==="active"?C.a:h.status==="released"?C.tm:h.status==="failed"?C.d:h.status==="in_progress"?C.i:C.w;
-                    return (
-                      <tr key={h.id} style={{borderBottom:`1px solid ${C.b}`}}>
-                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                          <M style={{color:C.t,wordBreak:"break-all"}}>{h.case_id}</M>
-                          <M style={{color:C.td,display:"block",fontSize:10,marginTop:2,fontFamily:"'IBM Plex Mono',monospace",wordBreak:"break-all"}}>{h.id}</M>
-                          {h.indefinite_retention?(<M style={{color:C.a,display:"block",fontSize:10,marginTop:2}}>indefinite retention</M>):null}
-                        </td>
-                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                          <M style={{color:C.tm}}>{h.requested_at||"—"}</M>
-                          <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>by: {h.requested_by_user_id}</M>
-                          {h.rationale&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4,maxWidth:240,wordBreak:"break-word"}}>{h.rationale}</M>)}
-                        </td>
-                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                          <Badge color={statusColor}>{h.status}</Badge>
-                          {h.hold_released_at&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4}}>released {h.hold_released_at}<br/>by {h.hold_released_by_user_id}</M>)}
-                          {h.error_message&&(<M style={{color:C.d,display:"block",fontSize:10,marginTop:4,maxWidth:200,wordBreak:"break-word"}}>{h.error_message}</M>)}
-                        </td>
-                        <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                          <M style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{(h.manifest_signing_key_fingerprint||"—").slice(0,16)}{h.manifest_signing_key_fingerprint&&h.manifest_signing_key_fingerprint.length>16?"…":""}</M>
-                        </td>
-                        <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
-                          <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
-                            {(h.status==="active"||h.status==="released")&&(<Btn small primary onClick={()=>downloadLegalHold(h.id)}>Download</Btn>)}
-                            {h.status==="active"&&(<button onClick={()=>setLhReleaseModal({open:true,holdId:h.id,caseId:h.case_id,requestedBy:h.requested_by_user_id||"",rationale:"",submitting:false,error:""})} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.w}`,borderRadius:4,color:C.w,fontSize:10,fontWeight:500,cursor:"pointer"}}>Release</button>)}
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </Card>)}
-
-            {/* Release modal */}
-            {lhReleaseModal.open&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={e=>{if(e.target===e.currentTarget)setLhReleaseModal(prev=>({...prev,open:false}));}}>
-              <div style={{width:580,maxWidth:"95vw",maxHeight:"90vh",overflow:"auto",padding:24,background:"#0D1117",border:`1px solid ${C.b}`,borderRadius:14}}>
-                <div style={{fontSize:15,fontWeight:500,color:"#E8EDF5",marginBottom:16}}>Release Legal Hold</div>
-                <M style={{display:"block",marginBottom:12,color:C.tm,lineHeight:1.5}}>
-                  Releasing case <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.caseId}</span> (hold ID <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.holdId}</span>).
-                </M>
-                <Card style={{marginBottom:14,background:"rgba(239,179,68,0.08)",border:`1px solid ${C.w}`}}>
-                  <M style={{color:C.w,display:"block",lineHeight:1.5}}>
-                    ⚠ Separate-actor invariant: the CISO performing this release must be a DIFFERENT user from the original VP/CISO requester ({lhReleaseModal.requestedBy||"unknown"}). If you are the requester, this release will be denied at THREE layers — route handler, orchestrator, and schema CHECK constraint. The chain entry will record HOLD_RELEASE_DENIED with a precise reason field.
-                  </M>
-                </Card>
-                <div style={{marginBottom:14}}>
-                  <M style={{color:C.tm,marginBottom:4,display:"block"}}>Release rationale (required, min 20 chars)</M>
-                  <textarea value={lhReleaseModal.rationale} onChange={e=>setLhReleaseModal(prev=>({...prev,rationale:e.target.value}))} placeholder="Document why this hold is being released — case resolved, regulatory inquiry closed, court order lifted" rows={3} maxLength={2000} style={{width:"100%",padding:10,fontSize:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontFamily:"inherit",resize:"vertical"}}/>
-                  <M style={{color:lhReleaseModal.rationale.trim().length<20?C.d:C.tm,marginTop:4,display:"block"}}>{lhReleaseModal.rationale.trim().length}/20 minimum chars</M>
-                </div>
-                {lhReleaseModal.error&&(<Card style={{marginBottom:12,borderColor:C.d+"60"}}><M style={{color:C.d}}>{lhReleaseModal.error}</M></Card>)}
-                <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
-                  <Btn small onClick={()=>setLhReleaseModal(prev=>({...prev,open:false}))}>Cancel</Btn>
-                  <button onClick={submitLhRelease} disabled={lhReleaseModal.submitting||lhReleaseModal.rationale.trim().length<20} style={{padding:"6px 14px",background:lhReleaseModal.submitting||lhReleaseModal.rationale.trim().length<20?"rgba(239,68,68,0.3)":C.d,border:`1px solid ${C.d}`,borderRadius:4,color:"#fff",fontSize:11,fontWeight:600,cursor:lhReleaseModal.submitting||lhReleaseModal.rationale.trim().length<20?"not-allowed":"pointer"}}>{lhReleaseModal.submitting?"Releasing…":"Confirm Release"}</button>
-                </div>
-              </div>
-            </div>)}
           </div>)}
 
           {/* ══════════ SYSTEM HEALTH ══════════ */}

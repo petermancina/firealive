@@ -1,46 +1,45 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Abuse Review API — reviewer-only
+// FIREALIVE — Lead Abuse Review API — Team-Lead only
 //
-// Serves abuse cases to the independent abuse_reviewer ONLY. Mounted behind
-// authMiddleware(['abuse_reviewer']); every handler ALSO re-checks access with
-// canReview() (role + not-a-party + scope) so no single guard is load-bearing.
+// Serves abuse cases to the Team Lead on the Management Console. Mounted behind
+// authMiddleware(['lead']); a router-level guard ALSO re-checks role === 'lead'
+// so the route fails closed regardless of how it is mounted.
 //
-// The server NEVER decrypts flag content. Every flag's sealed note and sealed
-// offending message are stored as opaque multi-recipient envelopes (the shared
+// The server NEVER decrypts flag content. Each flag's sealed note and sealed
+// offending content are stored as opaque multi-recipient envelopes (the shared
 // abuse-seal module's FAS2 format); this API hands them back as base64 and the
-// Abuse Review Console opens them client-side with the reviewer's own private
-// key, which never leaves the reviewer's device. Identity reveal follows the
-// policy: a lead who is a party is shown by real name; an analyst is ONLY ever
-// a pseudonym.
+// Management Console opens them client-side with the lead's own private key,
+// which never leaves the lead's device. Identity reveal follows the policy: a
+// lead or admin who is a party is shown by real name; an analyst is ONLY ever a
+// pseudonym.
 //
-// All three flag target types are reviewable: 'lead_chat', 'peer_session',
-// 'board_post'. The management console never reviews abuse content; that
-// authority is exclusively the independent abuse reviewer's.
+// Reviewable target types are 'peer_session' and 'board_post' (both
+// analyst-to-analyst). The store is append-only and non-deletable -- a lead may
+// only mark a case resolved with a structured verdict.
 //
-//   GET  /cases            — list reviewable cases the reviewer may access (metadata only)
-//   GET  /cases/:id        — one case: metadata + opaque sealed note/content (base64)
-//   POST /cases/:id/resolve — mark a case resolved (reviewer disposition note)
+//   GET  /cases             — list reviewable cases (metadata only)
+//   GET  /cases/:id         — one case: metadata + opaque sealed note/content (base64)
+//   POST /cases/:id/resolve — mark a case resolved (verdict + rationale note)
+//   GET  /patterns          — metadata-only behavioral patterns (repeat/escalation/retaliation)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
-const { canReview, REVIEWER_ROLE } = require('../services/abuse-reviewer-access');
 
-// All three flag target types are reviewed here, by the independent Abuse Review
-// Console ONLY. Each case's sealed content is opaque to the server -- it was
-// sealed on the flagger's device to the active reviewer recipient set, and only
-// a designated reviewer with the matching private key can open it.
-const REVIEWABLE_TARGET_TYPES = ['lead_chat', 'peer_session', 'board_post'];
+// Both reviewable flag target types. Each case's sealed content is opaque to the
+// server -- it was sealed on the flagger's device to the active Team-Lead
+// recipient set, and only a lead with the matching private key can open it.
+const REVIEWABLE_TARGET_TYPES = ['peer_session', 'board_post'];
 const REVIEWABLE_IN = REVIEWABLE_TARGET_TYPES.map(() => '?').join(', ');
 
 const MAX_RESOLUTION_NOTE = 4000;
 
 // Identity reveal. A lead (or admin) who is a party is shown by real name; an
-// analyst — or any other role — is ONLY ever a pseudonym to the reviewer. The
-// UUID is exposed so the reviewer can correlate repeat cases without ever
-// learning an analyst's real name (which lives only in the lead's offline map).
+// analyst -- or any other role -- is ONLY ever a pseudonym to the reviewing lead.
+// The UUID is exposed so a lead can correlate repeat cases without ever learning
+// an analyst's real name (which lives only in the lead's offline map).
 function revealParty(db, userId, pseudonymAtSeal) {
   if (!userId) return { id: null, role: null, label: 'unknown' };
   const u = db.prepare('SELECT id, role, name, pseudonym FROM users WHERE id = ?').get(userId);
@@ -52,48 +51,35 @@ function revealParty(db, userId, pseudonymAtSeal) {
   return { id: u.id, role: u.role, pseudonym: pseudo, label: pseudo || 'analyst' };
 }
 
-function loadReviewerContext(db, userId) {
-  const reviewer = db.prepare('SELECT id, role, active FROM users WHERE id = ?').get(userId);
-  const assignments = db.prepare(
-    'SELECT scope, team_id, flag_id FROM abuse_reviewer_assignments WHERE reviewer_user_id = ?'
-  ).all(userId);
-  return { reviewer, assignments };
-}
-
-// Defense in depth: EVERY endpoint on this router serves abuse_reviewer ONLY.
-// The mount (index.js) already role-gates, and each handler re-checks access via
-// canReview, but this router-level guard makes the route fail closed regardless
-// of how it is mounted -- and means any future endpoint added here is role-gated
-// by default rather than relying on its author to remember the check.
+// Defense in depth: EVERY endpoint on this router serves the Team Lead ONLY. The
+// mount (index.js) already role-gates; this router-level guard makes the route
+// fail closed regardless of how it is mounted, and means any future endpoint
+// added here is lead-gated by default.
 router.use((req, res, next) => {
-  if (!req.user || req.user.role !== REVIEWER_ROLE) {
-    auditLog(req.user && req.user.id, 'ABUSE_REVIEW_DENIED', `role ${req.user && req.user.role}: not an abuse_reviewer`, req.ip);
+  if (!req.user || req.user.role !== 'lead') {
+    auditLog(req.user && req.user.id, 'ABUSE_REVIEW_DENIED', `role ${req.user && req.user.role}: not a lead`, req.ip);
     return res.status(403).json({ error: 'forbidden' });
   }
   next();
 });
 
-// GET /cases — reviewable cases the reviewer may access (metadata only; no content).
+// GET /cases — reviewable cases (metadata only; no content).
 router.get('/cases', (req, res) => {
   let db;
   try {
     db = getDb();
-    const { reviewer, assignments } = loadReviewerContext(db, req.user.id);
     const flags = db.prepare(
-      `SELECT id, target_type, flagger_user_id, flagged_user_id, tier, created_at, resolved_at, resolved_by
+      `SELECT id, target_type, flagger_user_id, flagged_user_id, tier, created_at, resolved_at, resolved_by, determination
          FROM peer_abuse_flags
         WHERE target_type IN (${REVIEWABLE_IN})
         ORDER BY (resolved_at IS NOT NULL), tier DESC, created_at DESC`
     ).all(...REVIEWABLE_TARGET_TYPES);
 
-    const cases = [];
-    for (const f of flags) {
-      // teamIds stays [] until a team-membership model exists (E3 note).
-      if (!canReview({ reviewer, flag: { ...f, teamIds: [] }, assignments }).allowed) continue;
+    const cases = flags.map((f) => {
       const v = db.prepare(
         'SELECT flagger_pseudonym_at_seal, accused_pseudonym_at_seal FROM peer_abuse_evidence_vault WHERE flag_id = ?'
       ).get(f.id);
-      cases.push({
+      return {
         id: f.id,
         targetType: f.target_type,
         tier: f.tier,
@@ -103,11 +89,11 @@ router.get('/cases', (req, res) => {
         determination: f.resolved_at ? (f.determination || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
-      });
-    }
+      };
+    });
     return res.json({ cases });
   } catch (err) {
-    logger.error('Abuse review: failed to list cases', { error: err.message });
+    logger.error('Lead abuse review: failed to list cases', { error: err.message });
     return res.status(500).json({ error: 'failed to list cases' });
   } finally {
     if (db) db.close();
@@ -123,13 +109,6 @@ router.get('/cases/:id', (req, res) => {
       `SELECT * FROM peer_abuse_flags WHERE id = ? AND target_type IN (${REVIEWABLE_IN})`
     ).get(req.params.id, ...REVIEWABLE_TARGET_TYPES);
     if (!f) return res.status(404).json({ error: 'case not found' });
-
-    const { reviewer, assignments } = loadReviewerContext(db, req.user.id);
-    const decision = canReview({ reviewer, flag: { ...f, teamIds: [] }, assignments });
-    if (!decision.allowed) {
-      auditLog(req.user.id, 'ABUSE_REVIEW_DENIED', `case ${f.id}: ${decision.reason}`, req.ip);
-      return res.status(403).json({ error: 'forbidden', reason: decision.reason });
-    }
 
     const v = db.prepare(
       `SELECT sealed_content_encrypted, context_encrypted, flagger_pseudonym_at_seal, accused_pseudonym_at_seal, sealed_at
@@ -149,8 +128,8 @@ router.get('/cases/:id', (req, res) => {
         determination: f.resolved_at ? (f.determination || null) : null,
         flagger: revealParty(db, f.flagger_user_id, v && v.flagger_pseudonym_at_seal),
         accused: revealParty(db, f.flagged_user_id, v && v.accused_pseudonym_at_seal),
-        // OPAQUE sealed envelopes — the server cannot read these. The Abuse Review
-        // Console opens them client-side with the reviewer's own private key.
+        // OPAQUE sealed envelopes -- the server cannot read these. The Management
+        // Console opens them client-side with the lead's own private key.
         sealedNote: f.content_encrypted ? Buffer.from(f.content_encrypted).toString('base64') : null,
         sealedContent: v && v.sealed_content_encrypted ? Buffer.from(v.sealed_content_encrypted).toString('base64') : null,
         sealedContext: v && v.context_encrypted ? Buffer.from(v.context_encrypted).toString('base64') : null,
@@ -158,14 +137,17 @@ router.get('/cases/:id', (req, res) => {
       },
     });
   } catch (err) {
-    logger.error('Abuse review: failed to read case', { error: err.message });
+    logger.error('Lead abuse review: failed to read case', { error: err.message });
     return res.status(500).json({ error: 'failed to read case' });
   } finally {
     if (db) db.close();
   }
 });
 
-// POST /cases/:id/resolve — mark a case resolved with the reviewer's disposition note.
+// POST /cases/:id/resolve — mark a case resolved with the lead's verdict + note.
+// One-shot: the 409 below blocks any second resolution; there is no
+// re-determination path by design. The verdict is stored on the flag row, never
+// written to the audit log.
 router.post('/cases/:id/resolve', (req, res) => {
   const { note, determination } = req.body || {};
   let db;
@@ -175,19 +157,8 @@ router.post('/cases/:id/resolve', (req, res) => {
       `SELECT * FROM peer_abuse_flags WHERE id = ? AND target_type IN (${REVIEWABLE_IN})`
     ).get(req.params.id, ...REVIEWABLE_TARGET_TYPES);
     if (!f) return res.status(404).json({ error: 'case not found' });
-
-    const { reviewer, assignments } = loadReviewerContext(db, req.user.id);
-    const decision = canReview({ reviewer, flag: { ...f, teamIds: [] }, assignments });
-    if (!decision.allowed) {
-      auditLog(req.user.id, 'ABUSE_REVIEW_DENIED', `resolve ${f.id}: ${decision.reason}`, req.ip);
-      return res.status(403).json({ error: 'forbidden', reason: decision.reason });
-    }
     if (f.resolved_at) return res.status(409).json({ error: 'case already resolved' });
 
-    // A resolution requires a structured verdict and a non-empty rationale note.
-    // The verdict is one-shot: the 409 above blocks any second resolution, and
-    // there is no re-determination path by design (U4 PR 5). The verdict is
-    // stored on the reviewer-only flag row, never written to the audit log.
     const DETERMINATIONS = ['substantiated', 'not_substantiated', 'inconclusive'];
     if (!DETERMINATIONS.includes(determination)) {
       return res.status(400).json({ error: `determination must be one of: ${DETERMINATIONS.join(', ')}` });
@@ -203,7 +174,7 @@ router.post('/cases/:id/resolve', (req, res) => {
     auditLog(req.user.id, 'ABUSE_REVIEW_RESOLVED', `case ${f.id}, tier ${f.tier}`, req.ip);
     return res.json({ id: f.id, resolved: true, determination });
   } catch (err) {
-    logger.error('Abuse review: failed to resolve case', { error: err.message });
+    logger.error('Lead abuse review: failed to resolve case', { error: err.message });
     return res.status(500).json({ error: 'failed to resolve case' });
   } finally {
     if (db) db.close();
@@ -211,16 +182,12 @@ router.post('/cases/:id/resolve', (req, res) => {
 });
 
 // GET /patterns — metadata-only behavioral patterns (repeat_offender / escalation
-// / retaliation) the reviewer may see. A pattern surfaces only if the reviewer
-// can access at least one of its involved REVIEWABLE flags; flagCount and maxTier
-// are computed from the accessible flags ALONE, so a reviewer never learns the
-// count/tier of cases outside their scope (e.g. another team's cases). Identities
-// follow the reveal policy.
+// / retaliation) over reviewable flags. flagCount and maxTier are computed from
+// the pattern's involved REVIEWABLE flags. Identities follow the reveal policy.
 router.get('/patterns', (req, res) => {
   let db;
   try {
     db = getDb();
-    const { reviewer, assignments } = loadReviewerContext(db, req.user.id);
     const patterns = db.prepare(
       "SELECT * FROM peer_abuse_patterns ORDER BY (acknowledged_at IS NOT NULL), created_at DESC"
     ).all();
@@ -230,37 +197,35 @@ router.get('/patterns', (req, res) => {
       let ids = [];
       try { ids = JSON.parse(pat.involved_flag_ids || '[]'); } catch (e) { ids = []; }
 
-      const accessible = [];
+      const involved = [];
       let maxTier = 0;
       for (const fid of ids) {
         const f = db.prepare(
-          `SELECT id, target_type, flagger_user_id, flagged_user_id, tier
-             FROM peer_abuse_flags WHERE id = ? AND target_type IN (${REVIEWABLE_IN})`
+          `SELECT id, tier FROM peer_abuse_flags WHERE id = ? AND target_type IN (${REVIEWABLE_IN})`
         ).get(fid, ...REVIEWABLE_TARGET_TYPES);
         if (!f) continue; // not a reviewable target type
-        if (!canReview({ reviewer, flag: { ...f, teamIds: [] }, assignments }).allowed) continue;
-        accessible.push(f.id);
+        involved.push(f.id);
         if (f.tier > maxTier) maxTier = f.tier;
       }
-      if (accessible.length === 0) continue; // nothing in this pattern is accessible
+      if (involved.length === 0) continue;
 
       out.push({
         id: pat.id,
         patternType: pat.pattern_type,
         severity: pat.severity,
-        flagCount: accessible.length,           // accessible cases only
-        maxTier,                                  // max tier among accessible cases
+        flagCount: involved.length,
+        maxTier,
         windowStart: pat.window_start,
         windowEnd: pat.window_end,
         acknowledged: !!pat.acknowledged_at,
         subject: revealParty(db, pat.subject_user_id, null),
         counterpart: pat.counterpart_user_id ? revealParty(db, pat.counterpart_user_id, null) : null,
-        accessibleFlagIds: accessible,            // the cases this reviewer can open
+        involvedFlagIds: involved,
       });
     }
     return res.json({ patterns: out });
   } catch (err) {
-    logger.error('Abuse review: failed to list patterns', { error: err.message });
+    logger.error('Lead abuse review: failed to list patterns', { error: err.message });
     return res.status(500).json({ error: 'failed to list patterns' });
   } finally {
     if (db) db.close();

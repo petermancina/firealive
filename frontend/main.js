@@ -353,34 +353,19 @@ try {
   ({ createSignalE2EE } = require('../packages/shared/signal-e2ee'));
 }
 
-// The reviewer-only seal helper (packages/shared/abuse-seal.js) is bundled the
-// same way; load it with the same packaged/source fallback. It needs no native
-// dependency (Node crypto only), so a plain require is enough.
-let sealToReviewers;
+// The abuse-seal helper (packages/shared/abuse-seal.js) is bundled the same way;
+// load it with the same packaged/source fallback. It needs no native dependency
+// (Node crypto only), so a plain require is enough. The Team-Lead review side
+// uses the keypair/open/wrap helpers (the lead holds the private key and opens
+// sealed cases in this main process).
+let generateReviewerKeypair, openForReviewer, wrapPrivateKey,
+  unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate;
 try {
-  ({ sealToReviewers } = require('./abuse-seal'));
+  ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey,
+    unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('./abuse-seal'));
 } catch {
-  ({ sealToReviewers } = require('../packages/shared/abuse-seal'));
-}
-
-// The reporter-note sanitizer (packages/shared/note-sanitizer.js) is loaded the
-// same packaged/source way. It hardens the reporter's free-text note before it
-// is sealed; the flagged CONTENT is never passed through it.
-let sanitizeNote;
-try {
-  ({ sanitizeNote } = require('./note-sanitizer'));
-} catch {
-  ({ sanitizeNote } = require('../packages/shared/note-sanitizer'));
-}
-
-// The abuse-flag export PDF builder (packages/shared/abuse-export-pdf.js) is
-// loaded the same packaged/source way. It renders the flagger's one-shot
-// submission record locally; no content leaves the device to build it.
-let buildAbuseExportPdf;
-try {
-  ({ buildAbuseExportPdf } = require('./abuse-export-pdf'));
-} catch {
-  ({ buildAbuseExportPdf } = require('../packages/shared/abuse-export-pdf'));
+  ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey,
+    unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('../packages/shared/abuse-seal'));
 }
 
 // B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
@@ -525,104 +510,114 @@ ipcMain.handle('e2ee:decrypt', async (_e, { domain, remoteUserId, envelope } = {
 ipcMain.handle('e2ee:safetyNumber', async (_e, { domain, remoteUserId, localId, remoteId } = {}) =>
   ({ safetyNumber: await domainHandle(domain).safetyNumber(remoteUserId, { localId, remoteId }) }));
 
-// Seal abuse-flag content to the active reviewer recipient set (multi-reviewer
-// zero-access). A lead reports an analyst's message here; the renderer passes the
-// offending text (already decrypted on screen) and the flagger's note, plus the
-// active reviewer public keys it fetched, and gets back opaque base64 that ONLY a
-// designated reviewer can open. The content is sealed to ALL active reviewer keys
-// at once (one multi-recipient envelope), so any one reviewer opens it with their
-// own private key. The server stores it and cannot read it; no private key is
-// ever involved here. The renderer calls this once per field (offending text,
-// note).
-ipcMain.handle('abuse:seal', async (_e, { recipientPublicKeys, plaintext, sanitize } = {}) => {
-  if (!Array.isArray(recipientPublicKeys) || recipientPublicKeys.length === 0) {
-    throw new Error('recipientPublicKeys (non-empty array of base64) required');
-  }
-  if (!recipientPublicKeys.every((k) => typeof k === 'string' && k)) {
-    throw new Error('each recipient public key must be base64');
-  }
-  if (typeof plaintext !== 'string') {
-    throw new Error('plaintext (string) required');
-  }
-  // Only the reporter's note is sanitized (sanitize: true). The flagged content
-  // is system-copied authentic text and must be sealed exactly as captured.
-  const material = sanitize ? sanitizeNote(plaintext) : plaintext;
-  return { sealed: sealToReviewers(recipientPublicKeys, material) };
+// -- Team-Lead abuse-review key: bootstrap, unlock, and sealed-content opening --
+// The Team Lead's abuse-review PRIVATE key never leaves this main process
+// unencrypted: it is generated once, wrapped under the lead's passphrase, then
+// sealed at rest with the OS keychain (safeStorage), and used only here to open
+// sealed case content. The renderer only ever receives the PUBLIC key (to
+// register) and decrypted plaintext (to display).
+const leadAbuseKeyFile = () => path.join(app.getPath('userData'), 'lead-abuse-review-key.enc');
+
+// Minimum passphrase length. A passphrase (length over composition) is the second
+// factor protecting the private key at rest; the renderer hints on strength, this
+// is the authoritative floor.
+const ABUSE_MIN_PASSPHRASE_LEN = 12;
+
+// The unwrapped private key is held ONLY in this main-process variable, only for
+// the duration of an unlocked session. It is set by abuse:unlock and cleared by
+// abuse:lock and on shutdown -- never written unwrapped, never sent to the
+// renderer.
+let unlockedAbusePrivB64 = null;
+
+// Does a sealed Team-Lead abuse-review key already exist on this device? Drives
+// the onboarding-vs-ready decision in the renderer.
+ipcMain.handle('abuse:hasKey', () => {
+  try { return fs.existsSync(leadAbuseKeyFile()); } catch { return false; }
 });
 
-// ── Abuse-flag export: one-shot, in-memory submission record ─────────────────
-//
-// Mirrors the Analyst Client. After a flag is submitted to the independent
-// reviewer (here, the team-lead-as-victim lead-chat case), the flagger may
-// export a single local PDF copy. The authentic plaintext is held HERE, in the
-// main process only, for a short window: never written to disk, IndexedDB, or
-// renderer state, and wiped on export, on decline, or on timeout. Memory-only,
-// not a hardware enclave -- JS strings cannot be reliably zeroed, so the
-// material is held in Buffers that are filled with zeros on wipe as a best
-// effort.
-const ABUSE_EXPORT_WINDOW_MS = 5 * 60 * 1000;
-let abuseExportHold = null;   // { flagId, targetType, content: Buffer, note: Buffer, contentSha256, expiresAt }
-let abuseExportTimer = null;
-
-function wipeAbuseExportHold() {
-  if (abuseExportTimer) { clearTimeout(abuseExportTimer); abuseExportTimer = null; }
-  if (abuseExportHold) {
-    try { if (abuseExportHold.content) abuseExportHold.content.fill(0); } catch (_) {}
-    try { if (abuseExportHold.note) abuseExportHold.note.fill(0); } catch (_) {}
-    abuseExportHold = null;
+// Generate this lead's abuse-review keypair on THIS device at first onboarding.
+// The private key is wrapped under the lead's passphrase and then sealed with
+// safeStorage before being persisted, so it is protected by something the lead
+// knows AND the OS keychain. Only the PUBLIC key, algo, and an 8-byte fingerprint
+// are returned, so the renderer can register the public key via POST
+// /api/abuse-review-key (which adds this lead to the recipient set). The private
+// key is never returned. Opening sealed content additionally requires an explicit
+// unlock, since the stored key is passphrase-wrapped.
+ipcMain.handle('abuse:generateKey', (_e, passphrase) => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('OS secure storage is unavailable; cannot protect the abuse-review key');
   }
-}
-
-ipcMain.handle('abuse:hold-for-export', async (_e, { flagId, targetType, contentText, note } = {}) => {
-  if (typeof flagId !== 'string' || !flagId) throw new Error('flagId (string) required');
-  if (typeof contentText !== 'string' || !contentText) throw new Error('contentText (string) required');
-  wipeAbuseExportHold();
-  const content = Buffer.from(contentText, 'utf8');
-  const noteBuf = Buffer.from(sanitizeNote(typeof note === 'string' ? note : ''), 'utf8');
-  const contentSha256 = crypto.createHash('sha256').update(content).digest('hex');
-  const expiresAt = Date.now() + ABUSE_EXPORT_WINDOW_MS;
-  abuseExportHold = { flagId, targetType: targetType || '', content, note: noteBuf, contentSha256, expiresAt };
-  abuseExportTimer = setTimeout(wipeAbuseExportHold, ABUSE_EXPORT_WINDOW_MS);
-  return { contentSha256, expiresAt, windowMs: ABUSE_EXPORT_WINDOW_MS };
+  if (typeof passphrase !== 'string' || passphrase.length < ABUSE_MIN_PASSPHRASE_LEN) {
+    throw new Error('a passphrase of at least ' + ABUSE_MIN_PASSPHRASE_LEN + ' characters is required');
+  }
+  if (fs.existsSync(leadAbuseKeyFile())) {
+    throw new Error('an abuse-review key already exists on this device');
+  }
+  const kp = generateReviewerKeypair();
+  const wrapped = wrapPrivateKey(kp.privateKeyB64, passphrase);
+  fs.writeFileSync(leadAbuseKeyFile(), safeStorage.encryptString(wrapped), { mode: 0o600 });
+  return { algo: kp.algo, publicKeyB64: kp.publicKeyB64, fingerprint: fingerprintForPubB64(kp.publicKeyB64).toString('hex') };
 });
 
-ipcMain.handle('abuse:finalize-export', async (_e, { descriptor } = {}) => {
-  const hold = abuseExportHold;
-  if (!hold) return { saved: false, reason: 'expired' };
-  const payload = (descriptor && descriptor.payload) || {};
-  if (payload.flag_uuid !== hold.flagId || payload.content_sha256 !== hold.contentSha256) {
-    return { saved: false, reason: 'mismatch' };
+// Unlock the abuse-review key for this session: decrypt the safeStorage layer,
+// then unwrap the passphrase layer, and hold the private key in memory until
+// locked. A wrong passphrase fails the unwrap and no key is held. Returns the
+// key's fingerprint so the UI can confirm which key is unlocked.
+ipcMain.handle('abuse:unlock', (_e, passphrase) => {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('OS secure storage is unavailable; cannot read the abuse-review key');
   }
-  let pdf;
+  if (typeof passphrase !== 'string' || !passphrase) {
+    throw new Error('a passphrase is required');
+  }
+  if (!fs.existsSync(leadAbuseKeyFile())) {
+    throw new Error('no abuse-review key on this device');
+  }
+  const wrapped = safeStorage.decryptString(fs.readFileSync(leadAbuseKeyFile()));
+  let privB64;
   try {
-    pdf = await buildAbuseExportPdf({
-      contentText: hold.content.toString('utf8'),
-      note: hold.note.toString('utf8'),
-      descriptor,
-    });
-  } catch (e) {
-    return { saved: false, reason: 'build_failed' };
+    privB64 = unwrapPrivateKey(wrapped, passphrase);
+  } catch {
+    throw new Error('incorrect passphrase');
   }
-  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
-  const defaultName = 'firealive-flag-' + hold.flagId.slice(0, 8) + '.pdf';
-  const { canceled, filePath } = await dialog.showSaveDialog(win, {
-    title: 'Save abuse-flag submission record',
-    defaultPath: defaultName,
-    filters: [{ name: 'PDF', extensions: ['pdf'] }],
-  });
-  if (canceled || !filePath) return { saved: false, reason: 'dialog_canceled' };
-  try {
-    fs.writeFileSync(filePath, pdf);
-  } catch (e) {
-    return { saved: false, reason: 'write_failed' };
-  }
-  wipeAbuseExportHold();
-  return { saved: true };
+  unlockedAbusePrivB64 = privB64;
+  return { unlocked: true, fingerprint: fingerprintForPubB64(publicKeyB64FromPrivate(privB64)).toString('hex') };
 });
 
-ipcMain.handle('abuse:cancel-export', async () => {
-  wipeAbuseExportHold();
-  return { canceled: true };
+// Lock the abuse-review key: clear it from memory. Invoked by the renderer and on
+// shutdown, so an unlocked session does not outlive the lead's presence.
+ipcMain.handle('abuse:lock', () => {
+  unlockedAbusePrivB64 = null;
+  return { locked: true };
+});
+
+// Open one sealed value (a case's sealed note or sealed content) with the
+// in-memory private key. The shared abuse-seal module's openForReviewer locates
+// this lead's slot by fingerprint, unwraps the DEK, and decrypts the content.
+// Refuses when the key is locked. Decryption happens only here; the renderer
+// receives plaintext to display. The private key is never returned.
+ipcMain.handle('abuse:open', (_e, sealedB64) => {
+  if (typeof sealedB64 !== 'string' || !sealedB64) {
+    throw new Error('sealed value (base64) required');
+  }
+  if (!unlockedAbusePrivB64) {
+    throw new Error('abuse-review key is locked; unlock with your passphrase first');
+  }
+  return { plaintext: openForReviewer(unlockedAbusePrivB64, sealedB64).toString('utf8') };
+});
+
+// Remove this device's abuse-review key entirely: delete the wrapped key file
+// and clear any unlocked private key from memory, so the lead can re-onboard
+// with a fresh key. Server-side revocation of the registered public key is
+// done separately by the renderer.
+ipcMain.handle('abuse:deleteKey', () => {
+  unlockedAbusePrivB64 = null;
+  try {
+    if (fs.existsSync(leadAbuseKeyFile())) fs.unlinkSync(leadAbuseKeyFile());
+  } catch (e) {
+    throw new Error('could not delete the abuse-review key file: ' + e.message);
+  }
+  return { deleted: true };
 });
 
 app.whenReady().then(() => {
@@ -639,4 +634,5 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ }
+  unlockedAbusePrivB64 = null;
 });

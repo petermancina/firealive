@@ -1293,7 +1293,7 @@ function MigrationPanel() {
   return (
     <div>
       <L>Deployment Migration (FA-MIG1)</L>
-      <M style={{color:C.tm,display:'block',marginBottom:16,lineHeight:1.6}}>Export this deployment as a signed FA-MIG1 bundle, or import one onto this host. A migration restores the source data (audit, forensic, and legal-hold chains, config, and analyst keys) and re-establishes this deployment instance identity fresh -- the source identity is never carried, so a migration is not a clone. Analyst clients re-bind through the recovery ceremony afterward.</M>
+      <M style={{color:C.tm,display:'block',marginBottom:16,lineHeight:1.6}}>Export this deployment as a signed FA-MIG1 bundle, or import one onto this host. A migration restores the source data (audit and forensic chains, config, and analyst keys) and re-establishes this deployment instance identity fresh -- the source identity is never carried, so a migration is not a clone. Analyst clients re-bind through the recovery ceremony afterward.</M>
       <Card style={{marginBottom:16}}>
         <div style={{fontSize:13,fontWeight:500,color:'#E8EDF5',marginBottom:8}}>Export</div>
         <M style={{color:C.tm,display:'block',marginBottom:12,lineHeight:1.6}}>Composes a golden-baseline plus a signed, encrypted full-suite backup into a portable bundle on this server. Requires MFA step-up.</M>
@@ -1344,47 +1344,6 @@ function MigrationPanel() {
 
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
-  // Abuse-reviewer recipient set: list of active reviewer public keys, register
-  // form fields, and a small status state. Public-key operations only (the
-  // private keys live on each reviewer's device behind their passphrase).
-  const [arKeys, setArKeys] = useState(null);   // null=unloaded, [] = loaded empty, [{...}] = present
-  const [arKeysErr, setArKeysErr] = useState("");
-  const [arMsg, setArMsg] = useState("");
-  const [arNewPub, setArNewPub] = useState("");
-  const [arNewLabel, setArNewLabel] = useState("");
-  const [arBusy, setArBusy] = useState(false);
-  async function loadAbuseReviewers() {
-    setArKeysErr(""); setArKeys(null);
-    const r = await api.get("/api/abuse-review-keys");
-    if (r && r.error) { setArKeysErr("Could not load reviewer keys."); setArKeys([]); return; }
-    setArKeys(Array.isArray(r && r.keys) ? r.keys : []);
-  }
-  async function registerReviewerKey() {
-    setArKeysErr(""); setArMsg("");
-    const pub = (arNewPub || "").trim();
-    const label = (arNewLabel || "").trim();
-    if (!pub) { setArKeysErr("Public key (base64) required."); return; }
-    setArBusy(true);
-    const r = await api.post("/api/abuse-review-key", { publicKey: pub, label: label || undefined });
-    setArBusy(false);
-    if (!r) { setArKeysErr("No response from server."); return; }
-    if (r.error) { setArKeysErr(r.error); return; }
-    setArMsg(`Added reviewer${r.fingerprint ? " " + r.fingerprint : ""}.`);
-    setArNewPub(""); setArNewLabel("");
-    loadAbuseReviewers();
-  }
-  async function revokeReviewerKey(id) {
-    setArKeysErr(""); setArMsg("");
-    if (!window.confirm("Revoke this reviewer key? New flags will not seal to it; flags already sealed to other active reviewers stay openable by them.")) return;
-    setArBusy(true);
-    const r = await api.post(`/api/abuse-review-key/${id}/revoke`, {});
-    setArBusy(false);
-    if (!r) { setArKeysErr("No response from server."); return; }
-    if (r.error) { setArKeysErr(r.error); return; }
-    setArMsg("Reviewer revoked.");
-    loadAbuseReviewers();
-  }
-  useEffect(() => { if (tab === "abuse_reviewers" && arKeys === null) loadAbuseReviewers(); }, [tab]);
   const [gDepth, setGD] = useState(null);
   const [pDepths, setPD] = useState({});
   const [silenced, setSil] = useState([]);
@@ -1498,62 +1457,6 @@ function ManagementConsole() {
   const [leadChatMsgs, setLeadChatMsgs] = useState([]);
   const [leadChatInput, setLeadChatInput] = useState("");
   const [leadChatSessionReady, setLeadChatSessionReady] = useState(false);
-  // Phase U3: lead-chat abuse flag. A lead can report an analyst's message; it
-  // is sealed on the client to the active reviewer recipient set and posted as
-  // a lead_chat flag. leadFlagMsg holds the message.
-  const [leadFlagMsg, setLeadFlagMsg] = useState(null);
-  const [leadFlagTier, setLeadFlagTier] = useState(0); // 0=unselected, 1/2/3
-  const [leadFlagNote, setLeadFlagNote] = useState("");
-  const [leadFlagBusy, setLeadFlagBusy] = useState(false);
-  const [leadFlagErr, setLeadFlagErr] = useState("");
-  // One-shot abuse-flag export prompt (team-lead-as-victim lead-chat case). After
-  // a flag is submitted, the lead may save a single signed PDF copy as a personal
-  // backup; the authentic plaintext lives only in the main process for a 5-minute
-  // window (see abuse:hold-for-export). Only a content hash is kept here.
-  const [exportPrompt, setExportPrompt] = useState(null);   // { flagId, targetType, contentSha256 }
-  const [exportExpiresAt, setExportExpiresAt] = useState(0);
-  const [exportBusy, setExportBusy] = useState(false);
-  const [exportMsg, setExportMsg] = useState("");
-  const [exportDone, setExportDone] = useState(false);
-  const beginExportPrompt = async (flagId, targetType, contentText, note) => {
-    const bridge = (typeof window !== "undefined") ? window.firealive : null;
-    if (!bridge || !bridge.invoke || !flagId || !contentText) return;
-    try {
-      const h = await bridge.invoke("abuse:hold-for-export", { flagId, targetType, contentText, note });
-      setExportPrompt({ flagId, targetType, contentSha256: h && h.contentSha256 });
-      setExportExpiresAt(h && h.expiresAt ? h.expiresAt : Date.now() + 5 * 60 * 1000);
-      setExportMsg(""); setExportDone(false); setExportBusy(false);
-    } catch (e) { /* export unavailable -- the submission still succeeded */ }
-  };
-  const doExport = async () => {
-    const bridge = (typeof window !== "undefined") ? window.firealive : null;
-    if (!exportPrompt || !bridge || !bridge.invoke) return;
-    setExportBusy(true); setExportMsg("");
-    try {
-      const r = await api.post("/api/peer/flags/" + exportPrompt.flagId + "/sign-record", { content_sha256: exportPrompt.contentSha256 });
-      if (!r || r.error || !r.signatureB64) { setExportMsg("Could not sign the record" + (r && r.error ? ": " + r.error : ".")); setExportBusy(false); return; }
-      const descriptor = { payload: r.payload, canonical: r.canonical, reportSha256: r.reportSha256, signatureB64: r.signatureB64, keyFingerprint: r.keyFingerprint, instanceLabel: r.instanceLabel, signedAt: r.signedAt };
-      const fin = await bridge.invoke("abuse:finalize-export", { descriptor });
-      if (fin && fin.saved) { setExportMsg("Saved. This signed PDF is your only personal copy."); setExportDone(true); }
-      else if (fin && fin.reason === "dialog_canceled") { setExportMsg("Save canceled. You can export again until the window closes."); }
-      else if (fin && fin.reason === "expired") { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); }
-      else { setExportMsg("Could not save the record."); }
-    } catch (e) { setExportMsg("Could not export the record."); }
-    setExportBusy(false);
-  };
-  const declineExport = async () => {
-    const bridge = (typeof window !== "undefined") ? window.firealive : null;
-    try { if (bridge && bridge.invoke) await bridge.invoke("abuse:cancel-export"); } catch (e) {}
-    setExportPrompt(null); setExportExpiresAt(0); setExportMsg(""); setExportDone(false); setExportBusy(false);
-  };
-  useEffect(() => {
-    if (!exportPrompt || exportDone || !exportExpiresAt) return undefined;
-    const ms = exportExpiresAt - Date.now();
-    const expire = () => { setExportMsg("The window has closed and the content was wiped from this device."); setExportDone(true); };
-    if (ms <= 0) { expire(); return undefined; }
-    const t = setTimeout(expire, ms);
-    return () => clearTimeout(t);
-  }, [exportPrompt, exportExpiresAt, exportDone]);
   const leadChatPollCursor = useRef(null);
   // Phase U3: threads where the analyst has an unacknowledged in-person 1:1
   // request (drives the global banner and the inbox callout below).
@@ -1586,36 +1489,6 @@ function ManagementConsole() {
       if (r && r.error) return;
       setLeadChatMsgs(prev => [...prev, local]);
     } catch (e) { /* swallow; the analyst can resend if needed */ }
-  };
-  // Phase U3: a lead reports an analyst's lead-chat message. Fetches the active
-  // reviewer recipient set; if none is registered, reporting is unavailable.
-  // Otherwise seals the offending message and the note to every active reviewer
-  // via the main-process abuse:seal handler -- the server stores only the
-  // opaque sealed envelopes and can never read them -- and posts a lead_chat
-  // flag. The accused analyst is resolved server-side from the thread.
-  const submitLeadChatFlag = async () => {
-    const m = leadFlagMsg;
-    if (!m || !leadFlagTier || !leadFlagNote.trim() || !leadChatSel || !leadChatSel.threadId) return;
-    const bridge = (typeof window !== "undefined") ? window.firealive : null;
-    if (!bridge || !bridge.invoke) { setLeadFlagErr("Reporting requires the desktop app."); return; }
-    setLeadFlagBusy(true); setLeadFlagErr("");
-    try {
-      const k = await api.get("/api/abuse-review-keys");
-      if (!k || !k.active || !Array.isArray(k.keys) || k.keys.length === 0) {
-        setLeadFlagErr("Reporting is unavailable until your organization designates an independent abuse reviewer.");
-        setLeadFlagBusy(false); return;
-      }
-      const pubs = k.keys.map((kk) => kk.publicKey).filter(Boolean);
-      const sc = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: m.text });
-      const sn = await bridge.invoke("abuse:seal", { recipientPublicKeys: pubs, plaintext: leadFlagNote.trim(), sanitize: true });
-      if (!sc || !sc.sealed || !sn || !sn.sealed) { setLeadFlagErr("Could not seal the report."); setLeadFlagBusy(false); return; }
-      const r = await api.post("/api/peer/flags", { target_type: "lead_chat", threadId: leadChatSel.threadId, tier: leadFlagTier, sealedContent: sc.sealed, sealedNote: sn.sealed });
-      if (r && r.error) { setLeadFlagErr(r.error); setLeadFlagBusy(false); return; }
-      if (r && r.id) beginExportPrompt(r.id, "lead_chat", m.text, leadFlagNote.trim());
-      setLeadFlagMsg(null); setLeadFlagTier(0); setLeadFlagNote(""); setLeadFlagBusy(false);
-    } catch (e) {
-      setLeadFlagErr("Could not submit the report."); setLeadFlagBusy(false);
-    }
   };
   // Poll the relay for the open thread: decrypt incoming analyst messages (the
   // first pre-key message establishes this side's session), mark each read to
@@ -1713,13 +1586,140 @@ function ManagementConsole() {
   }, [tab, inboxView, inboxIncludeRead]);
 
   // ── Peer Conduct (Phase 1.4b) ──
-  // U3: awareness-only pending-review count (no content/identities/tiers). The MC
-  // no longer reviews abuse -- the independent Abuse Review Console does.
+  // Pending-review count for the Peer Conduct nav badge (metadata only). The
+  // review itself happens in the peer_conduct tab once a Team Lead unlocks.
   const [peerReviewPendingCount, setPeerReviewPendingCount] = useState(0);
+  // Team-Lead abuse-review key lifecycle (peer_conduct). The private key lives in
+  // the MC main process behind the lead's passphrase; the renderer only triggers
+  // generate / unlock / lock / remove and ever sees the public-key fingerprint.
+  const [abuseKeyExists, setAbuseKeyExists] = useState(null); // null=unknown, false, true
+  const [abuseUnlocked, setAbuseUnlocked] = useState(false);
+  const [abuseKeyFp, setAbuseKeyFp] = useState("");
+  const [abusePass, setAbusePass] = useState("");
+  const [abusePass2, setAbusePass2] = useState("");
+  const [abuseKeyBusy, setAbuseKeyBusy] = useState(false);
+  const [abuseKeyErr, setAbuseKeyErr] = useState("");
+  const [abuseKeyMsg, setAbuseKeyMsg] = useState("");
+  const abuseBridge = () => (typeof window !== "undefined") ? window.firealive : null;
+  async function refreshAbuseKey() {
+    const b = abuseBridge();
+    if (!b || !b.invoke) { setAbuseKeyExists(false); return; }
+    try { const has = await b.invoke("abuse:hasKey"); setAbuseKeyExists(!!has); }
+    catch (e) { setAbuseKeyExists(false); }
+  }
+  async function generateAbuseKey() {
+    setAbuseKeyErr(""); setAbuseKeyMsg("");
+    if (abusePass.length < 12) { setAbuseKeyErr("Use a passphrase of at least 12 characters."); return; }
+    if (abusePass !== abusePass2) { setAbuseKeyErr("The passphrases do not match."); return; }
+    const b = abuseBridge();
+    if (!b || !b.invoke) { setAbuseKeyErr("Key setup requires the desktop app."); return; }
+    setAbuseKeyBusy(true);
+    try {
+      const kp = await b.invoke("abuse:generateKey", abusePass);
+      if (!kp || !kp.publicKeyB64) { setAbuseKeyErr("Could not generate the key."); setAbuseKeyBusy(false); return; }
+      const r = await api.post("/api/abuse-review-key", { publicKey: kp.publicKeyB64 });
+      setAbuseKeyExists(true); setAbuseUnlocked(true); setAbuseKeyFp(kp.fingerprint || "");
+      setAbusePass(""); setAbusePass2(""); setAbuseKeyBusy(false);
+      if (!r || r.error) { setAbuseKeyErr("Key created, but registration failed" + (r && r.error ? ": " + r.error : ".") + " Use Remove key, then try again."); }
+      else { setAbuseKeyMsg("Key created and registered. Verify the fingerprint out of band with whoever set up your team."); }
+    } catch (e) {
+      setAbuseKeyErr((e && e.message) ? e.message : "Could not generate the key."); setAbuseKeyBusy(false);
+    }
+  }
+  async function unlockAbuseKey() {
+    setAbuseKeyErr(""); setAbuseKeyMsg("");
+    const b = abuseBridge();
+    if (!b || !b.invoke) { setAbuseKeyErr("Unlock requires the desktop app."); return; }
+    if (!abusePass) { setAbuseKeyErr("Enter your passphrase."); return; }
+    setAbuseKeyBusy(true);
+    try {
+      const r = await b.invoke("abuse:unlock", abusePass);
+      if (!r || !r.unlocked) { setAbuseKeyErr("Could not unlock the key."); setAbuseKeyBusy(false); return; }
+      setAbuseUnlocked(true); setAbuseKeyFp(r.fingerprint || ""); setAbusePass(""); setAbuseKeyBusy(false);
+    } catch (e) {
+      setAbuseKeyErr((e && e.message) ? e.message : "Incorrect passphrase."); setAbuseKeyBusy(false);
+    }
+  }
+  async function lockAbuseKey() {
+    const b = abuseBridge();
+    try { if (b && b.invoke) await b.invoke("abuse:lock"); } catch (e) {}
+    setAbuseUnlocked(false); setAbuseKeyMsg(""); setAbuseKeyErr("");
+  }
+  async function removeAbuseKey() {
+    if (!window.confirm("Remove this device's abuse-review key? Your registration is revoked so new reports stop sealing to you, and the local key is deleted. You can set up a fresh key afterward.")) return;
+    setAbuseKeyErr(""); setAbuseKeyMsg(""); setAbuseKeyBusy(true);
+    const b = abuseBridge();
+    try {
+      const list = await api.get("/api/abuse-review-keys");
+      const mine = (list && Array.isArray(list.keys)) ? list.keys.find(k => k.fingerprint === abuseKeyFp) : null;
+      if (mine && mine.id) { await api.post("/api/abuse-review-key/" + mine.id + "/revoke", {}); }
+      if (b && b.invoke) await b.invoke("abuse:deleteKey");
+      setAbuseKeyExists(false); setAbuseUnlocked(false); setAbuseKeyFp("");
+      setAbuseKeyMsg("Key removed. You can set up a new one."); setAbuseKeyBusy(false);
+    } catch (e) {
+      setAbuseKeyErr("Could not fully remove the key. Check your connection and try again."); setAbuseKeyBusy(false);
+    }
+  }
+  useEffect(() => { if (tab === "peer_conduct" && abuseKeyExists === null) refreshAbuseKey(); }, [tab]);
+  // Team-Lead abuse-review case queue + one open case (peer_conduct). The case
+  // LIST is metadata only and loads regardless of key state; opening a case
+  // decrypts its sealed envelopes locally through the unlocked key (abuse:open).
+  const [abuseCases, setAbuseCases] = useState(null); // null until first load
+  const [abuseCasesBusy, setAbuseCasesBusy] = useState(false);
+  const [abuseCasesErr, setAbuseCasesErr] = useState("");
+  const [abuseSel, setAbuseSel] = useState(null);       // open case metadata
+  const [abuseSelBusy, setAbuseSelBusy] = useState(false);
+  const [abuseSelErr, setAbuseSelErr] = useState("");
+  const [abusePlain, setAbusePlain] = useState(null);   // { note, content, context }
+  const [abuseDet, setAbuseDet] = useState("");
+  const [abuseRationale, setAbuseRationale] = useState("");
+  const [abuseResolveBusy, setAbuseResolveBusy] = useState(false);
+  const [abuseResolveErr, setAbuseResolveErr] = useState("");
+  async function loadAbuseCases() {
+    setAbuseCasesErr(""); setAbuseCasesBusy(true);
+    const r = await api.get("/api/lead-abuse-review/cases");
+    if (!r || r.error) { setAbuseCasesErr((r && r.error) ? r.error : "Could not load reports."); setAbuseCasesBusy(false); return; }
+    setAbuseCases(Array.isArray(r.cases) ? r.cases : []); setAbuseCasesBusy(false);
+  }
+  async function openAbuseCase(id) {
+    setAbuseSelErr(""); setAbusePlain(null); setAbuseDet(""); setAbuseRationale(""); setAbuseResolveErr("");
+    if (!abuseUnlocked) { setAbuseSelErr("Unlock your key above to open a report."); return; }
+    setAbuseSelBusy(true);
+    const r = await api.get("/api/lead-abuse-review/cases/" + id);
+    if (!r || r.error || !r.case) { setAbuseSelErr((r && r.error) ? r.error : "Could not load the report."); setAbuseSelBusy(false); return; }
+    setAbuseSel(r.case);
+    const b = abuseBridge();
+    async function dec(sealed) {
+      if (!sealed || !b || !b.invoke) return null;
+      try { const o = await b.invoke("abuse:open", sealed); return (o && typeof o.plaintext === "string") ? o.plaintext : null; }
+      catch (e) { return "[could not decrypt: " + ((e && e.message) ? e.message : "error") + "]"; }
+    }
+    const note = await dec(r.case.sealedNote);
+    const content = await dec(r.case.sealedContent);
+    const context = await dec(r.case.sealedContext);
+    setAbusePlain({ note: note, content: content, context: context });
+    setAbuseSelBusy(false);
+  }
+  function closeAbuseCase() {
+    setAbuseSel(null); setAbusePlain(null); setAbuseDet(""); setAbuseRationale(""); setAbuseSelErr(""); setAbuseResolveErr("");
+  }
+  async function resolveAbuseCase() {
+    if (!abuseSel) return;
+    setAbuseResolveErr("");
+    if (!abuseDet) { setAbuseResolveErr("Choose a determination."); return; }
+    if (!abuseRationale.trim()) { setAbuseResolveErr("A rationale note is required."); return; }
+    setAbuseResolveBusy(true);
+    const r = await api.post("/api/lead-abuse-review/cases/" + abuseSel.id + "/resolve", { determination: abuseDet, note: abuseRationale.trim() });
+    if (!r || r.error) { setAbuseResolveErr((r && r.error) ? r.error : "Could not record the determination."); setAbuseResolveBusy(false); return; }
+    setAbuseResolveBusy(false);
+    closeAbuseCase();
+    loadAbuseCases();
+  }
+  useEffect(() => { if (tab === "peer_conduct") loadAbuseCases(); }, [tab]);
 
-  // U3: poll the awareness-only pending-review count every 60s for the sidebar
-  // badge and the Peer Conduct panel. Content, identities, and tiers are never
-  // exposed to the MC -- the independent Abuse Review Console owns review.
+  // Poll the pending-review count every 60s for the sidebar badge. This count is
+  // metadata only; the review itself (content, identities, tiers) happens in the
+  // peer_conduct tab and only after a Team Lead unlocks their key.
   useEffect(()=>{
     let cancelled = false;
     const fetchCount = ()=>{
@@ -3284,7 +3284,6 @@ function ManagementConsole() {
   const CLOUD_VULN_COMPONENTS = [
     {id:"mc",l:"Management Console"},
     {id:"ac",l:"Analyst Client"},
-    {id:"arc",l:"Abuse Review Console"},
     {id:"main_server",l:"Main server"},
     {id:"gd_server",l:"Global Dashboard server"},
   ];
@@ -3473,7 +3472,7 @@ function ManagementConsole() {
       {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cluster",label:"Cluster / Scaling"},{id:"cicd",label:"CI/CD"},
     ]},
     {cat:"data",label:"Data & Backup",items:[
-      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"legal_hold",label:"Legal Hold"},{id:"migration",label:"Deployment Migration"},
+      {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"migration",label:"Deployment Migration"},
     ]},
     {cat:"reports",label:"Reports & Compliance",items:[
       {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},
@@ -3485,7 +3484,7 @@ function ManagementConsole() {
       {id:"monitoring",label:"System Health"},{id:"vulnscan",label:"Vulnerability Scan"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},
     ]},
     {cat:"audit_cat",label:"Audit",items:[
-      {id:"audit",label:"Audit Log"},{id:"forensic_exports",label:"Forensic Exports"},{id:"abuse_reviewers",label:"Abuse Reviewers"},
+      {id:"audit",label:"Audit Log"},{id:"forensic_exports",label:"Forensic Exports"},
     ]},
   ];
   // Flat list for tab rendering compatibility
@@ -3965,41 +3964,6 @@ function ManagementConsole() {
   const [newOffboard, setNewOffboard] = useState({analystId:"",reason:"departure",archiveData:true,revokeKeys:true,cancelPeerSessions:true,notifySoar:true});
   // TTX generator
   // (ttxScenario state removed in Phase 1.4d — TTX is now a download-only flow)
-  // Legal hold backup
-  const [legalHoldCfg, setLegalHoldCfg] = useState({enabled:false,repository:"",hashAlgorithm:"sha256",format:"eml_pst",indefiniteRetention:true});
-  const [lhCreate, setLhCreate] = useState({open:false, caseId:"", rationale:"", outputFormats:["edrm-xml","eml-mime"], indefiniteRetention:true, submitting:false, error:""});
-  const [lhExports, setLhExports] = useState([]);
-  const [lhLoadState, setLhLoadState] = useState({loaded:false, loading:false, error:null});
-  const [lhReleaseModal, setLhReleaseModal] = useState({open:false, holdId:"", caseId:"", requestedBy:"", rationale:"", submitting:false, error:""});
-  const refreshLhList = async () => {
-    setLhLoadState({loaded:false, loading:true, error:null});
-    const r = await api.get('/api/legal-hold-exports');
-    if (!r || r.error) {
-      setLhLoadState({loaded:false, loading:false, error:(r && r.error) || 'request_failed'});
-      setLhExports([]);
-    } else {
-      setLhExports(Array.isArray(r.holds) ? r.holds : []);
-      setLhLoadState({loaded:true, loading:false, error:null});
-    }
-  };
-  useEffect(() => {
-    if (tab !== 'legal_hold') return;
-    let cancelled = false;
-    (async () => {
-      const r = await api.get('/api/legal-hold-exports');
-      if (cancelled) return;
-      if (!r || r.error) {
-        setLhLoadState({loaded:false, loading:false, error:(r && r.error) || 'request_failed'});
-        return;
-      }
-      setLhExports(Array.isArray(r.holds) ? r.holds : []);
-      setLhLoadState({loaded:true, loading:false, error:null});
-    })();
-    return () => { cancelled = true; };
-  }, [tab]);
-  const downloadLegalHold = async (id) => {
-    await api.download('/api/legal-hold-exports/' + encodeURIComponent(id) + '/download', 'firealive-legal-hold-' + id + '.tar.gz');
-  };
   // Risk register asset
   const [riskRegisterOutput, setRiskRegisterOutput] = useState(null);
   // ── v1.0.0 CONTINUED — Cross-app management state ────────────────────
@@ -4025,21 +3989,6 @@ function ManagementConsole() {
   return(
     <div style={{minHeight:"100vh",background:C.bg,color:C.t,fontFamily:"'DM Sans',sans-serif"}}>
       <style>{CSS}</style>
-      {exportPrompt && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,padding:20}}>
-          <Card style={{maxWidth:460,padding:22}}>
-            <M style={{color:C.t,fontWeight:600,fontSize:15,display:"block",marginBottom:8}}>Report submitted to the independent reviewer</M>
-            <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:10}}>You have a few minutes to save one personal PDF copy as your own backup -- for example, if the reviewer's record is ever lost. After you export or decline, the text is wiped from this device and only the reviewer's vault holds it. This is your only chance to keep a personal copy.</M>
-            {!exportDone && exportExpiresAt ? <M style={{color:C.td,display:"block",marginBottom:12}}>Window closes at {new Date(exportExpiresAt).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}.</M> : null}
-            {exportMsg ? <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.5}}>{exportMsg}</M> : null}
-            <div style={{display:"flex",gap:8}}>
-              {!exportDone && <Btn primary disabled={exportBusy} onClick={doExport}>{exportBusy?"Working\u2026":"Export PDF"}</Btn>}
-              {!exportDone && <Btn small disabled={exportBusy} onClick={declineExport}>Don't keep a copy</Btn>}
-              {exportDone && <Btn small onClick={()=>{setExportPrompt(null);setExportExpiresAt(0);setExportMsg("");setExportDone(false);}}>Close</Btn>}
-            </div>
-          </Card>
-        </div>
-      )}
       {/* R3j C9: Top-of-MC panic banner. Red while panic_mode is active; green for
           PANIC_BANNER_LINGER_SECONDS after deactivation; absent otherwise. Recomputes
           age against Date.now() on every render so the green banner vanishes at the
@@ -5488,7 +5437,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Automatic Schedule</div>
-            {[{l:"Daily full",d:"02:00 UTC · 35 days retention · AES-256-GCM + SHA-256 chain",a:true},{l:"Snapshots",d:"Before config changes + on-demand. No time limit.",a:true},{l:"WAL shipping",d:"Continuous replication. RPO < 5 min.",a:true},{l:"Forensic chain",d:"Tamper-evident SHA-256 hash chain. Legal-hold compatible.",a:true}].map((b,i)=>(
+            {[{l:"Daily full",d:"02:00 UTC · 35 days retention · AES-256-GCM + SHA-256 chain",a:true},{l:"Snapshots",d:"Before config changes + on-demand. No time limit.",a:true},{l:"WAL shipping",d:"Continuous replication. RPO < 5 min.",a:true},{l:"Forensic chain",d:"Tamper-evident SHA-256 hash chain.",a:true}].map((b,i)=>(
               <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<3?`1px solid ${C.b}`:"none"}}><div><div style={{fontSize:12}}>{b.l}</div><M style={{color:C.tm}}>{b.d}</M></div><Badge color={b.a?C.a:C.tm}>{b.a?"active":"off"}</Badge></div>
             ))}
           </Card>
@@ -5906,7 +5855,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* ══════════ CLOUD VULN SCAN ══════════ */}
         {tab==="cloud_vuln"&&(<div>
           <L>Cloud Vulnerability Scan</L>
-          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan FireAlive's cloud deployment. FireAlive does not run scans or store findings — results appear in the scanner's own console. This tab authorizes scanners (by bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches FireAlive. Authorization can cover any deployed component: Management Console, Analyst Client, Abuse Review Console, main server, and the Global Dashboard server (the GD server has its own separate authorization config).</M>
+          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan FireAlive's cloud deployment. FireAlive does not run scans or store findings — results appear in the scanner's own console. This tab authorizes scanners (by bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches FireAlive. Authorization can cover any deployed component: Management Console, Analyst Client, main server, and the Global Dashboard server (the GD server has its own separate authorization config).</M>
           <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
             <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Application-layer authorization</M>
             <M style={{color:C.t,lineHeight:1.6}}>FireAlive authorizes and logs scans that reach it; true network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility. Authorized scanner source IPs are exempt from FireAlive's API rate limiting so a sanctioned scan is not throttled — all other defenses stay active.</M>
@@ -8781,182 +8730,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
         </div>)}
 
-        {/* ══════════ v1.0.0 — LEGAL HOLD ══════════ */}
-        {tab==="legal_hold"&&(<div>
-          <L>Legal Hold Backup</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Export app data for legal hold / e-discovery requirements. Data is hashed for integrity verification, formatted for ESI repositories, and retained indefinitely until the hold is released. Chain of custody documentation is generated automatically.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={legalHoldCfg.enabled} onChange={e=>setLegalHoldCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable legal hold capability</label>
-            <Input label="ESI repository path / endpoint" value={legalHoldCfg.repository} onChange={e=>setLegalHoldCfg(prev=>({...prev,repository:e.target.value}))} placeholder="/legal-hold/esi-repo/ or https://ediscovery.corp.com/api" maxLength={512}/>
-            <Sel label="Hash algorithm" value={legalHoldCfg.hashAlgorithm} onChange={e=>setLegalHoldCfg(prev=>({...prev,hashAlgorithm:e.target.value}))}>
-              <option value="sha256">SHA-256</option><option value="sha512">SHA-512</option><option value="md5_sha256">MD5 + SHA-256 (dual hash)</option>
-            </Sel>
-            <Sel label="Export format" value={legalHoldCfg.format} onChange={e=>setLegalHoldCfg(prev=>({...prev,format:e.target.value}))}>
-              <option value="json">JSON (structured)</option><option value="csv">CSV (tabular)</option><option value="eml_pst">EML/PST (email-compatible)</option><option value="native">Native SQLite (forensic)</option>
-            </Sel>
-          </Card>
-          <Btn primary onClick={()=>setLhCreate(prev=>({...prev,open:true,error:""}))}>Execute Legal Hold Export</Btn>
-
-          {lhCreate.open && (
-            <Modal title="Create Legal Hold" onClose={()=>setLhCreate(prev=>({...prev,open:false}))} width={620}>
-              <M style={{display:"block",marginBottom:16,color:C.tm,lineHeight:1.5}}>
-                Initiates a litigation-grade evidence preservation hold. Active holds are exempt from scheduled retention. Release requires a CISO different from the requester (separate-actor invariant enforced at three layers — schema CHECK, orchestrator pre-check, and route handler).
-              </M>
-              <Input label="Case ID (required)" value={lhCreate.caseId} onChange={e=>setLhCreate(prev=>({...prev,caseId:e.target.value}))} placeholder="e.g., Smith-v-Acme-2026, GDPR-Inquiry-Q3" maxLength={200}/>
-              <div style={{marginBottom:14}}>
-                <M style={{color:C.tm,marginBottom:4,display:"block"}}>Rationale (required, min 20 chars)</M>
-                <textarea value={lhCreate.rationale} onChange={e=>setLhCreate(prev=>({...prev,rationale:e.target.value}))} placeholder="Document why this hold is being placed — court order ref, regulatory request, internal investigation context" style={{width:"100%",minHeight:80,padding:10,fontSize:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontFamily:"inherit",resize:"vertical"}} maxLength={2000}/>
-                <M style={{color:lhCreate.rationale.trim().length<20?C.dd:C.tm,marginTop:4,display:"block"}}>{lhCreate.rationale.trim().length}/20 minimum chars</M>
-              </div>
-              <div style={{marginBottom:14}}>
-                <M style={{color:C.tm,marginBottom:6,display:"block"}}>Export formats (select 1+ — all 8 are litigation-tested)</M>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
-                  {["edrm-xml","eml-mime","pst","concordance","relativity","json-tarball","pdf-bates","tiff-bates"].map(f=>(
-                    <label key={f} style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:C.t}}>
-                      <input type="checkbox" checked={lhCreate.outputFormats.includes(f)} onChange={e=>{
-                        const checked = e.target.checked;
-                        setLhCreate(prev=>{
-                          const next = checked ? [...prev.outputFormats, f] : prev.outputFormats.filter(x=>x!==f);
-                          return {...prev, outputFormats: next};
-                        });
-                      }} style={{accentColor:C.a}}/>
-                      <span style={{fontFamily:"'IBM Plex Mono',monospace"}}>{f}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}>
-                <input type="checkbox" checked={lhCreate.indefiniteRetention} onChange={e=>setLhCreate(prev=>({...prev,indefiniteRetention:e.target.checked}))} style={{accentColor:C.a}}/>
-                Indefinite retention (default; uncheck for time-bounded preservation orders)
-              </label>
-              {lhCreate.error && (
-                <div style={{padding:10,marginBottom:12,background:"rgba(239,68,68,0.1)",border:`1px solid ${C.dd}`,borderRadius:6,color:C.dd,fontSize:11}}>{lhCreate.error}</div>
-              )}
-              <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
-                <Btn onClick={()=>setLhCreate(prev=>({...prev,open:false}))}>Cancel</Btn>
-                <Btn primary disabled={lhCreate.submitting || lhCreate.rationale.trim().length<20 || !lhCreate.caseId.trim() || lhCreate.outputFormats.length===0} onClick={async ()=>{
-                  setLhCreate(prev=>({...prev,submitting:true,error:""}));
-                  const res = await api.post("/api/legal-hold-exports", {
-                    caseId: lhCreate.caseId.trim(),
-                    rationale: lhCreate.rationale.trim(),
-                    outputFormats: lhCreate.outputFormats,
-                    indefiniteRetention: lhCreate.indefiniteRetention
-                  });
-                  if (res && res.error) {
-                    setLhCreate(prev=>({...prev,submitting:false,error:res.error||"Submission failed"}));
-                  } else {
-                    addA("LEGAL_HOLD_CREATED","case="+lhCreate.caseId.trim()+" id="+(res.id||"?")+" formats="+lhCreate.outputFormats.join(","));
-                    setLhCreate({open:false,caseId:"",rationale:"",outputFormats:["edrm-xml","eml-mime"],indefiniteRetention:true,submitting:false,error:""});
-                    refreshLhList();
-                  }
-                }}>{lhCreate.submitting?"Submitting...":"Create Hold"}</Btn>
-              </div>
-            </Modal>
-          )}
-
-          {/* Existing holds list */}
-          {lhLoadState.loading && (
-            <M style={{display:"block",marginTop:16,color:C.tm,fontStyle:"italic"}}>Loading holds...</M>
-          )}
-          {lhLoadState.error && (
-            <Card style={{marginTop:16,background:"rgba(239,68,68,0.05)",border:`1px solid ${C.dd}`}}>
-              <M style={{color:C.dd}}>Failed to load legal holds: {lhLoadState.error}</M>
-            </Card>
-          )}
-          {lhLoadState.loaded && lhExports.length===0 && (
-            <Card style={{marginTop:16}}>
-              <M style={{color:C.tm,fontStyle:"italic"}}>No legal holds yet. Use the Execute button above to create one.</M>
-            </Card>
-          )}
-          {lhLoadState.loaded && lhExports.length>0 && (
-            <div style={{marginTop:16}}>
-              <L>Existing Legal Holds</L>
-              <Card style={{padding:0,overflow:"hidden"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead>
-                    <tr style={{background:"rgba(255,255,255,0.02)"}}>
-                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Case ID / Hold ID</th>
-                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Requested</th>
-                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Status</th>
-                      <th style={{padding:"10px 12px",textAlign:"left",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Manifest Key</th>
-                      <th style={{padding:"10px 12px",textAlign:"right",color:C.td,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase",fontSize:10,borderBottom:`1px solid ${C.b}`}}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lhExports.map(h=>{
-                      const statusColor = h.status==="active"?C.a:h.status==="released"?C.tm:h.status==="failed"?C.d:h.status==="in_progress"?C.i:C.w;
-                      return (
-                        <tr key={h.id} style={{borderBottom:`1px solid ${C.b}`}}>
-                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                            <M style={{color:C.t,wordBreak:"break-all"}}>{h.case_id}</M>
-                            <M style={{color:C.td,display:"block",fontSize:10,marginTop:2,fontFamily:"'IBM Plex Mono',monospace",wordBreak:"break-all"}}>{h.id}</M>
-                            {h.indefinite_retention?(<M style={{color:C.a,display:"block",fontSize:10,marginTop:2}}>indefinite retention</M>):null}
-                          </td>
-                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                            <M style={{color:C.tm}}>{h.requested_at||"—"}</M>
-                            <M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>by: {h.requested_by_user_id}</M>
-                            {h.rationale&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4,maxWidth:240,wordBreak:"break-word"}}>{h.rationale}</M>)}
-                          </td>
-                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                            <Badge color={statusColor}>{h.status}</Badge>
-                            {h.hold_released_at&&(<M style={{color:C.td,display:"block",fontSize:10,marginTop:4}}>released {h.hold_released_at}<br/>by {h.hold_released_by_user_id}</M>)}
-                            {h.error_message&&(<M style={{color:C.d,display:"block",fontSize:10,marginTop:4,maxWidth:200,wordBreak:"break-word"}}>{h.error_message}</M>)}
-                          </td>
-                          <td style={{padding:"10px 12px",verticalAlign:"top"}}>
-                            <M style={{color:C.tm,fontFamily:"'IBM Plex Mono',monospace",fontSize:10,wordBreak:"break-all"}}>{(h.manifest_signing_key_fingerprint||"—").slice(0,16)}{h.manifest_signing_key_fingerprint&&h.manifest_signing_key_fingerprint.length>16?"…":""}</M>
-                          </td>
-                          <td style={{padding:"10px 12px",verticalAlign:"top",textAlign:"right"}}>
-                            <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
-                              {(h.status==="active"||h.status==="released")&&(<button onClick={()=>downloadLegalHold(h.id)} style={{padding:"4px 8px",background:C.a,border:"none",borderRadius:4,color:"#000",fontSize:10,fontWeight:500,cursor:"pointer"}}>Download</button>)}
-                              {h.status==="active"&&(<button onClick={()=>setLhReleaseModal({open:true,holdId:h.id,caseId:h.case_id,requestedBy:h.requested_by_user_id||"",rationale:"",submitting:false,error:""})} style={{padding:"4px 8px",background:"transparent",border:`1px solid ${C.w}`,borderRadius:4,color:C.w,fontSize:10,fontWeight:500,cursor:"pointer"}}>Release</button>)}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </Card>
-            </div>
-          )}
-
-          {/* Release modal */}
-          {lhReleaseModal.open && (
-            <Modal title="Release Legal Hold" onClose={()=>setLhReleaseModal(prev=>({...prev,open:false}))} width={580}>
-              <M style={{display:"block",marginBottom:12,color:C.tm,lineHeight:1.5}}>
-                Releasing case <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.caseId}</span> (hold ID <span style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{lhReleaseModal.holdId}</span>).
-              </M>
-              <Card style={{marginBottom:14,background:"rgba(239,179,68,0.08)",border:`1px solid ${C.w}`}}>
-                <M style={{color:C.w,display:"block",lineHeight:1.5}}>
-                  ⚠ Separate-actor invariant: the CISO performing this release must be a DIFFERENT user from the original requester ({lhReleaseModal.requestedBy||"unknown"}). If you are the requester, this release will be denied at THREE layers — route handler, orchestrator, and schema CHECK constraint.
-                </M>
-              </Card>
-              <div style={{marginBottom:14}}>
-                <M style={{color:C.tm,marginBottom:4,display:"block"}}>Release rationale (required, min 20 chars)</M>
-                <textarea value={lhReleaseModal.rationale} onChange={e=>setLhReleaseModal(prev=>({...prev,rationale:e.target.value}))} placeholder="Document why this hold is being released — case resolved, regulatory inquiry closed, court order lifted" style={{width:"100%",minHeight:80,padding:10,fontSize:12,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontFamily:"inherit",resize:"vertical"}} maxLength={2000}/>
-                <M style={{color:lhReleaseModal.rationale.trim().length<20?C.dd:C.tm,marginTop:4,display:"block"}}>{lhReleaseModal.rationale.trim().length}/20 minimum chars</M>
-              </div>
-              {lhReleaseModal.error && (
-                <div style={{padding:10,marginBottom:12,background:"rgba(239,68,68,0.1)",border:`1px solid ${C.dd}`,borderRadius:6,color:C.dd,fontSize:11}}>{lhReleaseModal.error}</div>
-              )}
-              <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
-                <Btn onClick={()=>setLhReleaseModal(prev=>({...prev,open:false}))}>Cancel</Btn>
-                <Btn primary danger disabled={lhReleaseModal.submitting || lhReleaseModal.rationale.trim().length<20} onClick={async ()=>{
-                  setLhReleaseModal(prev=>({...prev,submitting:true,error:""}));
-                  const r = await api.post("/api/legal-hold-exports/"+encodeURIComponent(lhReleaseModal.holdId)+"/release", {rationale:lhReleaseModal.rationale.trim()});
-                  if (r && r.error) {
-                    setLhReleaseModal(prev=>({...prev,submitting:false,error:r.error||"Release failed"}));
-                  } else {
-                    addA("LEGAL_HOLD_RELEASED","case="+lhReleaseModal.caseId+" id="+lhReleaseModal.holdId);
-                    setLhReleaseModal({open:false,holdId:"",caseId:"",requestedBy:"",rationale:"",submitting:false,error:""});
-                    refreshLhList();
-                  }
-                }}>{lhReleaseModal.submitting?"Releasing…":"Confirm Release"}</Btn>
-              </div>
-            </Modal>
-          )}
-        </div>)}
-
         {/* ══════════ v1.0.0 — RISK REGISTER ASSET ══════════ */}
         {tab==="migration"&&<MigrationPanel/>}
         {tab==="risk_register"&&(<div>
@@ -9101,7 +8874,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {cat:"Integrations",items:[{n:"Health Dashboard",d:"Status of all system integrations — SIEM, SOAR, EDR, ticketing, cloud, etc."},{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
             {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
-            {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."},{n:"Legal Hold",d:"Export data for e-discovery with hashing and chain of custody."}]},
+            {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."}]},
             {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"50 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
           ].map(cat=>(
             <Card key={cat.cat} style={{marginBottom:12}}>
@@ -9318,31 +9091,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.td,display:"block",marginBottom:12,lineHeight:1.6}}>End-to-end encrypted. This analyst appears by pseudonym; their real name is never shown. Messages purge five minutes after the chat is closed.</M>
             <Card style={{maxHeight:320,overflow:"auto",marginBottom:12}}>
               {leadChatMsgs.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No messages yet.</M>:
-              leadChatMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:m.from==="you"?C.i:C.a,fontWeight:500}}>{m.from==="you"?"You":leadChatSel.label}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><div style={{display:"flex",gap:8,alignItems:"center"}}><M style={{color:C.td}}>E2EE{m.ts?` · ${m.ts}`:""}</M>{m.from==="analyst"&&<button onClick={()=>{setLeadFlagMsg(m);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}} title="Report this message to the independent reviewer" style={{background:"none",border:"none",color:C.d,cursor:"pointer",fontSize:10,fontFamily:"inherit",padding:0}}>Flag</button>}</div></div><div style={{fontSize:12,lineHeight:1.6,color:C.t}}>{m.text}</div></div>)}
+              leadChatMsgs.map(m=><div key={m.id} style={{padding:"10px 14px",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><M style={{color:m.from==="you"?C.i:C.a,fontWeight:500}}>{m.from==="you"?"You":leadChatSel.label}{m.kind==="inperson_1on1_request"?" · in-person 1:1 request":""}</M><div style={{display:"flex",gap:8,alignItems:"center"}}><M style={{color:C.td}}>E2EE{m.ts?` · ${m.ts}`:""}</M></div></div><div style={{fontSize:12,lineHeight:1.6,color:C.t}}>{m.text}</div></div>)}
             </Card>
-            {leadFlagMsg&&<Card style={{marginBottom:12,borderColor:C.d+"40",padding:12}}>
-              <M style={{color:C.d,fontWeight:600,display:"block",marginBottom:6}}>Report this message to the independent reviewer</M>
-              <M style={{color:C.tm,lineHeight:1.6,display:"block",marginBottom:8}}>This goes to an independent abuse reviewer -- not you as a reviewer, and not management -- and is encrypted so that only that reviewer can read it. Either party can report a message. Report only genuinely abusive content.</M>
-              <div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,marginBottom:10,fontSize:11,color:C.tm,fontStyle:"italic"}}>{leadFlagMsg.text.slice(0,140)}{leadFlagMsg.text.length>140?"...":""}</div>
-              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===1?"rgba(96,165,250,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===1?C.i+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===1} onChange={()=>setLeadFlagTier(1)} style={{marginTop:3}}/>
-                <div><M style={{color:C.t,fontWeight:500}}>Tier 1 -- Minor</M><M style={{color:C.td,display:"block"}}>Unprofessional or dismissive conduct.</M></div>
-              </label>
-              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:6,background:leadFlagTier===2?"rgba(251,191,36,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===2?C.w+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===2} onChange={()=>setLeadFlagTier(2)} style={{marginTop:3}}/>
-                <div><M style={{color:C.t,fontWeight:500}}>Tier 2 -- Personal attack</M><M style={{color:C.td,display:"block"}}>Targeted hostility, intimidation, or retaliation.</M></div>
-              </label>
-              <label style={{display:"flex",gap:10,padding:"8px 10px",marginBottom:8,background:leadFlagTier===3?"rgba(239,68,68,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${leadFlagTier===3?C.d+"50":C.b}`,borderRadius:8,cursor:"pointer"}}>
-                <input type="radio" name="mcleadflagtier" checked={leadFlagTier===3} onChange={()=>setLeadFlagTier(3)} style={{marginTop:3}}/>
-                <div><M style={{color:C.t,fontWeight:500}}>Tier 3 -- Urgent</M><M style={{color:C.td,display:"block"}}>Slurs, threats, or harassment.</M></div>
-              </label>
-              <textarea value={leadFlagNote} onChange={e=>setLeadFlagNote(e.target.value)} placeholder="Briefly describe the problem (required)" maxLength={2000} style={{width:"100%",minHeight:60,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit",boxSizing:"border-box",resize:"vertical"}}/>
-              {leadFlagErr&&<M style={{color:C.d,display:"block",marginTop:6}}>{leadFlagErr}</M>}
-              <div style={{display:"flex",gap:8,marginTop:10}}>
-                <Btn danger small disabled={!leadFlagNote.trim()||!leadFlagTier||leadFlagBusy} onClick={submitLeadChatFlag}>{leadFlagBusy?"Sealing...":"Submit report"}</Btn>
-                <Btn small onClick={()=>{setLeadFlagMsg(null);setLeadFlagTier(0);setLeadFlagNote("");setLeadFlagErr("");}}>Cancel</Btn>
-              </div>
-            </Card>}
             {leadChatSel.status==="closed"?<M style={{color:C.td,fontStyle:"italic"}}>This chat is closed -- read-only, and it will be purged shortly.</M>:
             <div style={{display:"flex",gap:8}}><input value={leadChatInput} onChange={e=>setLeadChatInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&leadChatInput.trim())sendLeadReply();}} placeholder={leadChatSessionReady?"Reply to this analyst...":"Reply unlocks once the analyst's first message arrives..."} maxLength={2000} style={{flex:1,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/><Btn primary disabled={!leadChatInput.trim()||!leadChatSessionReady} onClick={()=>sendLeadReply()}>Send</Btn></div>}
           </div>)}
@@ -9350,20 +9100,99 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* PEER CONDUCT — tiered abuse flag review */}
         {tab==="peer_conduct"&&((featureToggles.peer_chat===false&&featureToggles.peer_board===false&&featureToggles.peer_scheduling===false)?<AdminDisabledPanel name="Peer Conduct" mode="tab"/>:<div>
+          <L style={{marginBottom:12}}>Your Abuse-Review Key</L>
+          {abuseKeyExists===null?(
+            <Card style={{marginBottom:16}}><M style={{color:C.td}}>Checking for your review key...</M></Card>
+          ):abuseKeyExists===false?(
+            <Card style={{marginBottom:16,borderLeft:`4px solid ${C.w}`}}>
+              <M style={{color:C.t,fontWeight:600,fontSize:13,display:"block",marginBottom:6}}>Set up your abuse-review key</M>
+              <M style={{color:C.tm,lineHeight:1.7,display:"block",marginBottom:10}}>Peer-session and board abuse reports are encrypted to your key on the analyst's device, so only you -- not the server, not other management -- can open them. Create your key once on this device. Your passphrase wraps the private key at rest and unlocks it each session; there is no passphrase recovery, so store it safely.</M>
+              <Input label="Passphrase (at least 12 characters)" type="password" value={abusePass} onChange={e=>setAbusePass(e.target.value)} maxLength={256}/>
+              <Input label="Confirm passphrase" type="password" value={abusePass2} onChange={e=>setAbusePass2(e.target.value)} maxLength={256}/>
+              {abuseKeyErr&&<M style={{color:C.d,display:"block",marginBottom:8}}>{abuseKeyErr}</M>}
+              <Btn primary disabled={abuseKeyBusy||!abusePass||!abusePass2} onClick={generateAbuseKey}>{abuseKeyBusy?"Creating...":"Create and register my key"}</Btn>
+            </Card>
+          ):!abuseUnlocked?(
+            <Card style={{marginBottom:16,borderLeft:`4px solid ${C.w}`}}>
+              <M style={{color:C.t,fontWeight:600,fontSize:13,display:"block",marginBottom:6}}>Unlock your abuse-review key</M>
+              <M style={{color:C.tm,lineHeight:1.7,display:"block",marginBottom:10}}>Your key is set up on this device but locked. Enter your passphrase to unlock it for this session so you can open reports. It locks again when you close the app.</M>
+              <Input label="Passphrase" type="password" value={abusePass} onChange={e=>setAbusePass(e.target.value)} maxLength={256} onKeyDown={e=>{if(e.key==="Enter"&&abusePass)unlockAbuseKey();}}/>
+              {abuseKeyErr&&<M style={{color:C.d,display:"block",marginBottom:8}}>{abuseKeyErr}</M>}
+              <Btn primary disabled={abuseKeyBusy||!abusePass} onClick={unlockAbuseKey}>{abuseKeyBusy?"Unlocking...":"Unlock"}</Btn>
+            </Card>
+          ):(
+            <Card style={{marginBottom:16,borderLeft:`4px solid ${C.a}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                <div>
+                  <M style={{color:C.t,fontWeight:600,fontSize:13,display:"block",marginBottom:4}}>Your key is unlocked</M>
+                  <M style={{color:C.tm,display:"block"}}>Fingerprint: <span style={{color:C.a}}>{abuseKeyFp||"--"}</span></M>
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <Btn small disabled={abuseKeyBusy} onClick={lockAbuseKey}>Lock</Btn>
+                  <Btn small danger disabled={abuseKeyBusy} onClick={removeAbuseKey}>Remove key</Btn>
+                </div>
+              </div>
+              {abuseKeyMsg&&<M style={{color:C.tm,display:"block",marginTop:8}}>{abuseKeyMsg}</M>}
+              {abuseKeyErr&&<M style={{color:C.d,display:"block",marginTop:8}}>{abuseKeyErr}</M>}
+            </Card>
+          )}
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <L style={{marginBottom:0}}>Peer Conduct — Independent Review</L>
-            <Btn small onClick={()=>{api.get("/api/peer/flags/review-pending-count").then(r=>setPeerReviewPendingCount(r?.count||0)).catch(()=>{});}}>Refresh</Btn>
+            <L style={{marginBottom:0}}>Abuse Reports -- Team-Lead Review</L>
+            <Btn small disabled={abuseCasesBusy} onClick={loadAbuseCases}>{abuseCasesBusy?"Loading...":"Refresh"}</Btn>
           </div>
-          <Card style={{marginBottom:16,borderLeft:`4px solid ${C.i}`}}>
-            <div style={{display:"flex",alignItems:"baseline",gap:10,marginBottom:8}}>
-              <div style={{fontSize:30,fontWeight:600,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{peerReviewPendingCount}</div>
-              <div style={{fontSize:13,color:C.tm}}>report{peerReviewPendingCount===1?"":"s"} pending independent review</div>
+          <M style={{color:C.tm,display:"block",lineHeight:1.7,marginBottom:12}}>Reports from peer skill-share sessions and the skill-share board are encrypted to your key on the analyst's device. Only you can open them here -- the server stores opaque sealed envelopes and cannot read the content, the identities, or the tier. Open a report to decrypt it locally, then record a determination. A determination is final and cannot be changed.</M>
+          {abuseCasesErr&&<M style={{color:C.d,display:"block",marginBottom:10}}>{abuseCasesErr}</M>}
+          {abuseSel?(
+            <Card style={{marginBottom:16,borderLeft:`4px solid ${C.w}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <M style={{color:C.t,fontWeight:600,fontSize:13}}>Tier {abuseSel.tier} -- {abuseSel.targetType==="board_post"?"board post":"peer session"}</M>
+                <Btn small onClick={closeAbuseCase}>Back to list</Btn>
+              </div>
+              <M style={{color:C.tm,display:"block",marginBottom:4}}>Reported by <span style={{color:C.t}}>{abuseSel.flagger&&abuseSel.flagger.label}</span> against <span style={{color:C.t}}>{abuseSel.accused&&abuseSel.accused.label}</span></M>
+              <M style={{color:C.td,display:"block",marginBottom:10}}>Filed {abuseSel.createdAt?new Date(abuseSel.createdAt).toLocaleString():"--"}</M>
+              {abuseSelBusy?<M style={{color:C.td,display:"block"}}>Decrypting...</M>:abusePlain?(
+                <div>
+                  {abusePlain.note?<div style={{marginBottom:10}}><M style={{color:C.tm,display:"block",marginBottom:3}}>Reporter's note</M><div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{abusePlain.note}</div></div>:null}
+                  {abusePlain.content?<div style={{marginBottom:10}}><M style={{color:C.tm,display:"block",marginBottom:3}}>Reported content</M><div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{abusePlain.content}</div></div>:null}
+                  {abusePlain.context?<div style={{marginBottom:10}}><M style={{color:C.tm,display:"block",marginBottom:3}}>Surrounding context</M><div style={{padding:"8px 10px",background:"rgba(0,0,0,0.25)",borderRadius:6,fontSize:12,color:C.t,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{abusePlain.context}</div></div>:null}
+                  {!abusePlain.note&&!abusePlain.content&&!abusePlain.context?<M style={{color:C.td,display:"block"}}>No decryptable content was sealed with this report.</M>:null}
+                </div>
+              ):null}
+              {abuseSelErr&&<M style={{color:C.d,display:"block",marginTop:6}}>{abuseSelErr}</M>}
+              {abuseSel.resolved?(
+                <M style={{color:C.a,display:"block",marginTop:10}}>Resolved: {abuseSel.determination||"--"}</M>
+              ):(
+                <div style={{marginTop:12,borderTop:`1px solid ${C.b}`,paddingTop:12}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:6,fontWeight:600}}>Record a determination (final)</M>
+                  {[["substantiated","Substantiated"],["not_substantiated","Not substantiated"],["inconclusive","Inconclusive"]].map(o=>(
+                    <label key={o[0]} style={{display:"flex",gap:10,padding:"6px 8px",marginBottom:4,background:abuseDet===o[0]?"rgba(255,255,255,0.04)":"transparent",border:`1px solid ${abuseDet===o[0]?C.ba:C.b}`,borderRadius:8,cursor:"pointer"}}>
+                      <input type="radio" name="abusedet" checked={abuseDet===o[0]} onChange={()=>setAbuseDet(o[0])} style={{marginTop:2}}/>
+                      <M style={{color:C.t}}>{o[1]}</M>
+                    </label>
+                  ))}
+                  <textarea value={abuseRationale} onChange={e=>setAbuseRationale(e.target.value)} placeholder="Rationale for this determination (required)" maxLength={4000} style={{width:"100%",minHeight:70,marginTop:6,padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"inherit",boxSizing:"border-box",resize:"vertical"}}/>
+                  {abuseResolveErr&&<M style={{color:C.d,display:"block",marginTop:6}}>{abuseResolveErr}</M>}
+                  <Btn primary disabled={abuseResolveBusy||!abuseDet||!abuseRationale.trim()} style={{marginTop:8}} onClick={resolveAbuseCase}>{abuseResolveBusy?"Saving...":"Save determination"}</Btn>
+                </div>
+              )}
+            </Card>
+          ):(
+            <div>
+              {abuseCases===null?(
+                <M style={{color:C.td,display:"block"}}>Loading reports...</M>
+              ):abuseCases.length===0?(
+                <Card style={{background:"rgba(255,255,255,0.02)"}}><M style={{color:C.td,display:"block"}}>No reports to review.</M></Card>
+              ):abuseCases.map(c=>(
+                <Card key={c.id} onClick={()=>openAbuseCase(c.id)} style={{marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",borderLeft:`4px solid ${c.resolved?C.a:(c.tier>=3?C.d:c.tier===2?C.w:C.i)}`}}>
+                  <div style={{minWidth:0}}>
+                    <M style={{color:C.t,fontWeight:600}}>Tier {c.tier} -- {c.targetType==="board_post"?"board post":"peer session"}</M>
+                    <M style={{color:C.td,display:"block",marginTop:3}}>{c.flagger&&c.flagger.label} against {c.accused&&c.accused.label} -- {c.createdAt?new Date(c.createdAt).toLocaleDateString():"--"}</M>
+                  </div>
+                  <M style={{color:c.resolved?C.a:C.w,whiteSpace:"nowrap"}}>{c.resolved?(c.determination||"resolved"):"pending"}</M>
+                </Card>
+              ))}
             </div>
-            <M style={{color:C.tm,display:"block",lineHeight:1.7}}>Abuse reports from peer skill-share sessions and the skill-share board now go to an independent abuse reviewer, not to management. Each report is encrypted on the analyst's device so only the designated reviewer can open it -- this console cannot read the content, the identities, or even the severity tier. You see only this count, so you know reports are being handled without this console being a place where analysts' reports are read by their own management.</M>
-          </Card>
-          <Card style={{background:"rgba(255,255,255,0.02)"}}>
-            <M style={{color:C.td,display:"block",lineHeight:1.7}}>Review and resolution happen in the Abuse Review Console, operated by whoever your organization has designated as the independent reviewer -- a role kept separate from team leadership. If the count is not going down and you believe reports need attention, raise it with your reviewer through your normal channel, not here.</M>
-          </Card>
+          )}
         </div>)}
 
         {/* AUDIT — aggregated across MC, server, and all clients */}
@@ -9602,49 +9431,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </tbody>
             </table>
           </Card>)}
-        </div>)}
-        {tab==="abuse_reviewers"&&(<div>
-          <L>Abuse Reviewers — Recipient Set</L>
-          <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Each active row below is one independent reviewer's public key. Flag content from analysts and leads is sealed to ALL active keys at once, so any one reviewer can open a flag with their own private key. The private keys never appear here — they live on each reviewer's device behind their passphrase. Adding a reviewer is registering another public key; revoking one removes that reviewer from the active set without affecting other reviewers' ability to open existing flags.</M>
-          {arKeysErr && <Card style={{marginBottom:12,padding:"10px 14px",background:C.dd,border:`1px solid ${C.d}40`}}><M style={{color:C.d}}>{arKeysErr}</M></Card>}
-          {arMsg && !arKeysErr && <Card style={{marginBottom:12,padding:"10px 14px",background:C.ad,border:`1px solid ${C.a}40`}}><M style={{color:C.a}}>{arMsg}</M></Card>}
-
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>Active reviewers</div>
-            <M style={{color:C.tm,display:"block",marginBottom:10}}>With no active reviewer, flagging is disabled across the platform.</M>
-            {arKeys === null && <M style={{color:C.tm}}>Loading…</M>}
-            {Array.isArray(arKeys) && arKeys.length === 0 && <M style={{color:C.tm}}>No reviewers active. Add one below to enable flagging.</M>}
-            {Array.isArray(arKeys) && arKeys.length > 0 && (
-              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr style={{borderBottom:`1px solid ${C.b}`}}>
-                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600}}>Label</th>
-                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>Fingerprint</th>
-                  <th style={{textAlign:"left",padding:"6px 8px",color:C.tm,fontWeight:600}}>Algorithm</th>
-                  <th style={{textAlign:"right",padding:"6px 8px",color:C.tm,fontWeight:600}}>Action</th>
-                </tr></thead>
-                <tbody>
-                  {arKeys.map(k => (
-                    <tr key={k.id} style={{borderBottom:`1px solid ${C.b}`}}>
-                      <td style={{padding:"8px",color:C.t}}>{k.label || <span style={{color:C.tm,fontStyle:"italic"}}>unnamed</span>}</td>
-                      <td style={{padding:"8px",color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.fingerprint || <span style={{fontStyle:"italic"}}>—</span>}</td>
-                      <td style={{padding:"8px",color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.algo}</td>
-                      <td style={{padding:"8px",textAlign:"right"}}><Btn small danger disabled={arBusy} onClick={()=>revokeReviewerKey(k.id)}>Revoke</Btn></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </Card>
-
-          <Card>
-            <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:6}}>Add a reviewer</div>
-            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Paste the public key the reviewer generated on their device (shown after their first-run key creation in the Abuse Review Console). The fingerprint is derived server-side and a duplicate is rejected.</M>
-            <M style={{color:C.tm,display:"block",marginBottom:4}}>Label (optional)</M>
-            <input type="text" value={arNewLabel} onChange={e=>setArNewLabel(e.target.value)} placeholder="Reviewer A — Jordan" style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace",marginBottom:10,boxSizing:"border-box"}}/>
-            <M style={{color:C.tm,display:"block",marginBottom:4}}>Public key (base64 SPKI-DER)</M>
-            <textarea value={arNewPub} onChange={e=>setArNewPub(e.target.value)} rows={3} placeholder="MCowBQYDK2VuAyEA..." style={{width:"100%",padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",marginBottom:10,boxSizing:"border-box",resize:"vertical"}}/>
-            <Btn primary disabled={arBusy || !arNewPub.trim()} onClick={registerReviewerKey}>{arBusy?"Working…":"Register reviewer"}</Btn>
-          </Card>
         </div>)}
           </div>{/* end content area */}
         </div>{/* end sidebar flex container */}
