@@ -100,7 +100,7 @@ module.exports = (checks) => ({
       id: 'Art.18(II)',
       name: 'Right to Access',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history) with chain-of-custody metadata. Art.18(II) right of access to personal data; the platform provides the data substrate, response workflow is operator-side.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. Art.18(II) right of access to personal data; the subject can self-serve or an admin can initiate the export.',
     },
     {
       id: 'Art.18(III)',
@@ -112,13 +112,13 @@ module.exports = (checks) => ({
       id: 'Art.18(IV)',
       name: 'Right to Anonymization, Blocking, or Elimination',
       check: checks.checkDataSubjectRights,
-      mapping: 'Offboarding workflow (active=0 soft delete) blocks future processing; pseudonym rotation severs identity linkage; legal-hold workflow preserves required-retention data. Art.18(IV) right covers unnecessary, excessive, or unlawfully processed data.',
+      mapping: 'Dual-control erasure (POST /api/data-subject/erase) deletes the subject\'s personal rows and crypto-shreds an analyst\'s key material, tombstoning the user record while retaining de-identified audit history; pseudonym rotation severs identity linkage. Art.18(IV) right covers unnecessary, excessive, or unlawfully processed data.',
     },
     {
       id: 'Art.18(V)',
       name: 'Right to Data Portability',
       check: checks.checkDataSubjectRights,
-      mapping: 'Structured exports (JSON / CSV) via /api/legal-hold/export support Art.18(V) right to portability to another service or product provider, upon express request and per ANPD regulations.',
+      mapping: 'Structured exports via POST /api/data-subject/export support Art.18(V) right to portability to another service or product provider, upon express request and per ANPD regulations.',
     },
     {
       id: 'Art.46',

@@ -111,14 +111,16 @@ function checkPseudonymization(db) {
 
 // ── checkDataSubjectRights ───────────────────────────────────────────────────
 // Verifies platform support for data subject rights mechanisms:
-//   - Right to access / data portability: legal hold export endpoint
-//     (POST /api/legal-hold/export) returns user + audit data with
-//     chain-of-custody metadata and integrity hash.
-//   - Right to erasure: offboarding endpoint (POST
-//     /api/offboarding/execute) marks account inactive preserving
-//     audit/legal-hold continuity; pseudonym rotation re-keys
-//     analyst behavioral data, effectively erasing the
-//     identity-signal linkage.
+//   - Right to access / data portability: the data-subject export
+//     endpoint (POST /api/data-subject/export) returns the subject's
+//     record across every store; an analyst's bundle is sealed to the
+//     analyst's key so only they can open it.
+//   - Right to erasure: the dual-control erasure endpoint (POST
+//     /api/data-subject/erase, approved at POST
+//     /api/data-subject/erase/:id/approve) deletes the subject's
+//     personal rows, crypto-shreds an analyst's key material, and
+//     tombstones the user record while retaining de-identified audit
+//     history.
 //   - Right to rectification: standard user-update endpoints permit
 //     correction of personal data.
 // The check verifies the platform supports the mechanisms; whether
@@ -131,16 +133,16 @@ function checkPseudonymization(db) {
 function checkDataSubjectRights(db) {
   // Platform-level capability: the routes exist at startup.
   // We additionally surface usage metrics from audit_log if available
-  // (LEGAL_HOLD_EXPORT and ANALYST_OFFBOARDED events).
+  // (DATA_SUBJECT_EXPORT and DATA_SUBJECT_ERASURE events).
   const exportEvents = db.prepare(
-    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'LEGAL_HOLD_EXPORT'"
+    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'DATA_SUBJECT_EXPORT'"
   ).get();
-  const offboardingEvents = db.prepare(
-    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'ANALYST_OFFBOARDED'"
+  const erasureEvents = db.prepare(
+    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'DATA_SUBJECT_ERASURE'"
   ).get();
   return {
     status: 'pass',
-    detail: `Data subject rights mechanisms: access/portability via POST /api/legal-hold/export (${exportEvents.c} historical events), erasure via POST /api/offboarding/execute (${offboardingEvents.c} historical events) + pseudonym rotation. Rectification via standard user-update endpoints.`,
+    detail: `Data subject rights mechanisms: access/portability via POST /api/data-subject/export (${exportEvents.c} historical events), erasure via dual-control POST /api/data-subject/erase (${erasureEvents.c} historical events) + pseudonym rotation. Rectification via standard user-update endpoints.`,
   };
 }
 

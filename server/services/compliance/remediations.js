@@ -438,8 +438,8 @@ const REMEDIATIONS = {
   checkDataSubjectRights: {
     summary: 'No action -- DSR mechanisms are structurally available',
     steps: [
-      'Access / portability: POST /api/legal-hold/export returns user + audit data with chain-of-custody',
-      'Erasure: POST /api/offboarding/execute marks account inactive (soft delete preserving audit trail)',
+      'Access / portability: POST /api/data-subject/export returns the subject record across every store (an analyst bundle sealed to the analyst key)',
+      'Erasure: dual-control POST /api/data-subject/erase deletes personal rows and crypto-shreds analyst key material, then tombstones the user (audit retained, de-identified)',
       'Right-to-erasure via re-keying: rotate user pseudonym to sever identity-signal linkage',
       'Rectification: standard user-update endpoints permit data correction',
       'Document the DSR-handling process for your privacy operations team',

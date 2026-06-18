@@ -9,9 +9,6 @@
 // POST /api/retention/purge               — manual purge
 // GET  /api/audit/export-syslog           — export in syslog RFC 5424 format
 // GET  /api/audit/export-forensics        — forensics-tool-compatible export
-// POST /api/users/provision               — create user (requires lead MFA approval)
-// GET  /api/users/pending                 — list pending user approvals
-// POST /api/users/:id/approve             — approve pending user
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -310,106 +307,6 @@ router.get('/audit/export-forensics', (req, res) => {
   } catch (err) {
     logger.error('Forensics export error', { error: err.message });
     res.status(500).json({ error: 'Failed to export forensics data' });
-  }
-});
-
-// ── User Provisioning with Approval ──────────────────────────────────────────
-router.post('/users/provision', (req, res) => {
-  const { username, name, role, tier, shift } = req.body;
-  if (!username || !name || !role) return res.status(400).json({ error: 'username, name, and role required' });
-  if (!['analyst', 'lead', 'admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
-
-  try {
-    const db = getDb();
-    const id = crypto.randomBytes(16).toString('hex');
-
-    // Create as pending — requires lead/admin MFA approval
-    db.prepare("INSERT INTO team_config (key, value, updated_by) VALUES (?, ?, ?)").run(
-      `pending_user_${id}`,
-      JSON.stringify({
-        id, username: username.slice(0, 128), name: name.slice(0, 128),
-        role, tier: tier || 1, shift: shift || 'day',
-        requestedBy: req.user.id, requestedAt: new Date().toISOString(),
-        status: 'pending',
-      }),
-      req.user.id
-    );
-
-    db.close();
-    auditLog(req.user.id, 'USER_PROVISION_REQUESTED', `username=${username} role=${role}`, req.ip);
-
-    // In production, this triggers a notification to the team lead
-    res.status(201).json({ id, status: 'pending_approval', message: 'User creation requires team lead MFA approval.' });
-  } catch (err) {
-    logger.error('User provision error', { error: err.message });
-    res.status(500).json({ error: 'Failed to request user provisioning' });
-  }
-});
-
-router.get('/users/pending', (req, res) => {
-  if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can view pending users' });
-
-  try {
-    const db = getDb();
-    const rows = db.prepare("SELECT value FROM team_config WHERE key LIKE 'pending_user_%'").all();
-    db.close();
-    const pending = rows.map(r => { try { return JSON.parse(r.value); } catch { return null; } }).filter(p => p && p.status === 'pending');
-    res.json({ pending });
-  } catch (err) {
-    logger.error('List pending users error', { error: err.message });
-    res.status(500).json({ error: 'Failed to list pending users' });
-  }
-});
-
-router.post('/users/:id/approve', (req, res) => {
-  if (req.user.role === 'analyst') return res.status(403).json({ error: 'Only leads/admins can approve users' });
-
-  const { approved } = req.body;
-
-  try {
-    const db = getDb();
-    const row = db.prepare("SELECT key, value FROM team_config WHERE key = ?").get(`pending_user_${req.params.id}`);
-    if (!row) { db.close(); return res.status(404).json({ error: 'Pending user not found' }); }
-
-    const pending = JSON.parse(row.value);
-    if (pending.status !== 'pending') { db.close(); return res.status(400).json({ error: 'Already processed' }); }
-
-    if (approved) {
-      // Create the actual user
-      const bcrypt = require('bcryptjs');
-      const tempPassword = crypto.randomBytes(16).toString('hex');
-      const hash = bcrypt.hashSync(tempPassword, 12);
-
-      db.prepare(`
-        INSERT INTO users (id, username, password_hash, role, name, tier, shift, auth_method)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'local')
-      `).run(pending.id, pending.username, hash, pending.role, pending.name, pending.tier, pending.shift);
-
-      // Initialize routing cap
-      const defaultCap = pending.tier === 3 ? 5 : pending.tier === 2 ? 3 : 2;
-      db.prepare('INSERT OR IGNORE INTO routing_caps (analyst_id, max_complexity) VALUES (?, ?)').run(pending.id, defaultCap);
-
-      pending.status = 'approved';
-      pending.approvedBy = req.user.id;
-      pending.approvedAt = new Date().toISOString();
-      db.prepare("UPDATE team_config SET value = ? WHERE key = ?").run(JSON.stringify(pending), row.key);
-      db.close();
-
-      auditLog(req.user.id, 'USER_APPROVED', `username=${pending.username} role=${pending.role}`, req.ip);
-      res.json({ ok: true, userId: pending.id, tempPassword, message: 'User created. Provide temporary password securely — must be changed on first login.' });
-    } else {
-      pending.status = 'rejected';
-      pending.rejectedBy = req.user.id;
-      pending.rejectedAt = new Date().toISOString();
-      db.prepare("UPDATE team_config SET value = ? WHERE key = ?").run(JSON.stringify(pending), row.key);
-      db.close();
-
-      auditLog(req.user.id, 'USER_REJECTED', `username=${pending.username}`, req.ip);
-      res.json({ ok: true, status: 'rejected' });
-    }
-  } catch (err) {
-    logger.error('Approve user error', { error: err.message });
-    res.status(500).json({ error: 'Failed to process approval' });
   }
 });
 

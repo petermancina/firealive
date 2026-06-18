@@ -10,17 +10,13 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { requireArrayBody, requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
+const { generatePseudonym, generateUniquePseudonym } = require('../lib/pseudonym');
 
 // ── Pseudonym System ────────────────────────────────────────────────────────
 // The pseudonym is the ONLY identifier stored alongside burnout data.
 // IAM username → pseudonym mapping is encrypted and exportable, never stored
-// in the main database in plaintext.
-
-const PSEUDONYM_BIRDS = [
-  'Phoenix','Merlin','Peregrine','Kestrel','Harrier','Gyrfalcon','Sparrowhawk',
-  'Kite','Buzzard','Shrike','Osprey','Falcon','Hawk','Raven','Eagle','Condor',
-  'Albatross','Kingfisher','Nighthawk','Wren','Starling','Finch','Swift','Tern'
-];
+// in the main database in plaintext. The pseudonym scheme itself lives in
+// server/lib/pseudonym.js (shared with provisioning and the backfill).
 
 router.get('/pseudonyms/config', (req, res) => {
   try {
@@ -45,10 +41,8 @@ router.put('/pseudonyms/config', requireObjectBody, (req, res) => {
 });
 
 router.post('/pseudonyms/generate', (req, res) => {
-  // Generate a unique pseudonym
-  const bird = PSEUDONYM_BIRDS[Math.floor(Math.random() * PSEUDONYM_BIRDS.length)];
-  const suffix = Math.floor(Math.random() * 99);
-  res.json({ pseudonym: `Analyst-${bird}-${suffix}` });
+  // Suggest a pseudonym for the UI (uniqueness is enforced on assign).
+  res.json({ pseudonym: generatePseudonym() });
 });
 
 router.post('/pseudonyms/assign', (req, res) => {
@@ -71,11 +65,7 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
     const analysts = db.prepare("SELECT id FROM users WHERE role = 'analyst'").all();
     const used = new Set();
     analysts.forEach(a => {
-      let pseudonym;
-      do {
-        const bird = PSEUDONYM_BIRDS[Math.floor(Math.random() * PSEUDONYM_BIRDS.length)];
-        pseudonym = `Analyst-${bird}-${Math.floor(Math.random() * 99)}`;
-      } while (used.has(pseudonym));
+      const pseudonym = generateUniquePseudonym((candidate) => used.has(candidate));
       used.add(pseudonym);
       db.prepare("UPDATE users SET pseudonym = ?, pseudonym_rotated_at = ? WHERE id = ? AND role = 'analyst'").run(pseudonym, new Date().toISOString(), a.id);
     });

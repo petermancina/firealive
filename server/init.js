@@ -1159,6 +1159,27 @@ CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
   ON restore_approvals(requested_by_user_id);
 
+-- Data-subject erasure requests (dual control: an admin requests, a second
+-- admin approves, and on approval the erasure executes). Mirrors the
+-- restore_approvals idiom -- plain user-id columns, no FK -- so a user row that
+-- is later tombstoned by an erasure does not cascade this request away. Status
+-- lifecycle: pending -> approved/rejected, and approved -> executed.
+CREATE TABLE IF NOT EXISTS data_subject_erasure_requests (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  subject_id TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected', 'executed')),
+  approved_by TEXT,
+  approved_at TEXT,
+  executed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_data_subject_erasure_requests_subject
+  ON data_subject_erasure_requests(subject_id);
+CREATE INDEX IF NOT EXISTS idx_data_subject_erasure_requests_status
+  ON data_subject_erasure_requests(status);
+
 
 -- ── Audit Trail (immutable) ──────────────────────────────────────────────
 
@@ -7718,6 +7739,49 @@ function initDb() {
   } catch (b5gExportAtRestMigrationErr) {
     console.error('B5g export-at-rest column migration FAILED:', b5gExportAtRestMigrationErr.message);
     console.error('The server will start, but forensic-export artifacts cannot be sealed or re-encrypted at rest until the at_rest_scheme / at_rest_kek_ref columns exist. Recovery: run the two ALTER TABLE ADD COLUMN statements in a SQLite shell against the production DB, then restart.');
+  }
+
+  // ── Migration: backfill identity handles + analyst pseudonyms (B5h3) ──────────
+  // Identity minimization for rows that predate the directory-sync refactor.
+  // Such ldap rows may still carry the real displayName / sAMAccountName in
+  // name/username; overwrite both with the deterministic non-identifying handle
+  // derived from the stored objectGUID (external_id) -- the SAME derivation the
+  // sync now uses, so the values match and a later sync leaves them untouched.
+  // Separately, assign a unique pseudonym to any analyst lacking one so the team
+  // views have a non-identifying label. Idempotent: handles are deterministic and
+  // analysts that already have a pseudonym are skipped, so re-running is a no-op.
+  try {
+    const { handleForGuid } = require('../lib/identity-handle');
+    const { generateUniquePseudonym } = require('../lib/pseudonym');
+
+    const ldapRows = db.prepare("SELECT id, external_id, name, username FROM users WHERE auth_method = 'ldap'").all();
+    const setHandle = db.prepare('UPDATE users SET name = ?, username = ? WHERE id = ?');
+    let handlesFixed = 0;
+    for (const r of ldapRows) {
+      if (typeof r.external_id !== 'string' || r.external_id.length === 0) continue;
+      const handle = handleForGuid(r.external_id);
+      if (r.name !== handle || r.username !== handle) {
+        setHandle.run(handle, handle, r.id);
+        handlesFixed++;
+      }
+    }
+
+    const noPseudonym = db.prepare("SELECT id FROM users WHERE role = 'analyst' AND (pseudonym IS NULL OR pseudonym = '')").all();
+    const pseudonymTaken = db.prepare('SELECT 1 FROM users WHERE pseudonym = ?');
+    const setPseudonym = db.prepare('UPDATE users SET pseudonym = ?, pseudonym_rotated_at = ? WHERE id = ?');
+    let pseudonymsAssigned = 0;
+    const nowIso = new Date().toISOString();
+    for (const r of noPseudonym) {
+      const pseudonym = generateUniquePseudonym((candidate) => !!pseudonymTaken.get(candidate));
+      setPseudonym.run(pseudonym, nowIso, r.id);
+      pseudonymsAssigned++;
+    }
+
+    if (handlesFixed || pseudonymsAssigned) {
+      console.log('identity backfill (B5h3): ' + handlesFixed + ' directory row(s) handled, ' + pseudonymsAssigned + ' analyst pseudonym(s) assigned');
+    }
+  } catch (idBackfillErr) {
+    console.error('identity backfill (B5h3) failed (non-fatal):', idBackfillErr.message);
   }
 
   console.log('Database initialized at', DB_PATH);

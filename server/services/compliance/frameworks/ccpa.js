@@ -104,7 +104,7 @@ module.exports = (checks) => ({
       id: '§1798.110',
       name: 'Right to Know',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history) with chain-of-custody metadata. §1798.110 right to know covers specific pieces of personal information collected about the consumer; the platform provides the data substrate.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. §1798.110 right to know covers specific pieces of personal information collected about the consumer; the export provides that data directly.',
     },
     {
       id: '§1798.115',

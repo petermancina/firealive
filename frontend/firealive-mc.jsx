@@ -2391,7 +2391,7 @@ function ManagementConsole() {
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
-  const [newA, setNewA] = useState({name:"",username:"",tier:1,shift:"day",hostname:"",ip:""});
+  const [newA, setNewA] = useState({tier:1,shift:"day",hostname:"",ip:""});
   const [provisionBusy, setProvisionBusy] = useState(false);
   const [provisionErr, setProvisionErr] = useState("");
   const [provisionResult, setProvisionResult] = useState(null);
@@ -3356,7 +3356,7 @@ function ManagementConsole() {
         addA("API_CONNECTED","Backend v"+health.version+" connected");
 
         // Load team data
-        try { const td = await API.team.getOverview(); if(td.analysts) setAnalysts(td.analysts); } catch(e){}
+        try { const td = await API.team.getOverview(); if(td.analysts) setAnalysts(td.analysts.map(a=>({...a,name:a.pseudonym||a.name||a.id}))); } catch(e){}
 
         // Load retros
         try { const rd = await API.retro.list(); if(rd.retros?.length) setActiveRetros(rd.retros.map(r=>({id:r.id,incident:r.incident,severity:r.severity,names:r.analysts||[],phase:r.phase,initiated:r.created_at,actions:r.actions||[]}))); } catch(e){}
@@ -3427,23 +3427,24 @@ function ManagementConsole() {
   const highP=activeP.filter(([,p])=>p.sev==="high");
 
   const handleProvision = async () => {
-    if(!newA.name.trim()||!newA.username.trim()||!newA.hostname.trim()) return;
+    if(!newA.hostname.trim()) return;
     setProvisionBusy(true); setProvisionErr("");
     let resp;
-    try { resp = await api.post("/api/team/provision", { name:newA.name.trim(), username:newA.username.trim(), tier:newA.tier, shift:newA.shift, hostname:newA.hostname.trim(), ip:newA.ip.trim()||undefined }); }
+    try { resp = await api.post("/api/team/provision", { tier:newA.tier, shift:newA.shift, hostname:newA.hostname.trim(), ip:newA.ip.trim()||undefined }); }
     catch(e){ setProvisionBusy(false); setProvisionErr(e.message||"Provisioning failed."); return; }
     setProvisionBusy(false);
     if(!resp||resp.error){ setProvisionErr(resp&&resp.error?String(resp.error):"Provisioning failed."); return; }
     const activationId = resp.activationId || genId();
-    const newAnalyst = {id:`prov-${Date.now()}`,name:newA.name,tier:newA.tier,shift:newA.shift,days:0,available:true};
+    const pseudonym = resp.pseudonym || "";
+    const newAnalyst = {id:resp.id||`prov-${Date.now()}`,name:pseudonym,tier:newA.tier,shift:newA.shift,days:0,available:true};
     setAnalysts(prev=>[...prev,newAnalyst]);
     setRC(prev=>({...prev,[newAnalyst.id]:newA.tier===3?5:newA.tier===2?3:2}));
     setSC(prev=>({...prev,[newAnalyst.id]:{t:0,h:0}}));
-    const client = {id:activationId,analyst:newA.name,tier:newA.tier,shift:newA.shift,hostname:newA.hostname,ip:newA.ip,provisionedAt:new Date().toISOString(),status:"calibrating",analystId:newAnalyst.id};
+    const client = {id:activationId,analyst:pseudonym,tier:newA.tier,shift:newA.shift,hostname:newA.hostname,ip:newA.ip,provisionedAt:new Date().toISOString(),status:"calibrating",analystId:newAnalyst.id};
     setPC(prev=>[...prev,client]);
-    addA("ANALYST_PROVISIONED",`${newA.name} · ${tierLbl(newA.tier)} · ${newA.shift} · Host: ${newA.hostname} · Activation: ${activationId}`);
-    setProvisionResult({ name:newA.name, username:newA.username, activationId, enrollmentToken:resp.enrollmentToken||"", expiresInDays:resp.enrollmentExpiresInDays||7 });
-    setNewA({name:"",username:"",tier:1,shift:"day",hostname:"",ip:""});
+    addA("ANALYST_PROVISIONED",`${pseudonym||"analyst"} · ${tierLbl(newA.tier)} · ${newA.shift} · Host: ${newA.hostname} · Activation: ${activationId}`);
+    setProvisionResult({ pseudonym, activationId, enrollmentToken:resp.enrollmentToken||"", expiresInDays:resp.enrollmentExpiresInDays||7 });
+    setNewA({tier:1,shift:"day",hostname:"",ip:""});
   };
 
   const checkUpdate = () => {
@@ -3475,7 +3476,7 @@ function ManagementConsole() {
       {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"migration",label:"Deployment Migration"},
     ]},
     {cat:"reports",label:"Reports & Compliance",items:[
-      {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},
+      {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},{id:"data_subject",label:"Data Subject Rights"},
     ]},
     {cat:"config",label:"Configuration",items:[
       {id:"features",label:"Feature Toggles"},{id:"notif",label:"Burnout Alerts"},{id:"msp",label:"MSP Multi-Tenancy"},{id:"global_dash",label:"Global Dashboard"},{id:"updates",label:"Updates"},{id:"troubleshooter",label:"Troubleshooter"},
@@ -3528,6 +3529,53 @@ function ManagementConsole() {
     catch (_e) { return null; }
     if (!cred) return null;
     return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
+  };
+  // ── B5h3 PR-3: Data Subject Rights (access export + dual-control erasure)
+  const [dsrSubjectId, setDsrSubjectId] = useState("");
+  const [dsrExportBusy, setDsrExportBusy] = useState(false);
+  const [dsrExportMsg, setDsrExportMsg] = useState("");
+  const [dsrEraseSubjectId, setDsrEraseSubjectId] = useState("");
+  const [dsrEraseBusy, setDsrEraseBusy] = useState(false);
+  const [dsrEraseMsg, setDsrEraseMsg] = useState("");
+  const [dsrPending, setDsrPending] = useState([]);
+  const [dsrApprovingId, setDsrApprovingId] = useState(null);
+  const dsrLoadPending = async () => {
+    const r = await api.get("/api/data-subject/erase/pending");
+    if (r && !r.error) setDsrPending(Array.isArray(r.items) ? r.items : []);
+  };
+  useEffect(() => { if (tab === "data_subject") dsrLoadPending(); }, [tab]);
+  const dsrDoExport = async () => {
+    setDsrExportBusy(true); setDsrExportMsg("");
+    const sid = dsrSubjectId.trim();
+    const r = await api.post("/api/data-subject/export", sid ? { subject_id: sid } : {});
+    setDsrExportBusy(false);
+    if (!r || r.error) { setDsrExportMsg("Export failed: " + ((r && r.error) || "unknown")); addA("DATA_SUBJECT_EXPORT_FAILED", "subject=" + (sid || "self") + " error=" + ((r && r.error) || "unknown")); return; }
+    if (r.sealed) { setDsrExportMsg("Export sealed to the analyst key. Only that analyst can open it on their device; this console holds ciphertext only."); addA("DATA_SUBJECT_EXPORT", "subject=" + sid + " sealed=true"); return; }
+    const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+    a.download = "firealive-data-subject-" + (sid || "self") + "-" + new Date().toISOString().slice(0, 10) + ".json";
+    a.click(); URL.revokeObjectURL(a.href);
+    setDsrExportMsg("Export downloaded."); addA("DATA_SUBJECT_EXPORT", "subject=" + (sid || "self") + " sealed=false");
+  };
+  const dsrRequestErase = async () => {
+    const sid = dsrEraseSubjectId.trim();
+    if (!sid) { setDsrEraseMsg("Enter a subject id to request erasure."); return; }
+    if (!window.confirm("Request erasure of all personal data for subject " + sid + "? A second admin must approve before anything is deleted.")) return;
+    setDsrEraseBusy(true); setDsrEraseMsg("");
+    const r = await api.post("/api/data-subject/erase", { subject_id: sid });
+    setDsrEraseBusy(false);
+    if (!r || r.error) { const extra = (r && r.code === "ERASURE_ALREADY_PENDING") ? " (a request is already pending)" : ""; setDsrEraseMsg("Request failed: " + ((r && r.error) || "unknown") + extra); addA("DATA_SUBJECT_ERASURE_REQUEST_FAILED", "subject=" + sid + " error=" + ((r && r.error) || "unknown")); return; }
+    setDsrEraseMsg("Erasure requested (id " + r.id + "). A second admin must approve it below."); setDsrEraseSubjectId(""); addA("DATA_SUBJECT_ERASURE_REQUESTED", "request=" + r.id + " subject=" + sid); dsrLoadPending();
+  };
+  const dsrApprove = async (id) => {
+    if (!window.confirm("Approve and EXECUTE erasure for request " + id + "? This permanently deletes the subject personal data and cannot be undone.")) return;
+    setDsrApprovingId(id);
+    const stepup = await getStepUp();
+    if (!stepup) { setDsrApprovingId(null); return; }
+    const r = await api.post("/api/data-subject/erase/" + id + "/approve", { stepup });
+    setDsrApprovingId(null);
+    if (!r || r.error) { addA("DATA_SUBJECT_ERASURE_APPROVE_FAILED", "request=" + id + " error=" + ((r && r.error) || "unknown")); window.alert("Approval failed: " + ((r && r.error) || "unknown")); return; }
+    addA("DATA_SUBJECT_ERASURE", "request=" + id + " executed"); window.alert("Erasure executed for request " + id + "."); dsrLoadPending();
   };
   // ── B5d4: fleet operations + per-client recovery ────────────────────────────
   // Real dispatch + signed-result readback (client_ops_*) and the admin recovery
@@ -5187,7 +5235,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           {showProvision&&<Modal title="Provision Analyst Client" onClose={()=>{setShowProvision(false);setProvisionResult(null);setProvisionErr("");}} width={520}>
             {provisionResult ? (
               <div>
-                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>{provisionResult.name} ({provisionResult.username}) is provisioned. Activation ID: {provisionResult.activationId}.</M>
+                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Analyst {provisionResult.pseudonym} is provisioned. Activation ID: {provisionResult.activationId}.</M>
                 <Card style={{marginBottom:14,padding:12,borderColor:C.d+"30"}}>
                   <M style={{color:C.d,fontWeight:500,display:"block",marginBottom:6}}>One-time enrollment token</M>
                   <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Give this to the analyst over a secure channel. They redeem it once to enroll their first passkey. It expires in {provisionResult.expiresInDays} days and is shown only here.</M>
@@ -5199,9 +5247,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 </div>
               </div>
             ) : (<div>
-              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Specify the target host and assign to an analyst. No password is set — the analyst redeems a one-time enrollment token (shown next) to enroll their first passkey.</M>
-              <Input label="Analyst name" value={newA.name} onChange={e=>setNewA(prev=>({...prev,name:e.target.value}))} placeholder="Full name" maxLength={100}/>
-              <Input label="Username" value={newA.username} onChange={e=>setNewA(prev=>({...prev,username:e.target.value}))} placeholder="analyst.name" maxLength={64}/>
+              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Specify the target host, tier, and shift. A pseudonym is assigned automatically — no name is stored. No password is set; the analyst redeems a one-time enrollment token (shown next) to enroll their first passkey.</M>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
                 <Sel label="Tier" value={newA.tier} onChange={e=>setNewA(prev=>({...prev,tier:Number(e.target.value)}))}><option value={1}>L1</option><option value={2}>L2</option><option value={3}>L3</option></Sel>
                 <Sel label="Shift" value={newA.shift} onChange={e=>setNewA(prev=>({...prev,shift:e.target.value}))}><option value="day">Day</option><option value="swing">Swing</option><option value="night">Night</option></Sel>
@@ -5209,7 +5255,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               <Input label="Target hostname" value={newA.hostname} onChange={e=>setNewA(prev=>({...prev,hostname:e.target.value}))} placeholder="SOC-WS-042.corp.local" maxLength={253}/>
               <Input label="IP address (optional)" value={newA.ip} onChange={e=>setNewA(prev=>({...prev,ip:e.target.value}))} placeholder="10.0.5.42" maxLength={45}/>
               {provisionErr&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{provisionErr}</div>}
-              <Btn primary style={{width:"100%"}} disabled={!newA.name.trim()||!newA.username.trim()||!newA.hostname.trim()||provisionBusy} onClick={handleProvision}>{provisionBusy?"Provisioning…":"Provision Client"}</Btn>
+              <Btn primary style={{width:"100%"}} disabled={!newA.hostname.trim()||provisionBusy} onClick={handleProvision}>{provisionBusy?"Provisioning…":"Provision Client"}</Btn>
             </div>)}
           </Modal>}
         </div>)}
@@ -6842,6 +6888,40 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         </div>)}
 
         {/* ══════════ COMPLIANCE ══════════ */}
+        {tab==="data_subject"&&(<div>
+          <L>Data Subject Rights</L>
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Access / Portability Export</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Leave the subject id blank to export your own record. Enter another user id to run an organization-initiated export. An analyst export is sealed to that analyst key -- this console receives only ciphertext; every other export downloads here as JSON.</M>
+            <Input label="Subject id (blank = yourself)" value={dsrSubjectId} onChange={e=>setDsrSubjectId(e.target.value)} placeholder="user id" maxLength={128}/>
+            <Btn primary disabled={dsrExportBusy} onClick={dsrDoExport}>{dsrExportBusy?"Generating...":"Generate export"}</Btn>
+            {dsrExportMsg&&<M style={{color:C.tm,display:"block",marginTop:10,lineHeight:1.6}}>{dsrExportMsg}</M>}
+          </Card>
+          <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Erasure -- Request (dual control)</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Requesting erasure does not delete anything yet. A different admin must approve the request below with an MFA step-up; only then are the subject personal rows deleted, an analyst key material crypto-shredded, and the account tombstoned. De-identified audit history is retained.</M>
+            <Input label="Subject id to erase" value={dsrEraseSubjectId} onChange={e=>setDsrEraseSubjectId(e.target.value)} placeholder="user id" maxLength={128}/>
+            <Btn danger disabled={dsrEraseBusy} onClick={dsrRequestErase}>{dsrEraseBusy?"Requesting...":"Request erasure"}</Btn>
+            {dsrEraseMsg&&<M style={{color:C.tm,display:"block",marginTop:10,lineHeight:1.6}}>{dsrEraseMsg}</M>}
+          </Card>
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Erasure -- Pending Approvals</div>
+              <Btn small onClick={dsrLoadPending}>Refresh</Btn>
+            </div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Approve a request to execute it. You cannot approve a request you created -- a second admin is required. Approving prompts for an MFA step-up.</M>
+            {(!dsrPending||dsrPending.length===0)?<M style={{color:C.td,fontStyle:"italic"}}>No pending erasure requests. Use Refresh to check.</M>:
+            dsrPending.map(p=><Card key={p.id} style={{marginBottom:6,padding:"10px 14px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+                <div>
+                  <M style={{color:C.t,display:"block"}}>subject {p.subject_id}</M>
+                  <M style={{color:C.td}}>requested by {p.requested_by} - {p.requested_at}</M>
+                </div>
+                <Btn danger small disabled={dsrApprovingId===p.id} onClick={()=>dsrApprove(p.id)}>{dsrApprovingId===p.id?"Approving...":"Approve (MFA)"}</Btn>
+              </div>
+            </Card>)}
+          </Card>
+        </div>)}
         {tab==="compliance"&&(<div>
           <L>Compliance Reports</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Generate framework-specific compliance reports that check the running system against control requirements.</M>

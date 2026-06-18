@@ -146,7 +146,7 @@ module.exports = (checks) => ({
       id: 'Art.20',
       name: 'Right to Data Portability',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history) in machine-readable format with chain-of-custody metadata. Operator extends with subject-specific export endpoints as needed for Art.20 portability requests.',
+      mapping: 'POST /api/data-subject/export produces a structured, machine-readable export of the subject\'s record across every store (an analyst bundle sealed to their own key). Self-service for the subject or admin-initiated, directly serving Art.20 portability requests.',
     },
     // ── Chapter V Transfers ──────────────────────────────────────────────────
     {

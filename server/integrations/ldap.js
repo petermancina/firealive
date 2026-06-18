@@ -25,6 +25,7 @@
 
 const { Client, InvalidCredentialsError } = require('ldapts');
 const { logger } = require('../services/logger');
+const { handleForGuid } = require('../lib/identity-handle');
 
 // ── Role Mapping from AD Groups ──────────────────────────────────────────────
 const DEFAULT_GROUP_MAPPING = {
@@ -261,16 +262,23 @@ class LdapClient {
       for (const adUser of searchResult.users) {
         if (!adUser.objectGUID || !adUser.sAMAccountName) continue;
         const role = this._mapGroupToRole(adUser.memberOf);
+        // Identity minimization: persist only the opaque directory id
+        // (objectGUID, in external_id) and a non-identifying handle derived from
+        // it. The directory's displayName and sAMAccountName are NEVER stored, so
+        // a database read cannot map a pseudonym back to a real person.
+        const handle = handleForGuid(adUser.objectGUID);
         const existing = db.prepare('SELECT * FROM users WHERE external_id = ? AND auth_method = ?').get(adUser.objectGUID, 'ldap');
 
         if (!existing) {
-          db.prepare(`
-            INSERT INTO users (username, name, role, tier, auth_method, external_id)
-            VALUES (?, ?, ?, ?, 'ldap', ?)
-          `).run(adUser.sAMAccountName, adUser.displayName || adUser.sAMAccountName, role, role === 'analyst' ? 1 : null, adUser.objectGUID);
+          db.prepare(
+            'INSERT INTO users (username, name, role, tier, auth_method, external_id) VALUES (?, ?, ?, ?, ?, ?)'
+          ).run(handle, handle, role, role === 'analyst' ? 1 : null, 'ldap', adUser.objectGUID);
           created++;
-        } else if (existing.name !== adUser.displayName || existing.role !== role) {
-          db.prepare('UPDATE users SET name = ?, role = ?, updated_at = datetime("now") WHERE id = ?').run(adUser.displayName, role, existing.id);
+        } else if (existing.role !== role || existing.username !== handle || existing.name !== handle) {
+          // Sync the role, and self-heal any row provisioned before identity
+          // minimization (whose username/name still held the real values) onto
+          // the handle.
+          db.prepare("UPDATE users SET username = ?, name = ?, role = ?, updated_at = datetime('now') WHERE id = ?").run(handle, handle, role, existing.id);
           updated++;
         }
       }

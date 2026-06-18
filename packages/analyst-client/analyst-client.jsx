@@ -3983,6 +3983,11 @@ export default function AnalystClientApp() {
             <MyMfaSecuritySection/>
             <M style={{color:C.td,display:"block",marginTop:8,fontStyle:"italic"}}>When enabled, you can use your device's biometric sensor instead of typing your password to reopen FireAlive after inactivity lock. Initial login always requires full credentials + MFA.</M>
           </Card>
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Your Data</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Download a full copy of your FireAlive record -- your account, signals history, consent events, notification preferences, and key metadata -- to keep for yourself or to move elsewhere. Your private wellbeing entries are included sealed to your device, so only you can open them. This is your data-subject access and portability right; only you can run it for your own account.</M>
+            <Btn onClick={async()=>{ try { const resp = await api.post("/api/data-subject/export", {}); if (!resp || resp.error) { logC("data_subject_export_failed","Personal data export failed"); return; } const blob = new Blob([JSON.stringify(resp, null, 2)], { type: "application/json" }); const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "firealive-my-data-" + new Date().toISOString().slice(0,10) + ".json"; a.click(); URL.revokeObjectURL(a.href); logC("data_subject_export","Exported personal data (JSON)"); } catch (e) { logC("data_subject_export_failed","Personal data export failed"); } }}>Export my data (JSON)</Btn>
+          </Card>
           <L>Consent Events</L>
           {auditLog.length===0?<M style={{color:C.tm,fontStyle:"italic"}}>No data has crossed the privacy boundary.</M>:
           auditLog.filter(c=>c.a.includes("peer")||c.a.includes("CONSENT")||c.a.includes("lead")).map((c,i)=><Card key={i} style={{marginBottom:6,padding:"10px 14px"}}><M style={{color:C.w}}>{new Date(c.ts).toLocaleTimeString()}</M><M style={{color:C.tm}}> · {c.a} · </M><M style={{color:C.td}}>{c.dt}</M></Card>)}

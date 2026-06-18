@@ -6,11 +6,13 @@
 const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { handleForGuid } = require('../lib/identity-handle');
+const { generateUniquePseudonym } = require('../lib/pseudonym');
 
 // ── GET /api/team/overview — team health metrics ─────────────────────────────
 router.get('/overview', (req, res) => {
   const db = getDb();
-  const analysts = db.prepare('SELECT id, name, tier, shift, available FROM users WHERE role = ?').all('analyst');
+  const analysts = db.prepare('SELECT id, pseudonym, tier, shift, available FROM users WHERE role = ?').all('analyst');
   const caps = db.prepare('SELECT * FROM routing_caps').all();
   const lqCount = db.prepare('SELECT COUNT(*) as c FROM lighter_queue_requests WHERE status = ?').get('active');
   const autoSys = db.prepare('SELECT * FROM automation_systems').all();
@@ -22,7 +24,7 @@ router.get('/overview', (req, res) => {
 
   res.json({
     analysts: analysts.map(a => ({
-      id: a.id, name: a.name, tier: a.tier, shift: a.shift, available: !!a.available,
+      id: a.id, pseudonym: a.pseudonym, tier: a.tier, shift: a.shift, available: !!a.available,
       maxComplexity: capsMap[a.id]?.max_complexity || 2,
       isOverride: !!capsMap[a.id]?.is_override,
     })),
@@ -36,7 +38,7 @@ router.get('/overview', (req, res) => {
 router.get('/analysts', (req, res) => {
   const db = getDb();
   const analysts = db.prepare(
-    'SELECT id, name, tier, shift, available, created_at, last_login FROM users WHERE role = ? ORDER BY shift, tier DESC, name'
+    'SELECT id, pseudonym, tier, shift, available, created_at, last_login FROM users WHERE role = ? ORDER BY shift, tier DESC, pseudonym'
   ).all('analyst');
   db.close();
   res.json({ analysts });
@@ -44,29 +46,30 @@ router.get('/analysts', (req, res) => {
 
 // ── POST /api/team/provision — provision new analyst ─────────────────────────
 router.post('/provision', (req, res) => {
-  const { name, username, tier, shift, hostname, ip } = req.body;
-  if (!name || !username || !tier || !shift) {
-    return res.status(400).json({ error: 'name, username, tier, and shift are required' });
+  const { tier, shift } = req.body;
+  if (!tier || !shift) {
+    return res.status(400).json({ error: 'tier and shift are required' });
   }
 
   const crypto = require('crypto');
   const db = getDb();
 
-  // Check for duplicate username
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (existing) {
-    db.close();
-    return res.status(409).json({ error: 'Username already exists' });
-  }
-
   const id = crypto.randomBytes(16).toString('hex');
   const activationId = 'SCR-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+
+  // Identity minimization: no real name or account name is stored. The username
+  // and name are a non-identifying handle derived from the random id, and the
+  // analyst is referred to by a generated pseudonym (unique across the roster).
+  const handle = handleForGuid(id);
+  const pseudonym = generateUniquePseudonym(
+    (candidate) => !!db.prepare('SELECT 1 FROM users WHERE pseudonym = ?').get(candidate)
+  );
 
   // Passwordless-first: no password is set. The analyst enrolls a passkey by
   // redeeming the enrollment token minted below.
   db.prepare(
-    'INSERT INTO users (id, username, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(id, username, 'analyst', name, tier, shift);
+    "INSERT INTO users (id, username, role, name, pseudonym, pseudonym_rotated_at, tier, shift) VALUES (?, ?, 'analyst', ?, ?, ?, ?, ?)"
+  ).run(id, handle, handle, pseudonym, new Date().toISOString(), tier, shift);
 
   db.prepare(
     'INSERT INTO routing_caps (analyst_id, max_complexity) VALUES (?, ?)'
@@ -83,14 +86,14 @@ router.post('/provision', (req, res) => {
 
   db.close();
 
-  auditLog(req.user.id, 'ANALYST_PROVISIONED', `${name} · L${tier} · ${shift} · ${activationId}`, req.ip);
+  auditLog(req.user.id, 'ANALYST_PROVISIONED', 'pseudonym=' + pseudonym + ' L' + tier + ' ' + shift + ' ' + activationId, req.ip);
 
   res.status(201).json({
-    id, name, username, tier, shift, activationId,
+    id, pseudonym, tier, shift, activationId,
     enrollmentToken,
     enrollmentExpiresInDays: 7,
     enrollEndpoint: '/api/auth/enroll/passkey/options',
-    message: 'Analyst provisioned. Provide the enrollment token securely — the analyst redeems it once to enroll their first passkey. It expires in 7 days and can be used only once.',
+    message: 'Analyst provisioned. Provide the enrollment token securely so the analyst can redeem it once to enroll their first passkey. It expires in 7 days and can be used only once.',
   });
 });
 
