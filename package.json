@@ -8,10 +8,6 @@
   "directories": {
     "doc": "docs"
   },
-  "workspaces": [
-    "packages/*",
-    "frontend"
-  ],
   "scripts": {
     "start": "node server/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -39,7 +35,6 @@
     "@azure/identity": "^4.0.0",
     "@azure/keyvault-keys": "^4.8.0",
     "@azure/storage-blob": "^12.32.0",
-    "@firealive/shared": "*",
     "@google-cloud/kms": "^5.5.1",
     "@google-cloud/storage": "^7.21.0",
     "@mongodb-js/zstd": "^7.0.0",
