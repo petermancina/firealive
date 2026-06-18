@@ -124,7 +124,7 @@ module.exports = (checks) => ({
       id: '§23',
       name: 'Right of Access',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history). §23 (Condition 8) gives data subjects the right to access personal information held about them; response workflow is operator-side. Access provided within reasonable time and at prescribed fee.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. §23 (Condition 8) gives data subjects the right to access personal information held about them; the subject can self-serve or an admin can initiate the export. Access provided within reasonable time and at prescribed fee.',
     },
     {
       id: '§24',
