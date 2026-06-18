@@ -128,7 +128,7 @@ module.exports = (checks) => ({
       id: 'Principle 9',
       name: 'Individual Access',
       check: checks.checkDataSubjectRights,
-      mapping: 'POST /api/legal-hold/export produces structured exports (user record + audit history) with chain-of-custody metadata. Principle 9 grants individuals access to their personal information; response workflow is operator-side.',
+      mapping: 'POST /api/data-subject/export produces a structured export of the subject\'s record across every store. Principle 9 grants individuals access to their personal information; the subject can self-serve or an admin can initiate the export.',
     },
     {
       id: 'Principle 10',
