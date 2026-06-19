@@ -45,7 +45,7 @@ const SCENARIOS = [
       firstActions: [
         'Force-revoke all active sessions for the affected lead via /api/auth/sessions endpoint or by restarting the server with REVOKE_ALL_SESSIONS=true.',
         'Rotate the JWT signing secret in the server configuration. This invalidates all outstanding tokens issued under the old secret.',
-        'Reset the lead\'s password and require MFA re-enrollment before next login.',
+        'Re-issue the lead\'s client certificate (or re-enroll their passkey) and require MFA re-enrollment before next login.',
         'Review audit log for the past 72 hours filtered by user_id of affected lead. Identify which configuration changes, API key generations, or integration writes occurred during the suspected compromise window.',
         'Roll back any unauthorized changes using the Restore tab\'s Internal restore feature, picking a restore point from before the compromise window.',
       ],
@@ -72,7 +72,7 @@ const SCENARIOS = [
         'Examine pseudonym mapping access: if the encrypted UUID-pseudonym-realname file was downloaded during the window, treat as a privacy breach. Notify privacy officer and follow org\'s breach disclosure policy.',
       ],
       recovery: [
-        'Reset the lead\'s password and require MFA re-enrollment. The lead generates a new TOTP seed (or registers a new WebAuthn token) on first login.',
+        'Re-issue the lead\'s client certificate (or re-enroll their passkey) and require MFA re-enrollment. The lead generates a new TOTP seed (or registers a new WebAuthn token) on first login.',
         'Re-enable the lead\'s account.',
         'Restore any reverted configuration. If unauthorized changes were rolled back via Restore tab, verify the restored configuration matches what was expected before the compromise.',
         'Re-create any legitimate API keys that were revoked during eradication. New keys, fresh expirations, audit-logged.',
@@ -92,64 +92,7 @@ const SCENARIOS = [
         'Update the org\'s threat model to include this attack path in future tabletop exercises.',
       ],
       componentsInvolved: ['MC', 'Server', 'Auth middleware', 'JWT signing service', 'Sessions table', 'Audit log', 'Integration credentials', 'API keys'],
-      relatedScenarios: ['mfa_bypass_attempt', 'iam_sso_bypass', 'config_drift_unauthorized_changes'],
-    },
-  },
-
-  {
-    id: 'iam_sso_bypass',
-    category: 'Identity & Authentication',
-    title: 'IAM/SSO Bypass Attempt',
-    summary: 'An adversary attempts to authenticate to FireAlive directly, bypassing the org\'s configured IdP. Indicates either a misconfigured fallback path, stolen direct-auth credentials, or attacker probing for non-IdP authentication paths.',
-    indicators: [
-      'Successful login events that lack a corresponding SAML/OIDC assertion in the IdP\'s logs',
-      'Direct password authentication events for users who normally only authenticate via SSO',
-      'Auth_log entries with auth_method = \'local\' for accounts marked SSO-only',
-      'Login events from FireAlive without a matching IdP session ID',
-    ],
-    quickRef: {
-      trigger: 'Authentication event recorded in FireAlive auth_log without a corresponding IdP session, OR a user marked SSO-only authenticated via local password.',
-      firstActions: [
-        'Open Auth Logs tab. Filter by auth_method = local. Identify users who appear to have authenticated locally despite SSO being enforced.',
-        'Verify with the org\'s IdP admin whether the IdP has a corresponding session for each suspect login. No IdP session = bypass attempt or successful bypass.',
-        'In IAM tab, verify SSO is set to "enforced" not "preferred". If preferred, FireAlive falls back to local password — switch to enforced.',
-        'Disable local password authentication path entirely for SSO-required accounts via the IAM configuration.',
-        'Force password reset on any account that successfully authenticated via local during the suspect window.',
-      ],
-      escalation: 'If multiple accounts show bypass-pattern logins, treat as targeted attack on FireAlive\'s IdP integration. Notify the IdP admin team and the broader security ops team. Investigate whether the IdP itself has been compromised.',
-    },
-    fullRunbook: {
-      identification: [
-        'Pull auth_log entries for the relevant time window, looking specifically for auth_method values that are not \'sso\' or \'oidc\'.',
-        'For each suspect entry, check whether the user\'s account is configured as SSO-required (in users table or IAM tab settings).',
-        'Cross-reference with IdP logs. Each successful FireAlive login should have a corresponding IdP authentication event with matching timestamp and IP.',
-        'If IdP logs show no corresponding session: confirmed bypass attempt or successful bypass.',
-      ],
-      containment: [
-        'Switch IAM mode from "preferred" to "enforced" if not already. In enforced mode, FireAlive will reject any authentication that doesn\'t come through the IdP, even for accounts that have local password set.',
-        'Disable local password authentication entirely for SSO-required accounts. Set the password_hash field to NULL or a known-impossible value for these users so even direct password attempts fail.',
-        'If a successful bypass was confirmed for one or more accounts, revoke all sessions for those accounts and force MFA re-enrollment.',
-      ],
-      eradication: [
-        'Force password reset on every account that successfully bypassed SSO during the suspect window. The account owner generates a fresh password through the IdP\'s self-service password reset flow.',
-        'Audit all IAM tab settings for misconfigurations: SSO mode, fallback policy, account-level overrides.',
-        'Remove any account-level SSO override that exempts a user from SSO requirements unless explicitly approved for break-glass admin scenarios.',
-      ],
-      recovery: [
-        'Verify SSO authentication is working for legitimate users — coordinate a test login with the IdP admin.',
-        'Re-enable account access in coordination with the IdP team. New sessions must come through the IdP.',
-      ],
-      verification: [
-        'Monitor auth_log for 7 days. All auth_method values should be \'sso\' or \'oidc\' (or whatever the IdP integration uses). Any other value is a red flag.',
-        'Re-run a Compliance Scan (Compliance tab) to verify FireAlive\'s authentication controls match the framework requirements.',
-      ],
-      postIncident: [
-        'Document the bypass attempt and detection mechanism. Include the IdP and FireAlive log entries that triangulated the issue.',
-        'Update the threat model: IdP-bypass is now a known attack pattern for this deployment.',
-        'Consider adding a SOAR alert that fires whenever auth_method is not the configured SSO value.',
-      ],
-      componentsInvolved: ['IAM tab', 'Auth middleware', 'auth_log', 'users table', 'IdP integration'],
-      relatedScenarios: ['jwt_token_theft', 'mfa_bypass_attempt', 'auth_brute_force'],
+      relatedScenarios: ['mfa_bypass_attempt', 'config_drift_unauthorized_changes'],
     },
   },
 
@@ -178,9 +121,9 @@ const SCENARIOS = [
     },
     fullRunbook: {
       identification: [
-        'Filter auth_log for the affected user. Examine the sequence of events for each session: a normal authentication should be password_attempt → password_success → mfa_challenge_issued → mfa_challenge_completed → session_created.',
+        'Filter auth_log for the affected user. Examine the sequence of events for each session: a normal authentication should complete the primary factor (client certificate or passkey) → mfa_challenge_issued → mfa_challenge_completed → session_created.',
         'Look for sessions where the mfa_challenge events are missing or come after session_created (indicates the challenge was bypassed in the auth flow).',
-        'Examine the source IP and user-agent for completed MFA challenges. Mismatches between the password-attempt source and the MFA-completion source suggest the attacker had the password and intercepted/replayed the MFA token.',
+        'Examine the source IP and user-agent for completed MFA challenges. Mismatches between the primary-authentication source and the MFA-completion source suggest the attacker had the primary credential and intercepted/replayed the MFA token.',
         'For TOTP-specific bypass: check whether the code accepted matches the time window expected. Replays of old codes (outside the 30-second TOTP window) succeeding indicates a clock-skew exploitation.',
       ],
       containment: [
@@ -200,7 +143,7 @@ const SCENARIOS = [
         'Issue grace logins per the MFA tab configuration so the user can complete the enrollment workflow.',
       ],
       verification: [
-        'Verify the user\'s next login follows the full sequence: password_attempt → password_success → mfa_challenge_issued → mfa_challenge_completed → session_created.',
+        'Verify the user\'s next login follows the full sequence: primary factor (client certificate or passkey) → mfa_challenge_issued → mfa_challenge_completed → session_created.',
         'Monitor auth_log for the user for 7 days.',
         'Run a Compliance Scan to verify MFA controls still meet the org\'s framework requirements.',
       ],
@@ -210,67 +153,7 @@ const SCENARIOS = [
         'Consider adding a SOAR rule that alerts whenever a successful authentication occurs without a corresponding MFA challenge in the previous 60 seconds.',
       ],
       componentsInvolved: ['MFA tab', 'Auth middleware', 'auth_log', 'TOTP seeds storage', 'WebAuthn registrations'],
-      relatedScenarios: ['jwt_token_theft', 'iam_sso_bypass', 'auth_brute_force'],
-    },
-  },
-
-  {
-    id: 'auth_brute_force',
-    category: 'Identity & Authentication',
-    title: 'Brute-Force Authentication Attack',
-    summary: 'High-volume failed authentication attempts against one or more accounts, suggesting either credential-stuffing (using leaked credentials from other breaches) or password-guessing.',
-    indicators: [
-      'Auth_log shows >20 failed authentications from a single IP in <5 minutes',
-      'Sequential password attempts against many usernames (spray pattern)',
-      'Failed logins targeting accounts that don\'t exist (enumeration probing)',
-      'Distributed pattern: many IPs, each making a few attempts (slow brute force evading rate limits)',
-    ],
-    quickRef: {
-      trigger: 'Auth_log brute-force threshold trips automatically, OR security tooling alerts on FireAlive auth log volume.',
-      firstActions: [
-        'Confirm in Auth Logs tab whether the threshold automatically locked out the source IP(s). If yes, no immediate action needed beyond observation. If no, manually block via firewall.',
-        'Identify which accounts were targeted. If any were successful (auth_log shows password_success events), treat as compromised: revoke sessions, reset password, force MFA re-enroll.',
-        'Block source IPs at the network layer (firewall, WAF). FireAlive\'s rate limiting only slows attackers; network blocks stop them.',
-        'Lower the brute-force threshold temporarily (Auth Logs tab) for tighter automatic response during the active attack.',
-        'If credential stuffing is suspected (org\'s credentials were leaked elsewhere): proactively reset all non-MFA accounts and force MFA enrollment.',
-      ],
-      escalation: 'If the attack continues despite IP blocks (distributed source), engage the org\'s DDoS/WAF provider for upstream filtering. If the attack appears to be using valid leaked credentials, treat as a privacy breach disclosure event.',
-    },
-    fullRunbook: {
-      identification: [
-        'Pull auth_log entries for the past hour. Group by source IP. Any IP with >20 failed authentications is a candidate.',
-        'For each candidate IP, examine the username distribution. Single username = targeted brute force. Many usernames = spray attack. Non-existent usernames = enumeration probing.',
-        'For successful authentications during the attack window, treat each as compromised account.',
-        'If the attack pattern is distributed (many IPs with few attempts each), check whether the User-Agent strings, request paths, or timing patterns reveal botnet involvement.',
-      ],
-      containment: [
-        'Block source IPs at the firewall/WAF. FireAlive\'s rate limiting protects the application; network-layer blocks stop the traffic from reaching FireAlive at all.',
-        'Lower the Auth Logs brute-force threshold temporarily (e.g. 10 failed attempts in 5 minutes triggers automatic lockout).',
-        'For any account that was successfully authenticated to during the attack window: revoke session, reset password, force MFA re-enroll.',
-        'If spray pattern is detected, force password reset on any account with a weak/reused password (heuristic: passwords that match common-passwords lists).',
-      ],
-      eradication: [
-        'Audit all accounts for password strength. Force resets on any that don\'t meet current policy.',
-        'Verify MFA is enabled for all accounts where the org\'s policy requires it. Any accounts without MFA where it should be enabled — fix immediately.',
-        'Review IP-allowlist configuration. If the org has a known-good IP range, restrict authentication to that range during high-attack periods.',
-      ],
-      recovery: [
-        'After source IPs are blocked and attack subsides, confirm legitimate authentication still works for known-good users.',
-        'Re-enable any accounts that were temporarily disabled.',
-        'Restore original brute-force threshold once attack pressure subsides.',
-      ],
-      verification: [
-        'Monitor auth_log for 7 days. Failed authentication rates should return to baseline.',
-        'Run a Compliance Scan to verify access-control framework requirements.',
-      ],
-      postIncident: [
-        'Document the attack: source IPs, time range, accounts targeted, success rate, response time.',
-        'If the attack used leaked credentials (credential stuffing), the org\'s credentials are circulating in attacker hands. Disclose per the org\'s incident response policy.',
-        'Consider strengthening the IAM tab\'s policies: require MFA for all accounts, enforce password complexity, enable IP-allowlist.',
-        'Review whether the Auth Logs threshold was effective. If the attack succeeded at any account, the threshold was too high.',
-      ],
-      componentsInvolved: ['Auth Logs tab', 'Auth middleware', 'auth_log', 'Rate limiter', 'Network firewall'],
-      relatedScenarios: ['iam_sso_bypass', 'mfa_bypass_attempt'],
+      relatedScenarios: ['jwt_token_theft'],
     },
   },
 
@@ -670,7 +553,7 @@ const SCENARIOS = [
       eradication: [
         'Reprovision the affected analyst\'s AC: tear down, install fresh, restore configuration via External Restore.',
         'Investigate the root compromise of the workstation: was it malware? Phishing-delivered remote access? Address the root cause.',
-        'Audit the analyst\'s other credentials: IAM password, MFA seeds, any cached tokens. Rotate everything.',
+        'Audit the analyst\'s other credentials: client certificate, MFA seeds, any cached tokens. Rotate everything.',
       ],
       recovery: [
         'Re-enroll the cleaned AC. Analyst authenticates fresh, generates new NaCl box keypair.',
@@ -2272,7 +2155,7 @@ const SCENARIOS = [
       ],
       recovery: [
         'For legitimate: analyst continues working.',
-        'For illegitimate: per JWT theft recovery (password reset, MFA re-enroll, etc.).',
+        'For illegitimate: per JWT theft recovery (certificate re-issue, MFA re-enroll, etc.).',
       ],
       verification: [
         'For legitimate: monitor logins for anomalies during the travel period.',
@@ -2284,7 +2167,7 @@ const SCENARIOS = [
         'For illegitimate: full incident documentation, CISM Retro, threat model update.',
       ],
       componentsInvolved: ['Geo-Fencing / Data Sovereignty', 'Auth log', 'Geo-IP resolution'],
-      relatedScenarios: ['jwt_token_theft', 'iam_sso_bypass'],
+      relatedScenarios: ['jwt_token_theft'],
     },
   },
 

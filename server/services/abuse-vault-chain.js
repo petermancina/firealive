@@ -4,10 +4,6 @@
 // Append-only, hash-chained, Ed25519-signed lifecycle ledger for the abuse
 // evidence vault, plus the dedicated signing-key family that signs it. The
 // chain records VAULT_SEALED for every sealed case plus CHAIN_VERIFIED checks.
-// The legal-hold export lifecycle events (LEGAL_HOLD_REQUESTED / APPROVED /
-// DENIED / PRODUCED) are retained in VALID_EVENTS so historical entries still
-// verify, but that export flow has been removed and they are no longer
-// written.
 //
 // REVIEW MODEL
 //
@@ -19,7 +15,7 @@
 // KEY SEPARATION
 //
 // abuse_vault_chain_signing_keys is its own Ed25519 family, distinct from the
-// report-signing, legal-hold, forensic, backup, chain, gd-push, and cloud-iac
+// report-signing, forensic, backup, chain, gd-push, and cloud-iac
 // families — a compromise of any one must not taint the others. Public keys
 // are stored plaintext; private keys are Tier-1 (AES-256-GCM) encrypted via
 // encryptConfig and decrypted just-in-time at sign time, never cached at
@@ -43,10 +39,6 @@ const { canonicalSerialize } = require('./audit-export-shared');
 
 const VALID_EVENTS = [
   'VAULT_SEALED',
-  'LEGAL_HOLD_REQUESTED',
-  'LEGAL_HOLD_APPROVED',
-  'LEGAL_HOLD_DENIED',
-  'LEGAL_HOLD_PRODUCED',
   'CHAIN_VERIFIED',
 ];
 

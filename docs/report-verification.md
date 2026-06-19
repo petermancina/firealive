@@ -1,7 +1,7 @@
 # Report Verification Guide
 
-This document is for **independent abuse reviewers, auditors, HR, and court
-experts** who have received a FireAlive-generated report (a compliance report,
+This document is for **Team Leads, auditors, and HR** who have received a
+FireAlive-generated report (a compliance report,
 a Report Engine export, a helper-pay statement, or an abuse-flag submission
 report) and need to confirm two things:
 
@@ -18,16 +18,13 @@ Two verification depths are available:
   yourself with OpenSSL against the instance's published public key. No
   FireAlive tooling and no trust in the running system is required — only the
   public key, the signature, and the report. This is the standard for legal
-  admissibility, mirroring FireAlive's forensic and legal-hold export guides.
+  admissibility, mirroring FireAlive's forensic export guides.
 
 There is **no public verification endpoint** by design. Verification is always
 authenticated. In particular, abuse-flag reports verify **only for an
-independent abuse reviewer** — so that no one can grind hashes to enumerate or
-confirm the existence of accusations. The appeal path for a dismissed
-accusation is therefore out-of-band: the accuser presents their exported
-report to HR (or a court), and HR asks an independent abuse reviewer to confirm
-it against the system. This guide is what the reviewer (or a forwarded expert)
-runs.
+enrolled Team Lead** — so that no one can grind hashes to enumerate or
+confirm the existence of accusations. This guide is what a Team Lead (or a
+forwarded expert) runs.
 
 ## Two classes of report, two things signed
 
@@ -47,12 +44,12 @@ The abuse-flag canonical payload is a JSON object with keys sorted ascending,
 no insignificant whitespace, UTF-8:
 
 ```
-{"content_sha256":"<64-hex>","flag_uuid":"<uuid>","instance_label":"<label>","submitted_at":"<iso-8601>","target_type":"<peer_session|board_post|lead_chat>"}
+{"content_sha256":"<64-hex>","flag_uuid":"<uuid>","instance_label":"<label>","submitted_at":"<iso-8601>","target_type":"<peer_session|board_post>"}
 ```
 
 `content_sha256` is the SHA-256 of the exact submitted report text (UTF-8). The
 server never receives or stores that text — only its hash — which is what keeps
-abuse reports zero-access. A reviewer who can decrypt the sealed vault entry
+abuse reports zero-access. A lead who can decrypt the sealed vault entry
 recomputes `content_sha256` from the decrypted text and confirms it matches,
 binding the exported report to the real submission.
 
@@ -67,7 +64,7 @@ binding the exported report to the real submission.
 
 ## Step 1 — Obtain the public key
 
-An operator with `admin`, `ciso`, or `abuse_reviewer` access fetches it:
+An operator with `admin`, `ciso`, or `lead` access fetches it:
 
 ```
 GET /api/report-signing/key
@@ -118,7 +115,7 @@ GET /api/verify/report/{hash}
 }
 ```
 
-(For `abuse_flag`, this resolves only for an `abuse_reviewer`; for everyone else
+(For `abuse_flag`, this resolves only for a `lead`; for everyone else
 it returns 404, identical to a genuine miss.)
 
 Write the two values to files:
@@ -199,8 +196,7 @@ Not proven by cryptography alone (and never claimed):
 
 ## Design notes
 
-- Verification records are permanent and append-only; a dismissed accusation
-  stays verifiable indefinitely, which is what makes the HR/court appeal path
-  work after an independent reviewer has closed a case.
+- Verification records are permanent and append-only, so any signed report
+  stays verifiable indefinitely.
 - The architecture (key families, zero-access sealing, the canonical payload)
-  is described in the U4 build plan; this document is the procedure.
+  is documented separately; this document is the procedure.

@@ -1186,6 +1186,101 @@ class RegressionRunner {
       return 'scoped by req.user.id; no analyst id taken from body/query/params';
     });
 
+    await check('analyst-privacy', 'LDAP sync persists handle only (no directory display name)', async () => {
+      // Directory-identity minimization: syncUsers may read displayName /
+      // sAMAccountName in memory for matching, but must persist ONLY an opaque
+      // handle derived from objectGUID. Proven behaviorally against a schema
+      // clone with a stubbed directory entry carrying real-looking attributes.
+      const { LdapClient } = require('../integrations/ldap');
+      const { handleForGuid } = require('../lib/identity-handle');
+      const mem = cloneLiveSchema(this.db);
+      try {
+        const guid = 'GUID-RR-0001';
+        const displayName = 'Jane Q Analyst';
+        const sam = 'janalyst';
+        const client = new LdapClient({});
+        client.searchUsers = async () => ({
+          success: true,
+          users: [{ objectGUID: guid, sAMAccountName: sam, displayName: displayName, mail: 'j@corp.example', memberOf: ['CN=SOC-Analysts,OU=Security,DC=corp'] }],
+        });
+        const res = await client.syncUsers(mem);
+        if (!res || !res.success) throw new Error('syncUsers did not succeed: ' + (res && res.error));
+        const row = mem.prepare("SELECT * FROM users WHERE external_id = ? AND auth_method = 'ldap'").get(guid);
+        if (!row) throw new Error('sync created no ldap user row');
+        const expected = handleForGuid(guid);
+        if (row.username !== expected || row.name !== expected) throw new Error('username/name not set to derived handle');
+        if (row.external_id !== guid) throw new Error('external_id is not the opaque objectGUID');
+        const blob = JSON.stringify(row).toLowerCase();
+        for (const leak of [displayName.toLowerCase(), sam.toLowerCase()]) {
+          if (blob.indexOf(leak) !== -1) throw new Error('directory identity leaked into users row: ' + leak);
+        }
+        return 'handle-only row; no displayName/sAMAccountName persisted';
+      } finally {
+        try { mem.close(); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    // -- Category: Data-subject rights (DSR) erasure ------------------
+    // PR-5 coverage backfill. The erasure feature is operational (request
+    // table + dual-controlled route + service), so these prove it end-to-end:
+    // the erase actually runs over a clone of the live schema and tombstones
+    // the row, and the approval path is shown to be admin + step-up gated.
+    await check('data-subject', 'DSR erasure-request table + status lifecycle', () => {
+      if (!tableExists('data_subject_erasure_requests')) throw new Error('missing table data_subject_erasure_requests');
+      for (const col of ['subject_id', 'requested_by', 'status']) {
+        if (!columnExists('data_subject_erasure_requests', col)) throw new Error('data_subject_erasure_requests missing column: ' + col);
+      }
+      const ddl = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='data_subject_erasure_requests'").get();
+      if (!ddl || !ddl.sql) throw new Error('cannot read data_subject_erasure_requests DDL');
+      for (const st of ['pending', 'approved', 'rejected', 'executed']) {
+        if (ddl.sql.indexOf("'" + st + "'") === -1) throw new Error('status lifecycle missing state: ' + st);
+      }
+      return 'request table present; lifecycle pending/approved/rejected/executed';
+    });
+
+    await check('data-subject', 'DSR eraseSubject tombstones the row + erases over the live schema', () => {
+      // Drive the real erasure transaction against an in-memory clone of the
+      // live schema. Every DELETE must target a real table (a renamed/dropped
+      // table throws here), the users row must survive as a tombstone for the
+      // append-only audit FK, and an unknown subject must be refused.
+      const { eraseSubject } = require('../services/data-subject');
+      const mem = cloneLiveSchema(this.db);
+      try {
+        const subjectId = 'rr-dsr-subject-1';
+        mem.prepare("INSERT INTO users (id, username, name, role) VALUES (?, ?, ?, 'lead')").run(subjectId, 'rr-dsr-handle', 'rr-dsr-handle');
+        const receipt = eraseSubject(mem, subjectId);
+        if (!receipt || receipt.schema !== 'firealive.data-subject-erasure-receipt') throw new Error('unexpected erase receipt schema');
+        if (receipt.tombstoned !== true || receipt.audit_log_retained !== true) throw new Error('receipt does not assert tombstone + audit retention');
+        if (receipt.subject_id !== subjectId) throw new Error('receipt subject_id mismatch');
+        for (const t of ['analyst_availability', 'notification_preferences', 'e2ee_identity_keys']) {
+          if (typeof receipt.deleted[t] !== 'number') throw new Error('erase did not run the DELETE for ' + t);
+        }
+        const tomb = mem.prepare('SELECT external_id, username, name FROM users WHERE id = ?').get(subjectId);
+        if (!tomb) throw new Error('users row was removed (must be tombstoned, not deleted)');
+        if (tomb.external_id !== null) throw new Error('external_id not cleared on tombstone');
+        if (tomb.username !== 'erased-' + subjectId || tomb.name !== 'erased-' + subjectId) throw new Error('identifiers not tombstoned');
+        let refused = false;
+        try { eraseSubject(mem, 'no-such-subject'); } catch (e) { refused = !!(e && e.code === 'SUBJECT_NOT_FOUND'); }
+        if (!refused) throw new Error('unknown subject was not refused with SUBJECT_NOT_FOUND');
+        return 'erase ran over live schema; row tombstoned; unknown subject refused';
+      } finally {
+        try { mem.close(); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    await check('data-subject', 'DSR erase-approval requires admin gate + MFA step-up', () => {
+      // The approval endpoint is the dual-control point: it must carry BOTH the
+      // admin gate and the MFA step-up middleware.
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'data-subject.js'), 'utf-8');
+      const approve = src.split('\n').find((l) => l.indexOf("'/erase/:id/approve'") !== -1) || '';
+      if (!approve) throw new Error('no /erase/:id/approve route found');
+      if (approve.indexOf('eraseAdminGate') === -1 || approve.indexOf('mfaStepUp') === -1) {
+        throw new Error('erase-approve is not gated by both eraseAdminGate and mfaStepUp');
+      }
+      return 'approval gated by eraseAdminGate + mfaStepUp';
+    });
+
     // ── Category: B5d1-F burnout-signal data feed ──────────────────
     // The feed that gives the collector real inputs: the ticketing
     // activity-events push (-> ticket_actions), the break-outcome loop

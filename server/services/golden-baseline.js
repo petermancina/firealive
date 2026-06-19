@@ -30,7 +30,7 @@
 //     notification_config.pagerduty_key / sms_auth_token_encrypted,
 //     the cicd_webhook_secret config key)
 //   - every signing-key table (backup / chain / report / cloud-iac /
-//     gd-push / forensic / legal-hold): keys are deployment identity,
+//     gd-push / forensic): keys are deployment identity,
 //     not configuration
 //   - users, api keys, enrollment tokens, WebAuthn + certificate
 //     enrollments, break-glass credentials

@@ -686,7 +686,7 @@ async function start() {
       }
     }
 
-    // B5g: re-seal any legacy plaintext forensic / legal-hold export artifacts
+    // B5g: re-seal any legacy plaintext forensic export artifacts
     // at rest (idempotent; rows already sealed are skipped). The DB schema and
     // the Tier-1 KEK are ready by this point. Guarded so a failure logs and does
     // not abort startup; any unsealed rows are retried on the next boot.

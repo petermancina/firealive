@@ -1,9 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE — Shared Audit Export Utilities (R3l C21)
 //
-// Pure-function utilities shared by both the forensic-export orchestrator
-// (server/services/forensic-export.js, R3l C22) and the legal-hold-export
-// orchestrator (server/services/legal-hold-export.js, R3l C38). Three
+// Pure-function utilities used by the forensic-export orchestrator
+// (server/services/forensic-export.js, R3l C22). Three
 // responsibilities:
 //
 //   1. canonicalize() / canonicalSerialize() — Stable JSON representation
@@ -24,8 +23,8 @@
 //      for the manifest, populated from the export request, with empty
 //      slices/signing/archive/cosign sections that the orchestrator fills
 //      in as the export proceeds. The skeleton's keys and structure are
-//      stable across both forensic and legal-hold exports so verification
-//      tooling treats them uniformly.
+//      stable across forensic exports so verification tooling treats
+//      them uniformly.
 //
 // DELIBERATELY SEPARATE FROM backup-manifest.js
 //
@@ -33,7 +32,7 @@
 // The duplication is intentional: backup integrity and forensic-export
 // integrity are distinct cryptographic concerns. A future change to the
 // backup canonicalization (e.g., new normalization rule, BigInt handling)
-// should NOT silently propagate into the forensic/legal-hold signing chain,
+// should NOT silently propagate into the forensic signing chain,
 // because that would change what a previously-issued export's manifest
 // hashes to and break verification of historical exports. Each subsystem
 // owns its own canonicalization contract.
@@ -77,9 +76,9 @@ const crypto = require('crypto');
 const MANIFEST_FORMAT_VERSION = 1;
 
 // Allowed values for the export_type discriminator in the skeleton. The
-// orchestrators each pass one of these; anything else throws so a typo
+// forensic orchestrator passes this; anything else throws so a typo
 // can't produce a manifest claiming an unsupported export type.
-const ALLOWED_EXPORT_TYPES = new Set(['forensic', 'legal_hold']);
+const ALLOWED_EXPORT_TYPES = new Set(['forensic']);
 
 /**
  * Recursively sort object keys so the same data produces the same bytes
@@ -149,21 +148,19 @@ function sliceSha256(input) {
 }
 
 /**
- * Build the manifest skeleton for an export. The orchestrator (C22 for
- * forensic, C38 for legal hold) fills in the empty fields as the export
+ * Build the manifest skeleton for an export. The forensic orchestrator
+ * (C22) fills in the empty fields as the export
  * proceeds:
  *
  *   slices       — populated by addSlice() as each format file is produced
  *   signing      — populated after canonicalSerialize() + Ed25519 sign
  *   archive      — populated after tar.gz creation and archive SHA-256
  *   cosign       — populated if FIREALIVE_FORENSIC_USE_COSIGN=true and
- *                  the cosign binary call succeeded (forensic only;
- *                  always null for legal_hold)
+ *                  the cosign binary call succeeded
  *
  * opts: {
- *   exportType: 'forensic' | 'legal_hold' (required)
- *   exportId: string (required, matches forensic_exports.id or
- *             legal_hold_exports.id)
+ *   exportType: 'forensic' (required)
+ *   exportId: string (required, matches forensic_exports.id)
  *   requestedByUserId: string (required)
  *   rationale: string | null
  *   timeWindowStart: string | null (ISO 8601)

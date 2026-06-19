@@ -811,7 +811,7 @@ CREATE INDEX IF NOT EXISTS idx_chain_signing_keys_active
 --   RESTORE_COMPLETE    restore applied
 --   DELETE_DENIED       attempted backup deletion that was refused
 --                       (e.g. retention attempting to delete a
---                       backup currently held by a legal hold; the
+--                       backup still within its retention window; the
 --                       attempt itself is logged for auditability)
 --
 -- backup_id is nullable for events not tied to a specific backup
@@ -1486,8 +1486,8 @@ CREATE INDEX IF NOT EXISTS idx_evidence_vault_target
 
 -- peer_abuse_evidence_vault holds the only server-side copy of sealed abuse
 -- evidence and is retained indefinitely. The vault is append-only with no delete
--- path of any kind, so evidence cannot be erased by any actor. The legal-hold
--- action exports a copy of a case; it never removes the row. (U4 PR 5: eternal
+-- path of any kind, so evidence cannot be erased by any actor. A Team-Lead
+-- review reads a case; it never removes the row. (U4 PR 5: eternal
 -- retention.)
 CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_update
   BEFORE UPDATE ON peer_abuse_evidence_vault
@@ -1500,10 +1500,7 @@ CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_delete
 -- ── Abuse-vault lifecycle chain (U4 PR 5-C) ──────────────────────────────────
 -- Append-only, hash-chained, Ed25519-signed lifecycle ledger for the abuse
 -- evidence vault. Records VAULT_SEALED for every sealed case plus
--- CHAIN_VERIFIED checks. The legal-hold export lifecycle events
--- (LEGAL_HOLD_REQUESTED / APPROVED / DENIED / PRODUCED) are retained in the
--- event_type CHECK so historical entries still verify, but that export flow
--- has been removed and they are no longer written. Sealed cases are reviewed
+-- CHAIN_VERIFIED checks. Sealed cases are reviewed
 -- by the Team Lead in the Management Console (Peer Conduct tab); the content
 -- is decrypted only on the lead's device. The chain writes only the immutable
 -- record and never holds decrypted content; the vault row itself is never
@@ -1511,13 +1508,13 @@ CREATE TRIGGER IF NOT EXISTS peer_abuse_evidence_vault_no_delete
 -- retention holds.
 --
 -- Refs are plain TEXT (not foreign keys) so a ledger entry stands
--- independently of the rows it describes. Mirrors legal_hold_chain.
+-- independently of the rows it describes.
 CREATE TABLE IF NOT EXISTS abuse_vault_chain (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   prev_hash TEXT,
   this_hash TEXT NOT NULL,
   signature TEXT NOT NULL,
-  event_type TEXT NOT NULL CHECK (event_type IN ('VAULT_SEALED','LEGAL_HOLD_REQUESTED','LEGAL_HOLD_APPROVED','LEGAL_HOLD_DENIED','LEGAL_HOLD_PRODUCED','CHAIN_VERIFIED')),
+  event_type TEXT NOT NULL CHECK (event_type IN ('VAULT_SEALED','CHAIN_VERIFIED')),
   flag_id TEXT,
   request_ref TEXT,
   actor_user_id TEXT,
@@ -1536,9 +1533,8 @@ CREATE TRIGGER IF NOT EXISTS abuse_vault_chain_no_delete
   BEGIN SELECT RAISE(ABORT, 'abuse_vault_chain is append-only'); END;
 
 -- Dedicated Ed25519 signing-key family for the chain (key separation -- distinct
--- from the report-signing, legal-hold, backup, and forensic families). Mirrors
--- legal_hold_chain_signing_keys: public stored plaintext, private Tier-1
--- encrypted and JIT-decrypted at sign time.
+-- from the report-signing, backup, and forensic families). Public keys are
+-- stored plaintext, private Tier-1 encrypted and JIT-decrypted at sign time.
 CREATE TABLE IF NOT EXISTS abuse_vault_chain_signing_keys (
   id TEXT PRIMARY KEY,
   public_key TEXT NOT NULL,
@@ -2453,8 +2449,8 @@ CREATE INDEX IF NOT EXISTS idx_gd_push_signing_keys_fingerprint
 -- server ever holding plaintext.
 --
 -- Mirrors the gd_push_signing_keys / chain_signing_keys key-management pattern.
--- report signing keys are a DISTINCT family from the forensic, legal-hold,
--- backup, chain, gd-push, and cloud-iac signing keys: a compromise of any one
+-- report signing keys are a DISTINCT family from the forensic, backup,
+-- chain, gd-push, and cloud-iac signing keys: a compromise of any one
 -- family taints none of the others.
 -- ═══════════════════════════════════════════════════════════════════════════
 
@@ -4216,6 +4212,71 @@ function initDb() {
     console.error('The server will start, but exportable reports cannot be signed until this is investigated. Check that TIER1_ENCRYPTION_KEY is set in the environment.');
   }
 
+  // ── Migration: narrow abuse_vault_chain event_type CHECK (drop LEGAL_HOLD_*) ──
+  // The legal-hold export flow is gone, so its lifecycle events are no longer a
+  // valid chain event. SQLite cannot ALTER a CHECK, so the table is rebuilt by
+  // DERIVING the new DDL from the LIVE CREATE and replacing only the table name
+  // and the event_type CHECK -- no column drift. The chain's two append-only
+  // triggers and two indexes drop with the old table and are recreated from
+  // their stored DDL after the rename. The ledger is append-only, so the
+  // rebuild ABORTS if it finds any LEGAL_HOLD_* row rather than silently
+  // dropping it (none exist on any base -- the chain has never been written).
+  // Gated on the stored CHECK still containing 'LEGAL_HOLD'; a no-op on fresh
+  // installs and on re-runs.
+  try {
+    const avcRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abuse_vault_chain'").get();
+    if (avcRow && avcRow.sql && avcRow.sql.includes('LEGAL_HOLD')) {
+      const wideCheck = "CHECK (event_type IN ('VAULT_SEALED','LEGAL_HOLD_REQUESTED','LEGAL_HOLD_APPROVED','LEGAL_HOLD_DENIED','LEGAL_HOLD_PRODUCED','CHAIN_VERIFIED'))";
+      const narrowCheck = "CHECK (event_type IN ('VAULT_SEALED','CHAIN_VERIFIED'))";
+      if (!avcRow.sql.includes(wideCheck)) {
+        throw new Error('abuse_vault_chain event_type CHECK clause not found in live schema; aborting rebuild to avoid corruption');
+      }
+      const stragglers = db.prepare("SELECT COUNT(*) AS n FROM abuse_vault_chain WHERE event_type LIKE 'LEGAL_HOLD_%'").get().n;
+      if (stragglers > 0) {
+        throw new Error('abuse_vault_chain holds ' + stragglers + ' LEGAL_HOLD_* row(s); refusing to narrow the CHECK on an append-only ledger');
+      }
+      const ifNotExists = 'CREATE TABLE IF NOT EXISTS abuse_vault_chain';
+      const quoted = 'CREATE TABLE "abuse_vault_chain"';
+      const plain = 'CREATE TABLE abuse_vault_chain';
+      let newDdl;
+      if (avcRow.sql.startsWith(ifNotExists)) {
+        newDdl = 'CREATE TABLE abuse_vault_chain_new' + avcRow.sql.slice(ifNotExists.length);
+      } else if (avcRow.sql.startsWith(quoted)) {
+        newDdl = 'CREATE TABLE abuse_vault_chain_new' + avcRow.sql.slice(quoted.length);
+      } else if (avcRow.sql.startsWith(plain)) {
+        newDdl = 'CREATE TABLE abuse_vault_chain_new' + avcRow.sql.slice(plain.length);
+      } else {
+        throw new Error('unexpected abuse_vault_chain CREATE statement; aborting rebuild to avoid corruption');
+      }
+      newDdl = newDdl.replace(wideCheck, narrowCheck);
+      const auxDdl = db.prepare("SELECT sql FROM sqlite_master WHERE tbl_name='abuse_vault_chain' AND type IN ('index','trigger') AND sql IS NOT NULL").all();
+      console.log('abuse_vault_chain migration (B5h3): narrowing event_type CHECK to drop LEGAL_HOLD_* options');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(newDdl);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM abuse_vault_chain').get().n;
+        db.exec('INSERT INTO abuse_vault_chain_new SELECT * FROM abuse_vault_chain');
+        db.exec('DROP TABLE abuse_vault_chain');
+        db.exec('ALTER TABLE abuse_vault_chain_new RENAME TO abuse_vault_chain');
+        for (const aux of auxDdl) { db.exec(aux.sql); }
+        const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
+        if (fkViolations.length > 0) {
+          throw new Error('foreign_key_check reported ' + fkViolations.length + ' violation(s) after abuse_vault_chain rebuild');
+        }
+        db.exec('COMMIT');
+        console.log('abuse_vault_chain migration (B5h3): rebuilt, preserved ' + copied + ' ledger entr' + (copied === 1 ? 'y' : 'ies'));
+      } catch (avcRebuildErr) {
+        db.exec('ROLLBACK');
+        throw avcRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (avcMigErr) {
+    console.error('abuse_vault_chain migration (B5h3) failed (non-fatal):', avcMigErr.message);
+  }
+
   // ── U4 PR 5-C: abuse-vault chain signing key + VAULT_SEALED backfill ─────
   //
   // The abuse-vault ledger has its own Ed25519 signing-key family (key
@@ -4225,7 +4286,7 @@ function initDb() {
   // entry is recorded now (its created_at is this boot, not the original seal
   // time); the authoritative seal time stays on the vault row the entry points
   // to. Both steps are idempotent and non-fatal: a failure lets the server
-  // start, but legal-hold export of a case stays unavailable until resolved.
+  // start, but recording new sealed cases stays unavailable until resolved.
   try {
     const avChain = require('../services/abuse-vault-chain');
     const avKey = avChain.ensureActiveKey(db);
@@ -4251,7 +4312,7 @@ function initDb() {
     }
   } catch (avErr) {
     console.error('abuse-vault-chain initialization FAILED:', avErr.message);
-    console.error('The server will start, but legal-hold export of vaulted cases stays unavailable until this is investigated. Check that TIER1_ENCRYPTION_KEY is set.');
+    console.error('The server will start, but recording new sealed abuse cases stays unavailable until this is investigated. Check that TIER1_ENCRYPTION_KEY is set.');
   }
 
   // ── R3d-4: KMS providers + restore approval defaults ────────────────────
@@ -5005,8 +5066,8 @@ function initDb() {
   //
   //   Recommended fields (frequency, destination_type) are pre-filled
   //   on preset selection in the UI but NOT enforced by the API.
-  //   The operator may set retention HIGHER than the floor (legal-hold
-  //   use cases, longer compliance windows) but may NOT go below.
+  //   The operator may set retention HIGHER than the floor (longer
+  //   compliance or retention windows) but may NOT go below.
   //   Switching presets re-applies the new floor. The 'None' preset is
   //   the absence of a regulatory_preset_id (NULL foreign-key value);
   //   no floor enforcement runs in that case.

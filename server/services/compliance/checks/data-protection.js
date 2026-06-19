@@ -28,7 +28,7 @@
 //   - Planned hard-delete user endpoint (DELETE /api/users/:id) ->
 //     does not exist. The platform's right-to-erasure story is:
 //     (a) offboarding marks accounts inactive (active=0,
-//     offboarded_at set) preserving audit/legal-hold continuity;
+//     offboarded_at set) preserving audit continuity;
 //     (b) pseudonym rotation re-keys analyst data, effectively
 //     erasing the link between identity and behavioral signals.
 //   - Planned backup_destinations.encryption_enabled column -> does

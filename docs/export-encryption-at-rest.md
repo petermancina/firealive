@@ -1,23 +1,21 @@
 # Export Encryption at Rest (FA-ENC1)
 
-This document is for **CISOs**, **VPs of Security**, **operators**, and **auditors** who need to understand how FireAlive protects forensic-export and legal-hold-export artifacts while they sit on disk, what that protection does and does not cover, and how a produced package is still independently verified. It describes the at-rest encryption layer added in the FA-ENC1 format; it does **not** change how an export is requested, authorized, signed, or verified — those are covered in `docs/forensic-export-architecture.md`, `docs/legal-hold-export.md`, and `docs/forensic-export-verifier-guide.md`.
+This document is for **CISOs**, **VPs of Security**, **operators**, and **auditors** who need to understand how FireAlive protects forensic-export artifacts while they sit on disk, what that protection does and does not cover, and how a produced package is still independently verified. It describes the at-rest encryption layer added in the FA-ENC1 format; it does **not** change how an export is requested, authorized, signed, or verified — those are covered in `docs/forensic-export-architecture.md` and `docs/forensic-export-verifier-guide.md`.
 
 ## What this protects
 
-A completed forensic export or legal hold is written to the server's filesystem as a gzipped tar archive plus a JSON manifest. Before this layer, those files sat in cleartext: anyone who could read the bytes — a stolen disk, an exfiltrated backup, a snapshot copied off the host, a misconfigured volume mount — could open the archive and read the exported audit, incident, and access records, and the manifest's case metadata.
+A completed forensic export is written to the server's filesystem as a gzipped tar archive plus a JSON manifest. Before this layer, those files sat in cleartext: anyone who could read the bytes — a stolen disk, an exfiltrated backup, a snapshot copied off the host, a misconfigured volume mount — could open the archive and read the exported audit, incident, and access records, and the manifest's case metadata.
 
 With at-rest encryption, every export artifact is written as an encrypted, self-describing FA-ENC1 file. The plaintext is recoverable only with the deployment's key-encrypting key (KEK), which never lives in the export file and, on a properly provisioned deployment, never lives on disk in usable form at all. Reading the raw bytes off the filesystem yields ciphertext.
 
 ## Scope
 
-The layer covers both export families, on both servers:
+The layer covers forensic exports on both servers:
 
-- **Forensic exports** and **legal holds** on the **Regional (MC) server**.
-- **Forensic exports** and **legal holds** on the **Global Dashboard (GD) server**.
+- **Forensic exports** on the **Regional (MC) server**.
+- **Forensic exports** on the **Global Dashboard (GD) server**.
 
 For each artifact, **both** the gzipped tar archive **and** its `.manifest.json` sidecar are sealed. The manifest is sealed because it carries the case identifier, the custodian/scope filter, and retention metadata — material that should not sit in cleartext either.
-
-This layer does **not** cover the abuse-vault two-person legal-hold export (`docs/abuse-vault-legal-hold-export.md`), which is a reviewer-device flow whose case file is produced and protected client-side.
 
 ## Threat model
 
@@ -116,5 +114,4 @@ An auditor or recipient never needs the KEK: they verify the *delivered, decrypt
 
 - `docs/tier1-kek-hardware-sealing.md` — how the Tier-1 KEK is sealed and resolved.
 - `docs/forensic-export-architecture.md` — forensic export creation and structure.
-- `docs/legal-hold-export.md` — legal-hold export and custody chain.
 - `docs/forensic-export-verifier-guide.md` — how a recipient verifies a produced package.

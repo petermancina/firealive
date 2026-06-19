@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.63 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 56 (anti-rollback)
+**Version:** v1.0.64 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 57 (anti-rollback)
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.63) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.64) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -35,7 +35,6 @@ cd packages/global-dashboard-server && node index.js  # GD Server on :4001
 cd packages/analyst-client && npm start  # AC Electron app
 cd frontend && npm start                 # MC Electron app
 cd packages/global-dashboard && npm start # GD Electron app
-cd packages/abuse-review-console && npm start # ARC Electron app
 ```
 
 ### Environment Variables (Optional Features)
@@ -68,25 +67,23 @@ To enable GD push:
 cd packages/analyst-client && npm run build:mac   # .dmg
 cd frontend && npm run build:win                   # .exe
 cd packages/global-dashboard && npm run build:linux # .AppImage
-cd packages/abuse-review-console && npm run build:mac # .dmg
 ```
 
 -----
 
 ## Architecture
 
-Six components:
+Five components:
 
 |Component                     |Technology                |Purpose                                                                                                                                                                     |
 |------------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 |**Analyst Client (AC)**       |Electron + React          |Desktop app for individual SOC analysts                                                                                                                                     |
 |**Management Console (MC)**   |Electron + React          |Team Lead configuration and management                                                                                                                                      |
-|**Abuse Review Console (ARC)**|Electron + React          |Independent abuse reviewer’s app (separate from team leadership) — opens abuse flags client-side with the reviewer’s own private key; the server cannot decrypt flag content|
 |**Regional Server**           |Node.js + Express + SQLite|Backend API, routing engine, all services                                                                                                                                   |
 |**Global Dashboard (GD)**     |Electron + React          |CISO cross-region oversight                                                                                                                                                 |
 |**GD Server**                 |Node.js + Express + SQLite|Aggregates data from regional servers                                                                                                                                       |
 
-All four Electron apps (AC, MC, ARC, GD) are self-contained: their UI is precompiled in CI via esbuild into one `app.js` per app, React/ReactDOM are bundled in, every `index.html` loads only that single file, both CSP layers (meta tag + response header) are locked to `script-src 'self'`, and there are no runtime CDN fetches and no runtime transpiler. The apps run in restricted and air-gapped networks and make no external network calls for UI code.
+All three Electron apps (AC, MC, GD) are self-contained: their UI is precompiled in CI via esbuild into one `app.js` per app, React/ReactDOM are bundled in, every `index.html` loads only that single file, both CSP layers (meta tag + response header) are locked to `script-src 'self'`, and there are no runtime CDN fetches and no runtime transpiler. The apps run in restricted and air-gapped networks and make no external network calls for UI code.
 
 ### Backend Services
 
@@ -204,21 +201,21 @@ When active (requires SOAR + Ticketing configured):
 - **GD level**: CISO sees regional health only, no individual data
 - Pseudonyms protect analyst identity in all UIs. UUID stays constant across rotations.
 - **Peer chat** and **lead chat** are both genuinely end-to-end encrypted via the Signal protocol (libsignal), each on its own key domain. Lead chat is pseudonymous-to-the-lead. The server is a content-blind relay and cannot decrypt either channel.
-- **Abuse-flag content** (peer-session, board-post, and lead-chat reports) is sealed on the flagger’s device to the active reviewer recipient set — a multi-recipient X25519 envelope — before it leaves the app. The server stores only opaque ciphertext and cannot decrypt it; review and disposition happen only in the independent **Abuse Review Console** (ARC). Neither management, nor any team lead, nor an admin (who handles only public keys) can read flag content. See the mandate below.
+- **Abuse-flag content** (peer-session and board-post reports) is sealed on the flagger’s device to the active Team-Lead recipient set — a multi-recipient X25519 envelope — before it leaves the app. The server stores only opaque ciphertext and cannot decrypt it; review and disposition happen in the MC **Peer Conduct** tab, opened by a lead who has enrolled an abuse-review key. The server, the GD, and an admin (who handles only public keys) cannot read flag content — only an enrolled lead can, on their own device. See the review model below.
 
-### Independent abuse review (mandate)
+### Abuse review (Team Lead)
 
-Every FireAlive deployment must designate at least one **independent abuse reviewer** before abuse reporting can be used. The role `abuse_reviewer` is separate from team leadership: it sits outside the chain of command an analyst reports into, because a lead may be the subject of a report. Where the deployment cannot maintain a true separation — for example, where one person holds both team-lead and platform-admin duties — a reviewer drawn from HR, an ethics committee, or another independent function is required.
+Abuse reports from peer skill-share sessions and the skill-share Board are reviewed by a Team Lead in the MC **Peer Conduct** tab. At least one lead must enroll an abuse-review key before abuse reporting can be used; with no enrolled key, sealed reports could not be opened by anyone.
 
-**Multi-reviewer, zero-access.** Each designated reviewer generates their own X25519 keypair on their own device, behind a passphrase only they know. The public key is registered with the server via the MC’s Audit → Abuse Reviewers panel; the private key never leaves the reviewer’s device. Flag content is sealed on the flagger’s device to ALL active reviewer public keys at once (a multi-recipient envelope); any one reviewer opens it with their own private key. No private key is ever shared, exported, or transferred between people, and the admin only ever handles public keys — true zero-access, in the sense that the server, the admin, and any DB or key insider cannot decrypt flag content. Adding a reviewer is registering another public key to the set; removing one is revoking it.
+**Multi-lead, zero-access.** Each lead enrolls their own X25519 abuse-review key on their own device, behind a passphrase only they know. The public key is registered with the server from the MC Peer Conduct tab; the private key never leaves the lead’s device. Flag content is sealed on the flagger’s device to ALL enrolled leads at once (a multi-recipient envelope); any one lead opens it with their own key. No private key is ever shared, exported, or transferred between people, and the admin only ever handles public keys — true zero-access, in the sense that the server, the admin, and any DB or key insider cannot decrypt flag content. Enrolling another lead adds a public key to the set; revoking removes it.
 
-**Until at least one reviewer is registered, abuse reporting is disabled** — with no reviewer public key, nothing could be decrypted, and the flagger’s app shows an explicit message saying so. The Abuse Review Console enforces a 12-character passphrase minimum on key generation, holds the unlocked private key in main-process memory for the session only (a 5-minute inactivity hard-lock clears it), and never returns the private key to its renderer.
+**Until at least one lead has enrolled, abuse reporting is disabled** — with no enrolled key, nothing could be decrypted, and the flagger’s app shows an explicit message saying so. Key enrollment requires a 12-character (or longer) passphrase, and the private key stays on the lead’s device — it is never sent to the server.
 
 ### Signed reports & verification
 
-Every exportable report FireAlive generates — compliance reports, Report Engine output, helper-pay statements, and abuse-flag submission reports — is signed by the instance’s Ed25519 **report-signing key**, a key family distinct from the forensic, legal-hold, backup, chain, GD-push, and cloud-IaC signing keys (a compromise of one family taints none of the others). Each report carries a footer with the human-readable instance label, the UTC sign time, a report id, the short signing-key fingerprint, and a verification hash — so a genuine FireAlive report cannot be forged or altered and passed off as legitimate.
+Every exportable report FireAlive generates — compliance reports, Report Engine output, helper-pay statements, and abuse-flag submission reports — is signed by the instance’s Ed25519 **report-signing key**, a key family distinct from the forensic, backup, chain, GD-push, and cloud-IaC signing keys (a compromise of one family taints none of the others). Each report carries a footer with the human-readable instance label, the UTC sign time, a report id, the short signing-key fingerprint, and a verification hash — so a genuine FireAlive report cannot be forged or altered and passed off as legitimate.
 
-Verification is **authenticated only — there is no public endpoint**. A public hash-verify endpoint would let an adversary grind hashes to enumerate or confirm accusations, so abuse-flag reports verify solely for an independent `abuse_reviewer`; compliance and Report Engine reports for admin/CISO; helper-pay statements for the owning analyst or an admin. The appeal path for a dismissed accusation is therefore out-of-band: the accuser presents their exported report to HR or a court, who ask an independent reviewer to confirm it against the system. Because the verification ledger is permanent and append-only, a dismissed accusation stays verifiable indefinitely.
+Verification is **authenticated only — there is no public endpoint**. A public hash-verify endpoint would let an adversary grind hashes to enumerate or confirm accusations, so abuse-flag reports verify solely for an enrolled Team Lead; compliance and Report Engine reports for admin/CISO; helper-pay statements for the owning analyst or an admin. The verification ledger is permanent and append-only, so any signed report stays verifiable indefinitely.
 
 Reports can also be verified **independently, with no FireAlive tooling and no trust in the running system**, using OpenSSL against the instance’s published Ed25519 public key — see [`docs/report-verification.md`](docs/report-verification.md). Abuse-flag reports are zero-access end to end: the signature covers a canonical data record containing only a content hash, never the report text, so the server signs and records a verifiable report without ever holding the plaintext.
 

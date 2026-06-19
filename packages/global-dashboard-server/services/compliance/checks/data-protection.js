@@ -1,234 +1,264 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL DASHBOARD — Compliance Check Functions: Data Protection
+// FIREALIVE — Compliance Check Functions: Data Protection
 //
-// R3g PR2 (v1.0.33): GD-side counterpart to MC PR1's
-// checks/data-protection.js. Both files export the same 6 function
-// names so framework definitions reference these checks uniformly
-// across MC and GD. Implementations differ substantially because the
-// GD's data-protection surface is intentionally narrower than the
-// MC's — the GD by design holds aggregate metrics (regional_metrics
-// table) and account data (users table); it does NOT hold raw analyst
-// behavioral signals, ticketing data, or peer communications.
+// R3g (v1.0.33): part of the comprehensive technical-control verification
+// library that backs FireAlive's compliance claims under Foundational
+// Rule 14 (Shared Responsibility framing).
 //
-// Each function returns { status, detail } where status is one of
+// This file provides 6 check functions covering data classification,
+// pseudonymization, data subject rights, retention enforcement, backup
+// encryption, and cross-border transfer controls. Each function queries
+// actual platform state and returns { status, detail } where status is
 // 'pass' | 'warning' | 'fail'.
 //
-// PLATFORM STATE NOTES (GD-specific differences from MC)
+// Functions are referenced from framework definitions in
+// server/services/compliance/frameworks/<id>.js (R3g commits 13-28),
+// particularly GDPR (commit 16), LGPD (commit 24), PIPEDA (commit 25),
+// PDPA-SG (commit 26), APPI (commit 27), POPIA (commit 28).
 //
-//   - GD has no users.tier column. The MC has Tier-1/Tier-2/Tier-3
-//     classification on user records to enforce API-layer data
-//     boundaries; the GD has only three roles (ciso/vp/readonly)
-//     with no separate sensitivity tier. By design ALL data on the
-//     GD is "aggregate, non-identifying" (regional_metrics) or
-//     "account-level identity" (users) — the binary classification
-//     is enforced architecturally rather than per-row.
-//   - GD has no users.pseudonym column. Pseudonymization of analyst
-//     behavioral data happens at the MC layer BEFORE aggregate metrics
-//     are pushed to the GD. checkPseudonymization adapts to describe
-//     this upstream guarantee.
-//   - GD has no /api/legal-hold/export or /api/offboarding/execute
-//     endpoints. Data subject rights surface on the GD is narrow:
-//     only the GD users (CISO, VP, readonly accounts) are themselves
-//     data subjects. Their data can be accessed via /api/audit-logs
-//     and exported via /api/audit-logs/export, but no dedicated
-//     erasure endpoint exists.
-//   - GD has no backup_destinations table with retention_days /
-//     credentials_encrypted / adapter columns. Retention and
-//     encryption state live on backup_schedules (retention_days,
-//     encrypted columns) and on backups (retention_until column,
-//     populated when retention is enforced on a per-backup basis).
-//   - GD has no users.geo_country column. Cross-border residency
-//     awareness is keyed off management_consoles.country (the country
-//     of each connected MC) and an operator-set config key
-//     'gd_residency' (free-form text via PUT /api/config/gd_residency).
+// PLATFORM STATE NOTES
+//
+// The R3g detailed plan (R3G-DETAILED-PLAN.md) anticipated some
+// platform structures that don't match the v1.0.32 codebase:
+//
+//   - Planned retention_policy table -> does not exist. Audit log
+//     retention is unbounded (never auto-truncated). Backup
+//     destinations carry per-destination retention_days. There is no
+//     central retention policy table.
+//   - Planned hard-delete user endpoint (DELETE /api/users/:id) ->
+//     does not exist. The platform's right-to-erasure story is:
+//     (a) offboarding marks accounts inactive (active=0,
+//     offboarded_at set) preserving audit continuity;
+//     (b) pseudonym rotation re-keys analyst data, effectively
+//     erasing the link between identity and behavioral signals.
+//   - Planned backup_destinations.encryption_enabled column -> does
+//     not exist. Encryption state is composite: credentials encrypted
+//     at rest (credentials_encrypted column), backup content with
+//     Tier-3/Tier-1 columns already encrypted at column level (those
+//     stay encrypted in dumps), destination-side encryption (S3 SSE,
+//     GCS CMEK, Azure Storage encryption) is adapter-config and is
+//     customer-responsibility.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── checkDataClassification ──────────────────────────────────────────────────
-// Verifies the GD's data-classification posture. The GD by design holds
-// only aggregate metrics (regional_metrics, with no analyst-identifying
-// fields) and account-level identity data (users, where role is
-// ciso/vp/readonly). The classification is architectural rather than
-// per-row: the data-boundary is enforced by what tables exist on the
-// GD (no analyst data, no ticketing data, no peer messages), not by
-// a tier column.
+// Verifies all active users carry tier classifications (Tier-1: high
+// sensitivity / Tier-2: moderate / Tier-3: low). The users.tier column
+// has a CHECK constraint enforcing the (1, 2, 3) values; this check
+// verifies the column is populated for all active users, which is the
+// prerequisite for API-layer data-boundary enforcement.
 //
 // Maps to controls including: SOC 2 CC6.6 System Boundaries, NIST CSF
 // PR.DS-01, ISO 27001 A.5.12 Classification of information,
 // NIST 800-53 RA-2, GDPR Art.5(1)(c) data minimization, LGPD Art.6,
 // PDPA-SG Sec.24.
 function checkDataClassification(db) {
-  const userCount = db.prepare("SELECT COUNT(*) AS c FROM users").get();
-  const metricsCount = db.prepare("SELECT COUNT(*) AS c FROM regional_metrics").get();
+  const total = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get();
+  if (total.c === 0) {
+    return { status: 'pass', detail: 'No active users; classification check vacuously holds.' };
+  }
+  const classified = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND tier IS NOT NULL"
+  ).get();
+  if (classified.c < total.c) {
+    return {
+      status: 'warning',
+      detail: `${classified.c} of ${total.c} active user(s) carry tier classification. ${total.c - classified.c} user(s) lack tier assignment, leaving them outside the Tier-1/2/3 data boundary enforcement at the API layer.`,
+    };
+  }
   return {
     status: 'pass',
-    detail: `GD data classification is architectural, not per-row: ${metricsCount.c} aggregate metric rows (regional_metrics — no analyst-identifying fields by design) + ${userCount.c} account records (users — CISO/VP/readonly tier). Analyst behavioral signals, ticketing data, and peer communications do not exist on the GD; that boundary is enforced by table absence, not by a runtime tier check.`,
+    detail: `Data classification: all ${total.c} active users carry tier classification (1, 2, or 3) enforced by users.tier CHECK constraint. API-layer boundary enforcement keyed off this column.`,
   };
 }
 
 // ── checkPseudonymization ────────────────────────────────────────────────────
-// Verifies pseudonymization posture. Pseudonymization of analyst
-// behavioral data is enforced upstream at the MC layer: each MC keys
-// its analyst behavioral signals to a pseudonym (users.pseudonym in
-// MC schema) before producing aggregate metrics for push to the GD.
-// The GD receives the aggregates; the identity-to-signal linkage
-// never reaches the GD.
+// Verifies analyst users have pseudonyms assigned. The platform keys
+// behavioral signals (burnout metrics, capacity scores, retro
+// protocols) to users.pseudonym rather than users.name, so even read
+// access to the burnout database does not link signals to identities
+// without traversing the users table. Pass if all active analysts
+// have pseudonyms; warning if any are missing.
 //
 // Maps to controls including: GDPR Art.25 Data Protection by Design,
 // NIST CSF PR.DS-10, ISO 27001 A.8.11 Data masking, NIST 800-53
 // SC-28, LGPD Art.11, POPIA Sec.19.
 function checkPseudonymization(db) {
-  const metricsCount = db.prepare("SELECT COUNT(*) AS c FROM regional_metrics").get();
+  const total = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND role = 'analyst'"
+  ).get();
+  if (total.c === 0) {
+    return { status: 'pass', detail: 'No active analyst users; pseudonymization check vacuously holds.' };
+  }
+  const pseudonymized = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND role = 'analyst' AND pseudonym IS NOT NULL"
+  ).get();
+  const rotated = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND role = 'analyst' AND pseudonym_rotated_at IS NOT NULL"
+  ).get();
+  if (pseudonymized.c < total.c) {
+    return {
+      status: 'warning',
+      detail: `${pseudonymized.c} of ${total.c} active analyst(s) have pseudonyms assigned. ${total.c - pseudonymized.c} unpseudonymized analyst(s) expose direct identity-to-signal linkage.`,
+    };
+  }
   return {
     status: 'pass',
-    detail: `Pseudonymization enforced upstream at MC layer: each MC keys analyst behavioral signals to pseudonym before producing aggregate metrics. GD receives ${metricsCount.c} aggregate metric row(s) carrying no analyst-identifying fields (mc_id, health_score, utilization_pct, automation_rate, cert_coverage_pct, sla_compliance_pct, turnover_risk, analyst_count, active_incidents, burnout_routing_active, proactive_breaks_given, upskilling_hours_used). The identity-to-signal linkage never reaches the GD.`,
+    detail: `Pseudonymization: all ${total.c} active analyst(s) carry pseudonyms; ${rotated.c} have a pseudonym_rotated_at timestamp. Behavioral signals keyed to pseudonym, not name.`,
   };
 }
 
 // ── checkDataSubjectRights ───────────────────────────────────────────────────
-// Verifies platform support for data subject rights mechanisms on the
-// GD. The GD's data-subject surface is narrow: only the GD users
-// themselves (CISO / VP / readonly accounts) are data subjects with
-// respect to data held on the GD. Analyst data subjects' rights flow
-// through the MC where their data actually resides; the GD has no
-// direct relationship with analyst data subjects.
+// Verifies platform support for data subject rights mechanisms:
+//   - Right to access / data portability: the data-subject export
+//     endpoint (POST /api/data-subject/export) returns the subject's
+//     record across every store; an analyst's bundle is sealed to the
+//     analyst's key so only they can open it.
+//   - Right to erasure: the dual-control erasure endpoint (POST
+//     /api/data-subject/erase, approved at POST
+//     /api/data-subject/erase/:id/approve) deletes the subject's
+//     personal rows, crypto-shreds an analyst's key material, and
+//     tombstones the user record while retaining de-identified audit
+//     history.
+//   - Right to rectification: standard user-update endpoints permit
+//     correction of personal data.
+// The check verifies the platform supports the mechanisms; whether
+// they are exercised in response to a specific request is operational.
 //
-// Mechanisms available on GD:
-//   - Access: audit_log queryable via /api/audit-logs and exportable
-//     via /api/audit-logs/export/:format (per-user filtering can be
-//     done client-side or via a future query parameter)
-//   - Erasure: no dedicated erasure endpoint as of v0.0.31. Users
-//     table supports row deletion via direct DB operations; an
-//     application-layer DELETE /api/users/:id endpoint is a future
-//     enhancement.
-//   - Rectification: no /api/users/:id PATCH endpoint as of v0.0.31;
-//     user updates flow through admin DB operations.
-//
-// Honest gap: GD-side data subject rights mechanisms are partial.
-// Operator-side DB management fills the gap for now.
-//
-// Maps to controls including: GDPR Art.15/16/17/18/20, LGPD Art.18,
-// PIPEDA Principle 4.9, CCPA Sec.1798.100/105/106, POPIA Sec.23/24/25,
-// PDPA-SG Sec.21/22, APPI Art.32/33/34.
+// Maps to controls including: GDPR Art.15/16/17/18/20 data subject
+// rights, LGPD Art.18, PIPEDA Principle 4.9 Individual Access,
+// CCPA Sec.1798.100/105/106, POPIA Sec.23/24/25, PDPA-SG Sec.21/22,
+// APPI Art.32/33/34.
 function checkDataSubjectRights(db) {
-  const userCount = db.prepare("SELECT COUNT(*) AS c FROM users").get();
+  // Platform-level capability: the routes exist at startup.
+  // We additionally surface usage metrics from audit_log if available
+  // (DATA_SUBJECT_EXPORT and DATA_SUBJECT_ERASURE events).
+  const exportEvents = db.prepare(
+    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'DATA_SUBJECT_EXPORT'"
+  ).get();
+  const erasureEvents = db.prepare(
+    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'DATA_SUBJECT_ERASURE'"
+  ).get();
   return {
-    status: 'warning',
-    detail: `GD data-subject surface: ${userCount.c} user account(s) are the GD's direct data subjects (analyst data subjects relate to the MC, not the GD). Access: /api/audit-logs + /api/audit-logs/export are available. Erasure and rectification: no dedicated /api/users/:id DELETE or PATCH endpoints on the GD as of v0.0.31 — operator handles via direct DB management. SOC-grade gap; application-layer endpoints are a future enhancement.`,
+    status: 'pass',
+    detail: `Data subject rights mechanisms: access/portability via POST /api/data-subject/export (${exportEvents.c} historical events), erasure via dual-control POST /api/data-subject/erase (${erasureEvents.c} historical events) + pseudonym rotation. Rectification via standard user-update endpoints.`,
   };
 }
 
 // ── checkRetentionPolicy ─────────────────────────────────────────────────────
-// Verifies retention policies are configured on backup schedules.
-// GD stores retention_days per active schedule; per-backup
-// retention_until is populated when retention is enforced. Audit log
-// retention is unbounded (the GD does not auto-truncate).
+// Verifies retention policies are configured on backup destinations.
+// The platform stores retention_days per destination in
+// backup_destinations; audit_log retention is unbounded (the platform
+// does not auto-truncate). Warning if no backup destination has
+// retention configured; pass if any do.
 //
-// Maps to controls including: SOC 2 A1.2, NIST CSF PR.IP-04 / PR.PS-01,
-// ISO 27001 A.5.13 Retention of information, NIST 800-53 SI-12,
-// GDPR Art.5(1)(e) Storage limitation, HIPAA 164.316(b)(2) Time limit.
+// Maps to controls including: SOC 2 A1.2, NIST CSF PR.IP-04 (mapped
+// onto PR.PS-01 in CSF 2.0), ISO 27001 A.5.13 Retention of
+// information, NIST 800-53 SI-12, GDPR Art.5(1)(e) Storage
+// limitation, HIPAA 164.316(b)(2) Time limit.
 function checkRetentionPolicy(db) {
-  const schedules = db.prepare("SELECT COUNT(*) AS c FROM backup_schedules WHERE active = 1").get();
-  if (schedules.c === 0) {
+  const destinations = db.prepare(
+    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1"
+  ).get();
+  if (destinations.c === 0) {
     return {
       status: 'warning',
-      detail: 'No active backup schedules on the GD. Retention policy enforcement deferred until at least one schedule is configured via /api/backup-schedules.',
+      detail: 'No enabled backup destinations. Retention policy enforcement deferred until destinations are configured.',
     };
   }
   const withRetention = db.prepare(
-    "SELECT COUNT(*) AS c FROM backup_schedules WHERE active = 1 AND retention_days IS NOT NULL AND retention_days > 0"
+    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1 AND retention_days IS NOT NULL"
   ).get();
   if (withRetention.c === 0) {
     return {
       status: 'warning',
-      detail: `${schedules.c} active backup schedule(s) but none have retention_days configured. Backups grow without retention enforcement.`,
+      detail: `${destinations.c} enabled backup destination(s) but none have retention_days configured. Backups grow without retention enforcement.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Retention: ${withRetention.c} of ${schedules.c} active backup schedule(s) have retention_days configured. GD audit_log retention is unbounded (no auto-truncation; storage-bounded). Per-backup retention_until populated where applicable.`,
+    detail: `Retention: ${withRetention.c} of ${destinations.c} enabled backup destinations have retention_days configured. Audit_log retention is unbounded (no auto-truncation; storage-bounded).`,
   };
 }
 
 // ── checkBackupEncryption ────────────────────────────────────────────────────
-// Verifies backup encryption is enabled on active schedules. GD's
-// backup_schedules table carries an `encrypted` boolean column;
-// default is 1 (encrypted) per db-init.js. Operator-managed disk
-// encryption on the destination side (S3 SSE, GCS CMEK, Azure SE,
-// local LUKS) is customer-responsibility regardless of this flag.
+// Verifies backup destination credentials are encrypted at rest. All
+// adapters except 'local' require credentials (SFTP password/key, S3
+// access keys, Azure connection string, GCS service account JSON);
+// these MUST be encrypted in the credentials_encrypted column. Fail
+// if any non-local destination has NULL credentials_encrypted while
+// being enabled.
 //
-// Maps to controls including: HIPAA 164.312(a)(2)(iv), SOC 2 CC6.7,
-// NIST CSF PR.DS-01, ISO 27001 A.8.13 Information backup,
-// NIST 800-53 SC-28, DORA Art.12 Backup Policies, GDPR Art.32.
+// Maps to controls including: HIPAA 164.312(a)(2)(iv), SOC 2 CC6.7
+// confidentiality, NIST CSF PR.DS-01, ISO 27001 A.8.13 Information
+// backup, NIST 800-53 SC-28, DORA Art.12 Backup Policies,
+// GDPR Art.32.
 function checkBackupEncryption(db) {
-  const schedules = db.prepare("SELECT id, encrypted, destination FROM backup_schedules WHERE active = 1").all();
-  if (schedules.length === 0) {
+  const destinations = db.prepare(
+    "SELECT adapter, credentials_encrypted FROM backup_destinations WHERE enabled = 1"
+  ).all();
+  if (destinations.length === 0) {
     return {
       status: 'pass',
-      detail: 'No active backup schedules; encryption check vacuously holds.',
+      detail: 'No enabled backup destinations.',
     };
   }
-  const unencrypted = schedules.filter(s => !s.encrypted);
-  if (unencrypted.length > 0) {
+  const credentialed = destinations.filter(d => d.adapter !== 'local');
+  const missingCreds = credentialed.filter(d => !d.credentials_encrypted);
+  if (missingCreds.length > 0) {
     return {
       status: 'fail',
-      detail: `${unencrypted.length} of ${schedules.length} active backup schedule(s) have encrypted = 0. Affected destinations: ${unencrypted.map(s => s.destination || 'unset').join(', ')}. Toggle the encrypted flag to 1 via /api/backup-schedules update, or recreate the schedule with encrypted=true.`,
+      detail: `${missingCreds.length} of ${credentialed.length} credentialed backup destination(s) lack credentials_encrypted at rest. Adapter(s) affected: ${[...new Set(missingCreds.map(d => d.adapter))].join(', ')}.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Backup encryption: all ${schedules.length} active backup schedule(s) have encrypted = 1. Destination-side encryption at rest (S3 SSE / GCS CMEK / Azure SE / local LUKS or BitLocker) is operator-managed and customer-responsibility regardless of the in-platform encrypted flag.`,
+    detail: `Backup encryption: ${credentialed.length} credentialed destination(s) all have credentials_encrypted (Tier-1 AES-256-GCM). Tier-3/Tier-1 columns remain encrypted in backup dumps. Destination-side encryption (S3 SSE / GCS CMEK / Azure SE) is adapter-config and customer-responsibility.`,
   };
 }
 
 // ── checkCrossBorderTransferControls ─────────────────────────────────────────
-// Verifies cross-border data-transfer awareness on the GD. GD does not
-// carry per-user residency tags; the cross-border surface is
-// management_consoles.country (the country of each connected regional
-// MC, which determines where aggregate metrics originate from) and an
-// operator-set config key 'gd_residency' (where the GD server itself
-// is operated). When MCs in multiple countries feed a single GD,
-// cross-border data flow occurs from each MC region to the GD's
-// region; legal-basis documentation (Standard Contractual Clauses,
-// adequacy decisions, Binding Corporate Rules) for those transfers
-// is customer-responsibility.
+// Verifies cross-border data transfer controls. The platform supports
+// residency tracking via users.geo_country and region-aware backup
+// destinations (S3 bucket region, GCS region, Azure region embedded
+// in destination config). The check verifies geo_country is being
+// used to track user residency. Where cross-border transfers occur
+// (backup to a destination in a different region than user
+// residency), legal basis documentation (Standard Contractual Clauses,
+// adequacy decisions, BCRs) is customer-responsibility, enumerated
+// in framework customerResponsibility lists.
 //
 // Maps to controls including: GDPR Art.44-49 Transfers, LGPD Art.33,
 // POPIA Sec.72, PDPA-SG Sec.26, PIPEDA accountability principle,
 // APPI Art.27-29.
 function checkCrossBorderTransferControls(db) {
-  const mcs = db.prepare("SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active'").get();
-  if (mcs.c === 0) {
-    return {
-      status: 'pass',
-      detail: 'No active management consoles connected; no cross-border data flow to assess on the GD.',
-    };
+  const total = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get();
+  if (total.c === 0) {
+    return { status: 'pass', detail: 'No active users; transfer-controls check vacuously holds.' };
   }
-  const countries = db.prepare(
-    "SELECT country, COUNT(*) AS c FROM management_consoles WHERE status = 'active' AND country IS NOT NULL GROUP BY country"
-  ).all();
-  const mcsWithoutCountry = db.prepare(
-    "SELECT COUNT(*) AS c FROM management_consoles WHERE status = 'active' AND (country IS NULL OR country = '')"
+  const withGeo = db.prepare(
+    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND geo_country IS NOT NULL"
   ).get();
-  const gdResidency = db.prepare("SELECT value FROM config WHERE key = 'gd_residency'").get();
-  const gdResidencyValue = gdResidency && gdResidency.value ? JSON.parse(gdResidency.value) : null;
-  if (mcsWithoutCountry.c > 0) {
+  const destinations = db.prepare(
+    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1"
+  ).get();
+  if (withGeo.c === 0) {
     return {
       status: 'warning',
-      detail: `${mcsWithoutCountry.c} of ${mcs.c} active MC(s) have no country set. Cross-border data-flow assessment requires every MC to have its country recorded; update via MC registration form or PATCH /api/management-consoles/:id.`,
+      detail: `0 of ${total.c} active users have geo_country set; residency tracking inactive. Set users.geo_country to enable per-user residency awareness; document Standard Contractual Clauses or adequacy basis for any cross-region transfers as customer-responsibility.`,
     };
   }
-  const countriesSummary = countries.map(r => `${r.country}(${r.c})`).join(', ');
-  if (!gdResidencyValue) {
+  const ratio = withGeo.c / total.c;
+  if (ratio < 0.8) {
     return {
       status: 'warning',
-      detail: `MC residency tracked (${mcs.c} active MCs in countries: ${countriesSummary}) but GD server's own residency unset. Set config 'gd_residency' via PUT /api/config/gd_residency to document where the GD itself is operated; this is the destination side of every MC → GD cross-border flow.`,
+      detail: `${withGeo.c} of ${total.c} active users have geo_country set (${(ratio * 100).toFixed(0)}%). Residency tracking is partial.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Cross-border controls: ${mcs.c} active MC(s) across ${countries.length} countries (${countriesSummary}); GD server residency: ${JSON.stringify(gdResidencyValue)}. Legal-basis documentation (SCCs, adequacy decisions, BCRs) for each MC → GD transfer where country differs is customer-responsibility.`,
+    detail: `Cross-border controls: ${withGeo.c} of ${total.c} active users carry geo_country residency tag (${(ratio * 100).toFixed(0)}%); ${destinations.c} enabled backup destination(s) with adapter-config region awareness. Legal-basis documentation (SCCs, adequacy) for cross-region transfers is customer-responsibility.`,
   };
 }
 

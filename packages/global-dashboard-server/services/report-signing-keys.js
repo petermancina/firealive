@@ -13,7 +13,7 @@
 // DELIBERATELY SEPARATE FROM the other signing-key families
 //
 // Report attestation is a distinct cryptographic concern from backup
-// integrity, chain integrity, forensic export, legal-hold export, gd-push
+// integrity, chain integrity, forensic export, gd-push
 // transport, and cloud-iac signing. A compromise of any one signing family
 // MUST NOT compromise the others. report_signing_keys shares no state, no
 // in-memory KeyObject instances, and no DB tables with the other families.

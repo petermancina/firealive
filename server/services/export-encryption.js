@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE -- Export Encryption at Rest (FA-ENC1)
 //
-// Seals forensic-export and legal-hold-export artifacts at rest. Each artifact
+// Seals forensic-export artifacts at rest. Each artifact
 // (the gzipped tar archive, and its manifest.json sidecar) is written as a
 // self-describing FA-ENC1 file: a fresh per-artifact AES-256-GCM data key
 // encrypts the plaintext, and that data key is wrapped under the configured KEK

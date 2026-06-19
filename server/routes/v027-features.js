@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE v0.0.27 — New Routes
 // Adds: proactive break interventions, upskilling hour, auto-disable routing,
-// analyst offboarding, TTX generator, legal hold, risk register asset,
+// analyst offboarding, TTX generator, risk register asset,
 // client self-scan, cross-app audit collection
 // ═══════════════════════════════════════════════════════════════════════════════
 

@@ -12,21 +12,21 @@ If you’re new to FireAlive, start with **The Big Picture** below.
 
 FireAlive is a SOC analyst burnout-prevention platform. Security Operations Centers burn out their analysts at brutal rates — turnover, errors, mental health damage. FireAlive sits inside the team’s existing SOC tooling stack and intervenes at the points where burnout actually happens: ticket assignment, peer support, training, post-incident recovery, shift transitions.
 
-Four apps make up the suite:
+Three apps make up the suite:
 
 - **Analyst Client (AC)** — runs on each analyst’s workstation. Where the analyst sees their own signals, asks for help, takes care of themselves.
 - **Management Console (MC)** — runs on the team lead’s workstation. Where the lead sees aggregate team health (no individual burnout data), configures the platform, runs operations.
-- **Abuse Review Console (ARC)** — runs on the independent abuse reviewer’s own workstation. A role separate from team leadership; reviews abuse reports that neither the analyst client nor the management console can decrypt. Every deployment must designate at least one reviewer before abuse reporting becomes available.
 - **Global Dashboard (GD)** — runs on the CISO’s workstation. Read-only view aggregating across multiple regional MCs. Executive-level visibility without the operational details.
 
-A regional **Server** sits behind the AC/MC/ARC. A separate **GD Server** aggregates from regional MCs.
+A regional **Server** sits behind the AC/MC. A separate **GD Server** aggregates from regional MCs.
 
-The whole thing is built on four privacy commitments:
+The whole thing is built on five privacy commitments:
 
 - **Tier-3 data** (individual burnout signals) is sealed to the analyst’s own key — the server stores only ciphertext it cannot read, it is decrypted only on the analyst’s own device, and the lead never sees it
 - **Tier-1 data** (team-level aggregates) is what the lead sees — averages, never individuals
 - **Pseudonyms** decouple analyst identity from burnout data at the database layer
-- **Abuse-report zero-access:** abuse reports (peer-session, board-post, lead-chat) are sealed on the reporter’s device to the active reviewer recipient set before they leave the app. The server, management, team leads, and admins (who handle only public keys) cannot decrypt them — only a designated independent reviewer can.
+- **Abuse-report zero-access:** abuse reports (peer-session and board-post) are sealed on the reporter’s device to the active Team-Lead recipient set before they leave the app. The server, the GD, and admins (who handle only public keys) cannot decrypt them — only a lead who has enrolled an abuse-review key can open a case, on their own device.
+- **Directory-identity minimization:** when FireAlive syncs accounts from a directory (LDAP/AD), it persists only the opaque directory id — the real `displayName` and `sAMAccountName` are never stored. FireAlive holds no real names anywhere; people are identified by username or pseudonym, which is why an abuse-review case can only ever show pseudonymous handles.
 
 -----
 
@@ -844,7 +844,7 @@ Supports GitHub Actions, GitLab CI, Jenkins, CircleCI. Pipelines embed (MC-side,
 
 **Full-suite backup.** A separate `POST /api/backup/full-suite` endpoint captures the entire instance — database, configuration rows, signing-key material, and a version manifest — into one tar.gz archive. The Backup tab’s **Trigger Full Backup Now** button calls this endpoint; the resulting archive is suitable for disaster-recovery restoration of the full instance (vs. the standard `POST /api/backup` which captures only the database). MC-side bundles use the v2 four-file layout (manifest + archive + Cosign signature + KEK-wrapped key); GD-side bundles use a v1-shape single-archive layout with SHA-256 tamper-detect. See `docs/full-suite-backup.md` for the full architecture, manifest schemas, and restoration semantics.
 
-**Exports are encrypted at rest, too.** Forensic-export and legal-hold archives are stored encrypted on the server’s own disk from the moment they are written — independent of whether they are also backed up — so the export files on the host are not readable without the deployment’s encryption key. Downloading an export is unchanged: the standard package streams to the browser and verifies the same way.
+**Exports are encrypted at rest, too.** Forensic-export archives are stored encrypted on the server’s own disk from the moment they are written — independent of whether they are also backed up — so the export files on the host are not readable without the deployment’s encryption key. Downloading an export is unchanged: the standard package streams to the browser and verifies the same way.
 
 ### Backup Schedules
 
@@ -1035,7 +1035,7 @@ Keys are shown with their origin (local or external) and status, so the lead can
 
 ### Deployment Migration
 
-**What it’s for:** Move an entire FireAlive deployment to new hardware or a new host — a hardware refresh, a bare-metal-to-VM move, or a data-center relocation — without cloning it. A migration deliberately does NOT copy the source’s instance identity (a verbatim identity restore would be indistinguishable from a clone); instead it carries the data and configuration forward and re-establishes a fresh identity on the target. Three layers are reconciled: instance identity (CA, server keys, analyst-client device keys, certificates, enrollment) is re-established fresh; analyst keys (per-analyst, recoverable through the offline recovery code) are preserved; and data (audit, forensic, and legal-hold chains, configuration, sealed history, training and helper-pay records) is preserved. Analyst clients re-bind afterward through the Per-Client Recovery ceremony.
+**What it’s for:** Move an entire FireAlive deployment to new hardware or a new host — a hardware refresh, a bare-metal-to-VM move, or a data-center relocation — without cloning it. A migration deliberately does NOT copy the source’s instance identity (a verbatim identity restore would be indistinguishable from a clone); instead it carries the data and configuration forward and re-establishes a fresh identity on the target. Three layers are reconciled: instance identity (CA, server keys, analyst-client device keys, certificates, enrollment) is re-established fresh; analyst keys (per-analyst, recoverable through the offline recovery code) are preserved; and data (audit and forensic chains, configuration, sealed history, training and helper-pay records) is preserved. Analyst clients re-bind afterward through the Per-Client Recovery ceremony.
 
 The migration bundle (format FA-MIG1) is a self-contained, signed package: a manifest, the golden-baseline configuration capture, and a signed, KEK-wrapped full-suite backup — bound together by SHA-256 and signed with the source deployment’s Ed25519 backup signing key.
 
@@ -1060,55 +1060,6 @@ The migration bundle (format FA-MIG1) is a self-contained, signed package: a man
 1. Per client: tags country, regulatory framework, data residency requirement
 1. Toggles “block logins from countries not matching client’s location”
 1. From now on: a German-tagged client can’t be logged into from China — IP-based block, lead notified
-
-### Legal Hold
-
-**What it’s for:** Litigation-grade evidence preservation for e-discovery, regulatory inquiries, and internal investigations. Bundles selected platform data into one or more of eight e-discovery formats (EDRM XML, EML/mbox, PST-equivalent ZIP, Concordance DAT, Relativity load bundle, JSON tarball, PDF with Bates numbering, TIFF with Bates load file), signs the manifest with Ed25519 from a signing key set DISTINCT from the forensic-export keys, holds the archive indefinitely until a separate CISO issues a release with rationale. Triple-layer separate-actor enforcement at the route, orchestrator, and SQL CHECK constraint levels makes the release workflow structurally admissible in court.
-
-**Distinct from forensic export:** forensic exports are operational (an admin generates an archive for an incident response and may delete it later). Legal holds preserve evidence indefinitely until a release authority decides the matter is closed. Three lifecycle differences: indefinite retention by default, NO deletion only release, separate-actor enforced at three layers (not two).
-
-**Workflow — create a hold:**
-
-1. Admin or CISO receives a litigation hold notice, regulatory inquiry, or internal-investigation request from counsel
-1. Opens Legal Hold tab
-1. Fills the Create form/modal:
-- **Case ID** (required) — references the litigation matter, regulatory case number, or internal investigation ID
-- **Rationale** (required, min 20 chars) — court order ref, regulatory request, investigation context
-- **Time window** (optional) — restricts evidence to a specific date range
-- **Custodian filter** (optional, API only currently) — restricts evidence to a specific user’s activity (so a hold for “Jane Doe’s actions Q3” doesn’t sweep up other employees’ audit records)
-- **Output formats** — pick 1+ of the 8 (defaults to edrm-xml + eml-mime, the two most universal). Each selected format produces one file inside the archive.
-- **Indefinite retention** (default checked) — uncheck only for time-bounded preservation orders
-1. Submit. System fetches the data slices, runs each format serializer, signs the manifest, optionally co-signs with sigstore Cosign, writes the tar.gz archive, and appends HOLD_CREATED + HOLD_COMPLETED chain entries.
-1. The hold appears in the Existing Legal Holds list with status=‘active’. The retention job will skip this hold forever (until released).
-
-**Workflow — hand to counsel:**
-
-1. From the holds list, click Download → tar.gz archive streams to the browser
-1. Transfer the archive to opposing counsel or the receiving e-discovery vendor via the case-specific secure channel (encrypted SFTP, vendor upload portal — external to FireAlive)
-1. Counsel extracts the outer tar.gz, finds manifest.json + manifest.sig + per-format files
-1. Counsel verifies the Ed25519 manifest signature using the public key from /api/legal-hold-exports/chain
-1. Counsel imports the per-format file into their review platform per the ESI compatibility matrix in docs/legal-hold-export.md (e.g., Relativity ingests the relativity.zip; Concordance ingests the concordance.dat; in-house Python pipelines ingest the json-tarball.tar.gz)
-1. Each event in every format carries its canonical SHA-256, allowing per-event integrity verification end-to-end
-
-**Workflow — release a hold (CISO only):**
-
-1. When the matter closes (case resolved, regulatory inquiry closed, court order lifted), a CISO different from the original requester opens the Legal Hold tab
-1. Clicks Release on the active hold
-1. Confirms in the release modal with a rationale ≥ 20 chars
-1. If the CISO IS the original requester, the release is rejected at THREE layers (route, orchestrator, schema CHECK) with HOLD_RELEASE_DENIED chain entry recording which layer caught the violation
-1. On successful release, the hold transitions to status=‘released’ with hold_released_at, hold_released_by_user_id, and hold_release_rationale stamped atomically. HOLD_RELEASED chain entry appended. The archive remains downloadable for post-litigation audit.
-
-**Why three layers of separate-actor enforcement:**
-
-- **Layer 1 (route handler):** cleanest UX — caught immediately with a precise error, no DB write attempted
-- **Layer 2 (orchestrator):** defense-in-depth if a future route bypass exists; throws SeparateActorViolation
-- **Layer 3 (SQL CHECK constraint):** structurally impossible to bypass — lives in the database file itself. Opposing counsel cannot argue “the application could have been compromised” because the constraint is in the schema.
-
-All three must agree. The schema is the final backstop and the reason this workflow is admissible in court.
-
-**Cryptographic isolation:** legal hold signing keys are DISTINCT from forensic-export signing keys on each server. Plus MC and GD each maintain their own Tier-1 KEK and their own legal hold signing keys. Four independent key sets across the platform (MC forensic, MC legal-hold, GD forensic, GD legal-hold), each rotatable independently. Compromise of any one key does not taint the others.
-
-**Encrypted at rest:** while a forensic export or a legal hold sits on the server’s disk — the archive and its manifest alike — it is stored encrypted, so the files cannot be read by anyone who merely reaches the bytes (a stolen disk, a copied snapshot, an exfiltrated backup) without the deployment’s encryption key. The protection is transparent in use: downloading a hold or an export returns the same standard package as always, and counsel verifies its signatures exactly as described above.
 
 -----
 
@@ -1239,6 +1190,23 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 1. Picks data source, regex filter
 1. Runs query — system parameterizes, strips injection attempts, returns results
 
+### Data-Subject Rights
+
+**What it’s for:** Serving access and erasure requests for the people whose data FireAlive holds, through `/api/data-subject/*`, with the same zero-access and dual-control properties as the rest of the platform.
+
+**Access export.** `POST /api/data-subject/export` gathers a subject’s data into a portable bundle. Two modes:
+
+- **Self-service.** Any user — analyst, lead, admin, CISO — exports their own data from their own authenticated session. For an analyst, the sealed `analyst_private_data` blobs inside the bundle still decrypt on-device with the key the Analyst Client already holds, so even a self-export of burnout data stays end-to-end.
+- **Organization-initiated.** An admin runs an export for another user. If that subject is an analyst, the **whole bundle is sealed to the analyst’s active key** — the admin who ran it holds only ciphertext, and only the analyst can open it on their device. For a non-analyst subject, whose data the server can already read, the gathered bundle is returned to the operator.
+
+**Erasure (dual-control).** Deletion is never a single click; it mirrors the restore-approval workflow:
+
+1. An admin submits an erasure request for a subject, creating a pending row.
+1. A **second** admin, different from the requester, reviews the queue and approves with a fresh MFA step-up.
+1. Only on that second approval does the erasure run and the request move to executed.
+
+**Audit trail.** Every export emits `DATA_SUBJECT_EXPORT`; a request emits `DATA_SUBJECT_ERASURE_REQUESTED`; a completed erasure emits `DATA_SUBJECT_ERASURE`. The access surfaces are self-service in the Analyst Client and admin-initiated in the Management Console.
+
 -----
 
 ## Configuration group
@@ -1250,7 +1218,7 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 **Not everything is a toggle.** Features are classified:
 
 - **Toggle** — the 19 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, pseudonymous lead chat (Signal E2EE), proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, MSP multi-tenancy, CI/CD pipelines). Toggles default on except MSP multi-tenancy and CI/CD, which default off.
-- **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, legal hold, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC’s defenses can never be turned off, even by a forged request.
+- **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC’s defenses can never be turned off, even by a forged request.
 - **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA and clustering, and so on). These have no switch.
 
 **Before you turn anything off:** FireAlive is most effective at reducing burnout when every analyst-facing capability is active — they reinforce one another, and the research treats them as a system rather than a menu of extras. The switches exist because every SOC is different: some adopt everything at once, others introduce capabilities gradually or run a subset that fits their environment and their people’s readiness. Toggling a feature off tailors FireAlive to your organization; it does not mean the feature is optional to the mission. Nothing is deleted when a feature is off. The optimal configuration is everything on.
@@ -1379,7 +1347,7 @@ The tab exposes two admin-configurable control panels:
 
 **What it’s for:** Authorize your organization’s cloud-posture and IaC scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) to scan your FireAlive cloud deployment, and keep a tamper-evident record of every scan that reaches it. FireAlive does not run scans or store findings itself — scan results live in the scanner’s own console, the same way EDR and threat-hunting integrations let approved tooling inspect FireAlive without FireAlive duplicating the tool. This is the cloud-posture companion to the endpoint-focused EDR/Threat Hunting integrations: FireAlive opens itself to authorized scanning by the org’s security tooling and logs that access.
 
-Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, Abuse Review Console, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
 
 FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
@@ -1425,13 +1393,23 @@ On the Global Dashboard server the same feature appears in its own console and a
 
 ### Peer Conduct
 
-**What it’s for:** An awareness-only view of abuse reports from peer skill-share sessions and the skill-share Board. After the Phase U3 cutover the MC no longer reviews these reports — review and resolution moved to the independent Abuse Review Console (operated by the separate `abuse_reviewer` role). This tab exists only so a lead knows reports are being handled, without management being able to read them.
+**What it’s for:** Reviewing and resolving abuse reports from peer skill-share sessions and the skill-share Board. This is where the Team Lead opens a sealed case, reads the flagged content, and closes it with a verdict.
 
-**What the lead sees:** A single count of reports pending independent review, and nothing else — no content, no identities, not even the severity tier. Each report is sealed on the analyst’s device to the active reviewers’ public keys before it leaves the app, so this console structurally cannot decrypt it. The same count drives the sidebar badge.
+**Zero-access review.** Each report is sealed on the flagger’s device to the active Team-Lead recipient set (a multi-recipient X25519 envelope) before it leaves the app, so the server, the GD, and an admin who handles only public keys all hold opaque ciphertext they cannot open. Only a lead who has enrolled an abuse-review key, unlocked on their own device, can decrypt a case — the plaintext exists only in the renderer for the duration of viewing.
 
-**Why management can’t review it.** A report can be about anyone, including a lead, so routing peer-session and Board reports through the people an analyst works under would chill reporting. They follow the same path as lead-chat reports: sealed to an independent reviewer (a role kept separate from team leadership) and opened only in the Abuse Review Console. Tiers signal severity to that reviewer; they no longer escalate identity reveal, and analysts stay pseudonymous to the reviewer.
+**One-time setup — enroll your key.** Generate your abuse-review key here behind a 12-character (or longer) passphrase; the key is created on your device and the private half never leaves the MC machine, while the server receives only the public key. Enrolling adds you to the recipient set, and abuse reporting stays disabled until at least one lead has enrolled (with no key, nothing could be decrypted). Multiple leads can each enroll, and every flag seals to all of them at once. A key can be revoked from this tab; flags already sealed to other active leads stay openable by them. If a passphrase is lost, revoke that key and enroll a fresh one — flags sealed to other active leads remain openable, but a flag sealed only to the lost key can no longer be opened, the cost of zero-access.
 
-**Locked toggle.** `peer_abuse_flagging` stays a **locked** capability in Feature Toggles and cannot be turned off — disabling abuse reporting would lower the SOC’s safety floor.
+**Workflow:**
+
+1. Open the Peer Conduct tab; the case list shows metadata only — case id, target type (peer-session or board-post), tier, time, parties, status. No content.
+1. Unlock with your passphrase and open a case. The sealed note and content decrypt client-side; for a board-post, a small thread-context snippet is included.
+1. Resolve the case with a structured verdict and rationale. The store is append-only — nothing is ever deleted; a board-post flag upheld keeps the post removed, dismissed returns it to the Board.
+
+**Patterns.** A metadata-only detector surfaces signals across the cases a lead can see — repeat-offender (same person flagged 2+ times in 30 days), escalation (tiers rising across cases), and retaliation. It reads metadata only and never decrypts content.
+
+**Pseudonyms only.** Cases identify everyone by pseudonym. FireAlive stores no real names, so a review can only ever show the system’s pseudonymous handles, even though a lead generally knows who they belong to. Tiers signal severity; they do not change identity, and analysts stay pseudonymous throughout.
+
+**Locked toggle.** `peer_abuse_flagging` is a **locked** capability in Feature Toggles and cannot be turned off — disabling abuse reporting would lower the SOC’s safety floor.
 
 ### Help (MC)
 
@@ -1515,8 +1493,6 @@ Second — and equally important — true positives that are nonetheless low-lev
 1. Either side can verify the safety number out of band — read it aloud; the numbers must match
 1. Analyst closes the chat; five minutes later the scheduler purges the thread’s messages
 
-**Reporting abuse:** Either party can report a message in a lead chat — the analyst can flag a lead’s message, and the lead can flag the analyst’s. Each incoming message carries a Flag control; reporting it opens a tier picker (Tier 1 minor, Tier 2 personal attack, Tier 3 urgent) and a required note. This is deliberately **not** routed to the team lead: a lead can be the subject of a report, so lead-chat reports go to an **independent abuse reviewer** instead. The reported message and the note are sealed on the reporter’s own device to the active reviewer recipient set (a multi-recipient X25519 envelope) before they leave the app, so the server stores only opaque ciphertext it can never read, and neither management nor any team lead can decrypt it — only a designated reviewer’s Abuse Review Console, which holds the reviewer’s own private key, can open it. Reporting is available only once an organization has designated at least one independent abuse reviewer (otherwise nothing could be decrypted, and the UI says so). When the reviewer later opens a report, a lead who is a party is shown by real name, while an analyst is shown only by pseudonym.
-
 ### Helper Pay (AC-side)
 
 **What it’s for:** The analyst’s own view of their Helper Pay state — points earned from helping peers, current balance, transaction ledger, available rewards, and the leaderboard visibility toggle that controls whether their pseudonym appears on the lead’s recognition leaderboard.
@@ -1543,7 +1519,7 @@ The Your Records card exports a personal copy of the statement — balance, full
 
 **What it’s for:** Async forum for tips, questions, burnout strategies. Posts auto-expire after 7 days (so it’s a current-conversation space, not a permanent record). Each post supports threaded responses so analysts can ask follow-up questions or add comments, and posts and replies can be marked with lightweight reactions (Helpful, Thanks, Insightful, Same here) for low-effort acknowledgement. The same conduct rules and tiered abuse flagging system from peer chat apply here too.
 
-If a post is flagged, it’s temporarily removed from the Board pending independent review. The flagged content is sealed on the flagger’s device to the active reviewer recipient set and stored as opaque ciphertext in an evidence vault with no expiration (so it can’t disappear before review) — neither management nor any team lead can read it. Only a designated reviewer’s Abuse Review Console can open it; the reviewer then dismisses the flag (the post returns to the Board) or upholds it (the post stays removed). It’s the same independent-reviewer path as peer chat.
+If a post is flagged, it’s temporarily removed from the Board pending review. The flagged content is sealed on the flagger’s device to the enrolled Team Leads and stored as opaque ciphertext in an evidence vault with no expiration (so it can’t disappear before review) — the server and an admin who handles only public keys cannot read it. A lead opens it in the MC Peer Conduct tab, then dismisses the flag (the post returns to the Board) or upholds it (the post stays removed). It’s the same review path as peer skill-share sessions.
 
 **Workflow:**
 
@@ -1557,7 +1533,7 @@ If a post is flagged, it’s temporarily removed from the Board pending independ
 1. Analyst sees a post or response that’s inappropriate
 1. Flags it with a tier (1: minor / 2: personal attack / 3: urgent — slurs, threats, harassment)
 1. Post is removed from Board pending review, stored in evidence vault
-1. The independent abuse reviewer opens the case in the Abuse Review Console, reviews the sealed evidence and thread context, then dismisses (post returns to the Board) or upholds it (stays removed) — management is not involved
+1. The Team Lead opens the case in the MC Peer Conduct tab, reviews the sealed evidence and thread context, then dismisses (post returns to the Board) or upholds it (stays removed)
 
 ### IR Simulator (this is the AI/ML training feature)
 
@@ -1682,8 +1658,6 @@ Reports render in three formats: JSON in-app (for the dashboard preview) and sig
 
 **Top-of-list summary line:** When any MCs have pending submissions, a one-line summary above the MC list names the distinct count and points the operator at the amber “Review keys” affordance.
 
-**Pending Legal-Hold Export Approvals card:** The connections tab also carries the CISO’s approval queue for two-person legal-hold exports of vaulted abuse cases. When an abuse reviewer requests an export, it appears here (gated to the `ciso` role) with the case and request identifiers and the reviewer’s written rationale. Approving mints an Ed25519-signed decision token over that specific request — bound to the request, case, and decision; denying records a signed denial with a reason. The CISO approval key is distinct from the report-signing and trust-registry keys, and the management console never sees that an export was requested, approved, or produced. The reviewer’s own device verifies the signed token against an independently pinned copy of this CISO key before any case file is produced. Full procedure in `docs/abuse-vault-legal-hold-export.md`.
-
 ### Compliance Posture
 
 **What it’s for:** Generate a compliance report against THIS GD-Server’s own running state. Same 16-framework selector as the MC side, same Shared Responsibility two-bucket structure (verifiedControls + customerResponsibility), but the controls checked are GD-specific: cross-region aggregation integrity, signing-key trust registry hygiene, mailbox-pattern fulfillment, GD-side audit log integrity, GD-side encryption, GD-side authentication, GD-side configuration locking. Each report carries the framework name, authority, citation, generation timestamp, and the app version that produced it — useful provenance metadata for audit evidence.
@@ -1760,108 +1734,3 @@ Same purposes as MC equivalents but scoped to the GD server (which is independen
 ### Audit & Forensics
 
 Audit trail visibility for the GD layer — separate audit log from the regional MCs.
-
------
-
-# ABUSE REVIEW CONSOLE (the independent reviewer’s app)
-
-The Abuse Review Console (ARC) is a separate desktop app for the independent abuse reviewer — a role kept **outside team leadership** so that a lead can be the subject of a report without controlling the review. Every FireAlive deployment must designate at least one independent reviewer; abuse reporting in the AC and MC stays disabled until a reviewer’s public key is registered. Where one person holds both team-lead and platform-admin duties, the reviewer comes from an independent function (HR, ethics committee, etc.).
-
-The ARC opens abuse-report content **client-side, with the reviewer’s own private key**. The server stores only opaque sealed envelopes; the management console cannot decrypt them; an admin who handles only public keys cannot decrypt them. Adding or removing a reviewer is a public-key operation in the MC’s Audit → Abuse Reviewers panel — no private key is ever shared, exported, or transferred between people.
-
-### First-Run Setup
-
-**What it’s for:** Generating the reviewer’s keypair on the reviewer’s own device and handing the public key to the admin so it can be registered with the server.
-
-**Who uses it:** The independent abuse reviewer, once, on a device only they use.
-
-**Workflow:**
-
-1. Install the ARC (see SETUP.md). On first launch, set a 12-character (or longer) passphrase, entered twice. The passphrase is the only thing that unlocks the private key on future sessions; if forgotten, the key is unrecoverable and a new one must be designated.
-1. The ARC generates an X25519 keypair locally. The private key is wrapped under the passphrase (scrypt → AES-256-GCM) and then sealed to the OS keychain via Electron `safeStorage`. The private key never reaches the renderer and never leaves the device.
-1. The ARC displays the public key and a 16-hex-character fingerprint. Hand both to the platform admin via an out-of-band channel; never share the passphrase or the private key with anyone.
-1. The admin opens the MC → Audit → Abuse Reviewers panel and registers the public key (the server derives and stores the fingerprint, which the admin can confirm against the one you handed over). Once at least one active public key is registered, abuse reporting becomes available in the AC and MC.
-
-### Sign-in (every session)
-
-**What it’s for:** Authenticating the reviewer (credentials + MFA) and unlocking the in-memory private key for the session.
-
-**Workflow:**
-
-1. Launch the ARC and enter credentials + TOTP MFA code. The reviewer’s role is checked against `abuse_reviewer`; every other role (lead, admin, analyst) is rejected.
-1. Enter your passphrase; the ARC `safeStorage`-decrypts the wrapped private-key blob, scrypt-unwraps it, and holds the unwrapped key in main-process memory **for this session only**. The renderer never sees the key.
-1. A persistent banner across the top of the app reminds the reviewer that they hold independent authority and that management cannot read flag content.
-
-### Case List & Case Detail
-
-**What it’s for:** Browsing abuse reports the server has routed to the active reviewer set and opening one to read the sealed content.
-
-**What you see in the list:** Metadata only — case id, target type (peer-session, board-post, lead-chat), tier, time, parties (a lead who is a party is shown by real name; an analyst is shown only by pseudonym), status. No content. The list is scoped to cases the reviewer has access to (per the assignment rules — no party to the case, no team-lead role).
-
-**What you see in the detail:** The sealed note and the sealed message (and for board-post, a small thread-context snippet) are each fetched as opaque base64 from the server. The ARC decrypts them client-side using the in-memory private key. The plaintext exists only in the renderer for the duration of viewing.
-
-**Workflow:**
-
-1. Open the Case List tab; pick a case.
-1. The detail view renders the metadata; each sealed panel decrypts locally and shows its plaintext (or an error if the reviewer is not in the recipient set — which can happen for a flag sealed before this reviewer was registered).
-1. Move on to resolution.
-
-### Resolving a Case
-
-**What it’s for:** Closing a case with a disposition note (dismiss / uphold / escalate). The disposition is metadata; no content is altered by resolution.
-
-**Workflow:**
-
-1. From a case detail view, click Resolve, choose a disposition, enter a note.
-1. The case moves to resolved status; the audit log records who resolved it and the note. The disposition flows back to whatever downstream behaviour the target type requires (a board-post flag upheld keeps the post removed; dismissed returns it to the board).
-
-### Legal-Hold Export
-
-**What it’s for:** Taking a single sealed abuse case out of the eternal-retention vault as a self-contained case file for a legal or HR matter, under a two-person rule. The reviewer requests; a CISO approves with a signed token; the reviewer’s device verifies that token before producing the file. The vault original is never altered — the action exports a copy.
-
-**Who uses it:** The independent reviewer (request and produce) together with a CISO in the Global Dashboard (approve). They must be different people — the software separates the two roles across realms but cannot detect one person holding both accounts.
-
-**One-time setup — pin the CISO key:** Before producing, the ARC must hold the CISO’s approval *public* key, pinned once and out of band. Obtain the key and its SHA-256 fingerprint from the CISO through a trusted channel, paste both into the ARC, and it recomputes the fingerprint and refuses to pin on a mismatch. The pin lives only on the reviewer’s device, independent of the server.
-
-**Workflow:**
-
-1. From a case detail view, open Legal-Hold Export and submit a request with a written rationale (a minimum length is enforced). One open request per case; it is valid for a fixed approval window.
-1. The request is relayed to the CISO. Its status shows here and updates when the CISO acts.
-1. On approval, click Produce case file. The ARC re-verifies the CISO’s signed token on the device — the signature, and that it binds this exact request, case, and decision — and refuses if anything fails.
-1. The ARC assembles a watermarked “RESTRICTED — Legal/HR” case file from the locally decrypted material, embeds the verified approval token so a recipient can check it independently, downloads it, and records production. The vault row is untouched.
-
-**Framing:** the export is a chain-of-custody and authenticity control, not a way to go over a reviewer’s head or to reopen a locked determination. Once two authorized people hold the file, software cannot control where it then goes; the watermark and recorded rationale are accountability, not destination enforcement. Full architecture, the canonical token payload, and an OpenSSL procedure for verifying a produced file offline are in `docs/abuse-vault-legal-hold-export.md`.
-
-### Patterns
-
-**What it’s for:** Surfacing **metadata-only** signals across the cases the reviewer has access to — repeat-offender (same person flagged 2+ times in 30 days), escalation (tiers increasing across cases), retaliation (a flag against someone who recently flagged the reviewer’s own party). The pattern detector reads metadata only; it never decrypts content.
-
-**Where it lives:** Patterns tab. Clickable signal chips jump to the relevant case detail.
-
-### Locking & Auto-lock
-
-**What it’s for:** Defence in depth around the in-memory private key.
-
-**How it works:**
-
-- A 5-minute inactivity timer hard-locks the session: the in-memory private key is cleared, the app returns to the unlock screen, and the reviewer re-enters their passphrase to continue.
-- A Lock button is in the header at all times; clicking it clears the in-memory key immediately.
-- Closing all windows (window-all-closed) and shutdown (before-quit) also clear the in-memory key.
-- The on-disk passphrase-wrapped, safeStorage-sealed blob is never touched by any of these; it survives across sessions and shutdowns. Only the passphrase brings it back.
-
-### Adding or Removing Reviewers (admin-side)
-
-**What it’s for:** Curating the active recipient set. Every flag is sealed at submission time to ALL reviewer public keys active at that moment.
-
-**Workflow:**
-
-- **Adding:** the new reviewer installs the ARC on their own device, generates their own keypair (First-Run Setup above), and hands the public key + fingerprint to the admin. The admin registers it via MC → Audit → Abuse Reviewers. From the next flag onward, content is sealed to the expanded recipient set.
-- **Removing:** the admin revokes the reviewer’s public key in the same MC panel. New flags omit the revoked slot. Flags already sealed to a set including that key stay openable by every other active reviewer at the time of sealing.
-
-**Boundary:** the recipient set is computed at seal time. A reviewer registered AFTER a flag was sealed cannot open that older flag — their slot does not exist in the envelope. There is no server-side re-seal path; the server never holds plaintext.
-
-### Recovery
-
-**Forgotten passphrase:** the private key is irrecoverable. Revoke that public key, have the reviewer generate a fresh keypair (a new passphrase, a new fingerprint), and register the new public key. Past flags that were also sealed to other active reviewers stay openable by them; flags sealed when the lost-key reviewer was the sole active reviewer cannot be reopened by anyone — this is the cost of zero-access.
-
-**Lost or compromised device:** revoke the public key in the MC panel immediately so no new flags are sealed to that slot. The device still holds the passphrase-wrapped private-key blob (passphrase-required to unwrap), so the risk depends on passphrase strength and how quickly revocation happens.

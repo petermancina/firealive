@@ -29,7 +29,7 @@ const EXPORT_VERSION = 1;
 
 // Allow-list of users columns included in an access export: profile, status, and
 // non-secret auth metadata. Credential and second-factor secrets are never
-// exported (password_hash, totp_secret, totp_last_used_step,
+// exported (totp_secret, totp_last_used_step,
 // totp_recovery_codes_hashed are intentionally absent). Allow-list, not a
 // blocklist: a column is exported only by being named here, so a column added to
 // users in the future is excluded until it is deliberately added to this list.

@@ -21,7 +21,7 @@
 // cascade into analyst or operational data. Everything else is PRESERVED:
 // per-analyst burnout keys and recovery wraps (user-bound, so they survive an
 // identity reset and stay recoverable via the offline recovery code); the
-// audit, forensic, and legal-hold chains; team and system config and sealed
+// audit and forensic chains; team and system config and sealed
 // history; and training / helper-pay records.
 //
 // Re-minting reuses the same provisioning the suite runs at first boot:
@@ -54,7 +54,7 @@ const IDENTITY_TABLES = [
 // an operator can see, at apply time, exactly what is preserved.
 const PRESERVED = [
   'per-analyst burnout keys and recovery wraps',
-  'audit, forensic, and legal-hold chains',
+  'audit and forensic chains',
   'team and system config and sealed history',
   'training and helper-pay records',
 ];

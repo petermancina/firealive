@@ -31,7 +31,7 @@
 //   - instance-level identity ... re-established FRESH on the target (never
 //     restored verbatim, because verbatim identity restore IS cloning)
 //   - analyst-level keys ........ PRESERVED (user-bound, survive the reset)
-//   - data ...................... PRESERVED (audit / forensic / legal chains,
+//   - data ...................... PRESERVED (audit / forensic chains,
 //     config, sealed history, training / helper-pay)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -238,7 +238,7 @@ function planReconciliation(bundleDir, options) {
       data: {
         action: 'preserve',
         preserved: true,
-        detail: 'Audit, forensic, and legal-hold chains, team and system config, '
+        detail: 'Audit and forensic chains, team and system config, '
           + 'sealed history, and training / helper-pay records are restored as-is.',
       },
     },
