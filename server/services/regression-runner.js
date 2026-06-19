@@ -910,10 +910,10 @@ class RegressionRunner {
     });
 
     // ── Category 12: System ────────────────────────────────────────
-    await check('system', 'Node.js version >= 18', () => {
+    await check('system', 'Node.js version >= 20', () => {
       const major = parseInt(process.version.replace(/^v/, '').split('.')[0], 10);
-      if (!Number.isFinite(major) || major < 18) {
-        throw new Error('Node ' + process.version + ' is below the supported floor (>=18)');
+      if (!Number.isFinite(major) || major < 20) {
+        throw new Error('Node ' + process.version + ' is below the supported floor (>=20)');
       }
       return 'Node ' + process.version;
     });
