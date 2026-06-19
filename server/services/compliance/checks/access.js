@@ -35,7 +35,7 @@
 //     (1 = login blocks JWT until enrolled) per R3f
 //   - Planned "lead-only badge attributes" for privilege separation →
 //     no such concept; the users.role CHECK constraint makes roles
-//     mutually exclusive (analyst | lead | admin | developer)
+//     mutually exclusive (analyst | lead | admin)
 //   - Planned iam_integrations table → does not exist; IAM is stored
 //     in integration_config with integration_type in {iam_saml,
 //     iam_oidc, iam_ldap, iam_cloud}
@@ -161,7 +161,6 @@ function checkMfaEnforcement(db) {
 function checkPrivilegedSeparation(db) {
   const total = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get();
   const admins = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1 AND role = 'admin'").get();
-  const developers = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1 AND role = 'developer'").get();
   if (admins.c === 0) {
     return { status: 'fail', detail: 'No admin users defined — privileged role boundary violated; Config Lock and platform admin functions are unreachable.' };
   }
@@ -176,7 +175,7 @@ function checkPrivilegedSeparation(db) {
   }
   return {
     status: 'pass',
-    detail: `${admins.c} admin(s), ${developers.c} developer(s) across ${total.c} active user(s). Roles mutually exclusive at users.role CHECK constraint (analyst | lead | admin | developer).`,
+    detail: `${admins.c} admin(s) across ${total.c} active user(s). Roles mutually exclusive at users.role CHECK constraint (analyst | lead | admin).`,
   };
 }
 

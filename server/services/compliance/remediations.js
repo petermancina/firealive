@@ -56,7 +56,7 @@ const REMEDIATIONS = {
     summary: 'Ensure user roles and API keys are provisioned',
     steps: [
       'Navigate to MC -> Admin -> User Management',
-      'Verify at least one user exists per required role (analyst, lead, admin, developer)',
+      'Verify at least one user exists per required role (analyst, lead, admin)',
       'For programmatic access, create scoped API keys via MC -> Admin -> API Keys',
       'Each API key must have explicit scopes (comma-separated: health:read, siem:read, etc.)',
     ],
@@ -232,7 +232,7 @@ const REMEDIATIONS = {
     steps: [
       'Navigate to MC -> Admin -> User Management',
       'Review users with role = "admin"; SoD norm is admins <= 25% of active users',
-      'Demote unnecessary admin accounts to "lead" or "developer" as appropriate',
+      'Demote unnecessary admin accounts to "lead" as appropriate',
       'For SoD audit trail: every role change is recorded in audit_log via USER_ROLE_CHANGED events',
     ],
     uiPath: 'mc:admin/users',

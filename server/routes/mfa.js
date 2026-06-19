@@ -25,8 +25,8 @@
 // before the action runs.
 //
 // Auth:
-//   This file is mounted with authMiddleware(['analyst', 'lead', 'admin',
-//   'developer']) in server/index.js. Any authenticated user can manage
+//   This file is mounted with authMiddleware(['analyst', 'lead', 'admin'])
+//   in server/index.js. Any authenticated user can manage
 //   their own credentials. No per-handler role tightening -- the user_id
 //   scoping to req.user.id is the security boundary.
 //
@@ -69,19 +69,17 @@ const { auditLog } = require('../middleware/audit');
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Count a user's usable LOGIN methods, optionally excluding one passkey (used to
-// preview the effect of a deletion). A login method is: a password (if set), an
-// active issued certificate, or a passwordless passkey. Second-factor-only
-// passkeys are NOT login methods and never count here.
+// preview the effect of a deletion). A login method is an active issued
+// certificate or a passwordless passkey -- the only ways to obtain a session.
+// Second-factor-only passkeys are NOT login methods and never count here.
 function countLoginMethodsExcluding(db, userId, excludePasskeyId, excludeCertSerial) {
-  const u = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(userId);
-  const hasPassword = u && u.password_hash ? 1 : 0;
   const pwlessPasskeys = db.prepare(
     'SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ? AND is_passwordless = 1 AND id != ?'
   ).get(userId, excludePasskeyId || '').c;
   const activeCerts = db.prepare(
     "SELECT COUNT(*) AS c FROM issued_certs WHERE user_id = ? AND status = 'active' AND serial != ?"
   ).get(userId, excludeCertSerial || '').c;
-  return hasPassword + pwlessPasskeys + activeCerts;
+  return pwlessPasskeys + activeCerts;
 }
 
 // ── POST /api/mfa/passkey/register-options ──────────────────────────────────

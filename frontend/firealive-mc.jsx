@@ -2632,9 +2632,9 @@ function ManagementConsole() {
   const [compromiseTick, setCompromiseTick] = useState(0);
   // Auth logs
   const [authLogs, setAuthLogs] = useState([
-    {ts:"2026-04-08T08:01:00Z",user:"lead@corp.local",action:"LOGIN_SUCCESS",ip:"10.0.1.50",method:"password+totp"},
-    {ts:"2026-04-08T07:58:00Z",user:"unknown",action:"LOGIN_FAILED",ip:"192.168.1.99",method:"password",reason:"Invalid credentials"},
-    {ts:"2026-04-08T03:14:00Z",user:"analyst3@corp.local",action:"LOGIN_FAILED",ip:"10.0.1.72",method:"password",reason:"Account locked"},
+    {ts:"2026-04-08T08:01:00Z",user:"lead@corp.local",action:"LOGIN_SUCCESS",ip:"10.0.1.50",method:"passkey"},
+    {ts:"2026-04-08T07:58:00Z",user:"unknown",action:"LOGIN_FAILED",ip:"192.168.1.99",method:"cert",reason:"Untrusted client certificate"},
+    {ts:"2026-04-08T03:14:00Z",user:"analyst3@corp.local",action:"LOGIN_FAILED",ip:"10.0.1.72",method:"passkey",reason:"Account inactive"},
     {ts:"2026-04-07T23:42:00Z",user:"lead@corp.local",action:"LOGIN_SUCCESS",ip:"10.0.1.50",method:"saml_sso"},
   ]);
   const [authLogNotifCfg, setAuthLogNotifCfg] = useState({outOfCycleAttempts:true,deletedLogs:true,missingLogs:true,bruteForceThreshold:5,outOfCycleStartHr:0,outOfCycleEndHr:5});

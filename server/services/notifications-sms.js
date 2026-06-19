@@ -22,7 +22,7 @@
 // RECIPIENT PHONE RESOLUTION (N1a C6 schema):
 //   notifications.recipient_id is users.id. Phone is looked up via
 //   lead_notification_contacts WHERE user_id = ?. That table is structurally
-//   restricted to non-anonymous roles (lead, admin, developer) — analysts NEVER
+//   restricted to non-anonymous roles (lead, admin) — analysts NEVER
 //   have rows there. If no row or no phone column value → skip with audit
 //   NOTIFICATION_SMS_SKIPPED_NO_PHONE and notification_delivery_log status='skipped'.
 //
@@ -73,12 +73,12 @@ const PIPELINE_VERSION = 1;
 // ── Role policy ──────────────────────────────────────────────────────────────
 // Duplicated from notifications.js (N1a C7) to keep this module standalone
 // without introducing a circular-import risk against notifications.js. The
-// policy is intentionally simple (lead, admin, developer are contact-safe) and
+// policy is intentionally simple (lead, admin are contact-safe) and
 // expected to remain stable. If the canonical policy in notifications.js
 // changes, this duplicate must change in lockstep. Single grep-able function
 // name keeps the drift risk auditable.
 function isContactSafeRole(role) {
-  return role === 'lead' || role === 'admin' || role === 'developer';
+  return role === 'lead' || role === 'admin';
 }
 
 // ── Config resolution ────────────────────────────────────────────────────────

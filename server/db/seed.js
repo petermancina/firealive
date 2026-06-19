@@ -7,25 +7,31 @@ require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 
 const { getDb, initDb } = require('./init');
 const { appendAuditEntry } = require('../services/audit-chain');
-const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 async function seed() {
   initDb();
   const db = getDb();
 
-  const hash = (pw) => bcrypt.hashSync(pw, 10);
   const id = () => crypto.randomBytes(16).toString('hex');
+
+  // ── Login note ────────────────────────────────────────────────────────────
+  // These demo users are seeded WITHOUT credentials; authentication is
+  // passwordless (passkey or mTLS client certificate). To sign in to a freshly
+  // seeded instance, start the server once and capture the break-glass recovery
+  // credential it logs at first CA init, redeem it at POST /api/auth/break-glass,
+  // then enroll a passkey for the admin. No password, and no seed-time
+  // credential, by design.
 
   // ── Admin user ─────────────────────────────────────────────────────────
   const adminId = id();
-  db.prepare(`INSERT OR IGNORE INTO users (id, username, password_hash, role, name) VALUES (?, ?, ?, ?, ?)`)
-    .run(adminId, 'admin', hash('admin'), 'admin', 'System Admin');
+  db.prepare(`INSERT OR IGNORE INTO users (id, username, role, name) VALUES (?, ?, ?, ?)`)
+    .run(adminId, 'admin', 'admin', 'System Admin');
 
   // ── Team Lead ──────────────────────────────────────────────────────────
   const leadId = id();
-  db.prepare(`INSERT OR IGNORE INTO users (id, username, password_hash, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(leadId, 'lead', hash('lead'), 'lead', 'Team Lead', 3, 'day');
+  db.prepare(`INSERT OR IGNORE INTO users (id, username, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(leadId, 'lead', 'lead', 'Team Lead', 3, 'day');
 
   // ── Analysts (matches frontend demo data) ──────────────────────────────
   const analysts = [
@@ -50,7 +56,7 @@ async function seed() {
   ];
 
   const insertAnalyst = db.prepare(
-    `INSERT OR IGNORE INTO users (id, username, password_hash, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT OR IGNORE INTO users (id, username, role, name, tier, shift) VALUES (?, ?, ?, ?, ?, ?)`
   );
 
   const insertCap = db.prepare(
@@ -61,8 +67,23 @@ async function seed() {
   for (const a of analysts) {
     const aid = id();
     analystIds[a.user] = aid;
-    insertAnalyst.run(aid, a.user, hash(a.user), 'analyst', a.name, a.tier, a.shift);
+    insertAnalyst.run(aid, a.user, 'analyst', a.name, a.tier, a.shift);
     insertCap.run(aid, a.tier === 3 ? 5 : a.tier === 2 ? 3 : 2);
+  }
+
+  // ── Demo analyst pseudonyms ─────────────────────────────────────────────────
+  // The MC team views key burnout surfaces to the pseudonym, not the name.
+  // initDb()'s identity backfill assigns one to every analyst lacking it, but it
+  // runs before these demo rows exist, so assign here with the same canonical
+  // generator. Idempotent: analysts that already have a pseudonym are skipped.
+  const { generateUniquePseudonym } = require('../lib/pseudonym');
+  const noPseudonym = db.prepare("SELECT id FROM users WHERE role = 'analyst' AND (pseudonym IS NULL OR pseudonym = '')").all();
+  const pseudonymTaken = db.prepare('SELECT 1 FROM users WHERE pseudonym = ?');
+  const setPseudonym = db.prepare('UPDATE users SET pseudonym = ?, pseudonym_rotated_at = ? WHERE id = ?');
+  const nowIso = new Date().toISOString();
+  for (const r of noPseudonym) {
+    const pseudonym = generateUniquePseudonym((candidate) => !!pseudonymTaken.get(candidate));
+    setPseudonym.run(pseudonym, nowIso, r.id);
   }
 
   // ── Automation Systems ─────────────────────────────────────────────────

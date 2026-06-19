@@ -37,8 +37,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   username TEXT UNIQUE NOT NULL,
   email TEXT,  -- R3c: SILENT join key for HR scheduling sync ONLY. Populated by SSO claim at login; never typed by leads, never displayed in MC/AC/GD, never written to burnout/metrics/audit tables. See ANONYMITY MODEL note in migration block below.
-  password_hash TEXT,  -- NULL when using SSO (SAML/OIDC/LDAP)
-  role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'developer')),
+  role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'anon_author')),  -- anon_author: a rights-less system role (in no route allow-list) held only by the lazily-created legacy-anonymous post-author sentinel
   name TEXT NOT NULL,
   pseudonym TEXT,  -- v0.0.25: burnout data keyed to this, not name
   pseudonym_rotated_at TEXT,  -- R0: timestamp of last pseudonym rotation
@@ -2889,7 +2888,7 @@ function initDb() {
         if (sentinelEnsured) return;
         db.prepare(
           "INSERT OR IGNORE INTO users (id, username, role, name, active, mfa_enrollment_required) " +
-          "VALUES (?, ?, 'developer', 'Legacy Anonymous (system)', 0, 0)"
+          "VALUES (?, ?, 'anon_author', 'Legacy Anonymous (system)', 0, 0)"
         ).run(SENTINEL_ID, SENTINEL_ID);
         sentinelEnsured = true;
       };
@@ -3257,6 +3256,95 @@ function initDb() {
     }
   } catch (userRoleMigErr) {
     console.error('users migration (B5h3) failed (non-fatal):', userRoleMigErr.message);
+  }
+
+  // ── Migration: users role CHECK swap -- retire developer for anon_author (B5h3) ──
+  // The 'developer' role is retired. The only account that ever held it is the
+  // lazily-created 'legacy-anonymous' system sentinel (the FK author-of-record
+  // for anonymized posts); the seed never creates developers and no directory
+  // group maps to one. Any row still on 'developer' is rewritten to 'anon_author'
+  // -- a rights-less role that is in no route allow-list, so it can authorize
+  // nothing. SQLite cannot ALTER a CHECK, so the table is rebuilt by DERIVING the
+  // new DDL from the LIVE users CREATE and replacing only the table name and the
+  // role CHECK. The role is remapped DURING the copy into the new table (a plain
+  // UPDATE on the old table would violate its CHECK, which still forbids
+  // 'anon_author', and SELECT * would carry the forbidden value across), so the
+  // column list is taken from PRAGMA table_info and the role column is rewritten
+  // in flight. Foreign keys toggle OFF for the rebuild and back ON afterward;
+  // foreign_key_check verifies no orphaned child rows before COMMIT. Gated on the
+  // live users SQL still containing 'developer' in the CHECK -- a no-op on fresh
+  // installs and on already-swapped bases. Runs BEFORE the password_hash drop so
+  // it derives the DDL from a schema SQLite has not yet rewritten.
+  try {
+    const uDevRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+    if (uDevRow && uDevRow.sql && uDevRow.sql.includes('developer')) {
+      const devWideCheck = "role IN ('analyst', 'lead', 'admin', 'developer')";
+      const devNarrowCheck = "role IN ('analyst', 'lead', 'admin', 'anon_author')";
+      if (!uDevRow.sql.includes(devWideCheck)) {
+        throw new Error('users role CHECK clause not found in live schema; aborting rebuild to avoid corruption');
+      }
+      const devPrefixes = [
+        'CREATE TABLE IF NOT EXISTS "users"',
+        'CREATE TABLE IF NOT EXISTS users',
+        'CREATE TABLE "users"',
+        'CREATE TABLE users',
+      ];
+      let devNewDdl = null;
+      for (const pfx of devPrefixes) {
+        if (uDevRow.sql.startsWith(pfx)) { devNewDdl = 'CREATE TABLE users_new' + uDevRow.sql.slice(pfx.length); break; }
+      }
+      if (devNewDdl === null) {
+        throw new Error('unexpected users CREATE statement; aborting rebuild to avoid corruption');
+      }
+      devNewDdl = devNewDdl.replace(devWideCheck, devNarrowCheck);
+      const devCols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+      const devColList = devCols.map((c) => '"' + c + '"').join(', ');
+      const devSelectList = devCols.map((c) =>
+        c === 'role' ? "CASE WHEN role = 'developer' THEN 'anon_author' ELSE role END" : '"' + c + '"'
+      ).join(', ');
+      console.log('users migration (B5h3): swapping role CHECK to retire developer');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(devNewDdl);
+        const devTotal = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+        const devMoved = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'developer'").get().n;
+        db.exec('INSERT INTO users_new (' + devColList + ') SELECT ' + devSelectList + ' FROM users');
+        db.exec('DROP TABLE users');
+        db.exec('ALTER TABLE users_new RENAME TO users');
+        const devFkViolations = db.prepare('PRAGMA foreign_key_check').all();
+        if (devFkViolations.length > 0) {
+          throw new Error('foreign_key_check reported ' + devFkViolations.length + ' violation(s) after users rebuild');
+        }
+        db.exec('COMMIT');
+        if (devMoved) console.log('users migration (B5h3): reassigned ' + devMoved + ' developer account(s) to anon_author');
+        console.log('users migration (B5h3): rebuilt, preserved ' + devTotal + ' user(s)');
+      } catch (devRebuildErr) {
+        db.exec('ROLLBACK');
+        throw devRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (userDevMigErr) {
+    console.error('users migration (B5h3) developer swap failed (non-fatal):', userDevMigErr.message);
+  }
+
+  // ── Migration: drop the unused password_hash column (B5h3) ──
+  // Password login was removed -- a session now comes only from a client
+  // certificate or a passkey -- so password_hash is dead. No index, foreign
+  // key, CHECK, or trigger references it, so a plain DROP COLUMN suffices
+  // (SQLite 3.35+; better-sqlite3 12.x bundles a newer engine). Gated on the
+  // column still being present, so this is a no-op on fresh installs and on
+  // bases where it has already been dropped.
+  try {
+    const usersCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+    if (usersCols.includes('password_hash')) {
+      db.exec('ALTER TABLE users DROP COLUMN password_hash');
+      console.log('users migration (B5h3): dropped unused password_hash column');
+    }
+  } catch (pwHashMigErr) {
+    console.error('users migration (B5h3) drop password_hash failed (non-fatal):', pwHashMigErr.message);
   }
 
   // ── Migration: ir_policies phantom → canonical (Phase 1.4c precursor) ──
@@ -4642,14 +4730,14 @@ function initDb() {
           CHECK (mfa_enrollment_required IN (0, 1));
       `);
       // Set the flag for ALL existing user rows. Per R3f-pt2, MFA is
-      // required for every account (admin, lead, developer, analyst).
+      // required for every account (admin, lead, analyst).
       // SOC-grade environments universally require MFA per NIST SP
       // 800-63B, SOC 2, PCI-DSS. The original R3f carve-out for the
       // analyst role was UX deference; SOC security policy wins.
       const setResult = db.prepare(`
         UPDATE users
         SET mfa_enrollment_required = 1
-        WHERE role IN ('admin', 'lead', 'developer', 'analyst')
+        WHERE role IN ('admin', 'lead', 'analyst')
       `).run();
       console.log(`R3f migration: added users.mfa_enrollment_required and set it for ${setResult.changes} user row(s)`);
     }
@@ -6741,7 +6829,7 @@ function initDb() {
   //   (4) New notification_delivery_log table for per-attempt audit
   //   (5) New lead_notification_contacts table — per-lead phone + email storage
   //       for SMS + email notification channels. Structurally restricted to
-  //       non-anonymous roles (lead, admin, developer) via API role-gating;
+  //       non-anonymous roles (lead, admin) via API role-gating;
   //       analyst-role users NEVER have rows here. Anonymity-preservation by
   //       design (see anonymity-preservation note below + N1a C7).
   //
@@ -6759,7 +6847,7 @@ function initDb() {
   // PII-in-audit-logs.
   //
   // Anonymity-preservation note on lead_notification_contacts: this table is
-  // structurally restricted to non-anonymous roles (lead, admin, developer).
+  // structurally restricted to non-anonymous roles (lead, admin).
   // Analyst-role users NEVER have rows here — three layers of defense:
   //   (a) AC preference UI hides email + SMS channel checkboxes entirely
   //   (b) API PUT /api/users/me/lead-contacts rejects analyst-role callers
@@ -6963,7 +7051,7 @@ function initDb() {
       n1aLeadContactsMigrationErr.message
     );
     console.error(
-      'The server will start, but lead/admin/developer users cannot register personal phone or email for SMS/email notifications. The MC "Your Contact Info" Card (Notification Preferences tab) will fail to save; PUT /api/users/me/lead-contacts will return 500. SMS and email dispatch attempts for lead users will skip with audit reason="no_lead_phone_registered" or "no_lead_email_registered". In-app + desktop channels continue to function normally for all roles. Analyst-role users are unaffected (this table never holds analyst rows by design — anonymity preservation). Recovery: manually run the CREATE TABLE + CREATE INDEX statements in a SQLite shell against the production DB.'
+      'The server will start, but lead/admin users cannot register personal phone or email for SMS/email notifications. The MC "Your Contact Info" Card (Notification Preferences tab) will fail to save; PUT /api/users/me/lead-contacts will return 500. SMS and email dispatch attempts for lead users will skip with audit reason="no_lead_phone_registered" or "no_lead_email_registered". In-app + desktop channels continue to function normally for all roles. Analyst-role users are unaffected (this table never holds analyst rows by design — anonymity preservation). Recovery: manually run the CREATE TABLE + CREATE INDEX statements in a SQLite shell against the production DB.'
     );
   }
 

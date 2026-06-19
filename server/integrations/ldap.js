@@ -32,7 +32,6 @@ const DEFAULT_GROUP_MAPPING = {
   'CN=SOC-Analysts,OU=Security,DC=corp': 'analyst',
   'CN=SOC-Leads,OU=Security,DC=corp': 'lead',
   'CN=IT-Admins,OU=IT,DC=corp': 'admin',
-  'CN=SOC-Developers,OU=Security,DC=corp': 'developer',
 };
 
 const SEARCH_ATTRS = ['sAMAccountName', 'userPrincipalName', 'displayName', 'cn', 'mail', 'memberOf', 'objectGUID', 'entryUUID'];

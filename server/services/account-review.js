@@ -47,10 +47,13 @@ function runAccountReview() {
     // 2. Orphaned local accounts — created locally but LDAP is configured
     const ldapConfig = db.prepare("SELECT id FROM integration_config WHERE integration_type = 'iam_ldap' AND status = 'operational'").get();
     if (ldapConfig) {
+      // Exclude the 'legacy-anonymous' system sentinel: a deliberate local,
+      // inactive placeholder account (FK author-of-record for anonymized
+      // messages), identified by its stable id rather than by role.
       const localAccounts = db.prepare(`
         SELECT id, username, name, role, created_at
         FROM users
-        WHERE auth_method = 'local' AND role != 'developer'
+        WHERE auth_method = 'local' AND id != 'legacy-anonymous'
       `).all();
 
       for (const u of localAccounts) {

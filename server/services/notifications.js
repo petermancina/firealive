@@ -148,8 +148,8 @@ function isKnownEventType(eventType) {
 }
 
 // ── Anonymity-preservation role check ────────────────────────────────────────
-// N1a C7: Returns true if the role is a non-anonymous role (lead, admin,
-// developer) and therefore eligible for the email + sms notification channels.
+// N1a C7: Returns true if the role is a non-anonymous role (lead, admin)
+// and therefore eligible for the email + sms notification channels.
 // Returns false for analyst-role users (anonymity-protected — only in_app +
 // desktop channels are available) and for any unknown role (safe default —
 // treat as anonymity-protected if the user lookup fails).
@@ -169,7 +169,7 @@ function isKnownEventType(eventType) {
 //       for analyst users regardless of stored notification_preferences
 //       values (defense against DB tampering, legacy data, or API bypass)
 function isContactSafeRole(role) {
-  return role === 'lead' || role === 'admin' || role === 'developer';
+  return role === 'lead' || role === 'admin';
 }
 
 // ── Preference resolution ────────────────────────────────────────────────────
@@ -216,7 +216,7 @@ function resolvePreference(db, userId, eventType, opts = {}) {
   // N1a C7: ANALYST ANONYMITY ENFORCEMENT (dispatch-layer defense)
   // Look up role if not provided. Unknown role → treat as anonymity-protected
   // (safer default for unknown user). isContactSafeRole() returns false unless
-  // role is lead/admin/developer.
+  // role is lead/admin.
   let role = opts.role;
   if (role === undefined) {
     const userRow = db.prepare('SELECT role FROM users WHERE id = ?').get(userId);
@@ -522,7 +522,7 @@ function setPreference(userId, eventType, { in_app, email, sms, desktop }) {
     const role = userRow ? userRow.role : undefined;
     if (!isContactSafeRole(role) && (email || sms)) {
       const err = new Error(
-        `setPreference(): email and sms channels are not available for analyst-role users — these channels are restricted to lead/admin/developer roles to preserve analyst anonymity`
+        `setPreference(): email and sms channels are not available for analyst-role users — these channels are restricted to lead/admin roles to preserve analyst anonymity`
       );
       err.code = 'ANALYST_CHANNEL_RESTRICTED';
       throw err;

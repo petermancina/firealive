@@ -8,7 +8,7 @@
 //
 // SECURITY MODEL (anonymity preservation, N1a C7 + C19):
 //   - Both endpoints require an authenticated user (req.user from JWT middleware)
-//   - Both endpoints check role: only lead/admin/developer can read or write
+//   - Both endpoints check role: only lead/admin can read or write
 //   - Analyst-role users get HTTP 403 with code ANALYST_CONTACT_STORAGE_BLOCKED
 //   - The underlying lead_notification_contacts table (N1a C6 schema) is
 //     structurally restricted by design: analysts NEVER have rows there.
@@ -46,10 +46,10 @@ const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 
 // N1a C19: Anonymity-preservation role policy. Duplicated from notifications.js
-// (N1a C7) to avoid circular-import risk. Stable policy (lead/admin/developer
+// (N1a C7) to avoid circular-import risk. Stable policy (lead/admin
 // are contact-safe; analyst + unknown roles are not).
 function isContactSafeRole(role) {
-  return role === 'lead' || role === 'admin' || role === 'developer';
+  return role === 'lead' || role === 'admin';
 }
 
 // RFC 5322 light: rejects whitespace, requires single @, requires a TLD-ish
@@ -99,7 +99,7 @@ router.get('/', (req, res) => {
       auditLog(userId, 'MC_ANALYST_CONTACT_STORAGE_ACCESS_DENIED',
         `role=${role || 'unknown'} action=read`, req.ip);
       return res.status(403).json({
-        error: 'Lead contact storage is restricted to non-anonymous roles (lead, admin, developer). Analyst-role users do not have a lead_notification_contacts entry by design — this preserves the pseudonym architecture.',
+        error: 'Lead contact storage is restricted to non-anonymous roles (lead, admin). Analyst-role users do not have a lead_notification_contacts entry by design — this preserves the pseudonym architecture.',
         code: 'ANALYST_CONTACT_STORAGE_BLOCKED',
       });
     }
@@ -137,7 +137,7 @@ router.put('/', (req, res) => {
       auditLog(userId, 'MC_ANALYST_CONTACT_STORAGE_ACCESS_DENIED',
         `role=${role || 'unknown'} action=write`, req.ip);
       return res.status(403).json({
-        error: 'Lead contact storage is restricted to non-anonymous roles (lead, admin, developer). Analyst-role users cannot register notification contact info — this preserves the pseudonym architecture.',
+        error: 'Lead contact storage is restricted to non-anonymous roles (lead, admin). Analyst-role users cannot register notification contact info — this preserves the pseudonym architecture.',
         code: 'ANALYST_CONTACT_STORAGE_BLOCKED',
       });
     }

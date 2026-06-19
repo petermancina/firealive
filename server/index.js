@@ -243,7 +243,6 @@ app.use('/api/training/completions-review', authMiddleware(['lead', 'admin']), r
 app.use('/api/training', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/training'));
 app.use('/api/features', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/features'));
 app.use('/api/query', authMiddleware(['lead', 'admin']), require('./routes/query'));
-app.use('/api/auth/password', require('./routes/password'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/restore-approvals', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/restore-approvals'));
 app.use('/api/data-subject', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/data-subject'));
