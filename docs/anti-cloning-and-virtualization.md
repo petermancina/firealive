@@ -176,7 +176,7 @@ A migration separates the imported bundle into three layers:
 - Analyst-level keys (per-analyst burnout keys and recovery wraps):
   preserved. They are user-bound and stay recoverable through the offline
   recovery code, so they survive the identity reset.
-- Data (audit, forensic, and legal-hold chains, team and system config,
+- Data (audit and forensic chains, team and system config,
   sealed history, training and helper-pay records): preserved.
 
 ### The FA-MIG1 bundle
