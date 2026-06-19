@@ -232,7 +232,7 @@ function withSftp(creds, log, op) {
     // Host key verification -- REQUIRED PINNING (see file header).
     config.hostVerifier = (key) => {
       const hash = crypto.createHash('sha256').update(key).digest('base64')
-        .replace(/=+$/, '');  // SSH fingerprint convention strips trailing '='
+        .replaceAll('=', '');  // SSH fingerprint convention strips trailing '='
       const fingerprint = `SHA256:${hash}`;
       if (creds.hostKeyFingerprint !== fingerprint) {
         log('error', 'sftp host key MISMATCH -- refusing connection', {

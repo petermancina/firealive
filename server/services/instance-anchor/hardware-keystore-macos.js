@@ -176,7 +176,7 @@ function realRunHelper(args) {
 }
 
 function toBase64Url(buf) {
-  return buf.toString('base64').split('+').join('-').split('/').join('_').replace(/=+$/, '');
+  return buf.toString('base64url');
 }
 
 function x963ToSpkiDer(b64point) {
