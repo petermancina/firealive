@@ -1,6 +1,6 @@
 {
   "name": "firealive-global-dashboard-server",
-  "version": "1.0.64",
+  "version": "1.0.65",
   "description": "FireAlive Global Dashboard — Independent Backend Server",
   "main": "index.js",
   "scripts": {

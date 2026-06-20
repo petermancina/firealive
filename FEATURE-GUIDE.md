@@ -758,13 +758,18 @@ Step-up user verification stays required in every mode — there is no VDI or vi
 
 ### SDN
 
-**What it’s for:** Configure FireAlive for distributed SOC environments where analysts, automation, and SIEM infrastructure span multiple sites connected via SD-WAN or SDN fabrics. Tells FireAlive which CIDRs are which sites so routing and access controls are network-aware.
+**What it’s for:** Run the FireAlive regional server inside a software-defined network — on bare metal with a TPM or a VM with a vTPM — and have FireAlive treat the SDN as a security boundary it continuously verifies. SDN mode is chosen once at first boot, alongside bare-metal, virtualized, and cloud, and is sealed to the hardware root so it cannot be flipped later. FireAlive only ever *reads* your SDN controller; it never applies, pushes, or programs controller configuration.
 
-**Workflow:**
+**What SDN Mode enforces:**
 
-1. Lead picks SDN platform (Cisco ACI, VMware NSX, etc.)
-1. Configures controller endpoint, primary/secondary site CIDRs, SD-WAN overlay
-1. FireAlive’s network awareness adjusts to the SDN topology
+- **Segment-aware admission.** You declare which network segments FireAlive’s own components occupy. Connections originating outside those permitted segments are refused before authentication, so a foothold elsewhere on the network cannot even reach the API. Local and loopback traffic is always allowed so the host stays manageable.
+- **Continuous, read-only posture verification.** FireAlive probes the SDN controller — Cisco ACI, VMware NSX, OpenFlow, Arista CloudVision, Juniper CN2, Calico, Cilium, or a generic REST controller — on a schedule, using read-only credentials over a certificate-pinned connection, to confirm segmentation assurance is intact. Probes never change anything on the controller.
+- **Assume-breach fail-safe.** If segmentation assurance is lost — controllers unreachable or rejecting authentication past a debounce threshold — FireAlive locks down its entire API surface (health checks included) rather than serving traffic it can no longer prove is segmented. Lockdown lifts automatically once posture is restored; there is no remote override.
+- **Least-privilege segmentation policy, generated for you.** From the tier-to-segment map you declare, FireAlive generates a default-deny micro-segmentation policy in your platform’s own vocabulary, for you to review and apply through your own change control. The policy never permits management or aggregate zones (Tier-1) to reach analyst-private zones (Tier-3) — the same separation FireAlive enforces in its data model, now expressed at the network layer.
+
+**Not a container workload.** Like every non-cloud deployment, SDN mode runs the FireAlive server as a direct host process on hardware with a TPM or a VM with a vTPM — never Kubernetes, never a managed or orchestrated container — because those compute models cannot give FireAlive the per-instance hardware root of trust it depends on. The SDN segments that host at the network layer; FireAlive runs on it the same way a bare-metal or virtualized install does.
+
+The full operator runbook — provisioning, configuring the controller integration, the posture and lockdown model, and applying the generated segmentation policy — is in `docs/sdn-mode.md`.
 
 ### SASE / ZTNA
 
