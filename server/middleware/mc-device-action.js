@@ -79,7 +79,7 @@ function requireDeviceAction(action, targetOf) {
     // restore, pause/resume, migration) cannot be trusted to validate the iat
     // window. Fail closed in that case; bare-metal is never gated.
     const mode = (req.app && req.app.locals && req.app.locals.deploymentMode) || {};
-    const clock = checkClockIntegrity({ virtualized: !!mode.virtualized });
+    const clock = checkClockIntegrity({ virtualized: mode.substrateVirtualized === true });
     if (!clock.ok) {
       auditLog(uid, 'MC_DEVICE_ACTION_CLOCK_UNTRUSTED', action, req.ip);
       logger.error('mc device-action refused: clock integrity check failed', { reason: clock.reason, skewMs: clock.skewMs });
