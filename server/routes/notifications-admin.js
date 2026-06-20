@@ -67,7 +67,7 @@ router.get('/stats', (req, res) => {
 // ── Flush the queue immediately ──────────────────────────────────────────────
 router.post('/flush-queue', async (req, res) => {
   try {
-    const { processQueue } = require('../services/notifications-email');
+    const { processQueue } = require('../services/notifications-pipeline');
     const stats = await processQueue();
     auditLog(req.user?.id, 'NOTIFICATIONS_QUEUE_FLUSHED_MANUALLY', JSON.stringify(stats), req.ip);
     res.json({ success: true, stats });
