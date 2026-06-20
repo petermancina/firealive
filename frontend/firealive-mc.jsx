@@ -898,7 +898,7 @@ function IntegrationHealthPanel() {
   if (!settings) return <Card style={{ marginBottom: 16 }}><M style={{ color: C.w }}>Integration health settings unavailable (admin only).</M></Card>;
 
   const keys = settings.integrationKeys || [];
-  const labels = { kms: 'KMS / Key-Wrapping', storage: 'Cloud Storage', iam: 'LDAP / AD', siem: 'SIEM', soar: 'SOAR', edr: 'EDR / Malware Scanner', ticketing: 'Ticketing' };
+  const labels = { kms: 'KMS / Key-Wrapping', storage: 'Cloud Storage', iam: 'LDAP / AD', siem: 'SIEM', soar: 'SOAR', edr: 'EDR / Malware Scanner', ticketing: 'Ticketing', sdn: 'SDN Controller', cloud: 'Cloud Attestation', backup: 'Backup Schedules', notifications: 'Notification Channels', scheduling: 'Workforce Scheduling', cicd: 'CI/CD Pipeline' };
   const okAll = results && results.summary && results.summary.ok === results.summary.total;
 
   return (
@@ -1344,6 +1344,7 @@ function MigrationPanel() {
 
 function ManagementConsole() {
   const [tab, setTab] = useState("actions");
+  const [notifTest, setNotifTest] = useState(null);
   const [gDepth, setGD] = useState(null);
   const [pDepths, setPD] = useState({});
   const [silenced, setSil] = useState([]);
@@ -3464,7 +3465,7 @@ function ManagementConsole() {
       {id:"skillmatrix",label:"Skills Matrix"},{id:"assessments",label:"Assessments"},{id:"general_certs",label:"Certifications"},{id:"training_reviews",label:"Training Reviews",badge:trainingReviewPendingCount},{id:"retro",label:"CISM Retro"},{id:"peersupport",label:"Peer Config"},{id:"helper_pay",label:"Helper Pay"},{id:"pseudonyms",label:"Pseudonyms"},{id:"ooda_mgmt",label:"IR Simulator"},{id:"proactive",label:"Proactive Breaks"},{id:"upskilling_hr",label:"Upskilling Hour"},{id:"offboarding",label:"Offboarding"},{id:"sync_interval",label:"Sync Interval"},{id:"client_notif",label:"Client Notifications"},
     ]},
     {cat:"integrations",label:"Integrations",items:[
-      {id:"integrations",label:"Health Dashboard"},{id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"internal_ai",label:"Internal AI"},
+      {id:"siem",label:"SIEM"},{id:"edr",label:"EDR"},{id:"malware_scanners",label:"Malware Scanners"},{id:"threat_hunt",label:"Threat Hunting"},{id:"onboard",label:"Client Provisioning"},{id:"internal_ai",label:"Internal AI"},
     ]},
     {cat:"security",label:"Security",items:[
       {id:"iam",label:"IAM"},{id:"mfa",label:"MFA"},{id:"apikeys",label:"API Keys"},{id:"access_ctrl",label:"Access Control"},{id:"auth_logs",label:"Auth Logs"},{id:"kms",label:"KMS"},{id:"wifi",label:"WiFi Policy"},{id:"posture",label:"Posture Assessment"},{id:"tripwire",label:"Tripwire"},{id:"compromise_scan",label:"Compromise Scan"},{id:"log_integrity",label:"Log Integrity"},{id:"regression",label:"Regression Test"},{id:"ttx",label:"TTX Generator"},
@@ -5816,53 +5817,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/petermancina/firealive</M></Card>
         </div>)}
 
-        {/* ══════════ INTEGRATIONS HEALTH TAB ══════════ */}
-        {tab==="integrations"&&(<div>
-          <L>Integrations Health</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Real-time status of all configured integrations. Disconnected integrations will trigger alerts. Configure each integration in its dedicated tab.</M>
-          <Card style={{marginBottom:16}}>
-            {[
-              {n:"SIEM CEF Stream",s:"connected",d:"TLS 6514 · Last event 2s ago"},
-              {n:"Authentication",s:"connected",d:"Passwordless \u2014 mTLS client certificate + FIDO2 passkey (AAL3). Directory/offboarding via the IAM tab."},
-              {n:"SOAR Platform",s:"connected",d:"Splunk SOAR · Webhook active · Last playbook trigger 12m ago"},
-              {n:"Automation / SOAR Routing",s:autoSys.length+" connected",d:autoSys.map(a=>a.name).join(", ")||"None"},
-              {n:"Ticketing System",s:"connected",d:"ServiceNow · REST API · Last sync 5m ago"},
-              {n:"Vulnerability Scanner",s:"configured",d:"Nessus · Weekly schedule · Last scan 3d ago"},
-              {n:"Cloud Vuln Scanner",s:"pending",d:"Not configured — see Cloud Vuln Scan tab"},
-              {n:"SASE / ZTNA",s:"pending",d:"Not configured — see SASE tab"},
-              {n:"CASB",s:"pending",d:"Configured via SASE provider"},
-              {n:"VDI / Remote Desktop",s:"connected",d:"Citrix Workspace · TLS 1.3 · Cert pinned"},
-              {n:"SDN / Network Segmentation",s:"connected",d:"Cisco ACI · Microsegment active"},
-              {n:"Cloud Infrastructure",s:"connected",d:"AWS · VPC private endpoints · KMS envelope encryption"},
-              {n:"Backup System",s:"connected",d:"Daily auto · Last backup 6h ago · AES-256-GCM"},
-              {n:"Calendar Integration",s:"pending",d:"Individual analyst config — see Peer tab"},
-              {n:"Notification Channels",s:"configured",d:"Desktop notifications active"},
-              {n:"Testing Lab",s:"configured",d:"cyber-lab.corp.local · REST API"},
-              ...(provisionedClients.length>0?[{n:"Provisioned Clients",s:provisionedClients.length+" deployed",d:provisionedClients.map(c=>c.hostname).join(", ")}]:[]),
-              {n:"CI/CD Pipeline",s:"pending",d:"See CI/CD tab for pipeline configs"},
-              {n:"EDR File Inspection",s:edrCfg.enabled?"configured":"pending",d:edrCfg.enabled?`${edrCfg.provider} · Scan on upload/restore/import`:"Not configured — see EDR tab"},
-              {n:"Enterprise KMS",s:kmsCfg.enabled?"configured":"pending",d:kmsCfg.enabled?`${kmsCfg.provider} · ${kmsCfg.hsmBacked?"HSM-backed":"Software keys"} · Rotation: ${kmsCfg.rotationPolicy}`:"Not configured — see KMS tab"},
-              {n:"WiFi Security Policy",s:"configured",d:`Min: ${wifiPolicy.minimumProtocol.replace(/_/g," ")} · WPA3 preferred: ${wifiPolicy.wpa3Preferred?"yes":"no"} · Block PSK: ${wifiPolicy.blockWpa2Personal?"yes":"no"}`},
-              {n:"MSP Multi-Tenancy",s:mspCfg.enabled?mspCfg.tenants.length+" tenants":"disabled",d:mspCfg.enabled?`Isolation: ${Object.values(mspCfg.isolation).filter(Boolean).length}/5 controls active`:"Not enabled — see MSP tab"},
-              {n:"MFA",s:mfaCfg.status==="configured"?"configured":"pending",d:mfaCfg.status==="configured"?`Method: ${mfaCfg.method} · Enforce all: ${mfaCfg.enforceForAll?"yes":"no"}`:"Not configured — see MFA tab"},
-              {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?`${threatHuntCfg.xdr.provider} · Behavior monitoring`:"Not configured — see Threat Hunting tab"},
-              {n:"Tripwire",s:tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled",d:tripwireCfg.enabled?`Threshold: ${tripwireCfg.threshold_pct}% analysts in reduced routing`:"Not enabled — see Tripwire tab"},
-              {n:"Posture Assessment",s:postureCfg.enabled?"enabled":"disabled",d:postureCfg.enabled?`${Object.values(postureCfg.checks).filter(v=>v===true).length} checks active · ${postureCfg.blockOnFail?"strict":"warn"} mode`:"Not enabled — see Posture tab"},
-              {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?`${haCfg.mode} · Sync every ${haCfg.syncIntervalSec}s`:"Not configured — see HA tab"},
-              {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure · Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled — see Fail-Open tab"},
-              {n:"Pseudonym System",s:pseudonymCfg.enabled?"active":"disabled",d:pseudonymCfg.enabled?`${analystPseudonyms.length} analysts pseudonymized`:"Not enabled — see Pseudonyms tab"},
-              {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?`${geoFenceCfg.clients.length} clients geo-assigned`:"Not configured — see Data Sovereignty tab"},
-              {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?`${clusterCfg.nodeCount} nodes · ${clusterCfg.sessionStore}`:"Single instance"},
-              {n:"Sync Interval",s:"configured",d:`Every ${syncIntervalCfg.intervalMin}min · ${syncIntervalCfg.adaptiveSync?"adaptive":"fixed"} · ${syncIntervalCfg.batchMode?"batch":"streaming"}`},
-            ].map((item,idx)=>(
-              <div key={idx} style={{display:"flex",justifyContent:"space-between",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
-                <div><div style={{fontSize:12}}>{item.n}</div><M style={{color:C.td}}>{item.d}</M></div>
-                <Badge color={item.s.includes("connected")||item.s==="configured"?C.a:item.s==="pending"?C.w:C.d}>{item.s}</Badge>
-              </div>
-            ))}
-          </Card>
-        </div>)}
-
         {/* ══════════ CLIENT NOTIFICATIONS CONFIG ══════════ */}
         {tab==="client_notif"&&(<div>
           <L>Client Notification Configuration</L>
@@ -6986,6 +6940,40 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             </div>
           </Card>
           <IntegrationHealthPanel/>
+          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>System Configuration</div>
+          <Card style={{marginBottom:16}}>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Configuration state of internal controls and not-yet-probed integrations. These are FireAlive-internal features, not external systems to reach, so they show config state only \u2014 external integrations with live read-only health checks appear in the panel above.</M>
+            {[
+              {n:"Tripwire",s:tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled",d:tripwireCfg.enabled?"Threshold: "+tripwireCfg.threshold_pct+"% analysts in reduced routing":"Not enabled \u2014 see Tripwire tab"},
+              {n:"Posture Assessment",s:postureCfg.enabled?"enabled":"disabled",d:postureCfg.enabled?Object.values(postureCfg.checks).filter(v=>v===true).length+" checks active \u00b7 "+(postureCfg.blockOnFail?"strict":"warn")+" mode":"Not enabled \u2014 see Posture tab"},
+              {n:"MFA",s:mfaCfg.status==="configured"?"configured":"pending",d:mfaCfg.status==="configured"?"Method: "+mfaCfg.method+" \u00b7 Enforce all: "+(mfaCfg.enforceForAll?"yes":"no"):"Not configured \u2014 see MFA tab"},
+              {n:"Pseudonym System",s:pseudonymCfg.enabled?"active":"disabled",d:pseudonymCfg.enabled?analystPseudonyms.length+" analysts pseudonymized":"Not enabled \u2014 see Pseudonyms tab"},
+              {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure \u00b7 Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled \u2014 see Fail-Open tab"},
+              {n:"WiFi Security Policy",s:"configured",d:"Min: "+wifiPolicy.minimumProtocol.replace(/_/g," ")+" \u00b7 WPA3 preferred: "+(wifiPolicy.wpa3Preferred?"yes":"no")+" \u00b7 Block PSK: "+(wifiPolicy.blockWpa2Personal?"yes":"no")},
+              {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?haCfg.mode+" \u00b7 Sync every "+haCfg.syncIntervalSec+"s":"Not configured \u2014 see HA tab"},
+              {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?clusterCfg.nodeCount+" nodes \u00b7 "+clusterCfg.sessionStore:"Single instance"},
+              {n:"Sync Interval",s:"configured",d:"Every "+syncIntervalCfg.intervalMin+"min \u00b7 "+(syncIntervalCfg.adaptiveSync?"adaptive":"fixed")+" \u00b7 "+(syncIntervalCfg.batchMode?"batch":"streaming")},
+              {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?geoFenceCfg.clients.length+" clients geo-assigned":"Not configured \u2014 see Data Sovereignty tab"},
+              {n:"MSP Multi-Tenancy",s:mspCfg.enabled?mspCfg.tenants.length+" tenants":"disabled",d:mspCfg.enabled?"Isolation: "+Object.values(mspCfg.isolation).filter(Boolean).length+"/5 controls active":"Not enabled \u2014 see MSP tab"},
+              {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?threatHuntCfg.xdr.provider+" \u00b7 Behavior monitoring":"Not configured \u2014 see Threat Hunting tab"},
+              ...(provisionedClients.length>0?[{n:"Provisioned Clients",s:provisionedClients.length+" deployed",d:provisionedClients.map(c=>c.hostname).join(", ")}]:[]),
+            ].map((item,idx)=>(
+              <div key={idx} style={{display:"flex",justifyContent:"space-between",padding:"10px 0",borderBottom:"1px solid "+C.b}}>
+                <div><div style={{fontSize:12}}>{item.n}</div><M style={{color:C.td}}>{item.d}</M></div>
+                <Badge color={item.s.includes("connected")||item.s==="configured"||item.s==="enabled"||item.s==="active"||item.s==="armed"?C.a:item.s==="pending"?C.w:item.s==="TRIGGERED"?C.d:C.tm}>{item.s}</Badge>
+              </div>
+            ))}
+          </Card>
+          <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Notification Channel Test</div>
+          <Card style={{marginBottom:16}}>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Send a real test message to a configured external channel. Unlike the read-only health probe above, this delivers an actual notification to the channel\u2019s saved destination. Email, webhook, and PagerDuty only \u2014 SMS has no fixed test recipient.</M>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {[{k:"email",l:"Test Email"},{k:"webhook",l:"Test Webhook"},{k:"pagerduty",l:"Test PagerDuty"}].map(ch=>(
+                <Btn key={ch.k} small onClick={()=>{setNotifTest({channel:ch.k,status:"sending"});api.post("/api/inbox/admin/test-channel",{channel:ch.k}).then(r=>{setNotifTest({channel:ch.k,status:(r&&r.status)||"error",detail:(r&&r.detail)||null,ok:!!(r&&r.success)});addA("NOTIFICATION_TEST_SEND","Test "+ch.k+": "+((r&&r.status)||"error"));}).catch(()=>setNotifTest({channel:ch.k,status:"error",detail:"request failed"}));}}>{ch.l}</Btn>
+              ))}
+            </div>
+            {notifTest&&<M style={{color:notifTest.ok?C.a:notifTest.status==="sending"?C.tm:C.w,display:"block",marginTop:10}}>{notifTest.channel}: {notifTest.status}{notifTest.detail?" \u2014 "+notifTest.detail:""}</M>}
+          </Card>
           <AlertRoutingPanel/>
           {/* R3l C15: Connected Sessions card, wired to /api/system/connected-clients */}
           <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:16,marginBottom:8}}>Connected Sessions (WebSocket)</div>
@@ -8951,7 +8939,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           {[
             {cat:"Operations",items:[{n:"Actions",d:"Priority prompts generated from team health signals. Each prompt has severity, recommendation, and supporting research. Use depth controls to adjust detail level."},{n:"Team Overview",d:"Aggregate team health metrics — score, utilization, capacity. No individual burnout data. Shows shift roster with tier, utilization, and complexity caps."},{n:"Routing",d:"Configure burnout-aware ticket distribution. Set per-analyst complexity caps. Routing adjusts automatically based on team health signals."},{n:"Shift Handoff",d:"Structured shift transition notes. Maintains context continuity between shifts."},{n:"SLA",d:"Service Level Agreement targets for MTTA (mean time to acknowledge) and MTTR (mean time to resolve) by priority level."},{n:"Automation",d:"Track automated systems (EDR, SOAR, SIEM) and their alert volumes. Add new automation integrations."},{n:"Fail-Open Routing",d:"Like IPS fail-open: if burnout routing fails, tickets flow unfiltered so the SOC keeps running."},{n:"Auto-Disable Routing",d:"Automatically turn off burnout routing when critical incidents require all hands. Triggers: P1 tickets, SIEM alerts, SOAR escalations."},{n:"Recovery Runbook",d:"Generate step-by-step recovery instructions for 10+ failure scenarios (server crash, ransomware, insider threat, etc.)."}]},
             {cat:"Analysts & Wellbeing",items:[{n:"Skills Matrix",d:"Team skill coverage across 16 categories. Identifies gaps for training planning."},{n:"Assessments",d:"Create and assign skills assessments. Track results with progress bars."},{n:"Certifications",d:"Upload and track industry certs (CompTIA, ISACA, ISC², GIAC, etc.)."},{n:"CISM Retro",d:"Post-incident retrospective protocol following Mitchell's CISM model. 24hr/48-72hr/7-day check-ins."},{n:"Peer Config",d:"Configure peer skill-share scheduling windows, session limits, and helper leaderboard."},{n:"Pseudonyms",d:"Decouple analyst identity from burnout data. All data stored under pseudonyms. Mapping exportable for offline storage."},{n:"Proactive Breaks",d:"Sonnentag research-based: suggest breaks after prolonged high-severity work. Requires your approval before notification sent to analyst."},{n:"Upskilling Hour",d:"Dedicate one hour per shift to professional development. Routing pauses automatically. Research shows this reduces turnover by 20-30%."},{n:"Offboarding",d:"Securely deprovision analysts. Revokes keys, archives data, cancels peer sessions, notifies SOAR."}]},
-            {cat:"Integrations",items:[{n:"Health Dashboard",d:"Status of all system integrations — SIEM, SOAR, EDR, ticketing, cloud, etc."},{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
+            {cat:"Integrations",items:[{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
             {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
             {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."}]},

@@ -417,15 +417,9 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 
 ## Integrations group — connecting to the rest of the SOC stack
 
-### Integrations Health Dashboard
+### Integration health (moved to System Health)
 
-**What it’s for:** Real-time status of every external system FireAlive depends on — SOAR, ticketing, SIEM, EDR, IdP, KMS, etc. If any disconnect, the lead is alerted before it causes routing failures.
-
-**Workflow:**
-
-1. Lead glances at this tab daily as part of shift opening
-1. All integrations show green = healthy
-1. If something turns red or amber: lead clicks through to the specific integration tab to investigate
+**What it’s for:** Live integration health is no longer a separate dashboard — it now lives on the single **System Health** surface in the Monitoring group, side by side with configuration state. See **System Health** below. Each integration is still configured in its own tab within this group (SIEM, EDR, Threat Hunting, and so on).
 
 ### SIEM Integration
 
@@ -1312,8 +1306,10 @@ The synthesis runs on the FireAlive internal model only; the troubleshooter neve
 
 The tab exposes two admin-configurable control panels:
 
-- **Integration Health** — opt-in, read-only health probes against external integrations (KMS, cloud storage, LDAP/AD, SIEM, SOAR, EDR / malware scanner, ticketing). Probing is disabled by default at both the master and per-integration level and never mutates integration data; the KMS probe performs a live wrap/unwrap round-trip only when its deep-probe toggle is on. Admins set the master switch, the periodic interval, per-integration coverage, and can run an on-demand probe; results render as a colour-coded status table with per-integration latency.
+- **Integration Health** — the single config-and-health surface. It runs opt-in, read-only health probes against thirteen external integrations: KMS / key-wrapping, cloud storage, LDAP/AD, SIEM, SOAR, EDR / malware scanner, ticketing, workforce scheduling, the SDN controller, cloud attestation, backup schedules, notification channels, and CI/CD. Probing is disabled by default at both the master and per-integration level and never mutates integration data — most probes simply read the status the platform already records (the SDN probe, for one, reads last-known posture and never dials the controller), the KMS probe performs a live wrap/unwrap round-trip only when its deep-probe toggle is on, and the notification probe checks channel connectivity without sending anything. Admins set the master switch, the periodic interval, per-integration coverage, and can run an on-demand probe; results render as a colour-coded status table with per-integration latency. Directly below it, a **System Configuration** list shows FireAlive-internal controls — Tripwire, Posture, MFA, pseudonyms, fail-open, HA, and the rest — as configuration state only; they are internal features, not external systems to reach, so they carry no probe badge. A separate **Notification Channel Test** lets an admin send a real test message to a configured email, webhook, or PagerDuty destination (configure-then-test), deliberately distinct from the read-only probe, which never sends.
 - **Alert Routing** — a per-severity × channel routing matrix (audit, SIEM, SOAR, in-app notification, email, webhook). Audit is always recorded and cannot be disabled. The defaults escalate by severity: info is audit-only, warning adds SIEM, high adds SOAR + SIEM + an in-app notification to admins/leads, and critical adds email + webhook. The panel also sets the alert webhook URL and the sustained-load hysteresis thresholds (CPU / memory / DB-read enter, exit, and dwell, plus a cooldown) that decide when a sustained-load alert fires and when it clears.
+
+Health checks follow the feature: every integration is probed by a check that ships in the same phase as the integration itself. B5j was a one-time retroactive pass that added the probes for the seven integrations that predated this convention, bringing the roster to thirteen.
 
 **Workflow:**
 
