@@ -669,8 +669,153 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
+// ── Read-only channel connectivity probes (B5j) ───────────────────────
+// Consumed by the integration-health notifications probe. Each helper does a
+// connect/auth check ONLY and SENDS NOTHING - no email, no webhook POST, no
+// PagerDuty enqueue, no SMS. Config shapes mirror notifications-pipeline.js
+// (notification_config id='default') and the sms_* columns. Returns follow the
+// health-probe contract: { status: 'not_configured' } | { ok, status, detail }.
+// The db handle is borrowed and MUST NOT be closed here.
+function _connectOnly(host, port, useTls, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let sock;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      try { if (sock) sock.destroy(); } catch (_e) {}
+      resolve(r);
+    };
+    try {
+      if (useTls) {
+        const tls = require('tls');
+        sock = tls.connect({ host: host, port: port, servername: host, timeout: timeoutMs }, () => done({ ok: true }));
+      } else {
+        const net = require('net');
+        sock = net.connect({ host: host, port: port, timeout: timeoutMs }, () => done({ ok: true }));
+      }
+    } catch (e) {
+      return resolve({ ok: false, error: e.message });
+    }
+    sock.once('timeout', () => done({ ok: false, error: 'connect timeout' }));
+    sock.once('error', (e) => done({ ok: false, error: e.message }));
+  });
+}
+
+function _loadChannelConfig(db) {
+  try {
+    return db.prepare(
+      "SELECT email_enabled, email_address, webhook_enabled, webhook_url, pagerduty_enabled, pagerduty_key FROM notification_config WHERE id = 'default'"
+    ).get() || {};
+  } catch (_e) {
+    return {};
+  }
+}
+
+async function probeEmailChannel(db) {
+  const row = _loadChannelConfig(db);
+  if (!(row.email_enabled === 1 && row.email_address)) return { status: 'not_configured' };
+  const host = process.env.SMTP_HOST || null;
+  const user = process.env.SMTP_USER || null;
+  const pass = process.env.SMTP_PASS || null;
+  if (!host || !user || !pass) {
+    return { ok: false, status: 'error', detail: 'email enabled but SMTP_HOST/SMTP_USER/SMTP_PASS not set in env' };
+  }
+  let nodemailer;
+  try { nodemailer = require('nodemailer'); }
+  catch (_e) { return { ok: false, status: 'error', detail: 'nodemailer not installed' }; }
+  const transport = nodemailer.createTransport({
+    host: host,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: { user: user, pass: pass },
+    connectionTimeout: 8000,
+    socketTimeout: 8000,
+  });
+  try {
+    await transport.verify();
+    return { ok: true, status: 'ok', detail: 'SMTP connect + auth OK (no message sent)' };
+  } catch (err) {
+    const msg = (err && err.message) || String(err);
+    const isAuth = /invalid login|535|EAUTH|authentication|credentials|password/i.test(msg);
+    return { ok: false, status: isAuth ? 'auth_failed' : 'unreachable', detail: msg };
+  } finally {
+    try { transport.close(); } catch (_e) {}
+  }
+}
+
+async function probeWebhookChannel(db) {
+  const row = _loadChannelConfig(db);
+  if (!(row.webhook_enabled === 1 && row.webhook_url)) return { status: 'not_configured' };
+  let u;
+  try { u = new URL(row.webhook_url); } catch (_e) { return { ok: false, status: 'error', detail: 'invalid webhook_url' }; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    return { ok: false, status: 'error', detail: 'webhook_url must be http(s)' };
+  }
+  const useTls = u.protocol === 'https:';
+  const port = u.port ? parseInt(u.port, 10) : (useTls ? 443 : 80);
+  const r = await _connectOnly(u.hostname, port, useTls, 8000);
+  if (r.ok) return { ok: true, status: 'ok', detail: 'webhook host reachable (no payload sent)' };
+  return { ok: false, status: 'unreachable', detail: r.error || 'connect failed' };
+}
+
+async function probePagerDutyChannel(db) {
+  const row = _loadChannelConfig(db);
+  if (!(row.pagerduty_enabled === 1 && row.pagerduty_key)) return { status: 'not_configured' };
+  const r = await _connectOnly('events.pagerduty.com', 443, true, 8000);
+  if (r.ok) {
+    return { ok: true, status: 'ok', detail: 'PagerDuty Events API reachable (routing key not verifiable without sending)' };
+  }
+  return { ok: false, status: 'unreachable', detail: r.error || 'connect failed' };
+}
+
+async function probeSmsChannel(db) {
+  let row;
+  try {
+    row = db.prepare(
+      "SELECT sms_provider, sms_account_sid, sms_auth_token_encrypted, sms_from_number FROM notification_config WHERE id = 'default'"
+    ).get();
+  } catch (_e) {
+    row = null;
+  }
+  if (!row || !row.sms_provider) return { status: 'not_configured' };
+  if (!row.sms_account_sid || !row.sms_auth_token_encrypted || !row.sms_from_number) return { status: 'not_configured' };
+  if (row.sms_provider === 'twilio') {
+    let token;
+    try {
+      const { decrypt } = require('./encryption');
+      token = decrypt(row.sms_auth_token_encrypted, 'TIER1_ENCRYPTION_KEY');
+    } catch (_e) {
+      return { ok: false, status: 'error', detail: 'failed to decrypt SMS auth token' };
+    }
+    const url = 'https://api.twilio.com/2010-04-01/Accounts/' + encodeURIComponent(row.sms_account_sid) + '.json';
+    const auth = 'Basic ' + Buffer.from(row.sms_account_sid + ':' + token).toString('base64');
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const resp = await fetch(url, { method: 'GET', headers: { Authorization: auth }, signal: ctrl.signal });
+      clearTimeout(t);
+      if (resp.status >= 200 && resp.status < 300) return { ok: true, status: 'ok', detail: 'Twilio credentials valid (account read; no SMS sent)' };
+      if (resp.status === 401 || resp.status === 403) return { ok: false, status: 'auth_failed', detail: 'Twilio rejected credentials (HTTP ' + resp.status + ')' };
+      return { ok: false, status: 'unreachable', detail: 'Twilio returned HTTP ' + resp.status };
+    } catch (err) {
+      return { ok: false, status: 'unreachable', detail: (err && err.name === 'AbortError') ? 'Twilio request timeout' : ((err && err.message) || 'request failed') };
+    }
+  }
+  if (row.sms_provider === 'aws_sns') {
+    const r = await _connectOnly('sns.us-east-1.amazonaws.com', 443, true, 8000);
+    if (r.ok) return { ok: true, status: 'ok', detail: 'AWS SNS endpoint reachable (credentials not verified without a signed read call)' };
+    return { ok: false, status: 'unreachable', detail: r.error || 'connect failed' };
+  }
+  return { ok: false, status: 'error', detail: 'unsupported SMS provider: ' + row.sms_provider };
+}
+
 module.exports = {
   EVENT_TYPES,
+  probeEmailChannel,
+  probeWebhookChannel,
+  probePagerDutyChannel,
+  probeSmsChannel,
   isKnownEventType,
   notify,
   notifyMany,

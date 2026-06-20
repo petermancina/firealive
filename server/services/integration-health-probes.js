@@ -269,6 +269,230 @@ async function edrProbe(db) {
   return { ok: false, status: 'error', detail: `${okCount}/${scanners.length} ok; ${errs.join('; ')}` };
 }
 
+function _loadTicketingConfig(db) {
+  try {
+    const row = db.prepare("SELECT value FROM config WHERE key = 'ticketing_config'").get();
+    if (!row) return null;
+    const c = JSON.parse(row.value);
+    if (!c || !c.provider || c.provider === 'none' || !c.endpoint || !c.apiKey) return null;
+    return c;
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function ticketingProbe(db) {
+  const cfg = _loadTicketingConfig(db);
+  if (!cfg) return { status: 'not_configured' };
+  let TicketingAdapter;
+  try { ({ TicketingAdapter } = require('../integrations/ticketing-adapter')); }
+  catch (_e) { return { ok: false, status: 'error', detail: 'ticketing adapter module unavailable' }; }
+  try {
+    const adapter = new TicketingAdapter(cfg.provider, cfg.endpoint, cfg.apiKey);
+    const r = await adapter.getQueueMetadata();
+    const code = (r && typeof r.status === 'number') ? r.status : 0;
+    if (code >= 200 && code < 300) {
+      return { ok: true, status: 'ok', detail: cfg.provider + ' reachable (HTTP ' + code + ')' };
+    }
+    if (code === 401 || code === 403) {
+      return { ok: false, status: 'auth_failed', detail: cfg.provider + ' rejected the credentials (HTTP ' + code + ')' };
+    }
+    if (code === 0) {
+      return { ok: false, status: 'unreachable', detail: cfg.provider + ' unreachable' + (r && r.error ? ': ' + r.error : '') };
+    }
+    return { ok: false, status: 'unreachable', detail: cfg.provider + ' returned HTTP ' + code };
+  } catch (e) {
+    return { ok: false, status: 'unreachable', detail: 'ticketing probe failed: ' + (e && e.message ? e.message : 'error') };
+  }
+}
+
+function _loadSchedulingConfig(db) {
+  try {
+    return db.prepare("SELECT platform, last_sync_status, last_sync_at, last_sync_error FROM scheduling_platform_config WHERE id = 1").get() || null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function schedulingProbe(db) {
+  const row = _loadSchedulingConfig(db);
+  if (!row || !row.platform || row.platform === 'manual') return { status: 'not_configured' };
+  const st = row.last_sync_status;
+  if (st === 'success') {
+    return { ok: true, status: 'ok', detail: 'last sync ' + (row.last_sync_at || 'unknown') };
+  }
+  if (st === 'failure') {
+    return { ok: false, status: 'error', detail: row.last_sync_error ? ('last sync failed: ' + row.last_sync_error) : 'last sync failed' };
+  }
+  if (st === 'pending') {
+    return { ok: true, status: 'ok', detail: 'sync in progress' };
+  }
+  return { ok: false, status: 'error', detail: 'no successful sync recorded' };
+}
+
+function _enabledSdnIntegrations(db) {
+  try {
+    return db.prepare("SELECT name, last_probe_status, consecutive_failures FROM sdn_integrations WHERE enabled = 1").all();
+  } catch (_e) {
+    return [];
+  }
+}
+
+function sdnProbe(db) {
+  const rows = _enabledSdnIntegrations(db);
+  if (!rows.length) return { status: 'not_configured' };
+  let state = 'unknown';
+  try { state = require('./sdn-posture').currentPosture(db); } catch (_e) {}
+  const total = rows.length;
+  const reachable = rows.filter((r) => r.last_probe_status === 'reachable').length;
+  const failing = rows.filter((r) => r.last_probe_status === 'unreachable' || r.last_probe_status === 'unauthenticated' || r.last_probe_status === 'error');
+  if (failing.length) {
+    return { ok: false, status: 'unreachable', detail: 'posture ' + state + '; ' + failing.length + ' of ' + total + ' adapter(s) failing' };
+  }
+  if (state === 'degraded') {
+    return { ok: false, status: 'unreachable', detail: 'SDN posture degraded' };
+  }
+  return { ok: true, status: 'ok', detail: 'posture ' + state + '; ' + reachable + ' of ' + total + ' adapter(s) reachable' };
+}
+
+function cloudProbe(db) {
+  let att;
+  try { att = require('./cloud-attestation'); }
+  catch (_e) { return { ok: false, status: 'error', detail: 'cloud attestation module unavailable' }; }
+  let r;
+  try { r = att.verifyAttestation(); }
+  catch (e) { return { ok: false, status: 'error', detail: 'attestation check failed: ' + (e && e.message ? e.message : 'error') }; }
+  if (r && r.verified === true) {
+    return { ok: true, status: 'ok', detail: r.reason || ('confidential VM verified (' + (r.tech || 'cc') + ')') };
+  }
+  return { ok: false, status: 'error', detail: (r && r.reason) ? r.reason : 'confidential VM not verified' };
+}
+
+const CICD_FRESHNESS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function _parseTs(s) {
+  if (!s || typeof s !== 'string') return NaN;
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return Date.parse(s.replace(' ', 'T') + 'Z');
+  return Date.parse(s);
+}
+
+function _enabledBackupSchedules(db) {
+  try {
+    return db.prepare("SELECT name, last_status, last_run, next_run FROM backup_schedules WHERE active = 1").all();
+  } catch (_e) {
+    return [];
+  }
+}
+
+function backupProbe(db) {
+  const rows = _enabledBackupSchedules(db);
+  if (!rows.length) return { status: 'not_configured' };
+  const now = Date.now();
+  const failed = [];
+  const overdue = [];
+  for (const r of rows) {
+    const st = (r.last_status || '').toLowerCase();
+    if (st === 'failed' || st === 'failure' || st === 'error') { failed.push(r.name || 'schedule'); continue; }
+    const nextMs = _parseTs(r.next_run);
+    if (!Number.isNaN(nextMs) && nextMs < now) { overdue.push(r.name || 'schedule'); }
+  }
+  if (failed.length) {
+    return { ok: false, status: 'error', detail: failed.length + ' schedule(s) failed: ' + failed.join(', ') };
+  }
+  if (overdue.length) {
+    return { ok: false, status: 'error', detail: overdue.length + ' schedule(s) overdue: ' + overdue.join(', ') };
+  }
+  return { ok: true, status: 'ok', detail: rows.length + ' schedule(s), last run OK' };
+}
+
+function _cicdConfigs(db) {
+  try { return db.prepare("SELECT id, platform FROM cicd_configs").all(); }
+  catch (_e) { return []; }
+}
+
+function cicdProbe(db) {
+  const configs = _cicdConfigs(db);
+  if (!configs.length) return { status: 'not_configured' };
+  const now = Date.now();
+  let okCount = 0;
+  let noRun = 0;
+  const failed = [];
+  const stale = [];
+  for (const c of configs) {
+    let run;
+    try { run = db.prepare("SELECT status, received_at FROM cicd_runs WHERE config_id = ? ORDER BY received_at DESC LIMIT 1").get(c.id); }
+    catch (_e) { run = null; }
+    if (!run) { noRun++; continue; }
+    const st = (run.status || '').toLowerCase();
+    if (st === 'failed') { failed.push(c.platform || c.id); continue; }
+    const rcv = _parseTs(run.received_at);
+    if (!Number.isNaN(rcv) && (now - rcv) > CICD_FRESHNESS_MS) { stale.push(c.platform || c.id); continue; }
+    okCount++;
+  }
+  if (failed.length) {
+    return { ok: false, status: 'error', detail: failed.length + ' pipeline(s) failed: ' + failed.join(', ') };
+  }
+  if (stale.length) {
+    return { ok: false, status: 'error', detail: stale.length + ' pipeline(s) stale (no run within the freshness window)' };
+  }
+  if (noRun === configs.length) {
+    return { ok: false, status: 'error', detail: 'no pipeline runs reported yet' };
+  }
+  return { ok: true, status: 'ok', detail: okCount + ' of ' + configs.length + ' pipeline(s) reporting healthy runs' };
+}
+
+function _notificationConfigRow(db) {
+  try {
+    return db.prepare(
+      "SELECT email_enabled, email_address, webhook_enabled, webhook_url, pagerduty_enabled, pagerduty_key, sms_provider, sms_account_sid, sms_auth_token_encrypted, sms_from_number FROM notification_config WHERE id = 'default'"
+    ).get() || {};
+  } catch (_e) {
+    return {};
+  }
+}
+
+function _externalChannelsConfigured(db) {
+  const r = _notificationConfigRow(db);
+  const email = r.email_enabled === 1 && !!r.email_address;
+  const webhook = r.webhook_enabled === 1 && !!r.webhook_url;
+  const pagerduty = r.pagerduty_enabled === 1 && !!r.pagerduty_key;
+  const sms = !!(r.sms_provider && r.sms_account_sid && r.sms_auth_token_encrypted && r.sms_from_number);
+  return { email: email, webhook: webhook, pagerduty: pagerduty, sms: sms, any: email || webhook || pagerduty || sms };
+}
+
+async function notificationsProbe(db) {
+  const cfg = _externalChannelsConfigured(db);
+  if (!cfg.any) return { status: 'not_configured' };
+  let nf;
+  try { nf = require('./notifications'); }
+  catch (_e) { return { ok: false, status: 'error', detail: 'notifications service unavailable' }; }
+  const checks = [];
+  if (cfg.email) checks.push(['email', nf.probeEmailChannel]);
+  if (cfg.webhook) checks.push(['webhook', nf.probeWebhookChannel]);
+  if (cfg.pagerduty) checks.push(['pagerduty', nf.probePagerDutyChannel]);
+  if (cfg.sms) checks.push(['sms', nf.probeSmsChannel]);
+  const results = [];
+  for (const pair of checks) {
+    const name = pair[0];
+    const fn = pair[1];
+    let res;
+    try {
+      res = (typeof fn === 'function') ? await fn(db) : { ok: false, status: 'error', detail: 'helper missing' };
+    } catch (e) {
+      res = { ok: false, status: 'error', detail: (e && e.message) || 'probe threw' };
+    }
+    results.push({ name: name, status: res && res.status, ok: !!(res && res.ok) });
+  }
+  const detail = results.map(function (r) { return r.name + ': ' + (r.status || 'unknown'); }).join('; ');
+  const anyAuth = results.some(function (r) { return r.status === 'auth_failed'; });
+  const okCount = results.filter(function (r) { return r.ok; }).length;
+  const total = results.length;
+  if (anyAuth) return { ok: false, status: 'auth_failed', detail: detail };
+  if (okCount === total) return { ok: true, status: 'ok', detail: okCount + ' of ' + total + ' channel(s) reachable' };
+  if (okCount === 0) return { ok: false, status: 'unreachable', detail: detail };
+  return { ok: false, status: 'error', detail: detail };
+}
+
 const registry = [
   {
     key: 'kms',
@@ -312,6 +536,55 @@ const registry = [
     configured: (db) => _scannerRows(db).length > 0,
     probe: (db) => edrProbe(db),
   },
+  {
+    key: 'ticketing',
+    label: 'Ticketing (Jira / ServiceNow)',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'ticketing'),
+    configured: (db) => !!_loadTicketingConfig(db),
+    probe: (db) => ticketingProbe(db),
+  },
+  {
+    key: 'scheduling',
+    label: 'Workforce Scheduling (Workday / ADP)',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'scheduling'),
+    configured: (db) => { const r = _loadSchedulingConfig(db); return !!(r && r.platform && r.platform !== 'manual'); },
+    probe: (db) => schedulingProbe(db),
+  },
+  {
+    key: 'sdn',
+    label: 'SDN Controller',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'sdn'),
+    configured: (db) => { try { return require('./deployment-mode').isSdn(db) && _enabledSdnIntegrations(db).length > 0; } catch (_e) { return false; } },
+    probe: (db) => sdnProbe(db),
+  },
+  {
+    key: 'cloud',
+    label: 'Cloud Confidential-VM Attestation',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'cloud'),
+    configured: (db) => { try { return require('./deployment-mode').summary(db).substrateCloud === true; } catch (_e) { return false; } },
+    probe: (db) => cloudProbe(db),
+  },
+  {
+    key: 'backup',
+    label: 'Backup Schedules',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'backup'),
+    configured: (db) => _enabledBackupSchedules(db).length > 0,
+    probe: (db) => backupProbe(db),
+  },
+  {
+    key: 'cicd',
+    label: 'CI/CD Pipeline',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'cicd'),
+    configured: (db) => _cicdConfigs(db).length > 0,
+    probe: (db) => cicdProbe(db),
+  },
+  {
+    key: 'notifications',
+    label: 'Notification Channels',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'notifications'),
+    configured: (db) => _externalChannelsConfigured(db).any,
+    probe: (db) => notificationsProbe(db),
+  },
 ];
 
-module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe };
+module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe, ticketingProbe, schedulingProbe, sdnProbe, cloudProbe, backupProbe, cicdProbe, notificationsProbe };

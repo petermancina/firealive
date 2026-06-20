@@ -1085,6 +1085,93 @@ class RegressionRunner {
       }
     }
 
+    // -- Category: Integration health probe registry (B5j read-only probes) --
+    // Static + bare-DB assertions for the probe registry. No live probes run:
+    // every check uses a throwaway in-memory schema clone, and the channel
+    // connectivity helper is exercised only against a reserved unreachable host
+    // to prove the never-send contract. Side-effect-free against the live DB.
+    {
+      const ihp = require('./integration-health-probes');
+      const EXPECTED_KEYS = ['soar', 'siem', 'ticketing', 'iam', 'kms', 'storage', 'edr', 'sdn', 'cloud', 'backup', 'notifications', 'scheduling', 'cicd'];
+      const NEW_KEYS = ['sdn', 'cloud', 'backup', 'notifications', 'scheduling', 'cicd', 'ticketing'];
+
+      await check('integration_health', 'probe registry exposes 13 well-formed descriptors', () => {
+        const reg = ihp.registry;
+        if (!Array.isArray(reg)) throw new Error('registry is not an array');
+        if (reg.length !== 13) throw new Error('expected 13 descriptors, found ' + reg.length);
+        for (const d of reg) {
+          if (!d || typeof d.key !== 'string' || !d.key) throw new Error('descriptor missing key');
+          if (typeof d.label !== 'string' || !d.label) throw new Error(d.key + ': missing label');
+          for (const fnName of ['enabled', 'configured', 'probe']) {
+            if (typeof d[fnName] !== 'function') throw new Error(d.key + ': ' + fnName + ' is not a function');
+          }
+        }
+        const keys = reg.map((d) => d.key);
+        const missing = EXPECTED_KEYS.filter((k) => !keys.includes(k));
+        if (missing.length) throw new Error('registry missing key(s): ' + missing.join(', '));
+        return '13 descriptors, all with key/label/enabled/configured/probe';
+      });
+
+      await check('integration_health', 'new probes report not_configured on a bare DB (never throw)', () => {
+        const mem = cloneLiveSchema(this.db);
+        try {
+          const byKey = {};
+          for (const d of ihp.registry) byKey[d.key] = d;
+          for (const k of NEW_KEYS) {
+            const d = byKey[k];
+            if (!d) throw new Error('missing descriptor: ' + k);
+            let configured;
+            try {
+              configured = d.configured(mem);
+            } catch (e) {
+              throw new Error(k + '.configured() threw on bare DB: ' + (e.message || e));
+            }
+            if (configured !== false) throw new Error(k + '.configured() should be false on a bare DB, got ' + configured);
+          }
+          return NEW_KEYS.length + ' new probes: configured() === false, no throw (harness yields not_configured)';
+        } finally {
+          try { mem.close(); } catch (_e) { /* ignore */ }
+        }
+      });
+
+      await check('integration_health', 'mode-gated probes (sdn, cloud) are unconfigured outside their mode', () => {
+        const mem = cloneLiveSchema(this.db);
+        try {
+          const sdn = ihp.registry.find((d) => d.key === 'sdn');
+          const cloud = ihp.registry.find((d) => d.key === 'cloud');
+          if (!sdn || !cloud) throw new Error('sdn/cloud descriptor missing');
+          if (sdn.configured(mem) !== false) throw new Error('sdn.configured() should be false without SDN mode');
+          if (cloud.configured(mem) !== false) throw new Error('cloud.configured() should be false without a cloud substrate');
+          return 'sdn + cloud both not configured outside their mode';
+        } finally {
+          try { mem.close(); } catch (_e) { /* ignore */ }
+        }
+      });
+
+      await check('integration_health', 'notification connectivity check sends nothing (enqueue stays zero)', async () => {
+        const mem = cloneLiveSchema(this.db);
+        try {
+          mem.prepare("INSERT INTO notification_config (id, webhook_enabled, webhook_url) VALUES ('default', 1, 'https://fa-probe-test.invalid/hook')").run();
+          const countLog = () => {
+            try { return mem.prepare('SELECT COUNT(*) AS n FROM notification_delivery_log').get().n; } catch (_e) { return 0; }
+          };
+          const countQueue = () => {
+            try { return mem.prepare('SELECT COUNT(*) AS n FROM notifications').get().n; } catch (_e) { return 0; }
+          };
+          const before = countLog() + countQueue();
+          const nf = require('./notifications');
+          const res = await nf.probeWebhookChannel(mem);
+          const after = countLog() + countQueue();
+          if (!res || typeof res.status !== 'string') throw new Error('helper returned no status');
+          if (res.status === 'ok' || res.status === 'sent') throw new Error('unreachable host unexpectedly reported ' + res.status);
+          if (after !== before) throw new Error('connectivity check wrote ' + (after - before) + ' row(s); must enqueue nothing');
+          return 'webhook connectivity check -> ' + res.status + ', 0 rows enqueued';
+        } finally {
+          try { mem.close(); } catch (_e) { /* ignore */ }
+        }
+      });
+    }
+
     // -- Category: Analyst-privacy (B5d1 analyst-private data architecture) --
     await check('analyst-privacy', 'B5d1 schema + indexes present', () => {
       requireAll([
