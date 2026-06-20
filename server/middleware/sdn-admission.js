@@ -169,4 +169,4 @@ function sdnAdmission() {
   };
 }
 
-module.exports = { sdnAdmission, _refreshSegments: refreshSegments, _cacheTtlMs: CACHE_TTL_MS };
+module.exports = { sdnAdmission, _refreshSegments: refreshSegments, _ipMatchesEntry: ipMatchesEntry, _cacheTtlMs: CACHE_TTL_MS };
