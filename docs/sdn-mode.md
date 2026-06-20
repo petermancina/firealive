@@ -87,6 +87,43 @@ This is why SDN Mode is not a container workload: an orchestrated container
 does not present a per-instance TPM, so it cannot hold the anchor
 FireAlive’s identity depends on.
 
+### Host substrate
+
+SDN Mode is the one mode that composes with a *host substrate*. The other
+modes are themselves the substrate — bare-metal, virtualized, and cloud each
+describe the machine FireAlive runs on. An SDN deployment can run on any of
+the three, so it records its host substrate separately and layers the
+matching host defenses on top of its SDN networking and admission.
+
+- **SDN on bare metal** — a hardware TPM 2.0 on dedicated hardware. The host
+  is not easily copied, so beyond the anchor and SDN admission there is
+  nothing further to enforce; this is a pass-through.
+- **SDN on a virtualized host** — a vTPM in a VM or hypervisor. A VM is
+  trivially snapshotted, paused, and cloned, so the host-presence and
+  clock-integrity defenses apply: session-less enrollment and signed device
+  actions are refused when the clock cannot be trusted, and an instance that
+  looks cloned or rolled back is quarantined before authentication.
+- **SDN on cloud** — a confidential VM on AWS, Azure, or GCP with a vTPM
+  root of trust. Everything the virtualized substrate enforces applies, plus
+  confidential-computing attestation at boot and refusal of spot and
+  autoscaled instances, exactly as in cloud mode.
+
+The substrate is **declared by the operator** and is **required**: set
+`FIREALIVE_SDN_SUBSTRATE` to `bare-metal`, `virtualized`, or `cloud` before
+the first start. If it is absent or invalid the server refuses to boot —
+there is no default, because silently under-classifying a copyable host (for
+example reading a cloud VM whose metadata is unreachable as bare metal) would
+skip the very defenses that host needs.
+
+Detection is used only to *refute* an unsafe declaration, never to relax one.
+At boot the server independently detects the substrate; if what it detects is
+stronger evidence of a copyable host than what was declared — a hypervisor is
+present but bare metal was claimed — it refuses to start (anti-downgrade).
+Over-claiming is allowed: declaring a stricter substrate than the host truly
+is only adds enforcement, and the stricter gate self-corrects. Like the mode
+itself, the substrate is sealed into the anchor-signed deployment record at
+first boot, so it cannot be flipped later.
+
 ### Segment-aware admission
 
 The operator declares, in the network map, which network segments
@@ -238,10 +275,12 @@ controller integration configured after first boot.
    not a container, not a Kubernetes workload.
 2. **Install FireAlive.** Run the installer on the host as you would for any
    deployment.
-3. **Select SDN mode at first boot.** Set the deployment mode to `sdn`
-   before the first start (the deployment-mode environment variable). On
-   first boot the server seals SDN mode to the hardware root, so it cannot be
-   flipped later — the same one-time, sealed choice as bare-metal,
+3. **Select SDN mode and host substrate at first boot.** Set the deployment mode to `sdn`
+   before the first start (the deployment-mode environment variable), and set
+   `FIREALIVE_SDN_SUBSTRATE` to `bare-metal`, `virtualized`, or `cloud` for
+   the host this instance runs on; it is required, and the server refuses to
+   boot without it. On first boot the server seals both SDN mode and the
+   substrate to the hardware root, so neither can be flipped later — the same one-time, sealed choice as bare-metal,
    virtualized, and cloud.
 4. **Confirm the anchor pin.** Each Analyst Client and the Global Dashboard
    show the deployment anchor fingerprint on first connection. Confirm the
@@ -285,6 +324,7 @@ cadence and the admission and fail-safe behaviors are active.
 | --- | --- |
 | Server runtime | Direct host process on a TPM 2.0 / vTPM host — never a container or Kubernetes workload |
 | Hardware root of trust | Host TPM / vTPM, reusing the deployment anchor; no software fallback |
+| Host substrate | SDN only: declared and required via `FIREALIVE_SDN_SUBSTRATE` (bare-metal, virtualized, or cloud); sealed at boot; detection refutes an under-declaration |
 | Supported controllers | Cisco ACI, VMware NSX, OpenFlow, Arista CloudVision, Juniper CN2, Calico, Cilium, custom REST |
 | Controller access | Read-only, certificate-pinned; structurally incapable of writes |
 | Admission | Source segment checked before authentication; loopback always admitted; CIDR or exact match |
