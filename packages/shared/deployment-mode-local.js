@@ -17,7 +17,9 @@ const fs = require('fs');
 
 const BARE_METAL = 'bare-metal';
 const VIRTUALIZED = 'virtualized';
-const MODES = [BARE_METAL, VIRTUALIZED];
+const CLOUD = 'cloud';
+const SDN = 'sdn';
+const MODES = [BARE_METAL, VIRTUALIZED, CLOUD, SDN];
 
 function makeLocalMode(filePath) {
   function read() {
@@ -34,6 +36,13 @@ function makeLocalMode(filePath) {
     getMode() { const o = read(); return o ? o.mode : null; },
     isConfigured() { return read() !== null; },
     isVirtualized() { const o = read(); return !!o && o.mode === VIRTUALIZED; },
+    isCloud() { const o = read(); return !!o && o.mode === CLOUD; },
+    isSdn() { const o = read(); return !!o && o.mode === SDN; },
+    // Apply relaxed (mobility) tolerances when the deployment runs on a
+    // substrate where the server's network identity can shift -- a VM
+    // (live migration), a cloud instance, or an SDN fabric (multi-site,
+    // software-defined paths). Only bare-metal is strict.
+    toleratesMobility() { const o = read(); return !!o && o.mode !== BARE_METAL; },
     // Record the first-run selection. The local record is advisory, so
     // re-selection overwrites.
     setMode(mode) {
@@ -47,4 +56,4 @@ function makeLocalMode(filePath) {
   };
 }
 
-module.exports = { makeLocalMode, MODES, BARE_METAL, VIRTUALIZED };
+module.exports = { makeLocalMode, MODES, BARE_METAL, VIRTUALIZED, CLOUD, SDN };

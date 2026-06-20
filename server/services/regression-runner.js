@@ -1734,6 +1734,119 @@ class RegressionRunner {
       return 'sealArtifact/openArtifact present; default KEK env-var/TIER1; wraps via backup-key-wrapping';
     });
 
+    // ── Category: SDN mode (B5i) ───────────────────────────────────
+    await check('sdn_mode', 'SDN integration / network-map / posture tables present', () => {
+      const need = ['sdn_integrations', 'sdn_network_map', 'sdn_posture_state', 'sdn_posture_events'];
+      const have = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sdn_integrations','sdn_network_map','sdn_posture_state','sdn_posture_events')")
+        .all().map(r => r.name);
+      const missing = need.filter(n => have.indexOf(n) === -1);
+      if (missing.length) throw new Error('missing SDN tables: ' + missing.join(', '));
+      return 'sdn_integrations / sdn_network_map / sdn_posture_state / sdn_posture_events present';
+    });
+
+    await check('sdn_mode', 'Deployment-mode exposes the sdn mode and isSdn', () => {
+      const dm = require('./deployment-mode');
+      if (typeof dm.isSdn !== 'function') throw new Error('deployment-mode is missing isSdn');
+      if (dm.SDN !== 'sdn') throw new Error('deployment-mode SDN constant missing or not "sdn"');
+      if (!Array.isArray(dm.MODES) || dm.MODES.indexOf('sdn') === -1) throw new Error('sdn is not in deployment-mode MODES');
+      return 'isSdn present; SDN constant = sdn; sdn in MODES';
+    });
+
+    await check('sdn_mode', 'All eight controller adapters resolve read-only via the registry', () => {
+      const reg = require('./sdn');
+      const platforms = reg.listPlatforms();
+      if (platforms.length !== 8) throw new Error('expected 8 platforms, got ' + platforms.length);
+      for (let i = 0; i < platforms.length; i++) {
+        const p = platforms[i];
+        const adapter = reg.getAdapter(p); // throws if it lacks a read method or exposes a write verb
+        if (reg.assertReadOnly(p, adapter) !== adapter) throw new Error('assertReadOnly did not confirm the adapter for ' + p);
+      }
+      return platforms.length + ' adapters resolve and pass the read-only contract: ' + platforms.join(', ');
+    });
+
+    await check('sdn_mode', 'Adapter contract rejects write verbs and requires the read methods', () => {
+      const reg = require('./sdn');
+      const writeVerbs = ['writeFlows', 'pushPolicy', 'createSegment', 'updateTenant', 'deleteNode', 'applyPolicy', 'enforceSegmentation', 'configureFabric'];
+      const escaped = writeVerbs.filter(v => !reg.WRITE_METHOD_RE.test(v));
+      if (escaped.length) throw new Error('WRITE_METHOD_RE failed to match write verbs: ' + escaped.join(', '));
+      if (reg.WRITE_METHOD_RE.test('probe') || reg.WRITE_METHOD_RE.test('readTopology')) throw new Error('WRITE_METHOD_RE wrongly matched a read method');
+      const missingRead = ['probe', 'readTopology', 'readSegmentation'].filter(m => reg.READ_METHODS.indexOf(m) === -1);
+      if (missingRead.length) throw new Error('READ_METHODS missing: ' + missingRead.join(', '));
+      let rejected = false;
+      try { reg.assertReadOnly('custom', { probe() {}, readTopology() {}, readSegmentation() {}, applyPolicy() {} }); }
+      catch (_e) { rejected = true; }
+      if (!rejected) throw new Error('assertReadOnly accepted an adapter exposing a write verb');
+      return 'write verbs rejected; read methods required; a write-capable adapter is refused';
+    });
+
+    await check('sdn_mode', 'Posture thresholds and the integration classifier are intact', () => {
+      const sp = require('./sdn-posture');
+      if (sp.FAILURE_THRESHOLD !== 3 || sp.AUTH_FAILURE_THRESHOLD !== 2 || sp.SUCCESS_THRESHOLD !== 3) {
+        throw new Error('posture thresholds drifted (expected FAILURE 3 / AUTH 2 / SUCCESS 3)');
+      }
+      if (!(sp.STALENESS_MS > 0)) throw new Error('STALENESS_MS is not positive');
+      const now = Date.now();
+      const at = (deltaMs) => new Date(now - (deltaMs || 0)).toISOString();
+      const C = (row) => sp.classifyIntegration(row, now);
+      if (C({ last_probe_status: 'unreachable', consecutive_failures: 2, consecutive_successes: 0, last_probe_at: at(1000) }) !== 'watch') {
+        throw new Error('2 plain failures must classify as watch (below the degraded threshold)');
+      }
+      if (C({ last_probe_status: 'unreachable', consecutive_failures: 3, consecutive_successes: 0, last_probe_at: at(1000) }) !== 'down') {
+        throw new Error('3 plain failures must classify as down');
+      }
+      if (C({ last_probe_status: 'error', consecutive_failures: 2, consecutive_successes: 0, last_probe_at: at(1000) }) !== 'down') {
+        throw new Error('2 weighted (error/unauthenticated) failures must classify as down');
+      }
+      if (C({ last_probe_status: 'reachable', consecutive_failures: 0, consecutive_successes: 2, last_probe_at: at(1000) }) !== 'watch') {
+        throw new Error('2 successes (below SUCCESS_THRESHOLD) must remain watch, not up');
+      }
+      if (C({ last_probe_status: 'reachable', consecutive_failures: 0, consecutive_successes: 3, last_probe_at: at(1000) }) !== 'up') {
+        throw new Error('3 successes must classify as up');
+      }
+      return 'thresholds 3/2/3; classifier honors the degraded threshold, weighting, and recovery hysteresis';
+    });
+
+    await check('sdn_mode', 'Fail-safe denies the entire /api surface while degraded (assume-breach)', () => {
+      const failsafe = require('../middleware/sdn-fail-safe');
+      if (!Array.isArray(failsafe._degradedReachable) || failsafe._degradedReachable.length !== 0) {
+        throw new Error('the degraded allow-list is not empty; assume-breach requires deny-all');
+      }
+      const paths = ['/api/health', '/api/auth/login', '/api/sdn/posture', '/api/anything', '/api/'];
+      const reachable = paths.filter(p => failsafe._isReachableWhileDegraded(p) === true);
+      if (reachable.length) throw new Error('paths wrongly reachable while degraded: ' + reachable.join(', '));
+      if (typeof failsafe.sdnFailSafe !== 'function') throw new Error('sdnFailSafe middleware missing');
+      return 'empty degraded allow-list; every /api path (health included) is denied while degraded';
+    });
+
+    await check('sdn_mode', 'Admission refuses a non-permitted source and admits a permitted one', () => {
+      const adm = require('../middleware/sdn-admission');
+      if (typeof adm._ipMatchesEntry !== 'function') throw new Error('admission matcher hook (_ipMatchesEntry) is missing');
+      if (adm._ipMatchesEntry('10.20.0.5', '10.20.0.0/24') !== true) throw new Error('a source inside a permitted CIDR must match');
+      if (adm._ipMatchesEntry('10.20.0.5', '10.20.0.5') !== true) throw new Error('an exact IPv4 source must match');
+      if (adm._ipMatchesEntry('192.168.50.1', '10.20.0.0/24') !== false) throw new Error('a source outside the permitted CIDR must NOT match (refusal invariant)');
+      const mw = adm.sdnAdmission();
+      const res = { status() { return { json() {} }; } };
+      let passedThrough = false;
+      mw({ app: { locals: { deploymentMode: {} } }, ip: '192.168.50.1', path: '/api/x' }, res, () => { passedThrough = true; });
+      if (!passedThrough) throw new Error('admission must pass through outside sdn mode');
+      let admittedLoopback = false;
+      mw({ app: { locals: { deploymentMode: { sdn: true } } }, ip: '127.0.0.1', path: '/api/x' }, res, () => { admittedLoopback = true; });
+      if (!admittedLoopback) throw new Error('loopback must be admitted in sdn mode');
+      return 'matcher admits permitted CIDR/exact, refuses non-permitted; mode-gate passes through; loopback admitted';
+    });
+
+    await check('sdn_mode', 'SDN has its own route and is no longer a generic integration type', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'routes', 'integrations.js'), 'utf-8');
+      const m = src.match(/const VALID_TYPES = \[([\s\S]*?)\]/);
+      if (!m) throw new Error('could not locate VALID_TYPES in integrations.js');
+      if (/['"]sdn['"]/.test(m[1])) throw new Error("'sdn' is still present in the generic integrations VALID_TYPES");
+      const sdnRoute = require('../routes/sdn');
+      if (typeof sdnRoute !== 'function') throw new Error('routes/sdn did not load as a router');
+      return "'sdn' removed from generic VALID_TYPES; dedicated routes/sdn router loads";
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

@@ -92,7 +92,7 @@ ipcMain.handle('auth:caStatus', () => {
 ipcMain.handle('deployment:getLocalMode', async () => {
   try {
     const lm = localMode();
-    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized() };
+    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized(), toleratesMobility: lm.toleratesMobility() };
   } catch (e) {
     return { error: e.message };
   }

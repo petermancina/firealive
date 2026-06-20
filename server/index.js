@@ -155,6 +155,15 @@ app.use('/api/', auditMiddleware);
 // virtualized mode it refuses the whole API surface when the instance is
 // quarantined. Placed after audit logging and before per-route auth.
 app.use('/api/', require('./middleware/vm-attestation').vmAttestation());
+// B5i (D-B5i-4): mode-gated SDN connection admission. No-op outside sdn mode;
+// in sdn mode it refuses the API surface for connections originating outside
+// the operator-declared permitted SDN segments. Same pre-auth placement.
+app.use('/api/', require('./middleware/sdn-admission').sdnAdmission());
+// B5i (D-B5i-5): mode-gated SDN degraded-posture fail-safe. No-op outside sdn
+// mode and while posture is healthy/uncertain; when posture is degraded it
+// denies the entire API surface (assume-breach lockdown). After admission so
+// the segment perimeter check runs first; same pre-auth placement.
+app.use('/api/', require('./middleware/sdn-fail-safe').sdnFailSafe());
 
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
@@ -209,6 +218,7 @@ app.use('/api/delegations', authMiddleware(['analyst', 'lead', 'admin']), requir
 app.use('/api/pseudonyms', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/pseudonyms'));
 app.use('/api/integrations/ticketing/activity-events', authMiddleware(['admin']), require('./routes/ticketing-activity'));
 app.use('/api/integrations', authMiddleware(['admin']), configLockChokepoint(), require('./routes/integrations'));
+app.use('/api/sdn', authMiddleware(['admin']), configLockChokepoint(), require('./routes/sdn'));
 app.use('/api/v1/malware-scanners', authMiddleware(['admin']), configLockChokepoint(), require('./routes/malware-scanners'));
 app.use('/api/apikeys', authMiddleware(['admin']), configLockChokepoint(), require('./routes/apikeys'));
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
@@ -487,13 +497,36 @@ async function start() {
       app.locals.deploymentMode = { mode: 'bare-metal', configured: false, recordPresent: false, virtualized: false, hypervisor: null };
     }
 
-    // B5h: Cloud Mode boot gate (D-B5h-3, D-B5h-4). When the sealed mode is
-    // cloud, confidential computing is REQUIRED and attested before the server
-    // serves any request: verify a confidential-VM guest is present (fail closed
-    // if not), refuse spot / autoscaled / ephemeral-fleet instances, stamp the
-    // attestation, and publish the result on app.locals for the pre-auth gate.
-    // Any error here halts the server -- cloud mode never silently downgrades.
-    if (app.locals.deploymentMode && app.locals.deploymentMode.cloud === true) {
+    // B5i (D-B5i-2): substrate detection for sdn mode. An sdn deployment can be
+    // cloud-resident or onsite; a cloud-resident sdn component inherits the
+    // confidential-computing + vTPM enforcement below, while an onsite one uses
+    // its TPM hardware root (the bare-metal / virtualized path established
+    // above). Detect the substrate from the live cloud metadata service; the
+    // absence of a provider means onsite.
+    app.locals.sdnCloudResident = false;
+    if (app.locals.deploymentMode && app.locals.deploymentMode.sdn === true) {
+      try {
+        const cloudMetadata = require('./services/cloud-metadata');
+        const meta = await cloudMetadata.readCloudMetadata();
+        app.locals.sdnCloudResident = !!(meta && meta.provider);
+        app.locals.cloudMetadata = meta || null;
+        logger.info('SDN Mode substrate detected', { cloudResident: app.locals.sdnCloudResident, provider: meta ? meta.provider : null });
+      } catch (sdnSubstrateErr) {
+        logger.warn('SDN Mode substrate detection failed; treating as onsite (TPM hardware root)', { error: sdnSubstrateErr.message });
+        app.locals.sdnCloudResident = false;
+      }
+    }
+
+    // B5h / B5i: confidential-VM boot gate (D-B5h-3, D-B5h-4, D-B5i-2). On a
+    // confidential-VM substrate -- cloud mode, or sdn mode detected as cloud-
+    // resident above -- confidential computing is REQUIRED and attested before
+    // the server serves any request: verify a confidential-VM guest is present
+    // (fail closed if not), refuse spot / autoscaled / ephemeral-fleet
+    // instances, stamp the attestation, and publish the result on app.locals for
+    // the pre-auth gate. Any error here halts the server -- it never silently
+    // downgrades. An onsite sdn (or bare-metal / virtualized) deployment skips
+    // this gate and relies on its TPM hardware root established above.
+    if (app.locals.deploymentMode && (app.locals.deploymentMode.cloud === true || app.locals.sdnCloudResident === true)) {
       try {
         const cloudAttestation = require('./services/cloud-attestation');
         const cloudMetadata = require('./services/cloud-metadata');
@@ -501,14 +534,14 @@ async function start() {
 
         const att = cloudAttestation.verifyAttestation();
         if (!att.verified) {
-          logger.error('Cloud Mode requires a confidential VM, but confidential computing was not attested; refusing to start (fail-closed, D-B5h-3)', { reason: att.reason });
+          logger.error('A confidential-VM substrate (cloud, or cloud-resident sdn) requires confidential computing, but it was not attested; refusing to start (fail-closed, D-B5h-3 / D-B5i-2)', { reason: att.reason });
           process.exit(1);
         }
         logger.info('Confidential computing attested', { tech: att.tech, platformValidationPending: att.platformValidationPending });
 
         const meta = await cloudMetadata.readCloudMetadata();
         if (meta && (meta.spot === true || meta.autoscaled === true)) {
-          logger.error('Cloud Mode refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
+          logger.error('A confidential-VM substrate refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
           process.exit(1);
         }
 
@@ -521,9 +554,9 @@ async function start() {
 
         app.locals.cloudAttestation = { verified: true, tech: att.tech, platformValidationPending: att.platformValidationPending, reason: att.reason };
         app.locals.cloudMetadata = meta || null;
-        logger.info('Cloud Mode attested and sealed', { provider: meta ? meta.provider : null, privateIp: meta ? meta.privateIp : null });
+        logger.info('Confidential-VM substrate attested and sealed', { mode: app.locals.deploymentMode.mode, provider: meta ? meta.provider : null, privateIp: meta ? meta.privateIp : null });
       } catch (cloudBootErr) {
-        logger.error('Cloud Mode boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
+        logger.error('Confidential-VM boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
         process.exit(1);
       }
     }
@@ -752,6 +785,11 @@ async function start() {
 
     try { require('./services/tripwire-scheduler').startTripwireScheduler(getDb, { getWsServer: () => app.locals.wsServer }); logger.info('Tripwire scheduler started'); } catch (e) { logger.warn('Tripwire scheduler failed to start', { error: e.message }); }
     try { require('./services/audit-integrity-scheduler').startAuditIntegrityScheduler(getDb); logger.info('Audit integrity scheduler started'); } catch (e) { logger.warn('Audit integrity scheduler failed to start', { error: e.message }); }
+
+    // Start the SDN posture probe scheduler. Self-gating: a no-op outside sdn
+    // mode. In sdn mode it probes the enabled controller integrations on an
+    // interval and drives the posture state machine (and the fail-safe gate).
+    try { require('./services/sdn-probe-scheduler').startSdnProbeScheduler(getDb); logger.info('SDN posture probe scheduler started'); } catch (e) { logger.warn('SDN posture probe scheduler failed to start', { error: e.message }); }
 
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();

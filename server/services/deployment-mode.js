@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// The deployment mode (bare-metal, virtualized, or cloud) is chosen once at install
+// The deployment mode (bare-metal, virtualized, cloud, or sdn) is chosen once at install
 // and hardware-sealed with the instance anchor, so it cannot be flipped at
 // runtime to unlock the relaxed virtualization allowances. The seal binds the
 // mode to THIS deployment's anchor (instanceId + fingerprint) and is an
@@ -26,7 +26,8 @@ const MODE_KEY = 'deployment_mode';
 const BARE_METAL = 'bare-metal';
 const VIRTUALIZED = 'virtualized';
 const CLOUD = 'cloud';
-const MODES = [BARE_METAL, VIRTUALIZED, CLOUD];
+const SDN = 'sdn';
+const MODES = [BARE_METAL, VIRTUALIZED, CLOUD, SDN];
 const SIG_ALG = 'ecdsa-p256-ieee-p1363';
 
 function fail(code, message) {
@@ -94,6 +95,10 @@ function isCloud(db) {
   return getMode(db) === CLOUD;
 }
 
+function isSdn(db) {
+  return getMode(db) === SDN;
+}
+
 // Provisioning-only: set and hardware-seal the mode. Refuses to change an
 // already-sealed mode unless opts.force (reserved for the authorized
 // re-provision ceremony). Requires an established instance anchor to seal.
@@ -151,6 +156,7 @@ function summary(db) {
     recordPresent: !!rec,
     virtualized: valid && rec.mode === VIRTUALIZED,
     cloud: valid && rec.mode === CLOUD,
+    sdn: valid && rec.mode === SDN,
     hypervisor: detectHypervisor()
   };
 }
@@ -160,12 +166,14 @@ module.exports = {
   setMode,
   isVirtualized,
   isCloud,
+  isSdn,
   isConfigured,
   detectHypervisor,
   summary,
   BARE_METAL,
   VIRTUALIZED,
   CLOUD,
+  SDN,
   MODES,
   MODE_KEY
 };

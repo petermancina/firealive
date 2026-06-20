@@ -563,6 +563,66 @@ CREATE TABLE IF NOT EXISTS integration_config (
   updated_at TEXT DEFAULT (datetime('now'))
 );
 
+-- ── SDN (Software-Defined Networking) mode + controller integration (B5i) ──
+-- Read-only controller integration plus the operator-declared network map that
+-- sdn deployment mode uses for self-protection (connection admission), policy
+-- generation, and posture-degradation detection. FireAlive never writes to the
+-- controller; these tables hold only what it reads, observes, and configures.
+
+CREATE TABLE IF NOT EXISTS sdn_integrations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL CHECK (platform IN (
+    'cisco-aci', 'vmware-nsx', 'openflow', 'arista-cv',
+    'juniper-cn2', 'calico', 'cilium', 'custom'
+  )),
+  api_endpoint TEXT NOT NULL,
+  api_credentials_encrypted BLOB,         -- Tier-1 KEK wrap of the per-platform credential blob (token/cert/user+pass/API key)
+  endpoint_fingerprint TEXT,              -- pinned controller certificate fingerprint for mTLS
+  enabled INTEGER DEFAULT 1,
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  last_probe_at TEXT,
+  last_probe_status TEXT CHECK (last_probe_status IN ('unknown', 'reachable', 'unreachable', 'unauthenticated', 'error')),
+  last_probe_detail TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,   -- B5i posture debounce: consecutive failed probes (feeds the degraded threshold)
+  consecutive_successes INTEGER NOT NULL DEFAULT 0   -- B5i posture debounce: consecutive successful probes (feeds recovery hysteresis)
+);
+
+-- Singleton operator-declared topology (one row, keyed 'default').
+CREATE TABLE IF NOT EXISTS sdn_network_map (
+  id TEXT PRIMARY KEY DEFAULT 'default',
+  permitted_segments TEXT DEFAULT '[]',   -- JSON array of CIDRs/segments FireAlive's own components may use
+  tier_segment_map TEXT DEFAULT '{}',     -- JSON object mapping FireAlive tier -> segment/VLAN
+  sdwan_sites TEXT DEFAULT '{}',          -- JSON object: primary/secondary site CIDRs + overlay
+  updated_by TEXT REFERENCES users(id),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Append-only audit of read-only observations and posture transitions.
+CREATE TABLE IF NOT EXISTS sdn_posture_events (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  integration_id TEXT REFERENCES sdn_integrations(id),
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'probe', 'topology_read', 'segmentation_read',
+    'admission_refused', 'posture_degraded', 'posture_restored'
+  )),
+  severity TEXT DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'critical')),
+  detail TEXT,                            -- JSON observation/transition detail
+  observed_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Singleton aggregate posture state machine (one row, keyed 'default') so the
+-- graduated/hysteretic degradation detector survives restart (B5i, D-B5i-5).
+CREATE TABLE IF NOT EXISTS sdn_posture_state (
+  id TEXT PRIMARY KEY DEFAULT 'default',
+  current_state TEXT NOT NULL DEFAULT 'healthy' CHECK (current_state IN ('healthy', 'uncertain', 'degraded')),
+  state_since TEXT DEFAULT (datetime('now')),
+  last_eval_at TEXT,
+  last_transition_event_id TEXT REFERENCES sdn_posture_events(id)
+);
+
 -- ── API Keys ─────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -2835,6 +2895,22 @@ function initDb() {
 
   // Execute schema
   db.exec(SCHEMA);
+
+  // Migration (B5i): SDN posture debounce counters. The sdn_integrations table
+  // gains per-integration probe debounce counters feeding the posture state
+  // machine. PRAGMA-guarded so a fresh database (which already has them from the
+  // CREATE above) no-ops; an upgraded database that predates them is patched.
+  try {
+    const sdnCols = db.prepare("PRAGMA table_info(sdn_integrations)").all().map((c) => c.name);
+    if (!sdnCols.includes('consecutive_failures')) {
+      db.exec('ALTER TABLE sdn_integrations ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!sdnCols.includes('consecutive_successes')) {
+      db.exec('ALTER TABLE sdn_integrations ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0');
+    }
+  } catch (e) {
+    console.error('B5i sdn posture-counter migration failed:', e.message);
+  }
 
   // Migration (B5d1): drop retired analyst-private burnout tables. The
   // server-decryptable per-analyst burnout path is fully retired -- behavioral

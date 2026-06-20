@@ -39,7 +39,6 @@ const { logger } = require('../services/logger');
 const VALID_TYPES = [
   'soar', 'siem', 'ticketing',
   'iam_saml', 'iam_oidc', 'iam_ldap', 'iam_cloud',
-  'sdn',
   'cloud_aws', 'cloud_gcp', 'cloud_azure',
   'training_htb', 'training_thm', 'training_letsdefend', 'training_cyberdefenders',
   'training_sans', 'training_immersive',

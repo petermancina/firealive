@@ -9562,6 +9562,7 @@ function DeploymentSetup({ onComplete }) {
         {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
         {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
         {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.")}
+        {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.")}
       </div>
       {err && <M style={{color:C.d,fontSize:10}}>{err}</M>}
     </div>
