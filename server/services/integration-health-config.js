@@ -21,7 +21,7 @@ const MASTER_KEY = 'integration_health_probes_enabled';
 const SETTINGS_KEY = 'integration_health_settings';
 
 // Canonical set of probe-able integrations.
-const INTEGRATION_KEYS = ['soar', 'siem', 'ticketing', 'iam', 'kms', 'storage', 'edr', 'sdn', 'cloud', 'backup', 'notifications', 'scheduling', 'cicd'];
+const INTEGRATION_KEYS = ['soar', 'siem', 'ticketing', 'iam', 'kms', 'storage', 'edr', 'sdn', 'sase', 'cloud', 'backup', 'notifications', 'scheduling', 'cicd'];
 
 const DEFAULT_INTERVAL_MIN = 60;
 const MIN_INTERVAL_MIN = 5;
