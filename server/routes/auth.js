@@ -25,7 +25,7 @@ const { logger } = require('../services/logger');
 const { verifyPeerCertificate } = require('../middleware/network-security');
 const ca = require('../services/ca');
 const webauthn = require('../services/webauthn');
-const { isVirtualized } = require('../services/deployment-mode');
+const deploymentMode = require('../services/deployment-mode');
 const { checkClockIntegrity } = require('../services/clock-integrity');
 const rateLimit = require('express-rate-limit');
 
@@ -451,11 +451,12 @@ function resolveEnrollmentAuth(db, body) {
   // validity (the enrollment token's SQL expiry check and the break-glass
   // token's signed expiry). Neither survives a VM snapshot rollback as a
   // defense, because a rollback restores the database too, so a used or
-  // expired token can be revived. In virtualized mode a jumped clock cannot
-  // be trusted to enforce expiry, so refuse session-less enrollment
-  // authorization. Bare-metal is never gated.
+  // expired token can be revived. On a virtualized substrate (virtualized
+  // mode or an SDN deployment sealed on a VM) a jumped clock cannot be
+  // trusted to enforce expiry, so refuse session-less enrollment
+  // authorization. A bare-metal substrate is never gated.
   if (body.enrollment_token || body.breakglass_token) {
-    const clock = checkClockIntegrity({ virtualized: isVirtualized(db) });
+    const clock = checkClockIntegrity({ virtualized: deploymentMode.summary(db).substrateVirtualized });
     if (!clock.ok) {
       auditLog(null, 'ENROLL_AUTH_CLOCK_UNTRUSTED', 'enrollment authorization refused: clock integrity check failed', null);
       return { ok: false, status: 503, error: 'server clock unverified; retry' };

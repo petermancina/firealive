@@ -225,17 +225,17 @@ ipcMain.handle('device:signPopProof', async (_e, { method, path } = {}) => {
 ipcMain.handle('deployment:getLocalMode', async () => {
   try {
     const lm = localMode();
-    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized(), toleratesMobility: lm.toleratesMobility() };
+    return { mode: lm.getMode(), configured: lm.isConfigured(), virtualized: lm.isVirtualized(), toleratesMobility: lm.toleratesMobility(), substrate: lm.getSubstrate() };
   } catch (e) {
     return { error: e.message };
   }
 });
 
-ipcMain.handle('deployment:setLocalMode', async (_e, { mode } = {}) => {
+ipcMain.handle('deployment:setLocalMode', async (_e, { mode, substrate } = {}) => {
   try {
     const lm = localMode();
-    lm.setMode(mode);
-    return { ok: true, mode: lm.getMode() };
+    lm.setMode(mode, substrate);
+    return { ok: true, mode: lm.getMode(), substrate: lm.getSubstrate() };
   } catch (e) {
     return { error: e.message };
   }

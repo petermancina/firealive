@@ -72,7 +72,7 @@ require('./destination-adapter-local');
 require('./destination-adapter-sftp');
 
 const { encryptConfig, decryptConfig } = require('./encryption');
-const { isVirtualized } = require('./deployment-mode');
+const deploymentMode = require('./deployment-mode');
 
 const ADAPTERS_LANDING_IN_R3D4 = new Set(['s3', 'azure-blob', 'gcs']);
 
@@ -293,14 +293,15 @@ function createDestination(db, input) {
     err.validation = true;
     throw err;
   }
-  // Virtualization mode: a 'local' destination writes the backup into this
+  // Virtualized substrate: a 'local' destination writes the backup into this
   // instance's own filesystem, which a VM snapshot or clone captures wholesale,
   // defeating backup independence and proliferating backup data with every
-  // clone. In virtualized mode backups must target external storage, so reject
-  // the local adapter here. Bare-metal is unaffected, and KEK-sealing already
-  // applies in every mode via backup-key-wrapping.
-  if (v.normalized.adapter === 'local' && isVirtualized(db)) {
-    const err = new Error('local backup destinations are not allowed in virtualized mode; configure an external destination (sftp, s3, azure-blob, or gcs) so backups are not captured by VM snapshots or clones');
+  // clone. On a virtualized substrate (virtualized mode or SDN+virtualized)
+  // backups must target external storage, so reject the local adapter here. A
+  // bare-metal substrate is unaffected, and KEK-sealing already applies in
+  // every mode via backup-key-wrapping.
+  if (v.normalized.adapter === 'local' && deploymentMode.summary(db).substrateVirtualized === true) {
+    const err = new Error('local backup destinations are not allowed on a virtualized substrate; configure an external destination (sftp, s3, azure-blob, or gcs) so backups are not captured by VM snapshots or clones');
     err.field = 'adapter';
     err.validation = true;
     throw err;

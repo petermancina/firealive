@@ -9532,12 +9532,13 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 function DeploymentSetup({ onComplete }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const choose = async (mode) => {
+  const [pickSubstrate, setPickSubstrate] = useState(false);
+  const choose = async (mode, substrate) => {
     setErr(""); setBusy(true);
     try {
       const bridge = (typeof window !== "undefined") ? window.firealive : null;
       if (!bridge || typeof bridge.invoke !== "function") { onComplete(); return; }
-      const r = await bridge.invoke("deployment:setLocalMode", { mode: mode });
+      const r = await bridge.invoke("deployment:setLocalMode", { mode: mode, substrate: substrate });
       if (r && r.error) { setErr(r.error); setBusy(false); return; }
       onComplete();
     } catch (e) {
@@ -9545,25 +9546,43 @@ function DeploymentSetup({ onComplete }) {
       setBusy(false);
     }
   };
-  const card = (mode, title, desc) => (
-    <button key={mode} onClick={()=>choose(mode)} disabled={busy} style={{textAlign:"left",padding:"18px 20px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,color:C.t,cursor:busy?"default":"pointer",opacity:busy?0.6:1,display:"flex",flexDirection:"column",gap:6,maxWidth:420}}>
+  const card = (key, title, desc, onClick) => (
+    <button key={key} onClick={onClick} disabled={busy} style={{textAlign:"left",padding:"18px 20px",background:C.s,border:`1px solid ${C.b}`,borderRadius:10,color:C.t,cursor:busy?"default":"pointer",opacity:busy?0.6:1,display:"flex",flexDirection:"column",gap:6,maxWidth:420}}>
       <span style={{fontSize:13,fontWeight:600,color:C.t}}>{title}</span>
       <M style={{color:C.tm,fontSize:10,lineHeight:1.5}}>{desc}</M>
     </button>
   );
   return (
     <div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:18,padding:24}}>
-      <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
-        <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP</M>
-        <div style={{color:C.t,fontSize:20,fontWeight:600}}>Select deployment mode</div>
-        <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>Choose how this deployment runs. This sets local virtualization tolerances and is confirmed against the server.</M>
-      </div>
-      <div style={{display:"flex",flexDirection:"column",gap:12}}>
-        {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.")}
-        {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.")}
-        {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.")}
-        {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.")}
-      </div>
+      {!pickSubstrate ? (
+        <>
+          <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
+            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP</M>
+            <div style={{color:C.t,fontSize:20,fontWeight:600}}>Select deployment mode</div>
+            <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>Choose how this deployment runs. This sets local virtualization tolerances and is confirmed against the server.</M>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.",()=>choose("bare-metal"))}
+            {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.",()=>choose("virtualized"))}
+            {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("cloud"))}
+            {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.",()=>{setErr("");setPickSubstrate(true);})}
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
+            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP / SDN</M>
+            <div style={{color:C.t,fontSize:20,fontWeight:600}}>What does the SDN host run on?</div>
+            <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>The substrate sets this host's identity and snapshot tolerances. It is confirmed against the server, which fails closed if the declared substrate is weaker than what it detects.</M>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {card("sdn-bare-metal","Bare metal","Dedicated physical hardware with a hardware TPM. Strictest identity enforcement; no snapshot or live-migration allowances.",()=>choose("sdn","bare-metal"))}
+            {card("sdn-virtualized","Virtualized","A VM or hypervisor with a vTPM. Adds snapshot and clock-jump tolerances; quarantines a host that looks cloned or rolled back.",()=>choose("sdn","virtualized"))}
+            {card("sdn-cloud","Cloud","A confidential VM on AWS, Azure, or GCP. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("sdn","cloud"))}
+          </div>
+          <button onClick={()=>{setErr("");setPickSubstrate(false);}} disabled={busy} style={{background:"none",border:"none",color:C.tm,fontSize:10,cursor:busy?"default":"pointer",textDecoration:"underline",padding:4}}>Back to deployment mode</button>
+        </>
+      )}
       {err && <M style={{color:C.d,fontSize:10}}>{err}</M>}
     </div>
   );

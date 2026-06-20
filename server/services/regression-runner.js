@@ -1537,10 +1537,18 @@ class RegressionRunner {
       if (!dm.BARE_METAL || !dm.VIRTUALIZED) throw new Error('deployment-mode mode constants missing');
       return 'getMode / setMode / isConfigured / isVirtualized / detectHypervisor / summary present';
     });
-    await check('virtualization_mode', 'Deployment mode seeded in system_meta', () => {
-      const row = this.db.prepare("SELECT value FROM system_meta WHERE key = 'deployment_mode'").get();
-      if (!row) throw new Error('no deployment_mode row in system_meta (B5e seed missing)');
-      return 'deployment_mode = ' + row.value;
+    await check('virtualization_mode', 'Deployment-mode record readable and verified (config store)', () => {
+      const dm = require('./deployment-mode');
+      const s = dm.summary(this.db);
+      if (!s || typeof s.mode !== 'string') throw new Error('deployment-mode summary returned no mode');
+      // The sealed record lives in the config store under deployment_mode, not
+      // system_meta (the old check read a key that is never written). No record
+      // is a valid fresh install (fail-safe bare-metal default); a record that
+      // is present but does not verify means tamper or an anchor mismatch.
+      if (s.recordPresent && !s.configured) {
+        throw new Error('deployment_mode record present but failed verification (tamper or anchor mismatch); fell back to ' + s.mode);
+      }
+      return s.recordPresent ? ('deployment_mode = ' + s.mode + ' (sealed)') : ('no sealed record; default ' + s.mode);
     });
     await check('virtualization_mode', 'Clock-integrity monitor present (snapshot-rollback defense)', () => {
       const ci = require('./clock-integrity');
@@ -1845,6 +1853,30 @@ class RegressionRunner {
       const sdnRoute = require('../routes/sdn');
       if (typeof sdnRoute !== 'function') throw new Error('routes/sdn did not load as a router');
       return "'sdn' removed from generic VALID_TYPES; dedicated routes/sdn router loads";
+    });
+
+    await check('sdn_mode', 'Deployment-mode exposes the substrate API (B5i2)', () => {
+      const dm = require('./deployment-mode');
+      if (!Array.isArray(dm.SUBSTRATES)) throw new Error('deployment-mode SUBSTRATES is not an array');
+      const missing = ['bare-metal', 'virtualized', 'cloud'].filter(x => dm.SUBSTRATES.indexOf(x) === -1);
+      if (missing.length) throw new Error('SUBSTRATES missing: ' + missing.join(', '));
+      if (typeof dm.detectSubstrate !== 'function') throw new Error('deployment-mode is missing detectSubstrate');
+      return 'SUBSTRATES = [' + dm.SUBSTRATES.join(', ') + ']; detectSubstrate present';
+    });
+
+    await check('sdn_mode', 'Substrate gates are present and fail safe with no sealed record (B5i2)', () => {
+      const dm = require('./deployment-mode');
+      const s = dm.summary(this.db);
+      const need = ['substrate', 'substrateVirtualized', 'substrateCloud', 'easilyCopied', 'ccRequired'];
+      const absent = need.filter(k => !(k in s));
+      if (absent.length) throw new Error('deployment-mode summary missing substrate fields: ' + absent.join(', '));
+      // No sealed record: the host is treated as bare-metal, so none of the
+      // easily-copied gates fire. This is the fail-safe default the pre-auth
+      // and clock-integrity gates depend on.
+      if (s.substrateVirtualized || s.substrateCloud || s.easilyCopied || s.ccRequired) {
+        throw new Error('substrate gates must all be false with no sealed record');
+      }
+      return 'summary exposes substrate fields; all easily-copied gates false by default';
     });
 
     // ── Aggregate ──────────────────────────────────────────────────

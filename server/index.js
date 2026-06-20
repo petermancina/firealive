@@ -480,6 +480,24 @@ async function start() {
         if (envMode && !deploymentMode.isConfigured(modeDb)) {
           if (deploymentMode.MODES.indexOf(envMode) === -1) {
             logger.warn('Ignoring invalid FIREALIVE_DEPLOYMENT_MODE', { value: envMode, valid: deploymentMode.MODES });
+          } else if (envMode === deploymentMode.SDN) {
+            // SDN composes with a host substrate. It is operator-declared via a
+            // required env (never auto-picked) and sealed; an absent or
+            // weaker-than-detected substrate halts the server (fail-closed), it
+            // never silently downgrades.
+            const declared = process.env.FIREALIVE_SDN_SUBSTRATE;
+            if (deploymentMode.SUBSTRATES.indexOf(declared) === -1) {
+              logger.error('SDN mode requires FIREALIVE_SDN_SUBSTRATE to be one of ' + deploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed)', { value: declared || null });
+              process.exit(1);
+            }
+            const detected = await deploymentMode.detectSubstrate(modeDb);
+            const substrateRank = { 'bare-metal': 0, 'virtualized': 1, 'cloud': 2 };
+            if (substrateRank[detected] > substrateRank[declared]) {
+              logger.error('FIREALIVE_SDN_SUBSTRATE declares a weaker host substrate than detection proves; refusing to start (anti-downgrade, fail-closed)', { declared: declared, detected: detected });
+              process.exit(1);
+            }
+            deploymentMode.setMode(modeDb, envMode, { substrate: declared });
+            logger.info('Deployment mode provisioned and sealed', { mode: envMode, substrate: declared, detected: detected });
           } else {
             deploymentMode.setMode(modeDb, envMode);
             logger.info('Deployment mode provisioned and sealed', { mode: envMode });
@@ -488,6 +506,9 @@ async function start() {
           logger.warn('FIREALIVE_DEPLOYMENT_MODE differs from the sealed mode; the sealed mode is authoritative', { env: envMode, sealed: deploymentMode.getMode(modeDb) });
         }
         app.locals.deploymentMode = deploymentMode.summary(modeDb);
+        if (app.locals.deploymentMode.sdn === true && !app.locals.deploymentMode.substrate) {
+          logger.warn('This SDN deployment was sealed before host-substrate support and runs on the strict TPM path; re-provision with FIREALIVE_SDN_SUBSTRATE to enable substrate-specific protections.');
+        }
         logger.info('Deployment mode', app.locals.deploymentMode);
       } finally {
         modeDb.close();
@@ -497,36 +518,24 @@ async function start() {
       app.locals.deploymentMode = { mode: 'bare-metal', configured: false, recordPresent: false, virtualized: false, hypervisor: null };
     }
 
-    // B5i (D-B5i-2): substrate detection for sdn mode. An sdn deployment can be
-    // cloud-resident or onsite; a cloud-resident sdn component inherits the
-    // confidential-computing + vTPM enforcement below, while an onsite one uses
-    // its TPM hardware root (the bare-metal / virtualized path established
-    // above). Detect the substrate from the live cloud metadata service; the
-    // absence of a provider means onsite.
-    app.locals.sdnCloudResident = false;
-    if (app.locals.deploymentMode && app.locals.deploymentMode.sdn === true) {
-      try {
-        const cloudMetadata = require('./services/cloud-metadata');
-        const meta = await cloudMetadata.readCloudMetadata();
-        app.locals.sdnCloudResident = !!(meta && meta.provider);
-        app.locals.cloudMetadata = meta || null;
-        logger.info('SDN Mode substrate detected', { cloudResident: app.locals.sdnCloudResident, provider: meta ? meta.provider : null });
-      } catch (sdnSubstrateErr) {
-        logger.warn('SDN Mode substrate detection failed; treating as onsite (TPM hardware root)', { error: sdnSubstrateErr.message });
-        app.locals.sdnCloudResident = false;
-      }
-    }
+    // B5i2: the SDN host substrate is now sealed in the deployment-mode record
+    // (operator-declared, anchor-signed), not detected at runtime. sdnCloudResident
+    // is a derived alias -- true only for an SDN deployment sealed on a cloud
+    // substrate -- kept for the pre-auth attestation gate. The cloud metadata the
+    // confidential-VM gate and cert-SAN reconcile need is read and published by
+    // the gate below, only for a cloud substrate.
+    app.locals.sdnCloudResident = !!(app.locals.deploymentMode && app.locals.deploymentMode.sdn === true && app.locals.deploymentMode.substrateCloud === true);
 
     // B5h / B5i: confidential-VM boot gate (D-B5h-3, D-B5h-4, D-B5i-2). On a
-    // confidential-VM substrate -- cloud mode, or sdn mode detected as cloud-
-    // resident above -- confidential computing is REQUIRED and attested before
+    // confidential-VM substrate -- cloud mode, or an sdn deployment sealed on a
+    // cloud substrate -- confidential computing is REQUIRED and attested before
     // the server serves any request: verify a confidential-VM guest is present
     // (fail closed if not), refuse spot / autoscaled / ephemeral-fleet
     // instances, stamp the attestation, and publish the result on app.locals for
     // the pre-auth gate. Any error here halts the server -- it never silently
     // downgrades. An onsite sdn (or bare-metal / virtualized) deployment skips
     // this gate and relies on its TPM hardware root established above.
-    if (app.locals.deploymentMode && (app.locals.deploymentMode.cloud === true || app.locals.sdnCloudResident === true)) {
+    if (app.locals.deploymentMode && app.locals.deploymentMode.substrateCloud === true) {
       try {
         const cloudAttestation = require('./services/cloud-attestation');
         const cloudMetadata = require('./services/cloud-metadata');
@@ -575,8 +584,8 @@ async function start() {
         const mode = app.locals.deploymentMode || {};
         const presence = instanceRegistry.recordHostPresence(hostDb, {
           host: os.hostname(),
-          virtualized: mode.virtualized === true,
-          cloud: mode.cloud === true,
+          virtualized: mode.substrateVirtualized === true,
+          cloud: mode.substrateCloud === true,
           hypervisor: mode.hypervisor || null
         });
         if (presence.migration) {
@@ -686,7 +695,7 @@ async function start() {
     // re-issuing on a cloud stop/start or load-balancer change is safe. Guarded:
     // a reconcile failure keeps the existing cert (still served over the pinned
     // anchor) rather than halting.
-    if (app.locals.deploymentMode && app.locals.deploymentMode.cloud === true) {
+    if (app.locals.deploymentMode && app.locals.deploymentMode.substrateCloud === true) {
       try {
         const cloudMode = require('./services/cloud-mode');
         const reconcileDb = getDb();

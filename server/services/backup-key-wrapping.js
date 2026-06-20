@@ -276,7 +276,7 @@ function assertCloudBackupKekPosture(scheme, cloud) {
 function isCloudDeployment(db) {
   if (!db || typeof db.prepare !== 'function') return false;
   try {
-    return require('./deployment-mode').isCloud(db) === true;
+    return require('./deployment-mode').summary(db).substrateCloud === true;
   } catch (_e) {
     return false;
   }
@@ -325,8 +325,9 @@ async function wrapKey(ephemeralKey, options) {
     throw new Error('backup-key-wrapping: kekReference required (non-empty string)');
   }
 
-  // Cloud Mode backup-KEK posture (D-B5h-5): refuse an env-var KEK for new
-  // backups in cloud mode. Restore (unwrapKey) is unaffected.
+  // Cloud backup-KEK posture (D-B5h-5): refuse an env-var KEK for new backups
+  // on a cloud substrate (cloud mode or SDN+cloud). Restore (unwrapKey) is
+  // unaffected.
   assertCloudBackupKekPosture(scheme, isCloudDeployment(db));
 
   ensureProvidersLoaded();
