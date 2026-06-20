@@ -1966,6 +1966,114 @@ class RegressionRunner {
       return 'summary exposes substrate fields; all easily-copied gates false by default';
     });
 
+    // -- SASE mode (B5k): the fifth deployment mode, substrate-aware ----------
+    await check('sase_mode', 'SASE posture-events table present', () => {
+      const have = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sase_posture_events'").all().map(r => r.name);
+      if (have.indexOf('sase_posture_events') === -1) throw new Error('sase_posture_events table is missing');
+      return 'sase_posture_events present';
+    });
+
+    await check('sase_mode', 'Deployment-mode exposes sase, isSase, and the summary fields', () => {
+      const dm = require('./deployment-mode');
+      if (typeof dm.isSase !== 'function') throw new Error('deployment-mode is missing isSase');
+      if (dm.SASE !== 'sase') throw new Error('deployment-mode SASE constant missing or not "sase"');
+      if (!Array.isArray(dm.MODES) || dm.MODES.indexOf('sase') === -1) throw new Error('sase is not in deployment-mode MODES');
+      const s = dm.summary(this.db);
+      const need = ['sase', 'networkMode', 'substrate', 'substrateVirtualized', 'substrateCloud', 'easilyCopied', 'ccRequired'];
+      const absent = need.filter(k => !(k in s));
+      if (absent.length) throw new Error('summary missing fields: ' + absent.join(', '));
+      if (s.sase !== false) throw new Error('sase must be false with no sealed record');
+      if (s.networkMode !== null) throw new Error('networkMode must be null with no sealed record');
+      return 'isSase + SASE=sase + sase in MODES; summary exposes sase/networkMode/substrate fields (false/null by default)';
+    });
+
+    await check('sase_mode', 'setMode requires a valid substrate for sase (fail-closed)', () => {
+      const dm = require('./deployment-mode');
+      const mem = cloneLiveSchema(this.db);
+      let missingRejected = false, badRejected = false, validAccepted = false;
+      try { dm.setMode(mem, 'sase', {}); } catch (e) { if (e.code === 'INVALID_SUBSTRATE') missingRejected = true; }
+      try { dm.setMode(mem, 'sase', { substrate: 'nonsense' }); } catch (e) { if (e.code === 'INVALID_SUBSTRATE') badRejected = true; }
+      // A valid substrate passes the substrate gate and only then fails at the anchor step.
+      try { dm.setMode(mem, 'sase', { substrate: 'virtualized' }); } catch (e) { if (e.code === 'ANCHOR_REQUIRED') validAccepted = true; }
+      if (!missingRejected) throw new Error('sase with no substrate must be rejected (INVALID_SUBSTRATE)');
+      if (!badRejected) throw new Error('sase with an invalid substrate must be rejected (INVALID_SUBSTRATE)');
+      if (!validAccepted) throw new Error('sase with a valid substrate must pass the substrate gate (reach ANCHOR_REQUIRED)');
+      return 'sase requires a valid substrate; missing/invalid rejected; a valid substrate is accepted past the gate';
+    });
+
+    await check('sase_mode', 'Admission admits the connector source, refuses non-connector, and detects clientless headers', () => {
+      const adm = require('../middleware/sase-admission');
+      if (typeof adm._ipMatchesEntry !== 'function') throw new Error('admission matcher hook (_ipMatchesEntry) is missing');
+      if (adm._ipMatchesEntry('203.0.113.7', '203.0.113.0/24') !== true) throw new Error('a peer inside a connector CIDR must match');
+      if (adm._ipMatchesEntry('203.0.113.7', '203.0.113.7') !== true) throw new Error('an exact connector IPv4 must match');
+      if (adm._ipMatchesEntry('198.51.100.9', '203.0.113.0/24') !== false) throw new Error('a peer outside the connector allow-list must NOT match (direct-exposure invariant)');
+      if (typeof adm._clientlessIdentityHeader !== 'function') throw new Error('passthrough hook (_clientlessIdentityHeader) is missing');
+      if (adm._clientlessIdentityHeader({ headers: { 'cf-access-authenticated-user-email': 'a@b.c' } }) !== 'cf-access-authenticated-user-email') throw new Error('a clientless identity header must be detected');
+      if (adm._clientlessIdentityHeader({ headers: { 'x-forwarded-for': '1.2.3.4' } }) !== null) throw new Error('X-Forwarded-For must NOT be treated as a clientless identity header');
+      if (adm._clientlessIdentityHeader({ headers: {} }) !== null) throw new Error('no identity header must return null');
+      return 'connector CIDR/exact admitted, non-connector refused; clientless header detected; XFF not flagged';
+    });
+
+    await check('sase_mode', 'Admission passes through outside sase mode and admits loopback in sase mode', () => {
+      const adm = require('../middleware/sase-admission');
+      const mw = adm.saseAdmission();
+      const res = { status() { return { json() {} }; } };
+      let passedThrough = false;
+      mw({ app: { locals: { deploymentMode: {} } }, socket: { remoteAddress: '198.51.100.9' }, headers: {}, path: '/api/x' }, res, () => { passedThrough = true; });
+      if (!passedThrough) throw new Error('admission must pass through outside sase mode');
+      let admittedLoopback = false;
+      mw({ app: { locals: { deploymentMode: { sase: true } } }, socket: { remoteAddress: '127.0.0.1' }, headers: {}, path: '/api/x' }, res, () => { admittedLoopback = true; });
+      if (!admittedLoopback) throw new Error('loopback must be admitted in sase mode');
+      return 'pass-through outside sase mode; loopback admitted in sase mode (against the raw socket peer)';
+    });
+
+    await check('sase_mode', 'Fail-safe denies the entire /api surface while degraded (assume-breach)', () => {
+      const failsafe = require('../middleware/sase-fail-safe');
+      if (!Array.isArray(failsafe._degradedReachable) || failsafe._degradedReachable.length !== 0) throw new Error('the degraded allow-list is not empty; assume-breach requires deny-all');
+      const paths = ['/api/health', '/api/auth/login', '/api/sase/config', '/api/anything', '/api/'];
+      const reachable = paths.filter(p => failsafe._isReachableWhileDegraded(p) === true);
+      if (reachable.length) throw new Error('paths wrongly reachable while degraded: ' + reachable.join(', '));
+      if (typeof failsafe.saseFailSafe !== 'function') throw new Error('saseFailSafe middleware missing');
+      return 'empty degraded allow-list; every /api path is denied while sase posture is degraded';
+    });
+
+    await check('sase_mode', 'Posture latches degraded on a boundary-failure event and clears on an explicit restore', () => {
+      const sm = require('./sase-mode');
+      const mem = cloneLiveSchema(this.db);
+      if (sm.getPosture(mem).degraded !== false) throw new Error('a fresh deployment must not be degraded');
+      sm.recordPostureEvent(mem, { eventType: 'direct_exposure_refused', severity: 'critical', detail: { sourceIp: '198.51.100.9' } });
+      if (sm.getPosture(mem).degraded !== true) throw new Error('a direct-exposure refusal must latch posture degraded');
+      sm.recordPostureEvent(mem, { eventType: 'posture_restored', severity: 'info' });
+      if (sm.getPosture(mem).degraded !== false) throw new Error('an explicit restore must clear the latch');
+      return 'healthy by default; latches degraded on a direct-exposure refusal; clears only on an explicit restore';
+    });
+
+    await check('sase_mode', 'SASE probe descriptor is present, in the roster, not configured by default, and read-only', () => {
+      const ihp = require('./integration-health-probes');
+      const cfg = require('./integration-health-config');
+      if (!Array.isArray(cfg.INTEGRATION_KEYS) || cfg.INTEGRATION_KEYS.indexOf('sase') === -1) throw new Error('sase is not in INTEGRATION_KEYS');
+      const sase = ihp.registry.find((d) => d.key === 'sase');
+      if (!sase) throw new Error('sase descriptor missing from the probe registry');
+      if (typeof ihp.saseProbe !== 'function') throw new Error('saseProbe is not exported');
+      if (sase.configured(this.db) !== false) throw new Error('sase.configured() must be false without sase mode + connector sources');
+      const r = ihp.saseProbe(this.db);
+      if (!r || r.status !== 'not_configured') throw new Error('saseProbe must report not_configured on a non-sase deployment');
+      return 'sase in INTEGRATION_KEYS; descriptor present; configured() false by default; probe reports not_configured without dialing the provider';
+    });
+
+    await check('sase_mode', 'Connector-source normalizer trims, de-duplicates, and rejects malformed entries', () => {
+      const sm = require('./sase-mode');
+      if (typeof sm.normalizeConnectorSources !== 'function') throw new Error('normalizeConnectorSources is not exported');
+      const ok = sm.normalizeConnectorSources([' 203.0.113.0/24 ', '198.51.100.7', '203.0.113.0/24']);
+      if (ok.length !== 2) throw new Error('normalizer must trim and de-duplicate (expected 2, got ' + ok.length + ')');
+      let rejectedBad = false, rejectedType = false;
+      try { sm.normalizeConnectorSources(['not a cidr!!']); } catch (_e) { rejectedBad = true; }
+      try { sm.normalizeConnectorSources('nope'); } catch (_e) { rejectedType = true; }
+      if (!rejectedBad) throw new Error('a malformed connector source must be rejected');
+      if (!rejectedType) throw new Error('a non-array connector-sources value must be rejected');
+      return 'normalizer trims/dedupes valid CIDRs and rejects malformed entries and non-array input';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

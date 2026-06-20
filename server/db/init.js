@@ -623,6 +623,21 @@ CREATE TABLE IF NOT EXISTS sdn_posture_state (
   last_transition_event_id TEXT REFERENCES sdn_posture_events(id)
 );
 
+-- B5k SASE posture: append-only audit of dark-app / passthrough admission
+-- refusals and posture transitions. SASE degradation is event-driven (discrete
+-- security events), not probe-noise, so there is no separate hysteresis state
+-- table; posture is re-derived from this log and so survives restart.
+CREATE TABLE IF NOT EXISTS sase_posture_events (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'direct_exposure_refused', 'passthrough_violation_refused',
+    'posture_degraded', 'posture_restored'
+  )),
+  severity TEXT DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'critical')),
+  detail TEXT,                            -- JSON observation/transition detail
+  observed_at TEXT DEFAULT (datetime('now'))
+);
+
 -- ── API Keys ─────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS api_keys (

@@ -2664,6 +2664,13 @@ function ManagementConsole() {
   const [accessCtrlCfg, setAccessCtrlCfg] = useState({model:"rbac",enforceSessionBinding:true,maxConcurrentSessions:3,sessionTimeoutMinutes:480,requireMfaForAdmin:true,requireMfaForConfig:true});
   const [recertCfg, setRecertCfg] = useState({intervalDays:90,enabled:true});
   const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,clients:[]});
+  const [saseCfg, setSaseCfg] = useState({enabled:false,provider:"",ztnaEndpoint:"",casbEnabled:false,swgEnabled:false,fwaasPolicyId:"",deployedAsSECaaS:false});
+  const [saseSourcesText, setSaseSourcesText] = useState("");
+  const [sdnNetCfg, setSdnNetCfg] = useState({sdwanSites:{}});
+  const [sdnSegmentsText, setSdnSegmentsText] = useState("");
+  const [sdnInt, setSdnInt] = useState({platform:"",apiEndpoint:"",username:"",apiKey:""});
+  const [sdnIntId, setSdnIntId] = useState(null);
+  const [sdnIntHasCreds, setSdnIntHasCreds] = useState(false);
   const [newGeoClient, setNewGeoClient] = useState({clientId:"",country:"",region:"",dataResidency:"local",regulatoryFramework:"none"});
   // HA enhancements
   const [haManualFailover, setHaManualFailover] = useState(false);
@@ -3273,6 +3280,9 @@ function ManagementConsole() {
     api.get("/api/geo-fence/config").then(c=>{if(c&&!c.error)setGeoFenceCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/threat-hunting/config").then(c=>{if(c&&!c.error)setThreatHuntCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/pseudonyms/config").then(c=>{if(c&&!c.error)setPseudonymCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/sase/config").then(c=>{if(c&&!c.error){setSaseCfg(pr=>({...pr,...c}));setSaseSourcesText(((c.connectorSources)||[]).join("\n"));}}).catch(()=>{});
+    api.get("/api/sdn/network-map").then(c=>{if(c&&!c.error&&c.networkMap){const m=c.networkMap;setSdnNetCfg(pr=>({...pr,sdwanSites:m.sdwanSites||{}}));setSdnSegmentsText(((m.permittedSegments)||[]).join("\n"));}}).catch(()=>{});
+    api.get("/api/sdn/integrations").then(c=>{if(c&&!c.error&&Array.isArray(c.integrations)&&c.integrations.length){const it=c.integrations[0];setSdnInt(pr=>({...pr,platform:it.platform||"",apiEndpoint:it.apiEndpoint||""}));setSdnIntId(it.id||null);setSdnIntHasCreds(!!it.credentialsConfigured);}}).catch(()=>{});
   },[]);
   // ── B1: Cloud Vulnerability Scan — scanner authorization registry + scan-access log ──
   const CLOUD_VULN_SCANNERS = [
@@ -5354,12 +5364,15 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure the platform for distributed SOC environments where analysts, automation systems, and SIEM infrastructure span multiple sites connected via SD-WAN or SDN fabrics.</M>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>SDN Controller Integration</div>
-            <Sel label="SDN Platform"><option value="">Select...</option><option value="cisco-aci">Cisco ACI</option><option value="vmware-nsx">VMware NSX-T</option><option value="openflow">OpenFlow (Open vSwitch)</option><option value="arista-cv">Arista CloudVision</option><option value="juniper-cn2">Juniper CN2</option><option value="calico">Calico Enterprise</option><option value="cilium">Cilium (eBPF)</option><option value="custom">Custom REST API</option></Sel>
-            <Input label="Controller API endpoint" placeholder="https://sdn-controller.corp.local:443/api/v1" maxLength={512}/>
+            <Sel label="SDN Platform" value={sdnInt.platform} onChange={e=>setSdnInt(p=>({...p,platform:e.target.value}))} disabled={!!sdnIntId}><option value="">Select...</option><option value="cisco-aci">Cisco ACI</option><option value="vmware-nsx">VMware NSX-T</option><option value="openflow">OpenFlow (Open vSwitch)</option><option value="arista-cv">Arista CloudVision</option><option value="juniper-cn2">Juniper CN2</option><option value="calico">Calico Enterprise</option><option value="cilium">Cilium (eBPF)</option><option value="custom">Custom REST API</option></Sel>
+            {sdnIntId&&<M style={{color:C.tm,fontSize:10,marginBottom:10,display:"block"}}>Platform is fixed after creation; delete and recreate the integration to change it.</M>}
+            <Input label="Controller API endpoint" placeholder="https://sdn-controller.corp.local:443/api/v1" maxLength={512} value={sdnInt.apiEndpoint} onChange={e=>setSdnInt(p=>({...p,apiEndpoint:e.target.value}))}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="API username / service account" placeholder="svc-socwellbeing" maxLength={256}/>
-              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" placeholder="••••••••" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
+              <Input label="API username / service account" placeholder="svc-socwellbeing" maxLength={256} value={sdnInt.username} onChange={e=>setSdnInt(p=>({...p,username:e.target.value}))}/>
+              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>API key / token</M><input type="password" placeholder="••••••••" maxLength={512} value={sdnInt.apiKey} onChange={e=>setSdnInt(p=>({...p,apiKey:e.target.value}))} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
             </div>
+            {sdnIntHasCreds&&<M style={{color:C.tm,fontSize:10,marginBottom:10,display:"block"}}>Credentials are configured; leave username and key blank to keep them, or re-enter to replace.</M>}
+            <Btn primary onClick={()=>{const creds=(sdnInt.username||sdnInt.apiKey)?{username:sdnInt.username,apiKey:sdnInt.apiKey}:undefined;const nm="SDN controller ("+(sdnInt.platform||"custom")+")";const body=sdnIntId?{name:nm,apiEndpoint:sdnInt.apiEndpoint}:{name:nm,platform:sdnInt.platform,apiEndpoint:sdnInt.apiEndpoint};if(creds)body.credentials=creds;const pr=sdnIntId?api.put("/api/sdn/integrations/"+sdnIntId,body):api.post("/api/sdn/integrations",body);pr.then(r=>{if(r&&!r.error&&r.integration){setSdnIntId(r.integration.id);setSdnIntHasCreds(!!r.integration.credentialsConfigured);setSdnInt(q=>({...q,username:"",apiKey:""}));}saved(r,"SDN_INTEGRATION_SAVED","SDN controller integration saved");});}}>Save Controller Integration</Btn>
           </Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Network Segmentation Policy</div>
@@ -5372,12 +5385,14 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             ))}
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>SD-WAN Site Configuration</div>
-            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>For multi-site SOCs where analysts work from different locations connected via SD-WAN (Cisco Viptela, VMware VeloCloud, Fortinet, Palo Alto Prisma SD-WAN).</M>
-            <Input label="Primary site CIDR" placeholder="10.0.0.0/16" maxLength={18}/>
-            <Input label="Secondary site CIDR" placeholder="10.1.0.0/16" maxLength={18}/>
-            <Input label="SD-WAN overlay network" placeholder="172.16.0.0/12" maxLength={18}/>
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"SDN_CONFIGURED",detail:"SDN integration configured"}).then(()=>addA("SDN_CONFIGURED","SDN integration configured"))}>Save SDN Configuration</Btn>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Network Admission &amp; SD-WAN Sites</div>
+            <Input label="Permitted segments (CIDR allow-list, comma or newline separated)" placeholder="10.0.0.0/16, 10.1.0.0/16" maxLength={2048} value={sdnSegmentsText} onChange={e=>setSdnSegmentsText(e.target.value)}/>
+            <M style={{color:C.tm,fontSize:10,lineHeight:1.5,marginBottom:12,display:"block"}}>The network segments FireAlive's own components may connect from. In sdn mode the admission gate refuses any connection originating outside these segments.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>SD-WAN site CIDRs below are recorded for the segmentation-policy generator (Cisco Viptela, VMware VeloCloud, Fortinet, Palo Alto Prisma SD-WAN); they do not by themselves widen the admission allow-list above.</M>
+            <Input label="Primary site CIDR" placeholder="10.0.0.0/16" maxLength={18} value={sdnNetCfg.sdwanSites.primary||""} onChange={e=>setSdnNetCfg(p=>({...p,sdwanSites:{...p.sdwanSites,primary:e.target.value}}))}/>
+            <Input label="Secondary site CIDR" placeholder="10.1.0.0/16" maxLength={18} value={sdnNetCfg.sdwanSites.secondary||""} onChange={e=>setSdnNetCfg(p=>({...p,sdwanSites:{...p.sdwanSites,secondary:e.target.value}}))}/>
+            <Input label="SD-WAN overlay network" placeholder="172.16.0.0/12" maxLength={18} value={sdnNetCfg.sdwanSites.overlay||""} onChange={e=>setSdnNetCfg(p=>({...p,sdwanSites:{...p.sdwanSites,overlay:e.target.value}}))}/>
+            <Btn primary onClick={()=>api.put("/api/sdn/network-map",{permittedSegments:sdnSegmentsText.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),sdwanSites:sdnNetCfg.sdwanSites}).then(r=>saved(r,"SDN_NETWORK_MAP_UPDATED","SDN network map saved"))}>Save Network Configuration</Btn>
           </Card>
         </div>)}
 
@@ -7302,15 +7317,18 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <L>SASE Integration</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Integrate FireAlive with your Secure Access Service Edge platform. FireAlive can operate within SASE as a SECaaS offering or connect through ZTNA, CASB, and SWG components.</M>
           <Card style={{marginBottom:16}}>
-            <Sel label="SASE Provider">
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox" checked={saseCfg.enabled} onChange={e=>setSaseCfg(p=>({...p,enabled:e.target.checked}))}/><M style={{color:C.t}}>Enable SASE integration</M></label>
+            <Sel label="SASE Provider" value={saseCfg.provider||""} onChange={e=>setSaseCfg(p=>({...p,provider:e.target.value}))}>
               <option value="">Select provider...</option><option value="zscaler">Zscaler</option><option value="netskope">Netskope</option><option value="palo_alto_prisma">Palo Alto Prisma Access</option><option value="cato">Cato Networks</option><option value="cloudflare">Cloudflare One</option><option value="fortinet">Fortinet</option>
             </Sel>
-            <Input label="ZTNA Endpoint URL" placeholder="https://ztna.corp.example.com"/>
-            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox"/><M style={{color:C.t}}>Enable CASB integration</M></label>
-            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox"/><M style={{color:C.t}}>Enable SWG policy enforcement</M></label>
-            <Input label="FWaaS Policy ID" placeholder="Policy identifier"/>
-            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox"/><M style={{color:C.t}}>Deploy FireAlive as SECaaS within SASE</M></label>
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"SASE_CONFIG_SAVED",detail:"SASE integration configured"}).then(()=>addA("SASE_CONFIG_SAVED","SASE integration configured"))}>Save SASE Config</Btn>
+            <Input label="ZTNA Endpoint URL" placeholder="https://ztna.corp.example.com" value={saseCfg.ztnaEndpoint||""} onChange={e=>setSaseCfg(p=>({...p,ztnaEndpoint:e.target.value}))}/>
+            <Input label="ZTNA connector source IPs / CIDRs (comma or newline separated)" placeholder="203.0.113.10, 198.51.100.0/24" maxLength={2048} value={saseSourcesText} onChange={e=>setSaseSourcesText(e.target.value)}/>
+            <M style={{color:C.tm,fontSize:10,lineHeight:1.5,marginBottom:12,display:"block"}}>The source addresses of your ZTNA App Connector. In sase mode FireAlive admits only connections arriving from these peers; anything else is treated as direct exposure and locks the surface down.</M>
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox" checked={saseCfg.casbEnabled} onChange={e=>setSaseCfg(p=>({...p,casbEnabled:e.target.checked}))}/><M style={{color:C.t}}>Enable CASB integration</M></label>
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,cursor:"pointer"}}><input type="checkbox" checked={saseCfg.swgEnabled} onChange={e=>setSaseCfg(p=>({...p,swgEnabled:e.target.checked}))}/><M style={{color:C.t}}>Enable SWG policy enforcement</M></label>
+            <Input label="FWaaS Policy ID" placeholder="Policy identifier" value={saseCfg.fwaasPolicyId||""} onChange={e=>setSaseCfg(p=>({...p,fwaasPolicyId:e.target.value}))}/>
+            <label style={{display:"flex",alignItems:"center",gap:6,marginBottom:12,cursor:"pointer"}}><input type="checkbox" checked={saseCfg.deployedAsSECaaS} onChange={e=>setSaseCfg(p=>({...p,deployedAsSECaaS:e.target.checked}))}/><M style={{color:C.t}}>Deploy FireAlive as SECaaS within SASE</M></label>
+            <Btn primary onClick={()=>api.put("/api/sase/config",{...saseCfg,connectorSources:saseSourcesText.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean)}).then(r=>saved(r,"SASE_CONFIG_SAVED","SASE integration saved"))}>Save SASE Config</Btn>
           </Card>
         </div>)}
 
@@ -9553,20 +9571,21 @@ function DeploymentSetup({ onComplete }) {
             {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.",()=>choose("bare-metal"))}
             {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.",()=>choose("virtualized"))}
             {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("cloud"))}
-            {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.",()=>{setErr("");setPickSubstrate(true);})}
+            {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.",()=>{setErr("");setPickSubstrate("sdn");})}
+            {card("sase","SASE / ZTNA","Private (dark) application behind your organization's ZTNA/SASE edge. Reachable only through the connector, with FireAlive's device-bound mTLS preserved end-to-end; refuses clientless TLS-terminating access.",()=>{setErr("");setPickSubstrate("sase");})}
           </div>
         </>
       ) : (
         <>
           <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
-            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP / SDN</M>
-            <div style={{color:C.t,fontSize:20,fontWeight:600}}>What does the SDN host run on?</div>
+            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>{"FIREALIVE SETUP / " + (pickSubstrate === "sase" ? "SASE" : "SDN")}</M>
+            <div style={{color:C.t,fontSize:20,fontWeight:600}}>{"What does the " + (pickSubstrate === "sase" ? "SASE" : "SDN") + " host run on?"}</div>
             <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>The substrate sets this host's identity and snapshot tolerances. It is confirmed against the server, which fails closed if the declared substrate is weaker than what it detects.</M>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
-            {card("sdn-bare-metal","Bare metal","Dedicated physical hardware with a hardware TPM. Strictest identity enforcement; no snapshot or live-migration allowances.",()=>choose("sdn","bare-metal"))}
-            {card("sdn-virtualized","Virtualized","A VM or hypervisor with a vTPM. Adds snapshot and clock-jump tolerances; quarantines a host that looks cloned or rolled back.",()=>choose("sdn","virtualized"))}
-            {card("sdn-cloud","Cloud","A confidential VM on AWS, Azure, or GCP. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("sdn","cloud"))}
+            {card(pickSubstrate + "-bare-metal","Bare metal","Dedicated physical hardware with a hardware TPM. Strictest identity enforcement; no snapshot or live-migration allowances.",()=>choose(pickSubstrate,"bare-metal"))}
+            {card(pickSubstrate + "-virtualized","Virtualized","A VM or hypervisor with a vTPM. Adds snapshot and clock-jump tolerances; quarantines a host that looks cloned or rolled back.",()=>choose(pickSubstrate,"virtualized"))}
+            {card(pickSubstrate + "-cloud","Cloud","A confidential VM on AWS, Azure, or GCP. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose(pickSubstrate,"cloud"))}
           </div>
           <button onClick={()=>{setErr("");setPickSubstrate(false);}} disabled={busy} style={{background:"none",border:"none",color:C.tm,fontSize:10,cursor:busy?"default":"pointer",textDecoration:"underline",padding:4}}>Back to deployment mode</button>
         </>

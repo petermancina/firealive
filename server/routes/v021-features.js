@@ -11,6 +11,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const { version } = require('../lib/version');
+const saseMode = require('../services/sase-mode');
 
 // ── Vulnerability Scanner Integration ────────────────────────────────────────
 // Allows approved scanners (Nessus, OpenVAS, Qualys) to scan the app.
@@ -189,6 +190,7 @@ router.get('/sase/config', (req, res) => {
       enabled: false,
       provider: null, // zscaler, netskope, palo_alto_prisma, cato, cloudflare
       ztnaEndpoint: '',
+      connectorSources: [],
       casbEnabled: false,
       swgEnabled: false,
       fwaasPolicyId: '',
@@ -198,12 +200,19 @@ router.get('/sase/config', (req, res) => {
 });
 
 router.put('/sase/config', (req, res) => {
-  const { enabled, provider, ztnaEndpoint, casbEnabled, swgEnabled, fwaasPolicyId, deployedAsSECaaS } = req.body;
+  const { enabled, provider, ztnaEndpoint, casbEnabled, swgEnabled, fwaasPolicyId, deployedAsSECaaS, connectorSources } = req.body;
   const validProviders = ['zscaler', 'netskope', 'palo_alto_prisma', 'cato', 'cloudflare', 'fortinet'];
+  let normalizedSources;
+  try {
+    normalizedSources = saseMode.normalizeConnectorSources(connectorSources);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || 'invalid connector sources' });
+  }
   const config = {
     enabled: !!enabled,
     provider: validProviders.includes(provider) ? provider : null,
     ztnaEndpoint: (ztnaEndpoint || '').slice(0, 512),
+    connectorSources: normalizedSources,
     casbEnabled: !!casbEnabled,
     swgEnabled: !!swgEnabled,
     fwaasPolicyId: (fwaasPolicyId || '').slice(0, 128),

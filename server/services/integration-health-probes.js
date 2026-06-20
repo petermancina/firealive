@@ -355,6 +355,37 @@ function sdnProbe(db) {
   return { ok: true, status: 'ok', detail: 'posture ' + state + '; ' + reachable + ' of ' + total + ' adapter(s) reachable' };
 }
 
+function _saseConnectorState(db) {
+  try {
+    const sm = require('./sase-mode');
+    const cfg = sm.getSaseConfig(db);
+    const posture = sm.getPosture(db);
+    return {
+      sources: Array.isArray(cfg.connectorSources) ? cfg.connectorSources : [],
+      provider: cfg.provider || null,
+      degraded: posture.degraded === true,
+      lastEvent: posture.lastEvent || null,
+    };
+  } catch (_e) {
+    return { sources: [], provider: null, degraded: false, lastEvent: null };
+  }
+}
+
+// State-read only: reports the configured connector allow-list and the latched
+// posture. FireAlive sits BEHIND the ZTNA connector and never dials out, so this
+// probe makes no network call and never contacts the SASE provider.
+function saseProbe(db) {
+  let sase = false;
+  try { sase = require('./deployment-mode').isSase(db); } catch (_e) {}
+  const state = _saseConnectorState(db);
+  if (!sase || !state.sources.length) return { status: 'not_configured' };
+  if (state.degraded) {
+    return { ok: false, status: 'unreachable', detail: 'SASE posture degraded' + (state.lastEvent ? (' (' + state.lastEvent + ')') : '') };
+  }
+  const prefix = state.provider ? (state.provider + '; ') : '';
+  return { ok: true, status: 'ok', detail: prefix + 'connector allow-list active (' + state.sources.length + ' source(s)); posture healthy' };
+}
+
 function cloudProbe(db) {
   let att;
   try { att = require('./cloud-attestation'); }
@@ -558,6 +589,13 @@ const registry = [
     probe: (db) => sdnProbe(db),
   },
   {
+    key: 'sase',
+    label: 'SASE / ZTNA',
+    enabled: (db) => ihCfg.isIntegrationEnabled(db, 'sase'),
+    configured: (db) => { try { return require('./deployment-mode').isSase(db) && require('./sase-mode').getConnectorSources(db).length > 0; } catch (_e) { return false; } },
+    probe: (db) => saseProbe(db),
+  },
+  {
     key: 'cloud',
     label: 'Cloud Confidential-VM Attestation',
     enabled: (db) => ihCfg.isIntegrationEnabled(db, 'cloud'),
@@ -587,4 +625,4 @@ const registry = [
   },
 ];
 
-module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe, ticketingProbe, schedulingProbe, sdnProbe, cloudProbe, backupProbe, cicdProbe, notificationsProbe };
+module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe, ticketingProbe, schedulingProbe, sdnProbe, saseProbe, cloudProbe, backupProbe, cicdProbe, notificationsProbe };

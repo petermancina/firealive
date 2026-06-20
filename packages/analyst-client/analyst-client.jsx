@@ -1078,20 +1078,21 @@ function DeploymentSetup({ onComplete }) {
             {card("bare-metal","Bare metal","Dedicated physical hardware. Strictest identity enforcement; no live-migration allowances.",()=>choose("bare-metal"))}
             {card("virtualized","Virtualized","Runs in a VM or hypervisor. Allows authorized live migration (vMotion) while still refusing clones.",()=>choose("virtualized"))}
             {card("cloud","Cloud","Confidential VM on AWS, Azure, or GCP with a vTPM root of trust. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("cloud"))}
-            {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.",()=>{setErr("");setPickSubstrate(true);})}
+            {card("sdn","SDN","Software-defined network spanning multiple sites or clouds. Integrates read-only with the SDN controller; admits FireAlive's own components only from the permitted network segments.",()=>{setErr("");setPickSubstrate("sdn");})}
+            {card("sase","SASE / ZTNA","Private (dark) application behind your organization's ZTNA/SASE edge. Reachable only through the connector, with FireAlive's device-bound mTLS preserved end-to-end; refuses clientless TLS-terminating access.",()=>{setErr("");setPickSubstrate("sase");})}
           </div>
         </>
       ) : (
         <>
           <div style={{textAlign:"center",display:"flex",flexDirection:"column",gap:8,maxWidth:460}}>
-            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>FIREALIVE SETUP / SDN</M>
-            <div style={{color:C.t,fontSize:20,fontWeight:600}}>What does the SDN host run on?</div>
+            <M style={{color:C.a,fontSize:11,letterSpacing:1}}>{"FIREALIVE SETUP / " + (pickSubstrate === "sase" ? "SASE" : "SDN")}</M>
+            <div style={{color:C.t,fontSize:20,fontWeight:600}}>{"What does the " + (pickSubstrate === "sase" ? "SASE" : "SDN") + " host run on?"}</div>
             <M style={{color:C.tm,fontSize:11,lineHeight:1.6}}>The substrate sets this host's identity and snapshot tolerances. It is confirmed against the server, which fails closed if the declared substrate is weaker than what it detects.</M>
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
-            {card("sdn-bare-metal","Bare metal","Dedicated physical hardware with a hardware TPM. Strictest identity enforcement; no snapshot or live-migration allowances.",()=>choose("sdn","bare-metal"))}
-            {card("sdn-virtualized","Virtualized","A VM or hypervisor with a vTPM. Adds snapshot and clock-jump tolerances; quarantines a host that looks cloned or rolled back.",()=>choose("sdn","virtualized"))}
-            {card("sdn-cloud","Cloud","A confidential VM on AWS, Azure, or GCP. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose("sdn","cloud"))}
+            {card(pickSubstrate + "-bare-metal","Bare metal","Dedicated physical hardware with a hardware TPM. Strictest identity enforcement; no snapshot or live-migration allowances.",()=>choose(pickSubstrate,"bare-metal"))}
+            {card(pickSubstrate + "-virtualized","Virtualized","A VM or hypervisor with a vTPM. Adds snapshot and clock-jump tolerances; quarantines a host that looks cloned or rolled back.",()=>choose(pickSubstrate,"virtualized"))}
+            {card(pickSubstrate + "-cloud","Cloud","A confidential VM on AWS, Azure, or GCP. Requires confidential computing, attested at boot; refuses spot and autoscaled instances.",()=>choose(pickSubstrate,"cloud"))}
           </div>
           <button onClick={()=>{setErr("");setPickSubstrate(false);}} disabled={busy} style={{background:"none",border:"none",color:C.tm,fontSize:10,cursor:busy?"default":"pointer",textDecoration:"underline",padding:4}}>Back to deployment mode</button>
         </>

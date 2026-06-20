@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// The deployment mode (bare-metal, virtualized, cloud, or sdn) is chosen once at install
+// The deployment mode (bare-metal, virtualized, cloud, sdn, or sase) is chosen once at install
 // and hardware-sealed with the instance anchor, so it cannot be flipped at
 // runtime to unlock the relaxed virtualization allowances. The seal binds the
 // mode to THIS deployment's anchor (instanceId + fingerprint) and is an
@@ -27,8 +27,9 @@ const BARE_METAL = 'bare-metal';
 const VIRTUALIZED = 'virtualized';
 const CLOUD = 'cloud';
 const SDN = 'sdn';
-const MODES = [BARE_METAL, VIRTUALIZED, CLOUD, SDN];
-// SDN composes with a host substrate; the other modes ARE their substrate.
+const SASE = 'sase';
+const MODES = [BARE_METAL, VIRTUALIZED, CLOUD, SDN, SASE];
+// SDN and SASE compose with a host substrate; the other modes ARE their substrate.
 const SUBSTRATES = [BARE_METAL, VIRTUALIZED, CLOUD];
 const SIG_ALG = 'ecdsa-p256-ieee-p1363';
 
@@ -53,9 +54,9 @@ function signedPayload(rec) {
     anchorFingerprint: rec.anchorFingerprint,
     setAt: rec.setAt
   };
-  // The SDN host substrate is part of the signed bytes so it cannot be flipped.
-  // Non-SDN records carry no substrate, so a record sealed before B5i2 produces
-  // the identical payload and re-verifies unchanged.
+  // The SDN/SASE host substrate is part of the signed bytes so it cannot be flipped.
+  // Records without a substrate (the non-network modes, or an SDN record sealed
+  // before B5i2) produce the identical payload and re-verify unchanged.
   if (rec.substrate) payload.substrate = rec.substrate;
   return Buffer.from(canonicalize(payload), 'utf8');
 }
@@ -106,21 +107,25 @@ function isSdn(db) {
   return getMode(db) === SDN;
 }
 
+function isSase(db) {
+  return getMode(db) === SASE;
+}
+
 // Provisioning-only: set and hardware-seal the mode. Refuses to change an
 // already-sealed mode unless opts.force (reserved for the authorized
 // re-provision ceremony). Requires an established instance anchor to seal.
 function setMode(db, mode, opts) {
   const o = opts || {};
   if (MODES.indexOf(mode) === -1) throw fail('INVALID_MODE', 'mode must be one of ' + MODES.join(', '));
-  // SDN requires a host substrate (bare-metal, virtualized, or cloud); the other
-  // modes whose mode is their substrate reject one. The substrate is sealed and
-  // signed alongside the mode.
+  // SDN and SASE require a host substrate (bare-metal, virtualized, or cloud);
+  // the other modes whose mode is their substrate reject one. The substrate is
+  // sealed and signed alongside the mode.
   let substrate = null;
-  if (mode === SDN) {
-    if (SUBSTRATES.indexOf(o.substrate) === -1) throw fail('INVALID_SUBSTRATE', 'sdn deployments require a substrate, one of ' + SUBSTRATES.join(', '));
+  if (mode === SDN || mode === SASE) {
+    if (SUBSTRATES.indexOf(o.substrate) === -1) throw fail('INVALID_SUBSTRATE', 'sdn and sase deployments require a substrate, one of ' + SUBSTRATES.join(', '));
     substrate = o.substrate;
   } else if (o.substrate) {
-    throw fail('SUBSTRATE_NOT_ALLOWED', 'only sdn deployments carry a substrate');
+    throw fail('SUBSTRATE_NOT_ALLOWED', 'only sdn and sase deployments carry a substrate');
   }
   if (isConfigured(db) && !o.force) throw fail('MODE_ALREADY_SET', 'deployment mode is already provisioned');
   const identity = loadAnchor(db);
@@ -196,15 +201,16 @@ function summary(db) {
   const virtualized = valid && mode === VIRTUALIZED;
   const cloud = valid && mode === CLOUD;
   const sdn = valid && mode === SDN;
-  // The sealed substrate applies only to SDN; null for the other modes (whose
+  const sase = valid && mode === SASE;
+  // The sealed substrate applies to SDN or SASE; null for the other modes (whose
   // mode is their substrate) and for an SDN record sealed before B5i2.
-  const substrate = (sdn && rec && rec.substrate && SUBSTRATES.indexOf(rec.substrate) !== -1) ? rec.substrate : null;
-  // Substrate-effective gates: true for the top-level mode OR the matching SDN
-  // substrate. Downstream consumers read these instead of the raw mode booleans,
-  // so SDN+virtualized engages the clock-integrity gate and SDN+cloud the
-  // confidential-VM attestation path.
-  const substrateVirtualized = virtualized || (sdn && substrate === VIRTUALIZED);
-  const substrateCloud = cloud || (sdn && substrate === CLOUD);
+  const substrate = ((sdn || sase) && rec && rec.substrate && SUBSTRATES.indexOf(rec.substrate) !== -1) ? rec.substrate : null;
+  // Substrate-effective gates: true for the top-level mode OR the matching
+  // SDN/SASE substrate. Downstream consumers read these instead of the raw mode
+  // booleans, so e.g. sdn/sase + virtualized engages the clock-integrity gate and
+  // sdn/sase + cloud the confidential-VM attestation path.
+  const substrateVirtualized = virtualized || ((sdn || sase) && substrate === VIRTUALIZED);
+  const substrateCloud = cloud || ((sdn || sase) && substrate === CLOUD);
   return {
     mode: mode,
     configured: valid,
@@ -212,6 +218,8 @@ function summary(db) {
     virtualized: virtualized,
     cloud: cloud,
     sdn: sdn,
+    sase: sase,
+    networkMode: sdn ? SDN : (sase ? SASE : null),
     substrate: substrate,
     substrateVirtualized: substrateVirtualized,
     substrateCloud: substrateCloud,
@@ -227,6 +235,7 @@ module.exports = {
   isVirtualized,
   isCloud,
   isSdn,
+  isSase,
   isConfigured,
   detectHypervisor,
   detectSubstrate,
@@ -235,6 +244,7 @@ module.exports = {
   VIRTUALIZED,
   CLOUD,
   SDN,
+  SASE,
   MODES,
   SUBSTRATES,
   MODE_KEY

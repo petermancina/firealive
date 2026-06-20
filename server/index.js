@@ -159,11 +159,21 @@ app.use('/api/', require('./middleware/vm-attestation').vmAttestation());
 // in sdn mode it refuses the API surface for connections originating outside
 // the operator-declared permitted SDN segments. Same pre-auth placement.
 app.use('/api/', require('./middleware/sdn-admission').sdnAdmission());
+// B5k: mode-gated SASE connector admission. No-op outside sase mode; in sase
+// mode it refuses connections whose TCP socket peer is not the operator-declared
+// ZTNA connector source (direct-exposure) or that reach an authenticated path
+// without a client certificate (passthrough violation). Same pre-auth placement.
+app.use('/api/', require('./middleware/sase-admission').saseAdmission());
 // B5i (D-B5i-5): mode-gated SDN degraded-posture fail-safe. No-op outside sdn
 // mode and while posture is healthy/uncertain; when posture is degraded it
 // denies the entire API surface (assume-breach lockdown). After admission so
 // the segment perimeter check runs first; same pre-auth placement.
 app.use('/api/', require('./middleware/sdn-fail-safe').sdnFailSafe());
+// B5k: mode-gated SASE degraded-posture fail-safe. No-op outside sase mode and
+// while posture is healthy/uncertain; when the dark-app or passthrough posture
+// is degraded it denies the entire API surface (assume-breach lockdown). After
+// admission so the connector perimeter check runs first; same pre-auth placement.
+app.use('/api/', require('./middleware/sase-fail-safe').saseFailSafe());
 
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
@@ -480,20 +490,21 @@ async function start() {
         if (envMode && !deploymentMode.isConfigured(modeDb)) {
           if (deploymentMode.MODES.indexOf(envMode) === -1) {
             logger.warn('Ignoring invalid FIREALIVE_DEPLOYMENT_MODE', { value: envMode, valid: deploymentMode.MODES });
-          } else if (envMode === deploymentMode.SDN) {
-            // SDN composes with a host substrate. It is operator-declared via a
-            // required env (never auto-picked) and sealed; an absent or
-            // weaker-than-detected substrate halts the server (fail-closed), it
-            // never silently downgrades.
-            const declared = process.env.FIREALIVE_SDN_SUBSTRATE;
+          } else if (envMode === deploymentMode.SDN || envMode === deploymentMode.SASE) {
+            // SDN and SASE compose with a host substrate. It is operator-declared
+            // via a required, mode-specific env (never auto-picked) and sealed; an
+            // absent or weaker-than-detected substrate halts the server
+            // (fail-closed), it never silently downgrades.
+            const substrateEnv = envMode === deploymentMode.SASE ? 'FIREALIVE_SASE_SUBSTRATE' : 'FIREALIVE_SDN_SUBSTRATE';
+            const declared = process.env[substrateEnv];
             if (deploymentMode.SUBSTRATES.indexOf(declared) === -1) {
-              logger.error('SDN mode requires FIREALIVE_SDN_SUBSTRATE to be one of ' + deploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed)', { value: declared || null });
+              logger.error(envMode + ' mode requires ' + substrateEnv + ' to be one of ' + deploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed)', { value: declared || null });
               process.exit(1);
             }
             const detected = await deploymentMode.detectSubstrate(modeDb);
             const substrateRank = { 'bare-metal': 0, 'virtualized': 1, 'cloud': 2 };
             if (substrateRank[detected] > substrateRank[declared]) {
-              logger.error('FIREALIVE_SDN_SUBSTRATE declares a weaker host substrate than detection proves; refusing to start (anti-downgrade, fail-closed)', { declared: declared, detected: detected });
+              logger.error(substrateEnv + ' declares a weaker host substrate than detection proves; refusing to start (anti-downgrade, fail-closed)', { declared: declared, detected: detected });
               process.exit(1);
             }
             deploymentMode.setMode(modeDb, envMode, { substrate: declared });
@@ -506,8 +517,9 @@ async function start() {
           logger.warn('FIREALIVE_DEPLOYMENT_MODE differs from the sealed mode; the sealed mode is authoritative', { env: envMode, sealed: deploymentMode.getMode(modeDb) });
         }
         app.locals.deploymentMode = deploymentMode.summary(modeDb);
-        if (app.locals.deploymentMode.sdn === true && !app.locals.deploymentMode.substrate) {
-          logger.warn('This SDN deployment was sealed before host-substrate support and runs on the strict TPM path; re-provision with FIREALIVE_SDN_SUBSTRATE to enable substrate-specific protections.');
+        if (app.locals.deploymentMode.networkMode && !app.locals.deploymentMode.substrate) {
+          const nm = app.locals.deploymentMode.networkMode;
+          logger.warn('This ' + nm + ' deployment has no sealed host substrate and runs on the strict TPM path; re-provision with FIREALIVE_' + nm.toUpperCase() + '_SUBSTRATE to enable substrate-specific protections.');
         }
         logger.info('Deployment mode', app.locals.deploymentMode);
       } finally {
