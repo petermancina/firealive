@@ -2606,8 +2606,6 @@ function ManagementConsole() {
   useEffect(() => { reloadScanners(); }, []);
   const [kmsCfg, setKmsCfg] = useState({enabled:false,provider:null,endpoint:"",keyId:"",rotationPolicy:"annual",envelopeEncryption:true,hsmBacked:false,keyUsage:{tier3Encryption:true,tier1Encryption:true,e2eeKeyWrapping:true,backupEncryption:true,auditLogSigning:true}});
   const [wifiPolicy, setWifiPolicy] = useState({minimumProtocol:"wpa2_enterprise",wpa3Preferred:true,blockWpa2Personal:true,requireDot1x:true,warnOnInsecure:true,disconnectOnInsecure:false});
-  const [mspCfg, setMspCfg] = useState({enabled:false,tenants:[],isolation:{separateEncryptionKeys:true,separateAuditTrails:true,crossTenantAccessBlocked:true,tenantScopedApiKeys:true,perTenantBackups:true},managementOverlay:{centralDashboard:true,aggregateReporting:false,tenantAdminDelegation:true}});
-  const [newTenantName, setNewTenantName] = useState("");
   // ── v1.0.0 NEW STATE ──────────────────────────────────────────────────
   // MFA wizard
   const [mfaCfg, setMfaCfg] = useState({enabled:false,method:"totp",enforceForAll:true,graceLogins:3,rememberDeviceDays:30,backupCodes:true,status:"not_configured"});
@@ -3265,7 +3263,6 @@ function ManagementConsole() {
     api.get("/api/edr/config").then(c=>{if(c&&!c.error)setEdrCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/kms/config").then(c=>{if(c&&!c.error)setKmsCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/network/wifi-policy").then(c=>{if(c&&!c.error)setWifiPolicy(pr=>({...pr,...c}));}).catch(()=>{});
-    api.get("/api/msp/config").then(c=>{if(c&&!c.error)setMspCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/notifications/client-config").then(c=>{if(c&&!c.error)setClientNotifCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/recert/status").then(st=>{if(st&&!st.error)setRecertCfg(pr=>({intervalDays:st.intervalDays||pr.intervalDays,enabled:st.reason!=="Recertification disabled"}));}).catch(()=>{});
     api.get("/api/access-control/config").then(c=>{if(c&&!c.error)setAccessCtrlCfg(pr=>({...pr,...c}));}).catch(()=>{});
@@ -3490,7 +3487,7 @@ function ManagementConsole() {
       {id:"reports",label:"Report Engine"},{id:"compliance",label:"Compliance"},{id:"recert",label:"Recertification"},{id:"kb",label:"Knowledge Base"},{id:"playbooks",label:"Playbooks"},{id:"risk_register",label:"Risk Register Asset"},{id:"risk_report",label:"Human Impact Report"},{id:"query_tool",label:"Query Tool"},{id:"data_subject",label:"Data Subject Rights"},
     ]},
     {cat:"config",label:"Configuration",items:[
-      {id:"features",label:"Feature Toggles"},{id:"notif",label:"Burnout Alerts"},{id:"msp",label:"MSP Multi-Tenancy"},{id:"global_dash",label:"Global Dashboard"},{id:"updates",label:"Updates"},{id:"troubleshooter",label:"Troubleshooter"},
+      {id:"features",label:"Feature Toggles"},{id:"notif",label:"Burnout Alerts"},{id:"global_dash",label:"Global Dashboard"},{id:"updates",label:"Updates"},{id:"troubleshooter",label:"Troubleshooter"},
     ]},
     {cat:"monitor",label:"Monitoring",items:[
       {id:"monitoring",label:"System Health"},{id:"vulnscan",label:"Vulnerability Scan"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},
@@ -6969,7 +6966,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?clusterCfg.nodeCount+" nodes \u00b7 "+clusterCfg.sessionStore:"Single instance"},
               {n:"Sync Interval",s:"configured",d:"Every "+syncIntervalCfg.intervalMin+"min \u00b7 "+(syncIntervalCfg.adaptiveSync?"adaptive":"fixed")+" \u00b7 "+(syncIntervalCfg.batchMode?"batch":"streaming")},
               {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?geoFenceCfg.clients.length+" clients geo-assigned":"Not configured \u2014 see Data Sovereignty tab"},
-              {n:"MSP Multi-Tenancy",s:mspCfg.enabled?mspCfg.tenants.length+" tenants":"disabled",d:mspCfg.enabled?"Isolation: "+Object.values(mspCfg.isolation).filter(Boolean).length+"/5 controls active":"Not enabled \u2014 see MSP tab"},
               {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?threatHuntCfg.xdr.provider+" \u00b7 Behavior monitoring":"Not configured \u2014 see Threat Hunting tab"},
               ...(provisionedClients.length>0?[{n:"Provisioned Clients",s:provisionedClients.length+" deployed",d:provisionedClients.map(c=>c.hostname).join(", ")}]:[]),
             ].map((item,idx)=>(
@@ -7610,30 +7606,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={wifiPolicy.disconnectOnInsecure} onChange={e=>setWifiPolicy(prev=>({...prev,disconnectOnInsecure:e.target.checked}))}/><M style={{color:C.d}}>Disconnect client if WiFi is below policy (strict mode)</M></label>
           </Card>
           <Btn primary onClick={()=>api.put("/api/network/wifi-policy",wifiPolicy).then(r=>saved(r,"WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
-        </div>)}
-
-        {/* ══════════ MSP MULTI-TENANCY ══════════ */}
-        {tab==="msp"&&(featureToggles.msp_multitenancy===false?<AdminDisabledPanel name="MSP Multi-Tenancy" mode="tab"/>:<div>
-          <L>MSP Multi-Tenancy</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure FireAlive for managed service providers monitoring multiple client organizations. Each tenant gets isolated encryption keys, separate audit trails, and scoped API keys. Cross-tenant data access is blocked by default.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={mspCfg.enabled} onChange={e=>setMspCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable MSP multi-tenancy mode</label>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Tenant Isolation</div>
-            {[{k:"separateEncryptionKeys",l:"Separate encryption keys per tenant"},{k:"separateAuditTrails",l:"Separate audit trails per tenant"},{k:"crossTenantAccessBlocked",l:"Block cross-tenant data access"},{k:"tenantScopedApiKeys",l:"Tenant-scoped API keys"},{k:"perTenantBackups",l:"Per-tenant backup isolation"}].map(s=>(
-              <label key={s.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={mspCfg.isolation[s.k]} onChange={e=>setMspCfg(prev=>({...prev,isolation:{...prev.isolation,[s.k]:e.target.checked}}))}/><M style={{color:C.t}}>{s.l}</M></label>
-            ))}
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:12,marginBottom:8}}>Management Overlay</div>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={mspCfg.managementOverlay.centralDashboard} onChange={e=>setMspCfg(prev=>({...prev,managementOverlay:{...prev.managementOverlay,centralDashboard:e.target.checked}}))}/><M style={{color:C.t}}>Central management dashboard across tenants</M></label>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={mspCfg.managementOverlay.aggregateReporting} onChange={e=>setMspCfg(prev=>({...prev,managementOverlay:{...prev.managementOverlay,aggregateReporting:e.target.checked}}))}/><M style={{color:C.w}}>Aggregate reporting across tenants (privacy implications — requires tenant consent)</M></label>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={mspCfg.managementOverlay.tenantAdminDelegation} onChange={e=>setMspCfg(prev=>({...prev,managementOverlay:{...prev.managementOverlay,tenantAdminDelegation:e.target.checked}}))}/><M style={{color:C.t}}>Delegate admin to tenant-level team leads</M></label>
-          </Card>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Tenants ({mspCfg.tenants.length})</div>
-            {mspCfg.tenants.length===0?<M style={{color:C.td}}>No tenants configured. Add a tenant below.</M>:
-            mspCfg.tenants.map(t=><Card key={t.id} style={{marginBottom:6,padding:"10px 14px",borderLeft:`3px solid ${C.a}`}}><div style={{display:"flex",justifyContent:"space-between"}}><div><M style={{color:C.t,fontWeight:500}}>{t.name}</M><br/><M style={{color:C.td}}>{t.domain} · Key: {t.encryptionKeyId?.slice(0,8)}…</M></div><Badge color={C.a}>{t.status}</Badge></div></Card>)}
-            <div style={{display:"flex",gap:8,marginTop:10}}><Input label="New tenant name" value={newTenantName} onChange={e=>setNewTenantName(e.target.value)} placeholder="Client org name" maxLength={128}/><Btn primary disabled={!newTenantName.trim()} style={{marginTop:16}} onClick={()=>{const t={id:Math.random().toString(36).slice(2,10),name:newTenantName,domain:"",encryptionKeyId:Math.random().toString(36).slice(2,18),createdAt:new Date().toISOString(),status:"active"};setMspCfg(prev=>({...prev,tenants:[...prev.tenants,t]}));setNewTenantName("");addA("MSP_TENANT_CREATED","Tenant created: "+t.name);}}>Add Tenant</Btn></div>
-          </Card>
-          <Btn primary onClick={()=>api.put("/api/msp/config",{enabled:mspCfg.enabled,isolation:mspCfg.isolation,managementOverlay:mspCfg.managementOverlay}).then(r=>saved(r,"MSP_CONFIG_SAVED","MSP multi-tenancy configuration saved"))}>Save MSP Config</Btn>
         </div>)}
 
         {/* ══════════ R3f — MFA SELF-SERVICE + ADMIN POLICY ══════════ */}
