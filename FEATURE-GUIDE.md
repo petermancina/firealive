@@ -719,14 +719,17 @@ The Global Dashboard carries the same hash-chain + signed-checkpoint integrity o
 
 **What Cloud Mode enforces:**
 
-- **Confidential computing is required.** The server confirms it is running inside a confidential VM (memory-encrypted, hardware-attested) at start-up and refuses to start otherwise. There is no fall-back to an ordinary instance — a cloud deployment that cannot prove confidential computing simply does not come up.
+- **Confidential computing is required and remotely attested.** At start-up the server does not just check for a confidential VM — it fetches a CPU-signed attestation report (AMD SEV-SNP or Intel TDX), verifies the signature up to the hardware vendor’s root, and confirms the report is fresh. A cloud deployment that cannot produce a verifiable report simply does not come up; there is no fall-back to an ordinary instance, and the kernel device alone is not accepted as proof.
+- **Anti-rollback firmware floor.** The platform firmware version in the attestation report (the Trusted Computing Base) is pinned at provisioning and may only move upward. A later boot on downgraded firmware — which could reintroduce fixed vulnerabilities while still signing a valid report — is refused.
+- **Pinned launch measurement.** The measurement the CPU takes of the guest at launch is recorded on first use; every later boot must present the same measurement, so a tampered or substituted image is caught and halts the boot.
+- **Hardened guest, optionally single-tenant.** The server checks the guest kernel’s CPU side-channel mitigations and fails closed if an in-scope family is left vulnerable. An operator who wants more than memory-encryption isolation can additionally require dedicated, single-tenant hardware, refusing shared hosts.
 - **No disposable instances.** Spot, preemptible, autoscaled, and scale-set instances are refused, because a single anchored identity cannot live on an instance the cloud can terminate or clone at will.
 - **Stable trust across changing addresses.** A cloud instance’s IP can change when it stops and restarts or moves behind a load balancer. Cloud Mode anchors trust to a stable operator DNS name you provide, and analyst clients keep trusting the same deployment when the underlying address changes — they never have to re-pin after a routine restart.
 - **Cloud-key-store backups.** Backups must be protected by the cloud’s own key store rather than a key sitting in an environment variable, so backup protection does not depend on the same instance the data lives on.
 
 **Not a container or serverless workload.** Cloud Mode is deliberately *not* Kubernetes, ECS Fargate, Cloud Run, or any managed-container or serverless target. Those compute models do not give FireAlive the per-instance hardware root of trust it depends on, so they are not offered — FireAlive in the cloud is always a confidential VM.
 
-The full operator runbook — platforms, the confidential-VM requirement, the recovery code for instance loss, and the stable-DNS model — is in `docs/cloud-mode.md`.
+The full operator runbook — platforms, remote attestation and the firmware floor, the recovery code for instance loss, and the stable-DNS model — is in `docs/cloud-mode.md`.
 
 ### Virtualization
 

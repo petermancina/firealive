@@ -1697,15 +1697,18 @@ class RegressionRunner {
       if (dSev.present !== true || dSev.tech !== cc.CC_SEV_SNP) throw new Error('SEV-SNP guest device should be detected');
       return 'detectConfidentialComputing returns {present,tech,source}; SEV-SNP recognized';
     });
-    await check('cloud_mode', 'Attestation gate is fail-closed (D-B5h-3)', () => {
+    await check('cloud_mode', 'Attestation gate is fail-closed (D-B5h-3 / B5l2)', () => {
       const cc = require('./cloud-attestation');
       const none = { exists: function () { return false; } };
       const sev = { exists: function (p) { return p === '/dev/sev-guest'; } };
       const aNone = cc.verifyAttestation({ probe: none });
       if (aNone.verified !== false) throw new Error('attestation must fail closed when no confidential guest is present');
-      const aSev = cc.verifyAttestation({ probe: sev });
-      if (aSev.verified !== true || aSev.platformValidationPending !== true) throw new Error('attestation should verify (platform-validation-pending) on a confidential guest');
-      return 'verifyAttestation fails closed without CC; verified + platform-validation-pending with CC';
+      // B5l2: device presence alone no longer verifies; without a signed report
+      // that can be fetched and a vendor chain that validates, the gate stays closed.
+      const aSev = cc.verifyAttestation({ probe: sev, tsmReader: { fetch: function () { throw new Error('no tsm in CI'); } } });
+      if (aSev.verified !== false) throw new Error('attestation must fail closed when no signed report can be verified');
+      if (aSev.platformValidationPending !== true) throw new Error('a detected-but-unverified guest should mark platformValidationPending');
+      return 'verifyAttestation fails closed without CC and when no signed report can be fetched/verified';
     });
     await check('cloud_mode', 'Spot and autoscaled instances are detected for refusal (D-B5h-4)', () => {
       const md = require('./cloud-metadata');
@@ -1767,6 +1770,196 @@ class RegressionRunner {
       } finally { mem2.close(); }
       return 'cloud relocation authorized; bare-metal host change flagged; classify present';
     });
+
+    // B5l2: cloud remote-attestation verified end to end. Builds a synthetic
+    // SEV-SNP report and TDX quote signed by a throwaway openssl-generated cert
+    // chain (no confidential hardware in CI) and exercises the verifiers, the
+    // orchestrator over configfs-tsm, the guest-mitigation gate, the tenancy
+    // assertion, and the monotonic TCB floor / measurement TOFU. The report-
+    // backed checks skip (never fail) if openssl is unavailable.
+    let caf = null;
+    let cafErr = null;
+    try {
+      caf = (function buildAttestationFixtures() {
+        const { execFileSync } = require('child_process');
+        const os = require('os'); const fsx = require('fs'); const pathx = require('path');
+        const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'rr-att-'));
+        const P = (f) => pathx.join(dir, f);
+        const run = (args) => execFileSync('openssl', args, { stdio: 'ignore' });
+        const caExt = P('ca.ext'); const leafExt = P('leaf.ext');
+        fsx.writeFileSync(caExt, 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n');
+        fsx.writeFileSync(leafExt, 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n');
+        const ec = (curve, keyf) => run(['ecparam', '-name', curve, '-genkey', '-noout', '-out', P(keyf)]);
+        const root = (keyf, outf, cn, md) => run(['req', '-new', '-x509', '-key', P(keyf), '-out', P(outf), '-days', '3650', '-subj', '/CN=' + cn, '-' + md, '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign']);
+        const issue = (csrkey, cn, cacert, cakey, outf, md, ext) => { run(['req', '-new', '-key', P(csrkey), '-subj', '/CN=' + cn, '-out', P(outf + '.csr')]); run(['x509', '-req', '-in', P(outf + '.csr'), '-CA', P(cacert), '-CAkey', P(cakey), '-CAcreateserial', '-out', P(outf), '-days', '3650', '-' + md, '-extfile', ext]); };
+        ec('secp384r1', 'ark.key'); root('ark.key', 'ark.pem', 'rr-ARK', 'sha384');
+        ec('secp384r1', 'ask.key'); issue('ask.key', 'rr-ASK', 'ark.pem', 'ark.key', 'ask.pem', 'sha384', caExt);
+        ec('secp384r1', 'vcek.key'); issue('vcek.key', 'rr-VCEK', 'ask.pem', 'ask.key', 'vcek.pem', 'sha384', leafExt);
+        ec('secp384r1', 'ark2.key'); root('ark2.key', 'ark2.pem', 'rr-ARK2', 'sha384');
+        ec('prime256v1', 'iroot.key'); root('iroot.key', 'iroot.pem', 'rr-IntelRoot', 'sha256');
+        ec('prime256v1', 'pcka.key'); issue('pcka.key', 'rr-PCKCA', 'iroot.pem', 'iroot.key', 'pcka.pem', 'sha256', caExt);
+        ec('prime256v1', 'pck.key'); issue('pck.key', 'rr-PCK', 'pcka.pem', 'pcka.key', 'pck.pem', 'sha256', leafExt);
+        ec('prime256v1', 'iroot2.key'); root('iroot2.key', 'iroot2.pem', 'rr-IntelRoot2', 'sha256');
+        const read = (f) => fsx.readFileSync(P(f), 'utf8');
+        const vcekKey = crypto.createPrivateKey(read('vcek.key'));
+        const vcekDer = new crypto.X509Certificate(read('vcek.pem')).raw;
+        const pckKey = crypto.createPrivateKey(read('pck.key'));
+        const ak = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+        const rootsDir = P('roots');
+        fsx.mkdirSync(pathx.join(rootsDir, 'amd', 'test'), { recursive: true });
+        fsx.mkdirSync(pathx.join(rootsDir, 'intel'), { recursive: true });
+        fsx.copyFileSync(P('ark.pem'), pathx.join(rootsDir, 'amd', 'test', 'ark.pem'));
+        fsx.copyFileSync(P('ask.pem'), pathx.join(rootsDir, 'amd', 'test', 'ask.pem'));
+        fsx.copyFileSync(P('iroot.pem'), pathx.join(rootsDir, 'intel', 'sgx-root-ca.pem'));
+        const derToLe = (der, size) => {
+          let o = 0; if (der[o++] !== 0x30) throw new Error('seq'); let L = der[o++]; if (L & 0x80) { let n = L & 0x7f; while (n-- > 0) o++; }
+          const ri = () => { if (der[o++] !== 0x02) throw new Error('int'); const l = der[o++]; let v = der.slice(o, o + l); o += l; while (v.length > 1 && v[0] === 0) v = v.slice(1); return v; };
+          const r = ri(); const s = ri(); const rb = Buffer.alloc(size); r.copy(rb, size - r.length); const sb = Buffer.alloc(size); s.copy(sb, size - s.length);
+          return { r: Buffer.from(rb).reverse(), s: Buffer.from(sb).reverse() };
+        };
+        const makeSevReport = (nonce, opts) => {
+          const o = opts || {};
+          const rep = Buffer.alloc(1184); rep.writeUInt32LE(2, 0); rep.writeUInt32LE(1, 0x034);
+          rep[0x038] = o.bl == null ? 3 : o.bl; rep[0x038 + 6] = o.snp == null ? 8 : o.snp; rep[0x038 + 7] = o.uc == null ? 72 : o.uc;
+          Buffer.from(nonce).copy(rep, 0x050); Buffer.alloc(48, o.meas == null ? 0xAB : o.meas).copy(rep, 0x090);
+          rep[0x180] = o.bl == null ? 3 : o.bl; rep[0x180 + 6] = o.snp == null ? 8 : o.snp; rep[0x180 + 7] = o.uc == null ? 72 : o.uc;
+          Buffer.alloc(64, 0xCD).copy(rep, 0x1A0);
+          const sig = derToLe(crypto.sign('sha384', rep.slice(0, 672), vcekKey), 48);
+          const f = Buffer.alloc(512); sig.r.copy(f, 0); sig.s.copy(f, 72); f.copy(rep, 0x2A0);
+          return rep;
+        };
+        const makeAuxblob = () => {
+          const G = Buffer.from('8d75da6364e66445adc5f4b93be8accd', 'hex');
+          const e = Buffer.alloc(24); G.copy(e, 0); e.writeUInt32LE(48, 16); e.writeUInt32LE(vcekDer.length, 20);
+          return Buffer.concat([e, Buffer.alloc(24), vcekDer]);
+        };
+        const makeTdxQuote = (nonce, opts) => {
+          const o = opts || {};
+          const jwk = ak.publicKey.export({ format: 'jwk' });
+          const akPubLE = Buffer.concat([Buffer.from(jwk.x, 'base64url').reverse(), Buffer.from(jwk.y, 'base64url').reverse()]);
+          const qeAuth = Buffer.from('rr-auth');
+          const bind = crypto.createHash('sha256').update(akPubLE).update(qeAuth).digest();
+          const qe = Buffer.alloc(384); (o.breakBind ? crypto.randomBytes(32) : bind).copy(qe, 320);
+          const qs = derToLe(crypto.sign('sha256', qe, pckKey), 32); const qeSig = Buffer.concat([qs.r, qs.s]);
+          const hb = Buffer.alloc(632); hb.writeUInt16LE(4, 0); hb.writeUInt16LE(2, 2); hb.writeUInt32LE(0x81, 4);
+          const B = 48; Buffer.from([3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).copy(hb, B); Buffer.alloc(48, o.meas == null ? 0xE1 : o.meas).copy(hb, B + 136);
+          Buffer.from(nonce).copy(hb, B + 520);
+          const sg = derToLe(crypto.sign('sha256', hb, ak.privateKey), 32); const quoteSig = Buffer.concat([sg.r, sg.s]);
+          const cert = Buffer.from(read('pck.pem') + '\n' + read('pcka.pem'), 'utf8');
+          const h = Buffer.alloc(8); h.writeUInt16LE(qeAuth.length, 0); h.writeUInt16LE(5, 2); h.writeUInt32LE(cert.length, 4);
+          const sd = Buffer.concat([quoteSig, akPubLE, qe, qeSig, h.slice(0, 2), qeAuth, h.slice(2, 8), cert]);
+          const len = Buffer.alloc(4); len.writeUInt32LE(sd.length, 0); return Buffer.concat([hb, len, sd]);
+        };
+        return { dir, rootsDir, vcekPem: read('vcek.pem'), arkPem: read('ark.pem'), askPem: read('ask.pem'), ark2Pem: read('ark2.pem'), irootPem: read('iroot.pem'), iroot2Pem: read('iroot2.pem'), makeSevReport, makeAuxblob, makeTdxQuote };
+      })();
+    } catch (e) { cafErr = e.message || String(e); caf = null; }
+    await check('cloud_attestation', 'SEV-SNP report: valid verifies; tamper / chain / nonce fail closed', () => {
+      if (!caf) return SKIP('attestation fixtures unavailable: ' + cafErr);
+      const snp = require('./attestation-sev-snp');
+      const nonce = crypto.randomBytes(64);
+      const rep = caf.makeSevReport(nonce);
+      const ok = snp.verify({ report: rep, vcekPem: caf.vcekPem, askPem: caf.askPem, arkPem: caf.arkPem, expectedNonce: nonce });
+      if (!ok.verified) throw new Error('valid SEV-SNP report failed to verify: ' + ok.reason);
+      const tampered = Buffer.from(rep); tampered[0x100] = tampered[0x100] ^ 0xFF;
+      if (snp.verify({ report: tampered, vcekPem: caf.vcekPem, askPem: caf.askPem, arkPem: caf.arkPem, expectedNonce: nonce }).verified) throw new Error('tampered report must not verify');
+      if (snp.verify({ report: rep, vcekPem: caf.vcekPem, askPem: caf.askPem, arkPem: caf.ark2Pem, expectedNonce: nonce }).verified) throw new Error('wrong ARK must not verify');
+      if (snp.verify({ report: rep, vcekPem: caf.vcekPem, askPem: caf.askPem, arkPem: caf.arkPem, expectedNonce: crypto.randomBytes(64) }).verified) throw new Error('wrong nonce must not verify');
+      return 'SEV-SNP valid verifies; tampered / wrong-root / wrong-nonce fail closed';
+    });
+    await check('cloud_attestation', 'SEV-SNP TCB floor (pass/fail) and measurement extraction', () => {
+      if (!caf) return SKIP('attestation fixtures unavailable: ' + cafErr);
+      const snp = require('./attestation-sev-snp');
+      const nonce = crypto.randomBytes(64);
+      const ok = snp.verify({ report: caf.makeSevReport(nonce), vcekPem: caf.vcekPem, askPem: caf.askPem, arkPem: caf.arkPem, expectedNonce: nonce });
+      if (!ok.verified) throw new Error('verify failed: ' + ok.reason);
+      if (ok.measurement.indexOf('abababab') !== 0) throw new Error('measurement not extracted: ' + ok.measurement.slice(0, 8));
+      if (!snp.compareTcb(ok.tcb, { bootloader: 3, tee: 0, snp: 8, microcode: 72 })) throw new Error('floor at-or-below should pass');
+      if (snp.compareTcb(ok.tcb, { bootloader: 3, tee: 0, snp: 9, microcode: 72 })) throw new Error('floor above report should fail');
+      return 'TCB floor passes at-or-below and fails above; measurement extracted';
+    });
+    await check('cloud_attestation', 'TDX quote: valid verifies; tamper / binding / chain / nonce fail closed', () => {
+      if (!caf) return SKIP('attestation fixtures unavailable: ' + cafErr);
+      const tdx = require('./attestation-tdx');
+      const nonce = crypto.randomBytes(64);
+      const q = caf.makeTdxQuote(nonce);
+      const ok = tdx.verify({ quote: q, intelRootPem: caf.irootPem, expectedNonce: nonce });
+      if (!ok.verified) throw new Error('valid TDX quote failed to verify: ' + ok.reason);
+      const t = Buffer.from(q); t[200] = t[200] ^ 0xFF;
+      if (tdx.verify({ quote: t, intelRootPem: caf.irootPem, expectedNonce: nonce }).verified) throw new Error('tampered quote must not verify');
+      if (tdx.verify({ quote: caf.makeTdxQuote(nonce, { breakBind: true }), intelRootPem: caf.irootPem, expectedNonce: nonce }).verified) throw new Error('broken AK binding must not verify');
+      if (tdx.verify({ quote: q, intelRootPem: caf.iroot2Pem, expectedNonce: nonce }).verified) throw new Error('wrong Intel root must not verify');
+      if (tdx.verify({ quote: q, intelRootPem: caf.irootPem, expectedNonce: crypto.randomBytes(64) }).verified) throw new Error('wrong nonce must not verify');
+      return 'TDX valid verifies; tampered / bad-binding / wrong-root / wrong-nonce fail closed';
+    });
+    await check('cloud_attestation', 'TDX TCB SVN floor and MRTD extraction', () => {
+      if (!caf) return SKIP('attestation fixtures unavailable: ' + cafErr);
+      const tdx = require('./attestation-tdx');
+      const nonce = crypto.randomBytes(64);
+      const ok = tdx.verify({ quote: caf.makeTdxQuote(nonce), intelRootPem: caf.irootPem, expectedNonce: nonce });
+      if (!ok.verified) throw new Error('verify failed: ' + ok.reason);
+      if (ok.measurement.indexOf('e1e1e1e1') !== 0) throw new Error('MRTD not extracted: ' + ok.measurement.slice(0, 8));
+      if (!Array.isArray(ok.rtmrs) || ok.rtmrs.length !== 4) throw new Error('RTMRs not extracted');
+      if (!tdx.compareTcbSvn(ok.tcbSvn, '0304000000000000000000000000000000')) throw new Error('SVN floor at-or-below should pass');
+      if (tdx.compareTcbSvn(ok.tcbSvn, '0504000000000000000000000000000000')) throw new Error('SVN floor above should fail');
+      return 'TDX SVN floor passes at-or-below and fails above; MRTD + RTMRs extracted';
+    });
+    await check('cloud_attestation', 'Orchestrator dispatches SEV-SNP + TDX via configfs-tsm; Nitro/none fail closed', () => {
+      if (!caf) return SKIP('attestation fixtures unavailable: ' + cafErr);
+      const oc = require('./cloud-attestation');
+      const probe = (have) => ({ exists: (p) => p === have });
+      const sevTsm = { fetch: (nonce) => ({ provider: 'sev_guest', report: caf.makeSevReport(nonce), auxblob: caf.makeAuxblob() }) };
+      const tdxTsm = { fetch: (nonce) => ({ provider: 'tdx_guest', report: caf.makeTdxQuote(nonce), auxblob: Buffer.alloc(0) }) };
+      const aSev = oc.verifyAttestation({ probe: probe('/dev/sev-guest'), tsmReader: sevTsm, rootsDir: caf.rootsDir });
+      if (!aSev.verified || aSev.tech !== oc.CC_SEV_SNP) throw new Error('orchestrator SEV-SNP path failed: ' + aSev.reason);
+      const aTdx = oc.verifyAttestation({ probe: probe('/dev/tdx_guest'), tsmReader: tdxTsm, rootsDir: caf.rootsDir });
+      if (!aTdx.verified || aTdx.tech !== oc.CC_TDX) throw new Error('orchestrator TDX path failed: ' + aTdx.reason);
+      if (oc.verifyAttestation({ probe: probe('/dev/nitro_enclaves') }).verified) throw new Error('Nitro-only must not verify (enclave-scoped)');
+      if (oc.verifyAttestation({ probe: probe('/dev/none') }).verified) throw new Error('no CC device must not verify');
+      const staleTsm = { fetch: () => ({ provider: 'sev_guest', report: caf.makeSevReport(Buffer.alloc(64, 0x77)), auxblob: caf.makeAuxblob() }) };
+      if (oc.verifyAttestation({ probe: probe('/dev/sev-guest'), tsmReader: staleTsm, rootsDir: caf.rootsDir }).verified) throw new Error('stale nonce must not verify');
+      return 'orchestrator verifies SEV-SNP + TDX via TSM + bundled roots; Nitro/none/stale fail closed';
+    });
+    await check('cloud_attestation', 'Guest CPU side-channel mitigation gate', () => {
+      const gm = require('./guest-mitigations');
+      const R = (map) => ({ read: (p) => { const k = p.split('/').pop(); return (k in map) ? map[k] : null; } });
+      const all = {}; gm.IN_SCOPE.forEach((fam) => { all[fam] = fam === 'l1tf' ? 'Not affected' : 'Mitigation: present'; });
+      if (!gm.evaluateMitigations({ reader: R(all) }).ok) throw new Error('all-mitigated should pass');
+      const vuln = Object.assign({}, all); vuln.retbleed = 'Vulnerable';
+      if (gm.evaluateMitigations({ reader: R(vuln) }).ok) throw new Error('a Vulnerable family must fail closed');
+      if (!gm.evaluateMitigations({ reader: R(vuln), overrides: ['retbleed'] }).ok) throw new Error('audited override should pass');
+      const miss = Object.assign({}, all); delete miss.mds;
+      if (!gm.evaluateMitigations({ reader: R(miss) }).ok) throw new Error('absent family tolerated by default');
+      if (gm.evaluateMitigations({ reader: R(miss), strictUnknown: true }).ok) throw new Error('strictUnknown should fail on absent family');
+      return 'mitigated passes; Vulnerable fails; override passes; unknown tolerated (strict fails)';
+    });
+    await check('cloud_attestation', 'Dedicated-tenancy assertion across providers', () => {
+      const md = require('./cloud-metadata');
+      if (!md.isDedicatedTenancy(md.buildAwsMetadata({ tenancy: 'dedicated' }))) throw new Error('AWS dedicated should be single-tenant');
+      if (!md.isDedicatedTenancy(md.buildAwsMetadata({ tenancy: 'host' }))) throw new Error('AWS host should be single-tenant');
+      if (md.isDedicatedTenancy(md.buildAwsMetadata({ tenancy: 'default' }))) throw new Error('AWS default is shared');
+      if (!md.isDedicatedTenancy(md.parseAzureInstance({ compute: { hostGroup: { id: 'hg' } } }))) throw new Error('Azure host group should be single-tenant');
+      if (!md.isDedicatedTenancy(md.parseGcpInstance({ id: 1, scheduling: { nodeAffinities: [{ key: 'n', operator: 'IN', values: ['x'] }] } }))) throw new Error('GCP sole-tenant should be single-tenant');
+      if (md.isDedicatedTenancy(md.emptyMetadata())) throw new Error('unknown tenancy is not dedicated');
+      return 'isDedicatedTenancy true for AWS dedicated/host, Azure host group, GCP sole-tenant; false otherwise';
+    });
+    // check 8: monotonic TCB floor + measurement TOFU, against an in-memory clone
+    await check('cloud_attestation', 'TCB floor is monotonic (upward-only) and measurement is TOFU', () => {
+      const cm = require('./cloud-mode');
+      const Database = this.db.constructor;
+      const mem = new Database(':memory:');
+      try {
+        mem.prepare('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)').run();
+        cm.setCloudConfig(mem, { platform: 'aws' });
+        cm.setTcbFloor(mem, { tech: 'sev-snp', floor: { bootloader: 3, tee: 0, snp: 8, microcode: 72 } });
+        if (cm.setTcbFloor(mem, { tech: 'sev-snp', floor: { snp: 5 } }).tcbFloor.snp !== 8) throw new Error('floor must not decrease');
+        if (cm.setTcbFloor(mem, { tech: 'sev-snp', floor: { snp: 10 } }).tcbFloor.snp !== 10) throw new Error('floor must raise');
+        if (!cm.pinMeasurement(mem, 'abcd').firstPin) throw new Error('first measurement should pin');
+        if (!cm.pinMeasurement(mem, 'ABCD').matched) throw new Error('same measurement should match (case-insensitive)');
+        if (cm.pinMeasurement(mem, 'ffff').matched) throw new Error('different measurement should mismatch');
+      } finally { mem.close(); }
+      return 'TCB floor only raises; measurement pins once then must match (TOFU)';
+    });
+    if (caf && caf.dir) { try { require('fs').rmSync(caf.dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
 
     // B5g: export encryption at rest. Exercises the keyless AES-256-GCM core
     // (no KEK / hardware needed in CI) and asserts the production seal path is

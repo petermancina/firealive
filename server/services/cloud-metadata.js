@@ -5,7 +5,9 @@
 // instance IP and hostnames for cert-SAN reconciliation, and (c) detect
 // spot/preemptible or autoscaled/scale-set instances, which Cloud Mode
 // refuses for the regional server: a copied image plus a shared hardware
-// root only stays clone-resistant on a single stable instance.
+// root only stays clone-resistant on a single stable instance. It also
+// reads instance tenancy (AWS placement, Azure dedicated host / host
+// group, GCP sole-tenant) for the optional dedicated-tenancy gate.
 //
 // Design:
 //   - readCloudMetadata() is async and cached per process. It probes GCP,
@@ -149,6 +151,7 @@ function fetchAws() {
       getText(IMDS_LINK_LOCAL_HOST, base + 'public-hostname', headers),
       getText(IMDS_LINK_LOCAL_HOST, base + 'instance-life-cycle', headers),
       getText(IMDS_LINK_LOCAL_HOST, base + 'autoscaling/target-lifecycle-state', headers),
+      getText(IMDS_LINK_LOCAL_HOST, base + 'placement/tenancy', headers),
     ]).then(function (values) {
       return buildAwsMetadata({
         instanceId: values[0],
@@ -158,6 +161,7 @@ function fetchAws() {
         publicHostname: values[4],
         lifeCycle: values[5],
         asgState: values[6],
+        tenancy: values[7],
       });
     });
   });
@@ -181,6 +185,9 @@ function parseAzureInstance(obj) {
   if (typeof compute.vmScaleSetName === 'string') {
     autoscaled = compute.vmScaleSetName.length > 0;
   }
+  let tenancy = 'default';
+  try { if (compute.host && compute.host.id) tenancy = 'dedicated'; } catch (e) { /* absent */ }
+  try { if (compute.hostGroup && compute.hostGroup.id) tenancy = 'dedicated'; } catch (e) { /* absent */ }
   return {
     provider: 'azure',
     instanceId: compute.vmId || null,
@@ -189,7 +196,7 @@ function parseAzureInstance(obj) {
     hostnames: dedupeHostnames([compute.name]),
     spot: compute.priority == null ? null : (compute.priority === 'Spot'),
     autoscaled: autoscaled,
-    tenancy: null,
+    tenancy: tenancy,
     confidentialHint: securityType == null ? null : (securityType === 'ConfidentialVM'),
   };
 }
@@ -236,6 +243,8 @@ function parseGcpInstance(obj) {
   if (createdBy != null) {
     autoscaled = createdBy.indexOf('instanceGroupManagers/') !== -1;
   }
+  let tenancy = 'default';
+  try { if (Array.isArray(scheduling.nodeAffinities) && scheduling.nodeAffinities.length > 0) tenancy = 'sole-tenant'; } catch (e) { /* absent */ }
   return {
     provider: 'gcp',
     instanceId: root.id == null ? null : String(root.id),
@@ -244,7 +253,7 @@ function parseGcpInstance(obj) {
     hostnames: dedupeHostnames([root.hostname, root.name]),
     spot: spot,
     autoscaled: autoscaled,
-    tenancy: null,
+    tenancy: tenancy,
     confidentialHint: null,
   };
 }
@@ -289,9 +298,19 @@ function detectProvider() {
   return readCloudMetadata().then(function (m) { return m.provider; });
 }
 
+// Single-tenant values across providers: AWS placement tenancy 'dedicated' or
+// 'host', Azure dedicated host / host group, GCP sole-tenant node. Used by the
+// boot gate when requireDedicatedTenancy is set.
+const DEDICATED_TENANCIES = ['dedicated', 'host', 'sole-tenant'];
+function isDedicatedTenancy(metadata) {
+  const t = metadata && metadata.tenancy;
+  return typeof t === 'string' && DEDICATED_TENANCIES.indexOf(t.toLowerCase()) !== -1;
+}
+
 module.exports = {
   readCloudMetadata,
   detectProvider,
+  isDedicatedTenancy,
   buildAwsMetadata,
   parseAzureInstance,
   parseGcpInstance,

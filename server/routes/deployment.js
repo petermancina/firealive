@@ -13,8 +13,10 @@
 //
 // Cloud Mode provisioning additionally requires, fail-closed and before the
 // seal, a verified confidential VM (services/cloud-attestation) and a non-spot,
-// non-autoscaled instance (services/cloud-metadata), and records the selected
-// platform and stable hostname via services/cloud-mode.
+// non-autoscaled instance (services/cloud-metadata). It records the selected
+// platform, stable hostname, and dedicated-tenancy requirement, pins the launch
+// measurement (TOFU), and persists the provision-time TCB floor via
+// services/cloud-mode.
 //
 // Endpoints:
 //   GET  /            current deployment-mode summary
@@ -73,9 +75,18 @@ router.post('/provision', mfaStepUp(), async (req, res) => {
       }
       const platform = req.body && req.body.platform;
       const stableHostname = req.body && req.body.stableHostname;
-      cloudMode.setCloudConfig(db, { platform: platform, stableHostname: stableHostname });
+      const requireDedicatedTenancy = !!(req.body && req.body.requireDedicatedTenancy === true);
+      cloudMode.setCloudConfig(db, { platform: platform, stableHostname: stableHostname, requireDedicatedTenancy: requireDedicatedTenancy });
+      // TOFU-pin the launch measurement and persist the TCB floor at the
+      // provision-time platform TCB, so a later boot cannot present a different
+      // launch measurement or a rolled-back firmware TCB.
+      if (attestation.measurement) cloudMode.pinMeasurement(db, attestation.measurement);
+      const provisionFloor = attestation.tcb || attestation.tcbSvn || null;
+      if (provisionFloor && cloudMode.TCB_TECHS.indexOf(attestation.tech) !== -1) {
+        cloudMode.setTcbFloor(db, { tech: attestation.tech, floor: provisionFloor });
+      }
       const result = deploymentMode.setMode(db, mode);
-      cloudMode.recordAttestation(db, { tech: attestation.tech });
+      cloudMode.recordAttestation(db, { tech: attestation.tech, tcb: attestation.tcb || attestation.tcbSvn || null, measurement: attestation.measurement || null, verified: attestation.verified, platformValidationPending: attestation.platformValidationPending });
       auditLog(req.user.id, 'DEPLOYMENT_MODE_PROVISIONED',
         'deployment mode sealed as ' + result.mode + ' on ' + platform + ' (cc ' + attestation.tech + ')', req.ip);
       return res.json(Object.assign({ ok: true, cloud: cloudMode.getCloudConfig(db) }, deploymentMode.summary(db)));

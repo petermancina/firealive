@@ -26,20 +26,32 @@ virtual TPM (vTPM) presented to the guest provides the hardware root of trust
 FireAlive already depends on for its instance anchor.
 
 Confidential computing is **required** in Cloud Mode, not optional, and it is
-**attested at boot**. If the server cannot confirm it is running inside a
-confidential guest, it refuses to start. There is no downgrade.
+**remotely attested at boot**. The server does not take the platform's word
+for it: it fetches a CPU-signed attestation report, verifies the signature up
+to a hardware-vendor root, and checks that the report is fresh and that the
+platform firmware is at or above a pinned floor. If any step fails, the server
+refuses to start. There is no downgrade.
 
 ## Supported platforms
 
-Cloud Mode supports the three clouds that offer a shared-tenancy confidential
-VM with a vTPM:
+Cloud Mode supports the clouds that offer a shared-tenancy confidential VM with
+a vTPM and a verifiable hardware attestation report:
 
 - **AWS** — an AMD SEV-SNP instance with NitroTPM. NitroTPM presents to the
-  guest as a TPM 2.0 device.
-- **Azure** — a Confidential VM (AMD SEV-SNP) with Trusted Launch, which
-  provides the vTPM and secure boot, plus VM guest-state disk encryption.
-- **GCP** — a Confidential VM (AMD SEV-SNP) with Shielded VM, which provides
-  the vTPM, secure boot, and integrity monitoring.
+  guest as a TPM 2.0 device; the SEV-SNP report, signed by an AMD VCEK, is the
+  attestation evidence.
+- **Azure** — a Confidential VM with Trusted Launch, on **AMD SEV-SNP** or
+  **Intel TDX**. Trusted Launch provides the vTPM and secure boot plus
+  guest-state disk encryption; the SEV-SNP report or the TDX quote is the
+  attestation evidence.
+- **GCP** — a Confidential VM with Shielded VM, on **AMD SEV-SNP** or **Intel
+  TDX**. Shielded VM provides the vTPM, secure boot, and integrity monitoring.
+
+Both confidential-computing technologies are verified natively: AMD SEV-SNP
+through the AMD VCEK-to-ASK-to-ARK certificate chain, and Intel TDX through the
+DCAP quote with its PCK certificate chain to the Intel SGX Root CA. No
+third-party attestation service is contacted; verification is performed in the
+server using the operating system's cryptography and the bundled vendor roots.
 
 Privacy-focused European and Swiss providers (for example Hetzner, OVHcloud,
 and Exoscale) are **not** Cloud Mode targets. Strong data residency and
@@ -51,17 +63,118 @@ dedicated or bare-metal hardware in **bare-metal mode** instead.
 
 ## What Cloud Mode enforces
 
-### Confidential computing, attested and fail-closed
+### Remote attestation, verified and fail-closed
 
 At boot, after the instance anchor is established and the deployment mode is
-resolved, a cloud deployment verifies that a confidential-computing guest is
-present. Detection looks for the guest attestation device the kernel creates
-only inside a genuine confidential guest — `/dev/sev-guest` for SEV-SNP,
-`/dev/tdx_guest` for TDX, or `/dev/nitro_enclaves` for Nitro. If none is
-present, the server logs the reason and exits. Full remote attestation (report
-fetch and CPU-vendor certificate-chain verification) is platform-validation
-pending and lands as the hardware path matures; the kernel device signal is
-the in-phase gate.
+resolved, a cloud deployment performs full remote attestation before it serves
+any traffic. The flow is the same shape for both technologies:
+
+1. **Generate a fresh nonce.** The server draws a random 64-byte nonce for
+   this boot. The nonce binds the report to this attestation and defeats replay
+   of a captured report.
+2. **Fetch a CPU-signed report.** Using the Linux `configfs-tsm` interface
+   (`/sys/kernel/config/tsm/report`), the server writes the nonce and reads
+   back the report the CPU produces over it, together with the certificate
+   material the platform supplies. For SEV-SNP the AMD VCEK is recovered from
+   the returned certificate table; for TDX the PCK chain rides inside the
+   quote.
+3. **Verify the signature to a vendor root.** For **SEV-SNP**, the report
+   signature is checked with the VCEK (ECDSA P-384), and the VCEK-to-ASK-to-ARK
+   certificate chain is verified against the bundled AMD root. For **TDX**, the TD-report
+   signature is checked with the in-quote attestation key, that key is bound to
+   the Quoting Enclave report, the QE report is checked with the PCK leaf, and
+   the PCK leaf-to-intermediate chain is verified against the bundled
+   Intel SGX Root CA.
+4. **Check freshness.** The report's report-data field must equal the nonce
+   from step 1. A report for a different nonce — including a stale one — is
+   rejected.
+5. **Enforce the firmware floor and the launch measurement.** The reported
+   Trusted Computing Base must be at or above the pinned floor, and the launch
+   measurement must match the pinned value (see the next two sections).
+
+Detection of which technology is present comes from the same `configfs-tsm`
+provider and the guest attestation device the kernel creates only inside a
+genuine confidential guest — `/dev/sev-guest` for SEV-SNP or `/dev/tdx_guest`
+for TDX. **Device presence alone is not sufficient.** Earlier builds treated
+the kernel device as the gate while full attestation was pending; that is no
+longer the case. If a signed report cannot be fetched and verified to a vendor
+root, the server marks the platform as validation-pending and **does not**
+treat it as attested.
+
+AWS Nitro Enclaves (`/dev/nitro_enclaves`) are **not** an attestation source
+for Cloud Mode. A Nitro Enclave attestation describes a carved-out enclave
+*within* the instance, not the whole VM that runs the Regional Server, so its
+presence does not verify the server's own memory-encrypted environment. The
+AWS path attests through the instance's SEV-SNP report.
+
+### Trusted Computing Base floor (anti-rollback)
+
+A confidential VM's attestation report carries the version of the platform
+firmware — the Trusted Computing Base, or TCB — that produced it. A rolled-back
+or downgraded firmware can reintroduce fixed vulnerabilities while still
+producing a validly signed report, so a signature check alone is not enough.
+
+At provisioning, FireAlive records the platform's current TCB as a **floor**.
+On every subsequent boot the reported TCB must be **at or above** that floor;
+a report from older firmware is refused. The floor is **monotonic** — it only
+ever moves upward. When the platform firmware is legitimately updated, the
+operator (or the boot path, once confirmed) raises the floor to the new level;
+it can never be lowered, so an attacker cannot quietly downgrade the platform
+under a sealed deployment. For SEV-SNP the floor is compared component by
+component (bootloader, TEE, SNP, microcode); for TDX it is compared across the
+TCB security-version bytes.
+
+### Launch measurement pinning (TOFU)
+
+The attestation report also carries a **launch measurement**: a hash over the
+initial state the CPU measured when the confidential guest started (the
+SEV-SNP measurement, or the TDX MRTD). Two boots of the same image on the same
+platform produce the same measurement; a tampered or substituted image does
+not.
+
+FireAlive pins the launch measurement on a **trust-on-first-use** basis. The
+measurement seen at provisioning is recorded, and every later boot must
+present the **same** measurement. A mismatch halts the boot: it means the guest
+that started is not the one the deployment was sealed against. The pin is
+recorded once and is never silently overwritten.
+
+### Guest CPU side-channel mitigations
+
+Memory encryption protects the guest from the hypervisor, but a guest kernel
+still has to be configured to mitigate CPU side-channel vulnerabilities
+(Spectre v2, MDS, L1TF, Retbleed, and related transient-execution issues). A
+confidential VM that has left one of these families unmitigated weakens the
+protection the platform is supposed to provide.
+
+At boot, FireAlive reads the kernel's own mitigation reporting under
+`/sys/devices/system/cpu/vulnerabilities/` for the in-scope families. If any
+in-scope family reports **Vulnerable**, the server **fails closed** and exits.
+A family the kernel does not report (unknown) is tolerated by default and noted
+for audit; an operator running in a strict posture can require every in-scope
+family to be explicitly mitigated. Where an operator has an out-of-band reason
+to accept a specific family, an **audited override** records that decision
+rather than hiding it.
+
+### Dedicated tenancy (optional)
+
+By default Cloud Mode trusts memory encryption to isolate the guest from
+co-tenants, so shared hardware is acceptable. An operator with a stricter
+requirement can additionally require **single-tenant** hardware. When that
+requirement is set, the boot path reads instance metadata and refuses to
+continue unless the instance is on dedicated hardware: AWS `dedicated` or
+`host` tenancy, an Azure dedicated host group, or a GCP sole-tenant node.
+Shared or unknown tenancy is refused. The requirement is off unless the
+operator turns it on at provisioning.
+
+### Periodic re-attestation
+
+Attestation is not only a boot-time check. While the server runs, it
+re-verifies the platform on a periodic schedule: it re-fetches and re-verifies
+the report, re-confirms the launch measurement, and re-checks the guest
+mitigations. A periodic re-attestation that regresses is recorded as a loss of
+attested status for operators to act on, rather than abruptly terminating a
+live server on a transient read; the authoritative fail-closed decision is made
+at boot and at provisioning.
 
 ### Refusal of spot and autoscaled instances
 
@@ -131,7 +244,9 @@ signed Infrastructure-as-Code generator. The flow is:
 
 1. **Provision a confidential VM** on AWS, Azure, or GCP. Use an on-demand
    instance only — spot, autoscaled, and ephemeral-fleet instances are
-   refused.
+   refused. If single-tenant hardware is required, provision dedicated tenancy
+   (AWS dedicated/host, an Azure dedicated host group, or a GCP sole-tenant
+   node).
 2. **Generate and apply the IaC bundle.** The MC's signed IaC generator
    produces a bundle for the chosen platform and format whose templates emit a
    confidential VM with a vTPM and stamp `deployment_mode = cloud`.
@@ -140,9 +255,11 @@ signed Infrastructure-as-Code generator. The flow is:
 4. **Set the backup KEK to the cloud KMS or Vault.** An environment-variable
    backup KEK is refused in cloud mode.
 5. **Start FireAlive and seal cloud mode.** On first boot the server attests
-   confidential computing, refuses to continue if it is absent, refuses spot
-   and autoscaled instances, and seals the mode to the instance vTPM. Capture
-   the recovery code and store it offline.
+   the confidential VM — fetching and verifying a CPU-signed report to a vendor
+   root — refuses to continue if attestation fails, refuses spot and autoscaled
+   instances, and seals the mode to the instance vTPM. At the seal it pins the
+   platform's launch measurement and records the current TCB as the floor for
+   later boots. Capture the recovery code and store it offline.
 6. **Confirm the anchor pin.** Each Analyst Client and the Global Dashboard
    show the deployment anchor fingerprint on first connection. Confirm the pin
    only if it matches the fingerprint the server printed at boot.
@@ -152,6 +269,23 @@ store using the instance's own identity (IAM role, managed identity, or
 service account). Secrets are never placed in instance user data in cleartext,
 because the confidential-VM threat model assumes the provider can read instance
 metadata but not guest memory.
+
+## Validation status
+
+The attestation verifiers and the boot and provisioning gates are implemented
+and are exercised end-to-end in CI against synthetic SEV-SNP reports and TDX
+quotes signed by throwaway certificate chains, covering valid evidence, tamper,
+wrong root, stale nonce, TCB-floor pass/fail, and measurement match/mismatch.
+
+The CPU-vendor **root certificates** that anchor the chains on real silicon —
+the AMD ARK (per product) and the Intel SGX Root CA — are added during hardware
+validation on genuine SEV-SNP and TDX instances. Until those roots are in place
+and confirmed against live hardware, the chain cannot complete on a real
+confidential VM, so attestation reports as not-yet-verified
+(validation-pending) and Cloud Mode stays **fail-closed**: the server declines
+to seal or boot a cloud deployment rather than trust an unverified platform.
+This is the intended staged posture for a pre-release platform, not a gap to be
+worked around.
 
 ## What Cloud Mode does not include
 
@@ -170,8 +304,14 @@ metadata but not guest memory.
 | Property | Cloud Mode |
 | --- | --- |
 | Hardware root of trust | Instance vTPM (TPM 2.0), reusing the deployment anchor |
-| Confidential computing | Required; attested at boot; fail-closed |
-| Supported platforms | AWS (SEV-SNP + NitroTPM), Azure (Confidential VM + Trusted Launch), GCP (Confidential VM + Shielded VM) |
+| Confidential computing | Required; remotely attested at boot; fail-closed |
+| Attestation evidence | AMD SEV-SNP report (VCEK to ARK) or Intel TDX quote (PCK to SGX Root CA), fetched via configfs-tsm, nonce-bound |
+| Supported platforms | AWS (SEV-SNP + NitroTPM), Azure (SEV-SNP or TDX + Trusted Launch), GCP (SEV-SNP or TDX + Shielded VM) |
+| Firmware floor | TCB recorded at provisioning; monotonic; older firmware refused |
+| Launch measurement | Pinned on first use (TOFU); a changed measurement halts boot |
+| Guest mitigations | `/sys` side-channel families checked; a Vulnerable family fails closed; audited overrides |
+| Dedicated tenancy | Optional; when required, shared/unknown tenancy is refused |
+| Re-attestation | Periodic re-verification of report, measurement, and mitigations |
 | Instance types refused | Spot / preemptible, autoscaled / scale-set, ephemeral fleet |
 | Tier-1 KEK | Sealed to the instance vTPM; recovery code for instance loss |
 | Backup KEK | Cloud KMS or Vault required; environment-variable KEK refused |

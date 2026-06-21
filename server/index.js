@@ -538,44 +538,111 @@ async function start() {
     // the gate below, only for a cloud substrate.
     app.locals.sdnCloudResident = !!(app.locals.deploymentMode && app.locals.deploymentMode.sdn === true && app.locals.deploymentMode.substrateCloud === true);
 
-    // B5h / B5i: confidential-VM boot gate (D-B5h-3, D-B5h-4, D-B5i-2). On a
-    // confidential-VM substrate -- cloud mode, or an sdn deployment sealed on a
-    // cloud substrate -- confidential computing is REQUIRED and attested before
-    // the server serves any request: verify a confidential-VM guest is present
-    // (fail closed if not), refuse spot / autoscaled / ephemeral-fleet
-    // instances, stamp the attestation, and publish the result on app.locals for
-    // the pre-auth gate. Any error here halts the server -- it never silently
-    // downgrades. An onsite sdn (or bare-metal / virtualized) deployment skips
-    // this gate and relies on its TPM hardware root established above.
+    // B5h / B5i / B5l2: confidential-VM boot gate (D-B5h-3, D-B5h-4, D-B5i-2).
+    // On a confidential-VM substrate -- cloud mode, or an sdn deployment sealed
+    // on a cloud substrate -- confidential computing is REQUIRED and fully
+    // attested before the server serves any request: verifyAttestation fetches a
+    // signed SEV-SNP / TDX report and verifies its vendor certificate chain, the
+    // nonce, and the configured TCB floor (fail closed if not verified); the
+    // guest CPU cross-tenant side-channel mitigations are checked; spot /
+    // autoscaled / ephemeral-fleet instances are refused; single-tenant hardware
+    // is required when configured; the launch measurement is pinned on first use
+    // and required to match on every boot; the result is stamped and published on
+    // app.locals for the pre-auth gate; and periodic re-attestation is scheduled.
+    // Any error here halts the server -- it never silently downgrades. An onsite
+    // sdn (or bare-metal / virtualized) deployment skips this gate and relies on
+    // its TPM hardware root established above.
     if (app.locals.deploymentMode && app.locals.deploymentMode.substrateCloud === true) {
       try {
         const cloudAttestation = require('./services/cloud-attestation');
         const cloudMetadata = require('./services/cloud-metadata');
         const cloudMode = require('./services/cloud-mode');
+        const guestMitigations = require('./services/guest-mitigations');
 
-        const att = cloudAttestation.verifyAttestation();
+        let cloudConfig = null;
+        const cfgDb = getDb();
+        try { cloudConfig = cloudMode.getCloudConfig(cfgDb); } finally { cfgDb.close(); }
+
+        const att = cloudAttestation.verifyAttestation({ tcbFloor: cloudConfig ? cloudConfig.tcbFloor : undefined });
         if (!att.verified) {
-          logger.error('A confidential-VM substrate (cloud, or cloud-resident sdn) requires confidential computing, but it was not attested; refusing to start (fail-closed, D-B5h-3 / D-B5i-2)', { reason: att.reason });
+          logger.error('A confidential-VM substrate (cloud, or cloud-resident sdn) requires confidential computing, but the attestation report did not verify; refusing to start (fail-closed, D-B5h-3 / D-B5i-2)', { reason: att.reason });
           process.exit(1);
         }
         logger.info('Confidential computing attested', { tech: att.tech, platformValidationPending: att.platformValidationPending });
+
+        const mit = guestMitigations.evaluateMitigations();
+        if (!mit.ok) {
+          logger.error('Guest CPU cross-tenant side-channel mitigations are not satisfied; refusing to start (fail-closed)', { detail: guestMitigations.summarize(mit) });
+          process.exit(1);
+        }
+        logger.info('Guest CPU side-channel mitigations verified', { detail: guestMitigations.summarize(mit) });
 
         const meta = await cloudMetadata.readCloudMetadata();
         if (meta && (meta.spot === true || meta.autoscaled === true)) {
           logger.error('A confidential-VM substrate refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
           process.exit(1);
         }
-
-        const attDb = getDb();
-        try {
-          cloudMode.recordAttestation(attDb, { tech: att.tech });
-        } finally {
-          attDb.close();
+        if (cloudConfig && cloudConfig.requireDedicatedTenancy === true && !cloudMetadata.isDedicatedTenancy(meta)) {
+          logger.error('requireDedicatedTenancy is set but the instance is not on single-tenant hardware; refusing to start (fail-closed)', { tenancy: meta ? meta.tenancy : null, provider: meta ? meta.provider : null });
+          process.exit(1);
         }
 
-        app.locals.cloudAttestation = { verified: true, tech: att.tech, platformValidationPending: att.platformValidationPending, reason: att.reason };
+        const recDb = getDb();
+        try {
+          if (att.measurement) {
+            const pin = cloudMode.pinMeasurement(recDb, att.measurement);
+            if (!pin.matched) {
+              logger.error('The confidential-VM launch measurement does not match the pinned value; refusing to start (fail-closed, measurement TOFU)', { tech: att.tech });
+              process.exit(1);
+            }
+            if (pin.firstPin) logger.info('Confidential-VM launch measurement pinned (trust-on-first-use)', { tech: att.tech });
+          }
+          cloudMode.recordAttestation(recDb, { tech: att.tech, tcb: att.tcb || att.tcbSvn || null, measurement: att.measurement || null, verified: att.verified, platformValidationPending: att.platformValidationPending });
+        } finally {
+          recDb.close();
+        }
+
+        app.locals.cloudAttestation = { verified: true, tech: att.tech, platformValidationPending: att.platformValidationPending, reason: att.reason, measurement: att.measurement || null };
         app.locals.cloudMetadata = meta || null;
         logger.info('Confidential-VM substrate attested and sealed', { mode: app.locals.deploymentMode.mode, provider: meta ? meta.provider : null, privateIp: meta ? meta.privateIp : null });
+
+        // Periodic re-attestation: re-verify the report, the pinned measurement,
+        // and the guest mitigations on an interval. A regression marks the
+        // attestation unverified so the pre-auth gate refuses, rather than tearing
+        // down a running server on a transient fetch hiccup.
+        const REATTEST_INTERVAL_MS = 60 * 60 * 1000;
+        const reattestTimer = setInterval(function () {
+          try {
+            const rdb = getDb();
+            try {
+              const cfg = cloudMode.getCloudConfig(rdb);
+              const re = cloudAttestation.verifyAttestation({ tcbFloor: cfg ? cfg.tcbFloor : undefined });
+              let ok = re.verified;
+              let reason = re.reason;
+              if (ok && re.measurement) {
+                const pin = cloudMode.pinMeasurement(rdb, re.measurement);
+                if (!pin.matched) { ok = false; reason = 'launch measurement changed since pin'; }
+              }
+              if (ok) {
+                const m2 = guestMitigations.evaluateMitigations();
+                if (!m2.ok) { ok = false; reason = 'guest mitigations regressed: ' + guestMitigations.summarize(m2); }
+              }
+              if (ok) {
+                cloudMode.recordAttestation(rdb, { tech: re.tech, tcb: re.tcb || re.tcbSvn || null, measurement: re.measurement || null, verified: true, platformValidationPending: re.platformValidationPending });
+                app.locals.cloudAttestation = { verified: true, tech: re.tech, platformValidationPending: re.platformValidationPending, reason: re.reason, measurement: re.measurement || null };
+              } else {
+                logger.error('Periodic confidential-VM re-attestation failed; marking attestation unverified (pre-auth gate will refuse)', { reason: reason });
+                app.locals.cloudAttestation = { verified: false, tech: re.tech || att.tech, reason: reason };
+              }
+            } finally {
+              rdb.close();
+            }
+          } catch (reErr) {
+            logger.error('Periodic confidential-VM re-attestation errored; marking attestation unverified', { error: reErr.message });
+            app.locals.cloudAttestation = { verified: false, reason: 're-attestation error: ' + reErr.message };
+          }
+        }, REATTEST_INTERVAL_MS);
+        if (reattestTimer && typeof reattestTimer.unref === 'function') reattestTimer.unref();
       } catch (cloudBootErr) {
         logger.error('Confidential-VM boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
         process.exit(1);
