@@ -126,8 +126,6 @@ const ALLOWED_EVENT_TYPES = new Set([
   // Log integrity (R3l-ish neighborhood)
   'LOG_INTEGRITY_ALL',
   'LOG_INTEGRITY_CHECK',
-  // MSP multi-tenancy
-  'MSP_CONFIG_SAVED',
   // Pseudonyms (admin operations)
   'PSEUDONYM_CONFIG_SAVED',
   'PSEUDONYM_MAPPING_EXPORTED',
