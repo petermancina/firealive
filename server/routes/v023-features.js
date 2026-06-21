@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE v0.0.23 — New Routes
 // Adds: human impact risk report, EDR file inspection, enterprise KMS wizard,
-// WiFi security policy, MSP multi-tenancy, peer chat post-session rating/flagging
+// WiFi security policy, peer chat post-session rating/flagging
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -328,84 +328,6 @@ router.put('/network/wifi-policy', (req, res) => {
     auditLog(req.user.id, 'WIFI_POLICY_UPDATED', `min=${config.minimumProtocol} blockPSK=${config.blockWpa2Personal}`, req.ip);
     res.json({ ok: true, config });
   } catch (err) { res.status(500).json({ error: 'Failed to update WiFi policy' }); }
-});
-
-// ── MSP Multi-Tenancy Configuration ─────────────────────────────────────────
-router.get('/msp/config', (req, res) => {
-  try {
-    const db = getDb();
-    const config = db.prepare("SELECT value FROM team_config WHERE key = 'msp_config'").get();
-    db.close();
-    res.json(config ? JSON.parse(config.value) : {
-      enabled: false,
-      tenants: [],
-      isolation: {
-        separateEncryptionKeys: true,
-        separateAuditTrails: true,
-        crossTenantAccessBlocked: true,
-        tenantScopedApiKeys: true,
-        perTenantBackups: true,
-      },
-      managementOverlay: {
-        centralDashboard: true,
-        aggregateReporting: false, // Must be explicitly enabled — privacy implications
-        tenantAdminDelegation: true,
-      },
-    });
-  } catch (err) { res.status(500).json({ error: 'Failed to get MSP config' }); }
-});
-
-router.put('/msp/config', (req, res) => {
-  const { enabled, isolation, managementOverlay } = req.body;
-  const config = {
-    enabled: !!enabled,
-    tenants: [], // Managed via separate tenant CRUD
-    isolation: {
-      separateEncryptionKeys: isolation?.separateEncryptionKeys !== false,
-      separateAuditTrails: isolation?.separateAuditTrails !== false,
-      crossTenantAccessBlocked: isolation?.crossTenantAccessBlocked !== false,
-      tenantScopedApiKeys: isolation?.tenantScopedApiKeys !== false,
-      perTenantBackups: isolation?.perTenantBackups !== false,
-    },
-    managementOverlay: {
-      centralDashboard: managementOverlay?.centralDashboard !== false,
-      aggregateReporting: !!managementOverlay?.aggregateReporting,
-      tenantAdminDelegation: managementOverlay?.tenantAdminDelegation !== false,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('msp_config', ?, ?)").run(JSON.stringify(config), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'MSP_CONFIG_UPDATED', `enabled=${config.enabled}`, req.ip);
-    res.json({ ok: true, config });
-  } catch (err) { res.status(500).json({ error: 'Failed to update MSP config' }); }
-});
-
-// Tenant CRUD
-router.post('/msp/tenants', (req, res) => {
-  const { name, domain, contactEmail } = req.body;
-  if (!name) return res.status(400).json({ error: 'name required' });
-  try {
-    const db = getDb();
-    const raw = db.prepare("SELECT value FROM team_config WHERE key = 'msp_config'").get();
-    const config = raw ? JSON.parse(raw.value) : { tenants: [] };
-    const tenant = {
-      id: crypto.randomBytes(8).toString('hex'),
-      name: name.slice(0, 128),
-      domain: (domain || '').slice(0, 256),
-      contactEmail: (contactEmail || '').slice(0, 256),
-      encryptionKeyId: crypto.randomBytes(16).toString('hex'),
-      createdAt: new Date().toISOString(),
-      status: 'active',
-    };
-    config.tenants = [...(config.tenants || []), tenant];
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('msp_config', ?, ?)").run(JSON.stringify(config), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'MSP_TENANT_CREATED', `name=${tenant.name} id=${tenant.id}`, req.ip);
-    res.status(201).json({ ok: true, tenant });
-  } catch (err) { res.status(500).json({ error: 'Failed to create tenant' }); }
 });
 
 // ── Peer Chat Post-Session Rating & Abuse Flagging ──────────────────────────

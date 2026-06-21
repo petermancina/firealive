@@ -139,7 +139,6 @@ const TEAM_CONFIG_KEYS = [
   'helper_pay_config',
   'iam_config',
   'kms_config',
-  'msp_config',
   'peer_schedule_config',
   'peer_share_exclusion_cap',
   'recert_config',

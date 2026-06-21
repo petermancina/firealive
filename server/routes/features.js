@@ -72,8 +72,6 @@ const FEATURE_CATALOG = [
   // ── Management ──
   { id: 'ttx_generator', name: 'Tabletop Exercise (TTX) Generator', category: 'management', klass: 'toggle', default: true,
     desc: 'Generate tabletop incident exercises for the team.' },
-  { id: 'msp_multitenancy', name: 'MSP Multi-Tenancy', category: 'management', klass: 'toggle', default: false,
-    desc: 'Isolated multi-tenant mode for managed service providers.' },
   { id: 'cicd_pipelines', name: 'CI/CD Pipelines', category: 'management', klass: 'toggle', default: false,
     desc: 'Integrate FireAlive with the org\u2019s CI/CD pipelines.' },
 

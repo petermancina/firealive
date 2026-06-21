@@ -1223,7 +1223,7 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 
 **Not everything is a toggle.** Features are classified:
 
-- **Toggle** — the 19 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, pseudonymous lead chat (Signal E2EE), proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, MSP multi-tenancy, CI/CD pipelines). Toggles default on except MSP multi-tenancy and CI/CD, which default off.
+- **Toggle** — the 18 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, pseudonymous lead chat (Signal E2EE), proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, CI/CD pipelines). Toggles default on except CI/CD, which defaults off.
 - **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC’s defenses can never be turned off, even by a forged request.
 - **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA and clustering, and so on). These have no switch.
 
@@ -1247,17 +1247,6 @@ This way users can still see what FireAlive offers without being confused about 
 1. Lead configures thresholds on initial setup
 1. Picks notification channels (per the Client Notifications config)
 1. When team metrics cross thresholds, alert fires through chosen channels
-
-### MSP Multi-Tenancy
-
-**What it’s for:** For Managed Service Providers monitoring multiple client organizations on one FireAlive deployment. Each tenant gets isolated encryption keys, separate audit trails, scoped API keys. Cross-tenant data access is blocked architecturally.
-
-**Workflow:**
-
-1. MSP sets up FireAlive
-1. Opens MSP Multi-Tenancy, adds first tenant
-1. Repeats per client org
-1. Each tenant runs in isolation: tenant A’s analysts never see tenant B’s data, even though both run on the same server
 
 ### Global Dashboard
 
