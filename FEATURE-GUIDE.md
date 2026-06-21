@@ -768,13 +768,19 @@ The full operator runbook — provisioning, configuring the controller integrati
 
 ### SASE / ZTNA
 
-**What it’s for:** Integrate FireAlive into the org’s SASE platform. FireAlive can operate as a SECaaS offering or connect through ZTNA, CASB, SWG components.
+**What it’s for:** Run the FireAlive regional server as a dark application behind your organization’s SASE/ZTNA edge — published to analysts only through a sanctioned connector, never directly reachable — and have FireAlive verify it is being reached the way it is supposed to be. SASE mode is chosen once at first boot, alongside bare-metal, virtualized, cloud, and SDN, and is sealed to the hardware root so it cannot be flipped later. It is a network overlay, not a change to how the server runs: FireAlive stays a direct host process on its own TPM/vTPM, terminates the analyst’s mutual TLS itself, and never hands its sessions to the vendor’s edge.
 
-**Workflow:**
+**What SASE Mode enforces:**
 
-1. Lead picks SASE provider (Zscaler, Palo Alto Prisma, Netskope, Cato)
-1. Configures ZTNA endpoint, FWaaS policy, optional CASB
-1. FireAlive’s network access adjusts to SASE policy enforcement
+- **Connector-tunneled passthrough, required.** FireAlive requires the ZTNA edge to relay the raw TCP stream — a passthrough connector — so the analyst’s device-bound mutual TLS reaches FireAlive intact, end to end. It **fails closed** on a clientless, TLS-terminating edge that decrypts the connection and forwards an identity header (for example a Cloudflare Access or proxy `x-auth-request` header), because honoring that would trade the analyst’s client certificate for the edge’s word. There is no weaker authentication path.
+- **Connector-source admission.** You declare the addresses of the sanctioned connectors. Admission runs before authentication and decides on the **raw TCP socket peer**, not a spoofable forwarded header: a connection arriving from outside the connector allow-list is refused as a direct exposure, and a connection carrying a clientless identity header is refused as a passthrough violation. Loopback is always allowed so the host stays manageable; an ordinary `X-Forwarded-For` is not treated as identity.
+- **Assume-breach fail-safe, latched.** A single observed boundary violation — a direct connection, or a clientless-identity connection — latches the deployment into degraded posture and locks down the **entire** API surface (health checks included). There is no uncertain debounce band, because these are real observed breaches rather than flaky probes, and no automatic recovery: the lockdown lifts only when an operator closes the hole and records an out-of-band restore. There is no remote override.
+- **Read-only posture, no provider calls.** SASE mode has no controller integration. The `sase` health probe is a local state read — is the mode active, are connector sources declared, is posture degraded — and **never dials the provider’s API**. The boundary is enforced at FireAlive’s own front door, not by polling the vendor.
+- **Host-substrate-aware defenses.** Because SASE can run on bare metal, a VM, or a cloud confidential VM, you declare the host substrate (`FIREALIVE_SASE_SUBSTRATE`) at first boot. FireAlive then applies the matching host defenses on top of the overlay: a virtualized host adds clock-integrity and clone or rollback quarantine, and a cloud host adds confidential-computing attestation and refusal of spot or autoscaled instances. The substrate is required and sealed at boot — detection refuses an under-declaration.
+
+**Not a SWG egress or a SECaaS rewrite.** SASE mode is an inbound-reachability overlay only. FireAlive does not route its own egress through your secure web gateway, does not call the provider’s CASB/SWG/SECaaS/FWaaS plane, and does not become a managed or orchestrated container — the provider and edge details you record are metadata, and the server runs on its own hardware root of trust exactly as in every non-cloud mode.
+
+The full operator runbook — the passthrough requirement and why, the connector-source allow-list, the latching posture and lockdown model, and the deployment walkthrough — is in `docs/sase-mode.md`.
 
 ### High Availability
 

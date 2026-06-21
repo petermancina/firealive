@@ -1,6 +1,6 @@
 {
   "name": "firealive-analyst-client",
-  "version": "1.0.67",
+  "version": "1.0.68",
   "description": "FireAlive SOC Analyst Wellbeing Platform \u2014 Analyst Client",
   "main": "main.js",
   "author": "Peter Mancina",

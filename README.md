@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.67 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 60 (anti-rollback)
+**Version:** v1.0.68 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 61 (anti-rollback)
 
 -----
 
@@ -13,7 +13,7 @@ FireAlive is grounded in peer-reviewed research on burnout — both SOC-analyst-
 
 The name plays on the notion of burnout — FireAlive keeps the fire burning long.
 
-> **📘 New: See <FEATURE-GUIDE.md>** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It’s also the reference behind the in-app Help articles in the MC, AC, and GD.
+> **📘 See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It’s also the reference behind the in-app Help articles in the MC, AC, and GD.
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.67) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.68) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -36,30 +36,6 @@ cd packages/analyst-client && npm start  # AC Electron app
 cd frontend && npm start                 # MC Electron app
 cd packages/global-dashboard && npm start # GD Electron app
 ```
-
-### Environment Variables (Optional Features)
-
-Some FireAlive features require a deployment-time environment variable to enable. These are intentionally **not set by default** — opt in only when you’re ready and have considered the security implications.
-
-|Env Var           |Purpose                                                                                                                                                            |Required For                  |
-|------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
-|`GD_ALLOWED_HOSTS`|Comma-separated allow-list of GD-Server hostnames the MC may push to. Hostname-only (no port). Case-insensitive exact match — no wildcards, no subdomain semantics.|Global Dashboard push pipeline|
-
-Example:
-
-```bash
-GD_ALLOWED_HOSTS=gd-prod.corp.local,gd-staging.corp.local
-```
-
-The **Global Dashboard push feature is disabled by default.** If `GD_ALLOWED_HOSTS` is unset or empty, the MC will reject any URL passed to `PUT /api/gd-config` and the recurring push service will refuse to send. This is the primary SSRF defense — the URL the MC sends to is restricted to a pre-approved set chosen at deployment time, not freely entered by an admin in the UI. See **Security.md** for the full threat model.
-
-To enable GD push:
-
-1. Set `GD_ALLOWED_HOSTS` on the MC server (env var, systemd unit, container env, etc.) and restart the MC process.
-1. In the MC UI, open the Global Dashboard tab and configure the URL + API key. The URL’s hostname must be in the allow-list.
-1. Click Save (with Enabled left off).
-1. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
-1. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
 
 ### Building Installers
 
@@ -84,6 +60,18 @@ Five components:
 |**GD Server**                 |Node.js + Express + SQLite|Aggregates data from regional servers                                                                                                                                       |
 
 All three Electron apps (AC, MC, GD) are self-contained: their UI is precompiled in CI via esbuild into one `app.js` per app, React/ReactDOM are bundled in, every `index.html` loads only that single file, both CSP layers (meta tag + response header) are locked to `script-src 'self'`, and there are no runtime CDN fetches and no runtime transpiler. The apps run in restricted and air-gapped networks and make no external network calls for UI code.
+
+### Deployment Modes
+
+The Regional Server runs in one of five mutually exclusive deployment modes, chosen once at first boot and sealed to the hardware root of trust so it cannot be changed later. Every mode keeps the same hardware-anchored identity and anti-cloning guarantees; they differ in the substrate the server runs on and the network boundary it enforces.
+
+- **Bare metal** — a direct host process on dedicated hardware with a TPM 2.0. The simplest, hardest-to-copy substrate.
+- **Virtualized** — a VM with a vTPM, adding clock-integrity and clone/rollback quarantine so a paused, snapshotted, or migrated VM is caught fail-closed. See [`docs/anti-cloning-and-virtualization.md`](docs/anti-cloning-and-virtualization.md).
+- **Cloud** — a confidential VM on AWS, Azure, or GCP, adding confidential-computing attestation at boot and refusal of spot or autoscaled instances.
+- **SDN** — runs on any of the above substrates inside a software-defined network, treating segmentation as a boundary it continuously and read-only verifies, failing closed when assurance is lost. See [`docs/sdn-mode.md`](docs/sdn-mode.md).
+- **SASE** — runs on any of the above substrates behind a SASE/ZTNA edge, reachable only through a sanctioned connector with required connector-tunneled passthrough, refusing direct exposure and clientless TLS-terminating edges. See [`docs/sase-mode.md`](docs/sase-mode.md).
+
+SDN and SASE are network overlays, not container deployments: in every mode the server is a direct host process on a TPM/vTPM host, never a Kubernetes or orchestrated-container workload, because those cannot provide the per-instance hardware root of trust the instance anchor requires.
 
 ### Backend Services
 
@@ -122,6 +110,20 @@ All three Electron apps (AC, MC, GD) are self-contained: their UI is precompiled
 |recovery-rate-limit|Burst limiter on destructive client-recovery (teardown / reprovision) actions                        |
 |audit              |Tamper-evident: per-row SHA-256 hash chain + Ed25519-signed checkpoints                              |
 
+### Integrations
+
+|System            |Access    |Purpose                                                                                       |
+|------------------|----------|----------------------------------------------------------------------------------------------|
+|SOAR              |WRITE     |Burnout-aware ticket distribution                                                             |
+|Ticketing         |READ-ONLY |Queue metadata for routing                                                                    |
+|SIEM              |PUSH (CEF)|Health metrics, security events                                                               |
+|IAM               |READ      |Certificate authority, directory, offboarding detection                                       |
+|EDR               |READ      |Malware scanning of uploads/data                                                              |
+|Malware Scanners  |READ      |15-vendor multi-provider malware scanning for IR Simulator uploads (see Upload Security below)|
+|Scheduling        |READ      |Shift data for upskilling                                                                     |
+|Training Platforms|LINK      |Assessment modules, training content                                                          |
+|KMS               |READ/WRITE|Encryption key management                                                                     |
+
 ### API Routes
 
 All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
@@ -147,6 +149,32 @@ All endpoints require JWT authentication. Manager-only endpoints enforce RBAC.
 **IR Simulator API (/api/ooda, 15 endpoints):** OODA-loop incident-response training generator. Team leads upload IR policies, playbooks, and after-action reports; FireAlive parses them (rule-based) and generates choose-your-own-adventure decision-tree scenarios calibrated to a scenario type (8 categories — ransomware, phishing, data exfil, insider threat, APT, DDoS, supply chain, credential compromise) and difficulty (beginner / intermediate / advanced). Analysts work through scenarios node-by-node with an explanation on every choice. The generator validates each model output structurally — node-count bounds, OODA-phase progression, exactly one correct choice per decision node, all node references resolving, exactly one resolution node — and rejects malformed scenarios rather than persisting them. Per-policy replenishment (threshold / scheduled / manual) drives auto-generation, and aggregated mastery metrics are available via `GET /api/ooda/mastery` (analyst-only). See **FEATURE-GUIDE.md** for the full workflow and the backing services.
 
 **Upload security (defense in depth, applies to /api/ooda/policies and /api/ooda/aar):** Every uploaded policy and after-action report passes two fail-closed scan layers before any database write. Layer 1 is a deterministic FireAlive-specific scanner targeting the threats that arise from feeding uploaded text to an LLM — prompt injection, embedded executables, and encoding / Unicode-smuggling attacks. Layer 2 routes the file through the multi-vendor malware scanner system (15 supported vendors — see **Integrations**) for novel-signature and threat-intel matches the internal scanner cannot stay current on. Either layer’s rejection blocks the upload, and the IR Simulator routes additionally hard-gate on at least one enabled scanner: with none configured, the upload is refused with HTTP 422 and code MALWARE_SCANNER_REQUIRED. That hard gate is local to the IR Simulator routes because their content becomes LLM context for scenario generation.
+
+-----
+
+## Environment Variables (Optional Features)
+
+Some FireAlive features require a deployment-time environment variable to enable. These are intentionally **not set by default** — opt in only when you’re ready and have considered the security implications.
+
+|Env Var           |Purpose                                                                                                                                                            |Required For                  |
+|------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------|
+|`GD_ALLOWED_HOSTS`|Comma-separated allow-list of GD-Server hostnames the MC may push to. Hostname-only (no port). Case-insensitive exact match — no wildcards, no subdomain semantics.|Global Dashboard push pipeline|
+
+Example:
+
+```bash
+GD_ALLOWED_HOSTS=gd-prod.corp.local,gd-staging.corp.local
+```
+
+The **Global Dashboard push feature is disabled by default.** If `GD_ALLOWED_HOSTS` is unset or empty, the MC will reject any URL passed to `PUT /api/gd-config` and the recurring push service will refuse to send. This is the primary SSRF defense — the URL the MC sends to is restricted to a pre-approved set chosen at deployment time, not freely entered by an admin in the UI. See **Security.md** for the full threat model.
+
+To enable GD push:
+
+1. Set `GD_ALLOWED_HOSTS` on the MC server (env var, systemd unit, container env, etc.) and restart the MC process.
+1. In the MC UI, open the Global Dashboard tab and configure the URL + API key. The URL’s hostname must be in the allow-list.
+1. Click Save (with Enabled left off).
+1. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
+1. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
 
 -----
 
@@ -237,22 +265,6 @@ Three reporting surfaces:
 - **GD → Cross-Region Compliance tab** — framework × MC matrix sourced from MCs’ pushed compliance summaries. Drill into any cell for that MC’s full-report history, request a fresh fulfillment via the per-cell Request Full Report button, and inspect per-control parsed report bodies when fulfilled. Active MCs only.
 
 See **SETUP.md → Shared Responsibility in Compliance Reports** for the operator-facing framing of what compliance reports do and do not tell you.
-
------
-
-## Integrations
-
-|System            |Access    |Purpose                                                                                       |
-|------------------|----------|----------------------------------------------------------------------------------------------|
-|SOAR              |WRITE     |Burnout-aware ticket distribution                                                             |
-|Ticketing         |READ-ONLY |Queue metadata for routing                                                                    |
-|SIEM              |PUSH (CEF)|Health metrics, security events                                                               |
-|IAM               |READ      |Certificate authority, directory, offboarding detection                                       |
-|EDR               |READ      |Malware scanning of uploads/data                                                              |
-|Malware Scanners  |READ      |15-vendor multi-provider malware scanning for IR Simulator uploads (see Upload Security above)|
-|Scheduling        |READ      |Shift data for upskilling                                                                     |
-|Training Platforms|LINK      |Assessment modules, training content                                                          |
-|KMS               |READ/WRITE|Encryption key management                                                                     |
 
 -----
 
