@@ -524,6 +524,54 @@ async function notificationsProbe(db) {
   return { ok: false, status: 'error', detail: detail };
 }
 
+// ── Threat-Hunting Integrations (B5m) ───────────────────────────────
+// FireAlive is the monitored asset here, not a client: this probe NEVER dials
+// out. It reports inward state only -- whether the surface is enabled in policy,
+// whether any consumer is authorized, and live authorization / access counts.
+function thConfigEnabled(db) {
+  try {
+    const row = db.prepare("SELECT value FROM config WHERE key = 'threat_hunting_config'").get();
+    if (!row || !row.value) return false;
+    const cfg = JSON.parse(row.value);
+    if (!cfg || typeof cfg !== 'object') return false;
+    return Object.keys(cfg).some((k) => cfg[k] && cfg[k].enabled === true);
+  } catch (_e) {
+    return false;
+  }
+}
+
+function thConfigured(db) {
+  try {
+    return db.prepare('SELECT COUNT(*) AS c FROM threat_hunting_consumer_authorizations').get().c > 0;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function threatHuntingProbe(db) {
+  try {
+    const total = db.prepare('SELECT COUNT(*) AS c FROM threat_hunting_consumer_authorizations').get().c;
+    const active = db.prepare('SELECT COUNT(*) AS c FROM threat_hunting_consumer_authorizations WHERE enabled = 1').get().c;
+    const accesses = db.prepare('SELECT COUNT(*) AS c FROM threat_hunting_access_log').get().c;
+    const lastRow = db.prepare('SELECT accessed_at FROM threat_hunting_access_log ORDER BY id DESC LIMIT 1').get();
+    const lastAccess = lastRow ? lastRow.accessed_at : null;
+    const status = active + ' active authorization(s)'
+      + (total > active ? (', ' + (total - active) + ' disabled') : '');
+    return {
+      ok: true,
+      status: status,
+      detail: 'authorizations=' + total + ' active=' + active + ' accesses=' + accesses
+        + (lastAccess ? (' last_access=' + lastAccess) : ''),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 'unavailable',
+      detail: 'threat-hunting tables not reachable: ' + ((err && err.message) ? err.message : 'error'),
+    };
+  }
+}
+
 const registry = [
   {
     key: 'kms',
@@ -623,6 +671,13 @@ const registry = [
     configured: (db) => _externalChannelsConfigured(db).any,
     probe: (db) => notificationsProbe(db),
   },
+  {
+    key: 'threat_hunting',
+    label: 'Threat Hunting Integrations',
+    enabled: (db) => thConfigEnabled(db),
+    configured: (db) => thConfigured(db),
+    probe: (db) => threatHuntingProbe(db),
+  },
 ];
 
-module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe, ticketingProbe, schedulingProbe, sdnProbe, saseProbe, cloudProbe, backupProbe, cicdProbe, notificationsProbe };
+module.exports = { registry, kmsProbe, storageProbe, ldapProbe, siemProbe, soarProbe, edrProbe, ticketingProbe, schedulingProbe, sdnProbe, saseProbe, cloudProbe, backupProbe, cicdProbe, notificationsProbe, threatHuntingProbe };

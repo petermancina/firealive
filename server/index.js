@@ -35,6 +35,8 @@ const oodaJobs = require('./services/ooda-generation-jobs');
 const { gdPushService } = require('./services/gd-push');
 const { schedulingSyncService } = require('./services/scheduling-sync');
 const { isAuthorizedScannerIp } = require('./services/cloud-vuln-allowlist');
+const { isAuthorizedConsumerIp } = require('./services/threat-hunting-allowlist');
+const threatHuntingGate = require('./middleware/threat-hunting-auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -143,7 +145,7 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip),
+  skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip),
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });
@@ -311,6 +313,24 @@ app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+// Dedicated limiter for the external-facing threat-hunting feed. Automated
+// consumers (XDR/ATP/NGAV/MSP) reach these routes over mTLS, and the TAXII
+// surface is mounted outside /api so apiLimiter does not cover it. A per-IP
+// ceiling bounds a misbehaving or compromised consumer; there is intentionally
+// no consumer-IP skip here, since this limiter exists to govern that traffic.
+const threatHuntingLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 600,
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: rateLimitKeyGenerator,
+  validate: true,
+});
+
+app.use('/api/threat-hunting', threatHuntingLimiter, authMiddleware(['admin']), configLockChokepoint(), require('./routes/threat-hunting-admin'));
+app.use('/api/threat-hunting-feed', threatHuntingLimiter, threatHuntingGate, require('./routes/threat-hunting-feed'));
+app.use('/taxii2', threatHuntingLimiter, threatHuntingGate, require('./routes/threat-hunting-taxii'));
 app.use('/api/forensic-exports', authMiddleware(['admin', 'ciso']), require('./routes/forensic-exports'));
 app.use('/api', authMiddleware(['analyst', 'lead', 'admin', 'ciso']), require('./routes/report-verification'));
 
@@ -327,7 +347,7 @@ const staticLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: (req) => isAuthorizedScannerIp(req.ip),
+  skip: (req) => isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip),
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });

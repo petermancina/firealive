@@ -90,6 +90,7 @@ const CLIENT_CERT_DAYS = 365;      // 1y analyst/operator certs.
 const KEY_ALGO_LABEL = 'rsa-3072'; // recorded in ca_authority.key_algo.
 const SIG_DIGEST = 'sha256';
 const EXTERNAL_ID_URI_PREFIX = 'firealive:external-id:'; // stamped into the SAN.
+const THREAT_HUNTING_CONSUMER_OU = 'threat-hunting-consumer'; // role OU the feed gate checks (B5m).
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 function nowSqlite() {
@@ -389,6 +390,64 @@ function recordIssued(db, { serial, userId, externalId, subject, certPem, days, 
   return fingerprint;
 }
 
+// ── threat-hunting consumer certs (B5m) ─────────────────────────────────
+// Mint a client cert for an external threat-hunting consumer (EDR/XDR/ATP/NGAV
+// /MSP). Unlike issueClientCert (which signs a client-supplied CSR), the admin
+// mints the key AND the cert here and hands both to the org to install in its
+// collector, so the subject -- including the consumer role OU the feed gate
+// checks -- is server-controlled and trustworthy. clientAuth EKU; signed by the
+// active deployment CA; recorded in issued_certs like every other leaf so it is
+// revocable through the same path.
+function sanitizeConsumerCn(name) {
+  const cleaned = String(name || '').replace(/[^A-Za-z0-9 ._-]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 64);
+  return cleaned || 'threat-hunting-consumer';
+}
+
+function issueThreatHuntingConsumerCert(db, { displayName } = {}) {
+  const cn = sanitizeConsumerCn(displayName);
+  return withTempDir((dir) => {
+    const caKeyPem = loadCaKeyPem(db);
+    const caCertPem = getCaCertPem(db);
+    const caKeyPath = path.join(dir, 'ca.key');
+    const caCrtPath = path.join(dir, 'ca.crt');
+    const keyPath = path.join(dir, 'consumer.key');
+    const csrPath = path.join(dir, 'consumer.csr');
+    const extPath = path.join(dir, 'consumer.ext');
+    const crtPath = path.join(dir, 'consumer.crt');
+    fs.writeFileSync(caKeyPath, caKeyPem, { mode: 0o600 });
+    fs.writeFileSync(caCrtPath, caCertPem);
+
+    // Generate the consumer key server-side (matches the server leaf key size).
+    openssl(['genpkey', '-algorithm', 'RSA',
+      '-pkeyopt', 'rsa_keygen_bits:' + SERVER_KEY_BITS, '-out', keyPath]);
+    // Server-controlled subject: we own the key, so the role OU is trustworthy.
+    const subject = '/OU=' + THREAT_HUNTING_CONSUMER_OU + '/CN=' + cn;
+    openssl(['req', '-new', '-key', keyPath, '-subj', subject, '-out', csrPath]);
+
+    const extLines = [
+      'basicConstraints=CA:FALSE',
+      'keyUsage=critical,digitalSignature',
+      'extendedKeyUsage=clientAuth',
+    ];
+    fs.writeFileSync(extPath, extLines.join('\n') + '\n');
+
+    const serial = nextSerialHex(db);
+    openssl(['x509', '-req', '-in', csrPath, '-CA', caCrtPath, '-CAkey', caKeyPath,
+      '-set_serial', '0x' + serial, '-days', String(CLIENT_CERT_DAYS),
+      '-' + SIG_DIGEST, '-extfile', extPath, '-out', crtPath]);
+
+    const certPem = fs.readFileSync(crtPath, 'utf8');
+    const keyPem = fs.readFileSync(keyPath, 'utf8');
+    const fp = fingerprint256(certPem);
+    recordIssued(db, {
+      serial, userId: null, externalId: null,
+      subject: 'OU=' + THREAT_HUNTING_CONSUMER_OU + ',CN=' + cn,
+      certPem, days: CLIENT_CERT_DAYS, fp,
+    });
+    return { certPem, keyPem, fingerprint: fp, serial, caCertPem };
+  });
+}
+
 // ── revoke (local revocation list) ────────────────────────────────────────────
 function revokeCert(db, { serial, reason = 'unspecified' } = {}) {
   const row = db.prepare('SELECT status FROM issued_certs WHERE serial = ?').get(serial);
@@ -512,6 +571,7 @@ module.exports = {
   reconcileServerCert,
   computeDesiredSan,
   issueClientCert,
+  issueThreatHuntingConsumerCert,
   revokeCert,
   verifyClientCert,
   buildRevocationList,
@@ -522,4 +582,5 @@ module.exports = {
   nowSqlite,
   KEY_ALGO_LABEL,
   EXTERNAL_ID_URI_PREFIX,
+  THREAT_HUNTING_CONSUMER_OU,
 };

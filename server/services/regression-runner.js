@@ -1172,6 +1172,206 @@ class RegressionRunner {
       });
     }
 
+    // ── Category: Threat hunting (B5m) ─────────────────
+    await check('threat_hunting', 'consumer_type is a closed enum (xdr/atp/ngav/msp), no custom type', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'db', 'init.js'), 'utf8');
+      const m = src.match(/consumer_type TEXT NOT NULL CHECK \(consumer_type IN \(([^)]*)\)/);
+      if (!m) throw new Error('threat_hunting_consumer_authorizations consumer_type CHECK enum not found');
+      for (const t of ['xdr', 'atp', 'ngav', 'msp']) {
+        if (m[1].indexOf("'" + t + "'") === -1) throw new Error('consumer_type enum missing ' + t);
+      }
+      if (/['"]custom['"]/.test(m[1])) throw new Error('consumer_type enum must not contain an open-ended custom type');
+      return 'consumer_type closed to xdr/atp/ngav/msp; no custom type';
+    });
+
+    await check('threat_hunting', 'access log is append-only with a closed outcome enum', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'db', 'init.js'), 'utf8');
+      if (!/threat_hunting_access_log_no_update[\s\S]*?RAISE\(ABORT/.test(src)) throw new Error('append-only BEFORE UPDATE trigger missing');
+      if (!/threat_hunting_access_log_no_delete[\s\S]*?RAISE\(ABORT/.test(src)) throw new Error('append-only BEFORE DELETE trigger missing');
+      const om = src.match(/threat_hunting_access_log[\s\S]*?outcome TEXT NOT NULL CHECK \(outcome IN \(([^)]*)\)/);
+      if (!om) throw new Error('access-log outcome CHECK enum not found');
+      for (const o of ['authorized', 'rejected_cert', 'rejected_token', 'rejected_ip', 'rejected_disabled', 'rejected_category', 'rejected_query']) {
+        if (om[1].indexOf("'" + o + "'") === -1) throw new Error('outcome enum missing ' + o);
+      }
+      return 'access log append-only (update+delete triggers) with closed outcome enum';
+    });
+
+    await check('threat_hunting', 'registry rejects an unknown consumer_type (closed enum at the app layer)', () => {
+      const registry = require('./threat-hunting-registry');
+      if (!Array.isArray(registry.CONSUMER_TYPES) || registry.CONSUMER_TYPES.join(',') !== 'xdr,atp,ngav,msp') {
+        throw new Error('registry CONSUMER_TYPES is not the closed set');
+      }
+      let threw = false;
+      try {
+        registry.createAuthorization({}, { consumerType: 'custom', displayName: 'x', allowedCidrs: ['1.1.1.1'] });
+      } catch (e) {
+        threw = /consumer_type must be one of/.test(e.message);
+      }
+      if (!threw) throw new Error('createAuthorization accepted an unknown consumer_type');
+      return 'registry throws on consumer_type=custom before any DB/CA work';
+    });
+
+    await check('threat_hunting', 'feed gate enforces cert + token + IP and fails closed on each', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'threat-hunting-auth.js'), 'utf8');
+      const need = [
+        ['verifyClientCert', /verifyClientCert\(/],
+        ['consumer OU check', /subjectHasConsumerOu|THREAT_HUNTING_CONSUMER_OU|CONSUMER_OU/],
+        ['registry fingerprint lookup', /findByCertFingerprint\(/],
+        ['constant-time token verify', /verifyToken\(/],
+        ['IP allow-list check', /ipAllowed\(/],
+        ['rejected_cert path', /rejected_cert/],
+        ['rejected_disabled path', /rejected_disabled/],
+        ['rejected_token path', /rejected_token/],
+        ['rejected_ip path', /rejected_ip/],
+      ];
+      for (let i = 0; i < need.length; i += 1) {
+        if (!need[i][1].test(src)) throw new Error('gate missing ' + need[i][0]);
+      }
+      if (!/req\.threatHuntingAuth\s*=/.test(src)) throw new Error('gate does not attach req.threatHuntingAuth on success');
+      if (/outcome:\s*'authorized'/.test(src)) throw new Error('gate must defer the authorized-access log to the route');
+      return 'gate validates cert(chain+OU+registry) + token + IP, four reject paths, defers authorized log';
+    });
+
+    await check('threat_hunting', 'access log is hash-chained and tamper-evident', () => {
+      const log = require('./threat-hunting-access-log');
+      const rows = []; let clock = 0;
+      const db = {
+        transaction: (fn) => ((...a) => fn(...a)),
+        prepare: (sql) => ({
+          get: () => {
+            if (sql.indexOf("datetime('now')") !== -1) { clock += 1; return { t: '2026-01-01 00:00:0' + clock }; }
+            if (sql.indexOf('ORDER BY id DESC LIMIT 1') !== -1) return rows.length ? { this_hash: rows[rows.length - 1].this_hash } : undefined;
+            return undefined;
+          },
+          run: function () {
+            const a = Array.prototype.slice.call(arguments);
+            const cols = ['prev_hash', 'this_hash', 'authorization_id', 'consumer_type', 'source_ip', 'cert_fingerprint', 'endpoint', 'format', 'query_summary', 'outcome', 'result_count', 'accessed_at'];
+            const r = { id: rows.length + 1 };
+            for (let i = 0; i < cols.length; i += 1) { r[cols[i]] = a[i]; }
+            rows.push(r);
+          },
+          all: () => rows.map((r) => Object.assign({}, r)),
+        }),
+      };
+      log.appendAccessLog(db, { source_ip: '10.0.0.1', endpoint: '/x', outcome: 'authorized', result_count: 1 });
+      log.appendAccessLog(db, { source_ip: '8.8.8.8', endpoint: '/x', outcome: 'rejected_ip' });
+      log.appendAccessLog(db, { source_ip: '10.0.0.1', endpoint: '/y', outcome: 'authorized', result_count: 0 });
+      if (rows[1].prev_hash !== rows[0].this_hash || rows[2].prev_hash !== rows[1].this_hash) throw new Error('chain links broken');
+      const intact = log.verifyAccessLogChain(db);
+      if (!intact.intact || intact.count !== 3) throw new Error('fresh chain not intact');
+      rows[1].outcome = 'authorized';
+      const broken = log.verifyAccessLogChain(db);
+      if (broken.intact !== false || broken.brokenAt !== 2) throw new Error('tamper not detected');
+      return 'append-only chain links + verify detects tampering at the altered entry';
+    });
+
+    await check('threat_hunting', 'every output dialect serializes a sample model', () => {
+      const fmts = require('./threat-hunting-formats');
+      const model = {
+        domain: 'auth_events', label: 'Authentication events', count: 2,
+        events: [
+          { time: '2026-01-01T00:00:00.000Z', actor: 'analyst-aaaa000000000000', src: '10.0.0.1', act: 'login', action: 'login', outcome: 'success' },
+          { time: '2026-01-01T00:01:00.000Z', actor: 'analyst-bbbb000000000000', src: '10.0.0.2', act: 'logout', action: 'logout', outcome: 'success' },
+        ],
+        has_more: false, next_cursor: null, generated_at: '2026-01-01T00:02:00.000Z',
+      };
+      const j = JSON.parse(fmts.getFormatter('json').events(model));
+      if (!Array.isArray(j.events) || j.events.length !== 2) throw new Error('json envelope malformed');
+      const cefLines = fmts.getFormatter('cef').events(model).split('\n').filter(Boolean);
+      if (cefLines.length !== 2 || !cefLines.every((l) => l.indexOf('CEF:0|') === 0)) throw new Error('cef lines malformed');
+      const o = JSON.parse(fmts.getFormatter('ocsf').events(model));
+      if (o.format !== 'ocsf' || !Array.isArray(o.events) || o.events.length !== 2) throw new Error('ocsf envelope malformed');
+      const sx = JSON.parse(fmts.getFormatter('stix').events(model));
+      if (sx.type !== 'bundle' || !Array.isArray(sx.objects) || !sx.objects.some((x) => x.type === 'observed-data')) throw new Error('stix bundle malformed');
+      if (fmts.getFormatter('nope') !== null) throw new Error('unknown format must resolve to null');
+      if (fmts.resolve('') !== fmts.getFormatter('json')) throw new Error('absent format must default to json');
+      return 'json/cef/ocsf/stix serialize a 2-event model; unknown->null, absent->json';
+    });
+
+    await check('threat_hunting', 'burnout + identity never reach the feed (no burnout collector + fail-closed projection)', () => {
+      const ps = require('./threat-hunting-pseudonymize');
+      const fs = require('fs');
+      // (1) the burnout store is never a collector source (strip comments first;
+      // the module names it once in a DELIBERATELY EXCLUDED comment).
+      const csrc = fs.readFileSync(path.join(__dirname, 'threat-hunting-collectors.js'), 'utf8')
+        .replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      if (/analyst_metrics/.test(csrc)) throw new Error('a collector references the burnout store (analyst_metrics) outside comments');
+      // (2) fail-closed projection: deny-vocab + identity fields dropped, actor pseudonymized.
+      let stored = null;
+      const db = {
+        prepare: (sql) => ({
+          run: function () { const a = Array.prototype.slice.call(arguments); if (sql.indexOf('INSERT OR IGNORE INTO config') !== -1 && stored === null) stored = a[1]; },
+          get: function () { if (sql.indexOf('SELECT value FROM config') !== -1) return stored !== null ? { value: stored } : undefined; return undefined; },
+        }),
+      };
+      const record = { user_id: 'u-123', stress: 8, fatigue: 7, morale: 3, real_name: 'Jane Doe', email: 'j@x.com', token_hash: 'deadbeef', action: 'login', src: '10.0.0.1', outcome: 'success' };
+      const allow = [
+        { from: 'user_id', to: 'actor', pseudonym: true },
+        { from: 'action' }, { from: 'src' }, { from: 'outcome' },
+        { from: 'stress' }, { from: 'fatigue' }, { from: 'morale' }, { from: 'real_name' }, { from: 'email' }, { from: 'token_hash' },
+      ];
+      const proj = ps.projectAllowed(db, record, allow);
+      if (!proj.actor || String(proj.actor).indexOf('analyst-') !== 0) throw new Error('actor not pseudonymized');
+      if (String(proj.actor).indexOf('u-123') !== -1) throw new Error('raw user id leaked into pseudonym');
+      if (proj.action !== 'login' || proj.src !== '10.0.0.1' || proj.outcome !== 'success') throw new Error('allow-listed field dropped');
+      for (const k of ['stress', 'fatigue', 'morale', 'real_name', 'email', 'token_hash', 'user_id']) {
+        if (Object.prototype.hasOwnProperty.call(proj, k)) throw new Error('denied/identity field leaked: ' + k);
+      }
+      for (const term of ['burnout', 'stress', 'fatigue', 'morale', 'wellbeing', 'tier3']) {
+        if (ps.DENY_SUBSTRINGS.indexOf(term) === -1) throw new Error('deny-list missing burnout term: ' + term);
+      }
+      const a1 = ps.pseudonymizeActor(db, 'u-123', 'actor');
+      const a2 = ps.pseudonymizeActor(db, 'u-123', 'actor');
+      const a3 = ps.pseudonymizeActor(db, 'u-123', 'session');
+      if (a1 !== a2) throw new Error('pseudonym not stable for same actor');
+      if (a1 === a3) throw new Error('namespace did not change pseudonym');
+      return 'burnout store has no collector; deny-vocab + identity dropped; actor pseudonymized, stable, namespaced';
+    });
+
+    await check('threat_hunting', 'query rejects bad limit/since/until/cursor/domain before any DB read', () => {
+      const t = require('./threat-hunting-telemetry');
+      const dom = (Array.isArray(t.DOMAINS) && t.DOMAINS[0]) || 'auth_events';
+      const cur = t.encodeCursor(dom, 4242);
+      if (t.decodeCursor(dom, cur) !== 4242) throw new Error('cursor did not round-trip');
+      if (t.decodeCursor('integrity', cur) !== null) throw new Error('cursor is not domain-bound');
+      if (t.decodeCursor(dom, undefined) !== 0) throw new Error('absent cursor must decode to 0');
+      if (t.decodeCursor(dom, 'garbage-not-a-cursor!!') !== null) throw new Error('malformed cursor must be null');
+      const boom = { prepare: () => { throw new Error('DB must not be read on rejected params'); } };
+      const cases = [
+        ['limit<=0', { limit: 0 }], ['non-integer limit', { limit: 3.5 }],
+        ['bad since', { since: 'nope' }], ['bad until', { until: 'nope' }],
+        ['bad cursor', { cursor: 'garbage!!' }],
+      ];
+      for (let i = 0; i < cases.length; i += 1) {
+        const r = t.query(boom, dom, cases[i][1]);
+        if (!r || r.ok !== false) throw new Error('not rejected: ' + cases[i][0]);
+      }
+      const ru = t.query(boom, 'no_such_domain', {});
+      if (!ru || ru.ok !== false) throw new Error('unknown domain not rejected');
+      return 'cursor round-trips + domain-bound; bad limit/since/until/cursor/domain rejected pre-DB';
+    });
+
+    await check('threat_hunting', 'TAXII 2.1 surfaces are present with correct media types', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'threat-hunting-taxii.js'), 'utf8');
+      const need = [
+        ['taxii media type', /application\/taxii\+json;version=2\.1/],
+        ['stix media type', /application\/stix\+json;version=2\.1/],
+        ['discovery api_roots', /api_roots/],
+        ['collections', /collections/],
+        ['objects endpoint', /objects/],
+        ['envelope more field', /more:/],
+        ['auth guard', /threatHuntingAuth/],
+      ];
+      for (let i = 0; i < need.length; i += 1) {
+        if (!need[i][1].test(src)) throw new Error('taxii route missing ' + need[i][0]);
+      }
+      return 'TAXII discovery/collections/objects present with taxii+stix media types and auth guard';
+    });
+
     // -- Category: Analyst-privacy (B5d1 analyst-private data architecture) --
     await check('analyst-privacy', 'B5d1 schema + indexes present', () => {
       requireAll([

@@ -7301,6 +7301,106 @@ function initDb() {
     );
   }
 
+  // ── B5m: threat-hunting consumer authorizations + access log ────────────────
+  // The read-only exposure surface that lets the org's EDR / XDR / ATP / NGAV /
+  // MSP tooling pull FireAlive's own security telemetry to hunt for an attacker
+  // inside a FireAlive instance. Per authorization: a FireAlive-CA-issued
+  // consumer client cert (fingerprint bound here), a hashed bearer token, and a
+  // CIDR allow-list -- all three required at the gate. Every access (allow or
+  // deny) is written to the append-only, hash-chained access log. New tables via
+  // CREATE IF NOT EXISTS (safe on existing DBs).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS threat_hunting_consumer_authorizations (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        consumer_type TEXT NOT NULL CHECK (consumer_type IN (
+          'xdr',
+          'atp',
+          'ngav',
+          'msp'
+        )),
+        display_name TEXT NOT NULL,
+        allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+        cert_fingerprint TEXT NOT NULL,
+        cert_serial TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        token_salt TEXT NOT NULL,
+        default_format TEXT NOT NULL DEFAULT 'json' CHECK (default_format IN (
+          'json',
+          'cef',
+          'ocsf',
+          'stix'
+        )),
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_access_at TEXT,
+        last_access_source_ip TEXT,
+        revoked_at TEXT,
+        notes TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_threat_hunting_auth_enabled
+        ON threat_hunting_consumer_authorizations(enabled, consumer_type);
+      CREATE INDEX IF NOT EXISTS idx_threat_hunting_auth_fingerprint
+        ON threat_hunting_consumer_authorizations(cert_fingerprint);
+
+      CREATE TABLE IF NOT EXISTS threat_hunting_access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prev_hash TEXT,
+        this_hash TEXT NOT NULL,
+        authorization_id TEXT REFERENCES threat_hunting_consumer_authorizations(id) ON DELETE SET NULL,
+        consumer_type TEXT,
+        source_ip TEXT NOT NULL,
+        cert_fingerprint TEXT,
+        endpoint TEXT NOT NULL,
+        format TEXT,
+        query_summary TEXT,
+        outcome TEXT NOT NULL CHECK (outcome IN (
+          'authorized',
+          'rejected_cert',
+          'rejected_token',
+          'rejected_ip',
+          'rejected_disabled',
+          'rejected_category',
+          'rejected_query'
+        )),
+        result_count INTEGER,
+        accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_threat_hunting_access_accessed_at
+        ON threat_hunting_access_log(accessed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_threat_hunting_access_outcome
+        ON threat_hunting_access_log(outcome);
+      CREATE INDEX IF NOT EXISTS idx_threat_hunting_access_auth
+        ON threat_hunting_access_log(authorization_id);
+
+      CREATE TRIGGER IF NOT EXISTS threat_hunting_access_log_no_update
+        BEFORE UPDATE ON threat_hunting_access_log
+        BEGIN SELECT RAISE(ABORT, 'threat_hunting_access_log is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS threat_hunting_access_log_no_delete
+        BEFORE DELETE ON threat_hunting_access_log
+        BEGIN SELECT RAISE(ABORT, 'threat_hunting_access_log is append-only'); END;
+    `);
+    const threatHuntingAuthCount = db
+      .prepare("SELECT COUNT(*) as c FROM threat_hunting_consumer_authorizations")
+      .get().c;
+    console.log(
+      'B5m migration: threat_hunting_consumer_authorizations + threat_hunting_access_log ready (' +
+        threatHuntingAuthCount + ' authorization(s) present)'
+    );
+  } catch (b5mThreatHuntingMigrationErr) {
+    console.error(
+      'B5m threat_hunting migration FAILED:',
+      b5mThreatHuntingMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Threat Hunting Integrations tab cannot register consumer authorizations or record telemetry access: GET/POST/PUT/DELETE /api/threat-hunting/* will return 500, and the threat-hunting feed and TAXII endpoints will reject all access. No other feature is affected. Recovery: manually run the CREATE TABLE / CREATE INDEX / CREATE TRIGGER statements above in a SQLite shell against the production DB.'
+    );
+  }
+
   // ── B1 (W2): model-file integrity & safety gate — server-side scan log ──────
   // Append-only, per-layer record of every server-side model-file gate decision
   // (hash-pin / signature / GGUF format / malware scan) made before a model is
