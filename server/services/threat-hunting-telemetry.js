@@ -27,8 +27,8 @@ function encodeCursor(domain, rowid) {
   if (typeof domain !== 'string' || !domain) return null;
   if (!Number.isInteger(rowid) || rowid < 0) return null;
   const raw = CURSOR_VERSION + ':' + domain + ':' + rowid;
-  return Buffer.from(raw, 'utf8').toString('base64')
-    .replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  return Buffer.from(raw, 'utf8')
+    .toString('base64url');
 }
 
 // Returns the afterRowid: 0 for an absent cursor (start), a positive integer for
