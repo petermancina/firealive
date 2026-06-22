@@ -445,13 +445,20 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 
 ### Threat Hunting Integrations
 
-**What it’s for:** Open FireAlive itself to inspection by the org’s threat-hunting tooling — XDR behavioral monitoring, ATP, Next-Gen AV, MSP scanners. So the org can detect if FireAlive itself is compromised. Companion to EDR (which scans files coming IN); this enables tools to scan FireAlive’s own behavior.
+**What it’s for:** Authorize your organization’s threat-hunting tools — XDR, ATP, Next-Gen AV, and MSP scanners — to pull FireAlive’s own operational security telemetry as a read-only feed they can correlate in their own consoles. This is the inbound counterpart to the SIEM/SOAR integrations (which push events out): here approved tooling connects in and pulls a curated slice — authentication events, sessions, the audit trail, and client-integrity findings — plus an actor-free summary of activity counts and compromise indicators. FireAlive is the monitored asset and never dials out; it serves only what a consumer is authorized to pull, and logs every pull. The per-category policy in this tab governs which consumer classes are allowed; each individual consumer is then authorized below.
+
+The feed is pseudonymous by construction and carries no burnout, wellbeing, or Tier-3 data — those signals have no path into it. Every request passes a three-factor gate that fails closed on each factor: a mutual-TLS client certificate issued by FireAlive’s internal CA, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list. Consumer types are a fixed set (XDR, ATP, Next-Gen AV, MSP) — there is no open-ended custom type. Each consumer pulls in its preferred dialect: native JSON, CEF, OCSF, or STIX 2.1 over a TAXII 2.1 server. Every pull — authorized or rejected — is written to an append-only, hash-chained access log whose integrity can be verified from the console at any time, and the feed carries its own dedicated rate limit.
+
+FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized hosts remains your firewall / security-group responsibility — the source-IP allow-list is a second check, not a substitute for it. The feature runs on the Regional Server only.
 
 **Workflow:**
 
-1. Lead configures provider per category
-1. Hunting tools now have authorized access to scan FireAlive
-1. Findings flow back through normal hunting workflow
+1. An administrator opens Threat Hunting, enables the consumer class in the per-category policy, and selects “Authorize Consumer”
+1. Picks the consumer type, names it, sets the source-IP allow-list, and chooses a default output format
+1. FireAlive issues the credentials once — a bearer token plus the client certificate, private key, and CA certificate; copy them into the consumer now, as the token and key cannot be retrieved again
+1. The consumer connects over mutual TLS from an allow-listed IP, presents its token, and pulls from the native feed or the TAXII server in its chosen format
+1. FireAlive authorizes (or rejects) each pull and records it in the access log; the pulled telemetry is correlated in the consumer’s own console
+1. The administrator reviews the access log, verifies its integrity (chain check), and can disable or revoke an authorization at any time — revoking immediately invalidates that consumer’s token and revokes its certificate
 
 ### Client Provisioning
 

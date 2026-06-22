@@ -3295,6 +3295,15 @@ function ManagementConsole() {
     {id:"main_server",l:"Main server"},
     {id:"gd_server",l:"Global Dashboard server"},
   ];
+  const THREAT_HUNT_CONSUMERS = [
+    {id:"xdr",l:"XDR (Extended Detection & Response)",d:"Correlates endpoint, network, and cloud signals."},
+    {id:"atp",l:"ATP (Advanced Threat Protection)",d:"Deep inspection for advanced persistent threats."},
+    {id:"ngav",l:"Next-Gen Antivirus",d:"ML-based malware detection beyond signatures."},
+    {id:"msp",l:"MSP Security Scanner",d:"Third-party MSP management / monitoring agents."},
+  ];
+  const THREAT_HUNT_FORMATS = [
+    {id:"json",l:"Native JSON"},{id:"cef",l:"CEF (ArcSight / syslog)"},{id:"ocsf",l:"OCSF 1.1.0"},{id:"stix",l:"STIX 2.1 / TAXII"},
+  ];
   const [cloudVulnList, setCloudVulnList] = useState([]);
   const [cloudVulnLoading, setCloudVulnLoading] = useState(false);
   const [cloudVulnError, setCloudVulnError] = useState(null);
@@ -3303,6 +3312,14 @@ function ManagementConsole() {
   const [cloudVulnLog, setCloudVulnLog] = useState([]);
   const [cloudVulnLogTotal, setCloudVulnLogTotal] = useState(0);
   const [cloudVulnChain, setCloudVulnChain] = useState(null); // {intact, count, brokenAt?}
+  const [thAuthList, setThAuthList] = useState([]);
+  const [thAuthLoading, setThAuthLoading] = useState(false);
+  const [thAuthError, setThAuthError] = useState(null);
+  const [thAuthForm, setThAuthForm] = useState(null); // {mode, id?, consumer_type, display_name, allowed_cidrs(text), default_format, notes, enabled}
+  const [thNewCreds, setThNewCreds] = useState(null); // one-time {token, cert_pem, key_pem, ca_cert_pem, display_name}
+  const [thAuthLog, setThAuthLog] = useState([]);
+  const [thAuthLogCount, setThAuthLogCount] = useState(0);
+  const [thAuthChain, setThAuthChain] = useState(null); // {intact, count, brokenAt?}
   const reloadCloudVuln = async () => {
     setCloudVulnLoading(true); setCloudVulnError(null);
     try {
@@ -3315,6 +3332,18 @@ function ManagementConsole() {
     setCloudVulnLoading(false);
   };
   useEffect(() => { reloadCloudVuln(); }, []);
+  const reloadThreatHuntAuth = async () => {
+    setThAuthLoading(true); setThAuthError(null);
+    try {
+      const r = await api.get("/api/threat-hunting/authorizations");
+      if (r && Array.isArray(r.authorizations)) setThAuthList(r.authorizations);
+      else if (r && r.error) setThAuthError(r.error);
+      const lg = await api.get("/api/threat-hunting/access-log?limit=100");
+      if (lg && Array.isArray(lg.entries)) { setThAuthLog(lg.entries); setThAuthLogCount(lg.count||lg.entries.length); }
+    } catch (e) { setThAuthError(e.message); }
+    setThAuthLoading(false);
+  };
+  useEffect(() => { if (tab === "threat_hunt") reloadThreatHuntAuth(); }, [tab]);
   // Query tool
   const [querySource, setQuerySource] = useState("audit_log");
   const [queryRegex, setQueryRegex] = useState("");
@@ -7662,6 +7691,147 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.tm,lineHeight:1.8}}>Uploaded files (analyst attachments, config imports) · App update packages (before installation) · Application behavior patterns (API call frequency, memory usage, DB access patterns) · Resource consumption metrics (CPU, memory, network I/O anomalies) · All scanning integrations use read-only API tokens scoped to the specific inspection function</M>
           </Card>
           <Btn primary onClick={()=>api.put("/api/threat-hunting/config",threatHuntCfg).then(r=>saved(r,"THREAT_HUNT_CONFIG_SAVED","Threat hunting integrations saved"))}>Save All Threat Hunting Config</Btn>
+
+          {/* ══════════ B5m - FEED CONSUMER AUTHORIZATIONS ══════════ */}
+          <div style={{borderTop:`1px solid ${C.b}`,margin:"28px 0 18px"}}/>
+          <L>Feed Consumer Authorizations</L>
+          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize external security tools to pull FireAlive's own operational security telemetry (authentication events, sessions, audit trail, integrity findings) as a read-only feed. FireAlive never dials out: authorized consumers connect inbound over mutual TLS and present a bearer token, restricted to a source-IP allow-list. Records are pseudonymous and carry no burnout or Tier-3 data. Each consumer pulls via the native JSON / CEF / OCSF feed or the STIX 2.1 / TAXII server.</M>
+          <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
+            <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Three-factor access</M>
+            <M style={{color:C.t,lineHeight:1.6}}>Every pull is gated on a client certificate (issued below), a bearer token, and the source-IP allow-list, each failing closed independently. Revoking an authorization disables its token and revokes its certificate. Consumer traffic is bounded by a dedicated rate limit.</M>
+          </Card>
+
+          {thAuthError&&<Card style={{marginBottom:16,borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Error: {thAuthError}</M></Card>}
+
+          {thNewCreds&&(<Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
+            <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Consumer credentials - shown once</M>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>Copy these into "{thNewCreds.display_name}" now. The token and private key are not retrievable again. The consumer presents the client certificate and key for mutual TLS and the token as Authorization: Bearer.</M>
+            {[
+              {k:"token",l:"Bearer token"},
+              {k:"cert_pem",l:"Client certificate (PEM)"},
+              {k:"key_pem",l:"Client private key (PEM)"},
+              {k:"ca_cert_pem",l:"FireAlive CA certificate (PEM)"},
+            ].map(c=>thNewCreds[c.k]?(
+              <div key={c.k} style={{marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <M style={{color:C.t,fontWeight:500}}>{c.l}</M>
+                  <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(thNewCreds[c.k]);}catch(e){}}}>Copy</Btn>
+                </div>
+                <code style={{display:"block",fontSize:10,whiteSpace:"pre-wrap",wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace",maxHeight:120,overflowY:"auto"}}>{thNewCreds[c.k]}</code>
+              </div>
+            ):null)}
+            <Btn small onClick={()=>setThNewCreds(null)}>Dismiss</Btn>
+          </Card>)}
+
+          {/* -- AUTHORIZED CONSUMERS LIST -- */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Authorized consumers ({thAuthList.length})</div>
+              <Btn primary small onClick={()=>{setThNewCreds(null);setThAuthForm({mode:"add",consumer_type:"",display_name:"",allowed_cidrs:"",default_format:"json",notes:"",enabled:true});}}>+ Authorize Consumer</Btn>
+            </div>
+            {thAuthLoading&&<M style={{color:C.tm}}>Loading...</M>}
+            {!thAuthLoading&&thAuthList.length===0&&(<div style={{padding:"24px 0",textAlign:"center"}}><M style={{color:C.tm,display:"block"}}>No consumers authorized. No external tool can pull the feed until one is added and enabled.</M></div>)}
+            {thAuthList.map(a=>{
+              const ct=THREAT_HUNT_CONSUMERS.find(s=>s.id===a.consumer_type);
+              const fmt=THREAT_HUNT_FORMATS.find(x=>x.id===a.default_format);
+              return(<div key={a.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:a.enabled?1:0.55}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                    <M style={{color:C.t,fontWeight:600}}>{a.display_name}</M>
+                    <Badge color={C.i}>{ct?ct.l:a.consumer_type}</Badge>
+                    <Badge color={C.p}>{fmt?fmt.l:(a.default_format||"json")}</Badge>
+                    {!a.enabled&&<Badge>DISABLED</Badge>}
+                  </div>
+                  <M style={{color:C.tm,display:"block"}}>Allow-list: {(a.allowed_cidrs||[]).join(", ")||"-"}</M>
+                  <M style={{color:C.td,display:"block",marginTop:2,wordBreak:"break-all"}}>Cert: {a.cert_fingerprint?(a.cert_fingerprint.slice(0,32)+"..."):"-"}</M>
+                  <M style={{color:C.td,display:"block",marginTop:4}}>Last pull: {a.last_access_at?(a.last_access_at+(a.last_access_source_ip?(" from "+a.last_access_source_ip):"")):"never"}</M>
+                  {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn small onClick={async()=>{const r=await api.put(`/api/threat-hunting/authorizations/${a.id}`,{enabled:!a.enabled});if(r&&!r.error)reloadThreatHuntAuth();else setThAuthError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={()=>{setThNewCreds(null);setThAuthForm({mode:"edit",id:a.id,consumer_type:a.consumer_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),default_format:a.default_format||"json",notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
+                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? Its token stops working and its certificate is revoked.`))return;const r=await api.del(`/api/threat-hunting/authorizations/${a.id}`);if(r&&!r.error){addA("THREAT_HUNTING_AUTH_REVOKED",a.display_name+" ("+a.consumer_type+")");reloadThreatHuntAuth();}else setThAuthError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                </div>
+              </div>);
+            })}
+          </Card>
+
+          {/* -- FEED ACCESS LOG -- */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Feed access log ({thAuthLogCount})</div>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                {thAuthChain&&<Badge color={thAuthChain.intact?C.a:C.d}>{thAuthChain.intact?("CHAIN OK ("+thAuthChain.count+")"):("CHAIN BROKEN @"+thAuthChain.brokenAt)}</Badge>}
+                <Btn small onClick={async()=>{const r=await api.get("/api/threat-hunting/access-log/verify");if(r&&!r.error)setThAuthChain(r);else setThAuthError((r&&r.error)||"verify failed");}}>Verify chain</Btn>
+                <Btn small onClick={reloadThreatHuntAuth}>Refresh</Btn>
+              </div>
+            </div>
+            {thAuthLog.length===0&&<M style={{color:C.tm}}>No feed access recorded yet.</M>}
+            {thAuthLog.map(e=>{
+              const okOutcome=e.outcome==="authorized";
+              return(<div key={e.id} style={{padding:"8px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:10}}>
+                <Badge color={okOutcome?C.a:C.d}>{e.outcome}</Badge>
+                <M style={{color:C.t,flex:1,minWidth:0,wordBreak:"break-all"}}>{(e.consumer_type||"unknown")+" \u00b7 "+(e.endpoint||"-")+(e.format?(" \u00b7 "+e.format):"")+" \u00b7 "+e.source_ip+(typeof e.result_count==="number"?(" \u00b7 "+e.result_count+" rows"):"")}</M>
+                <M style={{color:C.td,flexShrink:0}}>{e.accessed_at}</M>
+              </div>);
+            })}
+          </Card>
+
+          {/* -- FEED ENDPOINTS -- */}
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Feed endpoints</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>Point your consumer at these on this regional server's external HTTPS base URL (the host its certificate and allow-list are scoped to). The TAXII discovery URL is the entry point for STIX 2.1 clients.</M>
+            {[
+              {l:"Native feed (JSON / CEF / OCSF)",path:"/api/threat-hunting-feed/"},
+              {l:"TAXII 2.1 discovery",path:"/taxii2/"},
+            ].map(ep=>{
+              const url=API_BASE.replace(/\/+$/,"")+ep.path;
+              return(<div key={ep.path} style={{marginBottom:8}}>
+                <M style={{color:C.td,display:"block",marginBottom:3}}>{ep.l}</M>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"6px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{url}</code>
+                  <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(url);}catch(e){}}}>Copy</Btn>
+                </div>
+              </div>);
+            })}
+          </Card>
+
+          {/* -- AUTHORIZE / EDIT MODAL -- */}
+          {thAuthForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setThAuthForm(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:16,padding:32,maxWidth:560,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+              <L>{thAuthForm.mode==="add"?"Authorize Consumer":"Edit Authorization"}</L>
+              <Sel label="Consumer type" value={thAuthForm.consumer_type} onChange={e=>setThAuthForm(prev=>({...prev,consumer_type:e.target.value}))} disabled={thAuthForm.mode==="edit"}>
+                <option value="">Select a consumer type...</option>
+                {THREAT_HUNT_CONSUMERS.map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+              </Sel>
+              {thAuthForm.consumer_type&&(()=>{const s=THREAT_HUNT_CONSUMERS.find(x=>x.id===thAuthForm.consumer_type);return s?(<M style={{color:C.td,display:"block",marginTop:-8,marginBottom:12}}>{s.d}</M>):null;})()}
+              <Input label="Display name" value={thAuthForm.display_name} onChange={e=>setThAuthForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Cortex XDR (prod)" maxLength={128}/>
+              <Input label="Source IP allow-list (comma-separated IPs or CIDRs)" value={thAuthForm.allowed_cidrs} onChange={e=>setThAuthForm(prev=>({...prev,allowed_cidrs:e.target.value}))} placeholder="e.g. 10.0.0.0/24, 203.0.113.7" maxLength={512}/>
+              <Sel label="Default output format" value={thAuthForm.default_format} onChange={e=>setThAuthForm(prev=>({...prev,default_format:e.target.value}))}>
+                {THREAT_HUNT_FORMATS.map(x=>(<option key={x.id} value={x.id}>{x.l}</option>))}
+              </Sel>
+              <Input label="Notes (optional)" value={thAuthForm.notes} onChange={e=>setThAuthForm(prev=>({...prev,notes:e.target.value}))} maxLength={1000}/>
+              {thAuthForm.mode==="edit"&&(<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:8}}><input type="checkbox" checked={thAuthForm.enabled} onChange={e=>setThAuthForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Enabled</M></label>)}
+              <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                <Btn onClick={()=>setThAuthForm(null)}>Cancel</Btn>
+                <Btn primary onClick={async()=>{
+                  const cidrs=thAuthForm.allowed_cidrs.split(",").map(x=>x.trim()).filter(Boolean);
+                  if(!thAuthForm.consumer_type){setThAuthError("Consumer type is required");return;}
+                  if(!thAuthForm.display_name.trim()){setThAuthError("Display name is required");return;}
+                  if(cidrs.length===0){setThAuthError("At least one source IP / CIDR is required");return;}
+                  if(thAuthForm.mode==="add"){
+                    const r=await api.post("/api/threat-hunting/authorizations",{consumer_type:thAuthForm.consumer_type,display_name:thAuthForm.display_name.trim(),allowed_cidrs:cidrs,default_format:thAuthForm.default_format,notes:thAuthForm.notes||null});
+                    if(r&&!r.error&&r.token){addA("THREAT_HUNTING_AUTH_CREATED",thAuthForm.display_name.trim()+" ("+thAuthForm.consumer_type+")");setThAuthForm(null);setThAuthError(null);setThNewCreds({token:r.token,cert_pem:r.cert_pem,key_pem:r.key_pem,ca_cert_pem:r.ca_cert_pem,display_name:thAuthForm.display_name.trim()});reloadThreatHuntAuth();}
+                    else setThAuthError((r&&r.error)||"create failed");
+                  }else{
+                    const r=await api.put(`/api/threat-hunting/authorizations/${thAuthForm.id}`,{display_name:thAuthForm.display_name.trim(),allowed_cidrs:cidrs,default_format:thAuthForm.default_format,notes:thAuthForm.notes||null,enabled:thAuthForm.enabled});
+                    if(r&&!r.error){addA("THREAT_HUNTING_AUTH_UPDATED",thAuthForm.display_name.trim());setThAuthForm(null);setThAuthError(null);reloadThreatHuntAuth();}
+                    else setThAuthError((r&&r.error)||"save failed");
+                  }
+                }}>{thAuthForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
+              </div>
+            </div>
+          </div>)}
         </div>)}
 
         {/* ══════════ v1.0.0 — TRIPWIRE ══════════ */}
