@@ -21,6 +21,8 @@ const { signToken, getClientCertThumbprint } = require('../middleware/auth');
 const devicePop = require('../services/device-pop');
 const deviceKey = require('../services/device-key');
 const { auditLog } = require('../middleware/audit');
+const { routeAlert } = require('../services/alert-router');
+const { checkGeoFence } = require('../services/geo-fence');
 const { logger } = require('../services/logger');
 const { verifyPeerCertificate } = require('../middleware/network-security');
 const ca = require('../services/ca');
@@ -260,6 +262,40 @@ function finishPasswordlessLogin(db, user, req, res, method) {
     auditLog(user.id, 'LOGIN_OFFBOARDED', `method=${method}`, req.ip);
     return res.status(403).json({ error: 'account offboarded' });
   }
+
+  // B5n: login geo-fencing. checkGeoFence is side-effect-free; this is where the
+  // verdict becomes an audit row, a fire-and-forget alert, and -- under
+  // enforcement -- a 403 that stops the session before any JWT is issued.
+  const geo = checkGeoFence(db, user, req.ip);
+  if (geo.action === 'misconfigured') {
+    auditLog(user.id, 'GEO_CONFIG_MISCONFIGURED',
+      'enabled but no GeoIP database loaded; login allowed (fail-open) method=' + method, req.ip);
+    Promise.resolve(routeAlert(db, {
+      type: 'GEO_CONFIG_MISCONFIGURED',
+      severity: 'high',
+      message: 'Login geo-fencing is enabled but no GeoIP database is loaded. Logins are allowed '
+        + '(fail-open) and are NOT geo-checked. Provision a GeoLite2-Country database under '
+        + 'MC > Data Sovereignty.',
+      timestamp: new Date().toISOString(),
+    })).catch(() => {});
+  } else if (geo.action === 'mismatch' || geo.action === 'unresolved') {
+    const geoDetail = 'action=' + geo.action + ' observed=' + (geo.observedCountry || 'none')
+      + ' expected=' + (geo.expectedCountries || []).join('/')
+      + ' enforce=' + geo.enforced + ' method=' + method;
+    auditLog(user.id, 'GEO_FENCE_VIOLATION', geoDetail, req.ip);
+    Promise.resolve(routeAlert(db, {
+      type: 'GEO_FENCE_VIOLATION',
+      severity: 'critical',
+      message: 'Login geo-fence violation for account ' + user.id + ': ' + geo.reason
+        + ' (' + (geo.blocked ? 'blocked' : 'allowed, audit-only') + ').',
+      timestamp: new Date().toISOString(),
+    })).catch(() => {});
+    if (geo.blocked) {
+      auditLog(user.id, 'GEO_FENCE_BLOCKED', geoDetail, req.ip);
+      return res.status(403).json({ error: 'login blocked by geo-fence policy', code: 'GEO_FENCE_BLOCKED' });
+    }
+  }
+
   const cnf = computeCnf(db, user, req);
   const result = issueJwt(db, user, req.ip, req.headers['user-agent'], cnf);
   auditLog(user.id, 'LOGIN_SUCCESS', `role=${user.role} method=${method} aal=high`, req.ip);

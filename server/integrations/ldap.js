@@ -34,7 +34,7 @@ const DEFAULT_GROUP_MAPPING = {
   'CN=IT-Admins,OU=IT,DC=corp': 'admin',
 };
 
-const SEARCH_ATTRS = ['sAMAccountName', 'userPrincipalName', 'displayName', 'cn', 'mail', 'memberOf', 'objectGUID', 'entryUUID'];
+const SEARCH_ATTRS = ['sAMAccountName', 'userPrincipalName', 'displayName', 'cn', 'mail', 'memberOf', 'objectGUID', 'entryUUID', 'c'];
 const OP_TIMEOUT_MS = 10000;
 
 // RFC 4515 filter escaping — anything user-supplied that enters a search filter
@@ -64,6 +64,18 @@ function formatGuid(buf) {
 function firstValue(v) {
   if (Array.isArray(v)) return v.length ? v[0] : null;
   return v == null ? null : v;
+}
+
+// Normalize an LDAP country attribute (RFC 4519 countryName, attribute 'c') to
+// a 2-letter ISO-3166-1 alpha-2 code in uppercase, or null when the directory
+// has no usable value. Anything that is not exactly two letters is treated as
+// absent rather than stored, so a malformed directory value never becomes a
+// geo-fence.
+function normalizeCountry(v) {
+  const s = firstValue(v);
+  if (!s) return null;
+  const c = String(s).trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(c) ? c : null;
 }
 
 class LdapClient {
@@ -117,6 +129,7 @@ class LdapClient {
       userPrincipalName: firstValue(e.userPrincipalName),
       displayName: firstValue(e.displayName) || firstValue(e.cn),
       mail: firstValue(e.mail),
+      country: normalizeCountry(e.c),
       memberOf: Array.isArray(e.memberOf) ? e.memberOf : (e.memberOf ? [e.memberOf] : []),
       objectGUID: oid,
     };
@@ -270,15 +283,26 @@ class LdapClient {
 
         if (!existing) {
           db.prepare(
-            'INSERT INTO users (username, name, role, tier, auth_method, external_id) VALUES (?, ?, ?, ?, ?, ?)'
-          ).run(handle, handle, role, role === 'analyst' ? 1 : null, 'ldap', adUser.objectGUID);
+            'INSERT INTO users (username, name, role, tier, auth_method, external_id, geo_country) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          ).run(handle, handle, role, role === 'analyst' ? 1 : null, 'ldap', adUser.objectGUID, adUser.country);
           created++;
-        } else if (existing.role !== role || existing.username !== handle || existing.name !== handle) {
+        } else {
           // Sync the role, and self-heal any row provisioned before identity
           // minimization (whose username/name still held the real values) onto
-          // the handle.
-          db.prepare("UPDATE users SET username = ?, name = ?, role = ?, updated_at = datetime('now') WHERE id = ?").run(handle, handle, role, existing.id);
-          updated++;
+          // the handle. The directory is authoritative for geo_country only
+          // WHEN it supplies the country attribute (c); when the directory
+          // omits it, the stored value is kept so an LDAP sync never wipes a
+          // manually-assigned country.
+          const nextGeo = adUser.country || existing.geo_country || null;
+          if (
+            existing.role !== role ||
+            existing.username !== handle ||
+            existing.name !== handle ||
+            (existing.geo_country || null) !== nextGeo
+          ) {
+            db.prepare("UPDATE users SET username = ?, name = ?, role = ?, geo_country = ?, updated_at = datetime('now') WHERE id = ?").run(handle, handle, role, nextGeo, existing.id);
+            updated++;
+          }
         }
       }
 

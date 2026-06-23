@@ -50,6 +50,8 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/config-baseline',  // snapshots + golden-baseline (mount-gated to cover the :id routes)
   '/api/client-recovery',  // B5d4: per-client AC teardown + re-provision (POST writes gated)
   '/api/migration',  // B5e: FA-MIG1 deployment migration export + import (POST writes gated)
+  '/api/geoip',  // B5n: GeoIP database provisioning (POST /database upload gated)
+  '/api/geo-fence',  // B5n: login geo-fence config/exceptions/per-user country (all writes + the resolve dry-run gated under the mount)
 ];
 
 // Exact config-write endpoints inside the mixed feature routers (v021-v030).
@@ -74,7 +76,6 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/ha/config' },
   { method: 'PUT',  path: '/api/fail-open/config' },
   { method: 'PUT',  path: '/api/pseudonyms/config' },
-  { method: 'PUT',  path: '/api/geo-fence/config' },
   { method: 'PUT',  path: '/api/cluster/config' },
   { method: 'PUT',  path: '/api/global-dashboard/config' },
   { method: 'PUT',  path: '/api/sync-interval/config' },

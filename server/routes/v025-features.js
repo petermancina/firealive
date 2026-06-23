@@ -75,52 +75,6 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to rotate pseudonyms' }); }
 });
 
-// ── Data Sovereignty / Geo-Fencing ──────────────────────────────────────────
-router.get('/geo-fence/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = db.prepare("SELECT value FROM config WHERE key = 'geo_fence_config'").get();
-    db.close();
-    res.json(cfg ? JSON.parse(cfg.value) : { enabled: false, enforceGeoLogin: true, clients: [] });
-  } catch (e) { res.status(500).json({ error: 'Failed to load geo-fence config' }); }
-});
-
-router.put('/geo-fence/config', requireObjectBody, (req, res) => {
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('geo_fence_config', ?)").run(JSON.stringify(req.body));
-    auditLog(req.user?.id || 'system', 'GEO_FENCE_CONFIG_UPDATED', `${req.body.clients?.length || 0} clients geo-assigned`);
-    db.close();
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Failed to save geo-fence config' }); }
-});
-
-// Geo-login check — called on each authentication
-router.post('/geo-fence/check', (req, res) => {
-  try {
-    const { clientId, loginCountry } = req.body;
-    const db = getDb();
-    const cfgRow = db.prepare("SELECT value FROM config WHERE key = 'geo_fence_config'").get();
-    const cfg = cfgRow ? JSON.parse(cfgRow.value) : { enabled: false };
-    db.close();
-
-    if (!cfg.enabled || !cfg.enforceGeoLogin) return res.json({ allowed: true });
-
-    const assignment = cfg.clients?.find(c => c.clientId === clientId);
-    if (!assignment) return res.json({ allowed: true, reason: 'no geo-assignment for this client' });
-
-    if (assignment.country !== loginCountry) {
-      return res.json({
-        allowed: false,
-        reason: `Login from ${loginCountry} blocked — client assigned to ${assignment.country}`,
-        assignedCountry: assignment.country,
-        attemptedCountry: loginCountry
-      });
-    }
-    res.json({ allowed: true });
-  } catch (e) { res.status(500).json({ error: 'Geo-fence check failed' }); }
-});
-
 // ── Cluster Configuration ───────────────────────────────────────────────────
 router.get('/cluster/config', (req, res) => {
   try {

@@ -46,9 +46,20 @@ router.get('/analysts', (req, res) => {
 
 // ── POST /api/team/provision — provision new analyst ─────────────────────────
 router.post('/provision', (req, res) => {
-  const { tier, shift } = req.body;
+  const { tier, shift, geo_country } = req.body;
   if (!tier || !shift) {
     return res.status(400).json({ error: 'tier and shift are required' });
+  }
+
+  // Optional geo-fence assignment at provision time. When present it must be a
+  // 2-letter ISO-3166-1 alpha-2 code; stored uppercase, or NULL when omitted.
+  let geoCountry = null;
+  if (geo_country !== null && geo_country !== undefined && String(geo_country).trim() !== '') {
+    const gc = String(geo_country).trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(gc)) {
+      return res.status(400).json({ error: 'geo_country must be a 2-letter ISO-3166-1 alpha-2 code' });
+    }
+    geoCountry = gc;
   }
 
   const crypto = require('crypto');
@@ -68,8 +79,8 @@ router.post('/provision', (req, res) => {
   // Passwordless-first: no password is set. The analyst enrolls a passkey by
   // redeeming the enrollment token minted below.
   db.prepare(
-    "INSERT INTO users (id, username, role, name, pseudonym, pseudonym_rotated_at, tier, shift) VALUES (?, ?, 'analyst', ?, ?, ?, ?, ?)"
-  ).run(id, handle, handle, pseudonym, new Date().toISOString(), tier, shift);
+    "INSERT INTO users (id, username, role, name, pseudonym, pseudonym_rotated_at, tier, shift, geo_country) VALUES (?, ?, 'analyst', ?, ?, ?, ?, ?, ?)"
+  ).run(id, handle, handle, pseudonym, new Date().toISOString(), tier, shift, geoCountry);
 
   db.prepare(
     'INSERT INTO routing_caps (analyst_id, max_complexity) VALUES (?, ?)'
@@ -86,10 +97,10 @@ router.post('/provision', (req, res) => {
 
   db.close();
 
-  auditLog(req.user.id, 'ANALYST_PROVISIONED', 'pseudonym=' + pseudonym + ' L' + tier + ' ' + shift + ' ' + activationId, req.ip);
+  auditLog(req.user.id, 'ANALYST_PROVISIONED', 'pseudonym=' + pseudonym + ' L' + tier + ' ' + shift + ' geo=' + (geoCountry || 'none') + ' ' + activationId, req.ip);
 
   res.status(201).json({
-    id, pseudonym, tier, shift, activationId,
+    id, pseudonym, tier, shift, geo_country: geoCountry, activationId,
     enrollmentToken,
     enrollmentExpiresInDays: 7,
     enrollEndpoint: '/api/auth/enroll/passkey/options',

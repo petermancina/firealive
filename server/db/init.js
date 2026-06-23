@@ -8124,6 +8124,45 @@ function initDb() {
     console.error('identity backfill (B5h3) failed (non-fatal):', idBackfillErr.message);
   }
 
+  // ── B5n migration: login geo-fencing tables ──────────────────────────
+  // geoip_database records the operator-provisioned MaxMind GeoLite2-Country
+  // database currently active for IP -> country resolution: its SHA-256, declared
+  // type, and build/size metadata, plus who uploaded it and when. One row is
+  // active at a time (active = 1); superseded uploads are retained for audit.
+  // geo_login_exceptions holds per-user country allowances (e.g. approved travel)
+  // that suppress a geo-fence block for a specific user + country, with an
+  // optional expiry. Both are operational state, not analyst data. Idempotent:
+  // CREATE TABLE / CREATE INDEX IF NOT EXISTS make re-running initDb a no-op.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS geoip_database (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sha256 TEXT NOT NULL,
+        db_type TEXT NOT NULL,
+        build_epoch INTEGER,
+        node_count INTEGER,
+        ip_version INTEGER,
+        record_count INTEGER,
+        uploaded_by TEXT,
+        uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+        active INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS geo_login_exceptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        country TEXT NOT NULL,
+        reason TEXT,
+        added_by TEXT,
+        added_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_geo_exc_user
+        ON geo_login_exceptions(user_id);
+    `);
+  } catch (b5nGeoFenceMigrationErr) {
+    console.error('B5n geo-fence table migration failed (non-fatal):', b5nGeoFenceMigrationErr.message);
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   db.close();

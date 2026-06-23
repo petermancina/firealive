@@ -1068,14 +1068,19 @@ The migration bundle (format FA-MIG1) is a self-contained, signed package: a man
 
 ### Data Sovereignty / Geo-Fencing
 
-**What it’s for:** Multinational SOC support. Each analyst client gets a country tag and the regulatory framework that applies (GDPR, PIPEDA, LGPD, etc.). Enforces data residency, blocks logins from unexpected countries, applies the right framework to that client’s data.
+**What it’s for:** Login geo-fencing for distributed SOCs. Each analyst is assigned a home country; the server resolves the country of every login’s source IP against a self-hosted MaxMind GeoLite2-Country database and, when enforcement is on, blocks logins whose country doesn’t match. It runs on FireAlive’s own MMDB reader — no third-party GeoIP dependency — and no analyst identity or location ever leaves the server. (Per-jurisdiction regulatory frameworks and data-residency routing are a separate, later capability; this surface is login geo-fencing only.)
+
+**What it can and can’t do:** the check can only judge a login when FireAlive sees a real, public client IP. Behind a reverse proxy, set `TRUST_PROXY` so the server reads the real client address; on a pure-LAN deployment every login is a private address with no country, so the **trusted-network allow-list** (your office and VPN ranges) is what does the work there. A VPN or proxy in the expected country still passes — country is a tripwire layered on hardware-bound passwordless auth, not a perimeter. A misconfigured (unloaded) database fails **open** and alerts rather than locking everyone out, and break-glass recovery is geo-exempt by design.
 
 **Workflow:**
 
-1. Lead opens Data Sovereignty
-1. Per client: tags country, regulatory framework, data residency requirement
-1. Toggles “block logins from countries not matching client’s location”
-1. From now on: a German-tagged client can’t be logged into from China — IP-based block, lead notified
+1. Lead provisions a free MaxMind GeoLite2-Country database, then uploads the `.mmdb` under Data Sovereignty → GeoIP Database (malware-scanned, format-validated, and hash-verified on upload)
+1. Assigns each analyst a home country — per-account in the console, at provision time, or inherited from the directory `c` attribute (a directory value wins but never wipes a manual one)
+1. Adds office and VPN egress ranges to Trusted Networks so on-site logins always pass; loopback is always exempt
+1. Pilots in audit-only mode (mismatches alert without blocking), works through the lockout checklist, then turns on enforcement
+1. From then on: a US-assigned analyst logging in from an unexpected country is blocked (403, no token) and the event is alerted; legitimate travel is handled with a time-boxed exception
+
+Full operator guidance — provisioning, the lockout checklist, reverse-proxy setup, the audit events, and the threat model — is in `docs/geo-fencing.md`.
 
 -----
 

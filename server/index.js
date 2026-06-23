@@ -36,6 +36,7 @@ const { gdPushService } = require('./services/gd-push');
 const { schedulingSyncService } = require('./services/scheduling-sync');
 const { isAuthorizedScannerIp } = require('./services/cloud-vuln-allowlist');
 const { isAuthorizedConsumerIp } = require('./services/threat-hunting-allowlist');
+const geoipService = require('./services/geoip/geoip-service');
 const threatHuntingGate = require('./middleware/threat-hunting-auth');
 
 const app = express();
@@ -313,6 +314,10 @@ app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+
+// B5n: login geo-fencing -- GeoIP database provisioning + policy/management (admin).
+app.use('/api/geoip', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geoip-database'));
+app.use('/api/geo-fence', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geo-fence'));
 // Dedicated limiter for the external-facing threat-hunting feed. Automated
 // consumers (XDR/ATP/NGAV/MSP) reach these routes over mTLS, and the TAXII
 // surface is mounted outside /api so apiLimiter does not cover it. A per-IP
@@ -447,6 +452,30 @@ async function start() {
     // Initialize database
     initDb();
     logger.info('Database initialized');
+
+    // B5n: load the active GeoIP database (login geo-fencing) into memory.
+    // Non-fatal: with no provisioned/verifiable database the service stays
+    // unloaded and the geo-fence treats an enabled-but-unloaded state as a
+    // fail-open misconfiguration rather than blocking logins.
+    try {
+      const geoDb = getDb();
+      try {
+        const geoStatus = geoipService.init(geoDb);
+        if (geoStatus.loaded) {
+          logger.info('GeoIP database loaded', {
+            databaseType: geoStatus.database_type,
+            sha256: String(geoStatus.sha256 || '').slice(0, 12),
+            buildEpoch: geoStatus.build_epoch,
+          });
+        } else {
+          logger.info('GeoIP database not loaded', { reason: geoStatus.error });
+        }
+      } finally {
+        geoDb.close();
+      }
+    } catch (geoErr) {
+      logger.error('GeoIP init failed (non-fatal)', { error: geoErr.message });
+    }
 
     // B5e: establish this deployment's instance identity (anti-cloning) before
     // the CA and other long-lived keys are minted. Verify entropy first, then
