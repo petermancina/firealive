@@ -44,6 +44,7 @@ function emptyMetadata() {
     spot: null,
     autoscaled: null,
     tenancy: null,
+    region: null,
     confidentialHint: null,
   };
 }
@@ -55,6 +56,25 @@ function dedupeHostnames(values) {
     if (h && typeof h === 'string' && out.indexOf(h) === -1) out.push(h);
   }
   return out;
+}
+
+// Normalize a provider region token to the lowercase form used by
+// residency-regions.js (provider region codes are canonically lowercase).
+function normalizeRegion(v) {
+  return (typeof v === 'string' && v.trim().length) ? v.trim().toLowerCase() : null;
+}
+
+// GCP reports zone as 'projects/<num>/zones/<region>-<letter>' (or a bare
+// '<region>-<letter>'); the region is the zone with its trailing zone letter
+// removed. Returns null when unparseable.
+function gcpRegionFromZone(zone) {
+  if (typeof zone !== 'string' || !zone.trim().length) return null;
+  let z = zone.trim();
+  const slash = z.lastIndexOf('/');
+  if (slash !== -1) z = z.substring(slash + 1);
+  const dash = z.lastIndexOf('-');
+  if (dash <= 0) return null;
+  return normalizeRegion(z.substring(0, dash));
 }
 
 // Best-effort HTTP request. Resolves the response body on a 2xx, or null on
@@ -134,6 +154,7 @@ function buildAwsMetadata(fields) {
     spot: fields.lifeCycle == null ? null : (fields.lifeCycle === 'spot'),
     autoscaled: fields.asgState == null ? null : true,
     tenancy: fields.tenancy || null,
+    region: normalizeRegion(fields.region),
     confidentialHint: null,
   };
 }
@@ -152,6 +173,7 @@ function fetchAws() {
       getText(IMDS_LINK_LOCAL_HOST, base + 'instance-life-cycle', headers),
       getText(IMDS_LINK_LOCAL_HOST, base + 'autoscaling/target-lifecycle-state', headers),
       getText(IMDS_LINK_LOCAL_HOST, base + 'placement/tenancy', headers),
+      getText(IMDS_LINK_LOCAL_HOST, base + 'placement/region', headers),
     ]).then(function (values) {
       return buildAwsMetadata({
         instanceId: values[0],
@@ -162,6 +184,7 @@ function fetchAws() {
         lifeCycle: values[5],
         asgState: values[6],
         tenancy: values[7],
+        region: values[8],
       });
     });
   });
@@ -197,6 +220,7 @@ function parseAzureInstance(obj) {
     spot: compute.priority == null ? null : (compute.priority === 'Spot'),
     autoscaled: autoscaled,
     tenancy: tenancy,
+    region: normalizeRegion(compute.location),
     confidentialHint: securityType == null ? null : (securityType === 'ConfidentialVM'),
   };
 }
@@ -254,6 +278,7 @@ function parseGcpInstance(obj) {
     spot: spot,
     autoscaled: autoscaled,
     tenancy: tenancy,
+    region: gcpRegionFromZone(root.zone),
     confidentialHint: null,
   };
 }
@@ -307,10 +332,20 @@ function isDedicatedTenancy(metadata) {
   return typeof t === 'string' && DEDICATED_TENANCIES.indexOf(t.toLowerCase()) !== -1;
 }
 
+// Accessor for the detected cloud region (the provider region string), or null.
+// Map it to an ISO country via residency-regions.regionToCountry at the call
+// site (the residency boot check / posture endpoint), keeping this module free
+// of the residency mapping.
+function getRegion(metadata) {
+  return (metadata && typeof metadata.region === 'string' && metadata.region.length)
+    ? metadata.region : null;
+}
+
 module.exports = {
   readCloudMetadata,
   detectProvider,
   isDedicatedTenancy,
+  getRegion,
   buildAwsMetadata,
   parseAzureInstance,
   parseGcpInstance,
