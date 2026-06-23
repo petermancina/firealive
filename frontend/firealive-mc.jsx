@@ -2392,7 +2392,7 @@ function ManagementConsole() {
   const [analysts, setAnalysts] = useState(ANALYSTS_INIT);
   const [provisionedClients, setPC] = useState([]);
   const [showProvision, setShowProvision] = useState(false);
-  const [newA, setNewA] = useState({tier:1,shift:"day",hostname:"",ip:""});
+  const [newA, setNewA] = useState({tier:1,shift:"day",hostname:"",ip:"",geoCountry:""});
   const [provisionBusy, setProvisionBusy] = useState(false);
   const [provisionErr, setProvisionErr] = useState("");
   const [provisionResult, setProvisionResult] = useState(null);
@@ -2661,7 +2661,12 @@ function ManagementConsole() {
   // Data sovereignty / geo-fencing
   const [accessCtrlCfg, setAccessCtrlCfg] = useState({model:"rbac",enforceSessionBinding:true,maxConcurrentSessions:3,sessionTimeoutMinutes:480,requireMfaForAdmin:true,requireMfaForConfig:true});
   const [recertCfg, setRecertCfg] = useState({intervalDays:90,enabled:true});
-  const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,clients:[]});
+  const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,trustedNetworks:[]});
+  const [geoUsers, setGeoUsers] = useState([]);
+  const [geoExceptions, setGeoExceptions] = useState([]);
+  const [geoEvents, setGeoEvents] = useState([]);
+  const [geoDbStatus, setGeoDbStatus] = useState(null);
+  const [geoDbUploading, setGeoDbUploading] = useState(false);
   const [saseCfg, setSaseCfg] = useState({enabled:false,provider:"",ztnaEndpoint:"",casbEnabled:false,swgEnabled:false,fwaasPolicyId:"",deployedAsSECaaS:false});
   const [saseSourcesText, setSaseSourcesText] = useState("");
   const [sdnNetCfg, setSdnNetCfg] = useState({sdwanSites:{}});
@@ -2669,7 +2674,12 @@ function ManagementConsole() {
   const [sdnInt, setSdnInt] = useState({platform:"",apiEndpoint:"",username:"",apiKey:""});
   const [sdnIntId, setSdnIntId] = useState(null);
   const [sdnIntHasCreds, setSdnIntHasCreds] = useState(false);
-  const [newGeoClient, setNewGeoClient] = useState({clientId:"",country:"",region:"",dataResidency:"local",regulatoryFramework:"none"});
+  const [newTrustedNet, setNewTrustedNet] = useState("");
+  const [newGeoException, setNewGeoException] = useState({userId:"",country:"",reason:"",expiresAt:""});
+  const [geoResolveIp, setGeoResolveIp] = useState("");
+  const [geoResolveUser, setGeoResolveUser] = useState("");
+  const [geoResolveResult, setGeoResolveResult] = useState(null);
+  const GEO_COUNTRY_OPTS = [{v:"US",l:"United States"},{v:"CA",l:"Canada"},{v:"GB",l:"United Kingdom"},{v:"IE",l:"Ireland"},{v:"DE",l:"Germany"},{v:"FR",l:"France"},{v:"NL",l:"Netherlands"},{v:"ES",l:"Spain"},{v:"IT",l:"Italy"},{v:"BE",l:"Belgium"},{v:"SE",l:"Sweden"},{v:"NO",l:"Norway"},{v:"FI",l:"Finland"},{v:"DK",l:"Denmark"},{v:"PL",l:"Poland"},{v:"AT",l:"Austria"},{v:"CH",l:"Switzerland"},{v:"PT",l:"Portugal"},{v:"HU",l:"Hungary"},{v:"RO",l:"Romania"},{v:"CZ",l:"Czechia"},{v:"GR",l:"Greece"},{v:"AU",l:"Australia"},{v:"NZ",l:"New Zealand"},{v:"JP",l:"Japan"},{v:"SG",l:"Singapore"},{v:"IN",l:"India"},{v:"KR",l:"South Korea"},{v:"HK",l:"Hong Kong"},{v:"AE",l:"United Arab Emirates"},{v:"IL",l:"Israel"},{v:"ZA",l:"South Africa"},{v:"BR",l:"Brazil"},{v:"MX",l:"Mexico"},{v:"AR",l:"Argentina"},{v:"CL",l:"Chile"}];
   // HA enhancements
   const [haManualFailover, setHaManualFailover] = useState(false);
   const [haTestResults, setHaTestResults] = useState(null);
@@ -3274,7 +3284,11 @@ function ManagementConsole() {
     api.get("/api/auto-disable-routing/config").then(c=>{if(c&&!c.error)setAutoDisableRoutingCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/fail-open/config").then(c=>{if(c&&!c.error)setFailOpenCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/auth-logs/notification-config").then(c=>{if(c&&!c.error)setAuthLogNotifCfg(pr=>({...pr,...c}));}).catch(()=>{});
-    api.get("/api/geo-fence/config").then(c=>{if(c&&!c.error)setGeoFenceCfg(pr=>({...pr,...c}));}).catch(()=>{});
+    api.get("/api/geo-fence/config").then(c=>{if(c&&!c.error)setGeoFenceCfg(pr=>({...pr,enabled:!!c.enabled,enforceGeoLogin:!!c.enforceGeoLogin,trustedNetworks:Array.isArray(c.trustedNetworks)?c.trustedNetworks:[]}));}).catch(()=>{});
+    api.get("/api/geo-fence/users").then(r=>{if(r&&Array.isArray(r.users))setGeoUsers(r.users);}).catch(()=>{});
+    api.get("/api/geo-fence/exceptions").then(r=>{if(r&&Array.isArray(r.exceptions))setGeoExceptions(r.exceptions);}).catch(()=>{});
+    api.get("/api/geo-fence/events").then(r=>{if(r&&Array.isArray(r.events))setGeoEvents(r.events);}).catch(()=>{});
+    api.get("/api/geoip/database").then(r=>{if(r&&!r.error)setGeoDbStatus(r);}).catch(()=>{});
     api.get("/api/threat-hunting/config").then(c=>{if(c&&!c.error)setThreatHuntCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/pseudonyms/config").then(c=>{if(c&&!c.error)setPseudonymCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/sase/config").then(c=>{if(c&&!c.error){setSaseCfg(pr=>({...pr,...c}));setSaseSourcesText(((c.connectorSources)||[]).join("\n"));}}).catch(()=>{});
@@ -3467,7 +3481,7 @@ function ManagementConsole() {
     if(!newA.hostname.trim()) return;
     setProvisionBusy(true); setProvisionErr("");
     let resp;
-    try { resp = await api.post("/api/team/provision", { tier:newA.tier, shift:newA.shift, hostname:newA.hostname.trim(), ip:newA.ip.trim()||undefined }); }
+    try { resp = await api.post("/api/team/provision", { tier:newA.tier, shift:newA.shift, hostname:newA.hostname.trim(), ip:newA.ip.trim()||undefined, geo_country:newA.geoCountry||undefined }); }
     catch(e){ setProvisionBusy(false); setProvisionErr(e.message||"Provisioning failed."); return; }
     setProvisionBusy(false);
     if(!resp||resp.error){ setProvisionErr(resp&&resp.error?String(resp.error):"Provisioning failed."); return; }
@@ -3481,7 +3495,7 @@ function ManagementConsole() {
     setPC(prev=>[...prev,client]);
     addA("ANALYST_PROVISIONED",`${pseudonym||"analyst"} · ${tierLbl(newA.tier)} · ${newA.shift} · Host: ${newA.hostname} · Activation: ${activationId}`);
     setProvisionResult({ pseudonym, activationId, enrollmentToken:resp.enrollmentToken||"", expiresInDays:resp.enrollmentExpiresInDays||7 });
-    setNewA({tier:1,shift:"day",hostname:"",ip:""});
+    setNewA({tier:1,shift:"day",hostname:"",ip:"",geoCountry:""});
   };
 
   const checkUpdate = () => {
@@ -5291,6 +5305,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </div>
               <Input label="Target hostname" value={newA.hostname} onChange={e=>setNewA(prev=>({...prev,hostname:e.target.value}))} placeholder="SOC-WS-042.corp.local" maxLength={253}/>
               <Input label="IP address (optional)" value={newA.ip} onChange={e=>setNewA(prev=>({...prev,ip:e.target.value}))} placeholder="10.0.5.42" maxLength={45}/>
+              <Sel label="Home country (optional, for login geo-fencing)" value={newA.geoCountry} onChange={e=>setNewA(prev=>({...prev,geoCountry:e.target.value}))}><option value="">Not assigned</option>{GEO_COUNTRY_OPTS.map(o=><option key={o.v} value={o.v}>{o.l} ({o.v})</option>)}</Sel>
               {provisionErr&&<div style={{fontSize:11,color:C.d,marginBottom:12}}>{provisionErr}</div>}
               <Btn primary style={{width:"100%"}} disabled={!newA.hostname.trim()||provisionBusy} onClick={handleProvision}>{provisionBusy?"Provisioning…":"Provision Client"}</Btn>
             </div>)}
@@ -6994,7 +7009,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?haCfg.mode+" \u00b7 Sync every "+haCfg.syncIntervalSec+"s":"Not configured \u2014 see HA tab"},
               {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?clusterCfg.nodeCount+" nodes \u00b7 "+clusterCfg.sessionStore:"Single instance"},
               {n:"Sync Interval",s:"configured",d:"Every "+syncIntervalCfg.intervalMin+"min \u00b7 "+(syncIntervalCfg.adaptiveSync?"adaptive":"fixed")+" \u00b7 "+(syncIntervalCfg.batchMode?"batch":"streaming")},
-              {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?geoFenceCfg.clients.length+" clients geo-assigned":"Not configured \u2014 see Data Sovereignty tab"},
+              {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?(geoUsers.filter(u=>u.geo_country).length+" of "+geoUsers.length+" analysts geo-assigned"+(geoFenceCfg.enforceGeoLogin?" \u00b7 enforcing":" \u00b7 audit only")):"Not configured \u2014 see Data Sovereignty tab"},
               {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?threatHuntCfg.xdr.provider+" \u00b7 Behavior monitoring":"Not configured \u2014 see Threat Hunting tab"},
               ...(provisionedClients.length>0?[{n:"Provisioned Clients",s:provisionedClients.length+" deployed",d:provisionedClients.map(c=>c.hostname).join(", ")}]:[]),
             ].map((item,idx)=>(
@@ -8237,42 +8252,118 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* ══════════ v1.0.0 — DATA SOVEREIGNTY / GEO-FENCING ══════════ */}
         {tab==="geo_fence"&&(<div>
-          <L>Data Sovereignty & Geo-Fencing</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Assign geographic locations to provisioned clients so the app can enforce geo-fenced logins (block logins from unexpected countries), apply the correct regulatory framework (GDPR, PIPEDA, LGPD, etc.), and ensure data residency requirements are met. Critical for multinational SOCs with analysts in multiple jurisdictions.</M>
+          <L>Data Sovereignty &amp; Login Geo-Fencing</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Geo-fencing checks the country an analyst authenticates from against the country assigned to their account, and optionally blocks logins that do not match. It runs entirely off a self-hosted MaxMind GeoLite2-Country database; no analyst identity or location ever leaves this server. Honesty note: this control can only judge a login when FireAlive observes a real public client IP. On a pure-LAN deployment every login looks like a private address, so use the trusted-network allow-list to define which internal ranges are accepted.</M>
+
           <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={geoFenceCfg.enabled} onChange={e=>setGeoFenceCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable data sovereignty controls</label>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={geoFenceCfg.enforceGeoLogin} onChange={e=>setGeoFenceCfg(prev=>({...prev,enforceGeoLogin:e.target.checked}))}/><M style={{color:C.d}}>Block logins from countries not matching client's assigned location</M></label>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:12}}>Enforcement Policy</div>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:12}}><input type="checkbox" checked={geoFenceCfg.enabled} onChange={e=>setGeoFenceCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable login geo-fencing</label>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t}}><input type="checkbox" checked={geoFenceCfg.enforceGeoLogin} disabled={!geoFenceCfg.enabled} onChange={e=>setGeoFenceCfg(prev=>({...prev,enforceGeoLogin:e.target.checked}))} style={{accentColor:C.a}}/>Block logins whose source country does not match the analyst's assigned country</label>
+            <M style={{color:C.td,display:"block",marginTop:6,marginLeft:24}}>When unchecked, mismatches are recorded as audit events but the login is still allowed (audit-only mode).</M>
+            {geoFenceCfg.enabled&&geoFenceCfg.enforceGeoLogin&&(
+              <Card style={{marginTop:12,padding:12,background:C.wd,borderColor:C.w+"50"}}>
+                <M style={{color:C.w,fontWeight:600,display:"block",marginBottom:4}}>Lockout risk &mdash; read before enforcing</M>
+                <M style={{color:C.tm,lineHeight:1.7,display:"block"}}>In enforce mode a login is blocked when the observed country does not match, or cannot be resolved. Before relying on this: (1) confirm a GeoIP database is loaded below; (2) assign a country to every analyst who logs in over the public internet; (3) add your corporate LAN/VPN egress ranges to Trusted Networks so on-site logins are never blocked. A misconfigured database fails OPEN (logins proceed and an alert is raised) rather than locking everyone out, but an unassigned or wrong country still blocks that analyst. Break-glass recovery is exempt from geo-fencing.</M>
+              </Card>
+            )}
+            <Btn primary style={{marginTop:14}} onClick={()=>api.put("/api/geo-fence/config",{enabled:geoFenceCfg.enabled,enforceGeoLogin:geoFenceCfg.enforceGeoLogin,trustedNetworks:geoFenceCfg.trustedNetworks}).then(r=>saved(r,"GEO_CONFIG_SAVED","Geo-fence policy saved"))}>Save Policy</Btn>
           </Card>
+
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Client Geo-Assignments ({geoFenceCfg.clients.length})</div>
-            {geoFenceCfg.clients.length===0&&<M style={{color:C.td}}>No clients geo-assigned yet. Add assignments below.</M>}
-            {geoFenceCfg.clients.map((gc,i)=>(
-              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
-                <div><M style={{color:C.t,fontWeight:500}}>{gc.clientId}</M><M style={{color:C.td,display:"block"}}>{gc.country} · {gc.regulatoryFramework} · Data residency: {gc.dataResidency}</M></div>
-                <Badge color={C.a}>{gc.country}</Badge>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:10}}>GeoIP Database</div>
+            {geoDbStatus&&geoDbStatus.service&&geoDbStatus.service.loaded?(
+              <div style={{marginBottom:12}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}><Badge color={C.a}>LOADED</Badge><M style={{color:C.t}}>{geoDbStatus.service.database_type||"GeoLite2-Country"}{geoDbStatus.service.ip_version?(" \u00b7 IPv"+geoDbStatus.service.ip_version):""}</M></div>
+                <M style={{color:C.td,display:"block",wordBreak:"break-all"}}>sha256: {String((geoDbStatus.active&&geoDbStatus.active.sha256)||geoDbStatus.service.sha256||"").slice(0,40)}</M>
+                {geoDbStatus.active&&<M style={{color:C.td,display:"block"}}>{geoDbStatus.active.node_count?(geoDbStatus.active.node_count+" nodes \u00b7 "):""}{geoDbStatus.active.build_epoch?("built "+new Date(geoDbStatus.active.build_epoch*1000).toISOString().slice(0,10)+" \u00b7 "):""}{geoDbStatus.active.uploaded_at?("uploaded "+String(geoDbStatus.active.uploaded_at).slice(0,10)):""}</M>}
+              </div>
+            ):(
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><Badge color={C.w}>NOT LOADED</Badge><M style={{color:C.tm}}>{(geoDbStatus&&geoDbStatus.service&&geoDbStatus.service.error)?String(geoDbStatus.service.error):"No GeoIP database is active. Country checks cannot run until one is uploaded."}</M></div>
+            )}
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Upload a MaxMind GeoLite2-Country .mmdb file. It is malware-scanned, format-validated, and hashed before activation; the SHA-256 of the selected file is computed locally and sent as an integrity header so the server can reject a corrupted upload. Provision a free database from MaxMind (see the operator runbook).</M>
+            <label style={{display:"inline-block"}}>
+              <input type="file" accept=".mmdb,application/octet-stream" disabled={geoDbUploading} style={{display:"none"}} onChange={async e=>{const file=e.target.files&&e.target.files[0];if(!file)return;setGeoDbUploading(true);try{const buf=await file.arrayBuffer();let hash="";try{const dig=await crypto.subtle.digest("SHA-256",buf);hash=Array.from(new Uint8Array(dig)).map(b=>b.toString(16).padStart(2,"0")).join("");}catch(_e){}const headers=Object.assign({},await api.authHeaders("POST","/api/geoip/database"),{"Content-Type":"application/octet-stream"},hash?{"X-Expected-Sha256":hash}:{});const r=await fetch(API_BASE+"/api/geoip/database",{method:"POST",headers:headers,body:buf});let body={};try{body=await r.json();}catch(_e){}if(r.ok){addA("GEO_DB_UPDATED","GeoIP database activated \u00b7 sha256 "+String(body.sha256||hash).slice(0,16));const s=await api.get("/api/geoip/database");if(s&&!s.error)setGeoDbStatus(s);}else{addA("GEO_DB_REJECTED","GeoIP upload rejected: "+(body.error||r.statusText)+(body.code?" ("+body.code+")":""));window.alert("Upload rejected: "+(body.error||r.statusText));}}catch(err){addA("GEO_DB_REJECTED","GeoIP upload failed: "+(err.message||"error"));}setGeoDbUploading(false);try{e.target.value="";}catch(_e){}}}/>
+              <span style={{display:"inline-block",padding:"8px 16px",background:geoDbUploading?C.b:C.ad,border:`1px solid ${geoDbUploading?C.b:C.a+"50"}`,borderRadius:8,color:geoDbUploading?C.tm:C.a,fontSize:12,fontFamily:"'IBM Plex Mono',monospace",cursor:geoDbUploading?"default":"pointer"}}>{geoDbUploading?"Uploading\u2026":"Select .mmdb file\u2026"}</span>
+            </label>
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>Trusted Networks ({geoFenceCfg.trustedNetworks.length})</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Logins whose source IP falls inside one of these CIDR ranges bypass the country check entirely. Use this for your corporate LAN and VPN egress ranges so on-site analysts are never blocked. Loopback addresses are always exempt.</M>
+            {geoFenceCfg.trustedNetworks.length===0&&<M style={{color:C.td,display:"block",marginBottom:8}}>No trusted networks defined.</M>}
+            {geoFenceCfg.trustedNetworks.map((tn,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
+                <M style={{color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{tn}</M>
+                <Btn small danger onClick={()=>setGeoFenceCfg(prev=>({...prev,trustedNetworks:prev.trustedNetworks.filter(x=>x!==tn)}))}>Remove</Btn>
               </div>
             ))}
-            <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Sel label="Client" value={newGeoClient.clientId} onChange={e=>setNewGeoClient(prev=>({...prev,clientId:e.target.value}))}>
-                <option value="">Select client...</option>{analysts.map(a=><option key={a.id} value={a.id}>{a.name}</option>)}
-              </Sel>
-              <Sel label="Country" value={newGeoClient.country} onChange={e=>setNewGeoClient(prev=>({...prev,country:e.target.value}))}>
-                <option value="">Select...</option><option value="US">United States</option><option value="UK">United Kingdom</option><option value="DE">Germany</option><option value="FR">France</option><option value="NL">Netherlands</option><option value="CA">Canada</option><option value="AU">Australia</option><option value="JP">Japan</option><option value="SG">Singapore</option><option value="BR">Brazil</option><option value="IN">India</option><option value="AT">Austria</option><option value="HU">Hungary</option><option value="Other">Other</option>
-              </Sel>
-              <Sel label="Regulatory framework" value={newGeoClient.regulatoryFramework} onChange={e=>setNewGeoClient(prev=>({...prev,regulatoryFramework:e.target.value}))}>
-                <option value="none">None specified</option><option value="GDPR">GDPR (EU/EEA)</option><option value="CCPA">CCPA (California)</option><option value="PIPEDA">PIPEDA (Canada)</option><option value="LGPD">LGPD (Brazil)</option><option value="APPI">APPI (Japan)</option><option value="PDPA">PDPA (Singapore)</option><option value="HIPAA">HIPAA (US Healthcare)</option>
-              </Sel>
-              <Sel label="Data residency" value={newGeoClient.dataResidency} onChange={e=>setNewGeoClient(prev=>({...prev,dataResidency:e.target.value}))}>
-                <option value="local">Local (data stays in client country)</option><option value="regional">Regional (data in same continent)</option><option value="global">Global (centralized)</option>
-              </Sel>
+            <div style={{display:"flex",gap:8,marginTop:10,alignItems:"flex-end"}}>
+              <div style={{flex:1}}><Input label="Add CIDR or IP (e.g. 10.0.0.0/8 or 2001:db8::/32)" value={newTrustedNet} onChange={e=>setNewTrustedNet(e.target.value)} placeholder="10.0.0.0/8" maxLength={64}/></div>
+              <Btn style={{marginBottom:14}} disabled={!/^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(newTrustedNet.trim())} onClick={()=>{const v=newTrustedNet.trim();if(!v)return;if(geoFenceCfg.trustedNetworks.indexOf(v)!==-1){setNewTrustedNet("");return;}setGeoFenceCfg(prev=>({...prev,trustedNetworks:[...prev.trustedNetworks,v]}));setNewTrustedNet("");}}>Add</Btn>
             </div>
-            <Btn primary style={{marginTop:12}} disabled={!newGeoClient.clientId||!newGeoClient.country} onClick={()=>{setGeoFenceCfg(prev=>({...prev,clients:[...prev.clients,{...newGeoClient}]}));setNewGeoClient({clientId:"",country:"",region:"",dataResidency:"local",regulatoryFramework:"none"});addA("GEO_CLIENT_ASSIGNED","Client geo-assigned: "+newGeoClient.clientId+" → "+newGeoClient.country);}}>Add Geo-Assignment</Btn>
+            <M style={{color:C.td,display:"block"}}>Trusted networks are saved with the policy &mdash; click Save Policy above after editing. Invalid ranges are rejected on save.</M>
           </Card>
-          <Card style={{padding:12,borderColor:C.i+"30",marginBottom:16}}>
-            <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Regulatory Impact</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>GDPR: Right to erasure, data minimization, 72-hr breach notification, DPO requirement · CCPA: Right to know, right to delete, opt-out of sale · PIPEDA: Consent-based collection, reasonable purpose · The compliance tab's framework scanner already checks against these — this tab ensures the correct framework is applied per analyst location. For complex multi-jurisdictional deployments, consult your DPO or privacy counsel.</M>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>Analyst Country Assignments ({geoUsers.filter(u=>u.geo_country).length}/{geoUsers.length})</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Assign each analyst's home country. Logins are checked against this value; analysts left unassigned are never geo-fenced. Directory-synced accounts inherit their country from the LDAP "c" attribute when present, and a directory value overrides a manual one on the next sync.</M>
+            {geoUsers.length===0&&<M style={{color:C.td,display:"block"}}>No accounts to assign. Provision analysts first.</M>}
+            {geoUsers.map((u)=>(
+              <div key={u.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{minWidth:0}}><M style={{color:C.t,fontWeight:500}}>{u.pseudonym||u.username||u.id}</M> <Badge color={u.role==="lead"?C.p:u.role==="admin"?C.i:C.tm}>{u.role}</Badge>{u.active===0&&<Badge color={C.td}>inactive</Badge>}</div>
+                <div style={{width:200,flexShrink:0}}><Sel value={u.geo_country||""} onChange={e=>{const cc=e.target.value;api.put("/api/geo-fence/users/"+u.id+"/country",{country:cc}).then(r=>{if(r&&!r.error){setGeoUsers(prev=>prev.map(x=>x.id===u.id?{...x,geo_country:cc||null}:x));addA("GEO_USER_COUNTRY_SET",(u.pseudonym||u.username||u.id)+" \u2192 "+(cc||"(cleared)"));}else{window.alert("Country update failed: "+(r&&r.error||"error"));}});}}><option value="">Not assigned</option>{GEO_COUNTRY_OPTS.map(o=><option key={o.v} value={o.v}>{o.l} ({o.v})</option>)}</Sel></div>
+              </div>
+            ))}
           </Card>
-          <Btn primary onClick={()=>api.put("/api/geo-fence/config",geoFenceCfg).then(r=>saved(r,"GEO_CONFIG_SAVED","Data sovereignty config saved"))}>Save Geo Config</Btn>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>Temporary Login Exceptions ({geoExceptions.length})</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Time-boxed allowances for an analyst to log in from a different country (for example, while traveling). Exceptions expire automatically at the date set; expired ones are kept for the audit trail but no longer permit access.</M>
+            {geoExceptions.length===0&&<M style={{color:C.td,display:"block",marginBottom:8}}>No exceptions.</M>}
+            {geoExceptions.map((ex)=>(
+              <div key={ex.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{minWidth:0}}><M style={{color:C.t,fontWeight:500}}>{ex.username||ex.user_id}</M> <Badge color={C.a}>{ex.country}</Badge> {ex.expired?<Badge color={C.d}>expired</Badge>:<Badge color={C.i}>active</Badge>}<M style={{color:C.td,display:"block"}}>{ex.reason?ex.reason+" \u00b7 ":""}{ex.expires_at?("until "+String(ex.expires_at).slice(0,10)):"no expiry"}</M></div>
+                <Btn small danger onClick={()=>api.del("/api/geo-fence/exceptions/"+ex.id).then(r=>{if(r&&!r.error){setGeoExceptions(prev=>prev.filter(x=>x.id!==ex.id));addA("GEO_EXCEPTION_REMOVED","Exception "+ex.id+" removed");}else{window.alert("Remove failed: "+(r&&r.error||"error"));}})}>Remove</Btn>
+              </div>
+            ))}
+            <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Sel label="Analyst" value={newGeoException.userId} onChange={e=>setNewGeoException(prev=>({...prev,userId:e.target.value}))}><option value="">Select analyst...</option>{geoUsers.map(u=><option key={u.id} value={u.id}>{u.pseudonym||u.username||u.id}</option>)}</Sel>
+              <Sel label="Permitted country" value={newGeoException.country} onChange={e=>setNewGeoException(prev=>({...prev,country:e.target.value}))}><option value="">Select...</option>{GEO_COUNTRY_OPTS.map(o=><option key={o.v} value={o.v}>{o.l} ({o.v})</option>)}</Sel>
+              <Input label="Reason (optional)" value={newGeoException.reason} onChange={e=>setNewGeoException(prev=>({...prev,reason:e.target.value}))} placeholder="Travel to conference" maxLength={200}/>
+              <Input label="Expires (date)" type="date" value={newGeoException.expiresAt} onChange={e=>setNewGeoException(prev=>({...prev,expiresAt:e.target.value}))}/>
+            </div>
+            <Btn primary style={{marginTop:10}} disabled={!newGeoException.userId||!newGeoException.country||!newGeoException.expiresAt} onClick={()=>{const ex=newGeoException;const payload={userId:ex.userId,country:ex.country,reason:ex.reason||undefined,expiresAt:ex.expiresAt||undefined};api.post("/api/geo-fence/exceptions",payload).then(r=>{if(r&&!r.error){api.get("/api/geo-fence/exceptions").then(rr=>{if(rr&&Array.isArray(rr.exceptions))setGeoExceptions(rr.exceptions);});setNewGeoException({userId:"",country:"",reason:"",expiresAt:""});addA("GEO_EXCEPTION_ADDED","Exception added: "+ex.country);}else{window.alert("Add failed: "+(r&&r.error||"error"));}});}}>Add Exception</Btn>
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>Resolve an IP (diagnostic)</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Look up how the server classifies and geo-resolves an address, and optionally dry-run the full decision for one analyst. Read-only; no login is affected.</M>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Input label="IP address" value={geoResolveIp} onChange={e=>setGeoResolveIp(e.target.value)} placeholder="203.0.113.7" maxLength={45}/>
+              <Sel label="Against analyst (optional)" value={geoResolveUser} onChange={e=>setGeoResolveUser(e.target.value)}><option value="">No decision, resolve only</option>{geoUsers.map(u=><option key={u.id} value={u.id}>{u.pseudonym||u.username||u.id}</option>)}</Sel>
+            </div>
+            <Btn style={{marginTop:4}} disabled={!geoResolveIp.trim()} onClick={()=>{const ip=geoResolveIp.trim();if(!ip)return;api.post("/api/geo-fence/resolve",{ip:ip,userId:geoResolveUser||undefined}).then(r=>setGeoResolveResult(r));}}>Resolve</Btn>
+            {geoResolveResult&&(geoResolveResult.error?<M style={{color:C.d,display:"block",marginTop:10}}>{String(geoResolveResult.error)}</M>:(
+              <Card style={{marginTop:10,padding:12}}>
+                <M style={{color:C.t,display:"block"}}>Country: {geoResolveResult.country||"(unresolved)"} \u00b7 class: {geoResolveResult.ipClass||"?"} \u00b7 database {geoResolveResult.dbLoaded?"loaded":"not loaded"}</M>
+                {geoResolveResult.decision&&<M style={{color:geoResolveResult.decision.blocked?C.d:C.a,display:"block",marginTop:6}}>Decision: {geoResolveResult.decision.action} &mdash; {geoResolveResult.decision.blocked?"BLOCKED":"allowed"}{geoResolveResult.decision.observedCountry?(" (observed "+geoResolveResult.decision.observedCountry+")"):""}</M>}
+              </Card>
+            ))}
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>Recent Geo Events ({geoEvents.length})</div>
+              <Btn small onClick={()=>api.get("/api/geo-fence/events").then(r=>{if(r&&Array.isArray(r.events))setGeoEvents(r.events);})}>Refresh</Btn>
+            </div>
+            {geoEvents.length===0&&<M style={{color:C.td,display:"block"}}>No geo events recorded yet.</M>}
+            {geoEvents.map((ev)=>(
+              <div key={ev.id} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><Badge color={(ev.event_type||"").indexOf("BLOCKED")!==-1||(ev.event_type||"").indexOf("VIOLATION")!==-1?C.d:(ev.event_type||"").indexOf("MISCONFIG")!==-1?C.w:C.i}>{ev.event_type}</Badge><M style={{color:C.td}}>{String(ev.timestamp||"").replace("T"," ").slice(0,19)}</M></div>
+                <M style={{color:C.tm,display:"block",marginTop:2}}>{ev.detail||""}{ev.ip_address?(" \u00b7 "+ev.ip_address):""}</M>
+              </div>
+            ))}
+          </Card>
         </div>)}
 
         {/* ══════════ v1.0.0 — CLUSTER / SCALING ══════════ */}
@@ -9102,7 +9193,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {cat:"Integrations",items:[{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
             {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
-            {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Geo-fence clients, assign regulatory frameworks per jurisdiction."}]},
+            {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Assign each analyst a home country and geo-fence logins against the country observed from their source IP, with trusted-network allow-listing and time-boxed exceptions."}]},
             {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"50 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
           ].map(cat=>(
             <Card key={cat.cat} style={{marginBottom:12}}>
