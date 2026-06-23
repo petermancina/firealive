@@ -65,6 +65,7 @@ const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const backupDestinations = require('../services/backup-destinations');
+const dataResidency = require('../services/data-residency');
 const base = require('../services/destination-adapter-base');
 
 // ── GET / ────────────────────────────────────────────────────────────────
@@ -152,6 +153,9 @@ router.post('/', (req, res) => {
     try {
       destination = backupDestinations.createDestination(db, req.body);
     } catch (err) {
+      if (err.residencyBlocked) {
+        auditLog(req.user?.id, 'RESIDENCY_DESTINATION_BLOCKED', 'name=' + (req.body.name || '?') + ' adapter=' + (req.body.adapter || '?') + ' ' + err.message, req.ip);
+      }
       if (err.validation) {
         return res.status(400).json({ error: err.message, field: err.field || null });
       }
@@ -163,6 +167,10 @@ router.post('/', (req, res) => {
       throw err;
     }
     auditLog(req.user?.id, 'BACKUP_DESTINATION_CREATED', `id=${destination.id} name=${destination.name} adapter=${destination.adapter} immutability=${destination.immutability_mode} enabled=${destination.enabled}`, req.ip);
+    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/backup-destinations: residency reconcile failed', { error: e.message }); }
+    if (destination.residencyWarning) {
+      auditLog(req.user?.id, 'RESIDENCY_DESTINATION_WARNED', 'id=' + destination.id + ' name=' + destination.name + ' adapter=' + destination.adapter + ' ' + destination.residencyWarning, req.ip);
+    }
     res.status(201).json({ destination });
   } catch (err) {
     logger.error('routes/backup-destinations: create failed', { error: err.message });
@@ -185,6 +193,9 @@ router.patch('/:id', (req, res) => {
     try {
       destination = backupDestinations.updateDestination(db, req.params.id, req.body);
     } catch (err) {
+      if (err.residencyBlocked) {
+        auditLog(req.user?.id, 'RESIDENCY_DESTINATION_BLOCKED', 'id=' + req.params.id + ' ' + err.message, req.ip);
+      }
       if (err.validation) {
         return res.status(400).json({ error: err.message, field: err.field || null });
       }
@@ -200,6 +211,10 @@ router.patch('/:id', (req, res) => {
     if (req.body.config !== undefined) changedFields.push('config');         // mention but don't log values
     if (req.body.credentials !== undefined) changedFields.push('credentials'); // mention but don't log values
     auditLog(req.user?.id, 'BACKUP_DESTINATION_UPDATED', `id=${destination.id} name=${destination.name} fields=${changedFields.join(',') || 'none'}`, req.ip);
+    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/backup-destinations: residency reconcile failed', { error: e.message }); }
+    if (destination.residencyWarning) {
+      auditLog(req.user?.id, 'RESIDENCY_DESTINATION_WARNED', 'id=' + destination.id + ' name=' + destination.name + ' adapter=' + destination.adapter + ' ' + destination.residencyWarning, req.ip);
+    }
     res.json({ destination });
   } catch (err) {
     logger.error('routes/backup-destinations: update failed', { id: req.params.id, error: err.message });

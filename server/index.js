@@ -318,6 +318,8 @@ app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRout
 // B5n: login geo-fencing -- GeoIP database provisioning + policy/management (admin).
 app.use('/api/geoip', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geoip-database'));
 app.use('/api/geo-fence', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geo-fence'));
+// B5n2: data residency -- policy, jurisdiction declarations, transfer register, posture (admin).
+app.use('/api/data-residency', authMiddleware(['admin']), configLockChokepoint(), require('./routes/data-residency'));
 // Dedicated limiter for the external-facing threat-hunting feed. Automated
 // consumers (XDR/ATP/NGAV/MSP) reach these routes over mTLS, and the TAXII
 // surface is mounted outside /api so apiLimiter does not cover it. A per-IP
@@ -927,6 +929,54 @@ async function start() {
     // mode. In sdn mode it probes the enabled controller integrations on an
     // interval and drives the posture state machine (and the fail-safe gate).
     try { require('./services/sdn-probe-scheduler').startSdnProbeScheduler(getDb); logger.info('SDN posture probe scheduler started'); } catch (e) { logger.warn('SDN posture probe scheduler failed to start', { error: e.message }); }
+
+    // B5n2: data residency -- reconcile the cross-border transfer register, and
+    // validate the declared primary residency against the detected cloud region
+    // (Cloud Mode), raising a HIGH alert on a mismatch. Off-cloud / undeclared
+    // is a no-op.
+    try {
+      const dataResidency = require('./services/data-residency');
+      const residencyRegions = require('./services/residency-regions');
+      const cloudMetadataSvc = require('./services/cloud-metadata');
+      const residencyDb = getDb();
+      let mismatch = null;
+      try {
+        dataResidency.reconcileTransfers(residencyDb);
+        const cfg = dataResidency.loadResidencyConfig(residencyDb);
+        const declared = cfg.primaryResidency.country;
+        const meta = app.locals.cloudMetadata || null;
+        const region = meta ? cloudMetadataSvc.getRegion(meta) : null;
+        let detectedCountry = null;
+        if (region) {
+          const hit = residencyRegions.regionToCountry(region);
+          detectedCountry = hit ? hit.country : null;
+        }
+        if (cfg.enabled && declared && detectedCountry && detectedCountry !== declared) {
+          mismatch = { declared: declared, region: region, country: detectedCountry };
+        }
+      } finally {
+        residencyDb.close();
+      }
+      if (mismatch) {
+        const { routeAlert } = require('./services/alert-router');
+        const { auditLog } = require('./middleware/audit');
+        const alertDb = getDb();
+        routeAlert(alertDb, {
+          type: 'RESIDENCY_REGION_MISMATCH',
+          severity: 'high',
+          source: 'data-residency',
+          message: 'declared primary residency ' + mismatch.declared
+            + ' does not match detected deployment region ' + mismatch.region
+            + ' (' + mismatch.country + ')',
+          timestamp: new Date().toISOString(),
+        }).finally(function () { try { alertDb.close(); } catch (_) { /* ignore */ } });
+        auditLog(null, 'RESIDENCY_REGION_MISMATCH',
+          'declared=' + mismatch.declared + ' detected=' + mismatch.region + ' country=' + mismatch.country, null);
+        logger.warn('Data residency: declared primary residency does not match detected region', mismatch);
+      }
+    } catch (e) {
+      logger.warn('Data residency boot init failed', { error: e.message });
+    }
 
     // Start GD push service (pushes aggregate metrics to configured GD-Server)
     gdPushService.start();

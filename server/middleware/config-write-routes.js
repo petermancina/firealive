@@ -52,6 +52,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/migration',  // B5e: FA-MIG1 deployment migration export + import (POST writes gated)
   '/api/geoip',  // B5n: GeoIP database provisioning (POST /database upload gated)
   '/api/geo-fence',  // B5n: login geo-fence config/exceptions/per-user country (all writes + the resolve dry-run gated under the mount)
+  '/api/data-residency',  // B5n2: data-residency policy/declarations/transfer-mechanism (all writes + the evaluate re-check gated under the mount)
 ];
 
 // Exact config-write endpoints inside the mixed feature routers (v021-v030).

@@ -993,6 +993,51 @@ CREATE INDEX IF NOT EXISTS idx_backup_destinations_adapter
   ON backup_destinations(adapter);
 
 
+-- ── B5n2: DATA RESIDENCY (jurisdiction declarations + transfer register) ──
+-- Per-destination jurisdiction declarations and the derived-and-annotated
+-- cross-border transfer register backing the data-residency policy. The
+-- policy itself lives in the config table under 'data_residency_config'.
+-- Both tables are operational state (NOT golden-baseline). backup_destinations
+-- carries no region column, so the declaration is a side table keyed by
+-- destination_ref (the backup_destinations.id). B5q adds the routed kinds.
+CREATE TABLE IF NOT EXISTS data_residency_destinations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_kind  TEXT NOT NULL,        -- 'backup' (B5q adds the routed kinds)
+  destination_ref   TEXT NOT NULL,        -- backup_destinations.id
+  declared_country  TEXT,                 -- ISO 3166-1 alpha-2
+  declared_region   TEXT,                 -- provider region string, if known
+  provider_domicile TEXT,                 -- legal home of the provider (e.g. 'US')
+  key_custody       TEXT,                 -- jurisdiction of the encryption keys
+  auto_detected     INTEGER NOT NULL DEFAULT 0
+    CHECK (auto_detected IN (0, 1)),
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_residency_dest
+  ON data_residency_destinations(destination_kind, destination_ref);
+
+CREATE TABLE IF NOT EXISTS data_residency_transfers (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  transfer_key         TEXT NOT NULL UNIQUE,  -- category + destination_ref fingerprint
+  data_category        TEXT NOT NULL,
+  source_jurisdiction  TEXT,
+  dest_jurisdiction    TEXT,
+  destination_ref      TEXT,
+  provider_domicile    TEXT,
+  foreign_law_exposure TEXT,                  -- e.g. 'US CLOUD Act'
+  key_custody          TEXT,
+  mechanism            TEXT NOT NULL DEFAULT 'unset'
+    CHECK (mechanism IN ('adequacy', 'scc', 'bcr', 'derogation', 'none', 'unset')),
+  mechanism_notes      TEXT,
+  status               TEXT NOT NULL DEFAULT 'undocumented'
+    CHECK (status IN ('documented', 'undocumented', 'blocked')),
+  detected_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  reviewed_at          TEXT,
+  reviewed_by          TEXT,
+  next_review_at       TEXT
+);
+
+
 -- ── R3d-3: BACKUP PUSHES (per-backup-per-destination push status) ────────
 -- Tracks the status of every push attempt. One row per (backup,
 -- destination) pair, updated as the push progresses through:

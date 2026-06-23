@@ -42,6 +42,8 @@
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const dataResidency = require('../../data-residency');
+
 // ── checkDataClassification ──────────────────────────────────────────────────
 // Verifies all active users carry tier classifications (Tier-1: high
 // sensitivity / Tier-2: moderate / Tier-3: low). The users.tier column
@@ -218,47 +220,61 @@ function checkBackupEncryption(db) {
   };
 }
 
-// ── checkCrossBorderTransferControls ─────────────────────────────────────────
-// Verifies cross-border data transfer controls. The platform supports
-// residency tracking via users.geo_country and region-aware backup
-// destinations (S3 bucket region, GCS region, Azure region embedded
-// in destination config). The check verifies geo_country is being
-// used to track user residency. Where cross-border transfers occur
-// (backup to a destination in a different region than user
-// residency), legal basis documentation (Standard Contractual Clauses,
-// adequacy decisions, BCRs) is customer-responsibility, enumerated
-// in framework customerResponsibility lists.
+// ── checkCrossBorderTransferControls ─────────────────────────────
+// Verifies cross-border data-transfer controls via the data-residency transfer
+// register (B5n2). The register records each backup destination whose
+// jurisdiction differs from the declared primary residency, carrying the
+// provider-domicile, foreign-law exposure, key-custody, and the operator's
+// legal-transfer mechanism (adequacy / SCC / BCR / derogation). A transfer is
+// "documented" once a real mechanism is recorded, and "blocked" when the
+// destination falls outside permitted regions under an enforce-mode category.
+//
+// Before a primary residency is declared the register is empty, and the check
+// falls back to the per-user residency-tracking signal (users.geo_country).
 //
 // Maps to controls including: GDPR Art.44-49 Transfers, LGPD Art.33,
 // POPIA Sec.72, PDPA-SG Sec.26, PIPEDA accountability principle,
 // APPI Art.27-29.
 function checkCrossBorderTransferControls(db) {
-  const total = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get();
-  if (total.c === 0) {
-    return { status: 'pass', detail: 'No active users; transfer-controls check vacuously holds.' };
-  }
-  const withGeo = db.prepare(
-    "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND geo_country IS NOT NULL"
-  ).get();
-  const destinations = db.prepare(
-    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1"
-  ).get();
-  if (withGeo.c === 0) {
+  const summary = dataResidency.summarize(db);
+
+  if (summary.transfers === 0) {
+    const cfg = dataResidency.loadResidencyConfig(db);
+    if (cfg.enabled && cfg.primaryResidency.country) {
+      return {
+        status: 'pass',
+        detail: `Cross-border transfer register active (declared primary residency ${cfg.primaryResidency.country}); no cross-border backup transfers currently recorded.`,
+      };
+    }
+    const total = db.prepare("SELECT COUNT(*) AS c FROM users WHERE active = 1").get();
+    if (total.c === 0) {
+      return { status: 'pass', detail: 'No active users and an empty transfer register; transfer-controls check vacuously holds.' };
+    }
+    const withGeo = db.prepare(
+      "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND geo_country IS NOT NULL"
+    ).get();
     return {
       status: 'warning',
-      detail: `0 of ${total.c} active users have geo_country set; residency tracking inactive. Set users.geo_country to enable per-user residency awareness; document Standard Contractual Clauses or adequacy basis for any cross-region transfers as customer-responsibility.`,
+      detail: `Data-residency policy not enabled and transfer register empty. ${withGeo.c} of ${total.c} active users carry a geo_country residency tag. Declare a primary residency and permitted regions under Data Sovereignty to activate the cross-border transfer register and per-transfer legal-basis (SCC / adequacy / BCR) documentation.`,
     };
   }
-  const ratio = withGeo.c / total.c;
-  if (ratio < 0.8) {
+
+  const undocumented = summary.transfers - summary.documented;
+  if (summary.blocked > 0) {
+    return {
+      status: 'fail',
+      detail: `${summary.blocked} of ${summary.transfers} cross-border transfer(s) are blocked by residency policy: a destination falls outside the permitted regions of an enforce-mode category. Remediate the destination or adjust permitted regions. ${summary.documented} of ${summary.transfers} carry a documented legal basis.`,
+    };
+  }
+  if (undocumented > 0) {
     return {
       status: 'warning',
-      detail: `${withGeo.c} of ${total.c} active users have geo_country set (${(ratio * 100).toFixed(0)}%). Residency tracking is partial.`,
+      detail: `${summary.documented} of ${summary.transfers} cross-border transfer(s) carry a documented legal basis (SCC / adequacy / BCR / derogation); ${undocumented} undocumented. Record a transfer mechanism for each undocumented entry under Data Sovereignty.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Cross-border controls: ${withGeo.c} of ${total.c} active users carry geo_country residency tag (${(ratio * 100).toFixed(0)}%); ${destinations.c} enabled backup destination(s) with adapter-config region awareness. Legal-basis documentation (SCCs, adequacy) for cross-region transfers is customer-responsibility.`,
+    detail: `Cross-border transfer controls: all ${summary.transfers} recorded transfer(s) carry a documented legal basis (SCC / adequacy / BCR / derogation). Per-destination residency declarations and the transfer register are maintained under Data Sovereignty.`,
   };
 }
 

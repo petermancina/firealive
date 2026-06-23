@@ -73,6 +73,7 @@ require('./destination-adapter-sftp');
 
 const { encryptConfig, decryptConfig } = require('./encryption');
 const deploymentMode = require('./deployment-mode');
+const dataResidency = require('./data-residency');
 
 const ADAPTERS_LANDING_IN_R3D4 = new Set(['s3', 'azure-blob', 'gcs']);
 
@@ -285,6 +286,33 @@ function attachPushStats(db, publicView) {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+// Config-time data-residency helpers. A blocked verdict (enforce mode +
+// violation/undeclared) becomes a validation error the route surfaces as a 400;
+// a warn verdict is attached to the returned view as residencyWarning so the
+// route can audit it and the console can display it.
+function residencyBlockError(ev) {
+  const regionList = (ev.permittedRegions && ev.permittedRegions.length)
+    ? ev.permittedRegions.join(', ') : 'none';
+  const err = new Error('data residency: ' + ev.reason
+    + ' (backup category is in enforce mode; permitted regions: ' + regionList + ')');
+  err.field = 'config';
+  err.validation = true;
+  err.residencyBlocked = true;
+  return err;
+}
+
+function residencyWarningText(ev) {
+  if (ev && (ev.action === 'violation-region' || ev.action === 'undeclared')) {
+    return 'data residency: ' + ev.reason;
+  }
+  return null;
+}
+
+function withResidencyWarning(view, warning) {
+  if (warning) view.residencyWarning = warning;
+  return view;
+}
+
 function createDestination(db, input) {
   const v = validateInput(input, { isUpdate: false });
   if (!v.ok) {
@@ -321,6 +349,13 @@ function createDestination(db, input) {
     throw err;
   }
 
+  // Config-time residency gate: evaluate the input config before persisting.
+  const residencyEv = dataResidency.evaluateConfig(db, 'backup', v.normalized.adapter, v.normalized.config, null);
+  if (residencyEv.blocked) {
+    throw residencyBlockError(residencyEv);
+  }
+  const residencyWarning = residencyWarningText(residencyEv);
+
   const id = generateId();
   const credentialsEncrypted = encryptCredentials(v.normalized.credentials);
   const configJson = JSON.stringify(v.normalized.config);
@@ -337,7 +372,7 @@ function createDestination(db, input) {
   );
 
   const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
-  return attachPushStats(db, rowToPublicView(row));
+  return withResidencyWarning(attachPushStats(db, rowToPublicView(row)), residencyWarning);
 }
 
 function updateDestination(db, id, input) {
@@ -372,6 +407,17 @@ function updateDestination(db, id, input) {
     err.field = adapterValidation.field; err.validation = true; throw err;
   }
 
+  // Config-time residency gate on the effective config. Block a config change
+  // or an enable that would violate the policy under enforce; a rename/disable
+  // of an already-non-compliant destination is allowed (remediation), with the
+  // write-time push gate as the backstop.
+  const residencyEv = dataResidency.evaluateConfig(db, 'backup', existing.adapter, effectiveConfig, id);
+  const enabling = input.enabled !== undefined && v.normalized.enabled === true;
+  if (residencyEv.blocked && (input.config !== undefined || enabling)) {
+    throw residencyBlockError(residencyEv);
+  }
+  const residencyWarning = residencyWarningText(residencyEv);
+
   // Build SET clause incrementally based on which fields changed
   const sets = [];
   const args = [];
@@ -390,7 +436,7 @@ function updateDestination(db, id, input) {
   }
   if (sets.length === 0) {
     // Nothing to update; return current state
-    return attachPushStats(db, rowToPublicView(existing));
+    return withResidencyWarning(attachPushStats(db, rowToPublicView(existing)), residencyWarning);
   }
   sets.push("updated_at = datetime('now')");
   args.push(id);
@@ -398,7 +444,7 @@ function updateDestination(db, id, input) {
   db.prepare(`UPDATE backup_destinations SET ${sets.join(', ')} WHERE id = ?`).run(...args);
 
   const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
-  return attachPushStats(db, rowToPublicView(row));
+  return withResidencyWarning(attachPushStats(db, rowToPublicView(row)), residencyWarning);
 }
 
 function listDestinations(db, options = {}) {

@@ -2467,6 +2467,111 @@ class RegressionRunner {
       return 'normalizer trims/dedupes valid CIDRs and rejects malformed entries and non-array input';
     });
 
+    // ── Data residency (B5n2) ────────────────────────────────────
+    await check('data_residency', 'Residency tables present', () => {
+      return requireAll(['data_residency_destinations', 'data_residency_transfers']);
+    });
+    await check('data_residency', 'Destination-declaration unique index present', () => {
+      if (!indexExists('idx_residency_dest')) throw new Error('missing idx_residency_dest');
+      return 'idx_residency_dest present';
+    });
+    await check('data_residency', 'Data categories are canonical (6; live_deployment first)', () => {
+      const dr = require('./data-residency');
+      const expected = ['live_deployment', 'backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive'];
+      const missing = expected.filter(c => !dr.CATEGORIES.includes(c));
+      if (missing.length > 0) throw new Error('missing categories: ' + missing.join(', '));
+      if (dr.CATEGORIES[0] !== 'live_deployment') throw new Error('live_deployment must be first');
+      return dr.CATEGORIES.length + ' categories';
+    });
+    await check('data_residency', 'Default policy is safe (disabled; live_deployment declare-only; nulls)', () => {
+      const dr = require('./data-residency');
+      const d = dr.defaultConfig();
+      if (d.enabled !== false) throw new Error('default must be disabled');
+      if (d.primaryResidency.country !== null) throw new Error('default primary country must be null');
+      if (!d.categories.live_deployment || d.categories.live_deployment.mode !== 'declare-only') {
+        throw new Error('live_deployment must default to declare-only');
+      }
+      if (!d.categories.backup || d.categories.backup.mode !== 'warn') throw new Error('backup must default to warn');
+      return 'default policy disabled and safe';
+    });
+    await check('data_residency', 'Modes are canonical (enforce, warn, declare-only)', () => {
+      const dr = require('./data-residency');
+      const expected = ['enforce', 'warn', 'declare-only'];
+      const missing = expected.filter(m => !dr.MODES.includes(m));
+      if (missing.length > 0) throw new Error('missing modes: ' + missing.join(', '));
+      return dr.MODES.length + ' modes';
+    });
+    await check('data_residency', 'Cloud region resolves to jurisdiction (AWS); provider domicile US', () => {
+      const rg = require('./residency-regions');
+      const us = rg.regionToCountry('us-east-1');
+      if (!us || us.country !== 'US' || us.domicile !== 'US') throw new Error('us-east-1 must map to US / US-domicile');
+      const eu = rg.regionToCountry('eu-west-1');
+      if (!eu || !eu.country) throw new Error('eu-west-1 must map to a country');
+      if (rg.resolveJurisdiction(eu.country).blocs.indexOf('EU') === -1) {
+        throw new Error('eu-west-1 country must resolve into the EU bloc');
+      }
+      if (rg.regionToCountry('zz-nowhere-1') !== null) throw new Error('unknown region must map to null');
+      return 'us-east-1 -> US; eu-west-1 -> ' + eu.country + ' (EU)';
+    });
+    await check('data_residency', 'Permitted-region check honours bloc membership', () => {
+      const rg = require('./residency-regions');
+      if (rg.isPermitted('DE', ['EU']) !== true) throw new Error('DE must be permitted under EU');
+      if (rg.isPermitted('US', ['EU']) !== false) throw new Error('US must not be permitted under EU');
+      if (rg.isPermitted('DE', ['DE']) !== true) throw new Error('DE must be permitted under exact DE');
+      return 'bloc + exact membership honoured';
+    });
+    await check('data_residency', 'Empty permitted list is default-deny', () => {
+      const rg = require('./residency-regions');
+      if (rg.isPermitted('DE', []) !== false) throw new Error('empty permitted list must deny');
+      return 'empty permitted list denies';
+    });
+    await check('data_residency', 'Policy block is enforce-only (pure decision)', () => {
+      const dr = require('./data-residency');
+      const cfg = {
+        enabled: true,
+        primaryResidency: { country: 'DE' },
+        categories: {
+          backup: { permittedRegions: ['EU'], mode: 'enforce' },
+          snapshot: { permittedRegions: ['EU'], mode: 'warn' },
+        },
+      };
+      if (dr.isBlockedByPolicy(cfg, 'backup', 'US') !== true) throw new Error('enforce + non-permitted must block');
+      if (dr.isBlockedByPolicy(cfg, 'backup', 'DE') !== false) throw new Error('enforce + permitted must not block');
+      if (dr.isBlockedByPolicy(cfg, 'snapshot', 'US') !== false) throw new Error('warn mode must never block');
+      return 'enforce blocks non-permitted; warn never blocks';
+    });
+    await check('data_residency', 'Foreign-law exposure reflects provider domicile (residency != sovereignty)', () => {
+      const dr = require('./data-residency');
+      const us = dr.foreignLawExposure('US');
+      if (!us || !/CLOUD Act/i.test(us)) throw new Error('US domicile must cite the CLOUD Act');
+      if (!dr.foreignLawExposure('DE')) throw new Error('non-US domicile must report a provider-domicile law');
+      if (dr.foreignLawExposure(null) !== null) throw new Error('null domicile must be null');
+      return 'US -> CLOUD Act; other -> domicile law; null -> null';
+    });
+    await check('data_residency', 'Transfer-mechanism status derivation', () => {
+      const dr = require('./data-residency');
+      for (const m of ['adequacy', 'scc', 'bcr', 'derogation']) {
+        if (dr.deriveStatus(m) !== 'documented') throw new Error(m + ' must be documented');
+      }
+      for (const m of ['none', 'unset']) {
+        if (dr.deriveStatus(m) !== 'undocumented') throw new Error(m + ' must be undocumented');
+      }
+      return 'adequacy/scc/bcr/derogation documented; none/unset undocumented';
+    });
+    await check('data_residency', 'Register summary and config load are well-formed', () => {
+      const dr = require('./data-residency');
+      const cfg = dr.loadResidencyConfig(this.db);
+      if (typeof cfg.enabled !== 'boolean' || !cfg.categories || !cfg.primaryResidency) {
+        throw new Error('loadResidencyConfig shape invalid');
+      }
+      const sm = dr.summarize(this.db);
+      if (typeof sm.transfers !== 'number' || typeof sm.documented !== 'number' || typeof sm.blocked !== 'number') {
+        throw new Error('summarize shape invalid');
+      }
+      if (sm.documented > sm.transfers || sm.blocked > sm.transfers) throw new Error('summary counts inconsistent');
+      return sm.transfers + ' transfer(s), ' + sm.documented + ' documented, ' + sm.blocked + ' blocked';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;
