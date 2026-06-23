@@ -2662,6 +2662,10 @@ function ManagementConsole() {
   const [accessCtrlCfg, setAccessCtrlCfg] = useState({model:"rbac",enforceSessionBinding:true,maxConcurrentSessions:3,sessionTimeoutMinutes:480,requireMfaForAdmin:true,requireMfaForConfig:true});
   const [recertCfg, setRecertCfg] = useState({intervalDays:90,enabled:true});
   const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,trustedNetworks:[]});
+  // B5n2: Data Residency state
+  const [resCfg, setResCfg] = useState({enabled:false,primaryResidency:{country:"",region:"",providerDomicile:"",source:"declared"},categories:{},_loaded:false,_saving:false});
+  const [resData, setResData] = useState({posture:null,destinations:[],transfers:[],register:null,_evaluating:false});
+  const [resModal, setResModal] = useState(null);
   const [geoUsers, setGeoUsers] = useState([]);
   const [geoExceptions, setGeoExceptions] = useState([]);
   const [geoEvents, setGeoEvents] = useState([]);
@@ -3367,6 +3371,44 @@ function ManagementConsole() {
   const [siemQueryOutput, setSiemQueryOutput] = useState("");
 
   const addA = (ty,dt) => setAudit(prev=>[...prev,{ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),ty,dt}]);
+  // ── B5n2: Data Residency loader + mutation handlers ─────────────────────────
+  const loadResidency = () => {
+    api.get("/api/data-residency/config").then(c=>{if(c&&!c.error)setResCfg(pr=>({...pr,enabled:!!c.enabled,primaryResidency:Object.assign({country:"",region:"",providerDomicile:"",source:"declared"},c.primaryResidency||{}),categories:c.categories||{},_loaded:true}));}).catch(()=>{});
+    api.get("/api/data-residency/posture").then(r=>{if(r&&!r.error)setResData(pr=>({...pr,posture:r}));}).catch(()=>{});
+    api.get("/api/data-residency/destinations").then(r=>{if(r&&Array.isArray(r.destinations))setResData(pr=>({...pr,destinations:r.destinations}));}).catch(()=>{});
+    api.get("/api/data-residency/transfers").then(r=>{if(r&&!r.error)setResData(pr=>({...pr,transfers:Array.isArray(r.transfers)?r.transfers:[],register:r.summary||null}));}).catch(()=>{});
+  };
+  useEffect(()=>{loadResidency();},[]);
+  const setResPrimary = (patch) => setResCfg(pr=>({...pr,primaryResidency:{...pr.primaryResidency,...patch}}));
+  const setResCat = (k,patch) => setResCfg(pr=>({...pr,categories:{...pr.categories,[k]:{...(pr.categories[k]||{permittedRegions:[],mode:"warn"}),...patch}}}));
+  const saveResidencyPolicy = async () => {
+    setResCfg(pr=>({...pr,_saving:true}));
+    const pr0 = resCfg.primaryResidency;
+    const body = {enabled:resCfg.enabled,primaryResidency:{country:(pr0.country||"").toUpperCase()||null,region:pr0.region||null,providerDomicile:(pr0.providerDomicile||"").toUpperCase()||null,source:pr0.source||"declared"},categories:resCfg.categories};
+    const r = await api.put("/api/data-residency/config",body);
+    setResCfg(pr=>({...pr,_saving:false}));
+    if(r&&!r.error){addA("RESIDENCY_CONFIG_UPDATED","Data-residency policy saved"+(resCfg.enabled?" \u00b7 enabled":" \u00b7 disabled"));loadResidency();}
+    else window.alert("Save failed: "+((r&&r.error)||"error"));
+  };
+  const recheckResidency = async () => {
+    setResData(pr=>({...pr,_evaluating:true}));
+    const r = await api.post("/api/data-residency/evaluate",{});
+    setResData(pr=>({...pr,_evaluating:false}));
+    if(r&&!r.error){setResData(pr=>({...pr,posture:r}));const mm=r.primaryResidency&&r.primaryResidency.mismatch;addA("RESIDENCY_EVALUATED","Residency drift re-check"+(mm?" \u00b7 region MISMATCH":" \u00b7 consistent"));loadResidency();}
+    else window.alert("Re-check failed: "+((r&&r.error)||"error"));
+  };
+  const saveDestinationDecl = async () => {
+    const m=resModal; if(!m)return;
+    const r = await api.put("/api/data-residency/destinations/"+encodeURIComponent(m.ref),{declared_country:(m.declared_country||"").toUpperCase()||null,provider_domicile:(m.provider_domicile||"").toUpperCase()||null,key_custody:m.key_custody||null});
+    if(r&&!r.error){addA("RESIDENCY_DESTINATION_SET","Declared jurisdiction for "+(m.name||m.ref));setResModal(null);loadResidency();}
+    else window.alert("Save failed: "+((r&&r.error)||"error"));
+  };
+  const saveTransferMech = async () => {
+    const m=resModal; if(!m)return;
+    const r = await api.put("/api/data-residency/transfers/"+encodeURIComponent(m.id),{mechanism:m.mechanism,mechanism_notes:m.mechanism_notes||"",next_review_at:m.next_review_at||null});
+    if(r&&!r.error){addA("RESIDENCY_TRANSFER_MECHANISM_SET","Set mechanism "+m.mechanism+" for transfer #"+m.id);setResModal(null);loadResidency();}
+    else window.alert("Save failed: "+((r&&r.error)||"error"));
+  };
   // N1b: lead-triggered refresh of team guidance. POSTs /refresh (which expires
   // the cached prompts so the next precompute cycle regenerates the active
   // conditions). A raw fetch is used so the 429 retry-after body is read. The
@@ -8364,6 +8406,104 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </div>
             ))}
           </Card>
+          {/* ══════════ B5n2 — DATA RESIDENCY ══════════ */}
+          <div style={{borderTop:`1px solid ${C.ba}`,margin:"32px 0 20px"}}/>
+          <L>Data Residency &amp; Cross-Border Transfer Controls</L>
+          <Card style={{padding:12,borderColor:C.i+"30",marginBottom:16}}>
+            <M style={{color:C.i,fontWeight:600,display:"block",marginBottom:4}}>Residency is not sovereignty</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>Storing data in a region does not place it under that region's law alone. AWS, Azure, and GCP are US-domiciled, so the US CLOUD Act can reach data even in an EU region. Declare your primary residency, set per-category permitted regions as an allow-list (an empty list denies), and document a legal basis for every cross-border transfer. Enforcement is applied at config time and write time with a drift re-check; the live deployment is never blocked.</M>
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={resCfg.enabled} onChange={e=>setResCfg(pr=>({...pr,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enforce data-residency policy</label>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <Input label="Primary residency (ISO country, e.g. DE)" maxLength={2} value={resCfg.primaryResidency.country||""} onChange={e=>setResPrimary({country:e.target.value.toUpperCase()})}/>
+              <Input label="Provider domicile (ISO country, e.g. US)" maxLength={2} value={resCfg.primaryResidency.providerDomicile||""} onChange={e=>setResPrimary({providerDomicile:e.target.value.toUpperCase()})}/>
+            </div>
+            {resData.posture&&resData.posture.primaryResidency&&resData.posture.primaryResidency.detected&&resData.posture.primaryResidency.detected.country&&(
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+                <M style={{color:C.tm}}>Detected region: {resData.posture.primaryResidency.detected.region||"?"} ({resData.posture.primaryResidency.detected.country})</M>
+                {resData.posture.primaryResidency.mismatch&&<Badge color={C.d}>MISMATCH</Badge>}
+                {resData.posture.primaryResidency.detected.country!==(resCfg.primaryResidency.country||"")&&<Btn small onClick={()=>setResPrimary({country:resData.posture.primaryResidency.detected.country,source:"cloud-metadata"})}>Use detected</Btn>}
+              </div>
+            )}
+            <L style={{marginTop:8,marginBottom:8}}>Per-category permitted regions</L>
+            {[["live_deployment","Live deployment"],["backup","Backup"],["audit_log","Audit log"],["forensic_export","Forensic export"],["snapshot","Snapshot"],["cef_archive","CEF archive"]].map(([k,lbl])=>{
+              const cat = resCfg.categories[k]||{permittedRegions:[],mode:k==="live_deployment"?"declare-only":"warn"};
+              return (
+                <div key={k} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:`1px solid ${C.b}`,flexWrap:"wrap"}}>
+                  <div style={{minWidth:130,fontSize:11,color:C.t}}>{lbl}</div>
+                  {k==="live_deployment"&&<Badge color={C.i}>declare-only \u00b7 never blocked</Badge>}
+                  {k!=="live_deployment"&&<select value={cat.mode==="enforce"?"enforce":"warn"} onChange={e=>setResCat(k,{mode:e.target.value})} style={{padding:"6px 8px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11}}><option value="warn">warn</option><option value="enforce">enforce</option></select>}
+                  {k!=="live_deployment"&&<input placeholder="EU, US, GB (empty denies)" value={(cat.permittedRegions||[]).join(", ")} onChange={e=>setResCat(k,{permittedRegions:e.target.value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean)})} style={{flex:1,minWidth:160,padding:"6px 8px",background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11}}/>}
+                </div>
+              );
+            })}
+            <Btn primary style={{marginTop:14}} disabled={resCfg._saving} onClick={saveResidencyPolicy}>{resCfg._saving?"Saving...":"Save Residency Policy"}</Btn>
+          </Card>
+
+          {resData.posture&&(
+            <Card style={{marginBottom:16,borderColor:resData.posture.primaryResidency&&resData.posture.primaryResidency.mismatch?C.d+"60":C.b}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5"}}>Residency Posture</div>
+                <Btn small disabled={resData._evaluating} onClick={recheckResidency}>{resData._evaluating?"Checking...":"Re-check drift"}</Btn>
+              </div>
+              <M style={{color:C.tm,display:"block"}}>Declared primary: {(resData.posture.primaryResidency&&resData.posture.primaryResidency.declared&&resData.posture.primaryResidency.declared.country)||"(none)"} \u00b7 {resData.posture.enabled?"enforcing policy":"policy disabled"}</M>
+              {resData.posture.primaryResidency&&resData.posture.primaryResidency.mismatch&&<M style={{color:C.d,display:"block",marginTop:6}}>Detected deployment region does not match the declared primary residency. A HIGH alert was raised.</M>}
+              {resData.register&&<M style={{color:C.tm,display:"block",marginTop:6}}>Transfer register: {resData.register.transfers} transfer(s) \u00b7 {resData.register.documented} documented \u00b7 {resData.register.blocked} blocked</M>}
+            </Card>
+          )}
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>Backup Destinations ({resData.destinations.length})</div>
+            {resData.destinations.length===0&&<M style={{color:C.td,display:"block"}}>No backup destinations configured.</M>}
+            {resData.destinations.map((d)=>(
+              <div key={d.ref} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  <Badge color={C.tm}>{d.adapter}</Badge>
+                  <M style={{color:C.t}}>{d.name}</M>
+                  <Badge color={d.blocked?C.d:d.compliant?C.a:C.w}>{d.blocked?"BLOCKED":d.compliant?"COMPLIANT":"REVIEW"}</Badge>
+                  <Btn small onClick={()=>setResModal({kind:"dest",ref:d.ref,name:d.name,declared_country:(d.declaration&&d.declaration.declared_country)||"",provider_domicile:(d.declaration&&d.declaration.provider_domicile)||"",key_custody:(d.declaration&&d.declaration.key_custody)||""})}>Declare</Btn>
+                </div>
+                <M style={{color:C.tm,display:"block",marginTop:2}}>Jurisdiction: {d.jurisdiction||"(undeclared)"}{d.providerDomicile?(" \u00b7 provider domicile "+d.providerDomicile):""}{d.reason?(" \u00b7 "+d.reason):""}</M>
+              </div>
+            ))}
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>Cross-Border Transfer Register ({resData.transfers.length})</div>
+            {resData.transfers.length===0&&<M style={{color:C.td,display:"block"}}>No cross-border transfers recorded. Declare a primary residency and enable destinations in a different jurisdiction to populate the register.</M>}
+            {resData.transfers.map((t)=>(
+              <div key={t.id} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  <Badge color={C.tm}>{t.data_category}</Badge>
+                  <M style={{color:C.t}}>{(t.source_jurisdiction||"?")+" -> "+(t.dest_jurisdiction||"?")}</M>
+                  <Badge color={t.status==="documented"?C.a:t.status==="blocked"?C.d:C.w}>{(t.status||"undocumented").toUpperCase()}</Badge>
+                  <Badge color={C.i}>{t.mechanism||"unset"}</Badge>
+                  <Btn small onClick={()=>setResModal({kind:"transfer",id:t.id,mechanism:t.mechanism||"unset",mechanism_notes:t.mechanism_notes||"",next_review_at:t.next_review_at||"",label:(t.source_jurisdiction||"?")+" -> "+(t.dest_jurisdiction||"?")})}>Document</Btn>
+                </div>
+                {t.foreign_law_exposure&&<M style={{color:C.w,display:"block",marginTop:2}}>Foreign-law exposure: {t.foreign_law_exposure}</M>}
+                {t.next_review_at&&<M style={{color:C.td,display:"block",marginTop:2}}>Next review: {String(t.next_review_at).slice(0,10)}{t.reviewed_by?(" \u00b7 last by "+t.reviewed_by):""}</M>}
+              </div>
+            ))}
+          </Card>
+
+          {resModal&&resModal.kind==="dest"&&<Modal title={"Declare jurisdiction \u2014 "+(resModal.name||resModal.ref)} onClose={()=>setResModal(null)}>
+            <Input label="Declared country (ISO alpha-2, blank to clear)" maxLength={2} value={resModal.declared_country||""} onChange={e=>setResModal(pr=>({...pr,declared_country:e.target.value.toUpperCase()}))}/>
+            <Input label="Provider domicile (ISO alpha-2, e.g. US)" maxLength={2} value={resModal.provider_domicile||""} onChange={e=>setResModal(pr=>({...pr,provider_domicile:e.target.value.toUpperCase()}))}/>
+            <Input label="Key custody (e.g. customer-managed KMS)" value={resModal.key_custody||""} onChange={e=>setResModal(pr=>({...pr,key_custody:e.target.value}))}/>
+            <div style={{display:"flex",gap:8,marginTop:8}}><Btn primary onClick={saveDestinationDecl}>Save Declaration</Btn><Btn onClick={()=>setResModal(null)}>Cancel</Btn></div>
+          </Modal>}
+          {resModal&&resModal.kind==="transfer"&&<Modal title="Document transfer mechanism" onClose={()=>setResModal(null)}>
+            <M style={{color:C.tm,display:"block",marginBottom:10}}>{resModal.label||""}</M>
+            <Sel label="Legal transfer mechanism" value={resModal.mechanism||"unset"} onChange={e=>setResModal(pr=>({...pr,mechanism:e.target.value}))}>
+              <option value="unset">unset</option><option value="adequacy">Adequacy decision</option><option value="scc">Standard Contractual Clauses</option><option value="bcr">Binding Corporate Rules</option><option value="derogation">Derogation (Art. 49)</option><option value="none">None</option>
+            </Sel>
+            <Input label="Notes" value={resModal.mechanism_notes||""} onChange={e=>setResModal(pr=>({...pr,mechanism_notes:e.target.value}))}/>
+            <Input label="Next review (YYYY-MM-DD)" maxLength={10} value={resModal.next_review_at||""} onChange={e=>setResModal(pr=>({...pr,next_review_at:e.target.value}))}/>
+            <div style={{display:"flex",gap:8,marginTop:8}}><Btn primary onClick={saveTransferMech}>Save Mechanism</Btn><Btn onClick={()=>setResModal(null)}>Cancel</Btn></div>
+          </Modal>}
+
         </div>)}
 
         {/* ══════════ v1.0.0 — CLUSTER / SCALING ══════════ */}
