@@ -471,7 +471,7 @@ FireAlive performs application-layer authorization and logging. Network-layer bl
 1. Per analyst: enters name, tier, shift, target hostname, IP
 1. Clicks “Provision Client” — system generates a config.json + enrollment token, packages it for the deployment tool
 1. Deployment tool pushes the AC to the analyst’s machine
-1. Analyst opens the AC, trusts the FireAlive CA, redeems the one-time enrollment token to enroll a passkey (or installs their client certificate), signs in, and baseline calibration begins
+1. Analyst opens the AC, trusts the FireAlive CA, redeems the one-time enrollment token to enroll a hardware passkey, signs in, and baseline calibration begins (a transport certificate may also be installed)
 
 ### Internal AI
 
@@ -520,18 +520,18 @@ Target directory: the server model root (default `~/.firealive/models`, override
 
 ### IAM
 
-**What it’s for:** Manage how people sign in — and they sign in **passwordlessly**. FireAlive issues per-analyst **client certificates** from a built-in Certificate Authority (the PIV/CAC pattern) and registers **FIDO2/WebAuthn passkeys**; both are phishing-resistant, and there is no password, no SAML/OIDC browser redirect, and no TOTP. LDAP/AD is connected as a **directory source only** — group membership and presence for the offboarding detector — never as a login method. The IAM panel manages the built-in CA (issued certificates, revocation, the signed CRL), the LDAP/AD directory connection, and offboarding candidates. See `docs/iam-and-authentication.md`.
+**What it’s for:** Manage how people sign in — and they sign in **passwordlessly** with a **hardware FIDO2/WebAuthn passkey** (a security key with a PIN). A passkey is accepted only if its attestation chains to a trusted vendor root, it is non-syncable, and it is user-verified — so there is no password, no SAML/OIDC browser redirect, and no TOTP. FireAlive also issues per-analyst **client certificates** from a built-in Certificate Authority, but a certificate is **transport identity (mutual TLS), not a sign-in method**. LDAP/AD is connected as a **directory source only** — group membership and presence for the offboarding detector — never as a login method. The IAM panel manages the built-in CA (issued certificates, revocation, the signed CRL), the **hardware-key trust anchors** (attestation roots and the model allow-list), the LDAP/AD directory connection, and offboarding candidates. See `docs/iam-and-authentication.md`.
 
 **Workflow:**
 
 1. Lead opens IAM tab on initial setup
 1. Reviews the built-in CA (or points FireAlive at the org’s own CA in relying-party mode)
 1. Optionally connects LDAP/AD over LDAPS as the directory / offboarding source (bind + test)
-1. Provisions analysts (which mints a one-time enrollment token); each analyst enrolls a passkey or receives a certificate and signs in — no password
+1. Provisions analysts (which mints a one-time enrollment token); each analyst enrolls a hardware passkey and signs in — no password (a transport certificate may also be issued)
 
 ### My Security (passkeys & certificates)
 
-**What it’s for:** Self-service management of your own phishing-resistant credentials. A user-verified passkey or a certificate-plus-PIN is already strong, single-step MFA (AAL3), so there is no separate TOTP prompt. Each person can enroll and remove their own passkeys and view or revoke their own certificates; the system refuses to remove your last working credential. Consequential actions (the configuration lock, two-person restore approvals) require a fresh WebAuthn step-up assertion at the moment of the action.
+**What it’s for:** Self-service management of your own phishing-resistant credentials. Sign-in is a user-verified **hardware passkey** — already strong, single-step MFA — so there is no separate TOTP prompt. Each person can enroll and remove their own passkeys and view or revoke their own **transport** certificates; the system refuses to remove your last working passkey. Consequential actions (the configuration lock, two-person restore approvals) require a fresh WebAuthn step-up assertion at the moment of the action.
 
 **Workflow:**
 

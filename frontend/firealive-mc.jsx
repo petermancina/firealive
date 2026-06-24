@@ -639,27 +639,6 @@ function LoginScreen({role, onLogin, onBack}) {
     }
   };
 
-  // Certificate sign-in: the main process presents an OS-store client certificate
-  // at the TLS handshake; the server reads the peer certificate and issues a
-  // session. The renderer just calls the endpoint.
-  const handleCertLogin = async () => {
-    setLoading(true); setError("");
-    try {
-      const r = await api.post("/api/auth/login-cert", {});
-      setLoading(false);
-      if (!r || r.error || !r.accessToken || !r.user) {
-        setError(r && typeof r.error === "string" ? r.error
-          : "Certificate sign-in failed. Ensure a client certificate is installed and selected.");
-        return;
-      }
-      if (roleMismatch(r.user)) { setError("Account role does not match the selected role."); return; }
-      finalizeLogin(r);
-    } catch (e) {
-      setLoading(false);
-      setError(e.message || "Certificate sign-in failed.");
-    }
-  };
-
   // Import / pin the FireAlive CA certificate (PEM) into the main process so the
   // renderer can trust its own server over HTTPS. Available from the server's
   // /ca-cert endpoint; done once.
@@ -709,9 +688,8 @@ function LoginScreen({role, onLogin, onBack}) {
             ) : (
               <div>
                 <L>Sign In</L>
-                <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Authenticate with your passkey or your hardware certificate. There is no password.</M>
-                <Btn primary style={{width:"100%",marginBottom:10}} onClick={handlePasskeyLogin} disabled={loading}>{loading?"Working…":"Sign in with a passkey"}</Btn>
-                <Btn style={{width:"100%"}} onClick={handleCertLogin} disabled={loading}>Sign in with a certificate</Btn>
+                <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Sign in with your hardware security key (a FIDO2 passkey with a PIN). There is no password.</M>
+                <Btn primary style={{width:"100%"}} onClick={handlePasskeyLogin} disabled={loading}>{loading?"Working…":"Sign in with a passkey"}</Btn>
                 {error&&<div style={{fontSize:11,color:C.d,marginTop:12}}>{error}</div>}
                 {apiMode===false&&!error&&<div style={{fontSize:11,color:C.td,marginTop:12}}>Cannot reach the server. On a new install the FireAlive CA may not be trusted yet.</div>}
                 {caStatus&&caStatus.pinned&&!caStatus.unmanaged&&caStatus.subject&&(
@@ -785,8 +763,15 @@ function MyMfaSecuritySection() {
         label: label.trim() || undefined,
       });
       setBusy(false);
-      if (!r || r.error) { setErr(r && r.error ? String(r.error) : "Passkey verification failed."); return; }
-      setMsg("Passkey enrolled."); setLabel(""); loadPasskeys().catch(()=>{});
+      if (!r || r.error) {
+        if (r && r.code === "ENROLL_PASSKEY_NOT_HARDWARE") {
+          setErr("This passkey was not accepted. Use a hardware security key (a FIDO2 key or fob) that requires a PIN. Synced or software passkeys (iCloud Keychain, Google Password Manager, Windows Hello) cannot be used to sign in.");
+        } else {
+          setErr(r && r.error ? String(r.error) : "Passkey verification failed.");
+        }
+        return;
+      }
+      setMsg("Passkey enrolled — hardware security key verified."); setLabel(""); loadPasskeys().catch(()=>{});
     } catch (e) {
       setBusy(false);
       setErr(e.message || "Passkey enrollment failed.");
@@ -804,7 +789,7 @@ function MyMfaSecuritySection() {
   };
 
   const revokeCert = async (serial) => {
-    if (!window.confirm("Revoke certificate " + serial + "? It will no longer authenticate.")) return;
+    if (!window.confirm("Revoke certificate " + serial + "? It can no longer secure your connection.")) return;
     setErr(""); setMsg("");
     const r = await api.post("/api/mfa/certs/revoke", { serial });
     if (r && r.revoked) { setMsg("Certificate " + serial + " revoked."); loadCerts().catch(()=>{}); }
@@ -814,7 +799,7 @@ function MyMfaSecuritySection() {
   return (
     <Card style={{marginBottom:16}}>
       <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>My Security — Passkeys & Certificates</div>
-      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a FIDO2/WebAuthn passkey or a client certificate — there is no password. Keep at least one working credential enrolled at all times.</M>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a hardware FIDO2/WebAuthn passkey (a security key with a PIN) — there is no password. A client certificate secures your connection but is not a sign-in method. Keep at least one working passkey enrolled at all times.</M>
 
       <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:8}}>Passkeys</div>
       {passkeys===null ? <M style={{color:C.td}}>Loading…</M> : passkeys.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No passkeys enrolled.</M> : passkeys.map((k,i)=>(
@@ -831,8 +816,8 @@ function MyMfaSecuritySection() {
         <Btn primary onClick={addPasskey} disabled={busy}>{busy?"Working…":"Add a passkey"}</Btn>
       </div>
 
-      <div style={{fontSize:12,fontWeight:500,color:C.t,margin:"18px 0 8px"}}>Client Certificates</div>
-      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>Certificates are issued to you during provisioning or by an administrator. Review them here and revoke one you no longer use or that may be compromised.</M>
+      <div style={{fontSize:12,fontWeight:500,color:C.t,margin:"18px 0 8px"}}>Transport Certificate (mTLS)</div>
+      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>A client certificate secures your connection to the server (mutual TLS) and binds your session to this device. It is not a sign-in credential — sign-in is always your hardware passkey. Certificates are issued during provisioning or by an administrator; review them here and revoke one you no longer use or that may be compromised.</M>
       {certs===null ? <M style={{color:C.td}}>Loading…</M> : certs.length===0 ? <M style={{color:C.td}}>No certificates issued to you.</M> : certs.map((c,i)=>(
         <div key={c.serial||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
           <div style={{minWidth:0}}>
@@ -1043,7 +1028,8 @@ function IamPanel() {
   // subtabs wired to /api/iam: the built-in CA + issued client certificates,
   // the LDAP/AD directory used only as a user/offboarding source (never for
   // authentication), and directory-driven offboarding. There is no SSO/SAML/OIDC
-  // and no auth-method selector -- the method is fixed (mTLS cert + FIDO2 passkey).
+  // and no auth-method selector -- sign-in is a hardware FIDO2 passkey only; a
+  // client certificate is transport identity (mTLS), not a login credential.
   const [sub, setSub] = useState("ca");          // ca | directory | offboarding
   const [posture, setPosture] = useState(null);
 
@@ -1065,6 +1051,18 @@ function IamPanel() {
   const [cands, setCands] = useState(null);
   const [offMsg, setOffMsg] = useState("");
   const [offBusy, setOffBusy] = useState(false);
+
+  // FIDO2 attestation trust anchors (B5n3): bundled + admin-added vendor roots
+  // and an optional AAGUID model allow-list. Wired to /api/iam/fido-* (lead/
+  // admin, behind the config lock). The server audits each change; we also log
+  // locally via audit(). At least one trusted root must always remain.
+  const [fidoRoots, setFidoRoots] = useState(null);
+  const [fidoAaguids, setFidoAaguids] = useState(null);
+  const [fidoMode, setFidoMode] = useState("");
+  const [newRoot, setNewRoot] = useState({vendor:"",label:"",pem:""});
+  const [newAaguid, setNewAaguid] = useState({aaguid:"",label:""});
+  const [fidoMsg, setFidoMsg] = useState("");
+  const [fidoBusy, setFidoBusy] = useState(false);
 
   const audit = (event_type, detail) => { try { api.post("/api/audit/mc-event", {event_type, detail}); } catch (_e) {} };
 
@@ -1088,12 +1086,20 @@ function IamPanel() {
     const r = await api.get("/api/iam/offboarding-candidates");
     setCands(r && Array.isArray(r.candidates) ? r.candidates : []);
   };
+  const loadFido = async () => {
+    const r = await api.get("/api/iam/fido-roots");
+    setFidoRoots(r && Array.isArray(r.roots) ? r.roots : []);
+    const a = await api.get("/api/iam/fido-aaguids");
+    setFidoAaguids(a && Array.isArray(a.aaguids) ? a.aaguids : []);
+    setFidoMode(a && a.mode ? String(a.mode) : "");
+  };
 
   useEffect(()=>{ api.get("/api/iam/enforcement").then(p=>setPosture(p&&!p.error?p:null)).catch(()=>{}); },[]);
   useEffect(()=>{
     if (sub==="ca" && caInfo===null) loadCa().catch(()=>{});
     if (sub==="directory" && !ldapLoaded) loadLdap().catch(()=>{});
     if (sub==="offboarding" && cands===null) loadOff().catch(()=>{});
+    if (sub==="fido" && fidoRoots===null) loadFido().catch(()=>{});
   },[sub]);
 
   const doRevoke = async (serial) => {
@@ -1147,14 +1153,45 @@ function IamPanel() {
     else { setOffMsg(r && r.error ? String(r.error) : "Action failed."); }
   };
 
+  const addRoot = async () => {
+    if (!newRoot.vendor.trim() || !newRoot.label.trim() || !newRoot.pem.trim()) { setFidoMsg("Vendor, label, and root PEM are all required."); return; }
+    setFidoBusy(true); setFidoMsg("");
+    const r = await api.post("/api/iam/fido-roots", { vendor:newRoot.vendor.trim(), label:newRoot.label.trim(), rootPem:newRoot.pem.trim() });
+    setFidoBusy(false);
+    if (r && r.added) { setFidoMsg("Trusted attestation root added."); audit("FIDO_ROOT_ADDED","vendor="+newRoot.vendor.trim()); setNewRoot({vendor:"",label:"",pem:""}); loadFido().catch(()=>{}); }
+    else { setFidoMsg(r && r.error ? String(r.error) : "Could not add the trusted root."); }
+  };
+  const removeRoot = async (id) => {
+    if (!window.confirm("Remove this trusted attestation root? Keys whose attestation chains only to this root will no longer be accepted at enrollment. At least one root must remain.")) return;
+    setFidoMsg("");
+    const r = await api.del("/api/iam/fido-roots/" + id);
+    if (r && r.removed) { setFidoMsg("Trusted root removed."); audit("FIDO_ROOT_REMOVED","id="+id); loadFido().catch(()=>{}); }
+    else { setFidoMsg(r && r.error ? String(r.error) : "Could not remove the trusted root."); }
+  };
+  const addAaguid = async () => {
+    if (!newAaguid.aaguid.trim() || !newAaguid.label.trim()) { setFidoMsg("AAGUID and a model label are required."); return; }
+    setFidoBusy(true); setFidoMsg("");
+    const r = await api.post("/api/iam/fido-aaguids", { aaguid:newAaguid.aaguid.trim(), label:newAaguid.label.trim() });
+    setFidoBusy(false);
+    if (r && r.added) { setFidoMsg("Model added to the allow-list."); audit("FIDO_AAGUID_ADDED","aaguid="+(r.aaguid||newAaguid.aaguid.trim())); setNewAaguid({aaguid:"",label:""}); loadFido().catch(()=>{}); }
+    else { setFidoMsg(r && r.error ? String(r.error) : "Could not add the AAGUID."); }
+  };
+  const removeAaguid = async (id) => {
+    if (!window.confirm("Remove this model from the allow-list?")) return;
+    setFidoMsg("");
+    const r = await api.del("/api/iam/fido-aaguids/" + id);
+    if (r && r.removed) { setFidoMsg("Model removed from the allow-list."); audit("FIDO_AAGUID_REMOVED","id="+id); loadFido().catch(()=>{}); }
+    else { setFidoMsg(r && r.error ? String(r.error) : "Could not remove the AAGUID."); }
+  };
+
   const filteredCerts = (certs||[]).filter(c => !certFilter || c.status===certFilter);
-  const subTabs = [{id:"ca",l:"Built-in CA"},{id:"directory",l:"Directory (LDAP/AD)"},{id:"offboarding",l:"Offboarding"}];
+  const subTabs = [{id:"ca",l:"Built-in CA"},{id:"fido",l:"Hardware Keys"},{id:"directory",l:"Directory (LDAP/AD)"},{id:"offboarding",l:"Offboarding"}];
 
   return (<div>
     <L>IAM / Authentication</L>
     <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
       <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Authentication: Passwordless</M>
-      <M style={{color:C.tm,lineHeight:1.6}}>Operators sign in with a mutual-TLS client certificate (PIV/CAC) or a FIDO2/WebAuthn passkey — both phishing-resistant, AAL3. There is no password or TOTP, and the method is not operator-configurable.{posture&&posture.authEnforcement?(" Server policy: "+posture.authEnforcement+"."):""}</M>
+      <M style={{color:C.tm,lineHeight:1.6}}>Operators sign in with a hardware FIDO2/WebAuthn passkey (a security key with a PIN) — phishing-resistant and hardware-backed. A client certificate secures the connection (mutual TLS) and binds the session to the device, but is not a sign-in credential. There is no password or TOTP, and the method is not operator-configurable.{posture&&posture.authEnforcement?(" Server policy: "+posture.authEnforcement+"."):""}</M>
     </Card>
 
     <div style={{display:"flex",gap:4,marginBottom:20}}>{subTabs.map(t=><button key={t.id} onClick={()=>setSub(t.id)} style={{padding:"6px 14px",background:sub===t.id?C.ad:"transparent",border:`1px solid ${sub===t.id?C.a+"50":C.b}`,borderRadius:6,color:sub===t.id?C.a:C.tm,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{t.l}</button>)}</div>
@@ -1195,7 +1232,7 @@ function IamPanel() {
 
     {sub==="directory"&&(<Card>
       <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Directory (LDAP / Active Directory)</div>
-      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Connect a directory over LDAPS as a read-only source for user and offboarding sync. The directory is never used to authenticate operators — sign-in is always by client certificate or passkey.</M>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Connect a directory over LDAPS as a read-only source for user and offboarding sync. The directory is never used to authenticate operators — sign-in is always by hardware passkey.</M>
       <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:12}}>
         <Input label="Server" value={ldap.server} onChange={e=>setLdap(p=>({...p,server:e.target.value}))} placeholder="dc01.corp.local" maxLength={253}/>
         <Input label="Port" value={ldap.port} onChange={e=>setLdap(p=>({...p,port:e.target.value.replace(/\D/g,"").slice(0,5)}))} placeholder="636" maxLength={5}/>
@@ -1232,6 +1269,52 @@ function IamPanel() {
       ))}
       {offMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{offMsg}</M>}
     </Card>)}
+
+    {sub==="fido"&&(<div>
+      <Card style={{marginBottom:12}}>
+        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Trusted Attestation Roots</div>
+        <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Sign-in requires a hardware FIDO2 security key with a PIN. A passkey is accepted at enrollment only if its attestation certificate chains to one of these trusted vendor roots. Bundled roots ship with FireAlive; add a vendor root (from the vendor's official PKI or the FIDO Alliance metadata service) to accept that vendor's keys. At least one root must always remain.</M>
+        {fidoRoots===null ? <M style={{color:C.td}}>Loading…</M> : fidoRoots.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No trusted roots. Hardware-key enrollment is refused until at least one is present.</M> : fidoRoots.map((r,i)=>(
+          <div key={r.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+            <div style={{minWidth:0}}>
+              <M style={{color:C.t,display:"block"}}>{r.vendor} · {r.label}</M>
+              <M style={{color:C.td,display:"block"}}>{r.seeded?"bundled":"admin-added"}{r.sha256?(" · sha256 "+String(r.sha256).slice(0,20)+"…"):""}{r.valid_to?(" · exp "+String(r.valid_to).slice(0,10)):""}</M>
+            </div>
+            <Btn small danger onClick={()=>removeRoot(r.id)}>Remove</Btn>
+          </div>
+        ))}
+        <div style={{marginTop:14,paddingTop:12,borderTop:`1px solid ${C.b}`}}>
+          <M style={{color:C.t,fontWeight:500,display:"block",marginBottom:8}}>Add a trusted root</M>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <Input label="Vendor" value={newRoot.vendor} onChange={e=>setNewRoot(p=>({...p,vendor:e.target.value}))} placeholder="e.g. Feitian" maxLength={64}/>
+            <Input label="Label" value={newRoot.label} onChange={e=>setNewRoot(p=>({...p,label:e.target.value}))} placeholder="e.g. Feitian FIDO Root CA" maxLength={128}/>
+          </div>
+          <M style={{color:C.tm,marginBottom:4,display:"block"}}>Root certificate (PEM)</M>
+          <textarea value={newRoot.pem} onChange={e=>setNewRoot(p=>({...p,pem:e.target.value}))} placeholder="-----BEGIN CERTIFICATE-----" rows={5} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical",marginBottom:10}}/>
+          <Btn primary onClick={addRoot} disabled={fidoBusy}>{fidoBusy?"Working…":"Add trusted root"}</Btn>
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Model Allow-List (AAGUID)</div>
+        <M style={{color:C.tm,display:"block",marginBottom:14,lineHeight:1.6}}>Optional narrowing. With an empty list, any model from a trusted vendor is accepted{fidoMode?(" (current mode: "+fidoMode+")"):""}. Add AAGUIDs to restrict enrollment to specific authenticator models.</M>
+        {fidoAaguids===null ? <M style={{color:C.td}}>Loading…</M> : fidoAaguids.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No models listed — any model from a trusted vendor is accepted.</M> : fidoAaguids.map((a,i)=>(
+          <div key={a.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
+            <div style={{minWidth:0}}>
+              <M style={{color:C.t,display:"block"}}>{a.label}</M>
+              <M style={{color:C.td,display:"block",fontFamily:"'IBM Plex Mono',monospace"}}>{a.aaguid}</M>
+            </div>
+            <Btn small danger onClick={()=>removeAaguid(a.id)}>Remove</Btn>
+          </div>
+        ))}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:12}}>
+          <Input label="AAGUID" value={newAaguid.aaguid} onChange={e=>setNewAaguid(p=>({...p,aaguid:e.target.value}))} placeholder="ee882879-721c-4913-9775-3dfcf0a8e1c3" maxLength={36}/>
+          <Input label="Model label" value={newAaguid.label} onChange={e=>setNewAaguid(p=>({...p,label:e.target.value}))} placeholder="e.g. YubiKey 5 Series" maxLength={128}/>
+        </div>
+        <Btn primary onClick={addAaguid} disabled={fidoBusy} style={{marginTop:4}}>{fidoBusy?"Working…":"Add model"}</Btn>
+      </Card>
+      {fidoMsg&&<M style={{color:C.tm,display:"block",marginTop:10}}>{fidoMsg}</M>}
+    </div>)}
   </div>);
 }
 

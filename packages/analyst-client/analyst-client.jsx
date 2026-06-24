@@ -506,8 +506,15 @@ function MyMfaSecuritySection() {
         label: label.trim() || undefined,
       });
       setBusy(false);
-      if (!r || r.error) { setErr(r && r.error ? String(r.error) : "Passkey verification failed."); return; }
-      setMsg("Passkey enrolled."); setLabel(""); loadPasskeys().catch(()=>{});
+      if (!r || r.error) {
+        if (r && r.code === "ENROLL_PASSKEY_NOT_HARDWARE") {
+          setErr("This passkey was not accepted. Use a hardware security key (a FIDO2 key or fob) that requires a PIN. Synced or software passkeys (iCloud Keychain, Google Password Manager, Windows Hello) cannot be used to sign in.");
+        } else {
+          setErr(r && r.error ? String(r.error) : "Passkey verification failed.");
+        }
+        return;
+      }
+      setMsg("Passkey enrolled — hardware security key verified."); setLabel(""); loadPasskeys().catch(()=>{});
     } catch (e) {
       setBusy(false);
       setErr(e.message || "Passkey enrollment failed.");
@@ -525,7 +532,7 @@ function MyMfaSecuritySection() {
   };
 
   const revokeCert = async (serial) => {
-    if (!window.confirm("Revoke certificate " + serial + "? It will no longer authenticate.")) return;
+    if (!window.confirm("Revoke certificate " + serial + "? It can no longer secure your connection.")) return;
     setErr(""); setMsg("");
     const r = await api.post("/api/mfa/certs/revoke", { serial });
     if (r && r.revoked) { setMsg("Certificate " + serial + " revoked."); loadCerts().catch(()=>{}); }
@@ -535,7 +542,7 @@ function MyMfaSecuritySection() {
   return (
     <Card style={{marginBottom:16}}>
       <div style={{fontSize:13,fontWeight:500,color:C.t,marginBottom:6}}>My Security — Passkeys & Certificates</div>
-      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a FIDO2/WebAuthn passkey or a client certificate — there is no password. Keep at least one working credential enrolled at all times.</M>
+      <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Manage your own phishing-resistant credentials. Sign-in uses a hardware FIDO2/WebAuthn passkey (a security key with a PIN) — there is no password. A client certificate secures your connection but is not a sign-in method. Keep at least one working passkey enrolled at all times.</M>
 
       <div style={{fontSize:12,fontWeight:500,color:C.t,marginBottom:8}}>Passkeys</div>
       {passkeys===null ? <M style={{color:C.td}}>Loading…</M> : passkeys.length===0 ? <M style={{color:C.td,display:"block",marginBottom:8}}>No passkeys enrolled.</M> : passkeys.map((k,i)=>(
@@ -552,8 +559,8 @@ function MyMfaSecuritySection() {
         <Btn primary onClick={addPasskey} disabled={busy}>{busy?"Working…":"Add a passkey"}</Btn>
       </div>
 
-      <div style={{fontSize:12,fontWeight:500,color:C.t,margin:"18px 0 8px"}}>Client Certificates</div>
-      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>Certificates are issued to you during provisioning or by an administrator. Review them here and revoke one you no longer use or that may be compromised.</M>
+      <div style={{fontSize:12,fontWeight:500,color:C.t,margin:"18px 0 8px"}}>Transport Certificate (mTLS)</div>
+      <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>A client certificate secures your connection to the server (mutual TLS) and binds your session to this device. It is not a sign-in credential — sign-in is always your hardware passkey. Certificates are issued during provisioning or by an administrator; review them here and revoke one you no longer use or that may be compromised.</M>
       {certs===null ? <M style={{color:C.td}}>Loading…</M> : certs.length===0 ? <M style={{color:C.td}}>No certificates issued to you.</M> : certs.map((c,i)=>(
         <div key={c.serial||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
           <div style={{minWidth:0}}>
@@ -635,9 +642,10 @@ function serializeAttestation(cred) {
   return out;
 }
 
-// ── ANALYST CLIENT LOGIN (passwordless: passkey + client certificate) ─────────
-// The analyst signs in with a FIDO2/WebAuthn passkey or a client certificate
-// against the pre-configured FireAlive server (API_BASE). There is no password
+// ── ANALYST CLIENT LOGIN (passwordless: hardware FIDO2 passkey) ──────────────
+// The analyst signs in with a hardware FIDO2/WebAuthn passkey (a security key
+// with a PIN) against the FireAlive server (API_BASE). A client certificate
+// secures the connection but is not a sign-in credential. There is no password
 // and no TOTP. Before sign-in the analyst must trust the server's internal CA
 // (paste the PEM) so the HTTPS/WSS connection validates. A first-time analyst
 // redeems a one-time enrollment token (issued by the Management Console during
@@ -784,16 +792,6 @@ function AcLoginScreen({ onLoggedIn, logC }) {
     } catch (e) { setBusy(false); setError(e.message || "Passkey sign-in failed."); }
   };
 
-  const handleCertLogin = async () => {
-    setBusy(true); setError("");
-    try {
-      const r = await api.post("/api/auth/login-cert", {});
-      setBusy(false);
-      if (!r || r.error || !r.accessToken) { setError(r && r.error ? String(r.error) : "Certificate sign-in failed. Ensure your client certificate is installed."); return; }
-      await finalize(r, "certificate");
-    } catch (e) { setBusy(false); setError(e.message || "Certificate sign-in failed."); }
-  };
-
   const handleImportCa = async () => {
     const bridge = bridgeRef();
     if (!bridge || !bridge.invoke) { setError("Certificate import is unavailable in this environment."); return; }
@@ -854,9 +852,8 @@ function AcLoginScreen({ onLoggedIn, logC }) {
             </div>
           ) : (
             <div>
-              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Sign in with your passkey or client certificate. There is no password.</M>
-              <Btn primary style={{width:"100%",marginBottom:10}} onClick={handlePasskeyLogin} disabled={busy}>{busy?"Working…":"Sign in with a passkey"}</Btn>
-              <Btn style={{width:"100%"}} onClick={handleCertLogin} disabled={busy}>Sign in with a client certificate</Btn>
+              <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Sign in with your hardware security key (a FIDO2 passkey with a PIN). There is no password.</M>
+              <Btn primary style={{width:"100%"}} onClick={handlePasskeyLogin} disabled={busy}>{busy?"Working…":"Sign in with a passkey"}</Btn>
               {error && <M style={{color:C.d,display:"block",marginTop:14}}>{error}</M>}
 
               <div style={{borderTop:`1px solid ${C.b}`,marginTop:18,paddingTop:14}}>
