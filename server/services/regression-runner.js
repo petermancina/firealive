@@ -359,13 +359,15 @@ class RegressionRunner {
           .filter(l => l && l.route && l.route.path)
           .map(l => l.route.path)
       );
-      const required = ['/login-cert', '/login-webauthn/options', '/login-webauthn/verify'];
+      const required = ['/login-webauthn/options', '/login-webauthn/verify'];
       const missing = required.filter(p => !paths.has(p));
       if (missing.length) throw new Error('missing passwordless login route(s): ' + missing.join(', '));
-      const forbidden = ['/login', '/login-ldap', '/login-mfa', '/login-enroll-start', '/login-enroll-confirm'];
+      // B5n3: certificate login is removed -- a client certificate is transport
+      // identity only, never a login credential, so /login-cert must be ABSENT.
+      const forbidden = ['/login', '/login-ldap', '/login-mfa', '/login-enroll-start', '/login-enroll-confirm', '/login-cert'];
       const present = forbidden.filter(p => paths.has(p));
-      if (present.length) throw new Error('password / TOTP login route(s) still present: ' + present.join(', '));
-      return 'cert + passkey login present; no password / LDAP / TOTP login route';
+      if (present.length) throw new Error('forbidden login route(s) present: ' + present.join(', '));
+      return 'passkey login present; no password / LDAP / TOTP / certificate login route';
     });
     await check('auth', 'CA issue / verify / revoke / CRL round-trip', () => {
       // Real openssl-backed CA round-trip against a throwaway in-memory clone:
@@ -419,6 +421,91 @@ class RegressionRunner {
       if (missing.length) throw new Error('missing webauthn fn(s): ' + missing.join(', '));
       if (!tableExists('webauthn_credentials')) throw new Error('missing table webauthn_credentials');
       return 'registration + authentication + step-up wired; webauthn_credentials present';
+    });
+    await check('auth', 'B5n3 hardware-attestation schema (columns + trust tables)', () => {
+      const cols = new Set(this.db.prepare("PRAGMA table_info(webauthn_credentials)").all().map(c => c.name));
+      const needCols = ['backed_up', 'device_type', 'attestation_fmt', 'hardware_verified', 'trusted_root_id'];
+      const missingCols = needCols.filter(c => !cols.has(c));
+      if (missingCols.length) throw new Error('webauthn_credentials missing column(s): ' + missingCols.join(', '));
+      for (const t of ['fido_trusted_roots', 'fido_aaguid_allowlist']) {
+        if (!tableExists(t)) throw new Error('missing table ' + t);
+      }
+      return 'webauthn_credentials hardware columns + fido_trusted_roots + fido_aaguid_allowlist present';
+    });
+    await check('auth', 'FIDO attestation trust anchors seeded (>= 1, all parse as CA)', () => {
+      const n = this.db.prepare('SELECT COUNT(*) AS n FROM fido_trusted_roots').get().n;
+      if (!n || n < 1) throw new Error('no trusted FIDO attestation roots present; hardware enrollment would be impossible');
+      const rows = this.db.prepare('SELECT label, root_pem FROM fido_trusted_roots').all();
+      for (const r of rows) {
+        let cert;
+        try { cert = new crypto.X509Certificate(r.root_pem); } catch (_) { throw new Error('stored root not parseable: ' + r.label); }
+        if (cert.ca !== true) throw new Error('stored root is not a CA certificate: ' + r.label);
+      }
+      return n + ' trusted root(s) present; all parse as CA certificates';
+    });
+    await check('auth', 'assertHardwareCredential gate (accept hardware / reject soft + synced)', () => {
+      let wa;
+      try { wa = require('./webauthn'); } catch (e) { throw new Error('cannot load webauthn service: ' + e.message); }
+      if (typeof wa.assertHardwareCredential !== 'function') throw new Error('assertHardwareCredential not exported');
+      if (typeof wa.HardwareCredentialError !== 'function') throw new Error('HardwareCredentialError not exported');
+      const emptyAllowDb = { prepare: () => ({ all: () => [] }) };
+      const ok = wa.assertHardwareCredential({ attestationVerified: true, backedUp: false, deviceType: 'singleDevice', fmt: 'packed', aaguid: 'x', db: emptyAllowDb });
+      if (ok !== true) throw new Error('genuine hardware verdict did not pass the gate');
+      const cases = [
+        ['unverified attestation', { attestationVerified: false, backedUp: false, deviceType: 'singleDevice', fmt: 'packed', db: emptyAllowDb }],
+        ['no attestation format', { attestationVerified: true, backedUp: false, deviceType: 'singleDevice', fmt: 'none', db: emptyAllowDb }],
+        ['synced / backed-up', { attestationVerified: true, backedUp: true, deviceType: 'singleDevice', fmt: 'packed', db: emptyAllowDb }],
+        ['multi-device', { attestationVerified: true, backedUp: false, deviceType: 'multiDevice', fmt: 'packed', db: emptyAllowDb }],
+      ];
+      for (const entry of cases) {
+        let threw = false;
+        try { wa.assertHardwareCredential(entry[1]); } catch (e) { threw = e instanceof wa.HardwareCredentialError; }
+        if (!threw) throw new Error('gate failed to reject: ' + entry[0]);
+      }
+      return 'gate accepts genuine hardware; rejects unverified / none / synced / multi-device';
+    });
+    await check('auth', 'Attestation chain verification (accept chained leaf / reject foreign root)', () => {
+      let wa;
+      try { wa = require('./webauthn'); } catch (e) { throw new Error('cannot load webauthn service: ' + e.message); }
+      if (typeof wa.verifyAttestationChain !== 'function') throw new Error('verifyAttestationChain not exported');
+      const { execFileSync } = require('child_process');
+      const os = require('os'); const fsx = require('fs'); const pathx = require('path');
+      const dir = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'rr-fido-'));
+      try {
+        const rk = pathx.join(dir, 'r.key'), rc = pathx.join(dir, 'r.pem');
+        const lk = pathx.join(dir, 'l.key'), lcsr = pathx.join(dir, 'l.csr'), lc = pathx.join(dir, 'l.pem');
+        const fc = pathx.join(dir, 'f.key'), fpem = pathx.join(dir, 'f.pem');
+        execFileSync('openssl', ['ecparam', '-genkey', '-name', 'prime256v1', '-noout', '-out', rk], { stdio: 'ignore' });
+        execFileSync('openssl', ['req', '-new', '-x509', '-key', rk, '-subj', '/CN=RR FIDO Root', '-days', '2', '-addext', 'basicConstraints=critical,CA:TRUE', '-out', rc], { stdio: 'ignore' });
+        execFileSync('openssl', ['ecparam', '-genkey', '-name', 'prime256v1', '-noout', '-out', lk], { stdio: 'ignore' });
+        execFileSync('openssl', ['req', '-new', '-key', lk, '-subj', '/CN=RR Leaf', '-out', lcsr], { stdio: 'ignore' });
+        execFileSync('openssl', ['x509', '-req', '-in', lcsr, '-CA', rc, '-CAkey', rk, '-CAcreateserial', '-days', '2', '-out', lc], { stdio: 'ignore' });
+        execFileSync('openssl', ['ecparam', '-genkey', '-name', 'prime256v1', '-noout', '-out', fc], { stdio: 'ignore' });
+        execFileSync('openssl', ['req', '-new', '-x509', '-key', fc, '-subj', '/CN=RR Foreign Root', '-days', '2', '-addext', 'basicConstraints=critical,CA:TRUE', '-out', fpem], { stdio: 'ignore' });
+        const leaf = new crypto.X509Certificate(fsx.readFileSync(lc));
+        const root = new crypto.X509Certificate(fsx.readFileSync(rc));
+        const foreign = new crypto.X509Certificate(fsx.readFileSync(fpem));
+        const good = wa.verifyAttestationChain([leaf], [{ id: 'r', cert: root }]);
+        if (!good || good.verified !== true || good.trustedRootId !== 'r') throw new Error('leaf failed to chain to its issuing root');
+        const bad = wa.verifyAttestationChain([leaf], [{ id: 'f', cert: foreign }]);
+        if (!bad || bad.verified !== false) throw new Error('leaf wrongly chained to a foreign root');
+        return 'leaf verifies to issuing root (id captured); rejects foreign root';
+      } finally {
+        try { fsx.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+      }
+    });
+    await check('iam', 'FIDO trust-anchor admin routes present', () => {
+      let router;
+      try { router = require('../routes/iam'); } catch (e) { throw new Error('cannot load iam router: ' + e.message); }
+      const paths = new Set(
+        (router && router.stack ? router.stack : [])
+          .filter(l => l && l.route && l.route.path)
+          .map(l => l.route.path)
+      );
+      const need = ['/fido-roots', '/fido-roots/:id', '/fido-aaguids', '/fido-aaguids/:id'];
+      const missing = need.filter(p => !paths.has(p));
+      if (missing.length) throw new Error('missing FIDO admin route(s): ' + missing.join(', '));
+      return 'fido-roots + fido-aaguids admin routes (list / add / remove) present';
     });
     await check('auth', 'LDAP directory helpers (filter-escape + group mapping)', () => {
       // The directory layer is used for offboarding presence, not for

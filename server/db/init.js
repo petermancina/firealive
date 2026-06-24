@@ -8208,8 +8208,75 @@ function initDb() {
     console.error('B5n geo-fence table migration failed (non-fatal):', b5nGeoFenceMigrationErr.message);
   }
 
+  // ── B5n3 migration: hardware-credential login hardening ───────────────────
+  // Login becomes a hardware FIDO2 key + PIN (user verification) only; a soft
+  // certificate is no longer a login credential. Enrollment must prove the
+  // passkey is genuine hardware (its attestation chains to a trusted vendor
+  // root), non-syncable (backed_up = 0), and UV-gated. These additive columns
+  // record that verdict per credential. The two new tables hold the bundled +
+  // admin-added trusted attestation roots and the optional AAGUID model
+  // allow-list. All idempotent: new columns are guarded by PRAGMA table_info,
+  // tables are CREATE IF NOT EXISTS. The bundled roots are loaded from
+  // server/data/fido-attestation-roots.json by seed-fido-roots.js, called below
+  // after the training-library seed.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS fido_trusted_roots (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        vendor TEXT NOT NULL,
+        label TEXT NOT NULL,
+        root_pem TEXT NOT NULL,
+        seeded INTEGER NOT NULL DEFAULT 1 CHECK (seeded IN (0, 1)),
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(root_pem)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fido_trusted_roots_vendor
+        ON fido_trusted_roots(vendor);
+
+      CREATE TABLE IF NOT EXISTS fido_aaguid_allowlist (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        aaguid TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    // Additive hardware-attestation columns on webauthn_credentials. ADD COLUMN
+    // is idempotent here: each runs only when the column is missing, so an
+    // existing deployment upgrades in place without a table rebuild. Pre-B5n3
+    // credentials default to hardware_verified = 0; login requires
+    // hardware_verified = 1, so any legacy soft credential is refused at login
+    // and the user re-enrolls a hardware key -- no migration path weakens the
+    // bar.
+    const wacCols = db.prepare("PRAGMA table_info(webauthn_credentials)").all().map((c) => c.name);
+    if (!wacCols.includes('backed_up')) {
+      db.exec("ALTER TABLE webauthn_credentials ADD COLUMN backed_up INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!wacCols.includes('device_type')) {
+      db.exec("ALTER TABLE webauthn_credentials ADD COLUMN device_type TEXT");
+    }
+    if (!wacCols.includes('attestation_fmt')) {
+      db.exec("ALTER TABLE webauthn_credentials ADD COLUMN attestation_fmt TEXT");
+    }
+    if (!wacCols.includes('hardware_verified')) {
+      db.exec("ALTER TABLE webauthn_credentials ADD COLUMN hardware_verified INTEGER NOT NULL DEFAULT 0 CHECK (hardware_verified IN (0, 1))");
+    }
+    if (!wacCols.includes('trusted_root_id')) {
+      db.exec("ALTER TABLE webauthn_credentials ADD COLUMN trusted_root_id TEXT");
+    }
+
+    const fidoRootCount = db.prepare("SELECT COUNT(*) AS c FROM fido_trusted_roots").get().c;
+    console.log(`B5n3 migration: fido_trusted_roots + fido_aaguid_allowlist + webauthn_credentials hardware columns ready (${fidoRootCount} trusted root(s) present pre-seed)`);
+  } catch (b5n3HwAuthMigrationErr) {
+    console.error('B5n3 hardware-auth migration FAILED:', b5n3HwAuthMigrationErr.message);
+    console.error('The server will start, but hardware-credential login hardening is not in place: the trusted-root tables or the webauthn_credentials hardware columns may be missing, so hardware-gated passkey enrollment and login cannot function. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB.');
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
+  require('./seed-fido-roots').seedFidoRoots(db);
   db.close();
 }
 

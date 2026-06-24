@@ -130,6 +130,7 @@ router.post('/passkey/register-verify', async (req, res) => {
         response: body.response,
         challengeToken: body.challengeToken,
         requireUserVerification: passwordless,
+        db,
       });
     } catch (vErr) {
       return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message });
@@ -138,11 +139,38 @@ router.post('/passkey/register-verify', async (req, res) => {
       return res.status(400).json({ error: 'passkey verification failed' });
     }
     const c = result.credential;
+    // Hardware-credential verdict. A passwordless passkey can serve as a login
+    // credential, so it MUST be genuine hardware -- gate it with the same
+    // chokepoint as first-credential enrollment (reject with 422 + audit). A
+    // second-factor-only passkey cannot log in (is_passwordless = 0 is refused at
+    // /login-webauthn/verify), so its hardware status is recorded honestly but is
+    // not required.
+    let hardwareVerified = 0;
+    try {
+      webauthn.assertHardwareCredential({
+        attestationVerified: c.attestationVerified,
+        backedUp: c.backedUp,
+        deviceType: c.deviceType,
+        fmt: c.fmt,
+        aaguid: c.aaguid,
+        db,
+      });
+      hardwareVerified = 1;
+    } catch (hwErr) {
+      if (!(hwErr instanceof webauthn.HardwareCredentialError)) throw hwErr;
+      if (passwordless) {
+        auditLog(req.user.id, 'ENROLL_PASSKEY_NOT_HARDWARE',
+          `reason=${hwErr.reason} fmt=${c.fmt || 'none'} aaguid=${c.aaguid || 'none'} backedUp=${c.backedUp} passwordless=true`, req.ip);
+        return res.status(422).json({ error: hwErr.message, code: 'ENROLL_PASSKEY_NOT_HARDWARE' });
+      }
+      // second-factor only: not hardware, but permitted; hardwareVerified stays 0
+    }
     try {
       db.prepare(`
         INSERT INTO webauthn_credentials
-          (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless,
+           backed_up, device_type, attestation_fmt, hardware_verified, trusted_root_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         req.user.id,
         c.credentialId,
@@ -150,7 +178,12 @@ router.post('/passkey/register-verify', async (req, res) => {
         c.counter || 0,
         c.transports || null,
         c.aaguid || null,
-        passwordless ? 1 : 0
+        passwordless ? 1 : 0,
+        c.backedUp ? 1 : 0,
+        c.deviceType || null,
+        c.fmt || null,
+        hardwareVerified,
+        c.trustedRootId || null
       );
     } catch (dbErr) {
       // UNIQUE(credential_id) violation => the authenticator is already enrolled.

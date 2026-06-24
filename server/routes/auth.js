@@ -24,7 +24,6 @@ const { auditLog } = require('../middleware/audit');
 const { routeAlert } = require('../services/alert-router');
 const { checkGeoFence } = require('../services/geo-fence');
 const { logger } = require('../services/logger');
-const { verifyPeerCertificate } = require('../middleware/network-security');
 const ca = require('../services/ca');
 const webauthn = require('../services/webauthn');
 const deploymentMode = require('../services/deployment-mode');
@@ -302,32 +301,13 @@ function finishPasswordlessLogin(db, user, req, res, method) {
   return res.json(result);
 }
 
-// ── POST /api/auth/login-cert — passwordless mutual-TLS client certificate ───
-// The TLS layer requested the client cert (requestCert:true); this verifies it
-// against the built-in CA and maps it to a user via the issued_certs record
-// (user_id, else external_id). No password and no second prompt — a hardware
-// cert + PIN is AAL3.
-router.post('/login-cert', (req, res) => {
-  try {
-    const db = getDb();
-    const result = verifyPeerCertificate(req, db);
-    if (!result.valid) {
-      auditLog(null, 'LOGIN_CERT_FAILED', `reason=${result.reason || 'unknown'}`, req.ip);
-      return res.status(401).json({ error: 'client certificate not accepted', reason: result.reason });
-    }
-    let user = null;
-    if (result.userId) user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.userId);
-    if (!user && result.externalId) user = db.prepare('SELECT * FROM users WHERE external_id = ?').get(result.externalId);
-    if (!user) {
-      auditLog(null, 'LOGIN_CERT_NO_USER', `external_id=${result.externalId || 'none'}`, req.ip);
-      return res.status(401).json({ error: 'certificate valid but no matching user' });
-    }
-    return finishPasswordlessLogin(db, user, req, res, 'cert');
-  } catch (err) {
-    logger.error('Login-cert error', { error: err.message, stack: err.stack });
-    return res.status(500).json({ error: 'Authentication error' });
-  }
-});
+// NOTE: there is no certificate login path. A client certificate is transport
+// identity only -- it carries the B5f device-key proof-of-possession the ZTNA
+// layer binds into the session (cnf x5t#S256) -- and is never a login
+// credential. Login is a hardware FIDO2 passkey (see /login-webauthn/verify),
+// which proves a genuine, PIN-gated, non-syncable hardware key whose attestation
+// chains to a trusted vendor root. Certificate issuance and revocation remain
+// available under /enroll/cert and the CA routes.
 
 // ── POST /api/auth/login-webauthn/options — passkey assertion options ────────
 // Returns WebAuthn authentication options + a stateless challenge token. With no
@@ -406,6 +386,10 @@ router.post('/login-webauthn/verify', async (req, res) => {
     if (cred.is_passwordless !== 1) {
       auditLog(cred.user_id, 'LOGIN_WEBAUTHN_NOT_PASSWORDLESS', '', req.ip);
       return res.status(403).json({ error: 'this passkey is not enrolled for passwordless login' });
+    }
+    if (cred.hardware_verified !== 1) {
+      auditLog(cred.user_id, 'LOGIN_WEBAUTHN_NOT_HARDWARE', '', req.ip);
+      return res.status(403).json({ error: 'this passkey is not an accepted hardware security key; re-enroll a hardware key to sign in', code: 'LOGIN_WEBAUTHN_NOT_HARDWARE' });
     }
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(cred.user_id);
     if (!user) return res.status(401).json({ error: 'user no longer exists' });
@@ -587,6 +571,7 @@ router.post('/enroll/passkey/verify', async (req, res) => {
         response: body.response,
         challengeToken: body.challengeToken,
         requireUserVerification: true,
+        db,
       });
     } catch (vErr) {
       return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message });
@@ -595,12 +580,37 @@ router.post('/enroll/passkey/verify', async (req, res) => {
       return res.status(400).json({ error: 'passkey verification failed' });
     }
     const c = result.credential;
+    // Hardware-credential gate: the chokepoint that rejects synced/software
+    // passkeys and any authenticator whose attestation does not chain to a
+    // trusted vendor root. Runs before the kind-specific branch below, so both
+    // the enrollment-token and break-glass paths are gated identically.
+    try {
+      webauthn.assertHardwareCredential({
+        attestationVerified: c.attestationVerified,
+        backedUp: c.backedUp,
+        deviceType: c.deviceType,
+        fmt: c.fmt,
+        aaguid: c.aaguid,
+        db,
+      });
+    } catch (hwErr) {
+      if (hwErr instanceof webauthn.HardwareCredentialError) {
+        auditLog(user.id, 'ENROLL_PASSKEY_NOT_HARDWARE',
+          `reason=${hwErr.reason} fmt=${c.fmt || 'none'} aaguid=${c.aaguid || 'none'} backedUp=${c.backedUp}`, req.ip);
+        return res.status(422).json({ error: hwErr.message, code: 'ENROLL_PASSKEY_NOT_HARDWARE' });
+      }
+      throw hwErr;
+    }
     try {
       db.prepare(`
         INSERT INTO webauthn_credentials
-          (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).run(user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null);
+          (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless,
+           backed_up, device_type, attestation_fmt, hardware_verified, trusted_root_id)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?)
+      `).run(
+        user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null,
+        c.backedUp ? 1 : 0, c.deviceType || null, c.fmt || null, c.trustedRootId || null
+      );
     } catch (dbErr) {
       if (/UNIQUE|constraint/i.test(dbErr.message)) {
         return res.status(409).json({ error: 'this authenticator is already enrolled' });

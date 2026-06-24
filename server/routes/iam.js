@@ -14,6 +14,7 @@
 
 const router = require('express').Router();
 const { getDb } = require('../db/init');
+const crypto = require('crypto');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const ca = require('../services/ca');
@@ -426,6 +427,200 @@ router.post('/offboarding-candidates/resolve', (req, res) => {
     return res.status(500).json({ error: 'internal error' });
   } finally {
     try { db.close(); } catch (_) { /* ignore */ }
+  }
+});
+
+// ── FIDO2 attestation trust management (B5n3) ───────────────────────────────
+// Admin management of the trusted attestation roots and the optional AAGUID
+// model allow-list that gate hardware-key login enrollment. These sit behind the
+// same /api/iam guards as the rest of this router: lead/admin role AND the
+// config-lock chokepoint. Bundled roots (seeded=1) and admin-added roots
+// (seeded=0) are treated identically as trust anchors; removing the LAST root is
+// refused so enrollment can never be left with no anchor. An empty AAGUID
+// allow-list means "any model from a trusted vendor".
+
+router.get('/fido-roots', (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, vendor, label, root_pem, seeded, added_by, created_at FROM fido_trusted_roots ORDER BY seeded DESC, vendor, created_at'
+    ).all();
+    db.close();
+    const roots = rows.map((r) => {
+      let sha256 = null;
+      let subject = null;
+      let validTo = null;
+      try {
+        const cert = new crypto.X509Certificate(r.root_pem);
+        sha256 = crypto.createHash('sha256').update(cert.raw).digest('hex');
+        subject = cert.subject;
+        validTo = cert.validTo;
+      } catch (_) {
+        // leave nulls for an unparseable stored root
+      }
+      return {
+        id: r.id,
+        vendor: r.vendor,
+        label: r.label,
+        seeded: r.seeded === 1,
+        added_by: r.added_by || null,
+        created_at: r.created_at,
+        sha256,
+        subject,
+        valid_to: validTo,
+        root_pem: r.root_pem,
+      };
+    });
+    res.json({ roots, count: roots.length });
+  } catch (err) {
+    logger.error('IAM fido-roots list error', { error: err.message });
+    res.status(500).json({ error: 'Failed to list trusted roots' });
+  }
+});
+
+router.post('/fido-roots', (req, res) => {
+  const { vendor, label, rootPem } = req.body || {};
+  if (!vendor || typeof vendor !== 'string') {
+    return res.status(400).json({ error: 'vendor is required' });
+  }
+  if (!label || typeof label !== 'string') {
+    return res.status(400).json({ error: 'label is required' });
+  }
+  if (!rootPem || typeof rootPem !== 'string' || rootPem.indexOf('BEGIN CERTIFICATE') === -1) {
+    return res.status(400).json({ error: 'rootPem (a PEM certificate string) is required' });
+  }
+  let cert;
+  try {
+    cert = new crypto.X509Certificate(rootPem);
+  } catch (_) {
+    return res.status(400).json({ error: 'rootPem is not a valid X.509 certificate' });
+  }
+  if (cert.ca !== true) {
+    return res.status(400).json({ error: 'rootPem is not a CA certificate (basicConstraints CA:FALSE)' });
+  }
+  try {
+    const db = getDb();
+    try {
+      db.prepare(
+        'INSERT INTO fido_trusted_roots (vendor, label, root_pem, seeded, added_by) VALUES (?, ?, ?, 0, ?)'
+      ).run(String(vendor), String(label), String(rootPem), req.user?.id || null);
+    } catch (dbErr) {
+      db.close();
+      if (/UNIQUE|constraint/i.test(dbErr.message)) {
+        return res.status(409).json({ error: 'this attestation root is already trusted' });
+      }
+      throw dbErr;
+    }
+    const row = db.prepare('SELECT id FROM fido_trusted_roots WHERE root_pem = ?').get(String(rootPem));
+    db.close();
+    const sha256 = crypto.createHash('sha256').update(cert.raw).digest('hex');
+    auditLog(req.user?.id, 'FIDO_ROOT_ADDED', `vendor=${vendor} label="${label}" sha256=${sha256}`, req.ip);
+    return res.status(201).json({ added: true, id: row ? row.id : null, vendor, label, sha256 });
+  } catch (err) {
+    logger.error('IAM fido-roots add error', { error: err.message });
+    return res.status(500).json({ error: 'Failed to add trusted root' });
+  }
+});
+
+router.delete('/fido-roots/:id', (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: 'root id is required' });
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT id, vendor, label FROM fido_trusted_roots WHERE id = ?').get(id);
+    if (!row) {
+      db.close();
+      return res.status(404).json({ error: 'trusted root not found' });
+    }
+    const total = db.prepare('SELECT COUNT(*) AS n FROM fido_trusted_roots').get().n;
+    if (total <= 1) {
+      db.close();
+      return res.status(409).json({
+        error: 'cannot remove the last trusted attestation root; at least one must remain or hardware-key enrollment would be impossible',
+        code: 'LAST_TRUSTED_ROOT',
+      });
+    }
+    db.prepare('DELETE FROM fido_trusted_roots WHERE id = ?').run(id);
+    db.close();
+    auditLog(req.user?.id, 'FIDO_ROOT_REMOVED', `id=${id} vendor=${row.vendor} label="${row.label}"`, req.ip);
+    return res.json({ removed: true, id });
+  } catch (err) {
+    logger.error('IAM fido-roots remove error', { error: err.message });
+    return res.status(500).json({ error: 'Failed to remove trusted root' });
+  }
+});
+
+router.get('/fido-aaguids', (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT id, aaguid, label, added_by, created_at FROM fido_aaguid_allowlist ORDER BY created_at'
+    ).all();
+    db.close();
+    res.json({
+      aaguids: rows,
+      count: rows.length,
+      mode: rows.length === 0 ? 'any-trusted-vendor-model' : 'restricted-to-listed-models',
+    });
+  } catch (err) {
+    logger.error('IAM fido-aaguids list error', { error: err.message });
+    res.status(500).json({ error: 'Failed to list AAGUID allow-list' });
+  }
+});
+
+router.post('/fido-aaguids', (req, res) => {
+  const { aaguid, label } = req.body || {};
+  if (!aaguid || typeof aaguid !== 'string') {
+    return res.status(400).json({ error: 'aaguid is required' });
+  }
+  if (!label || typeof label !== 'string') {
+    return res.status(400).json({ error: 'label is required' });
+  }
+  // Normalize to the canonical lowercase dashed UUID form (the AAGUID string
+  // recorded at registration). Accept input with or without dashes.
+  const hex = aaguid.replace(/-/g, '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) {
+    return res.status(400).json({ error: 'aaguid must be a 128-bit value (32 hex digits, optionally dash-formatted)' });
+  }
+  const normalized = hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+  try {
+    const db = getDb();
+    try {
+      db.prepare('INSERT INTO fido_aaguid_allowlist (aaguid, label, added_by) VALUES (?, ?, ?)')
+        .run(normalized, String(label), req.user?.id || null);
+    } catch (dbErr) {
+      db.close();
+      if (/UNIQUE|constraint/i.test(dbErr.message)) {
+        return res.status(409).json({ error: 'this AAGUID is already on the allow-list' });
+      }
+      throw dbErr;
+    }
+    db.close();
+    auditLog(req.user?.id, 'FIDO_AAGUID_ADDED', `aaguid=${normalized} label="${label}"`, req.ip);
+    return res.status(201).json({ added: true, aaguid: normalized, label });
+  } catch (err) {
+    logger.error('IAM fido-aaguids add error', { error: err.message });
+    return res.status(500).json({ error: 'Failed to add AAGUID' });
+  }
+});
+
+router.delete('/fido-aaguids/:id', (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: 'aaguid id is required' });
+  try {
+    const db = getDb();
+    const row = db.prepare('SELECT id, aaguid FROM fido_aaguid_allowlist WHERE id = ?').get(id);
+    if (!row) {
+      db.close();
+      return res.status(404).json({ error: 'AAGUID not found' });
+    }
+    db.prepare('DELETE FROM fido_aaguid_allowlist WHERE id = ?').run(id);
+    db.close();
+    auditLog(req.user?.id, 'FIDO_AAGUID_REMOVED', `id=${id} aaguid=${row.aaguid}`, req.ip);
+    return res.json({ removed: true, id });
+  } catch (err) {
+    logger.error('IAM fido-aaguids remove error', { error: err.message });
+    return res.status(500).json({ error: 'Failed to remove AAGUID' });
   }
 });
 
