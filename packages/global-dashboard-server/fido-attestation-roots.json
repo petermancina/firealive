@@ -1,0 +1,51 @@
+{
+  "_comment": "FireAlive FIDO2 attestation trust anchors. Provenance-pinned, version-controlled, BUNDLED seed of trusted FIDO-certified vendor attestation root CAs. Login enrollment requires a hardware passkey whose attestation chains to one of these roots (or an admin-added root). FireAlive makes no outbound calls: this file is refreshed only by shipping a new release, never fetched at runtime (same constraint as the GeoIP database and bundled AI models). Do not hand-edit PEMs; each was validated as a self-signed X.509 CA certificate before bundling. The seeder (packages/global-dashboard-server/services/gd-seed-fido-roots.js) reads the roots array.",
+  "_meta": {
+    "version": 1,
+    "provenancePolicy": "Official first-party vendor publications and the FIDO Alliance Metadata Service (MDS, mds.fidoalliance.org) ONLY. No community mirrors, certificate aggregators, blogs, or third-party repositories are ever a source for a bundled trust anchor.",
+    "validation": "Every bundled rootPem was parsed with Node crypto.X509Certificate, confirmed self-signed (subject == issuer, self-signature verifies) and a CA certificate, and its DER SHA-256 recorded in sha256Der below.",
+    "refreshModel": "Bundled and version-controlled. A root is added or rotated only by shipping a new FireAlive release. There is no runtime fetch from the FIDO MDS and no relax-below-pinning toggle.",
+    "aaguidNarrowing": "Optional and OFF by default (empty allow-list = any model from a trusted vendor). Per-vendor aaguids here are left empty; an admin who wants model-level narrowing manages the AAGUID allow-list in the IAM admin surface using the authoritative AAGUID-to-model mapping published by the vendor or the FIDO MDS.",
+    "bundledRootCount": 2,
+    "recognizedVendorsForAdminAdd": [
+      {
+        "vendor": "Feitian",
+        "note": "FIDO Alliance Board member. Feitian distributes its FIDO2 attestation roots via the FIDO Alliance MDS (vendor-submitted), not as a standalone PEM on ftsafe.com. Add the MDS-published root via the Trusted Roots admin UI."
+      },
+      {
+        "vendor": "Google Titan",
+        "note": "Google distributes Titan Security Key attestation roots via the FIDO Alliance MDS. Add the MDS-published root via the Trusted Roots admin UI."
+      },
+      {
+        "vendor": "Nitrokey",
+        "note": "Open-source vendor. Distributes its FIDO2 attestation root via the FIDO Alliance MDS and its official channels (nitrokey.com / github.com/Nitrokey). Add the official root via the Trusted Roots admin UI."
+      },
+      {
+        "vendor": "SoloKeys",
+        "note": "Open-source vendor. Distributes its attestation root via the FIDO Alliance MDS and its official channels (github.com/solokeys). Note that some open hacker/dev editions ship a publicly-known attestation key and therefore do not prove tamper-evident hardware; vet the model before adding its root."
+      }
+    ]
+  },
+  "roots": [
+    {
+      "vendor": "Yubico",
+      "label": "Yubico U2F Root CA Serial 457200631",
+      "aaguids": [],
+      "rootPem": "-----BEGIN CERTIFICATE-----\nMIIDHjCCAgagAwIBAgIEG0BT9zANBgkqhkiG9w0BAQsFADAuMSwwKgYDVQQDEyNZ\ndWJpY28gVTJGIFJvb3QgQ0EgU2VyaWFsIDQ1NzIwMDYzMTAgFw0xNDA4MDEwMDAw\nMDBaGA8yMDUwMDkwNDAwMDAwMFowLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBSb290\nIENBIFNlcmlhbCA0NTcyMDA2MzEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK\nAoIBAQC/jwYuhBVlqaiYWEMsrWFisgJ+PtM91eSrpI4TK7U53mwCIawSDHy8vUmk\n5N2KAj9abvT9NP5SMS1hQi3usxoYGonXQgfO6ZXyUA9a+KAkqdFnBnlyugSeCOep\n8EdZFfsaRFtMjkwz5Gcz2Py4vIYvCdMHPtwaz0bVuzneueIEz6TnQjE63Rdt2zbw\nnebwTG5ZybeWSwbzy+BJ34ZHcUhPAY89yJQXuE0IzMZFcEBbPNRbWECRKgjq//qT\n9nmDOFVlSRCt2wiqPSzluwn+v+suQEBsUjTGMEd25tKXXTkNW21wIWbxeSyUoTXw\nLvGS6xlwQSgNpk2qXYwf8iXg7VWZAgMBAAGjQjBAMB0GA1UdDgQWBBQgIvz0bNGJ\nhjgpToksyKpP9xv9oDAPBgNVHRMECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAN\nBgkqhkiG9w0BAQsFAAOCAQEAjvjuOMDSa+JXFCLyBKsycXtBVZsJ4Ue3LbaEsPY4\nMYN/hIQ5ZM5p7EjfcnMG4CtYkNsfNHc0AhBLdq45rnT87q/6O3vUEtNMafbhU6kt\nhX7Y+9XFN9NpmYxr+ekVY5xOxi8h9JDIgoMP4VB1uS0aunL1IGqrNooL9mmFnL2k\nLVVee6/VR6C5+KSTCMCWppMuJIZII2v9o4dkoZ8Y7QRjQlLfYzd3qGtKbw7xaF1U\nsG/5xUb/Btwb2X2g4InpiB/yt/3CpQXpiWX/K4mBvUKiGn05ZsqeY1gx4g0xLBqc\nU9psmyPzK+Vsgw2jeRQ5JlKDyqE0hebfC1tvFu0CCrJFcw==\n-----END CERTIFICATE-----\n",
+      "sourceUrl": "https://developers.yubico.com/PKI/yubico-ca-certs.txt",
+      "sha256Der": "0fa1386f80eb8713263ae5c1d84deb455bdf08aea50ab05503cefee82b092d42",
+      "issued": "2014-08-01",
+      "notes": "Yubico FIDO/U2F attestation root. Signs FIDO2 / U2F device attestations for YubiKeys with firmware prior to 5.7.4. Published in the OpenPGP-signed Yubico PKI CA bundle."
+    },
+    {
+      "vendor": "Yubico",
+      "label": "Yubico FIDO Root CA Serial 450203556",
+      "aaguids": [],
+      "rootPem": "-----BEGIN CERTIFICATE-----\nMIIDMzCCAhugAwIBAgIUSOEjTf//yqRfPW7Qq8qtIyCrAg8wDQYJKoZIhvcNAQEL\nBQAwLzEtMCsGA1UEAwwkWXViaWNvIEZJRE8gUm9vdCBDQSBTZXJpYWwgNDUwMjAz\nNTU2MCAXDTI0MDUwMTAwMDAwMFoYDzIwNjAwNDMwMDAwMDAwWjAvMS0wKwYDVQQD\nDCRZdWJpY28gRklETyBSb290IENBIFNlcmlhbCA0NTAyMDM1NTYwggEiMA0GCSqG\nSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCdvl27w2gu1fPXeEFbIdqx0BalvVDVWrQP\nJ7HqviuEtZHlxSLxSFtcXpTolvLvof8f4tMerQTkVGzcmYzm1EBT4IJuMmoEqfkE\nEhWpsADMFrjZkqlZY9EqxQzLoVEEonE5oGxSdVCxCcLIackpyR/CCXvj1Bt/hTgE\n9hTlF4pRqxMkx3plF7y8dDZlRHWs7vbnhmBCGeI0ZPEQ6nl2mCg2r74adF2u6K9r\nrLfhBC3QLE8EPrgqUsI+hkuq2tK4M2SMOp8uUVVkqUeu3h0kr3WVI0W02pkgrOgi\nFKLFNkSrbYhdjMBDj5izmqfc9xJRKoDX612qd8ZGVHpT5AYFX+1hAgMBAAGjRTBD\nMB0GA1UdDgQWBBTZyU5DiQ/a2UEgE7qBK0zhIsRNRjASBgNVHRMBAf8ECDAGAQH/\nAgEAMA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAXvnB4SLuUJfY\nMSVGAhssL/SmWli3FSccgxydvKlACcidIIWKQqa3q/QSUEQzC9DgEfMgr7iC1BkT\nZbILboV6UZ5knNsvjEZWuMeogJ8tgZs1hVvKwZizwJ+mEcmsjhIrBYuoL1T6yrOJ\nvKFg1jv+Cy4ZwA9Bpk/V3UOir1VyK8dCtyHu6vfosotAdYx8FAuR243gRTMV6Jx8\nJdig2JDIAQMlzVeDpSUHX/K2HXRHxHwfgjbgUjjBu/72r8OfehyhzHXI3K8CFFdf\nlO+8nEOJK3y8F1ivgS5uN/8SmcYw/STQYwhrxPuwz3nP8baMum4BB2nnYmpB60sX\n3bl5k8QUSw==\n-----END CERTIFICATE-----\n",
+      "sourceUrl": "https://developers.yubico.com/PKI/yubico-ca-certs.txt",
+      "sha256Der": "35f1a54b353bfb711e6d42adbeb76c0e9dead095018e6a94783ba2192fd6faad",
+      "issued": "2024-05-01",
+      "notes": "Yubico FIDO attestation root. Signs FIDO2 device attestations for newer YubiKeys (firmware 5.7.4 and later). Published in the OpenPGP-signed Yubico PKI CA bundle."
+    }
+  ]
+}
