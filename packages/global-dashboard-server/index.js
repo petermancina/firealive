@@ -222,6 +222,9 @@ const authMiddleware = (roles, options) => (req, res, next) => {
 app.use('/api/instance', authMiddleware(null), require('./routes/instance-identity'));
 app.use('/api/cloud-vuln', authMiddleware(['ciso', 'vp']), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+// B5n3: CISO-only management of FIDO attestation trust anchors + AAGUID allow-list
+// (the GD has no config-lock chokepoint, so trust-anchor management is ciso-gated).
+app.use('/api/iam', authMiddleware(['ciso']), require('./routes/fido-trust-admin'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -245,19 +248,6 @@ app.get('/api/health', (req, res) => {
 // bootstrap is gated on the one-time break-glass recovery credential shown at CA
 // initialization.
 // ═══════════════════════════════════════════════════════════════════════════════
-
-// Verify the TLS peer certificate against the GD's own CA (chain + validity +
-// local revocation). The GD has no plaintext listener; a presented client cert
-// is verified here at the app layer.
-function verifyGdPeerCertificate(req, db) {
-  const sock = req && req.socket;
-  const peer = sock && typeof sock.getPeerCertificate === 'function' ? sock.getPeerCertificate() : null;
-  if (!peer || !peer.raw || Object.keys(peer).length === 0) return { valid: false, reason: 'no_client_cert' };
-  let pem;
-  try { pem = new crypto.X509Certificate(peer.raw).toString(); }
-  catch (_) { return { valid: false, reason: 'parse_error' }; }
-  return gdCa.verifyClientCert(db, pem);
-}
 
 // RFC 8705 certificate thumbprint (x5t#S256) of the presented mutual-TLS client
 // certificate: base64url(SHA-256(DER)), or null when no client cert is present.
@@ -333,29 +323,13 @@ function gdResolveEnrollmentTarget(db, body) {
   return { ok: true, user };
 }
 
-// ── POST /api/auth/login-cert — passwordless mutual-TLS login ────────────────
-app.post('/api/auth/login-cert', (req, res) => {
-  const db = getDb();
-  try {
-    const result = verifyGdPeerCertificate(req, db);
-    if (!result.valid) {
-      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (NULL, 'LOGIN_CERT_FAILED', ?, ?)").run(req.ip, result.reason || 'unknown');
-      return res.status(401).json({ error: 'client certificate not accepted', reason: result.reason });
-    }
-    const user = result.userId ? db.prepare('SELECT * FROM users WHERE id = ?').get(result.userId) : null;
-    if (!user) {
-      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (NULL, 'LOGIN_CERT_NO_USER', ?, 'cert valid, no matching user')").run(req.ip);
-      return res.status(401).json({ error: 'certificate valid but no matching user' });
-    }
-    const dk = gdResolveLoginDeviceKey(db, user, req);
-    if (!dk.ok) {
-      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_DEVICE_KEY_FAILED', ?, ?)").run(user.username, req.ip, dk.error);
-      return res.status(dk.status).json({ error: dk.error });
-    }
-    return res.json(gdIssuePasswordlessSession(db, user, req, 'cert', dk.cnf));
-  } catch (e) { return res.status(500).json({ error: 'Authentication error' }); }
-  finally { try { db.close(); } catch (_) { /* ignore */ } }
-});
+// ── certificate login removed (B5n3) ────────────────────────────
+// POST /api/auth/login-cert was removed. A client certificate is transport
+// identity only -- it still carries the device-key proof-of-possession bound
+// into the session, but it is no longer a login credential. Login is a hardware
+// FIDO2 passkey proven at enrollment; login-webauthn/verify (below) additionally
+// requires the stored credential's hardware_verified = 1. Certificate issuance
+// and revocation are unchanged.
 
 // ── POST /api/auth/login-webauthn/options — passkey assertion options ────────
 app.post('/api/auth/login-webauthn/options', async (req, res) => {
@@ -399,6 +373,10 @@ app.post('/api/auth/login-webauthn/verify', async (req, res) => {
     if (cred.is_passwordless !== 1) return res.status(403).json({ error: 'this passkey is not enrolled for passwordless login' });
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(cred.user_id);
     if (!user) return res.status(401).json({ error: 'user no longer exists' });
+    if (cred.hardware_verified !== 1) {
+      db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_WEBAUTHN_NOT_HARDWARE', ?, ?)").run(user.username, req.ip, 'credential not hardware-verified');
+      return res.status(403).json({ error: 'this passkey is not an accepted hardware security key; re-enroll a hardware key to sign in', code: 'LOGIN_WEBAUTHN_NOT_HARDWARE' });
+    }
     const dk = gdResolveLoginDeviceKey(db, user, req);
     if (!dk.ok) {
       db.prepare("INSERT INTO auth_log (username, action, ip, reason) VALUES (?, 'LOGIN_DEVICE_KEY_FAILED', ?, ?)").run(user.username, req.ip, dk.error);
@@ -468,13 +446,26 @@ app.post('/api/auth/enroll/passkey/verify', async (req, res) => {
     if (!body.response || !body.challengeToken) return res.status(400).json({ error: 'response and challengeToken required' });
     const rp = gdWebauthn.getRpConfig(db);
     let result;
-    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true }); }
+    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true, db }); }
     catch (vErr) { return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message }); }
     if (!result.verified || !result.credential) return res.status(400).json({ error: 'passkey verification failed' });
     const c = result.credential;
     try {
-      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless) VALUES (?, ?, ?, ?, ?, ?, 1)")
-        .run(auth.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null);
+      gdWebauthn.assertHardwareCredential({
+        attestationVerified: c.attestationVerified,
+        backedUp: c.backedUp,
+        deviceType: c.deviceType,
+        fmt: c.fmt,
+        aaguid: c.aaguid,
+        db,
+      });
+    } catch (hwErr) {
+      try { appendGdAuditEntry(db, { userId: auth.user.id, eventType: 'ENROLL_PASSKEY_NOT_HARDWARE', detail: 'reason=' + (hwErr.reason || 'not_hardware'), ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+      return res.status(422).json({ error: hwErr.message, code: 'ENROLL_PASSKEY_NOT_HARDWARE' });
+    }
+    try {
+      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless, backed_up, device_type, attestation_fmt, hardware_verified, trusted_root_id) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?)")
+        .run(auth.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null, c.backedUp ? 1 : 0, c.deviceType || null, c.fmt || null, c.trustedRootId || null);
     } catch (dbErr) {
       if (/UNIQUE|constraint/i.test(dbErr.message)) return res.status(409).json({ error: 'this authenticator is already enrolled' });
       throw dbErr;
@@ -579,13 +570,26 @@ app.post('/api/mfa/passkey/register-verify', authMiddleware(['ciso', 'vp']), asy
     if (!body.response || !body.challengeToken) return res.status(400).json({ error: 'response and challengeToken required' });
     const rp = gdWebauthn.getRpConfig(db);
     let result;
-    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true }); }
+    try { result = await gdWebauthn.finishRegistration({ rp, response: body.response, challengeToken: body.challengeToken, requireUserVerification: true, db }); }
     catch (vErr) { return res.status(400).json({ error: 'passkey verification failed', detail: vErr.message }); }
     if (!result.verified || !result.credential) return res.status(400).json({ error: 'passkey verification failed' });
     const c = result.credential;
     try {
-      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless) VALUES (?, ?, ?, ?, ?, ?, 1)")
-        .run(req.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null);
+      gdWebauthn.assertHardwareCredential({
+        attestationVerified: c.attestationVerified,
+        backedUp: c.backedUp,
+        deviceType: c.deviceType,
+        fmt: c.fmt,
+        aaguid: c.aaguid,
+        db,
+      });
+    } catch (hwErr) {
+      try { appendGdAuditEntry(db, { userId: req.user.id, eventType: 'ENROLL_PASSKEY_NOT_HARDWARE', detail: 'reason=' + (hwErr.reason || 'not_hardware'), ip: req.ip, severity: 'warning' }); } catch (_) { /* best-effort */ }
+      return res.status(422).json({ error: hwErr.message, code: 'ENROLL_PASSKEY_NOT_HARDWARE' });
+    }
+    try {
+      db.prepare("INSERT INTO webauthn_credentials (user_id, credential_id, public_key, sign_count, transports, aaguid, is_passwordless, backed_up, device_type, attestation_fmt, hardware_verified, trusted_root_id) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?)")
+        .run(req.user.id, c.credentialId, c.publicKey, c.counter || 0, c.transports || null, c.aaguid || null, c.backedUp ? 1 : 0, c.deviceType || null, c.fmt || null, c.trustedRootId || null);
     } catch (dbErr) {
       if (/UNIQUE|constraint/i.test(dbErr.message)) return res.status(409).json({ error: 'this authenticator is already enrolled' });
       throw dbErr;
@@ -3434,13 +3438,15 @@ function runGdRegression(db) {
     const stack = (r && r.stack) ? r.stack : [];
     if (!stack.length) return SKIP('router stack not introspectable in this runtime');
     const paths = new Set(stack.filter(l => l && l.route && l.route.path).map(l => l.route.path));
-    const required = ['/api/auth/login-cert', '/api/auth/login-webauthn/options', '/api/auth/login-webauthn/verify'];
+    const required = ['/api/auth/login-webauthn/options', '/api/auth/login-webauthn/verify'];
     const missing = required.filter(p => !paths.has(p));
     if (missing.length) throw new Error('missing passwordless login route(s): ' + missing.join(', '));
-    const forbidden = ['/api/auth/login', '/api/auth/login-ldap', '/api/auth/mfa-verify'];
+    // B5n3: certificate login was removed -- a client certificate is transport
+    // identity only, never a login credential, so /login-cert must be ABSENT.
+    const forbidden = ['/api/auth/login', '/api/auth/login-ldap', '/api/auth/mfa-verify', '/api/auth/login-cert'];
     const present = forbidden.filter(p => paths.has(p));
-    if (present.length) throw new Error('password / MFA login route(s) still present: ' + present.join(', '));
-    return 'cert + passkey login present; no password / LDAP / mfa-verify route';
+    if (present.length) throw new Error('password / MFA / cert login route(s) still present: ' + present.join(', '));
+    return 'passkey login present; no password / LDAP / mfa-verify / cert-login route';
   });
   record('auth', 'CA issue / verify / revoke / CRL round-trip', () => {
     // Real openssl-backed round-trip against a throwaway in-memory schema clone:
@@ -5535,9 +5541,9 @@ https.createServer({
   // Client certificates are REQUESTED but not REQUIRED at the handshake
   // (rejectUnauthorized:false): the WebAuthn login path and the regional MC push
   // path connect without a client cert and authenticate at the app layer.
-  // Encryption itself is never optional — there is no plaintext listener. mTLS
-  // client-cert AUTHENTICATION is enforced in /api/auth/login-cert, which passes
-  // the presented peer certificate to gdCa.verifyClientCert.
+  // Encryption itself is never optional — there is no plaintext listener. A
+  // client certificate is transport identity only (B5n3): there is no
+  // certificate login path; login is a hardware FIDO2 passkey.
   requestCert: true,
   rejectUnauthorized: false,
   minVersion: 'TLSv1.2',
