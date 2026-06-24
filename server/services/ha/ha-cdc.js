@@ -122,7 +122,7 @@ function jsonObjectExpr(cols, rowAlias) {
   for (let i = 0; i < cols.length; i++) {
     const c = cols[i];
     const valueExpr = c.isBlob
-      ? ('hex(' + rowAlias + '.' + quoteIdent(c.name) + ')')
+      ? ('CASE WHEN ' + rowAlias + '.' + quoteIdent(c.name) + ' IS NULL THEN NULL ELSE hex(' + rowAlias + '.' + quoteIdent(c.name) + ') END')
       : (rowAlias + '.' + quoteIdent(c.name));
     parts.push(sqlStrLiteral(c.name) + ', ' + valueExpr);
   }
