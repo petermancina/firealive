@@ -65,8 +65,8 @@ const isClientAlive = (clientId) => {
 // client cert at the APPLICATION layer against the built-in CA. This helper
 // pulls the peer certificate off the TLS socket and runs it through
 // ca.verifyClientCert (chain-to-CA + validity window + local revocation),
-// returning the mapped user/external_id. routes/auth.js (/login-cert) uses it
-// for passwordless cert login; validateMtls (below) uses it to gate the
+// returning the mapped user/external_id. A client cert is transport identity
+// only, not a login credential; validateMtls (below) uses it to gate the
 // internal inter-component API. Absence of a cert is reported as
 // { valid:false, reason:'no_client_cert' } and is NOT an error by itself —
 // whether to require a cert is the caller's policy decision.
