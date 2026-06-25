@@ -34,7 +34,7 @@ const haKeys = require('./ha-keys');
 const haPeerLink = require('./ha-peer-link');
 const haCdc = require('./ha-cdc');
 const haReplication = require('./ha-replication');
-const { auditLog } = require('../middleware/audit');
+const { auditLog } = require('../../middleware/audit');
 const ca = require('../ca');
 
 const TOKEN_CONFIG_KEY = 'ha_pairing_token';

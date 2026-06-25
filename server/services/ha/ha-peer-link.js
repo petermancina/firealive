@@ -26,9 +26,9 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DB_PATH } = require('../db/init');
-const { getClientCertThumbprint } = require('../middleware/auth');
-const { auditLog } = require('../middleware/audit');
+const { DB_PATH } = require('../../db/init');
+const { getClientCertThumbprint } = require('../../middleware/auth');
+const { auditLog } = require('../../middleware/audit');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
