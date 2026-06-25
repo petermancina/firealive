@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.74 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 67 (anti-rollback)
+**Version:** v1.0.75 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 68 (anti-rollback)
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.74) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.75) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -72,6 +72,10 @@ The Regional Server runs in one of five mutually exclusive deployment modes, cho
 - **SASE** — runs on any of the above substrates behind a SASE/ZTNA edge, reachable only through a sanctioned connector with required connector-tunneled passthrough, refusing direct exposure and clientless TLS-terminating edges. See [`docs/sase-mode.md`](docs/sase-mode.md).
 
 SDN and SASE are network overlays, not container deployments: in every mode the server is a direct host process on a TPM/vTPM host, never a Kubernetes or orchestrated-container workload, because those cannot provide the per-instance hardware root of trust the instance anchor requires.
+
+### High Availability
+
+The Regional Server can run as an **active/passive** pair for automated failover: one node serves the SOC while a warm, sealed standby is kept current over a mutually authenticated peer link and promotes itself if the active stops responding. Write authority is settled internally by a cryptographic lease at a monotonically increasing epoch — enforced at the data layer, the scheduler, and the request layer — so the organization’s own load balancer only routes traffic and a flapping or compromised balancer can never cause split-brain. Replication is near-synchronous (a bounded, seconds-scale recovery point) and failover is honest about its window rather than promising zero downtime; a built-in self-test measures the real failover-and-failback time. Single-node deployments are unaffected. See [`docs/high-availability.md`](docs/high-availability.md).
 
 ### Backend Services
 

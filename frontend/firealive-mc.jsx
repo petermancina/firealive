@@ -2723,7 +2723,7 @@ function ManagementConsole() {
   // Posture assessment
   const [postureCfg, setPostureCfg] = useState({enabled:true,requireOnConnect:true,checks:{osUpdated:true,avEnabled:true,firewallEnabled:true,diskEncrypted:true,screenLockEnabled:true,wifiCompliant:true,endpointProtectionRunning:true,minTlsVersion:"1.2"},blockOnFail:false,warnOnFail:true,gracePeriodMin:10});
   // HA configuration
-  const [haCfg, setHaCfg] = useState({enabled:false,mode:"active_passive",failoverEndpoint:"",syncIntervalSec:5,loadBalancer:{enabled:false,type:"round_robin",healthCheckSec:10,healthPath:"/api/health"},replicationStatus:"idle",lastSyncAt:null});
+  const [haCfg, setHaCfg] = useState({enabled:false,mode:"active_passive",peerEndpoint:"",selfEndpoint:"",syncIntervalSec:5,heartbeatIntervalSec:5,leaseTtlSec:30,missCount:3,promotionCooldownSec:60,selfFenceTimeoutSec:60,_loaded:false});
   // Fail-open routing
   const [failOpenCfg, setFailOpenCfg] = useState({enabled:true,autoDetect:true,notifyOnFailOpen:true,maxFailOpenMin:60,restoreAuto:true});
   // Troubleshooter (server-side diagnostics + internal-LLM synthesis)
@@ -2771,8 +2771,20 @@ function ManagementConsole() {
   const [haManualFailover, setHaManualFailover] = useState(false);
   const [haTestResults, setHaTestResults] = useState(null);
   const [haTestRunning, setHaTestRunning] = useState(false);
-  // Cluster config
-  const [clusterCfg, setClusterCfg] = useState({enabled:false,mode:"active_active",nodeCount:2,nodes:[],sessionStore:"redis",parallelProcessing:true,workerThreads:4});
+  const [haStatus, setHaStatus] = useState(null);
+  const [haPair, setHaPair] = useState({peerEndpoint:"",token:"",pairing:false,result:null});
+  // Load HA config once and poll live status while the HA tab is open.
+  useEffect(()=>{
+    if (tab !== "ha") return;
+    let alive = true;
+    if (!haCfg._loaded) {
+      api.get("/api/ha/config").then(r=>{ if(alive&&r&&!r.error) setHaCfg(prev=>({...prev,...r,peerEndpoint:r.peerEndpoint||"",selfEndpoint:r.selfEndpoint||"",_loaded:true})); }).catch(()=>{});
+    }
+    const pull = ()=>api.get("/api/ha/status").then(r=>{ if(alive&&r&&!r.error) setHaStatus(r); }).catch(()=>{});
+    pull();
+    const iv = setInterval(pull, 5000);
+    return ()=>{ alive=false; clearInterval(iv); };
+  }, [tab, haCfg._loaded]);
   // Global dashboard (read-only VP view)
   const [globalDashCfg, setGlobalDashCfg] = useState({enabled:false,endpoint_url:"",api_key_set:false,api_key_input:"",push_interval_minutes:15,retry_max:3,retry_backoff_seconds:30,last_push_at:null,last_push_status:null,last_push_error:null,consecutive_failures:0,_loaded:false,_saving:false,_testing:false,_testResult:null,_savedEndpointUrl:"",_savedApiKeySet:false});
   useEffect(()=>{
@@ -3646,7 +3658,7 @@ function ManagementConsole() {
       {id:"iam",label:"IAM"},{id:"mfa",label:"MFA"},{id:"apikeys",label:"API Keys"},{id:"access_ctrl",label:"Access Control"},{id:"auth_logs",label:"Auth Logs"},{id:"kms",label:"KMS"},{id:"wifi",label:"WiFi Policy"},{id:"posture",label:"Posture Assessment"},{id:"tripwire",label:"Tripwire"},{id:"compromise_scan",label:"Compromise Scan"},{id:"log_integrity",label:"Log Integrity"},{id:"regression",label:"Regression Test"},{id:"ttx",label:"TTX Generator"},
     ]},
     {cat:"infra",label:"Infrastructure",items:[
-      {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cluster",label:"Cluster / Scaling"},{id:"cicd",label:"CI/CD"},
+      {id:"cloud",label:"Cloud & IaC"},{id:"virt",label:"Virtualization"},{id:"sdn",label:"SDN"},{id:"sase",label:"SASE / ZTNA"},{id:"ha",label:"High Availability"},{id:"cicd",label:"CI/CD"},
     ]},
     {cat:"data",label:"Data & Backup",items:[
       {id:"backup",label:"Backup & Storage Routing"},{id:"backup_schedules",label:"Backup Schedules"},{id:"restore",label:"Restore"},{id:"geo_fence",label:"Data Sovereignty"},{id:"migration",label:"Deployment Migration"},
@@ -7132,7 +7144,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure \u00b7 Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled \u2014 see Fail-Open tab"},
               {n:"WiFi Security Policy",s:"configured",d:"Min: "+wifiPolicy.minimumProtocol.replace(/_/g," ")+" \u00b7 WPA3 preferred: "+(wifiPolicy.wpa3Preferred?"yes":"no")+" \u00b7 Block PSK: "+(wifiPolicy.blockWpa2Personal?"yes":"no")},
               {n:"High Availability",s:haCfg.enabled?"configured":"disabled",d:haCfg.enabled?haCfg.mode+" \u00b7 Sync every "+haCfg.syncIntervalSec+"s":"Not configured \u2014 see HA tab"},
-              {n:"Cluster Mode",s:clusterCfg.enabled?clusterCfg.mode:"disabled",d:clusterCfg.enabled?clusterCfg.nodeCount+" nodes \u00b7 "+clusterCfg.sessionStore:"Single instance"},
               {n:"Sync Interval",s:"configured",d:"Every "+syncIntervalCfg.intervalMin+"min \u00b7 "+(syncIntervalCfg.adaptiveSync?"adaptive":"fixed")+" \u00b7 "+(syncIntervalCfg.batchMode?"batch":"streaming")},
               {n:"Data Sovereignty",s:geoFenceCfg.enabled?"active":"disabled",d:geoFenceCfg.enabled?(geoUsers.filter(u=>u.geo_country).length+" of "+geoUsers.length+" analysts geo-assigned"+(geoFenceCfg.enforceGeoLogin?" \u00b7 enforcing":" \u00b7 audit only")):"Not configured \u2014 see Data Sovereignty tab"},
               {n:"Threat Hunting (XDR)",s:threatHuntCfg.xdr.enabled?"configured":"pending",d:threatHuntCfg.xdr.enabled?threatHuntCfg.xdr.provider+" \u00b7 Behavior monitoring":"Not configured \u2014 see Threat Hunting tab"},
@@ -8125,41 +8136,113 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Btn primary onClick={()=>api.put("/api/posture/config",postureCfg).then(r=>saved(r,"POSTURE_CONFIG_SAVED","Posture assessment config saved"))}>Save Posture Config</Btn>
         </div>)}
 
-        {/* ══════════ v1.0.0 — HIGH AVAILABILITY ══════════ */}
+        {/* HIGH AVAILABILITY -- active/passive failover (real /api/ha endpoints) */}
         {tab==="ha"&&(<div>
-          <L>High Availability Configuration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Deploy a replica FireAlive server instance in active/passive mode. The active instance handles all traffic while synchronously replicating state to the passive. If the active fails health checks, the passive promotes automatically. The Team Lead's Management Console is decoupled from the backend — it simply points at whichever server is currently active behind the load balancer, so failover is transparent.</M>
+          <L>High Availability</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run a warm standby FireAlive server in active/passive failover. The active node handles all traffic and replicates state to the sealed passive over a mutually-authenticated mTLS peer link. If the active stops sending heartbeats, the passive promotes itself automatically, claiming the next lease epoch so the old node can never write again. Failover authority is an internal cryptographic lease; your external load balancer routes traffic only, so a flapping or compromised LB is contained to availability, never split-brain.</M>
+
           <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Configuration</div>
             <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={haCfg.enabled} onChange={e=>setHaCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable High Availability</label>
             <Sel label="Mode" value={haCfg.mode} onChange={e=>setHaCfg(prev=>({...prev,mode:e.target.value}))}>
-              <option value="active_passive">Active/Passive (recommended)</option>
-              <option value="active_active">Active/Active (requires external session store)</option>
+              <option value="active_passive">Active/Passive (the only supported mode)</option>
             </Sel>
-            <Input label="Failover server endpoint" value={haCfg.failoverEndpoint} onChange={e=>setHaCfg(prev=>({...prev,failoverEndpoint:e.target.value}))} placeholder="https://firealive-standby.corp.local:3001" maxLength={512}/>
-            <Input label="Replication interval (seconds)" value={haCfg.syncIntervalSec} onChange={e=>setHaCfg(prev=>({...prev,syncIntervalSec:parseInt(e.target.value)||5}))} type="number"/>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:12,marginBottom:8}}>Load Balancer</div>
-            <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><input type="checkbox" checked={haCfg.loadBalancer.enabled} onChange={e=>setHaCfg(prev=>({...prev,loadBalancer:{...prev.loadBalancer,enabled:e.target.checked}}))}/><M style={{color:C.t}}>Deploy behind load balancer</M></label>
+            <Input label="This node's endpoint (advertised to the peer)" value={haCfg.selfEndpoint} onChange={e=>setHaCfg(prev=>({...prev,selfEndpoint:e.target.value}))} placeholder="https://firealive-a.corp.local:3000" maxLength={512}/>
+            <Input label="Peer (standby) endpoint" value={haCfg.peerEndpoint} onChange={e=>setHaCfg(prev=>({...prev,peerEndpoint:e.target.value}))} placeholder="https://firealive-standby.corp.local:3000" maxLength={512}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Health check interval (sec)" value={haCfg.loadBalancer.healthCheckSec} onChange={e=>setHaCfg(prev=>({...prev,loadBalancer:{...prev.loadBalancer,healthCheckSec:parseInt(e.target.value)||10}}))} type="number"/>
-              <Input label="Health check path" value={haCfg.loadBalancer.healthPath} onChange={e=>setHaCfg(prev=>({...prev,loadBalancer:{...prev.loadBalancer,healthPath:e.target.value}}))} maxLength={256}/>
+              <Input label="Replication interval (sec)" value={haCfg.syncIntervalSec} onChange={e=>setHaCfg(prev=>({...prev,syncIntervalSec:parseInt(e.target.value)||5}))} type="number"/>
+              <Input label="Heartbeat interval (sec)" value={haCfg.heartbeatIntervalSec} onChange={e=>setHaCfg(prev=>({...prev,heartbeatIntervalSec:parseInt(e.target.value)||5}))} type="number"/>
+              <Input label="Missed heartbeats before promotion" value={haCfg.missCount} onChange={e=>setHaCfg(prev=>({...prev,missCount:parseInt(e.target.value)||3}))} type="number"/>
+              <Input label="Lease TTL (sec)" value={haCfg.leaseTtlSec} onChange={e=>setHaCfg(prev=>({...prev,leaseTtlSec:parseInt(e.target.value)||30}))} type="number"/>
+              <Input label="Promotion cooldown (sec)" value={haCfg.promotionCooldownSec} onChange={e=>setHaCfg(prev=>({...prev,promotionCooldownSec:parseInt(e.target.value)||60}))} type="number"/>
+              <Input label="Self-fence timeout (sec)" value={haCfg.selfFenceTimeoutSec} onChange={e=>setHaCfg(prev=>({...prev,selfFenceTimeoutSec:parseInt(e.target.value)||60}))} type="number"/>
             </div>
+            <M style={{color:C.td,display:"block",marginTop:4,lineHeight:1.7}}>Detection time is roughly missed-heartbeats x heartbeat-interval (e.g. 3 x 5s ~= 15s) plus a fast promotion, so expect a ~15-45s failover window. The self-test measures the real number for your deployment.</M>
           </Card>
-          <Card style={{padding:12,borderColor:C.i+"30",marginBottom:16}}>
-            <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Architecture</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>Backend server is a separate process from the Management Console UI. The MC connects via API. Both active and passive servers share the same API contract. On failover, the load balancer redirects the MC's API calls to the newly promoted server — no MFA re-enrollment needed because auth tokens are replicated. Config changes made on the active are synchronously replicated to passive before the API returns success, ensuring zero data loss on failover.</M>
+          <Btn primary onClick={()=>api.put("/api/ha/config",{enabled:haCfg.enabled,mode:"active_passive",peerEndpoint:haCfg.peerEndpoint,selfEndpoint:haCfg.selfEndpoint,syncIntervalSec:haCfg.syncIntervalSec,heartbeatIntervalSec:haCfg.heartbeatIntervalSec,leaseTtlSec:haCfg.leaseTtlSec,missCount:haCfg.missCount,promotionCooldownSec:haCfg.promotionCooldownSec,selfFenceTimeoutSec:haCfg.selfFenceTimeoutSec}).then(r=>saved(r,"HA_CONFIG_UPDATED","High availability config saved"))}>Save HA Config</Btn>
+
+          <Card style={{marginTop:16,marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Pair with standby</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Generate a one-time pairing token on the standby, then pair from the active. Pairing exchanges and pins the peer's anchor and certificate fingerprints over mTLS and pre-positions a wrapped KEK the passive unseals only at promotion.</M>
+            <Input label="Standby endpoint" value={haPair.peerEndpoint} onChange={e=>setHaPair(prev=>({...prev,peerEndpoint:e.target.value}))} placeholder={haCfg.peerEndpoint||"https://firealive-standby.corp.local:3000"} maxLength={512}/>
+            <Input label="One-time pairing token" value={haPair.token} onChange={e=>setHaPair(prev=>({...prev,token:e.target.value}))} maxLength={512}/>
+            <Btn disabled={haPair.pairing} onClick={()=>{
+              const ep=haPair.peerEndpoint||haCfg.peerEndpoint;
+              if(!ep||!haPair.token){window.alert("Standby endpoint and pairing token are required.");return;}
+              setHaPair(prev=>({...prev,pairing:true,result:null}));
+              api.post("/api/ha/pair",{peerEndpoint:ep,token:haPair.token}).then(r=>{
+                if(r&&r.error){window.alert("Pairing failed: "+r.error);addA("HA_PAIR_FAILED","Pairing with "+ep+" failed: "+r.error);}
+                else{setHaPair(prev=>({...prev,token:"",result:r}));addA("HA_PAIRED","Paired with "+ep+(r.role?" (role: "+r.role+")":""));}
+                setHaPair(prev=>({...prev,pairing:false}));
+              });
+            }}>{haPair.pairing?"Pairing...":"Pair with standby"}</Btn>
+            {haPair.result&&(<Card style={{padding:12,borderColor:C.a+"30",marginTop:10}}>
+              <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:4}}>Paired - role: {haPair.result.role||"?"}</M>
+              <M style={{color:C.tm,lineHeight:1.7,wordBreak:"break-all"}}>Pinned peer fingerprint: {haPair.result.peerFingerprint||"(see status below)"}</M>
+            </Card>)}
           </Card>
-          <Btn primary onClick={()=>addA("HA_CONFIG_SAVED","High availability config saved — mode: "+haCfg.mode)}>Save HA Config</Btn>
-          <Card style={{marginTop:16}}>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Manual Failover & Testing</div>
-            <div style={{display:"flex",gap:8,marginBottom:12}}>
-              <Btn onClick={()=>{if(window.confirm("MANUAL FAILOVER: Force promote passive server to active? The current active will become passive.")){setHaManualFailover(true);api.post("/api/audit/mc-event",{event_type:"HA_MANUAL_FAILOVER",detail:"Manual failover initiated — passive promoted to active"}).then(()=>addA("HA_MANUAL_FAILOVER","Manual failover initiated — passive promoted to active"));setTimeout(()=>setHaManualFailover(false),3000);}}} style={{borderColor:C.d+"60",color:C.d}}>{haManualFailover?"Failing over...":"Manual Failover"}</Btn>
-              <Btn disabled={haTestRunning} onClick={()=>{setHaTestRunning(true);api.post("/api/audit/mc-event",{event_type:"HA_TEST_STARTED",detail:"Failover test initiated"}).then(()=>addA("HA_TEST_STARTED","Failover test initiated"));setTimeout(()=>{setHaTestRunning(false);setHaTestResults({ts:new Date().toISOString(),failoverTimeMs:1247,replicationLag:0,dataIntegrity:"verified",sessionsPreserved:true,apiAvailability:"100%",rollbackSuccess:true});api.post("/api/audit/mc-event",{event_type:"HA_TEST_COMPLETE",detail:"Failover test passed — 1247ms failover time, zero data loss, rollback successful"}).then(()=>addA("HA_TEST_COMPLETE","Failover test passed — 1247ms failover time, zero data loss, rollback successful"));},3000);}}>{haTestRunning?"Testing...":"Test Failover Now"}</Btn>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Live Status</div>
+              {haStatus&&<Badge color={haStatus.role==="active"?C.a:haStatus.role==="passive"?C.i:C.tm}>{haStatus.role||"standalone"}</Badge>}
+            </div>
+            {!haStatus&&<M style={{color:C.td}}>Loading status...</M>}
+            {haStatus&&(<div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 16px",marginBottom:10}}>
+                <M style={{color:C.tm}}>Role: <span style={{color:C.t}}>{haStatus.role}</span></M>
+                <M style={{color:C.tm}}>Epoch: <span style={{color:C.t}}>{haStatus.epoch}</span></M>
+                <M style={{color:C.tm}}>Lease holder: <span style={{color:C.t}}>{haStatus.leaseHolder||"none"}</span></M>
+                <M style={{color:C.tm}}>Lease expires: <span style={{color:C.t}}>{haStatus.leaseExpiresAt?new Date(haStatus.leaseExpiresAt).toLocaleTimeString():"--"}</span></M>
+              </div>
+              <div style={{fontSize:11,fontWeight:500,color:C.tm,marginBottom:6}}>Peer</div>
+              {(haStatus.peer&&haStatus.peer.paired)?(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 16px",marginBottom:10}}>
+                <M style={{color:C.tm}}>Reachable: <span style={{color:haStatus.peer.reachable?C.a:C.d}}>{haStatus.peer.reachable?"yes":"no"}</span></M>
+                <M style={{color:C.tm}}>Last heartbeat: <span style={{color:C.t}}>{haStatus.peer.lastHeartbeatAt?new Date(haStatus.peer.lastHeartbeatAt).toLocaleTimeString():"--"}</span></M>
+                <M style={{color:C.tm,gridColumn:"1 / -1"}}>Endpoint: <span style={{color:C.t}}>{haStatus.peer.endpoint||"--"}</span></M>
+                <M style={{color:C.tm,gridColumn:"1 / -1",wordBreak:"break-all"}}>Anchor fp: <span style={{color:C.t}}>{haStatus.peer.anchorFingerprint||"--"}</span></M>
+              </div>):<M style={{color:C.td,display:"block",marginBottom:10}}>No peer paired.</M>}
+              <div style={{fontSize:11,fontWeight:500,color:C.tm,marginBottom:6}}>Replication</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 16px"}}>
+                <M style={{color:C.tm}}>Lag: <span style={{color:(haStatus.replication&&haStatus.replication.lagSeconds>(haCfg.syncIntervalSec*3))?C.w:C.t}}>{haStatus.replication?haStatus.replication.lagSeconds:0}s</span></M>
+                <M style={{color:C.tm}}>Applied LSN: <span style={{color:C.t}}>{haStatus.replication?haStatus.replication.lastAppliedLsn:0}</span></M>
+                <M style={{color:C.tm}}>Shipped LSN: <span style={{color:C.t}}>{haStatus.replication?haStatus.replication.lastShippedLsn:0}</span></M>
+                <M style={{color:C.tm}}>Last apply: <span style={{color:C.t}}>{(haStatus.replication&&haStatus.replication.lastApplyAt)?new Date(haStatus.replication.lastApplyAt).toLocaleTimeString():"--"}</span></M>
+              </div>
+            </div>)}
+          </Card>
+
+          <Card style={{marginBottom:16}}>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Failover Operations</div>
+            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+              <Btn disabled={haManualFailover} style={{borderColor:C.d+"60",color:C.d}} onClick={()=>{
+                if(!window.confirm("MANUAL FAILOVER: step this active node down and promote the standby? This node becomes passive."))return;
+                setHaManualFailover(true);
+                api.post("/api/ha/manual-failover",{}).then(r=>{
+                  if(r&&r.error){window.alert("Manual failover: "+r.error);addA("HA_MANUAL_FAILOVER","Manual failover failed: "+r.error);}
+                  else addA("HA_MANUAL_FAILOVER","Stepped down to "+(r.role||"passive")+(r.peerPromoted?"; peer promoted to epoch "+(r.peerEpoch||"?"):"; peer will promote via detection"));
+                  setHaManualFailover(false);
+                });
+              }}>{haManualFailover?"Failing over...":"Manual Failover"}</Btn>
+              <Btn disabled={haTestRunning} onClick={()=>{
+                setHaTestRunning(true);setHaTestResults(null);
+                api.post("/api/ha/test-failover",{}).then(r=>{
+                  if(r&&r.error){window.alert("Self-test: "+r.error);addA("HA_TEST_COMPLETE","Self-test failed: "+r.error);}
+                  else{setHaTestResults(Object.assign({ts:new Date().toISOString()},r));addA("HA_TEST_COMPLETE","Self-test: failover "+r.failoverTimeMs+"ms, served="+r.served+", integrity="+r.integrityOk+", restored="+r.restored);}
+                  setHaTestRunning(false);
+                });
+              }}>{haTestRunning?"Testing...":"Run Failover Self-Test"}</Btn>
             </div>
             {haTestResults&&(<Card style={{padding:12,borderColor:C.a+"30"}}>
-              <div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:6}}>Last Test: {new Date(haTestResults.ts).toLocaleString()}</div>
-              <M style={{color:C.tm,lineHeight:1.8}}>Failover time: {haTestResults.failoverTimeMs}ms · Replication lag: {haTestResults.replicationLag}ms · Data integrity: {haTestResults.dataIntegrity} · Sessions preserved: {haTestResults.sessionsPreserved?"yes":"no"} · API availability during test: {haTestResults.apiAvailability} · Rollback to original active: {haTestResults.rollbackSuccess?"success":"failed"}</M>
+              <div style={{fontSize:12,fontWeight:500,color:C.a,marginBottom:6}}>Last self-test - {new Date(haTestResults.ts).toLocaleString()}</div>
+              <M style={{color:C.tm,lineHeight:1.8}}>Failover: {haTestResults.failoverTimeMs}ms / Failback: {haTestResults.failbackTimeMs}ms / Standby served: {haTestResults.served?"yes":"no"} / Data integrity: {haTestResults.integrityOk?"verified":"MISMATCH"} / Restored to this node: {haTestResults.restored?"yes":"no"} / Epoch: {haTestResults.epoch}</M>
             </Card>)}
-            <M style={{color:C.td,display:"block",marginTop:8,fontStyle:"italic"}}>Failover tests should be run in production — that's the only way to validate real failover behavior. The test promotes the passive, verifies it works, then rolls back to the original active. During the test, fail-open routing ensures no ticket disruption. For active-active mode, there is no failover gap — the load balancer simply stops routing to the failed node.</M>
+            <M style={{color:C.td,display:"block",marginTop:8,lineHeight:1.7}}>The self-test runs a real drill from the active: it steps down, promotes the standby over the peer link, measures the actual failover time, verifies the standby served and the data checksum matched, then fails back to this node, reporting the measured numbers rather than an estimate. Failover operations require configuration to be unlocked.</M>
+          </Card>
+
+          <Card style={{padding:12,borderColor:C.i+"30"}}>
+            <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>What this gives you</M>
+            <M style={{color:C.tm,lineHeight:1.8}}>Near-synchronous replication over the mTLS peer link with a bounded recovery point (seconds of data, not zero). On active failure the standby promotes automatically and the SOC keeps operating; this automates the restore-from-backup recovery so a lead never has to provision and restore by hand. It is not a zero-downtime or zero-data-loss guarantee, and there is a brief ~15-45s window dominated by failure detection. Sessions and Tier-1 data carry across because the passive holds a pre-wrapped key it unseals at promotion, so there is no re-enrollment and no posture weakening to achieve it.</M>
           </Card>
         </div>)}
 
@@ -8587,33 +8670,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <div style={{display:"flex",gap:8,marginTop:8}}><Btn primary onClick={saveTransferMech}>Save Mechanism</Btn><Btn onClick={()=>setResModal(null)}>Cancel</Btn></div>
           </Modal>}
 
-        </div>)}
-
-        {/* ══════════ v1.0.0 — CLUSTER / SCALING ══════════ */}
-        {tab==="cluster"&&(<div>
-          <L>Cluster & Scaling Configuration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>For large deployments (hundreds or thousands of analysts), deploy FireAlive as a multi-node cluster. Active-active clusters distribute load across nodes with shared session state. Supports horizontal scaling, parallel processing, and segmented management console teams.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={clusterCfg.enabled} onChange={e=>setClusterCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable cluster mode</label>
-            <Sel label="Cluster mode" value={clusterCfg.mode} onChange={e=>setClusterCfg(prev=>({...prev,mode:e.target.value}))}>
-              <option value="active_passive">Active/Passive (2 nodes, failover)</option>
-              <option value="active_active">Active/Active (all nodes serve traffic)</option>
-              <option value="segmented">Segmented (each MC manages a subset of analysts)</option>
-            </Sel>
-            <Input label="Node count" value={clusterCfg.nodeCount} onChange={e=>setClusterCfg(prev=>({...prev,nodeCount:parseInt(e.target.value)||2}))} type="number"/>
-            <Sel label="Session store (required for active-active)" value={clusterCfg.sessionStore} onChange={e=>setClusterCfg(prev=>({...prev,sessionStore:e.target.value}))}>
-              <option value="redis">Redis</option><option value="memcached">Memcached</option><option value="postgres">PostgreSQL</option><option value="dynamodb">DynamoDB</option>
-            </Sel>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:12,marginBottom:8}}>Parallel Processing</div>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}><input type="checkbox" checked={clusterCfg.parallelProcessing} onChange={e=>setClusterCfg(prev=>({...prev,parallelProcessing:e.target.checked}))}/><M style={{color:C.t}}>Enable Node.js worker threads for CPU-intensive tasks (report generation, encryption, integrity checks)</M></label>
-            <Input label="Worker threads per node" value={clusterCfg.workerThreads} onChange={e=>setClusterCfg(prev=>({...prev,workerThreads:parseInt(e.target.value)||4}))} type="number"/>
-            <M style={{color:C.td,display:"block",marginTop:8,fontStyle:"italic"}}>Node.js is single-threaded by default. Worker threads parallelize CPU-bound work (encryption, report generation) across cores. For I/O-bound work (API calls, DB queries), Node's event loop already handles concurrency well.</M>
-          </Card>
-          <Card style={{padding:12,borderColor:C.i+"30",marginBottom:16}}>
-            <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Segmented Mode</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>In segmented mode, multiple Management Consoles each manage a subset of analysts (e.g., by region, shift, or team). All nodes share a single database cluster but each MC sees only its assigned analysts. A "Global Dashboard" (see Global Dashboard tab) can aggregate read-only data from all segments for executive visibility.</M>
-          </Card>
-          <Btn primary onClick={()=>addA("CLUSTER_CONFIG_SAVED","Cluster config saved — mode: "+clusterCfg.mode+", nodes: "+clusterCfg.nodeCount)}>Save Cluster Config</Btn>
         </div>)}
 
         {/* ══════════ v1.0.0 — GLOBAL DASHBOARD ══════════ */}
@@ -9415,7 +9471,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {cat:"Analysts & Wellbeing",items:[{n:"Skills Matrix",d:"Team skill coverage across 16 categories. Identifies gaps for training planning."},{n:"Assessments",d:"Create and assign skills assessments. Track results with progress bars."},{n:"Certifications",d:"Upload and track industry certs (CompTIA, ISACA, ISC², GIAC, etc.)."},{n:"CISM Retro",d:"Post-incident retrospective protocol following Mitchell's CISM model. 24hr/48-72hr/7-day check-ins."},{n:"Peer Config",d:"Configure peer skill-share scheduling windows, session limits, and helper leaderboard."},{n:"Pseudonyms",d:"Decouple analyst identity from burnout data. All data stored under pseudonyms. Mapping exportable for offline storage."},{n:"Proactive Breaks",d:"Sonnentag research-based: suggest breaks after prolonged high-severity work. Requires your approval before notification sent to analyst."},{n:"Upskilling Hour",d:"Dedicate one hour per shift to professional development. Routing pauses automatically. Research shows this reduces turnover by 20-30%."},{n:"Offboarding",d:"Securely deprovision analysts. Revokes keys, archives data, cancels peer sessions, notifies SOAR."}]},
             {cat:"Integrations",items:[{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
             {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
-            {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive or active/active failover with manual failover and testing."},{n:"Cluster / Scaling",d:"Multi-node deployment for large SOCs (hundreds of analysts)."}]},
+            {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive failover with automated promotion, manual failover, and a measured self-test."}]},
             {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Assign each analyst a home country and geo-fence logins against the country observed from their source IP, with trusted-network allow-listing and time-boxed exceptions."}]},
             {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"50 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
           ].map(cat=>(

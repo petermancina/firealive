@@ -2718,6 +2718,78 @@ class RegressionRunner {
       if (!gb.CONFIG_TABLE_KEYS.includes('ha_config')) throw new Error('ha_config missing from golden baseline');
       return 'cluster_config absent; ha_config present';
     });
+    await check('high_availability', 'Scheduler HA tick re-registration API present', () => {
+      const { schedulerService } = require('./scheduler');
+      const need = ['_registerHaJobs', 'reloadHaJobs', '_haIntervals'];
+      const missing = need.filter(f => typeof schedulerService[f] !== 'function');
+      if (missing.length > 0) throw new Error('scheduler missing: ' + missing.join(', '));
+      return need.length + ' method(s) present';
+    });
+    await check('high_availability', 'Liveness tracker records and snapshots', () => {
+      const hl = require('./ha/ha-liveness');
+      const need = ['recordClientRequest', 'recordPeerContact', 'snapshot'];
+      const missing = need.filter(f => typeof hl[f] !== 'function');
+      if (missing.length > 0) throw new Error('ha-liveness missing: ' + missing.join(', '));
+      hl.recordClientRequest();
+      hl.recordPeerContact();
+      const snap = hl.snapshot();
+      if (!snap || !Number.isFinite(Date.parse(snap.lastClientRequestAt)) || !Number.isFinite(Date.parse(snap.lastPeerContactAt))) {
+        throw new Error('snapshot did not return parseable timestamps');
+      }
+      return 'snapshot returns lastClientRequestAt + lastPeerContactAt';
+    });
+    await check('high_availability', 'Detector threshold honors configured heartbeat interval', () => {
+      const hf = require('./ha/ha-failover');
+      const mem = cloneLiveSchema(this.db);
+      try {
+        mem.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)")
+          .run(JSON.stringify({ enabled: true, heartbeatIntervalSec: 11, missCount: 4 }));
+        const cfg = hf.getFailoverConfig(mem);
+        if (cfg.heartbeatIntervalSec !== 11) {
+          throw new Error('getFailoverConfig ignored heartbeatIntervalSec (got ' + cfg.heartbeatIntervalSec + ')');
+        }
+        return 'config heartbeatIntervalSec=11 flows to the detector';
+      } finally {
+        mem.close();
+      }
+    });
+    await check('high_availability', 'Self-fence abstains without two signals and fences on dual isolation', () => {
+      const hf = require('./ha/ha-failover');
+      const isoSec = 30;
+      const stale = new Date(Date.now() - (isoSec + 120) * 1000).toISOString();
+      const fresh = new Date().toISOString();
+      const setup = () => {
+        const mem = cloneLiveSchema(this.db);
+        mem.prepare("INSERT OR REPLACE INTO ha_node (id, role) VALUES ('self', 'active')").run();
+        mem.prepare("INSERT OR REPLACE INTO ha_lease (id, holder, epoch, term_started_at) VALUES ('current', 'self', 1, datetime('now'))").run();
+        mem.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)")
+          .run(JSON.stringify({ enabled: true, selfFenceTimeoutSec: isoSec }));
+        return mem;
+      };
+      // 1. No signals -> insufficient_signal: never fence a node that may be serving.
+      let mem = setup();
+      try {
+        const r = hf.checkSelfFence(mem, {});
+        if (r.fenced !== false || r.reason !== 'insufficient_signal') {
+          throw new Error('null signals must not fence (got ' + JSON.stringify(r) + ')');
+        }
+      } finally { mem.close(); }
+      // 2. One fresh signal -> not isolated, no fence.
+      mem = setup();
+      try {
+        const r = hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: fresh });
+        if (r.fenced !== false) throw new Error('a fresh client signal must not fence (got ' + JSON.stringify(r) + ')');
+      } finally { mem.close(); }
+      // 3. Both signals stale -> fence and demote to passive.
+      mem = setup();
+      try {
+        const r = hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: stale });
+        if (r.fenced !== true) throw new Error('dual isolation must fence (got ' + JSON.stringify(r) + ')');
+        const role = mem.prepare("SELECT role FROM ha_node WHERE id = 'self'").get().role;
+        if (role !== 'passive') throw new Error('self-fence did not demote to passive (role=' + role + ')');
+      } finally { mem.close(); }
+      return 'abstains on null/single signal; fences + demotes on dual isolation';
+    });
 
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;

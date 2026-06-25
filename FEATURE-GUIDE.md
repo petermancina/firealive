@@ -794,29 +794,24 @@ The full operator runbook — the passthrough requirement and why, the connector
 
 ### High Availability
 
-**What it’s for:** HA configuration with two supported topologies: active/passive (one server handles all traffic with a passive standby continuously replicating; failover happens when active fails health checks) and active/active (both servers handle traffic simultaneously, sharing session state). Synchronous replication keeps data consistent. The MC is decoupled from the backend — it talks to whichever server is currently reachable behind the load balancer, so failover is transparent to the lead.
+**What it’s for:** A warm standby and automated failover for the regional server. One node runs **active** and serves the SOC; a second runs **passive**, sealed and kept current over a mutually authenticated peer link, ready to take over. The topology is active/passive — a single sole-writer active and one warm passive — by design: FireAlive seals analyst-private data under keys the management tier cannot reach, and promotion unseals a pre-wrapped key only by proving the standby is the genuine anchored node, so two simultaneous writers (active/active) are ruled out rather than offered. What decides who may write is an internal **cryptographic lease at a monotonically increasing epoch**, enforced at the data layer, the scheduler, and the request layer. Your organization’s load balancer routes client traffic to whichever node is reachable and nothing more — so a flapping or even compromised balancer can affect availability but can never create split-brain, because a node that does not hold the lease will refuse to write.
 
-For larger deployments needing more than two servers, use the Cluster / Scaling feature instead.
+**What it does, honestly:** Replication is **near-synchronous** — the standby is kept within seconds of the active, not locked to it transaction-for-transaction — so the recovery point is a few seconds of unshipped writes, not zero. Failover is bounded but not instantaneous: typically on the order of fifteen to forty-five seconds, dominated by the detection wait. This replaces slow manual restore-from-backup with an automatic promotion that completes in under a minute; it is not a zero-downtime, zero-data-loss guarantee, and the tab’s copy says so.
 
-**Workflow:**
+**Detection and safeguards:** The active delivers a heartbeat every heartbeat interval; the passive promotes after it misses the configured count in a row (≈ miss-count × heartbeat interval). A recovered former active adopts the higher epoch and steps down rather than competing; a promotion cooldown blocks back-to-back promotions; and an **isolation self-fence** demotes an active that has been cut off from both its peer and its clients past the self-fence timeout — fencing only when both signals are stale, and never within a grace window after a node takes the lease.
 
-1. Lead opens HA Configuration
-1. Picks mode (active/passive or active/active)
-1. Configures secondary server endpoint, replication interval, health check interval/path
-1. For active/active: configures shared session store (Redis required)
-1. Once configured: replication is continuous
-1. If active fails (active/passive): passive promotes within seconds, MC reconnects automatically, lead is notified — but the SOC keeps operating
-
-### Cluster / Scaling
-
-**What it’s for:** For large deployments (hundreds or thousands of analysts), deploy FireAlive as a multi-node active-active cluster. Distributes load, supports horizontal scaling, supports segmenting different team-lead views.
+**Self-test:** The tab runs a real, measured failover-and-failback drill against the live pair and reports the actual milliseconds, whether the standby served, whether integrity held, and whether the original was restored — so the failover window is a number you measure, not one you take on faith.
 
 **Workflow:**
 
-1. Lead opens Cluster tab
-1. Picks cluster mode (active-active multi-node)
-1. Sets node count, session store (Redis required for active-active), worker threads per node
-1. Cluster comes online, load balancer distributes incoming connections
+1. Lead opens HA Configuration and enables HA
+1. Sets this node’s endpoint and the peer endpoint, then pairs the standby with a one-time token over the mutual-TLS peer link
+1. Tunes the live knobs as needed — sync interval, heartbeat interval, miss count, lease TTL, promotion cooldown, self-fence timeout — which take effect without a restart
+1. Replication runs continuously; the standby stays within seconds of the active
+1. Runs the self-test to confirm the pair is genuinely ready and to learn the real failover time
+1. If the active fails, the passive promotes itself within the detection window, the load balancer routes to it, and the SOC keeps operating
+
+The full operator runbook — the lease/epoch authority, pairing and the wrapped-key exchange, replication and the bounded recovery point, detection and the safeguards, the configurable knobs, and the troubleshooting steps — is in `docs/high-availability.md`.
 
 ### CI/CD
 
@@ -1256,7 +1251,7 @@ Second — and more importantly — it tracks in granular detail which TYPES of 
 
 - **Toggle** — the 18 lead-settable features (peer chat, peer board, peer skill-share scheduling, box breathing, lighter-queue requests, pseudonymous lead chat (Signal E2EE), proactive break interventions, upskilling hour, helper pay, burnout-aware routing, IR simulator, recovery runbook, skills & assessments, training & certs, professional certifications, calendar integration, TTX generator, CI/CD pipelines). Toggles default on except CI/CD, which defaults off.
 - **Locked** — security, integrity, safety, and compliance capabilities (analyst pseudonyms, audit log, log integrity, MFA, tripwire, insider-threat protocol, SOAR/EDR/threat-hunting, vulnerability scanning, enterprise KMS, backups, restore, peer abuse flagging, and more). These appear in the toggle list as permanently on with a short reason, and the update API rejects any attempt to disable them — a feature whose removal would lower the SOC’s defenses can never be turned off, even by a forged request.
-- **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA and clustering, and so on). These have no switch.
+- **Core** — structural scaffolding (impact feed, shift handoff, ticketing, SIEM feed, reporting engine, the global dashboard, HA, and so on). These have no switch.
 
 **Before you turn anything off:** FireAlive is most effective at reducing burnout when every analyst-facing capability is active — they reinforce one another, and the research treats them as a system rather than a menu of extras. The switches exist because every SOC is different: some adopt everything at once, others introduce capabilities gradually or run a subset that fits their environment and their people’s readiness. Toggling a feature off tailors FireAlive to your organization; it does not mean the feature is optional to the mission. Nothing is deleted when a feature is off. The optimal configuration is everything on.
 
@@ -1755,7 +1750,7 @@ Self-monitoring of the GD server.
 
 Connect GD to org’s monitoring stack so compromise of the GD itself is detected.
 
-### IAM & Access / MFA / Posture / WiFi / Compromise Scan / Vulnerability Scan / Regression Test / Cloud & IaC / SDN-SASE / HA & Clustering / Backup / Data Sovereignty / Recertification / Troubleshooter / App Updates
+### IAM & Access / MFA / Posture / WiFi / Compromise Scan / Vulnerability Scan / Regression Test / Cloud & IaC / SDN-SASE / HA / Backup / Data Sovereignty / Recertification / Troubleshooter / App Updates
 
 Same purposes as MC equivalents but scoped to the GD server (which is independent infrastructure separate from the regional MC). The GD Troubleshooter, though, is rule-based only — the Global Dashboard runs no model — and returns the same kind of structured findings, without an AI summary.
 

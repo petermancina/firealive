@@ -15,7 +15,7 @@
 // endpoints share a common shape but use different prefixes and allowlists:
 //
 //   AC events → /api/audit/event   → prefix AC_  → 16-entry wellness/nav allowlist
-//   MC events → /api/audit/mc-event → prefix MC_ → 62-entry operator-action allowlist
+//   MC events → /api/audit/mc-event → prefix MC_ → 59-entry operator-action allowlist
 //   server-middleware events → no prefix → captured by auditMiddleware
 //
 // Why one physical audit_log table with prefix-based source distinction
@@ -99,11 +99,8 @@ const ALLOWED_EVENT_TYPES = new Set([
   'VIRT_CONFIGURED',
   'VULNSCAN_CONFIG_SAVED',
   'VULN_SCAN_ALL_CLIENTS',
-  // High availability + failover
+  // Fail-open routing
   'FAILOPEN_CONFIG_SAVED',
-  'HA_MANUAL_FAILOVER',
-  'HA_TEST_COMPLETE',
-  'HA_TEST_STARTED',
   // Geo / location
   'GEO_CONFIG_SAVED',
   // Handoffs + shift transitions

@@ -196,6 +196,19 @@ app.use('/api/', require('./middleware/sase-fail-safe').saseFailSafe());
 // uncertainty. Placed pre-auth because the check is on node role, not the user.
 app.use('/api/', require('./middleware/ha-write-guard').haWriteGuard());
 
+// B5o: HA liveness. Stamp the last real client API request so the active's
+// self-fence (ha-failover.checkSelfFence) can tell whether the SOC is still
+// reaching this node. Excludes the peer control plane (/api/ha/peer/*, which is
+// peer-to-peer, not a client) and the health endpoint (load-balancer probes).
+// Bookkeeping only; never blocks a request.
+const haLiveness = require('./services/ha/ha-liveness');
+app.use('/api/', (req, res, next) => {
+  if (!req.path.startsWith('/api/ha/peer') && req.path !== '/api/system/health') {
+    try { haLiveness.recordClientRequest(); } catch (_) { /* never block on liveness bookkeeping */ }
+  }
+  next();
+});
+
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
 // ── B5b: public CA certificate distribution ─────────────────────────────────

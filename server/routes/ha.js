@@ -40,6 +40,7 @@ const DEFAULT_HA_CONFIG = {
   leaseTtlSec: 30,
   missCount: 3,
   promotionCooldownSec: 60,
+  selfFenceTimeoutSec: 60,
 };
 
 function loadHaConfig(db) {
@@ -116,6 +117,9 @@ router.put('/config', requireObjectBody, (req, res) => {
     const merged = Object.assign({}, DEFAULT_HA_CONFIG, req.body);
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(merged));
     auditLog(actor(req), 'HA_CONFIG_UPDATED', 'Mode: active_passive, enabled: ' + (merged.enabled ? 'yes' : 'no'), req.ip);
+    // Apply the new intervals live: re-register the HA scheduler ticks so a
+    // changed heartbeat/replication interval takes effect without a restart.
+    try { require('../services/scheduler').schedulerService.reloadHaJobs(); } catch (reloadErr) { /* scheduler not running; next start reads the saved config */ }
     res.json({ success: true });
   } catch (saveErr) {
     res.status(500).json({ error: 'Failed to save HA config' });

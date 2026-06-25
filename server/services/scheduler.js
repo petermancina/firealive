@@ -11,6 +11,9 @@ const notifications = require('./notifications');
 
 const schedulerService = {
   jobs: [],
+  haTimers: [],
+  _haHeartbeatBusy: false,
+  _haShipBusy: false,
 
   start() {
     // ── Expire lighter queue requests ────────────────────────────────────
@@ -598,115 +601,13 @@ const schedulerService = {
       }
     }));
 
-    // -- HA: active lease-renewal heartbeat + delivery (B5o) --
-    // No-op unless HA is enabled AND paired. The active renews its own lease
-    // each tick so the validity window the write-authority gate consults stays
-    // fresh, then delivers the heartbeat to the passive over the peer link so
-    // the passive's failure detector sees a live signal. If the reply carries
-    // a higher epoch this node has been superseded (the passive promoted): it
-    // adopts that epoch and reconciles, self-demoting to passive.
-    this.jobs.push(cron.schedule('*/5 * * * * *', async () => {
-      try {
-        const { getDb } = require('../db/init');
-        const db = getDb();
-        try {
-          const ctx = this.haReplicationContext(db);
-          if (ctx && ctx.role === 'active') {
-            const ttl = (ctx.cfg.leaseTtlSec && ctx.cfg.leaseTtlSec > 0) ? ctx.cfg.leaseTtlSec : 30;
-            db.prepare(
-              "UPDATE ha_lease SET last_heartbeat_at = datetime('now'), lease_expires_at = datetime('now', ?) WHERE id = 'current' AND holder = 'self'"
-            ).run('+' + ttl + ' seconds');
-            const haLease = require('./ha/ha-lease');
-            const haPeerLink = require('./ha/ha-peer-link');
-            const localEpoch = haLease.currentEpoch(db);
-            const lease = haLease.getLease(db) || {};
-            try {
-              const reply = await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', {
-                epoch: localEpoch,
-                leaseExpiresAt: lease.lease_expires_at || null
-              }, {});
-              const peerEpoch = reply && reply.json && reply.json.epoch;
-              if (peerEpoch && localEpoch && peerEpoch > localEpoch) {
-                haLease.recordPeerHeartbeat(db, peerEpoch, null);
-                require('./ha/ha-failover').reconcileRole(db);
-              }
-            } catch (sendErr) {
-              // Passive unreachable this tick; it runs its own detector. Not fatal.
-            }
-          }
-        } finally {
-          db.close();
-        }
-      } catch (err) {
-        logger.error('Scheduler: HA heartbeat failed', { error: err.message });
-      }
-    }));
-
-    // -- HA: replication shipping (B5o) --
-    // Active only. Ships pending journal rows to the paired passive; a no-op
-    // when nothing is pending. A peer rejection (stale epoch) is logged here;
-    // self-demotion on supersession arrives in a later phase.
-    this.jobs.push(cron.schedule('*/5 * * * * *', async () => {
-      try {
-        const { getDb } = require('../db/init');
-        const db = getDb();
-        try {
-          const ctx = this.haReplicationContext(db);
-          if (ctx && ctx.role === 'active') {
-            const haReplication = require('./ha/ha-replication');
-            const haPeerLink = require('./ha/ha-peer-link');
-            await haReplication.shipOnce(db, haPeerLink.peerSender(db, '/api/ha/peer/replicate'));
-          }
-        } finally {
-          db.close();
-        }
-      } catch (err) {
-        logger.error('Scheduler: HA replication shipping failed', { error: err.message });
-      }
-    }));
-
-    // -- HA: replication lag update (B5o) --
-    // Refreshes ha_replication_state.lag_seconds (and last_journaled_lsn) so
-    // GET /ha/status reports real lag. No-op unless HA is enabled AND paired.
-    this.jobs.push(cron.schedule('*/15 * * * * *', () => {
-      try {
-        const { getDb } = require('../db/init');
-        const db = getDb();
-        try {
-          const ctx = this.haReplicationContext(db);
-          if (ctx) {
-            require('./ha/ha-replication').computeLag(db);
-          }
-        } finally {
-          db.close();
-        }
-      } catch (err) {
-        logger.error('Scheduler: HA lag update failed', { error: err.message });
-      }
-    }));
-
-    // -- HA: failure detection / promotion evaluation (B5o) --
-    // Passive only. When the active's delivered heartbeat has gone stale past
-    // the configured miss-count, evaluatePromotion claims the next epoch,
-    // installs the sealed promotion material, and flips this node to active.
-    // No-op unless HA is enabled AND paired, and a no-op on the active; the
-    // cooldown / peer-presence / active-healthy guards live in ha-failover.
-    this.jobs.push(cron.schedule('*/5 * * * * *', () => {
-      try {
-        const { getDb } = require('../db/init');
-        const db = getDb();
-        try {
-          const ctx = this.haReplicationContext(db);
-          if (ctx && ctx.role === 'passive') {
-            require('./ha/ha-failover').evaluatePromotion(db, {});
-          }
-        } finally {
-          db.close();
-        }
-      } catch (err) {
-        logger.error('Scheduler: HA failure detection failed', { error: err.message });
-      }
-    }));
+    // -- HA jobs (B5o): heartbeat + self-fence, failure detection, replication
+    // shipping, and lag refresh. Registered via setInterval at config-driven
+    // periods (heartbeat/detect at heartbeatIntervalSec, ship at syncIntervalSec)
+    // and tracked in haTimers so reloadHaJobs() can re-register them live on a
+    // config change. Each tick self-gates by role and no-ops unless HA is
+    // enabled AND paired.
+    this._registerHaJobs();
 
     logger.info(`Scheduler started with ${this.jobs.length} jobs (email pipeline interval: ${emailIntervalSec}s)`);
   },
@@ -775,6 +676,187 @@ const schedulerService = {
       return true;
     }
   },
+  // -- HA jobs (B5o): config-driven, re-registerable lifecycle --
+  //
+  // The HA ticks run on setInterval at config-driven periods (heartbeat and
+  // failure detection at heartbeatIntervalSec, replication shipping at
+  // syncIntervalSec, lag refresh at a fixed 15s), tracked separately in
+  // haTimers so reloadHaJobs() can tear them down and re-register on a config
+  // change without a restart -- mirroring the backupJobs separate-lifecycle
+  // pattern. Periods are clamped to [1, 3600]s so a bad or imported config can
+  // never spin a tight loop or stall delivery. Every tick self-gates by role
+  // via haReplicationContext and no-ops unless HA is enabled AND paired.
+  _haIntervals() {
+    let cfg = {};
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const row = db.prepare("SELECT value FROM config WHERE key = 'ha_config'").get();
+        if (row) { try { cfg = JSON.parse(row.value) || {}; } catch (parseErr) { cfg = {}; } }
+      } finally {
+        db.close();
+      }
+    } catch (readErr) {
+      cfg = {};
+    }
+    const clamp = (v, dflt) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1) return dflt;
+      return Math.min(Math.floor(n), 3600);
+    };
+    return {
+      heartbeatSec: clamp(cfg.heartbeatIntervalSec, 5),
+      syncSec: clamp(cfg.syncIntervalSec, 5),
+      lagSec: 15,
+    };
+  },
+
+  _registerHaJobs() {
+    const iv = this._haIntervals();
+    this.haTimers.push(setInterval(() => { this._haHeartbeatTick(); }, iv.heartbeatSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haDetectTick(); }, iv.heartbeatSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haShipTick(); }, iv.syncSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haLagTick(); }, iv.lagSec * 1000));
+    logger.info(`HA jobs registered (heartbeat/detect ${iv.heartbeatSec}s, ship ${iv.syncSec}s, lag ${iv.lagSec}s)`);
+  },
+
+  // Re-register the HA ticks with the current config intervals. Called from
+  // PUT /ha/config so an interval change takes effect live, no restart.
+  reloadHaJobs() {
+    try { this.haTimers.forEach(t => clearInterval(t)); } catch (clearErr) { /* ignore */ }
+    this.haTimers = [];
+    this._registerHaJobs();
+  },
+
+  // Active only: renew the lease (keeping the write-authority validity window
+  // fresh), deliver the heartbeat to the passive over the peer link (recording
+  // peer contact on success), self-demote if the reply carries a higher epoch
+  // (the passive promoted), then run the isolation self-fence.
+  async _haHeartbeatTick() {
+    if (this._haHeartbeatBusy) return;
+    this._haHeartbeatBusy = true;
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const ctx = this.haReplicationContext(db);
+        if (ctx && ctx.role === 'active') {
+          const ttl = (ctx.cfg.leaseTtlSec && ctx.cfg.leaseTtlSec > 0) ? ctx.cfg.leaseTtlSec : 30;
+          db.prepare(
+            "UPDATE ha_lease SET last_heartbeat_at = datetime('now'), lease_expires_at = datetime('now', ?) WHERE id = 'current' AND holder = 'self'"
+          ).run('+' + ttl + ' seconds');
+          const haLease = require('./ha/ha-lease');
+          const haPeerLink = require('./ha/ha-peer-link');
+          const haLiveness = require('./ha/ha-liveness');
+          const localEpoch = haLease.currentEpoch(db);
+          const lease = haLease.getLease(db) || {};
+          try {
+            const reply = await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', {
+              epoch: localEpoch,
+              leaseExpiresAt: lease.lease_expires_at || null
+            }, {});
+            haLiveness.recordPeerContact();
+            const peerEpoch = reply && reply.json && reply.json.epoch;
+            if (peerEpoch && localEpoch && peerEpoch > localEpoch) {
+              haLease.recordPeerHeartbeat(db, peerEpoch, null);
+              require('./ha/ha-failover').reconcileRole(db);
+            }
+          } catch (sendErr) {
+            // Passive unreachable this tick; it runs its own detector. Not fatal.
+          }
+          // Isolation self-fence, gated by a grace window since this node took
+          // the lease so a freshly promoted active is not demoted on stale
+          // liveness before traffic/peer contact resumes. Age is computed in SQL
+          // (UTC-safe) from term_started_at; checkSelfFence then demotes only
+          // when BOTH client and peer signals are present and stale.
+          try {
+            const graceSec = (ctx.cfg.selfFenceTimeoutSec && ctx.cfg.selfFenceTimeoutSec > 0) ? ctx.cfg.selfFenceTimeoutSec : 60;
+            const ageRow = db.prepare(
+              "SELECT CAST((julianday('now') - julianday(term_started_at)) * 86400 AS REAL) AS age FROM ha_lease WHERE id = 'current'"
+            ).get();
+            const ageSec = (ageRow && Number.isFinite(ageRow.age)) ? ageRow.age : null;
+            if (ageSec !== null && ageSec > graceSec) {
+              require('./ha/ha-failover').checkSelfFence(db, haLiveness.snapshot());
+            }
+          } catch (fenceErr) {
+            // Self-fence is a safety net; never let it disrupt the heartbeat.
+          }
+        }
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      logger.error('Scheduler: HA heartbeat failed', { error: err.message });
+    } finally {
+      this._haHeartbeatBusy = false;
+    }
+  },
+
+  // Passive only: when the active's delivered heartbeat has gone stale past the
+  // configured miss-count, evaluatePromotion claims the next epoch, installs the
+  // sealed promotion material, and flips this node to active.
+  _haDetectTick() {
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const ctx = this.haReplicationContext(db);
+        if (ctx && ctx.role === 'passive') {
+          require('./ha/ha-failover').evaluatePromotion(db, {});
+        }
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      logger.error('Scheduler: HA failure detection failed', { error: err.message });
+    }
+  },
+
+  // Active only: ship pending journal rows to the paired passive; a no-op when
+  // nothing is pending.
+  async _haShipTick() {
+    if (this._haShipBusy) return;
+    this._haShipBusy = true;
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const ctx = this.haReplicationContext(db);
+        if (ctx && ctx.role === 'active') {
+          const haReplication = require('./ha/ha-replication');
+          const haPeerLink = require('./ha/ha-peer-link');
+          await haReplication.shipOnce(db, haPeerLink.peerSender(db, '/api/ha/peer/replicate'));
+        }
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      logger.error('Scheduler: HA replication shipping failed', { error: err.message });
+    } finally {
+      this._haShipBusy = false;
+    }
+  },
+
+  // Refreshes ha_replication_state.lag_seconds so GET /ha/status reports real
+  // lag. No-op unless HA is enabled AND paired.
+  _haLagTick() {
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        const ctx = this.haReplicationContext(db);
+        if (ctx) {
+          require('./ha/ha-replication').computeLag(db);
+        }
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      logger.error('Scheduler: HA lag update failed', { error: err.message });
+    }
+  },
+
   stop() {
     this.jobs.forEach(j => j.stop());
     for (const job of this.backupJobs.values()) {
@@ -782,6 +864,8 @@ const schedulerService = {
     }
     this.backupJobs.clear();
     this._lastBackupSignature = null;
+    this.haTimers.forEach(t => clearInterval(t));
+    this.haTimers = [];
     this.jobs = [];
     logger.info('Scheduler stopped');
   },
