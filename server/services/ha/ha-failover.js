@@ -33,7 +33,7 @@ const { auditLog } = require('../../middleware/audit');
 
 const DEFAULTS = {
   leaseTtlSec: 30,
-  healthCheckIntervalSec: 5,
+  heartbeatIntervalSec: 5,
   missCount: 3,
   promotionCooldownSec: 60,
   selfFenceTimeoutSec: 60,
@@ -59,7 +59,7 @@ function getFailoverConfig(db) {
   }
   return {
     leaseTtlSec: num(cfg.leaseTtlSec, DEFAULTS.leaseTtlSec),
-    healthCheckIntervalSec: num(cfg.healthCheckIntervalSec, DEFAULTS.healthCheckIntervalSec),
+    heartbeatIntervalSec: num(cfg.heartbeatIntervalSec, DEFAULTS.heartbeatIntervalSec),
     missCount: num(cfg.missCount, DEFAULTS.missCount),
     promotionCooldownSec: num(cfg.promotionCooldownSec, DEFAULTS.promotionCooldownSec),
     selfFenceTimeoutSec: num(cfg.selfFenceTimeoutSec, DEFAULTS.selfFenceTimeoutSec),
@@ -96,7 +96,7 @@ function activeIsDown(db, cfg) {
   if (!Number.isFinite(last)) {
     return false;
   }
-  const thresholdMs = cfg.missCount * cfg.healthCheckIntervalSec * 1000;
+  const thresholdMs = cfg.missCount * cfg.heartbeatIntervalSec * 1000;
   return (Date.now() - last) > thresholdMs;
 }
 
