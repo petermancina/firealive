@@ -38,11 +38,23 @@ const {
 const failures = [];
 const fail = (m) => failures.push(m);
 
-// Mixed routers whose config endpoints must be represented in the registry.
+// Mixed routers (config writes interleaved with operational actions) whose
+// config endpoints are represented in the registry at the endpoint level. Each
+// is paired with the mount prefix it is applied at in server/index.js so a
+// route's full /api path can be reconstructed. The v0NN feature routers mount
+// at the bare /api; the dedicated HA router mounts at /api/ha and is a mixed
+// router too -- its sole config write (PUT /api/ha/config) is gated by an
+// endpoint entry, not by prefix, so the emergency manual-failover /
+// test-failover / pair actions on the same router stay ungated.
 const FEATURE_IDS = ['021', '022', '023', '024', '025', '027', '030'];
-const FEATURE_FILES = FEATURE_IDS.map((n) =>
-  path.join(SERVER, 'routes', `v${n}-features.js`)
-);
+const MIXED_ROUTERS = [
+  ...FEATURE_IDS.map((n) => ({
+    file: path.join(SERVER, 'routes', `v${n}-features.js`),
+    mount: '/api',
+    label: `v${n}-features`,
+  })),
+  { file: path.join(SERVER, 'routes', 'ha.js'), mount: '/api/ha', label: 'ha' },
+];
 
 const ROUTE_RE = /router\.(put|post|patch|delete)\(\s*['"]([^'"]+)['"]/g;
 
@@ -56,15 +68,19 @@ function routesIn(file) {
   return out;
 }
 
-// Gather every mutating route in the feature routers as full /api paths.
+// Gather every mutating route in the mixed routers as full /api paths.
 const featureRoutes = [];
-for (const file of FEATURE_FILES) {
-  if (!fs.existsSync(file)) {
-    fail(`feature router missing: ${path.relative(ROOT, file)}`);
+for (const r of MIXED_ROUTERS) {
+  if (!fs.existsSync(r.file)) {
+    fail(`mixed router missing: ${path.relative(ROOT, r.file)}`);
     continue;
   }
-  for (const r of routesIn(file)) {
-    featureRoutes.push({ method: r.method, fullPath: '/api' + r.rel, file });
+  for (const route of routesIn(r.file)) {
+    featureRoutes.push({
+      method: route.method,
+      fullPath: r.mount + route.rel,
+      file: r.file,
+    });
   }
 }
 
@@ -116,6 +132,18 @@ for (const n of FEATURE_IDS) {
   } else if (!line.includes('configLockChokepoint()')) {
     fail(`feature router not gated by chokepoint in index.js: v${n}-features`);
   }
+}
+
+// The HA mixed router is mounted by property (ha.configRouter) rather than by a
+// require() expression, so it is checked explicitly: its config mount must sit
+// behind the chokepoint, keeping PUT /api/ha/config gated.
+const haMount = indexLines.find(
+  (l) => l.includes('ha.configRouter') && l.includes('app.use(')
+);
+if (!haMount) {
+  fail('HA config router mount not found in index.js: ha.configRouter');
+} else if (!haMount.includes('configLockChokepoint()')) {
+  fail('HA config router not gated by chokepoint in index.js: ha.configRouter');
 }
 
 if (failures.length > 0) {

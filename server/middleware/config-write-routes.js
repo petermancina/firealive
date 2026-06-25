@@ -77,7 +77,6 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/ha/config' },
   { method: 'PUT',  path: '/api/fail-open/config' },
   { method: 'PUT',  path: '/api/pseudonyms/config' },
-  { method: 'PUT',  path: '/api/cluster/config' },
   { method: 'PUT',  path: '/api/global-dashboard/config' },
   { method: 'PUT',  path: '/api/sync-interval/config' },
   { method: 'PUT',  path: '/api/proactive/config' },
