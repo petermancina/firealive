@@ -8274,6 +8274,107 @@ function initDb() {
     console.error('The server will start, but hardware-credential login hardening is not in place: the trusted-root tables or the webauthn_credentials hardware columns may be missing, so hardware-gated passkey enrollment and login cannot function. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB.');
   }
 
+  // ── B5o migration: High Availability / failover control plane ─────
+  // B5o builds active/passive HA: a sole-writer active replicates to a warm,
+  // sealed passive that auto-promotes on active failure. These tables are the
+  // HA control plane and are inert until HA is enabled and the node is paired.
+  // ha_node holds this node's HA role plus its X25519 replication key-agreement
+  // keypair (public in the clear, private sealed to local hardware) and the
+  // shared Tier-1 KEK pre-wrapped to this node, unsealed only at promotion.
+  // ha_peer pins the single paired peer (its anchor, its anchor-signed wrap key,
+  // and its mTLS client-cert thumbprint). ha_lease carries the monotonic epoch:
+  // only the current-epoch lease holder may write, and a BEFORE UPDATE trigger
+  // forbids the epoch from ever decreasing (the fence against a stale active).
+  // ha_replication_journal is the logical change-log produced on the active by
+  // change-data-capture triggers (added in a later commit) and shipped to the
+  // passive; it is transport, never itself replicated. ha_replication_state is
+  // the ship/apply cursor plus lag. None of these tables are replicated to the
+  // peer -- they are node-local control plane. All idempotent: CREATE TABLE /
+  // CREATE TRIGGER / CREATE INDEX IF NOT EXISTS make re-running initDb a no-op.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ha_node (
+        id TEXT PRIMARY KEY DEFAULT 'self' CHECK (id = 'self'),
+        role TEXT NOT NULL DEFAULT 'standalone' CHECK (role IN ('standalone', 'active', 'passive')),
+        wrap_public_pem TEXT,
+        wrap_private_sealed TEXT,
+        wrap_pubkey_anchor_sig TEXT,
+        sealed_promotion_kek TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS ha_peer (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        peer_endpoint TEXT NOT NULL,
+        peer_anchor_fingerprint TEXT NOT NULL,
+        peer_anchor_public_pem TEXT NOT NULL,
+        peer_wrap_public_pem TEXT NOT NULL,
+        peer_cert_fingerprint TEXT NOT NULL,
+        peer_ca_pem TEXT,
+        status TEXT NOT NULL DEFAULT 'pairing' CHECK (status IN ('pairing', 'paired', 'revoked')),
+        paired_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(peer_anchor_fingerprint)
+      );
+
+      CREATE TABLE IF NOT EXISTS ha_lease (
+        id TEXT PRIMARY KEY DEFAULT 'current' CHECK (id = 'current'),
+        epoch INTEGER NOT NULL DEFAULT 0,
+        holder TEXT NOT NULL DEFAULT 'none' CHECK (holder IN ('self', 'peer', 'none')),
+        lease_expires_at TEXT,
+        last_heartbeat_at TEXT,
+        term_started_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TRIGGER IF NOT EXISTS ha_lease_epoch_monotonic
+        BEFORE UPDATE ON ha_lease
+        WHEN NEW.epoch < OLD.epoch
+        BEGIN SELECT RAISE(ABORT, 'ha_lease epoch must not decrease'); END;
+
+      CREATE TABLE IF NOT EXISTS ha_replication_journal (
+        lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch INTEGER NOT NULL,
+        txn_marker TEXT,
+        table_name TEXT NOT NULL,
+        op TEXT NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+        pk_json TEXT NOT NULL,
+        row_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        shipped INTEGER NOT NULL DEFAULT 0 CHECK (shipped IN (0, 1))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ha_repl_journal_unshipped
+        ON ha_replication_journal(shipped, lsn);
+
+      CREATE TABLE IF NOT EXISTS ha_replication_state (
+        id TEXT PRIMARY KEY DEFAULT 'self' CHECK (id = 'self'),
+        last_journaled_lsn INTEGER NOT NULL DEFAULT 0,
+        last_shipped_lsn INTEGER NOT NULL DEFAULT 0,
+        last_acked_lsn INTEGER NOT NULL DEFAULT 0,
+        last_applied_lsn INTEGER NOT NULL DEFAULT 0,
+        last_apply_at TEXT,
+        lag_seconds REAL NOT NULL DEFAULT 0,
+        baseline_at TEXT
+      );
+    `);
+
+    // Additive column for B5o cert hardening: the paired peer's CA certificate,
+    // pinned (with the leaf fingerprint) so the peer links validate the chain
+    // instead of disabling certificate validation. Idempotent so an already-
+    // migrated ha_peer gains the column without a table rebuild.
+    const haPeerCols = db.prepare('PRAGMA table_info(ha_peer)').all().map(function (c) { return c.name; });
+    if (haPeerCols.indexOf('peer_ca_pem') === -1) {
+      db.exec('ALTER TABLE ha_peer ADD COLUMN peer_ca_pem TEXT');
+    }
+    const haTableCount = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name IN ('ha_node', 'ha_peer', 'ha_lease', 'ha_replication_journal', 'ha_replication_state')").get().c;
+    console.log(`B5o migration: HA control-plane tables ready (${haTableCount} ha_* table(s) present)`);
+  } catch (b5oHaMigrationErr) {
+    console.error('B5o HA control-plane migration FAILED:', b5oHaMigrationErr.message);
+    console.error('The server will start, but High Availability is not in place: the ha_node / ha_peer / ha_lease / ha_replication_journal / ha_replication_state tables may be missing, so pairing, replication, and automated failover cannot function. Recovery: run the CREATE TABLE / CREATE TRIGGER statements above in a SQLite shell against the production DB.');
+  }
+
   console.log('Database initialized at', DB_PATH);
   require('./seed-training-library').seedTrainingLibrary(db);
   require('./seed-fido-roots').seedFidoRoots(db);

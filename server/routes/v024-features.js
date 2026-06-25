@@ -284,31 +284,6 @@ const REMEDIATION_MAP = {
   minTlsVersion: 'Update TLS configuration to minimum required version',
 };
 
-// ── High Availability ───────────────────────────────────────────────────────
-router.get('/ha/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = db.prepare("SELECT value FROM config WHERE key = 'ha_config'").get();
-    db.close();
-    res.json(cfg ? JSON.parse(cfg.value) : { enabled: false, mode: 'active_passive' });
-  } catch (e) { res.status(500).json({ error: 'Failed to load HA config' }); }
-});
-
-router.put('/ha/config', requireObjectBody, (req, res) => {
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(req.body));
-    auditLog(req.user?.id || 'system', 'HA_CONFIG_UPDATED', `Mode: ${req.body.mode}`);
-    db.close();
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Failed to save HA config' }); }
-});
-
-router.get('/ha/status', (req, res) => {
-  // In production: checks replication lag, failover endpoint health, etc.
-  res.json({ role: 'active', replicationLag: 0, peerHealthy: true, lastSync: new Date().toISOString() });
-});
-
 // ── Fail-Open Routing ───────────────────────────────────────────────────────
 router.get('/fail-open/config', (req, res) => {
   try {

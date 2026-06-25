@@ -26,6 +26,8 @@ const { logger } = require('./services/logger');
 const { auditMiddleware } = require('./middleware/audit');
 const { authMiddleware } = require('./middleware/auth');
 const { configLockChokepoint } = require('./middleware/config-lock');
+const ha = require('./routes/ha');
+const { requirePeerCert } = require('./services/ha/ha-peer-link');
 const { schedulerService } = require('./services/scheduler');
 const { networkHardening, antiEnumerationErrors, validatePortBinding } = require('./middleware/network-hardening');
 const { bandwidthMonitor } = require('./services/bandwidth-monitor');
@@ -109,7 +111,15 @@ app.use(cors({
 }));
 
 app.use(compression());
-app.use(express.json({ limit: '5mb' }));
+// Global JSON body parser. /api/ha/peer/* (replication batches and the base64
+// pairing baseline) can exceed this limit and is parsed with a larger limit at
+// its own mount, after the peer-certificate gate; skip it here so the global
+// limit does not reject those bodies first.
+const jsonBodyParser = express.json({ limit: '5mb' });
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/ha/peer')) return next();
+  return jsonBodyParser(req, res, next);
+});
 
 // Rate limiting
 //
@@ -292,6 +302,16 @@ app.use('/api/inbox/admin', authMiddleware(['admin']), require('./routes/notific
 app.use('/api/users/me/lead-contacts', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/lead-contacts'));
 app.use('/api/helper-pay', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/helper-pay'));
 app.use('/api/heartbeat', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/heartbeat'));
+// ── High Availability (B5o) ───────────────────────────────
+// Mounted before the catch-all /api routers and the /api/ha config router so
+// Express matches these more specific paths first. The peer endpoints use the
+// pinned-peer-certificate gate (NOT JWT) and a large body limit for replication
+// and the pairing baseline; pair-init is token-authenticated in the handler
+// (NOT JWT, NOT pinned, since the pin does not exist until pairing completes);
+// config/status/pair use the same JWT + config-lock chokepoint as v024/v025.
+app.use('/api/ha/peer', requirePeerCert(getDb), express.json({ limit: '256mb' }), ha.peerRouter);
+app.use('/api/ha/pair-init', ha.pairInitRouter);
+app.use('/api/ha', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), ha.configRouter);
 app.use('/api', authMiddleware(['lead', 'admin']), configLockChokepoint(), require('./routes/v021-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), require('./routes/v022-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), require('./routes/v023-features'));

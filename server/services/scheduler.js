@@ -585,9 +585,96 @@ const schedulerService = {
       }
     }));
 
+    // -- HA: active lease-renewal heartbeat (B5o) --
+    // No-op unless HA is enabled AND paired. The active renews its own lease
+    // each tick so the validity window the write-authority gate consults stays
+    // fresh. Delivering this heartbeat to the passive and the passive's
+    // failure-detection / promotion arrive in a later phase.
+    this.jobs.push(cron.schedule('*/5 * * * * *', () => {
+      try {
+        const { getDb } = require('../db/init');
+        const db = getDb();
+        try {
+          const ctx = this.haReplicationContext(db);
+          if (ctx && ctx.role === 'active') {
+            const ttl = (ctx.cfg.leaseTtlSec && ctx.cfg.leaseTtlSec > 0) ? ctx.cfg.leaseTtlSec : 30;
+            db.prepare(
+              "UPDATE ha_lease SET last_heartbeat_at = datetime('now'), lease_expires_at = datetime('now', ?) WHERE id = 'current' AND holder = 'self'"
+            ).run('+' + ttl + ' seconds');
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        logger.error('Scheduler: HA heartbeat failed', { error: err.message });
+      }
+    }));
+
+    // -- HA: replication shipping (B5o) --
+    // Active only. Ships pending journal rows to the paired passive; a no-op
+    // when nothing is pending. A peer rejection (stale epoch) is logged here;
+    // self-demotion on supersession arrives in a later phase.
+    this.jobs.push(cron.schedule('*/5 * * * * *', async () => {
+      try {
+        const { getDb } = require('../db/init');
+        const db = getDb();
+        try {
+          const ctx = this.haReplicationContext(db);
+          if (ctx && ctx.role === 'active') {
+            const haReplication = require('./ha/ha-replication');
+            const haPeerLink = require('./ha/ha-peer-link');
+            await haReplication.shipOnce(db, haPeerLink.peerSender(db, '/api/ha/peer/replicate'));
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        logger.error('Scheduler: HA replication shipping failed', { error: err.message });
+      }
+    }));
+
+    // -- HA: replication lag update (B5o) --
+    // Refreshes ha_replication_state.lag_seconds (and last_journaled_lsn) so
+    // GET /ha/status reports real lag. No-op unless HA is enabled AND paired.
+    this.jobs.push(cron.schedule('*/15 * * * * *', () => {
+      try {
+        const { getDb } = require('../db/init');
+        const db = getDb();
+        try {
+          const ctx = this.haReplicationContext(db);
+          if (ctx) {
+            require('./ha/ha-replication').computeLag(db);
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        logger.error('Scheduler: HA lag update failed', { error: err.message });
+      }
+    }));
+
     logger.info(`Scheduler started with ${this.jobs.length} jobs (email pipeline interval: ${emailIntervalSec}s)`);
   },
 
+  // Cheap gate for the HA jobs: returns null (a no-op signal) unless HA is
+  // enabled in config AND a peer is paired; otherwise returns the node role.
+  // Any error (e.g. HA tables absent on a fresh DB) is treated as "not
+  // configured" so the jobs stay silent until HA is set up.
+  haReplicationContext(db) {
+    try {
+      const row = db.prepare("SELECT value FROM config WHERE key = 'ha_config'").get();
+      if (!row) return null;
+      let cfg;
+      try { cfg = JSON.parse(row.value) || {}; } catch (parseErr) { return null; }
+      if (!cfg.enabled) return null;
+      const peer = db.prepare("SELECT status FROM ha_peer WHERE status = 'paired' LIMIT 1").get();
+      if (!peer) return null;
+      const node = db.prepare("SELECT role FROM ha_node WHERE id = 'self'").get() || { role: 'standalone' };
+      return { cfg: cfg, role: node.role };
+    } catch (ctxErr) {
+      return null;
+    }
+  },
   stop() {
     this.jobs.forEach(j => j.stop());
     for (const job of this.backupJobs.values()) {
