@@ -15,6 +15,7 @@ const schedulerService = {
   start() {
     // ── Expire lighter queue requests ────────────────────────────────────
     this.jobs.push(cron.schedule('*/5 * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const db = getDb();
@@ -39,6 +40,7 @@ const schedulerService = {
     // the abuse evidence vault, so this sweep never destroys material a reviewer
     // still needs.
     this.jobs.push(cron.schedule('* * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         this.sweepEphemeralChatRetention();
       } catch (err) {
@@ -55,6 +57,7 @@ const schedulerService = {
     // copy of flagged content, so this sweep can never destroy material a
     // lead still needs. Daily is ample for a 7-day window.
     this.jobs.push(cron.schedule('30 3 * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const db = getDb();
@@ -100,6 +103,7 @@ const schedulerService = {
     // sweeper does NOT create a security gap; the row is still
     // unusable at restore time.
     this.jobs.push(cron.schedule('0 * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const approvalsSvc = require('./restore-approvals');
@@ -158,6 +162,7 @@ const schedulerService = {
 
     // ── Scheduled report generation ──────────────────────────────────────
     this.jobs.push(cron.schedule('0 * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const db = getDb();
@@ -206,6 +211,7 @@ const schedulerService = {
     // operator-acceptable.
     this._registerBackupJobs();
     this.jobs.push(cron.schedule('* * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       this._maybeReloadBackupJobs();
     }));
 
@@ -240,6 +246,7 @@ const schedulerService = {
       }
     })();
     this.jobs.push(cron.schedule(chainVerifierSchedule, () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { runScheduledVerification } = require('./chain-verifier');
         runScheduledVerification({ verifier: 'scheduled' });
@@ -271,6 +278,7 @@ const schedulerService = {
     // sees catastrophic failures (DB unreachable, etc.).
     const pushRetrySchedule = process.env.BACKUP_PUSH_RETRY_SCHEDULE || '15 * * * *';
     this.jobs.push(cron.schedule(pushRetrySchedule, async () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const backupPush = require('./backup-push');
@@ -302,6 +310,7 @@ const schedulerService = {
       ? `*/${Math.floor(emailIntervalSec / 60)} * * * *`
       : '* * * * *';
     this.jobs.push(cron.schedule(emailCronExpr, async () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { processQueue } = require('./notifications-pipeline');
         const stats = await processQueue();
@@ -333,6 +342,7 @@ const schedulerService = {
       ? `*/${Math.floor(smsIntervalSec / 60)} * * * *`
       : '* * * * *';
     this.jobs.push(cron.schedule(smsCronExpr, async () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { processSmsQueue } = require('./notifications-sms');
         const stats = await processSmsQueue();
@@ -362,6 +372,7 @@ const schedulerService = {
     const aitFreshnessSec = aitIntervalSec * 2;
     let aitRunning = false;
     this.jobs.push(cron.schedule(aitCron, async () => {
+      if (!this.mayRunWriteJob()) return;
       if (aitRunning) return; // internal LLM is serial -- never overlap cycles
       aitRunning = true;
       const { getDb } = require('../db/init');
@@ -415,6 +426,7 @@ const schedulerService = {
     // the configured interval, default 90 days), notifies every lead and
     // admin so they can run the recert workflow.
     this.jobs.push(cron.schedule('0 9 * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { checkRecertDue } = require('./recertification');
         const status = checkRecertDue();
@@ -477,6 +489,7 @@ const schedulerService = {
     // Per-policy enqueue errors are logged but don't stop the loop —
     // other policies still get their scheduled refills even if one fails.
     this.jobs.push(cron.schedule('0 * * * *', () => {
+      if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
         const oodaJobs = require('./ooda-generation-jobs');
@@ -585,12 +598,14 @@ const schedulerService = {
       }
     }));
 
-    // -- HA: active lease-renewal heartbeat (B5o) --
+    // -- HA: active lease-renewal heartbeat + delivery (B5o) --
     // No-op unless HA is enabled AND paired. The active renews its own lease
     // each tick so the validity window the write-authority gate consults stays
-    // fresh. Delivering this heartbeat to the passive and the passive's
-    // failure-detection / promotion arrive in a later phase.
-    this.jobs.push(cron.schedule('*/5 * * * * *', () => {
+    // fresh, then delivers the heartbeat to the passive over the peer link so
+    // the passive's failure detector sees a live signal. If the reply carries
+    // a higher epoch this node has been superseded (the passive promoted): it
+    // adopts that epoch and reconciles, self-demoting to passive.
+    this.jobs.push(cron.schedule('*/5 * * * * *', async () => {
       try {
         const { getDb } = require('../db/init');
         const db = getDb();
@@ -601,6 +616,23 @@ const schedulerService = {
             db.prepare(
               "UPDATE ha_lease SET last_heartbeat_at = datetime('now'), lease_expires_at = datetime('now', ?) WHERE id = 'current' AND holder = 'self'"
             ).run('+' + ttl + ' seconds');
+            const haLease = require('./ha/ha-lease');
+            const haPeerLink = require('./ha/ha-peer-link');
+            const localEpoch = haLease.currentEpoch(db);
+            const lease = haLease.getLease(db) || {};
+            try {
+              const reply = await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', {
+                epoch: localEpoch,
+                leaseExpiresAt: lease.lease_expires_at || null
+              }, {});
+              const peerEpoch = reply && reply.json && reply.json.epoch;
+              if (peerEpoch && localEpoch && peerEpoch > localEpoch) {
+                haLease.recordPeerHeartbeat(db, peerEpoch, null);
+                require('./ha/ha-failover').reconcileRole(db);
+              }
+            } catch (sendErr) {
+              // Passive unreachable this tick; it runs its own detector. Not fatal.
+            }
           }
         } finally {
           db.close();
@@ -653,6 +685,29 @@ const schedulerService = {
       }
     }));
 
+    // -- HA: failure detection / promotion evaluation (B5o) --
+    // Passive only. When the active's delivered heartbeat has gone stale past
+    // the configured miss-count, evaluatePromotion claims the next epoch,
+    // installs the sealed promotion material, and flips this node to active.
+    // No-op unless HA is enabled AND paired, and a no-op on the active; the
+    // cooldown / peer-presence / active-healthy guards live in ha-failover.
+    this.jobs.push(cron.schedule('*/5 * * * * *', () => {
+      try {
+        const { getDb } = require('../db/init');
+        const db = getDb();
+        try {
+          const ctx = this.haReplicationContext(db);
+          if (ctx && ctx.role === 'passive') {
+            require('./ha/ha-failover').evaluatePromotion(db, {});
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        logger.error('Scheduler: HA failure detection failed', { error: err.message });
+      }
+    }));
+
     logger.info(`Scheduler started with ${this.jobs.length} jobs (email pipeline interval: ${emailIntervalSec}s)`);
   },
 
@@ -673,6 +728,51 @@ const schedulerService = {
       return { cfg: cfg, role: node.role };
     } catch (ctxErr) {
       return null;
+    }
+  },
+
+  // Single source of truth for "may this node write?", shared with the data
+  // layer (ha-lease.assertWriteAuthority/iAmActive). Suppress autonomous
+  // scheduler work ONLY when positively confirmed a paired passive; fail OPEN
+  // on every other case (standalone, HA tables absent, probe error) so
+  // single-node deployments are never affected. A paired active is allowed
+  // only while it still holds a valid current-epoch lease -- one that has lost
+  // it is suppressed until it demotes.
+  haWriteAuthority(db) {
+    const ctx = this.haReplicationContext(db);
+    if (!ctx) {
+      return true;
+    }
+    if (ctx.role === 'passive') {
+      return false;
+    }
+    if (ctx.role === 'active') {
+      try {
+        return require('./ha/ha-lease').iAmActive(db);
+      } catch (leaseErr) {
+        return true;
+      }
+    }
+    return true;
+  },
+
+  // Self-contained write-authority probe for the cron callbacks: opens a
+  // short-lived connection, asks haWriteAuthority, closes it. A passive (or an
+  // active that has lost its lease) returns false and the calling job skips,
+  // so it never double-sends notifications, regenerates rows the active will
+  // overwrite via replication, or runs scheduled backups. Fails OPEN on any
+  // error: a probe failure must never freeze a standalone node's jobs.
+  mayRunWriteJob() {
+    try {
+      const { getDb } = require('../db/init');
+      const db = getDb();
+      try {
+        return this.haWriteAuthority(db);
+      } finally {
+        db.close();
+      }
+    } catch (probeErr) {
+      return true;
     }
   },
   stop() {
@@ -818,6 +918,7 @@ const schedulerService = {
     }
     try {
       const job = cron.schedule(cronExpr, () => {
+        if (!this.mayRunWriteJob()) return;
         this._runBackupJob(schedule.id);
       });
       this.backupJobs.set(schedule.id, job);
@@ -835,6 +936,7 @@ const schedulerService = {
   _registerLegacyEnvBackupJob(cronExpr) {
     try {
       const job = cron.schedule(cronExpr, () => {
+        if (!this.mayRunWriteJob()) return;
         try {
           logger.info('Starting legacy env-var scheduled backup');
           const { performBackup } = require('./backup');

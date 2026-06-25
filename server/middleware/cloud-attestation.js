@@ -324,48 +324,10 @@ function verifyPeerAttestation(assertion, opts) {
   return result;
 }
 
-// Produce THIS host's confidential-VM attestation for sending to a peer (the
-// peer verifies it with verifyPeerAttestation). The report is fetched from this
-// host's kernel bound to opts.nonce -- in HA pairing the nonce is derived from
-// the one-time pairing token both sides share, which gives anti-replay without an
-// extra handshake round-trip. opts (all optional): probe, tsmReader, tsmPath,
-// nonce. Returns { tech, report (hex), auxblob (hex), nonce (hex) }, or { error }
-// when this host is not a confidential guest or the report cannot be fetched.
-function produceAttestation(opts) {
-  const options = opts || {};
-  const probe = options.probe || defaultProbe();
-  const cc = detectConfidentialComputing(probe);
-  if (!cc.present) {
-    return { error: 'no confidential-computing guest detected; cannot produce an attestation' };
-  }
-  if (cc.tech === CC_NITRO && !probe.exists(SEV_SNP_GUEST_DEVICES[0])) {
-    return { error: 'Nitro Enclaves is enclave-scoped, not a whole-VM confidential guest' };
-  }
-  const nonce = options.nonce ? toBuf(options.nonce) : crypto.randomBytes(NONCE_LEN);
-  const tsm = options.tsmReader || defaultTsmReader();
-  let fetched;
-  try {
-    fetched = tsm.fetch(nonce, options.tsmPath);
-  } catch (e) {
-    return { error: 'attestation report fetch failed (configfs-tsm): ' + e.message };
-  }
-  const provider = (fetched.provider || '').toLowerCase();
-  let tech = cc.tech;
-  if (provider.indexOf('sev') !== -1) tech = CC_SEV_SNP;
-  else if (provider.indexOf('tdx') !== -1) tech = CC_TDX;
-  return {
-    tech: tech,
-    report: fetched.report.toString('hex'),
-    auxblob: (fetched.auxblob || Buffer.alloc(0)).toString('hex'),
-    nonce: nonce.toString('hex'),
-  };
-}
-
 module.exports = {
   detectConfidentialComputing,
   verifyAttestation,
   verifyPeerAttestation,
-  produceAttestation,
   extractVcekFromAuxblob,
   derCertToPem,
   CC_SEV_SNP,

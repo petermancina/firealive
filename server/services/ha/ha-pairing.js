@@ -36,6 +36,9 @@ const haCdc = require('./ha-cdc');
 const haReplication = require('./ha-replication');
 const { auditLog } = require('../../middleware/audit');
 const ca = require('../ca');
+const mode = require('../deployment-mode');
+const cloudAttestation = require('../cloud-attestation');
+const haModes = require('./ha-modes');
 
 const TOKEN_CONFIG_KEY = 'ha_pairing_token';
 const DEFAULT_TOKEN_TTL_SEC = 900;
@@ -101,7 +104,27 @@ function consumePairingToken(db, token) {
 // Identity bundle + verification + pinning.
 // ---------------------------------------------------------------------------
 
-function buildIdentityBundle(db, selfEndpoint) {
+// The attestation challenge nonce is derived from the one-time pairing token
+// both sides share, so each node's confidential-VM report is bound to THIS
+// pairing (anti-replay) without an extra handshake round-trip. 64 bytes.
+function attestationNonce(token) {
+  return crypto.createHash('sha512').update(String(token || ''), 'utf8').digest();
+}
+
+// Build the peer-attestation assertion ha-modes verifies: the peer's asserted
+// report plus the nonce WE expect (from the shared token), so the report must be
+// bound to this pairing.
+function peerAttestationAssertion(peerBundle, token) {
+  const att = (peerBundle && peerBundle.attestation) || {};
+  return {
+    tech: att.tech,
+    report: att.report,
+    auxblob: att.auxblob,
+    expectedNonce: attestationNonce(token).toString('hex'),
+  };
+}
+
+function buildIdentityBundle(db, selfEndpoint, attestNonce) {
   haKeys.ensureWrapKeypair(db);
   const wrap = haKeys.getLocalWrapPublic(db);
   const id = anchor.load({ db: db });
@@ -114,7 +137,7 @@ function buildIdentityBundle(db, selfEndpoint) {
   // relay cannot swap the advertised CA: the peer verifies this signature before
   // storing the CA it will later pin for the reverse-direction link.
   const bindingSig = anchor.sign({ db: db, data: certBindingData(caCertPem, certThumbprint) });
-  return {
+  const bundle = {
     anchorPublicPem: id.publicKey,
     anchorFingerprint: id.fingerprint,
     wrapPublicPem: wrap.wrapPublicPem,
@@ -124,6 +147,14 @@ function buildIdentityBundle(db, selfEndpoint) {
     certBindingSig: bindingSig ? bindingSig.toString('base64') : null,
     endpoint: selfEndpoint || null,
   };
+  // Cloud Mode: attach this host's confidential-VM attestation bound to the
+  // pairing-token nonce so the peer can verify it. produceAttestation returns
+  // { error } if this host cannot attest; the bundle carries that and the peer's
+  // gate refuses -- fail closed, never silently omit the proof.
+  if (attestNonce && mode.isCloud(db)) {
+    bundle.attestation = cloudAttestation.produceAttestation({ nonce: attestNonce });
+  }
+  return bundle;
 }
 
 function certBindingData(caCertPem, certThumbprint) {
@@ -332,7 +363,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
   const peerCaCertPem = boot.caCertPem;
   const peerLeafThumb = (boot.leafThumbprint || '').toLowerCase();
   const selfEndpoint = (opts && opts.selfEndpoint) || null;
-  const myBundle = buildIdentityBundle(db, selfEndpoint);
+  const myBundle = buildIdentityBundle(db, selfEndpoint, attestationNonce(boot.token));
   const init = await pairingRequest(peerEndpoint, { token: boot.token, bundle: myBundle }, peerCaCertPem, peerLeafThumb, opts);
   const peerBundle = init.json && init.json.bundle;
   if (!verifyPeerBundle(peerBundle)) {
@@ -343,6 +374,10 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
   if (peerBundle.caCertPem !== peerCaCertPem || (peerBundle.certThumbprint || '').toLowerCase() !== peerLeafThumb) {
     throw new Error('ha-pairing: peer identity does not match pairing code');
   }
+  // Per-mode gate: in Cloud Mode both peers must be attested confidential VMs
+  // (verifies the local node AND the peer's asserted report). Throws -> pairing
+  // aborts. No-op in bare-metal / virtualized / sdn.
+  haModes.assertModePairingAllowed(db, peerAttestationAssertion(peerBundle, boot.token));
   if (!peerBundle.endpoint) {
     peerBundle.endpoint = peerEndpoint;
   }
@@ -361,6 +396,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
   }
 
   finalizeRole(db, 'active', opts);
+  try { haModes.registerHaSegments(db); } catch (segErr) { /* SDN segment registration is best-effort */ }
   try { auditLog(null, 'HA_PAIRED', 'Paired with standby ' + peerEndpoint + ' (this node active)', null); } catch (auditErr) { /* ignore */ }
   return { role: 'active', peerEndpoint: peerEndpoint, peerFingerprint: peerBundle.anchorFingerprint };
 }
@@ -378,8 +414,15 @@ function respondToPairInit(db, body, clientCertThumbprint, opts) {
   if (peerBundle.certThumbprint && clientCertThumbprint && peerBundle.certThumbprint.toLowerCase() !== clientCertThumbprint) {
     return { ok: false, status: 400, error: 'peer certificate thumbprint mismatch' };
   }
+  // Per-mode gate (Cloud Mode): verify the local node + the initiator's asserted
+  // attestation before pinning. Refuse pairing if either fails.
+  try {
+    haModes.assertModePairingAllowed(db, peerAttestationAssertion(peerBundle, body.token));
+  } catch (gateErr) {
+    return { ok: false, status: 403, error: gateErr.message };
+  }
   pinPeer(db, peerBundle, clientCertThumbprint, 'pairing');
-  const myBundle = buildIdentityBundle(db, (opts && opts.selfEndpoint) || null);
+  const myBundle = buildIdentityBundle(db, (opts && opts.selfEndpoint) || null, attestationNonce(body.token));
   return { ok: true, status: 200, bundle: myBundle };
 }
 
@@ -397,6 +440,7 @@ function receiveBaseline(db, snapshotB64, opts) {
   try {
     restoreBaseline(db, tmp, opts);
     finalizeRole(db, 'passive', opts);
+    try { haModes.registerHaSegments(db); } catch (segErr) { /* SDN segment registration is best-effort */ }
   } finally {
     try { fs.unlinkSync(tmp); } catch (unlinkErr) { /* ignore */ }
   }

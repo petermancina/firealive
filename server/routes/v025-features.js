@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIREALIVE v0.0.25 — New Routes
-// Adds: pseudonym system, data sovereignty/geo-fencing, cluster config,
+// Adds: pseudonym system, data sovereignty/geo-fencing,
 // global dashboard, enhanced backup schedules, sync interval config
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -73,26 +73,6 @@ router.post('/pseudonyms/rotate-all', (req, res) => {
     db.close();
     res.json({ success: true, rotated: analysts.length });
   } catch (e) { res.status(500).json({ error: 'Failed to rotate pseudonyms' }); }
-});
-
-// ── Cluster Configuration ───────────────────────────────────────────────────
-router.get('/cluster/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = db.prepare("SELECT value FROM config WHERE key = 'cluster_config'").get();
-    db.close();
-    res.json(cfg ? JSON.parse(cfg.value) : { enabled: false, mode: 'active_active', nodeCount: 2 });
-  } catch (e) { res.status(500).json({ error: 'Failed to load cluster config' }); }
-});
-
-router.put('/cluster/config', requireObjectBody, (req, res) => {
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cluster_config', ?)").run(JSON.stringify(req.body));
-    auditLog(req.user?.id || 'system', 'CLUSTER_CONFIG_UPDATED', `Mode: ${req.body.mode}, nodes: ${req.body.nodeCount}`);
-    db.close();
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: 'Failed to save cluster config' }); }
 });
 
 // ── Global Dashboard Config ─────────────────────────────────────────────────
@@ -189,39 +169,6 @@ router.put('/sync-interval/config', requireObjectBody, (req, res) => {
     } catch (refreshErr) { /* non-fatal */ }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save sync interval config' }); }
-});
-
-// ── HA Enhanced Endpoints ───────────────────────────────────────────────────
-router.post('/ha/manual-failover', (req, res) => {
-  try {
-    const db = getDb();
-    auditLog(req.user?.id || 'system', 'HA_MANUAL_FAILOVER', 'Manual failover initiated by Team Lead');
-    // In production: sends promote command to passive node, updates LB config
-    db.close();
-    res.json({ success: true, newActive: 'passive_promoted', previousActive: 'demoted_to_passive' });
-  } catch (e) { res.status(500).json({ error: 'Manual failover failed' }); }
-});
-
-router.post('/ha/test-failover', (req, res) => {
-  try {
-    const db = getDb();
-    auditLog(req.user?.id || 'system', 'HA_FAILOVER_TEST_STARTED', 'Failover test initiated');
-    // In production: promotes passive, validates, then rolls back
-    db.close();
-    // Simulated test result
-    res.json({
-      success: true,
-      results: {
-        failoverTimeMs: 1247,
-        replicationLag: 0,
-        dataIntegrity: 'verified',
-        sessionsPreserved: true,
-        apiAvailability: '100%',
-        rollbackSuccess: true,
-        testedAt: new Date().toISOString()
-      }
-    });
-  } catch (e) { res.status(500).json({ error: 'Failover test failed' }); }
 });
 
 module.exports = router;

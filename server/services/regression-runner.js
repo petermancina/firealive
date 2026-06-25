@@ -2659,6 +2659,66 @@ class RegressionRunner {
       return sm.transfers + ' transfer(s), ' + sm.documented + ' documented, ' + sm.blocked + ' blocked';
     });
 
+    // -- Category: High Availability / Failover (B5o) --
+    await check('high_availability', 'HA tables present', () => {
+      return requireAll(['ha_node', 'ha_peer', 'ha_lease', 'ha_replication_journal', 'ha_replication_state']);
+    });
+    await check('high_availability', 'Lease epoch monotonic trigger present', () => {
+      const row = this.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='ha_lease_epoch_monotonic'").get();
+      if (!row) throw new Error('missing trigger ha_lease_epoch_monotonic');
+      return 'trigger present';
+    });
+    await check('high_availability', 'Write-authority gate API present', () => {
+      const hl = require('./ha/ha-lease');
+      const need = ['assertWriteAuthority', 'iAmActive', 'currentEpoch', 'renewLease', 'recordPeerHeartbeat', 'claimNextEpoch'];
+      const missing = need.filter(f => typeof hl[f] !== 'function');
+      if (missing.length > 0) throw new Error('ha-lease missing: ' + missing.join(', '));
+      return need.length + ' function(s) present';
+    });
+    await check('high_availability', 'Write authority is a no-op on a standalone node', () => {
+      const hl = require('./ha/ha-lease');
+      // A standalone DB (no ha_node self row) must NEVER have writes refused:
+      // assertWriteAuthority returns silently rather than throwing. This guards
+      // the fail-open property that keeps single-node deployments writable.
+      hl.assertWriteAuthority(this.db);
+      return 'standalone write allowed (no throw)';
+    });
+    await check('high_availability', 'Failover promotion API present', () => {
+      const hf = require('./ha/ha-failover');
+      const need = ['evaluatePromotion', 'promote', 'demote', 'reconcileRole', 'activeIsDown', 'checkSelfFence'];
+      const missing = need.filter(f => typeof hf[f] !== 'function');
+      if (missing.length > 0) throw new Error('ha-failover missing: ' + missing.join(', '));
+      return need.length + ' function(s) present';
+    });
+    await check('high_availability', 'HA route module loads', () => {
+      const r = require('../routes/ha');
+      if (typeof r !== 'function') throw new Error('route is not an express router');
+      return 'router exported';
+    });
+    await check('high_availability', 'Scheduler HA write gate present', () => {
+      const { schedulerService } = require('./scheduler');
+      const need = ['haReplicationContext', 'haWriteAuthority', 'mayRunWriteJob'];
+      const missing = need.filter(f => typeof schedulerService[f] !== 'function');
+      if (missing.length > 0) throw new Error('scheduler missing: ' + missing.join(', '));
+      return need.length + ' method(s) present';
+    });
+    await check('high_availability', 'Request-layer write guard present and fails open on standalone', () => {
+      const g = require('../middleware/ha-write-guard');
+      if (typeof g.haWriteGuard !== 'function' || typeof g.isConfirmedPassive !== 'function') {
+        throw new Error('ha-write-guard API missing');
+      }
+      // On a standalone node the guard must NOT classify it as a passive.
+      if (g.isConfirmedPassive(this.db) !== false) throw new Error('standalone misclassified as passive');
+      return 'guard present; standalone not blocked';
+    });
+    await check('high_availability', 'Cluster config removed from golden baseline (absence)', () => {
+      const gb = require('./golden-baseline');
+      if (!Array.isArray(gb.CONFIG_TABLE_KEYS)) throw new Error('CONFIG_TABLE_KEYS not exported');
+      if (gb.CONFIG_TABLE_KEYS.includes('cluster_config')) throw new Error('cluster_config still present in golden baseline');
+      if (!gb.CONFIG_TABLE_KEYS.includes('ha_config')) throw new Error('ha_config missing from golden baseline');
+      return 'cluster_config absent; ha_config present';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

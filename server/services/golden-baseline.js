@@ -165,7 +165,6 @@ const CONFIG_TABLE_KEYS = [
   'alert_webhook_url',
   'auth_log_notif_config',
   'auto_disable_routing_config',
-  'cluster_config',
   'config_snapshot_retention',
   'fail_open_config',
   'gd_push_schedule',

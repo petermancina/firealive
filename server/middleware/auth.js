@@ -8,8 +8,19 @@ const { logger } = require('../services/logger');
 const devicePop = require('../services/device-pop');
 const deviceKey = require('../services/device-key');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_INSECURE_DEFAULT';
+let JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_INSECURE_DEFAULT';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '15m';
+
+// Install a runtime JWT signing/validation secret. Used at HA promotion: the
+// promoted passive unseals the shared JWT_SECRET (wrapped to its hardware at
+// pairing) and installs it here, so it issues and validates the SAME sessions the
+// former active did and users are not forced to re-authenticate after a failover.
+// No-op for any node that never promotes -- the env value is used until installed.
+function installRuntimeJwtSecret(secret) {
+  if (secret) {
+    JWT_SECRET = String(secret);
+  }
+}
 
 function signToken(user, cnf) {
   const claims = { id: user.id, role: user.role, name: user.name, tier: user.tier, shift: user.shift };
@@ -206,4 +217,4 @@ function handleApiKeyAuth(apiKey, req, res, next) {
   }
 }
 
-module.exports = { authMiddleware, signToken, verifyToken, getClientCertThumbprint };
+module.exports = { authMiddleware, signToken, verifyToken, getClientCertThumbprint, installRuntimeJwtSecret };

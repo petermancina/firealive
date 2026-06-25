@@ -26,6 +26,9 @@ const { getClientCertThumbprint } = require('../middleware/auth');
 const haPairing = require('../services/ha/ha-pairing');
 const haReplication = require('../services/ha/ha-replication');
 const deploymentMode = require('../services/deployment-mode');
+const haLease = require('../services/ha/ha-lease');
+const haFailover = require('../services/ha/ha-failover');
+const haPeerLink = require('../services/ha/ha-peer-link');
 
 const DEFAULT_HA_CONFIG = {
   enabled: false,
@@ -59,6 +62,36 @@ function requireRole(req, res, roles) {
     return false;
   }
   return true;
+}
+
+const PEER_HEARTBEAT_PATH = '/api/ha/peer/heartbeat';
+const PEER_LEASE_PATH = '/api/ha/peer/lease';
+
+function nodeRole(db) {
+  const row = db.prepare("SELECT role FROM ha_node WHERE id = 'self'").get();
+  return row ? row.role : 'standalone';
+}
+
+function peerPaired(db) {
+  return !!db.prepare("SELECT 1 FROM ha_peer WHERE status = 'paired' LIMIT 1").get();
+}
+
+// A lightweight integrity fingerprint over stable reference data, compared
+// across the pair and before/after a drill to confirm no rows were lost.
+function dataChecksum(db) {
+  try {
+    return 'u' + db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+  } catch (e) {
+    return 'na';
+  }
+}
+
+// Apply an inbound peer epoch signal (heartbeat or lease assertion): adopt the
+// monotonic epoch and step down if we are a now-superseded active.
+function applyPeerLeaseSignal(db, body) {
+  const r = haLease.recordPeerHeartbeat(db, body.epoch, body.leaseExpiresAt);
+  haFailover.reconcileRole(db);
+  return { ok: r.ok !== false, epoch: haLease.currentEpoch(db), reason: r.reason || null };
 }
 
 // --- config (JWT + config-lock) ------------------------------------------
@@ -174,6 +207,103 @@ router.post('/pair', requireObjectBody, async (req, res) => {
   }
 });
 
+router.post('/manual-failover', requireObjectBody, async (req, res) => {
+  if (!requireRole(req, res, ['lead', 'admin'])) {
+    return;
+  }
+  const db = getDb();
+  try {
+    if (nodeRole(db) !== 'active') {
+      return res.status(409).json({ error: 'manual failover is initiated on the active node (it must step down first)' });
+    }
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'no paired peer to fail over to' });
+    }
+    const fromEpoch = haLease.currentEpoch(db);
+    // Step down FIRST so this node stops writing before the peer promotes -- the
+    // make-before-break order that guarantees no split-brain.
+    haFailover.demote(db, 'manual', {});
+    try {
+      const r = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {});
+      const peer = (r && r.json) ? r.json : {};
+      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
+      res.json({ ok: true, role: 'passive', peerPromoted: peer.promoted !== false, peerEpoch: peer.epoch || null });
+    } catch (sendErr) {
+      const m = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'error';
+      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
+      res.json({ ok: true, role: 'passive', peerPromoted: false, note: 'peer will promote via failure detection' });
+    }
+  } catch (failErr) {
+    res.status(500).json({ error: 'manual failover error', detail: (failErr && failErr.message) ? failErr.message.slice(0, 160) : 'error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+router.post('/test-failover', requireObjectBody, async (req, res) => {
+  if (!requireRole(req, res, ['lead', 'admin'])) {
+    return;
+  }
+  const db = getDb();
+  try {
+    if (nodeRole(db) !== 'active') {
+      return res.status(409).json({ error: 'the failover self-test is run from the active node' });
+    }
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'no paired peer for a failover self-test' });
+    }
+    try { auditLog(actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
+    const t0 = Date.now();
+    const fromEpoch = haLease.currentEpoch(db);
+    const checksumBefore = dataChecksum(db);
+    // Fail over: step down, then promote the peer over the peer link.
+    haFailover.demote(db, 'test', {});
+    let promoteResp = {};
+    try {
+      const r = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, test: true, fromEpoch: fromEpoch }, {});
+      promoteResp = (r && r.json) ? r.json : {};
+    } catch (sendErr) {
+      try { haFailover.promote(db, {}); } catch (restoreErr) { /* best-effort restore */ }
+      return res.status(502).json({ ok: false, error: 'self-test could not promote the peer', detail: (sendErr && sendErr.message) ? sendErr.message.slice(0, 160) : 'error' });
+    }
+    const failoverMs = Date.now() - t0;
+    const served = promoteResp.role === 'active' && promoteResp.promoted !== false;
+    const integrityOk = !!promoteResp.checksum && promoteResp.checksum === checksumBefore;
+    // Fail back: adopt the peer's new epoch so our next claim supersedes it,
+    // re-promote, then notify the peer (it demotes). Best-effort -- a failback
+    // failure leaves the peer active at a valid higher epoch, never split-brain.
+    const tBack0 = Date.now();
+    let restored = false;
+    try {
+      if (promoteResp.epoch) {
+        haLease.recordPeerHeartbeat(db, promoteResp.epoch, null);
+      }
+      haFailover.promote(db, {});
+      const lease = haLease.getLease(db) || {};
+      const back = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { epoch: haLease.currentEpoch(db), leaseExpiresAt: lease.lease_expires_at || null }, {});
+      restored = !!(back && back.json && back.json.ok);
+    } catch (backErr) {
+      restored = false;
+    }
+    const failbackMs = Date.now() - tBack0;
+    const result = {
+      ok: true,
+      failoverTimeMs: failoverMs,
+      failbackTimeMs: failbackMs,
+      served: served,
+      integrityOk: integrityOk,
+      restored: restored,
+      epoch: haLease.currentEpoch(db),
+    };
+    try { auditLog(actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
+    res.json(result);
+  } catch (testErr) {
+    res.status(500).json({ error: 'self-test error', detail: (testErr && testErr.message) ? testErr.message.slice(0, 160) : 'error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
 // --- pair-init (token-authenticated, NOT cert-pinned) --------------------
 
 pairInitRouter.post('/', requireObjectBody, (req, res) => {
@@ -236,6 +366,38 @@ peerRouter.post('/pair-baseline', requireObjectBody, (req, res) => {
     res.json(result);
   } catch (baselineErr) {
     res.status(500).json({ error: 'pair-baseline failed' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+peerRouter.post('/heartbeat', requireObjectBody, (req, res) => {
+  const db = getDb();
+  try {
+    res.json(applyPeerLeaseSignal(db, req.body || {}));
+  } catch (hbErr) {
+    res.status(500).json({ error: 'heartbeat error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+peerRouter.post('/lease', requireObjectBody, (req, res) => {
+  const db = getDb();
+  try {
+    const body = req.body || {};
+    if (body.handover === true) {
+      // Graceful failover handover: the former active stepped down. Promote.
+      if (nodeRole(db) === 'passive') {
+        const r = haFailover.promote(db, {});
+        return res.json({ ok: true, promoted: true, role: 'active', epoch: r.epoch, checksum: dataChecksum(db) });
+      }
+      // Already active (e.g., promoted via detection first): idempotent ack.
+      return res.json({ ok: true, promoted: false, role: nodeRole(db), epoch: haLease.currentEpoch(db), checksum: dataChecksum(db) });
+    }
+    res.json(applyPeerLeaseSignal(db, body));
+  } catch (leaseErr) {
+    res.status(500).json({ error: 'lease error' });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }

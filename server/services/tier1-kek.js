@@ -149,6 +149,16 @@ function recoverKekFromCode(recoveryCode, passphrase) {
   return kek;
 }
 
+// Install a raw KEK into the process cache at runtime. Used at HA promotion: the
+// promoted passive unseals the shared Tier-1 KEK (wrapped to its hardware at
+// pairing) and installs it here so the encryption chokepoint resolves the SHARED
+// key from now on -- the only way the promoted node can read the Tier-1 columns
+// the former active wrote. assertKek enforces the 32-byte length (fail-closed).
+function installRuntimeKek(rawKek) {
+  assertKek(rawKek);
+  cachedKek = Buffer.from(rawKek);
+}
+
 function _resetCacheForTests() {
   cachedKek = null;
 }
@@ -160,6 +170,7 @@ module.exports = {
   generateKek,
   sealKekToWrapper,
   resolveTier1Kek,
+  installRuntimeKek,
   makeRecoveryCode,
   recoverKekFromCode,
   _resetCacheForTests,

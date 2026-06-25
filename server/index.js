@@ -188,6 +188,14 @@ app.use('/api/', require('./middleware/sdn-fail-safe').sdnFailSafe());
 // admission so the connector perimeter check runs first; same pre-auth placement.
 app.use('/api/', require('./middleware/sase-fail-safe').saseFailSafe());
 
+// B5o: HA request-layer write guard. On a confirmed passive (HA enabled +
+// paired + node role passive) it refuses mutating requests
+// (POST/PUT/PATCH/DELETE) with 503, exempting the /ha control plane (the
+// active's peer replication/heartbeat/lease and HA admin must reach the
+// standby). No-op on standalone and on the active; fails open on any
+// uncertainty. Placed pre-auth because the check is on node role, not the user.
+app.use('/api/', require('./middleware/ha-write-guard').haWriteGuard());
+
 // ── API Routes ───────────────────────────────────────────────────────────────
 // Public (no auth)
 // ── B5b: public CA certificate distribution ─────────────────────────────────
