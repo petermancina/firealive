@@ -3445,6 +3445,42 @@ function ManagementConsole() {
     setCloudVulnLoading(false);
   };
   useEffect(() => { reloadCloudVuln(); }, []);
+  // ── B5p: Vulnerability Scan — on-prem scanner authorization registry + policy + access log ──
+  const VULN_SCAN_SCANNERS = [
+    {id:"nessus",l:"Nessus",d:"Tenable Nessus — host / network vulnerability assessment"},
+    {id:"openvas",l:"OpenVAS",d:"Greenbone OpenVAS — open-source vulnerability scanning"},
+    {id:"qualys",l:"Qualys",d:"Qualys VMDR — cloud-based vulnerability management"},
+    {id:"rapid7",l:"Rapid7",d:"Rapid7 InsightVM / Nexpose — vulnerability management"},
+    {id:"tenable_io",l:"Tenable.io",d:"Tenable.io — SaaS vulnerability management"},
+    {id:"nuclei",l:"Nuclei",d:"ProjectDiscovery Nuclei — template-based scanning"},
+  ];
+  const VULN_SCAN_SCHEDULES = [
+    {id:"weekly",l:"Weekly"},{id:"daily",l:"Daily"},{id:"monthly",l:"Monthly"},{id:"manual",l:"Manual only"},
+  ];
+  const [vulnScanList, setVulnScanList] = useState([]);
+  const [vulnScanLoading, setVulnScanLoading] = useState(false);
+  const [vulnScanError, setVulnScanError] = useState(null);
+  const [vulnScanForm, setVulnScanForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), notes, enabled}
+  const [vulnScanNewToken, setVulnScanNewToken] = useState(null); // one-time bearer token shown after create
+  const [vulnScanLog, setVulnScanLog] = useState([]);
+  const [vulnScanLogTotal, setVulnScanLogTotal] = useState(0);
+  const [vulnScanChain, setVulnScanChain] = useState(null); // {intact, count, brokenAt?}
+  const [vulnScanConfig, setVulnScanConfig] = useState({enabled:false, allowedScanners:[], schedule:"weekly"});
+  const [vulnScanConfigSaving, setVulnScanConfigSaving] = useState(false);
+  const reloadVulnScan = async () => {
+    setVulnScanLoading(true); setVulnScanError(null);
+    try {
+      const cf = await api.get("/api/vuln-scan/config");
+      if (cf && cf.config) setVulnScanConfig({enabled:!!cf.config.enabled, allowedScanners:cf.config.allowedScanners||[], schedule:cf.config.schedule||"weekly"});
+      const r = await api.get("/api/vuln-scan/authorizations");
+      if (r && Array.isArray(r.authorizations)) setVulnScanList(r.authorizations);
+      else if (r && r.error) setVulnScanError(r.error);
+      const lg = await api.get("/api/vuln-scan/access-log?limit=100");
+      if (lg && Array.isArray(lg.entries)) { setVulnScanLog(lg.entries); setVulnScanLogTotal(lg.total||lg.entries.length); }
+    } catch (e) { setVulnScanError(e.message); }
+    setVulnScanLoading(false);
+  };
+  useEffect(() => { reloadVulnScan(); }, []);
   const reloadThreatHuntAuth = async () => {
     setThAuthLoading(true); setThAuthError(null);
     try {
@@ -7447,21 +7483,138 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
         </div>)}
 
-        {/* ══════════ VULNERABILITY SCANNING ══════════ */}
+        {/* ══════════ VULNERABILITY SCAN ══════════ */}
         {tab==="vulnscan"&&(<div>
-          <L>Vulnerability Scanner Integration</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Allow approved vulnerability scanners to scan the FireAlive application. Unauthorized scans are blocked by the network hardening layer. Only scanners from approved IPs can connect.</M>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Approved Scanners</div>
-            {["nessus","openvas","qualys","rapid7","tenable_io","nuclei"].map(s=>(
-              <label key={s} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 0",borderBottom:`1px solid ${C.b}`,cursor:"pointer"}}><input type="checkbox" onChange={()=>addA("VULNSCAN_TOGGLED",s)}/><M style={{color:C.t}}>{s.replace(/_/g," ").replace(/\b\w/g,l=>l.toUpperCase())}</M></label>
-            ))}
+          <L>Vulnerability Scan</L>
+          <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's on-prem and network vulnerability scanners to scan the FireAlive instance itself. FireAlive does not run scans or store findings — results appear in the scanner's own console. This tab sets the scan policy, authorizes scanners (by bearer token + source-IP allow-list), and keeps a tamper-evident log of every scan that reaches FireAlive.</M>
+          <Card style={{marginBottom:16,borderColor:C.w+"40",background:C.wd}}>
+            <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Application-layer authorization</M>
+            <M style={{color:C.t,lineHeight:1.6}}>FireAlive authorizes and logs scans that reach it; true network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility. Authorized scanner source IPs are exempt from FireAlive's API rate limiting so a sanctioned scan is not throttled — all other defenses stay active.</M>
           </Card>
+
+          {vulnScanError&&<Card style={{marginBottom:16,borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Error: {vulnScanError}</M></Card>}
+
+          {/* ── SCAN POLICY ── */}
           <Card style={{marginBottom:16}}>
-            <Input label="Allowed Scanner IPs (one per line)" placeholder="10.0.1.50&#10;10.0.1.51"/>
-            <Sel label="Scan Schedule"><option value="weekly">Weekly</option><option value="daily">Daily</option><option value="monthly">Monthly</option><option value="manual">Manual Only</option></Sel>
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"VULNSCAN_CONFIG_SAVED",detail:"Vulnerability scanner config saved"}).then(()=>addA("VULNSCAN_CONFIG_SAVED","Vulnerability scanner config saved"))}>Save Config</Btn>
+            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Scan policy</div>
+            <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:12}}><input type="checkbox" checked={vulnScanConfig.enabled} onChange={e=>setVulnScanConfig(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Vulnerability scanning enabled</M></label>
+            <M style={{color:C.tm,marginBottom:6,display:"block"}}>Permitted scanner types</M>
+            <div style={{display:"flex",flexWrap:"wrap",gap:12,marginBottom:14}}>
+              {VULN_SCAN_SCANNERS.map(s=>(<label key={s.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}}>
+                <input type="checkbox" checked={vulnScanConfig.allowedScanners.includes(s.id)} onChange={e=>{if(e.target.checked)setVulnScanConfig(prev=>({...prev,allowedScanners:[...prev.allowedScanners,s.id]}));else setVulnScanConfig(prev=>({...prev,allowedScanners:prev.allowedScanners.filter(x=>x!==s.id)}));}} style={{accentColor:C.a}}/>
+                <M style={{color:C.t}}>{s.l}</M>
+              </label>))}
+            </div>
+            <Sel label="Scan schedule" value={vulnScanConfig.schedule} onChange={e=>setVulnScanConfig(prev=>({...prev,schedule:e.target.value}))}>
+              {VULN_SCAN_SCHEDULES.map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+            </Sel>
+            <M style={{color:C.td,display:"block",marginBottom:12,lineHeight:1.5}}>Removing a scanner type from the policy (or disabling scanning) immediately stops authorizing and rate-limit-exempting it — existing tokens for that type are rejected until it is permitted again.</M>
+            <Btn primary disabled={vulnScanConfigSaving} onClick={async()=>{
+              setVulnScanConfigSaving(true);
+              const r=await api.put("/api/vuln-scan/config",{enabled:vulnScanConfig.enabled,allowedScanners:vulnScanConfig.allowedScanners,schedule:vulnScanConfig.schedule});
+              setVulnScanConfigSaving(false);
+              if(r&&!r.error){addA("VULN_SCAN_CONFIG_UPDATED","enabled="+vulnScanConfig.enabled+" scanners="+vulnScanConfig.allowedScanners.join(",")+" schedule="+vulnScanConfig.schedule);setVulnScanError(null);if(r.config)setVulnScanConfig({enabled:!!r.config.enabled,allowedScanners:r.config.allowedScanners||[],schedule:r.config.schedule||"weekly"});}
+              else setVulnScanError((r&&r.error)||"save policy failed");
+            }}>{vulnScanConfigSaving?"Saving...":"Save policy"}</Btn>
           </Card>
+
+          {vulnScanNewToken&&(<Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
+            <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner's configuration now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer …, or the X-Scan-Token header) when it records a scan via POST /api/vuln-scan-access.</M>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{vulnScanNewToken}</code>
+              <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(vulnScanNewToken);}catch(e){}}}>Copy</Btn>
+              <Btn small onClick={()=>setVulnScanNewToken(null)}>Dismiss</Btn>
+            </div>
+          </Card>)}
+
+          {/* ── AUTHORIZED SCANNERS LIST ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Authorized scanners ({vulnScanList.length})</div>
+              <Btn primary small onClick={()=>{setVulnScanNewToken(null);setVulnScanForm({mode:"add",scanner_type:"",display_name:"",allowed_cidrs:"",notes:"",enabled:true});}}>+ Authorize Scanner</Btn>
+            </div>
+            {vulnScanLoading&&<M style={{color:C.tm}}>Loading...</M>}
+            {!vulnScanLoading&&vulnScanList.length===0&&(<div style={{padding:"24px 0",textAlign:"center"}}><M style={{color:C.tm,display:"block"}}>No scanners authorized. No external scanner can record a scan of FireAlive until one is added and enabled.</M></div>)}
+            {vulnScanList.map(a=>{
+              const sc=VULN_SCAN_SCANNERS.find(s=>s.id===a.scanner_type);
+              const permitted=vulnScanConfig.allowedScanners.includes(a.scanner_type);
+              return(<div key={a.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:a.enabled?1:0.55}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                    <M style={{color:C.t,fontWeight:600}}>{a.display_name}</M>
+                    <Badge color={C.i}>{sc?sc.l:a.scanner_type}</Badge>
+                    {!a.enabled&&<Badge>DISABLED</Badge>}
+                    {a.enabled&&!permitted&&<Badge color={C.w}>NOT IN POLICY</Badge>}
+                  </div>
+                  <M style={{color:C.tm,display:"block"}}>Allow-list: {(a.allowed_cidrs||[]).join(", ")||"—"}</M>
+                  <M style={{color:C.td,display:"block",marginTop:4}}>Last scan: {a.last_scan_at?(a.last_scan_at+(a.last_scan_source_ip?(" from "+a.last_scan_source_ip):"")):"never"}</M>
+                  {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <Btn small onClick={async()=>{const r=await api.put(`/api/vuln-scan/authorizations/${a.id}`,{enabled:!a.enabled});if(r&&!r.error)reloadVulnScan();else setVulnScanError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={()=>{setVulnScanNewToken(null);setVulnScanForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
+                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const r=await api.del(`/api/vuln-scan/authorizations/${a.id}`);if(r&&!r.error){addA("VULN_SCAN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadVulnScan();}else setVulnScanError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                </div>
+              </div>);
+            })}
+          </Card>
+
+          {/* ── SCAN-ACCESS LOG ── */}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Scan-access log ({vulnScanLogTotal})</div>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                {vulnScanChain&&<Badge color={vulnScanChain.intact?C.a:C.d}>{vulnScanChain.intact?("CHAIN OK ("+vulnScanChain.count+")"):("CHAIN BROKEN @"+vulnScanChain.brokenAt)}</Badge>}
+                <Btn small onClick={async()=>{const r=await api.get("/api/vuln-scan/access-log/verify");if(r&&!r.error)setVulnScanChain(r);else setVulnScanError((r&&r.error)||"verify failed");}}>Verify chain</Btn>
+                <Btn small onClick={reloadVulnScan}>Refresh</Btn>
+              </div>
+            </div>
+            {vulnScanLog.length===0&&<M style={{color:C.tm}}>No scan access recorded yet.</M>}
+            {vulnScanLog.map(e=>{
+              const okOutcome=e.outcome==="authorized";
+              return(<div key={e.id} style={{padding:"8px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:10}}>
+                <Badge color={okOutcome?C.a:C.d}>{e.outcome}</Badge>
+                <M style={{color:C.t,flex:1,minWidth:0}}>{(e.scanner_type||"unknown")+" · "+e.source_ip}</M>
+                <M style={{color:C.td,flexShrink:0}}>{e.accessed_at}</M>
+              </div>);
+            })}
+          </Card>
+
+          {/* ── AUTHORIZE / EDIT MODAL ── */}
+          {vulnScanForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setVulnScanForm(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:16,padding:32,maxWidth:560,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+              <L>{vulnScanForm.mode==="add"?"Authorize Scanner":"Edit Authorization"}</L>
+              {vulnScanForm.mode==="add"&&vulnScanConfig.allowedScanners.length===0&&(<M style={{color:C.w,display:"block",marginBottom:12,lineHeight:1.5}}>No scanner types are permitted yet. Add at least one under Scan policy and save before authorizing a scanner.</M>)}
+              <Sel label="Scanner" value={vulnScanForm.scanner_type} onChange={e=>setVulnScanForm(prev=>({...prev,scanner_type:e.target.value}))} disabled={vulnScanForm.mode==="edit"}>
+                <option value="">Select a scanner...</option>
+                {VULN_SCAN_SCANNERS.filter(s=>vulnScanForm.mode==="edit"||vulnScanConfig.allowedScanners.includes(s.id)).map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+              </Sel>
+              {vulnScanForm.scanner_type&&(()=>{const s=VULN_SCAN_SCANNERS.find(x=>x.id===vulnScanForm.scanner_type);return s?(<M style={{color:C.td,display:"block",marginTop:-8,marginBottom:12}}>{s.d}</M>):null;})()}
+              <Input label="Display name" value={vulnScanForm.display_name} onChange={e=>setVulnScanForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Prod Nessus (DMZ)" maxLength={128}/>
+              <Input label="Source IP allow-list (comma-separated IPs or CIDRs)" value={vulnScanForm.allowed_cidrs} onChange={e=>setVulnScanForm(prev=>({...prev,allowed_cidrs:e.target.value}))} placeholder="e.g. 10.0.0.0/24, 203.0.113.7" maxLength={512}/>
+              <Input label="Notes (optional)" value={vulnScanForm.notes} onChange={e=>setVulnScanForm(prev=>({...prev,notes:e.target.value}))} maxLength={1000}/>
+              {vulnScanForm.mode==="edit"&&(<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:8}}><input type="checkbox" checked={vulnScanForm.enabled} onChange={e=>setVulnScanForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Enabled</M></label>)}
+              <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                <Btn onClick={()=>setVulnScanForm(null)}>Cancel</Btn>
+                <Btn primary onClick={async()=>{
+                  const cidrs=vulnScanForm.allowed_cidrs.split(",").map(x=>x.trim()).filter(Boolean);
+                  if(!vulnScanForm.scanner_type){setVulnScanError("Scanner is required");return;}
+                  if(!vulnScanForm.display_name.trim()){setVulnScanError("Display name is required");return;}
+                  if(cidrs.length===0){setVulnScanError("At least one source IP / CIDR is required");return;}
+                  if(vulnScanForm.mode==="add"){
+                    const r=await api.post("/api/vuln-scan/authorizations",{scanner_type:vulnScanForm.scanner_type,display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null});
+                    if(r&&!r.error&&r.token){addA("VULN_SCAN_AUTH_CREATED",vulnScanForm.display_name.trim()+" ("+vulnScanForm.scanner_type+")");setVulnScanForm(null);setVulnScanError(null);setVulnScanNewToken(r.token);reloadVulnScan();}
+                    else setVulnScanError((r&&r.error)||"create failed");
+                  }else{
+                    const r=await api.put(`/api/vuln-scan/authorizations/${vulnScanForm.id}`,{display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null,enabled:vulnScanForm.enabled});
+                    if(r&&!r.error){addA("VULN_SCAN_AUTH_UPDATED",vulnScanForm.display_name.trim());setVulnScanForm(null);setVulnScanError(null);reloadVulnScan();}
+                    else setVulnScanError((r&&r.error)||"save failed");
+                  }
+                }}>{vulnScanForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
+              </div>
+            </div>
+          </div>)}
         </div>)}
 
         {/* ══════════ ACCESS CONTROL ══════════ */}

@@ -1459,6 +1459,123 @@ class RegressionRunner {
       return 'TAXII discovery/collections/objects present with taxii+stix media types and auth guard';
     });
 
+    // ── Category: Vulnerability scan (B5p) ─────────────────
+    await check('vuln_scan', 'B5p schema present (tables + indexes + append-only triggers)', () => {
+      requireAll(['vuln_scan_scanner_authorizations', 'vuln_scan_access_log']);
+      const missing = ['idx_vuln_scan_auth_enabled', 'idx_vuln_scan_access_accessed_at', 'idx_vuln_scan_access_outcome', 'idx_vuln_scan_access_auth'].filter((n) => !indexExists(n));
+      if (missing.length) throw new Error('missing index(es): ' + missing.join(', '));
+      const trg = this.db.prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'vuln_scan_access_log_no_%'").all();
+      const names = trg.map((t) => t.name);
+      for (const n of ['vuln_scan_access_log_no_update', 'vuln_scan_access_log_no_delete']) {
+        if (names.indexOf(n) === -1) throw new Error('missing trigger: ' + n);
+      }
+      if (!trg.every((t) => /RAISE\(ABORT/.test(t.sql || ''))) throw new Error('an append-only trigger does not RAISE(ABORT)');
+      return '2 tables + 4 indexes + 2 append-only RAISE(ABORT) triggers present in the live schema';
+    });
+
+    await check('vuln_scan', 'scanner_type is a closed enum (6 scanners), no custom type', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'db', 'init.js'), 'utf8');
+      const m = src.match(/vuln_scan_scanner_authorizations[\s\S]*?scanner_type TEXT NOT NULL CHECK \(scanner_type IN \(([^)]*)\)/);
+      if (!m) throw new Error('vuln_scan scanner_type CHECK enum not found');
+      for (const t of ['nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei']) {
+        if (m[1].indexOf("'" + t + "'") === -1) throw new Error('scanner_type enum missing ' + t);
+      }
+      if (/['"]custom['"]/.test(m[1])) throw new Error('scanner_type enum must not contain a custom type');
+      return 'scanner_type closed to the 6 approved scanners; no custom type';
+    });
+
+    await check('vuln_scan', 'access log is append-only with a closed outcome enum', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'db', 'init.js'), 'utf8');
+      if (!/vuln_scan_access_log_no_update[\s\S]*?RAISE\(ABORT/.test(src)) throw new Error('append-only BEFORE UPDATE trigger missing');
+      if (!/vuln_scan_access_log_no_delete[\s\S]*?RAISE\(ABORT/.test(src)) throw new Error('append-only BEFORE DELETE trigger missing');
+      const om = src.match(/vuln_scan_access_log[\s\S]*?outcome TEXT NOT NULL CHECK \(outcome IN \(([^)]*)\)/);
+      if (!om) throw new Error('access-log outcome CHECK enum not found');
+      for (const o of ['authorized', 'rejected_ip', 'rejected_token', 'rejected_disabled', 'rejected_unknown']) {
+        if (om[1].indexOf("'" + o + "'") === -1) throw new Error('outcome enum missing ' + o);
+      }
+      return 'access log append-only (update+delete triggers) with closed 5-value outcome enum';
+    });
+
+    await check('vuln_scan', 'scan-access log is hash-chained and verifiable', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'vuln-scan.js'), 'utf8');
+      if (!/function canonicalAccessEntry/.test(src)) throw new Error('canonical serialization helper missing');
+      if (!/db\.transaction/.test(src)) throw new Error('appendAccessLog is not transactional');
+      if (!/ORDER BY id DESC LIMIT 1/.test(src)) throw new Error('append does not read the prior this_hash for linkage');
+      if (!/createHash\('sha256'\)[\s\S]{0,80}?canonicalAccessEntry/.test(src)) throw new Error('this_hash is not sha256 of the canonical entry');
+      if (!/access-log\/verify/.test(src)) throw new Error('verify endpoint missing');
+      if (!/recomputed !== row\.this_hash/.test(src)) throw new Error('verify does not recompute this_hash');
+      if (!/linkage mismatch/.test(src)) throw new Error('verify does not check prev_hash linkage');
+      return 'canonical entry hashed with sha256, prev linkage in a txn, verify recomputes + checks linkage';
+    });
+
+    await check('vuln_scan', 'announce gate enforces token + source IP and fails closed on each', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'routes', 'vuln-scan.js'), 'utf8');
+      const need = [
+        ['token format check', /\^vss-\[0-9a-f\]\{64\}\$/],
+        ['constant-time token hash compare', /safeEqualHex\(hashToken\(/],
+        ['per-authorization enabled check', /matched\.enabled !== 1/],
+        ['IP allow-list check', /ipAllowed\(sourceIp/],
+        ['rejected_token path', /'rejected_token'/],
+        ['rejected_unknown path', /'rejected_unknown'/],
+        ['rejected_disabled path', /'rejected_disabled'/],
+        ['rejected_ip path', /'rejected_ip'/],
+        ['authorized path', /'authorized'/],
+      ];
+      for (let i = 0; i < need.length; i += 1) {
+        if (!need[i][1].test(src)) throw new Error('announce gate missing ' + need[i][0]);
+      }
+      return 'announce validates token(format+constant-time hash) + enabled + IP; four reject outcomes + authorized';
+    });
+
+    await check('vuln_scan', 'live policy is enforced at mint, announce, and tripwire allow-list', () => {
+      const fs = require('fs');
+      const router = fs.readFileSync(path.join(__dirname, '..', 'routes', 'vuln-scan.js'), 'utf8');
+      const allow = fs.readFileSync(path.join(__dirname, 'vuln-scan-allowlist.js'), 'utf8');
+      if (!/allowedScanners policy/.test(router) || !/status\(409\)/.test(router)) throw new Error('mint does not reject an unpermitted scanner_type with 409');
+      if (!/!cfg\.enabled/.test(router)) throw new Error('announce does not gate on the master enabled flag');
+      if (!/!cfg\.allowedScanners\.includes\(matched\.scanner_type\)/.test(router)) throw new Error('announce does not re-check the live allowedScanners policy');
+      if (!/policy\.enabled && policy\.allowedScanners\.length/.test(allow)) throw new Error('allow-list exempts without the master-enabled + policy gate');
+      if (!/allowed\.has\(r\.scanner_type\)/.test(allow)) throw new Error('allow-list does not filter exemptions by the live policy');
+      return 'allowedScanners enforced at mint(409) + announce(enabled+policy) + tripwire allow-list(enabled+policy)';
+    });
+
+    await check('vuln_scan', 'tripwire allow-list is fail-safe (no IP exempt on error / empty / disabled)', () => {
+      const fs = require('fs');
+      const src = fs.readFileSync(path.join(__dirname, 'vuln-scan-allowlist.js'), 'utf8');
+      if (!/enabled: false, allowedScanners: \[\]/.test(src)) throw new Error('readPolicy does not fail safe to a disabled, empty policy');
+      if (!/catch \(_\)/.test(src)) throw new Error('refresh/readPolicy lacks a fail-safe catch');
+      if (!/if \(!cache\.cidrs\.length\) return false/.test(src)) throw new Error('an empty cache does not exempt-nothing');
+      if (!/policy\.enabled && policy\.allowedScanners\.length/.test(src)) throw new Error('exemption is not gated by enabled + policy');
+      if (!/module\.exports = \{ isAuthorizedVulnScannerSource/.test(src)) throw new Error('isAuthorizedVulnScannerSource not exported');
+      return 'fail-safe: error/empty/disabled exempt nothing; exemption requires enabled + permitted scanner_type';
+    });
+
+    await check('vuln_scan', 'stores no scan findings (FireAlive is the scanned asset, not the scanner)', () => {
+      for (const t of ['vuln_scan_findings', 'vuln_scan_results', 'vuln_scan_scan_results']) {
+        if (tableExists(t)) throw new Error('a findings/results table exists: ' + t + ' (the integration must not store scan output)');
+      }
+      for (const c of ['result_count', 'findings', 'finding', 'result', 'payload', 'cve', 'severity']) {
+        if (columnExists('vuln_scan_access_log', c)) throw new Error('access log has a result-bearing column: ' + c);
+      }
+      return 'no findings/results table; access log carries no result/finding/severity column';
+    });
+
+    await check('vuln_scan', 'config relocated to /api/vuln-scan and gated by the config lock', () => {
+      const fs = require('fs');
+      const router = fs.readFileSync(path.join(__dirname, '..', 'routes', 'vuln-scan.js'), 'utf8');
+      const v021 = fs.readFileSync(path.join(__dirname, '..', 'routes', 'v021-features.js'), 'utf8');
+      const reg = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'config-write-routes.js'), 'utf8');
+      if (!/router\.put\('\/config'/.test(router) || !/router\.get\('\/config'/.test(router)) throw new Error('dedicated router is missing GET/PUT /config');
+      if (/vuln-scan\/config/.test(v021)) throw new Error('the old /vuln-scan/config stub still exists in v021-features.js');
+      if (reg.indexOf("'/api/vuln-scan'") === -1) throw new Error('/api/vuln-scan is not in CONFIG_WRITE_MOUNTS');
+      if (/\/api\/vuln-scan\/config/.test(reg)) throw new Error('a stale /api/vuln-scan/config path is still in the registry');
+      return 'config lives in /api/vuln-scan (gated by mount); old stub removed; no stale registry path';
+    });
+
     // -- Category: Analyst-privacy (B5d1 analyst-private data architecture) --
     await check('analyst-privacy', 'B5d1 schema + indexes present', () => {
       requireAll([

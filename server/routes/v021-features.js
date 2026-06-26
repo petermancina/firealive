@@ -13,44 +13,6 @@ const { logger } = require('../services/logger');
 const { version } = require('../lib/version');
 const saseMode = require('../services/sase-mode');
 
-// ── Vulnerability Scanner Integration ────────────────────────────────────────
-// Allows approved scanners (Nessus, OpenVAS, Qualys) to scan the app.
-// Unauthorized scans are blocked by the network hardening middleware.
-router.get('/vuln-scan/config', (req, res) => {
-  try {
-    const db = getDb();
-    const config = db.prepare("SELECT value FROM team_config WHERE key = 'vuln_scan_config'").get();
-    db.close();
-    res.json(config ? JSON.parse(config.value) : {
-      enabled: false,
-      allowedScanners: [],
-      allowedIPs: [],
-      lastScan: null,
-      schedule: 'weekly',
-    });
-  } catch (err) { res.status(500).json({ error: 'Failed to get vuln scan config' }); }
-});
-
-router.put('/vuln-scan/config', (req, res) => {
-  const { enabled, allowedScanners, allowedIPs, schedule } = req.body;
-  const validScanners = ['nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei'];
-  const config = {
-    enabled: !!enabled,
-    allowedScanners: (allowedScanners || []).filter(s => validScanners.includes(s)),
-    allowedIPs: (allowedIPs || []).filter(ip => /^[\d./:]+$/.test(ip)).slice(0, 10),
-    schedule: ['daily', 'weekly', 'monthly', 'manual'].includes(schedule) ? schedule : 'weekly',
-    lastScan: null,
-    updatedAt: new Date().toISOString(),
-  };
-  try {
-    const db = getDb();
-    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('vuln_scan_config', ?, ?)").run(JSON.stringify(config), req.user.id);
-    db.close();
-    auditLog(req.user.id, 'VULNSCAN_CONFIG_UPDATED', `scanners=${config.allowedScanners.join(',')}`, req.ip);
-    res.json({ ok: true, config });
-  } catch (err) { res.status(500).json({ error: 'Failed to update vuln scan config' }); }
-});
-
 // ── Recertification ──────────────────────────────────────────────────────────
 router.get('/recert/status', (req, res) => {
   const { checkRecertDue } = require('../services/recertification');

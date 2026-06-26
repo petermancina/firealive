@@ -38,6 +38,7 @@ const { gdPushService } = require('./services/gd-push');
 const { schedulingSyncService } = require('./services/scheduling-sync');
 const { isAuthorizedScannerIp } = require('./services/cloud-vuln-allowlist');
 const { isAuthorizedConsumerIp } = require('./services/threat-hunting-allowlist');
+const { isAuthorizedVulnScannerSource } = require('./services/vuln-scan-allowlist');
 const geoipService = require('./services/geoip/geoip-service');
 const threatHuntingGate = require('./middleware/threat-hunting-auth');
 
@@ -156,7 +157,7 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip),
+  skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip) || isAuthorizedVulnScannerSource(req.ip),
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });
@@ -355,6 +356,8 @@ app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
 app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+app.use('/api/vuln-scan', authMiddleware(['admin']), configLockChokepoint(), require('./routes/vuln-scan'));
+app.use('/api/vuln-scan-access', require('./routes/vuln-scan').accessRouter);
 
 // B5n: login geo-fencing -- GeoIP database provisioning + policy/management (admin).
 app.use('/api/geoip', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geoip-database'));

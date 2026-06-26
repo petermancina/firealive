@@ -7346,6 +7346,97 @@ function initDb() {
     );
   }
 
+  // B5p: Vulnerability Scanner Integration -- on-prem scanner authorization +
+  // tamper-evident scan-access log. The on-prem peer of cloud_vuln (B1).
+  // Authorizes the org's approved on-prem / network vulnerability scanners
+  // (Nessus, OpenVAS, Qualys, Rapid7, Tenable.io, Nuclei) to scan the FireAlive
+  // instance itself. FireAlive does NOT run scans and does NOT ingest/parse/store
+  // findings -- those live in the scanner's own application. This integration
+  // records WHICH scanners are authorized (per-authorization bearer token stored
+  // hashed + source-IP/CIDR allow-list) and logs EVERY scan access (authorized
+  // or rejected) in an append-only, hash-chained log so the SOC has a
+  // tamper-evident record of when FireAlive was scanned. Application-layer
+  // enforcement only -- network-layer blocking remains the operator's firewall
+  // responsibility.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS vuln_scan_scanner_authorizations (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        scanner_type TEXT NOT NULL CHECK (scanner_type IN (
+          'nessus',
+          'openvas',
+          'qualys',
+          'rapid7',
+          'tenable_io',
+          'nuclei'
+        )),
+        display_name TEXT NOT NULL,
+        allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+        token_hash TEXT NOT NULL,
+        token_salt TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_scan_at TEXT,
+        last_scan_source_ip TEXT,
+        notes TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_vuln_scan_auth_enabled
+        ON vuln_scan_scanner_authorizations(enabled, scanner_type);
+
+      CREATE TABLE IF NOT EXISTS vuln_scan_access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prev_hash TEXT,
+        this_hash TEXT NOT NULL,
+        authorization_id TEXT REFERENCES vuln_scan_scanner_authorizations(id) ON DELETE SET NULL,
+        scanner_type TEXT,
+        source_ip TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN (
+          'authorized',
+          'rejected_ip',
+          'rejected_token',
+          'rejected_disabled',
+          'rejected_unknown'
+        )),
+        request_path TEXT,
+        user_agent TEXT,
+        detail TEXT,
+        accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_vuln_scan_access_accessed_at
+        ON vuln_scan_access_log(accessed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_vuln_scan_access_outcome
+        ON vuln_scan_access_log(outcome);
+      CREATE INDEX IF NOT EXISTS idx_vuln_scan_access_auth
+        ON vuln_scan_access_log(authorization_id);
+
+      CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_update
+        BEFORE UPDATE ON vuln_scan_access_log
+        BEGIN SELECT RAISE(ABORT, 'vuln_scan_access_log is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_delete
+        BEFORE DELETE ON vuln_scan_access_log
+        BEGIN SELECT RAISE(ABORT, 'vuln_scan_access_log is append-only'); END;
+    `);
+    const vulnScanAuthCount = db
+      .prepare("SELECT COUNT(*) as c FROM vuln_scan_scanner_authorizations")
+      .get().c;
+    console.log(
+      `B5p migration: vuln_scan_scanner_authorizations + vuln_scan_access_log ready (${vulnScanAuthCount} authorization(s) present)`
+    );
+  } catch (b5pVulnScanMigrationErr) {
+    console.error(
+      'B5p vuln_scan migration FAILED:',
+      b5pVulnScanMigrationErr.message
+    );
+    console.error(
+      'The server will start, but the Vulnerability Scan tab cannot register scanner authorizations or record scan access: GET/POST/PUT/DELETE /api/vuln-scan/* will return 500, and authorized scans will not be logged. No other feature is affected. Recovery: manually run the CREATE TABLE / CREATE INDEX / CREATE TRIGGER statements above in a SQLite shell against the production DB.'
+    );
+  }
+
+
   // ── B5m: threat-hunting consumer authorizations + access log ────────────────
   // The read-only exposure surface that lets the org's EDR / XDR / ATP / NGAV /
   // MSP tooling pull FireAlive's own security telemetry to hunt for an attacker

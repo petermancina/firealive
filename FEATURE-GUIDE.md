@@ -1358,13 +1358,22 @@ Health checks follow the feature: every integration is probed by a check that sh
 
 ### Vulnerability Scan
 
-**What it’s for:** Allow approved vulnerability scanners (Nessus, Qualys, etc.) to scan the FireAlive application. Only scanners from approved IP allowlist can connect; unauthorized scans are blocked at the network layer.
+**What it’s for:** Authorize your organization’s approved on-prem and network vulnerability scanners (Nessus, OpenVAS, Qualys, Rapid7, Tenable.io, Nuclei) to scan the running FireAlive instance, and keep a tamper-evident record of every scan that reaches it. FireAlive does not run scans, schedule them, or store findings itself — scan results live in the scanner’s own console, the same way the Cloud Vulnerability Scan, EDR, and threat-hunting integrations let approved tooling inspect FireAlive without FireAlive duplicating the tool. This is the on-prem companion to Cloud Vulnerability Scan: there approved cloud-posture / IaC scanners are authorized against your cloud deployment; here approved host / network scanners are authorized against the instance itself.
+
+A scan policy sets the master on/off switch, the subset of the six scanner types you permit, and an informational schedule. The permitted-scanner policy is live: it is enforced when an authorization is created, again when a scan is announced, and again at the rate-limit exemption — so removing a scanner type (or disabling the feature) stops authorizing it and stops exempting its traffic within one refresh window, without touching individual authorizations.
+
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization whose type is currently permitted. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time.
+
+FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled, permitted authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
 **Workflow:**
 
-1. Lead opens Vulnerability Scan, adds approved scanner IPs
-1. Schedule a periodic scan
-1. Scanner runs, findings flow back through the org’s vuln management process
+1. An administrator opens Vulnerability Scan, sets the scan policy (enables the feature, checks the permitted scanner types, picks a schedule), and saves it
+1. Selects “Authorize Scanner”, picks the scanner type, names it, and sets the source-IP allow-list (the IPs or CIDRs the scanner originates from)
+1. FireAlive issues a one-time bearer token — copy it into the scanner’s configuration now; it cannot be retrieved again
+1. The scanner runs its own checks against the FireAlive instance and announces each scan with its token from an allow-listed IP
+1. FireAlive authorizes (or rejects) each access and records it in the scan-access log; findings remain in the scanner’s console for the org’s vulnerability-management process
+1. The administrator reviews the scan-access log, verifies the log’s integrity (chain check), and can disable or revoke an authorization at any time — revoking immediately invalidates that scanner’s token
 
 ### Cloud Vulnerability Scan
 
