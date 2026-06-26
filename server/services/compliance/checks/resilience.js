@@ -16,7 +16,7 @@
 //     direct record of completed backups; rows are inserted by the
 //     /api/backups/trigger endpoint (CISO-only) and presumably by a
 //     scheduler (not yet wired in v0.0.31).
-//   - GD has no backup_destinations table. Each backup_schedules row
+//   - GD has no storage_destinations table. Each backup_schedules row
 //     has a single destination column (string) and an encrypted
 //     boolean; there is no separate destinations registry with
 //     adapter configs.
