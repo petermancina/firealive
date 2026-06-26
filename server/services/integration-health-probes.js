@@ -21,7 +21,7 @@
 const net = require('net');
 const tls = require('tls');
 const kms = require('./kms-providers');
-const destinations = require('./backup-destinations');
+const destinations = require('./storage-destinations');
 const ihCfg = require('./integration-health-config');
 
 function _list(fn) {
