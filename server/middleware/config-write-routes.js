@@ -34,7 +34,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/integrations',
   '/api/v1/malware-scanners',
   '/api/apikeys',
-  '/api/backup-destinations',
+  '/api/storage-destinations',
   '/api/backup-push',
   '/api/backup-schedules',
   '/api/gd-config',
