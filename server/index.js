@@ -268,7 +268,8 @@ app.use('/api/v1/malware-scanners', authMiddleware(['admin']), configLockChokepo
 app.use('/api/apikeys', authMiddleware(['admin']), configLockChokepoint(), require('./routes/apikeys'));
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
 app.use('/api/backup-chain', authMiddleware(['admin']), require('./routes/backup-chain'));
-app.use('/api/backup-destinations', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-destinations'));
+app.use('/api/storage-destinations', authMiddleware(['admin']), configLockChokepoint(), require('./routes/storage-destinations'));
+app.use('/api/storage-routing', authMiddleware(['admin']), configLockChokepoint(), require('./routes/storage-routing'));
 app.use('/api/backup-push', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-push'));
 app.use('/api/backup-schedules', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-schedules'));
 app.use('/api/gd-config', authMiddleware(['admin']), configLockChokepoint(), require('./routes/gd-config'));
@@ -498,6 +499,29 @@ async function start() {
     // Initialize database
     initDb();
     logger.info('Database initialized');
+
+    // B5q: ensure the archive-chain signing key exists before any scheduled
+    // archival runs. The audit-log and CEF archival writers are unattended
+    // (scheduler-driven), so the Ed25519 signing identity is established
+    // deterministically at boot rather than lazily on first archive. Non-fatal:
+    // a failure here is logged and the writers' own resolve path still surfaces
+    // the missing key.
+    try {
+      const archiveChainKeys = require('./services/archive-chain-keys');
+      const archiveKeyDb = getDb();
+      try {
+        const archiveKey = archiveChainKeys.ensureActiveSigningKey(archiveKeyDb);
+        logger.info('Archive chain signing key ready', {
+          id: archiveKey.id,
+          fingerprint: String(archiveKey.fingerprint || '').slice(0, 12),
+          newlyCreated: archiveKey.isNewlyCreated,
+        });
+      } finally {
+        archiveKeyDb.close();
+      }
+    } catch (archiveKeyErr) {
+      logger.error('Archive chain signing key init failed (non-fatal)', { error: archiveKeyErr.message });
+    }
 
     // B5n: load the active GeoIP database (login geo-fencing) into memory.
     // Non-fatal: with no provisioned/verifiable database the service stays

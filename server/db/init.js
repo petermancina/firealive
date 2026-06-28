@@ -971,7 +971,14 @@ CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete
 -- trusts the operator's declaration. R3d-4 will add probes for
 -- destinations where they are programmatically verifiable
 -- (S3 GetObjectLockConfiguration).
-CREATE TABLE IF NOT EXISTS backup_destinations (
+-- B5q: generalized storage-destination registry (renamed from
+-- backup_destinations -- backups were its first consumer, but it is the
+-- shared registry of physical targets for every routed artifact type:
+-- backups, audit-log archives, forensic exports, snapshots, and CEF-stream
+-- archives). Existing databases are migrated by the guarded rename block in
+-- initDb (preserving all rows, the R3l C54 tags column, and the backup_pushes
+-- foreign key, which SQLite rewrites on RENAME).
+CREATE TABLE IF NOT EXISTS storage_destinations (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   adapter TEXT NOT NULL
@@ -987,23 +994,23 @@ CREATE TABLE IF NOT EXISTS backup_destinations (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_backup_destinations_enabled
-  ON backup_destinations(enabled) WHERE enabled = 1;
-CREATE INDEX IF NOT EXISTS idx_backup_destinations_adapter
-  ON backup_destinations(adapter);
+CREATE INDEX IF NOT EXISTS idx_storage_destinations_enabled
+  ON storage_destinations(enabled) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_storage_destinations_adapter
+  ON storage_destinations(adapter);
 
 
 -- ── B5n2: DATA RESIDENCY (jurisdiction declarations + transfer register) ──
 -- Per-destination jurisdiction declarations and the derived-and-annotated
 -- cross-border transfer register backing the data-residency policy. The
 -- policy itself lives in the config table under 'data_residency_config'.
--- Both tables are operational state (NOT golden-baseline). backup_destinations
+-- Both tables are operational state (NOT golden-baseline). storage_destinations
 -- carries no region column, so the declaration is a side table keyed by
--- destination_ref (the backup_destinations.id). B5q adds the routed kinds.
+-- destination_ref (the storage_destinations.id). B5q adds the routed kinds.
 CREATE TABLE IF NOT EXISTS data_residency_destinations (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   destination_kind  TEXT NOT NULL,        -- 'backup' (B5q adds the routed kinds)
-  destination_ref   TEXT NOT NULL,        -- backup_destinations.id
+  destination_ref   TEXT NOT NULL,        -- storage_destinations.id
   declared_country  TEXT,                 -- ISO 3166-1 alpha-2
   declared_region   TEXT,                 -- provider region string, if known
   provider_domicile TEXT,                 -- legal home of the provider (e.g. 'US')
@@ -1063,7 +1070,7 @@ CREATE TABLE IF NOT EXISTS backup_pushes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   backup_id TEXT NOT NULL,
   destination_id TEXT NOT NULL
-    REFERENCES backup_destinations(id) ON DELETE RESTRICT,
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
   status TEXT NOT NULL DEFAULT 'queued'
     CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
   pushed_at TEXT,
@@ -1082,6 +1089,145 @@ CREATE INDEX IF NOT EXISTS idx_backup_pushes_destination
   ON backup_pushes(destination_id);
 CREATE INDEX IF NOT EXISTS idx_backup_pushes_retry_scan
   ON backup_pushes(status, next_retry_at);
+
+
+-- ── B5q: STORAGE DESTINATION ROUTING + SEALED ARCHIVE SEGMENTS ───────────
+-- Per-data-type routing map plus the shared sealed archive-segment chain
+-- used by the audit-log and CEF archival writers. The routes table is
+-- operational state (NOT golden-baseline). The segment chain is append-only
+-- (tamper- AND gap-evident) and its manifests are signed by a dedicated
+-- Ed25519 family so one custody chain's key compromise cannot forge another.
+
+-- Routing map: one row per routed data type. destination_ref is a SOFT ref to
+-- storage_destinations.id (NULL = unconfigured; for 'snapshot', NULL means
+-- inherit the 'backup' route). options carries per-type JSON (cadence,
+-- immutability_required, ...). The PRIMARY KEY on data_type encodes the
+-- one-destination-per-type rule -- there is no fan-out.
+CREATE TABLE IF NOT EXISTS storage_destination_routes (
+  data_type TEXT PRIMARY KEY
+    CHECK (data_type IN ('backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive')),
+  destination_ref TEXT,                    -- soft ref to storage_destinations.id (primary)
+  secondary_destination_ref TEXT,          -- optional secondary; soft ref to storage_destinations.id
+  path_prefix TEXT,
+  options TEXT,                            -- JSON: cadence, immutability_required, ...
+  enabled INTEGER NOT NULL DEFAULT 0
+    CHECK (enabled IN (0, 1)),
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Sealed archive-segment chain (audit_log + cef_archive). Each segment
+-- references the prior segment's hash, so the series is tamper-evident (a
+-- changed segment breaks this_hash) and gap-evident (a removed segment breaks
+-- the prev_hash link). Append-only, mirroring the audit / forensic chains.
+CREATE TABLE IF NOT EXISTS storage_archive_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category TEXT NOT NULL
+    CHECK (category IN ('audit_log', 'cef_archive')),
+  sequence INTEGER NOT NULL,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  range_start TEXT,
+  range_end TEXT,
+  bytes INTEGER,
+  manifest_signature TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_archive_segments_category_seq
+  ON storage_archive_segments(category, sequence DESC);
+
+CREATE TRIGGER IF NOT EXISTS storage_archive_segments_no_update
+  BEFORE UPDATE ON storage_archive_segments
+  BEGIN SELECT RAISE(ABORT, 'storage_archive_segments is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS storage_archive_segments_no_delete
+  BEFORE DELETE ON storage_archive_segments
+  BEGIN SELECT RAISE(ABORT, 'storage_archive_segments is append-only'); END;
+
+-- B5q Revision v4: per-push tracking for archive segments. Mirrors backup_pushes.
+-- The append-only storage_archive_segments row carries the integrity chain only;
+-- this mutable table is the single record of every push (primary + secondary) and
+-- its retry state. The primary row is written 'succeeded' when the segment is
+-- committed (the segment commits only after the primary push lands); the secondary
+-- row is retried until it lands. source_artifact_path is the retained pending copy
+-- to re-push the secondary from (NULL once replicated/cleaned up).
+CREATE TABLE IF NOT EXISTS archive_segment_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  segment_id INTEGER NOT NULL
+    REFERENCES storage_archive_segments(id) ON DELETE RESTRICT,
+  destination_id TEXT NOT NULL
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  role TEXT NOT NULL
+    CHECK (role IN ('primary', 'secondary')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  source_artifact_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (segment_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_segment_pushes_retry
+  ON archive_segment_pushes(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_archive_segment_pushes_segment
+  ON archive_segment_pushes(segment_id);
+
+-- B5q Revision v4: per-push tracking for forensic exports. Same shape as
+-- archive_segment_pushes, keyed by the forensic_exports row. Both the primary and
+-- secondary rows are retried (neither push gates the export, which succeeds on the
+-- local seal); re-staged from the already-retained export files, so there is no
+-- separate pending directory for forensic.
+CREATE TABLE IF NOT EXISTS forensic_export_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  export_id TEXT NOT NULL
+    REFERENCES forensic_exports(id) ON DELETE RESTRICT,
+  destination_id TEXT NOT NULL
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  role TEXT NOT NULL
+    CHECK (role IN ('primary', 'secondary')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  source_artifact_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (export_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_pushes_retry
+  ON forensic_export_pushes(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_pushes_export
+  ON forensic_export_pushes(export_id);
+
+-- Dedicated Ed25519 family signing the archive-segment manifests. Private
+-- material is Tier-1-KEK-wrapped; one active key at a time (the partial
+-- index). Mirrors forensic_export_chain_signing_keys et al.
+CREATE TABLE IF NOT EXISTS archive_chain_signing_keys (
+  id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_chain_signing_keys_active
+  ON archive_chain_signing_keys(active) WHERE active = 1;
 
 
 -- ── R3d-4: KMS PROVIDERS (key encryption key sources) ────────────────────
@@ -1146,7 +1292,7 @@ CREATE INDEX IF NOT EXISTS idx_backup_pushes_retry_scan
 --
 -- CREDENTIALS_ENCRYPTED
 --
--- Same on-disk format as backup_destinations.credentials_encrypted:
+-- Same on-disk format as storage_destinations.credentials_encrypted:
 -- AES-256-GCM (iv + tag + ciphertext) base64-encoded for TEXT column.
 -- TIER1_ENCRYPTION_KEY is the wrapping key for THIS table too --
 -- which creates a chicken-and-egg: env-var rows don't need credentials
@@ -2955,6 +3101,81 @@ function initDb() {
 
   // Execute schema
   db.exec(SCHEMA);
+
+  // Migration (B5q): rename backup_destinations -> storage_destinations to
+  // generalize the destination registry (it now holds the routing targets for
+  // every artifact type, not just backups). The SCHEMA above creates an empty
+  // storage_destinations shell on an upgraded database; this block moves the
+  // real rows across by dropping that shell and renaming the old table, which
+  // preserves every column (including the R3l C54 tags column) and lets SQLite
+  // rewrite the backup_pushes foreign key on RENAME. PRAGMA-guarded and
+  // count-guarded so a fresh database (no backup_destinations) and an
+  // already-migrated database both no-op. foreign_keys is toggled off around
+  // the rename, matching the peer_abuse_flags rebuild idiom below.
+  try {
+    const hasLegacyDestinations = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='backup_destinations'")
+      .get();
+    if (hasLegacyDestinations) {
+      const migratedCount = db.prepare('SELECT COUNT(*) AS c FROM storage_destinations').get().c;
+      if (migratedCount === 0) {
+        db.exec('PRAGMA foreign_keys = OFF');
+        db.exec('BEGIN TRANSACTION');
+        try {
+          db.exec('DROP TABLE storage_destinations');
+          db.exec('ALTER TABLE backup_destinations RENAME TO storage_destinations');
+          db.exec('DROP INDEX IF EXISTS idx_backup_destinations_enabled');
+          db.exec('DROP INDEX IF EXISTS idx_backup_destinations_adapter');
+          db.exec('CREATE INDEX IF NOT EXISTS idx_storage_destinations_enabled ON storage_destinations(enabled) WHERE enabled = 1');
+          db.exec('CREATE INDEX IF NOT EXISTS idx_storage_destinations_adapter ON storage_destinations(adapter)');
+          db.exec('COMMIT');
+          console.log('B5q migration: renamed backup_destinations -> storage_destinations');
+        } catch (renameTxnErr) {
+          db.exec('ROLLBACK');
+          throw renameTxnErr;
+        } finally {
+          db.exec('PRAGMA foreign_keys = ON');
+        }
+      } else {
+        // storage_destinations already populated; drop the now-redundant legacy
+        // table if it somehow lingers alongside it (defensive, should not occur).
+        console.log('B5q migration: storage_destinations already present, leaving legacy backup_destinations untouched for manual review');
+      }
+    }
+  } catch (b5qRenameErr) {
+    console.error('B5q backup_destinations -> storage_destinations rename migration failed:', b5qRenameErr.message);
+  }
+
+  // Migration (B5q v3): storage_destination_routes gains an optional secondary
+  // destination (a route stores a primary plus an optional secondary, both written
+  // on every run). PRAGMA-guarded so a fresh database (which already has the column
+  // from the CREATE above) no-ops, while a database created under the single-
+  // destination schema (commit 20) is patched.
+  try {
+    const routeCols = db.prepare("PRAGMA table_info(storage_destination_routes)").all().map((c) => c.name);
+    if (!routeCols.includes('secondary_destination_ref')) {
+      db.exec('ALTER TABLE storage_destination_routes ADD COLUMN secondary_destination_ref TEXT');
+    }
+  } catch (b5qSecondaryErr) {
+    console.error('B5q secondary route column migration failed:', b5qSecondaryErr.message);
+  }
+
+  // Migration (B5q Revision v4): storage_archive_segments is now artifact +
+  // integrity-chain only; per-destination push state lives in the mutable
+  // archive_segment_pushes table (created above). Drop the segment's destination
+  // columns and pushed_at if an earlier schema (commits 20/24/28) created them.
+  // DROP COLUMN is DDL and is permitted by the append-only triggers, which block
+  // only UPDATE and DELETE. PRAGMA-guarded and idempotent.
+  try {
+    const segCols = db.prepare("PRAGMA table_info(storage_archive_segments)").all().map((c) => c.name);
+    for (const col of ['destination_ref', 'dest_path', 'secondary_destination_ref', 'secondary_dest_path', 'pushed_at']) {
+      if (segCols.includes(col)) {
+        db.exec(`ALTER TABLE storage_archive_segments DROP COLUMN ${col}`);
+      }
+    }
+  } catch (b5qSegPruneErr) {
+    console.error('B5q Revision v4 segment-column prune failed:', b5qSegPruneErr.message);
+  }
 
   // Migration (B5i): SDN posture debounce counters. The sdn_integrations table
   // gains per-integration probe debounce counters feeding the posture state
@@ -5514,7 +5735,7 @@ function initDb() {
   //                                   on a follow-up cleanup phase
   //                                   could deprecate this column
   //     destination     TEXT          destination identifier
-  //                                   (matches backup_destinations
+  //                                   (matches storage_destinations
   //                                   row id when modern shape)
   //     encrypted       INTEGER       DEFAULT 1 (encryption is
   //                                   the strong default)
@@ -5740,7 +5961,7 @@ function initDb() {
   //                                         and the legacy default).
   //                                         Example: ["offsite","encrypted"]
   //
-  //   backup_destinations.tags              JSON array of tags this
+  //   storage_destinations.tags             JSON array of tags this
   //                                         destination carries. NULL =
   //                                         no tags (passes no filters).
   //                                         Example: ["offsite","geo-redundant"]
@@ -5777,12 +5998,12 @@ function initDb() {
       console.log('R3l C54 migration: backup_schedules.destination_filter column already present, skipping');
     }
 
-    const r3lC54DestCols = db.prepare("PRAGMA table_info(backup_destinations)").all().map(c => c.name);
+    const r3lC54DestCols = db.prepare("PRAGMA table_info(storage_destinations)").all().map(c => c.name);
     if (!r3lC54DestCols.includes('tags')) {
-      db.exec(`ALTER TABLE backup_destinations ADD COLUMN tags TEXT`);
-      console.log('R3l C54 migration: added backup_destinations.tags column (NULL = no tags)');
+      db.exec(`ALTER TABLE storage_destinations ADD COLUMN tags TEXT`);
+      console.log('R3l C54 migration: added storage_destinations.tags column (NULL = no tags)');
     } else {
-      console.log('R3l C54 migration: backup_destinations.tags column already present, skipping');
+      console.log('R3l C54 migration: storage_destinations.tags column already present, skipping');
     }
   } catch (r3lC54MigrationErr) {
     console.error('R3l C54 destination subset migration FAILED:', r3lC54MigrationErr.message);

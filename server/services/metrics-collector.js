@@ -133,7 +133,7 @@ class MetricsCollector {
         try { const c = JSON.parse(r.value); return !!(c && c.server && c.bindDn); } catch { return false; }
       }
       if (key === 'kms') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM kms_providers WHERE enabled = 1').get(); return !!(c && c.c > 0); }
-      if (key === 'storage') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1').get(); return !!(c && c.c > 0); }
+      if (key === 'storage') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM storage_destinations WHERE enabled = 1').get(); return !!(c && c.c > 0); }
       if (key === 'edr') { const c = this.db.prepare('SELECT COUNT(*) AS c FROM malware_scanner_integrations').get(); return !!(c && c.c > 0); }
       return false;
     } catch { return false; }

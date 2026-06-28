@@ -34,7 +34,8 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/integrations',
   '/api/v1/malware-scanners',
   '/api/apikeys',
-  '/api/backup-destinations',
+  '/api/storage-destinations',
+  '/api/storage-routing',  // B5q: per-data-type storage routes (primary + secondary set + test probe gated under the mount)
   '/api/backup-push',
   '/api/backup-schedules',
   '/api/gd-config',

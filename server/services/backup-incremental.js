@@ -79,6 +79,7 @@ const keyWrapSvc = require('./backup-key-wrapping');
 const manifestSvc = require('./backup-manifest');
 const signingKeysSvc = require('./backup-signing-keys');
 const backupPushSvc = require('./backup-push');
+const storageRouting = require('./storage-routing');
 const walExtractor = require('./wal-extractor');
 const walCheckpoint = require('./wal-checkpoint');
 
@@ -244,32 +245,6 @@ function buildIncrementalManifest(args) {
     source_fuse_counter: args.sourceFuseCounter,
     frames_format: 'INCR-v1',
   };
-}
-
-/**
- * Resolve schedule's destination_filter from options.scheduleId.
- * Mirrors the lookup in services/backup.js performBackup (R3l C58d).
- */
-function resolveScheduleDestinationFilter(db, scheduleId) {
-  if (scheduleId == null) return null;
-  try {
-    const sched = db.prepare('SELECT destination_filter FROM backup_schedules WHERE id = ?').get(scheduleId);
-    if (sched && sched.destination_filter) {
-      try {
-        const parsed = JSON.parse(sched.destination_filter);
-        if (Array.isArray(parsed)) return parsed;
-      } catch (parseErr) {
-        logger.warn('backup-incremental: malformed destination_filter JSON', {
-          scheduleId, error: parseErr.message,
-        });
-      }
-    }
-  } catch (lookupErr) {
-    logger.warn('backup-incremental: failed to resolve destination_filter', {
-      scheduleId, error: lookupErr.message,
-    });
-  }
-  return null;
 }
 
 /**
@@ -617,9 +592,29 @@ async function performIncrementalBackup(options = {}) {
   // Optional push
   let pushResult = null;
   if (options.awaitPush) {
-    const destinationFilter = resolveScheduleDestinationFilter(db, scheduleId);
+    // B5q (Revision v3): resolve the backup route via the storage-routing
+    // resolver -- a primary plus an optional secondary, capped at two. The
+    // per-schedule destination_filter (R3l C58/C59) is retired; incremental
+    // backups push to the destinations an admin designates for the 'backup'
+    // type, the same as full backups. If no route is configured the backup is
+    // still created and chain-attested on-host; it simply is not pushed.
+    let incrementalDestinationRefs = [];
     try {
-      pushResult = await backupPushSvc.pushBackup(db, backupId, { logger, destinationFilter });
+      const route = storageRouting.getRouteForType(db, 'backup');
+      if (route.configured && Array.isArray(route.destinations)) {
+        incrementalDestinationRefs = route.destinations.map((d) => d.id);
+      }
+    } catch (routeErr) {
+      logger.warn('backup-incremental: failed to resolve storage route; backup will not be pushed', {
+        error: routeErr.message,
+      });
+    }
+    try {
+      pushResult = await backupPushSvc.pushBackup(db, backupId, {
+        logger,
+        destinationRef: incrementalDestinationRefs[0] || null,
+        destinationRefs: incrementalDestinationRefs,
+      });
     } catch (pushErr) {
       logger.error('backup-incremental: push orchestration crashed', { id: backupId, error: pushErr.message });
       pushResult = { ok: false, error: pushErr.message, crashed: true };

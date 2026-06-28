@@ -24,7 +24,7 @@
 // WHAT IS NEVER IN A BASELINE (hard exclusions, D20)
 //   - secret material of any kind: encrypted credential blobs
 //     (kms_providers.credentials_encrypted, integration_config.
-//     config_encrypted, backup_destinations.credentials_encrypted,
+//     config_encrypted, storage_destinations.credentials_encrypted,
 //     scheduling_platform_config.credentials_encrypted,
 //     gd_push_config.api_key_encrypted, external_restore_sources.*,
 //     notification_config.pagerduty_key / sms_auth_token_encrypted,
@@ -225,7 +225,7 @@ const TABLE_SECTIONS = [
     secretCols: ['config_encrypted'],
   },
   {
-    table: 'backup_destinations', mode: 'rows', matchKey: 'name', orderBy: 'name',
+    table: 'storage_destinations', mode: 'rows', matchKey: 'name', orderBy: 'name',
     configCols: ['id', 'name', 'adapter', 'config', 'enabled', 'retention_days', 'tags'],
     secretCols: ['credentials_encrypted'],
     secretDisables: { credentials_encrypted: 'enabled' },

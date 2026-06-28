@@ -125,7 +125,7 @@ router.get('/', (req, res) => {
     const sql = `
       SELECT bp.*, bd.name AS destination_name, bd.adapter AS destination_adapter
       FROM backup_pushes bp
-      LEFT JOIN backup_destinations bd ON bd.id = bp.destination_id
+      LEFT JOIN storage_destinations bd ON bd.id = bp.destination_id
       ${whereSql}
       ORDER BY bp.id DESC
       LIMIT ?
@@ -191,7 +191,7 @@ router.get('/:pushId', (req, res) => {
     const row = db.prepare(`
       SELECT bp.*, bd.name AS destination_name, bd.adapter AS destination_adapter
       FROM backup_pushes bp
-      LEFT JOIN backup_destinations bd ON bd.id = bp.destination_id
+      LEFT JOIN storage_destinations bd ON bd.id = bp.destination_id
       WHERE bp.id = ?
     `).get(pushId);
     if (!row) return res.status(404).json({ error: 'Push not found' });

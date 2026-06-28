@@ -19,7 +19,7 @@
 // noise. R3k absorbs what BUILD-PLAN-v22 had described as the deferred
 // B2 phase and ships a real runner against current canonical schema.
 //
-// CATEGORIES (12)
+// CATEGORIES (13)
 // ===============
 //
 //   1. Schema integrity      — SQLite integrity_check + canonical
@@ -62,6 +62,10 @@
 //   12. System               — Node version, RSS, security
 //                               middleware loadable, auth_log,
 //                               sessions
+//   13. Storage routing      -- storage_destinations + per-type
+//                               routes (primary + secondary),
+//                               archive/forensic push tracking +
+//                               retry columns, route refs resolve
 //
 // CHECK FUNCTION CONTRACT
 // =======================
@@ -863,7 +867,85 @@ class RegressionRunner {
       return c + ' schedule(s)';
     });
 
-    // ── Category 9: Audit chain ────────────────────────────────────
+    // ── Category 13: Storage routing ───────────────────────────────
+    await check('storage-routing', 'storage_destinations table present', () => {
+      if (!tableExists('storage_destinations')) throw new Error('missing table storage_destinations (B5q rename from backup_destinations)');
+      const n = this.db.prepare('SELECT COUNT(*) AS n FROM storage_destinations').get().n;
+      return n + ' destination(s) registered';
+    });
+    await check('storage-routing', 'storage_destination_routes has dual-write columns', () => {
+      if (!tableExists('storage_destination_routes')) throw new Error('missing table storage_destination_routes');
+      const required = ['data_type', 'destination_ref', 'secondary_destination_ref', 'path_prefix', 'options', 'enabled'];
+      const missing = required.filter(c => !columnExists('storage_destination_routes', c));
+      if (missing.length) throw new Error('missing column(s): ' + missing.join(', '));
+      return 'primary + secondary route columns present';
+    });
+    await check('storage-routing', 'enabled routes reference existing destinations', () => {
+      if (!tableExists('storage_destination_routes')) return SKIP('no routes table');
+      const rows = this.db.prepare(
+        'SELECT data_type, destination_ref, secondary_destination_ref FROM storage_destination_routes WHERE enabled = 1'
+      ).all();
+      if (rows.length === 0) return SKIP('no enabled routes configured');
+      const dangling = [];
+      for (const r of rows) {
+        for (const ref of [r.destination_ref, r.secondary_destination_ref]) {
+          if (!ref) continue;
+          const d = this.db.prepare('SELECT 1 AS x FROM storage_destinations WHERE id = ?').get(ref);
+          if (!d) dangling.push(r.data_type + '->' + ref);
+        }
+      }
+      if (dangling.length) throw new Error('route(s) point at missing destination(s): ' + dangling.join(', '));
+      return rows.length + ' enabled route(s), all refs resolve';
+    });
+    await check('storage-routing', 'archive_segment_pushes has tracking + retry columns', () => {
+      if (!tableExists('archive_segment_pushes')) throw new Error('missing table archive_segment_pushes');
+      const required = ['segment_id', 'destination_id', 'role', 'status', 'attempt_count', 'next_retry_at', 'source_artifact_path'];
+      const missing = required.filter(c => !columnExists('archive_segment_pushes', c));
+      if (missing.length) throw new Error('missing column(s): ' + missing.join(', '));
+      return 'role + retry columns present';
+    });
+    await check('storage-routing', 'forensic_export_pushes has tracking + retry columns', () => {
+      if (!tableExists('forensic_export_pushes')) throw new Error('missing table forensic_export_pushes');
+      const required = ['export_id', 'destination_id', 'role', 'status', 'attempt_count', 'next_retry_at'];
+      const missing = required.filter(c => !columnExists('forensic_export_pushes', c));
+      if (missing.length) throw new Error('missing column(s): ' + missing.join(', '));
+      return 'role + retry columns present';
+    });
+    await check('storage-routing', 'backup_pushes has retry columns (re-push path)', () => {
+      if (!tableExists('backup_pushes')) throw new Error('missing table backup_pushes');
+      const required = ['backup_id', 'destination_id', 'status', 'attempt_count', 'next_retry_at'];
+      const missing = required.filter(c => !columnExists('backup_pushes', c));
+      if (missing.length) throw new Error('missing column(s): ' + missing.join(', '));
+      return 'backup push retry columns present';
+    });
+    await check('storage-routing', 'archive segments pruned of destination columns', () => {
+      if (!tableExists('storage_archive_segments')) return SKIP('no archive segments table');
+      const leaked = ['destination_ref', 'dest_path', 'secondary_destination_ref', 'secondary_dest_path', 'pushed_at']
+        .filter(c => columnExists('storage_archive_segments', c));
+      if (leaked.length) throw new Error('segment table still carries push column(s): ' + leaked.join(', '));
+      return 'segment table is artifact + chain only';
+    });
+    await check('storage-routing', 'push rows reference existing artifacts', () => {
+      let scanned = 0;
+      if (tableExists('archive_segment_pushes') && tableExists('storage_archive_segments')) {
+        const orphan = this.db.prepare(
+          'SELECT COUNT(*) AS n FROM archive_segment_pushes p LEFT JOIN storage_archive_segments s ON s.id = p.segment_id WHERE s.id IS NULL'
+        ).get().n;
+        if (orphan > 0) throw new Error(orphan + ' archive push row(s) with no segment');
+        scanned += 1;
+      }
+      if (tableExists('forensic_export_pushes') && tableExists('forensic_exports')) {
+        const orphan = this.db.prepare(
+          'SELECT COUNT(*) AS n FROM forensic_export_pushes p LEFT JOIN forensic_exports e ON e.id = p.export_id WHERE e.id IS NULL'
+        ).get().n;
+        if (orphan > 0) throw new Error(orphan + ' forensic push row(s) with no export');
+        scanned += 1;
+      }
+      if (scanned === 0) return SKIP('no push-tracking tables to check');
+      return 'no orphan push rows';
+    });
+
+    // ── Category 9: Audit chain ────────────────────────────────────────
     await check('audit-chain', 'audit_log table reachable', () => {
       if (!tableExists('audit_log')) throw new Error('missing table audit_log');
       const c = this.db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n;

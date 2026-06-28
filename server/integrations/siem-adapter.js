@@ -3,6 +3,10 @@ const dgram = require('dgram');
 const net = require('net');
 const tls = require('tls');
 
+// B5q: durable archive of the CEF stream forwarded to the SIEM (see
+// services/cef-archive-spool.js).
+const cefArchiveSpool = require('../services/cef-archive-spool');
+
 class SiemAdapter {
   constructor(endpoint, protocol = 'tcp') {
     this.endpoint = endpoint;
@@ -41,6 +45,15 @@ class SiemAdapter {
   }
 
   async _send(message) {
+    // Tee every forwarded CEF line into the durable cef_archive spool. Done
+    // before the network attempt, so a send is archived even when the SIEM is
+    // unreachable. Best-effort: archival must never break SIEM transmission.
+    try {
+      cefArchiveSpool.appendLine(message);
+    } catch (_teeErr) {
+      /* never let archival break SIEM transmission */
+    }
+
     const syslog = `<134>1 ${new Date().toISOString()} firealive - - - ${message}`;
     return new Promise((resolve) => {
       if (this.protocol === 'udp') {

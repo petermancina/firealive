@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Data-Residency Core Service
+// FIREALIVE -- Data-Residency Core Service
 //
 // The decision and reconciliation logic behind the data-residency policy. Where
 // geo-fencing (B5n) controls who may log in from where, this controls where the
@@ -32,18 +32,19 @@ const regions = require('./residency-regions');
 const CONFIG_KEY = 'data_residency_config';
 
 // All recognized data categories. live_deployment is the deployment itself (one
-// declared primary residency, never blocked); backup has real remote
-// destinations today; the four routed types are declared/co-resident now and
-// enforced once B5q routes them.
+// declared primary residency, never blocked). backup and the four routed types
+// (audit_log, forensic_export, snapshot, cef_archive) all have real remote
+// destinations now -- B5q routes them to storage_destinations -- so each is
+// reconciled and enforceable. snapshot inherits backup's route.
 const CATEGORIES = [
   'live_deployment', 'backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive',
 ];
 const MODES = ['enforce', 'warn', 'declare-only'];
 
-// Categories reconciled into the transfer register by this phase. Backups are
-// the only category with real remote destinations today; B5q extends this list
-// to the routed types when it adds their storage routing.
-const RECONCILED_CATEGORIES = ['backup'];
+// Categories reconciled into the transfer register: every category with real
+// remote destinations. B5q adds the routed types to backup, since they now route
+// to storage_destinations like backups do (snapshot via backup's route).
+const RECONCILED_CATEGORIES = ['backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive'];
 
 // Default policy: off. live_deployment is declare-only (never blocked -- a
 // running deployment cannot be relocated). Destination-backed categories start
@@ -119,7 +120,7 @@ function loadResidencyConfig(db) {
 
 // The operator's declared jurisdiction if present, else a best-effort inference
 // from the backup destination's adapter config (backup category only, where the
-// ref is a backup_destinations.id). Reads config only, never credentials.
+// ref is a storage_destinations.id). Reads config only, never credentials.
 // Read the operator's declaration row for a destination, or null.
 function readDeclaration(db, category, destinationRef) {
   try {
@@ -166,14 +167,15 @@ function noJurisdiction() {
 }
 
 // The operator's declared jurisdiction if present, else a best-effort inference
-// from the backup destination's PERSISTED adapter config (backup category only,
-// where the ref is a backup_destinations.id). Reads config only, never credentials.
+// from the destination's PERSISTED adapter config. Applies to every reconciled
+// category (the ref is a storage_destinations.id for all of them). Reads config
+// only, never credentials.
 function resolveDestinationJurisdiction(db, category, destinationRef) {
   const decl = readDeclaration(db, category, destinationRef);
   if (decl && decl.country) return declaredJurisdiction(decl);
-  if (category === 'backup') {
+  if (RECONCILED_CATEGORIES.includes(category)) {
     try {
-      const dest = db.prepare('SELECT adapter, config FROM backup_destinations WHERE id = ?').get(destinationRef);
+      const dest = db.prepare('SELECT adapter, config FROM storage_destinations WHERE id = ?').get(destinationRef);
       if (dest && typeof dest.config === 'string') {
         let parsed = null;
         try { parsed = JSON.parse(dest.config); } catch (e2) { parsed = null; }
@@ -305,12 +307,20 @@ function isBlockedByPolicy(cfg, category, country) {
   return !regions.isPermitted(country, permitted);
 }
 
+// The destinations actually routed for this category -- its primary and optional
+// secondary (snapshot inherits backup's route). storage-routing is required
+// lazily to avoid a require cycle (storage-routing requires this module for its
+// own residency gate).
 function listDestinationsForCategory(db, category) {
-  if (category === 'backup') {
-    const rows = db.prepare('SELECT id FROM backup_destinations WHERE enabled = 1').all();
-    return rows.map(function (r) { return r.id; });
+  try {
+    const storageRouting = require('./storage-routing');
+    const route = storageRouting.getRouteForType(db, category);
+    if (route && route.configured && Array.isArray(route.destinations)) {
+      return route.destinations.map(function (d) { return d.id; });
+    }
+  } catch (e) {
+    // unresolved route -> no destinations to reconcile for this category
   }
-  // B5q categories have no live destinations resolvable here yet.
   return [];
 }
 

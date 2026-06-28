@@ -55,7 +55,7 @@
 // If the process crashes while a row says 'running', it stays in
 // that state until manual intervention. R3d-3 does NOT auto-recover
 // stale 'running' rows. A future scheduler enhancement could add a
-// "running for >1hr → mark failed-retryable" sweep. Operators
+// "running for >1hr -> mark failed-retryable" sweep. Operators
 // noticing stuck rows can use the routes-layer manual-retry endpoint.
 //
 // IDEMPOTENCY
@@ -91,7 +91,7 @@ const base = require('./destination-adapter-base');
 require('./destination-adapter-local');
 require('./destination-adapter-sftp');
 
-const backupDestinations = require('./backup-destinations');
+const storageDestinations = require('./storage-destinations');
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -154,59 +154,6 @@ function calculateNextRetryAt(justCompletedAttempt) {
   if (delaySec === undefined) return null;  // safety; shouldn't fire given MAX_ATTEMPTS check
   const next = new Date(Date.now() + delaySec * 1000);
   return next.toISOString().slice(0, 19).replace('T', ' ');
-}
-
-/**
- * R3l C58: matcher for per-schedule destination subset filtering.
- *
- * The schedule may carry a destination_filter array (e.g.
- * ["offsite","encrypted"]) added in C54. Each destination may carry
- * a tags array (e.g. ["offsite","geo-redundant"]) also added in C54.
- *
- * Semantic: a backup pushes to a destination if AND ONLY IF
- *   filter is null                                         (no filter active)
- *   OR
- *   the intersection of filter and destination.tags is non-empty
- *
- * NULL on the schedule side or NULL/missing on the destination side
- * are handled per the contract documented in init.js around the C54
- * migration block. Malformed JSON in destination.tags is treated as
- * "no tags" (the destination fails the match if a filter is active)
- * so that schedules with explicit filters never silently push to
- * untaggable legacy destinations.
- *
- * Inputs:
- *   filter:         array of tag strings, or null
- *   destinationTags: raw TEXT from backup_destinations.tags column
- *                    (JSON-encoded array of strings, or null)
- *
- * Returns: true if the destination matches; false otherwise.
- */
-function destinationMatchesFilter(filter, destinationTags) {
-  // Null filter means "no filter active" — every destination matches.
-  if (filter == null) return true;
-  // Defensive: filter must be an array. Anything else => no match.
-  if (!Array.isArray(filter)) return false;
-  // Empty filter array means "match nothing" — explicit operator choice
-  // to pause pushes on this schedule without disabling it entirely.
-  if (filter.length === 0) return false;
-
-  // Parse destination tags. Malformed JSON => treat as no tags.
-  let tags = [];
-  if (destinationTags != null && destinationTags !== '') {
-    try {
-      const parsed = JSON.parse(destinationTags);
-      if (Array.isArray(parsed)) {
-        tags = parsed.filter(t => typeof t === 'string');
-      }
-    } catch (_) {
-      // malformed JSON in tags column — treat as no tags
-      tags = [];
-    }
-  }
-
-  // Set-intersection: at least one tag in common.
-  return filter.some(f => tags.includes(f));
 }
 
 /**
@@ -446,36 +393,48 @@ async function pushBackup(db, backupId, options = {}) {
     return { ok: false, error: `backup status is ${backup.status}, not verified`, destinations: [] };
   }
 
-  const enabledDestinations = backupDestinations.listEnabledDestinations(db);
-  if (enabledDestinations.length === 0) {
-    logger.info(`backup-push: no enabled destinations; backup ${backupId} stays on-host only`);
+  // B5q (C12): backups go to the single destination resolved for the backup's
+  // type. services/backup.js performBackup passes its id as options.destinationRef
+  // (via the storage-routing resolver). No fan-out to every enabled destination,
+  // and no per-schedule destination_filter -- both are retired. When no route is
+  // configured, or the resolved destination is missing or disabled, the backup is
+  // still created and chain-attested on-host; it simply is not pushed (the
+  // existing graceful-degradation posture). The 0-or-1 length destinations array
+  // keeps the caller's push-summary logging unchanged.
+  // Resolve the ordered destination list (Revision v3: primary + optional
+  // secondary). Prefer options.destinationRefs; fall back to the singular
+  // options.destinationRef for back-compat.
+  let destinationRefs = [];
+  if (Array.isArray(options.destinationRefs) && options.destinationRefs.length > 0) {
+    destinationRefs = options.destinationRefs.filter((r) => r);
+  } else if (options.destinationRef) {
+    destinationRefs = [options.destinationRef];
+  }
+  if (destinationRefs.length === 0) {
+    logger.info(`backup-push: no destination configured; backup ${backupId} stays on-host only`);
     return { ok: true, destinations: [] };
   }
 
-  // R3l C58: apply schedule's destination_filter if present.
-  // options.destinationFilter is either an array (filter) or null/undefined
-  // (no filter). The caller (services/backup.js performBackup) resolves
-  // this from the originating schedule's destination_filter column.
-  // Unfiltered callers (manual API pushes, retry paths) pass null and get
-  // the pre-R3l behavior of pushing to all enabled destinations.
-  const destinationFilter = options.destinationFilter == null ? null : options.destinationFilter;
-  const matchingDestinations = destinationFilter == null
-    ? enabledDestinations
-    : enabledDestinations.filter(d => destinationMatchesFilter(destinationFilter, d.tags));
-
-  if (destinationFilter != null) {
-    const filteredOut = enabledDestinations.length - matchingDestinations.length;
-    logger.info(
-      `backup-push: schedule destination_filter applied for backup ${backupId} ` +
-      `(filter=${JSON.stringify(destinationFilter)}, matched=${matchingDestinations.length}, filtered_out=${filteredOut})`
-    );
-    if (matchingDestinations.length === 0) {
-      logger.warn(
-        `backup-push: schedule destination_filter excludes all enabled destinations; ` +
-        `backup ${backupId} not pushed to any remote (on-host copy retained)`
-      );
-      return { ok: true, destinations: [], filter: destinationFilter, filtered_out: filteredOut };
+  // Resolve each ref to a usable destination (with credentials). The resolver
+  // already filters to enabled, distinct destinations; stay defensive here and
+  // skip any that are missing, disabled, or duplicated.
+  const destinations = [];
+  for (const ref of destinationRefs) {
+    const dest = storageDestinations.getDestinationWithCredentials(db, ref);
+    if (!dest) {
+      logger.warn(`backup-push: resolved destination ${ref} not found; skipping`);
+      continue;
     }
+    if (!dest.enabled) {
+      logger.warn(`backup-push: resolved destination ${ref} is disabled; skipping`);
+      continue;
+    }
+    if (destinations.some((d) => d.id === dest.id)) continue;
+    destinations.push(dest);
+  }
+  if (destinations.length === 0) {
+    logger.warn(`backup-push: no usable destination resolved; backup ${backupId} stays on-host only`);
+    return { ok: true, destinations: [] };
   }
 
   const ctxResult = buildBackupContext(backup);
@@ -485,9 +444,16 @@ async function pushBackup(db, backupId, options = {}) {
   }
   const backupContext = ctxResult.context;
 
+  // Push to each resolved destination in priority order (primary first, then
+  // the secondary). One backup_pushes row per destination; the primary outcome
+  // is what the backup surfaces, and each row is retried independently by the
+  // backup-push retry loop. Each push is independent -- a primary failure does
+  // not skip the secondary; both are written on every backup.
   const results = [];
-  for (const destination of matchingDestinations) {
-    // Insert a fresh row in queued state
+  for (let i = 0; i < destinations.length; i++) {
+    const destination = destinations[i];
+    const role = i === 0 ? 'primary' : 'secondary';
+
     const insert = db.prepare(`
       INSERT INTO backup_pushes (backup_id, destination_id, status, attempt_count)
       VALUES (?, ?, 'queued', 0)
@@ -500,8 +466,8 @@ async function pushBackup(db, backupId, options = {}) {
     try {
       attemptResult = await runPushAttempt(db, pushId, adapterContext, options);
     } catch (err) {
-      // Should not happen -- runPushAttempt catches adapter errors
-      // and surfaces them via DB updates. Wrapping defensively.
+      // Should not happen -- runPushAttempt catches adapter errors and surfaces
+      // them via DB updates. Wrapping defensively.
       logger.error(`backup-push: unexpected error in runPushAttempt`, { pushId, error: err.message });
       db.prepare(`
         UPDATE backup_pushes
@@ -516,6 +482,7 @@ async function pushBackup(db, backupId, options = {}) {
     results.push({
       destinationId: destination.id,
       destinationName: destination.name,
+      role,
       ...attemptResult,
     });
   }
@@ -549,7 +516,7 @@ async function retryPush(db, pushId, options = {}) {
     return { ok: false, skipped: 'max-attempts-reached', error: 'maximum retry attempts reached', pushId };
   }
 
-  const destination = backupDestinations.getDestinationWithCredentials(db, pushRow.destination_id);
+  const destination = storageDestinations.getDestinationWithCredentials(db, pushRow.destination_id);
   if (!destination) {
     const errMsg = 'destination no longer exists';
     db.prepare(`
@@ -634,7 +601,7 @@ function listPushesForBackup(db, backupId) {
   return db.prepare(`
     SELECT bp.*, bd.name AS destination_name, bd.adapter AS destination_adapter
     FROM backup_pushes bp
-    LEFT JOIN backup_destinations bd ON bd.id = bp.destination_id
+    LEFT JOIN storage_destinations bd ON bd.id = bp.destination_id
     WHERE bp.backup_id = ?
     ORDER BY bp.created_at ASC
   `).all(backupId);

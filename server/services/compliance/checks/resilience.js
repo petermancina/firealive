@@ -1,201 +1,231 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL DASHBOARD — Compliance Check Functions: Resilience & IR
+// FIREALIVE — Compliance Check Functions: Resilience & IR
 //
-// R3g PR2 (v1.0.33): GD-side counterpart to MC PR1's
-// checks/resilience.js. Both files export the same 5 function names
-// so framework definitions reference these checks uniformly across
-// MC and GD. Implementations differ because the GD has a substantially
-// smaller resilience-and-IR surface than the MC.
+// Part of the comprehensive technical-control verification library that backs
+// FireAlive's compliance claims under the Shared Responsibility framing. These
+// five checks assess the regional server's backup, recovery, and
+// incident-response posture against the platform's actual schema.
 //
 // Each function returns { status, detail } where status is one of
-// 'pass' | 'warning' | 'fail'.
+// 'pass' | 'warning' | 'fail'. The framework definitions reference these checks
+// by name (see frameworks/*.js); the mappings there name the evidence each
+// check inspects, and these implementations read exactly that evidence.
 //
-// PLATFORM STATE NOTES (GD-specific gaps relative to MC)
+// PLATFORM STATE NOTES
 //
-//   - GD has no backup_pushes history table. The backups table is the
-//     direct record of completed backups; rows are inserted by the
-//     /api/backups/trigger endpoint (CISO-only) and presumably by a
-//     scheduler (not yet wired in v0.0.31).
-//   - GD has no backup_destinations table. Each backup_schedules row
-//     has a single destination column (string) and an encrypted
-//     boolean; there is no separate destinations registry with
-//     adapter configs.
-//   - GD has no restore_approvals table. The MC's DR test gauge is
-//     restore_approvals.status='consumed' rows; the GD has no
-//     restore workflow at all and therefore no DR test signal of
-//     that kind. Closest proxies: /api/regression-test (a real
-//     integration-test suite that is not a backup-restore drill)
-//     and /api/compromise-scan (which DOES log a
-//     COMPROMISE_SCAN audit event). Neither is a true backup-restore
-//     drill; the GD has no backup-restore DR-drill infrastructure as of v0.0.31.
-//   - GD has no ir_policies table. checkIrPlanExists returns warning;
-//     IR planning for the GD is operator-managed off-platform.
-//   - GD has no sla_config table. Notification thresholds live in
-//     config.notification_config JSON (burnout_threshold, sla_below,
-//     etc. — domain-specific thresholds, not incident MTTA/MTTR
-//     timings). checkNotificationTiming returns warning describing
-//     the gap.
+//   - backups records each completed backup (status='verified'); backup_pushes
+//     records each push to a storage destination (status='succeeded').
+//   - storage_destination_routes maps each data type to a primary plus an
+//     optional secondary destination (a concurrently-written second copy)
+//     drawn from the storage_destinations registry; backups resolve through
+//     the storage-routing resolver.
+//   - restore_approvals gates every restore behind a second-person approval; a
+//     consumed approval (status='consumed') records an executed restore and is
+//     the backup-restore DR-drill signal.
+//   - ir_policies is the incident-response plan / playbook / runbook registry.
+//   - sla_config holds the per-priority MTTA / MTTR commitments; sla_measurements
+//     records the actual measured response times.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const storageRouting = require('../../storage-routing');
+
 // ── checkBackupFrequency ─────────────────────────────────────────────────────
-// Verifies the GD has had backups recorded within the last 48 hours.
-// The backups table is the direct record of completed backups
-// (no separate push-history table on the GD). Warning if zero recent
-// backups; pass if any in the last 48h.
+// Verifies backups are produced on a regular cadence. The backups table records
+// each completed backup (status='verified'); backup_pushes records each push to
+// a configured storage destination (status='succeeded'). Warning when no recent
+// verified backup; pass when a verified backup exists in the last 48 hours, with
+// the offsite-push status reported.
 //
-// Maps to controls including: SOC 2 A1.1/A1.2, NIST CSF PR.IP-04
-// (CSF 1.1) / PR.PS-01 (CSF 2.0), ISO 27001 A.8.13, NIST 800-53
-// CP-9 System Backup, DORA Art.12, HIPAA 164.308(a)(7)(ii)(A).
+// Maps to controls including: SOC 2 A1.1/A1.2, NIST CSF PR.IP-04 (CSF 1.1) /
+// PR.PS-01 (CSF 2.0), ISO 27001 A.8.13, NIST 800-53 CP-9 System Backup,
+// DORA Art.12, HIPAA 164.308(a)(7)(ii)(A).
 function checkBackupFrequency(db) {
-  const recent = db.prepare(
-    "SELECT COUNT(*) AS c FROM backups WHERE status = 'completed' AND created_at > datetime('now', '-48 hours')"
+  const recentVerified = db.prepare(
+    "SELECT COUNT(*) AS c FROM backups WHERE status = 'verified' AND created_at > datetime('now', '-48 hours')"
   ).get();
-  const total = db.prepare(
-    "SELECT COUNT(*) AS c FROM backups WHERE status = 'completed'"
+  const totalVerified = db.prepare(
+    "SELECT COUNT(*) AS c FROM backups WHERE status = 'verified'"
+  ).get();
+  const recentPushes = db.prepare(
+    "SELECT COUNT(*) AS c FROM backup_pushes WHERE status = 'succeeded' AND pushed_at > datetime('now', '-48 hours')"
   ).get();
   const activeSchedules = db.prepare(
     "SELECT COUNT(*) AS c FROM backup_schedules WHERE active = 1"
   ).get();
-  if (total.c === 0) {
+
+  if (totalVerified.c === 0) {
     return {
       status: 'warning',
-      detail: `No completed backups recorded on the GD. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be wiring through to backups table insertion. Trigger a manual backup via POST /api/backups/trigger to bootstrap.`,
+      detail: `No verified backups recorded. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be completing backups. Trigger a manual backup to bootstrap, then confirm it reaches a configured storage destination.`,
     };
   }
-  if (recent.c === 0) {
+  if (recentVerified.c === 0) {
     return {
       status: 'warning',
-      detail: `${total.c} historical completed backup(s) on the GD but none in the last 48 hours. ${activeSchedules.c} active schedule(s) — scheduler may have stalled.`,
+      detail: `${totalVerified.c} historical verified backup(s) but none in the last 48 hours. ${activeSchedules.c} active schedule(s) -- the scheduler may have stalled.`,
     };
   }
+  const pushNote = recentPushes.c > 0
+    ? `${recentPushes.c} backup push(es) succeeded to a configured destination in the same window, evidencing offsite copies that survive loss of the host.`
+    : 'No successful backup push to a remote destination in the last 48 hours -- backups are retained on-host only. Configure a backup storage route (primary + secondary) so a backup survives loss of the host.';
   return {
     status: 'pass',
-    detail: `Backup frequency: ${recent.c} completed backup(s) in last 48 hours (${total.c} historical total). ${activeSchedules.c} active backup schedule(s). Each backup records SHA-256 hash for integrity verification.`,
+    detail: `Backup cadence: ${recentVerified.c} verified backup(s) in the last 48 hours (${totalVerified.c} historical). ${activeSchedules.c} active schedule(s). Each backup records a SHA-256 manifest hash for integrity verification. ${pushNote}`,
   };
 }
 
 // ── checkBackupMultiDestination ──────────────────────────────────────────────
-// Verifies the GD maintains backups across multiple destinations to
-// survive single-destination failure. The GD's backup_schedules table
-// has a `destination` column (free-form string per schedule). The
-// check counts distinct destination values across ACTIVE schedules.
-// Warning if zero or one distinct destination; pass if two or more.
+// Verifies backups are written to two destinations so that a copy already
+// exists in each and the loss of any single destination loses no backups. Every
+// backup is written to both the primary and the secondary destination on each
+// run (a concurrent dual-write, not an only-on-failure copy); the destinations
+// are drawn from the storage_destinations registry (local + S3 / GCS / Azure /
+// SFTP) and resolved through the storage-routing resolver. Only enabled,
+// distinct destinations count. Pass when both a primary and a secondary
+// resolve; warning when only one destination is configured; warning when no
+// backup destination is routed.
 //
-// Maps to controls including: SOC 2 A1.2 Availability — Capacity,
-// NIST CSF PR.IP-04 / PR.PS-01, ISO 27001 A.8.14 Redundancy,
-// NIST 800-53 CP-9(1), DORA Art.12, HIPAA 164.308(a)(7)(ii)(B).
+// Maps to controls including: SOC 2 CC7.5 Recovery and Restoration / A1.2,
+// NIST CSF PR.IP-04 / PR.PS-01, ISO 27001 A.8.14 Redundancy, NIST 800-53
+// CP-9(1), DORA Art.12, HIPAA 164.308(a)(7)(ii)(B).
 function checkBackupMultiDestination(db) {
-  const rows = db.prepare(
-    "SELECT destination, COUNT(*) AS c FROM backup_schedules WHERE active = 1 AND destination IS NOT NULL AND destination != '' GROUP BY destination"
-  ).all();
-  if (rows.length === 0) {
+  let destinations;
+  try {
+    const route = storageRouting.getRouteForType(db, 'backup');
+    destinations = (route && Array.isArray(route.destinations)) ? route.destinations : [];
+  } catch (err) {
     return {
       status: 'warning',
-      detail: 'No active backup schedules with destinations configured on the GD. Configure at least two schedules pointing to different destinations for redundancy.',
+      detail: `Unable to resolve the backup storage route (${err.message}). Configure two destinations for backups under storage routing so every backup is written to both.`,
     };
   }
-  if (rows.length === 1) {
+
+  if (destinations.length === 0) {
     return {
       status: 'warning',
-      detail: `Only 1 distinct backup destination across active schedules: '${rows[0].destination}' (${rows[0].c} schedule(s) using it). Single-destination configuration cannot survive a destination failure. Add a schedule pointing to a different destination for redundancy.`,
+      detail: 'No backup destination is configured under storage routing. Configure two destinations so every backup is written to both and a copy survives the loss of any single destination (3-2-1: an on-host copy plus two remote copies).',
     };
   }
-  const summary = rows.map(r => `${r.destination}(${r.c})`).join(', ');
+  if (destinations.length === 1) {
+    return {
+      status: 'warning',
+      detail: `Backups are written to only one destination ('${destinations[0].name}'); no second destination is configured, so losing that destination would lose every remote backup. Configure a second destination on the backup route so every backup is written to two locations.`,
+    };
+  }
+  const names = destinations.map((d) => d.name).join(', ');
   return {
     status: 'pass',
-    detail: `Multi-destination resilience on the GD: ${rows.length} distinct destinations across active schedules: ${summary}.`,
+    detail: `Backups are written to two destinations on every run (${names}), so a copy already exists in each and the loss of either destination loses no backups (an on-host copy plus two remote copies, 3-2-1). Restores are gated by the restore_approvals second-person workflow with SHA-256 verification.`,
   };
 }
 
 // ── checkDrTestRecency ───────────────────────────────────────────────────────
-// Verifies disaster recovery test recency. The GD has no backup-restore
-// DR-drill infrastructure as of v0.0.31:
-//   - /api/regression-test runs a real integration-test suite (and writes
-//     a REGRESSION_RUN audit entry) but does not exercise backup-restore.
-//   - /api/compromise-scan does log a COMPROMISE_SCAN audit event but
-//     is a self-scan, not a recovery drill.
-//   - There is no restore workflow on the GD (no restore_approvals
-//     table; no PUT/POST /api/backups/:id/restore endpoint).
-// Honest gap: DR testing on the GD is operator-managed off-platform
-// (operator restores a backup to a side-by-side GD instance manually).
+// Verifies disaster-recovery (backup-restore) testing recency. A restore flows
+// through the restore_approvals workflow (second-person approval); an approval
+// that has been consumed (status='consumed') records an actual restore having
+// executed -- the DR-drill signal. Pass when at least one restore was consumed
+// in the last 90 days (an at-least-quarterly cadence); warning when DR testing
+// has lapsed or none is on record.
 //
-// Maps to controls including: SOC 2 A1.3 Availability — Recovery
-// Testing, NIST CSF PR.IP-10 / RC.RP-02, ISO 27001 A.8.13/A.5.29,
-// NIST 800-53 CP-4, DORA Art.24, HIPAA 164.308(a)(7)(ii)(D).
+// Maps to controls including: SOC 2 A1.3 Recovery Testing, NIST CSF PR.IP-10 /
+// RC.RP-02, ISO 27001 A.8.13 / A.5.29, NIST 800-53 CP-4, DORA Art.24,
+// HIPAA 164.308(a)(7)(ii)(D).
 function checkDrTestRecency(db) {
-  const compromiseScans = db.prepare(
-    "SELECT COUNT(*) AS c FROM audit_log WHERE event_type = 'COMPROMISE_SCAN' AND timestamp > datetime('now', '-90 days')"
+  const recent = db.prepare(
+    "SELECT COUNT(*) AS c FROM restore_approvals WHERE status = 'consumed' AND consumed_at > datetime('now', '-90 days')"
   ).get();
-  if (compromiseScans.c > 0) {
+  const total = db.prepare(
+    "SELECT COUNT(*) AS c FROM restore_approvals WHERE status = 'consumed'"
+  ).get();
+
+  if (recent.c > 0) {
+    return {
+      status: 'pass',
+      detail: `Disaster-recovery testing is current: ${recent.c} restore(s) consumed in the last 90 days (${total.c} on record). A consumed restore_approval evidences an executed backup-restore drill through the second-person approval workflow, meeting the at-least-quarterly SOC-grade cadence.`,
+    };
+  }
+  if (total.c > 0) {
     return {
       status: 'warning',
-      detail: `GD has no application-layer DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). ${compromiseScans.c} compromise-scan event(s) in last 90 days provide partial self-integrity signal but are not a true backup-restore drill. SOC-grade DR testing on the GD is currently operator-managed off-platform.`,
+      detail: `Disaster-recovery testing has lapsed: ${total.c} restore(s) consumed historically but none in the last 90 days. Execute a backup-restore drill (request and consume a restore_approval) to restore the at-least-quarterly cadence SOC 2 A1.3 expects.`,
     };
   }
   return {
     status: 'warning',
-    detail: 'GD has no application-layer DR test infrastructure as of v0.0.31. SOC-grade DR testing is operator-managed off-platform (restore a backup to a side-by-side GD instance on a documented cadence — quarterly per SOC 2 A1.3 norm).',
+    detail: 'No backup-restore drill on record (no consumed restore_approvals). Execute a restore through the restore_approvals workflow on a documented at-least-quarterly cadence to evidence recovery capability; an auditor will examine restore_approvals records.',
   };
 }
 
 // ── checkIrPlanExists ────────────────────────────────────────────────────────
-// Verifies the platform has incident response plans on file. GD has
-// no ir_policies table or equivalent IR document registry. IR
-// planning at the GD layer (CISO/governance-tier IR) is
-// operator-managed off-platform.
+// Verifies the platform holds incident-response plans on file. The ir_policies
+// registry stores incident-response plans, playbooks, runbooks, policies, and
+// procedures (soft-deleted rows carry a deleted_at stamp); sla_config records
+// the per-priority MTTA / MTTR commitments those plans are held to. Pass when at
+// least one incident-response plan or playbook is on file; warning when the
+// registry holds no incident-response content.
 //
-// Note: SOC-level IR procedures (analyst-facing) live at the MC layer
-// — the GD is not responsible for SOC-level IR planning. The IR gap
-// at the GD layer covers things like: what happens if the GD is
-// compromised; what happens if the GD's database is corrupted; what
-// happens if an MC is detected pushing suspicious aggregate metrics.
-//
-// Maps to controls including: SOC 2 CC7.4, NIST CSF RS.MA-01,
-// ISO 27001 A.5.24, NIST 800-53 IR-8, DORA Art.17/18,
-// NIS2 Art.21(2)(b), HIPAA 164.308(a)(6).
-function checkIrPlanExists() {
+// Maps to controls including: SOC 2 CC7.4, NIST CSF RS.MA-01, ISO 27001 A.5.24,
+// NIST 800-53 IR-8, DORA Art.17/18, NIS2 Art.21(2)(b), HIPAA 164.308(a)(6).
+function checkIrPlanExists(db) {
+  const irPlans = db.prepare(
+    "SELECT COUNT(*) AS c FROM ir_policies WHERE deleted_at IS NULL AND policy_type IN ('incident_response', 'playbook')"
+  ).get();
+  const allPolicies = db.prepare(
+    "SELECT COUNT(*) AS c FROM ir_policies WHERE deleted_at IS NULL"
+  ).get();
+  const sla = db.prepare("SELECT COUNT(*) AS c FROM sla_config").get();
+
+  if (allPolicies.c === 0) {
+    return {
+      status: 'warning',
+      detail: 'No incident-response plans on file (the ir_policies registry is empty). Upload incident-response plans and scenario playbooks to the IR registry, covering scenarios such as platform compromise, database corruption, and credential exposure.',
+    };
+  }
+  if (irPlans.c === 0) {
+    return {
+      status: 'warning',
+      detail: `${allPolicies.c} document(s) in the ir_policies registry, but none typed as an incident-response plan or playbook. Add at least one incident_response or playbook document so the IR procedure is on record.`,
+    };
+  }
+  const slaNote = sla.c > 0
+    ? 'Per-priority MTTA / MTTR commitments are recorded in sla_config.'
+    : 'No per-priority MTTA / MTTR commitments are configured in sla_config -- record them to bind the IR plans to response-time targets.';
   return {
-    status: 'warning',
-    detail: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO/governance-tier incident response planning is operator-managed off-platform. Document scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC.',
+    status: 'pass',
+    detail: `Incident-response plans on file: ${irPlans.c} incident-response plan/playbook document(s) (${allPolicies.c} total in the IR registry). ${slaNote}`,
   };
 }
 
 // ── checkNotificationTiming ──────────────────────────────────────────────────
-// Verifies incident-notification SLA timings are configured. GD has
-// no sla_config table; notification_config in the config key-value
-// table holds domain-specific thresholds (burnout_threshold,
-// sla_below) but not incident MTTA/MTTR timings. The GD's
-// notification model is threshold-driven (alert when X crosses Y)
-// rather than incident-severity-driven (P1 needs response in N
-// minutes). The gap matters for frameworks that mandate timed
-// incident notification (NIS2 24-hour rule, DORA Art.19, GDPR
-// Art.33 72-hour rule).
+// Verifies incident-notification SLA timings are configured and measured.
+// sla_config holds the per-priority MTTA / MTTR commitments (P1 / P2);
+// sla_measurements records the actual measured response times. Pass when the SLA
+// timings are configured, with recent measurements reported. External regulatory
+// notification windows (NIS2 24h, DORA Art.19, GDPR Art.33 72h) are
+// operator-tracked and enumerated in each framework's customerResponsibility
+// list.
 //
-// Maps to controls including: SOC 2 CC7.4, NIST CSF DE.AE-06 /
-// RS.CO-02, ISO 27001 A.5.24, NIST 800-53 IR-6, NIS2 Art.23,
-// DORA Art.19, GDPR Art.33.
+// Maps to controls including: SOC 2 CC7.4, NIST CSF DE.AE-06 / RS.CO-02,
+// ISO 27001 A.5.24, NIST 800-53 IR-6, NIS2 Art.23, DORA Art.19, GDPR Art.33.
 function checkNotificationTiming(db) {
-  const row = db.prepare("SELECT value FROM config WHERE key = 'notification_config'").get();
-  if (!row || !row.value) {
+  const cfg = db.prepare("SELECT * FROM sla_config WHERE id = 'default'").get();
+  if (!cfg) {
     return {
       status: 'warning',
-      detail: 'GD has no incident-timing SLA configuration. config.notification_config absent. SOC-grade incident-response SLAs (P1 MTTA, P1 MTTR, P2 MTTA, P2 MTTR) are operator-managed off-platform; external regulatory timings (NIS2 24h, GDPR 72h, DORA Art.19) are documented in framework customerResponsibility lists.',
+      detail: 'No incident-response SLA timings configured (sla_config has no default row). Configure the per-priority MTTA / MTTR commitments (P1 / P2) so incident notification and response are held to documented targets. External regulatory windows (NIS2 24h, DORA Art.19, GDPR Art.33 72h) are operator-tracked and listed in each framework customerResponsibility set.',
     };
   }
-  let cfg;
-  try {
-    cfg = JSON.parse(row.value);
-  } catch (e) {
-    return {
-      status: 'fail',
-      detail: `config.notification_config failed to parse: ${e.message}.`,
-    };
-  }
+  const measured = db.prepare(
+    "SELECT COUNT(*) AS c FROM sla_measurements WHERE measured_at > datetime('now', '-90 days')"
+  ).get();
+  const measureNote = measured.c > 0
+    ? `${measured.c} response-time measurement(s) recorded in the last 90 days (sla_measurements), evidencing the timings are tracked against actual incidents.`
+    : 'No response-time measurements recorded in the last 90 days -- record MTTA / MTTR per incident in sla_measurements to evidence the timings are met in practice.';
   return {
-    status: 'warning',
-    detail: `GD notification model is threshold-driven, not incident-severity-driven. notification_config holds domain thresholds (burnout_threshold=${cfg.burnout_threshold}, sla_below=${cfg.sla_below}) and delivery flags (email=${!!cfg.email}, sms=${!!cfg.sms}) but no incident MTTA/MTTR timings. External regulatory notification windows (NIS2 24h, DORA Art.19, GDPR Art.33 72h breach notification) are operator-tracked off-platform and enumerated in framework customerResponsibility lists.`,
+    status: 'pass',
+    detail: `Incident-response SLA timings configured: P1 MTTA ${cfg.p1_mtta} / MTTR ${cfg.p1_mttr}, P2 MTTA ${cfg.p2_mtta} / MTTR ${cfg.p2_mttr}. ${measureNote} External regulatory notification windows (NIS2 24h, DORA Art.19, GDPR Art.33 72h) are operator-tracked and listed in each framework customerResponsibility set.`,
   };
 }
 

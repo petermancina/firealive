@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Data-Residency Admin Routes
+// FIREALIVE -- Data-Residency Admin Routes
 //
 // Admin-only CRUD for the data-residency policy, per-destination jurisdiction
 // declarations, and the cross-border transfer register, plus an on-demand
@@ -9,8 +9,10 @@
 // Routes:
 //   GET    /config              the policy
 //   PUT    /config              set the policy (validated) + reconcile + audit
-//   GET    /destinations        backup destinations + declaration + compliance
-//   PUT    /destinations/:ref    set a destination's jurisdiction + reconcile + audit
+//   GET    /destinations        destinations + declaration + compliance for a
+//                               routed category (?category=, default backup)
+//   PUT    /destinations/:ref    set a destination's jurisdiction for a routed
+//                               category (body.category, default backup) + audit
 //   GET    /transfers           the cross-border transfer register + summary
 //   PUT    /transfers/:id        set a transfer's mechanism / notes / review + audit
 //   POST   /evaluate            reconcile + posture; raise region-mismatch alert
@@ -39,6 +41,16 @@ const router = express.Router();
 const VALID_MODES = ['enforce', 'warn'];
 const VALID_MECHANISMS = ['adequacy', 'scc', 'bcr', 'derogation', 'none', 'unset'];
 
+// Residency declarations and posture are scoped to a routed destination kind: a
+// physical destination is declared/evaluated per category it serves (its route's
+// primary/secondary). Only reconciled categories (those with real remote
+// destinations) are accepted; 'backup' is the default for back-compat.
+function normalizeCategory(raw) {
+  if (raw === undefined || raw === null || raw === '') return 'backup';
+  const c = String(raw);
+  return dataResidency.RECONCILED_CATEGORIES.indexOf(c) !== -1 ? c : null;
+}
+
 function actorOf(req) {
   return req.user && req.user.id ? req.user.id : 'system';
 }
@@ -60,11 +72,13 @@ function isValidRegionToken(v) {
   return /^[A-Z]{2}$/.test(t);
 }
 
-function destinationView(db, d) {
-  const jur = dataResidency.resolveDestinationJurisdiction(db, 'backup', d.id);
-  const verdict = dataResidency.evaluateDestination(db, 'backup', d.id);
+function destinationView(db, d, category) {
+  const cat = category || 'backup';
+  const jur = dataResidency.resolveDestinationJurisdiction(db, cat, d.id);
+  const verdict = dataResidency.evaluateDestination(db, cat, d.id);
   return {
     ref: d.id,
+    category: cat,
     name: d.name,
     adapter: d.adapter,
     enabled: d.enabled === 1 || d.enabled === true,
@@ -125,7 +139,7 @@ async function buildPosture(db, req) {
     }
   }
 
-  const dests = db.prepare('SELECT id, name, adapter, enabled FROM backup_destinations ORDER BY name').all();
+  const dests = db.prepare('SELECT id, name, adapter, enabled FROM storage_destinations ORDER BY name').all();
   const destinations = dests.map(function (d) { return destinationView(db, d); });
 
   return {
@@ -250,17 +264,21 @@ router.put('/config', requireObjectBody, (req, res) => {
 router.get('/destinations', (req, res) => {
   const db = getDb();
   try {
-    const dests = db.prepare('SELECT id, name, adapter, enabled FROM backup_destinations ORDER BY name').all();
+    const category = normalizeCategory(req.query.category);
+    if (!category) {
+      return res.status(400).json({ error: 'category must be one of: ' + dataResidency.RECONCILED_CATEGORIES.join(', ') });
+    }
+    const dests = db.prepare('SELECT id, name, adapter, enabled FROM storage_destinations ORDER BY name').all();
     const out = dests.map(function (d) {
       const decl = db.prepare(
         'SELECT declared_country, declared_region, provider_domicile, key_custody, auto_detected '
         + 'FROM data_residency_destinations WHERE destination_kind = ? AND destination_ref = ?'
-      ).get('backup', d.id) || null;
-      const view = destinationView(db, d);
+      ).get(category, d.id) || null;
+      const view = destinationView(db, d, category);
       view.declaration = decl;
       return view;
     });
-    return res.json({ destinations: out });
+    return res.json({ category: category, destinations: out });
   } catch (e) {
     return res.status(500).json({ error: 'failed to list residency destinations' });
   } finally {
@@ -272,10 +290,14 @@ router.put('/destinations/:ref', requireObjectBody, (req, res) => {
   const db = getDb();
   try {
     const ref = req.params.ref;
-    const exists = db.prepare('SELECT id FROM backup_destinations WHERE id = ?').get(ref);
+    const exists = db.prepare('SELECT id FROM storage_destinations WHERE id = ?').get(ref);
     if (!exists) return res.status(404).json({ error: 'destination not found' });
 
     const b = req.body;
+    const category = normalizeCategory(b.category);
+    if (!category) {
+      return res.status(400).json({ error: 'category must be one of: ' + dataResidency.RECONCILED_CATEGORIES.join(', ') });
+    }
     let country = null;
     if (b.declared_country !== undefined && b.declared_country !== null && b.declared_country !== '') {
       if (!isIsoCountry(b.declared_country)) {
@@ -297,12 +319,12 @@ router.put('/destinations/:ref', requireObjectBody, (req, res) => {
     db.prepare(
       'INSERT INTO data_residency_destinations '
       + '(destination_kind, destination_ref, declared_country, declared_region, provider_domicile, key_custody, auto_detected, updated_at) '
-      + "VALUES ('backup', ?, ?, ?, ?, ?, ?, datetime('now')) "
+      + "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
       + 'ON CONFLICT(destination_kind, destination_ref) DO UPDATE SET '
       + 'declared_country = excluded.declared_country, declared_region = excluded.declared_region, '
       + 'provider_domicile = excluded.provider_domicile, key_custody = excluded.key_custody, '
       + "auto_detected = excluded.auto_detected, updated_at = datetime('now')"
-    ).run(ref, country, region, domicile, keyCustody, autoDetected);
+    ).run(category, ref, country, region, domicile, keyCustody, autoDetected);
 
     try {
       dataResidency.reconcileTransfers(db);
@@ -310,10 +332,10 @@ router.put('/destinations/:ref', requireObjectBody, (req, res) => {
       logger.error('routes/data-residency: reconcile after destination set failed', { error: e.message });
     }
     auditLog(actorOf(req), 'RESIDENCY_DESTINATION_SET',
-      'ref=' + ref + ' country=' + (country || 'cleared') + ' domicile=' + (domicile || 'none'), req.ip);
+      'category=' + category + ' ref=' + ref + ' country=' + (country || 'cleared') + ' domicile=' + (domicile || 'none'), req.ip);
 
-    const d = db.prepare('SELECT id, name, adapter, enabled FROM backup_destinations WHERE id = ?').get(ref);
-    return res.json({ success: true, destination: destinationView(db, d) });
+    const d = db.prepare('SELECT id, name, adapter, enabled FROM storage_destinations WHERE id = ?').get(ref);
+    return res.json({ success: true, destination: destinationView(db, d, category) });
   } catch (e) {
     return res.status(500).json({ error: 'failed to set residency destination' });
   } finally {

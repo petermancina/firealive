@@ -1,10 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Backup Destinations CRUD Service
+// FIREALIVE — Storage Destinations CRUD Service
 //
-// Manages rows in backup_destinations. Validates against the loaded
-// adapter registry, encrypts credentials at rest under Tier-1 AES-GCM,
-// exposes public (no-credentials) and internal (with-credentials)
-// retrieval paths.
+// Manages rows in storage_destinations -- the generalized destination
+// registry (backups were its first consumer, but it holds the routing
+// target for every artifact type Storage Routing routes: backups, audit-log
+// archives, forensic exports, snapshots, and CEF-stream archives). Validates
+// against the loaded adapter registry, encrypts credentials at rest under
+// Tier-1 AES-GCM, exposes public (no-credentials) and internal
+// (with-credentials) retrieval paths.
 //
 // PUBLIC API
 //
@@ -52,15 +55,18 @@
 //
 // ADAPTER LOADING
 //
-// At module load, this service requires both adapter files
-// (destination-adapter-local, destination-adapter-sftp). Each
+// At module load, this service requires all five adapter files
+// (destination-adapter-local, -sftp, -s3, -gcs, -azure-blob). Each
 // adapter self-registers via base.registerAdapter on require, so
-// after this module is loaded the registry is populated. The
-// push orchestrator's module load also triggers the same chain.
+// after this module is loaded the registry is fully populated. The
+// push orchestrator's module load also triggers the same chain. The
+// cloud adapters load their provider SDK lazily (only when a push or
+// probe runs), so requiring them here costs nothing at boot.
 //
-// Adapters not loaded in R3d-3 (s3, azure-blob, gcs):
-// rejected at create / update with a precise 'lands in R3d-4'
-// message rather than the generic 'unknown adapter'.
+// The cloud adapters (s3, gcs, azure-blob) were built and tested in
+// R3d-4 but were gated off behind ADAPTERS_LANDING_IN_R3D4; B5q
+// activates them (the HSM/KMS credential-at-rest dependency they
+// waited on now exists), so all five adapters are live.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
@@ -70,12 +76,13 @@ const base = require('./destination-adapter-base');
 // base.registerAdapter at end of module.
 require('./destination-adapter-local');
 require('./destination-adapter-sftp');
+require('./destination-adapter-s3');
+require('./destination-adapter-gcs');
+require('./destination-adapter-azure-blob');
 
 const { encryptConfig, decryptConfig } = require('./encryption');
 const deploymentMode = require('./deployment-mode');
 const dataResidency = require('./data-residency');
-
-const ADAPTERS_LANDING_IN_R3D4 = new Set(['s3', 'azure-blob', 'gcs']);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -105,13 +112,6 @@ function validateInput(input, { isUpdate = false } = {}) {
     if (!r.ok) return r;
     if (!base.VALID_ADAPTER_NAMES.includes(input.adapter)) {
       return { ok: false, error: `adapter must be one of: ${base.VALID_ADAPTER_NAMES.join(', ')}`, field: 'adapter' };
-    }
-    if (ADAPTERS_LANDING_IN_R3D4.has(input.adapter)) {
-      return {
-        ok: false,
-        error: `adapter '${input.adapter}' is recognized but not yet implemented (lands in R3d-4 alongside HSM/KMS work)`,
-        field: 'adapter',
-      };
     }
   }
 
@@ -361,7 +361,7 @@ function createDestination(db, input) {
   const configJson = JSON.stringify(v.normalized.config);
 
   db.prepare(`
-    INSERT INTO backup_destinations
+    INSERT INTO storage_destinations
       (id, name, adapter, config, credentials_encrypted, enabled,
        immutability_mode, retention_days)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -371,7 +371,7 @@ function createDestination(db, input) {
     v.normalized.immutability_mode, v.normalized.retention_days,
   );
 
-  const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM storage_destinations WHERE id = ?').get(id);
   return withResidencyWarning(attachPushStats(db, rowToPublicView(row)), residencyWarning);
 }
 
@@ -379,7 +379,7 @@ function updateDestination(db, id, input) {
   if (typeof id !== 'string' || !id) {
     const err = new Error('id required'); err.validation = true; throw err;
   }
-  const existing = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT * FROM storage_destinations WHERE id = ?').get(id);
   if (!existing) return null;
 
   const v = validateInput(input, { isUpdate: true });
@@ -441,9 +441,9 @@ function updateDestination(db, id, input) {
   sets.push("updated_at = datetime('now')");
   args.push(id);
 
-  db.prepare(`UPDATE backup_destinations SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+  db.prepare(`UPDATE storage_destinations SET ${sets.join(', ')} WHERE id = ?`).run(...args);
 
-  const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM storage_destinations WHERE id = ?').get(id);
   return withResidencyWarning(attachPushStats(db, rowToPublicView(row)), residencyWarning);
 }
 
@@ -453,7 +453,7 @@ function listDestinations(db, options = {}) {
   if (options.enabledOnly) where.push('enabled = 1');
   if (options.adapter) { where.push('adapter = ?'); args.push(options.adapter); }
   const sql = `
-    SELECT * FROM backup_destinations
+    SELECT * FROM storage_destinations
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY created_at DESC
   `;
@@ -463,20 +463,20 @@ function listDestinations(db, options = {}) {
 
 function getDestinationById(db, id) {
   if (typeof id !== 'string' || !id) return null;
-  const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM storage_destinations WHERE id = ?').get(id);
   if (!row) return null;
   return attachPushStats(db, rowToPublicView(row));
 }
 
 function getDestinationWithCredentials(db, id) {
   if (typeof id !== 'string' || !id) return null;
-  const row = db.prepare('SELECT * FROM backup_destinations WHERE id = ?').get(id);
+  const row = db.prepare('SELECT * FROM storage_destinations WHERE id = ?').get(id);
   if (!row) return null;
   return rowToInternalView(row);
 }
 
 function listEnabledDestinations(db) {
-  const rows = db.prepare('SELECT * FROM backup_destinations WHERE enabled = 1 ORDER BY created_at ASC').all();
+  const rows = db.prepare('SELECT * FROM storage_destinations WHERE enabled = 1 ORDER BY created_at ASC').all();
   return rows.map(rowToInternalView);
 }
 
@@ -496,7 +496,7 @@ function deleteDestination(db, id) {
   if (typeof id !== 'string' || !id) {
     const err = new Error('id required'); err.validation = true; throw err;
   }
-  const existing = db.prepare('SELECT id FROM backup_destinations WHERE id = ?').get(id);
+  const existing = db.prepare('SELECT id FROM storage_destinations WHERE id = ?').get(id);
   if (!existing) return { deleted: false, reason: 'not_found' };
 
   // Pre-check: count push records (the FK is ON DELETE RESTRICT
@@ -512,7 +512,7 @@ function deleteDestination(db, id) {
   }
 
   try {
-    db.prepare('DELETE FROM backup_destinations WHERE id = ?').run(id);
+    db.prepare('DELETE FROM storage_destinations WHERE id = ?').run(id);
     return { deleted: true };
   } catch (err) {
     // FK ON DELETE RESTRICT (defense-in-depth, should not fire after the pre-check)
@@ -536,7 +536,4 @@ module.exports = {
   decryptCredentials,
   validateInput,
   validateAgainstAdapter,
-
-  // constants
-  ADAPTERS_LANDING_IN_R3D4: [...ADAPTERS_LANDING_IN_R3D4],
 };

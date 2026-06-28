@@ -75,6 +75,11 @@ const {
   buildManifestSkeleton,
   addSlice,
 } = require('./audit-export-shared');
+const os = require('os');
+const storageRouting = require('./storage-routing');
+const storageDestinations = require('./storage-destinations');
+const dataResidency = require('./data-residency');
+const destinationBase = require('./destination-adapter-base');
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -83,6 +88,27 @@ const COSIGN_ENV_VAR = 'FIREALIVE_FORENSIC_USE_COSIGN';
 const TAR_BLOCK_SIZE = 512;
 const TAR_MAGIC = 'ustar\0';
 const TAR_VERSION = '00';
+
+// B5q: timeout for pushing a completed forensic export to its routed destination.
+const FORENSIC_PUSH_TIMEOUT_MS = 5 * 60 * 1000;
+// Revision v4: forensic push retry policy. Mirrors backup-push.js /
+// archive-segment.js (MAX_ATTEMPTS = 5, same backoff). Both the primary and the
+// secondary copy are retried (neither push gates the export, which succeeds on
+// the local seal); each retry re-stages from the export's already-retained files.
+const FORENSIC_MAX_ATTEMPTS = 5;
+const FORENSIC_RETRY_DELAYS_SEC = [
+  5 * 60,        // 5 min  -> attempt 2
+  30 * 60,       // 30 min -> attempt 3
+  2 * 60 * 60,   // 2 hr   -> attempt 4
+  12 * 60 * 60,  // 12 hr  -> attempt 5
+];
+function forensicNextRetryAt(justCompletedAttempt) {
+  if (justCompletedAttempt >= FORENSIC_MAX_ATTEMPTS) return null;
+  const delaySec = FORENSIC_RETRY_DELAYS_SEC[justCompletedAttempt - 1];
+  if (delaySec === undefined) return null;
+  return new Date(Date.now() + delaySec * 1000).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 
 // ── Lazy-loaded format serializer registry ────────────────────────────────
 //
@@ -432,6 +458,248 @@ function atomicReplace(targetPath, buf) {
  *   pending -> in_progress -> complete  (happy path)
  *   pending -> in_progress -> failed    (on error)
  */
+// ── B5q: push a completed forensic export to its routed destination(s) ───────
+//
+// Additive and never fatal. The forensic archive + manifest are already FA-ENC1
+// ciphertext at rest (B5g), so this pushes the already-encrypted files as-is
+// (encrypt-before-push holds with no re-encryption; the .sig sidecars carry no
+// confidential content). The same set of files is pushed to the primary and,
+// when configured, the secondary destination -- both on this run. The local copy
+// and decrypt-on-download path are unchanged; a push failure never fails the
+// export.
+//
+// Revision v4: every push is recorded in forensic_export_pushes, and BOTH the
+// primary and secondary are retried until they land -- neither push gates the
+// export, so neither is "authoritative" the way an archive primary is. A failed
+// copy is left for retryPendingExportPushes, which re-stages from the export's
+// retained files (forensic_exports.archive_path / manifest_path / sig sidecars),
+// so there is no separate pending directory. The residency gate is re-evaluated
+// per attempt.
+
+// Stage a list of existing source files into a unique temp dir and push them to
+// one destination. Returns the adapter push result; throws on push failure (no
+// files, adapter missing, or the push itself). The temp dir is always cleaned --
+// the durable copies are the export's retained files.
+async function stageAndPushExport(dest, exportId, files, manifestSha256, pathPrefix, logger) {
+  const stagingParent = fs.mkdtempSync(path.join(os.tmpdir(), 'fa-forensic-'));
+  const sourceDir = path.join(stagingParent, exportId);
+  try {
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const staged = [];
+    for (const src of files) {
+      if (!src || !fs.existsSync(src)) continue;
+      const name = path.basename(src);
+      const target = path.join(sourceDir, name);
+      fs.copyFileSync(src, target);
+      const bytes = fs.readFileSync(target);
+      staged.push({
+        name: name,
+        absolutePath: target,
+        sizeBytes: bytes.length,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      });
+    }
+    if (staged.length === 0) {
+      throw new Error('no files to push');
+    }
+    const adapter = destinationBase.getAdapter(dest.adapter);
+    if (!adapter) {
+      throw new Error('adapter \'' + dest.adapter + '\' not loaded in registry');
+    }
+    const context = {
+      backupId: exportId,
+      sourceDir: sourceDir,
+      files: staged,
+      manifestSha256: manifestSha256,
+      createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      // Recorded routing hint; current adapters mirror the source dir name under
+      // the destination's configured base path.
+      pathPrefix: pathPrefix,
+      destination: {
+        id: dest.id,
+        name: dest.name,
+        adapter: dest.adapter,
+        config: dest.config,
+        credentials: dest.credentials,
+        immutability_mode: dest.immutability_mode,
+        retention_days: dest.retention_days,
+      },
+    };
+    return await adapter.push(context, { logger: logger, timeoutMs: FORENSIC_PUSH_TIMEOUT_MS });
+  } finally {
+    try {
+      fs.rmSync(stagingParent, { recursive: true, force: true });
+    } catch (_cleanupErr) {
+      /* best-effort: staged files are encrypted; leftover is non-sensitive */
+    }
+  }
+}
+
+/**
+ * runExportPushAttempt(db, pushId, files, manifestSha256, options)
+ *
+ * One residency-gated attempt to push an export copy to its destination,
+ * updating the forensic_export_pushes row. Used by pushForensicExport (initial,
+ * for each role) and retryPendingExportPushes. Mirrors the backup-push attempt/
+ * backoff model (FORENSIC_MAX_ATTEMPTS). On success the row is 'succeeded'; on
+ * failure it is 'failed' with next_retry_at (null once attempts are exhausted).
+ * files may be omitted on retry, in which case it is derived from the export's
+ * retained columns. Returns { ok, reason?, destinationPath?, bytesPushed?,
+ * immutabilityVerified? }.
+ */
+async function runExportPushAttempt(db, pushId, files, manifestSha256, options = {}) {
+  const logger = options.logger || console;
+
+  const row = db.prepare(
+    'SELECT id, export_id, destination_id, role, status, attempt_count FROM forensic_export_pushes WHERE id = ?'
+  ).get(pushId);
+  if (!row) return { ok: false, reason: 'push row not found' };
+  if (row.status === 'succeeded') return { ok: true };
+
+  const attemptCount = row.attempt_count + 1;
+  const fail = (message) => {
+    db.prepare(
+      "UPDATE forensic_export_pushes SET status='failed', attempt_count=?, error_message=?, next_retry_at=?, last_attempt_at=datetime('now') WHERE id=?"
+    ).run(attemptCount, String(message).slice(0, 1000), forensicNextRetryAt(attemptCount), pushId);
+    return { ok: false, reason: message };
+  };
+
+  const residency = dataResidency.evaluateDestination(db, 'forensic_export', row.destination_id);
+  if (residency.blocked) {
+    logger.warn('forensic export destination blocked by residency; copy deferred', {
+      exportId: row.export_id, destinationRef: row.destination_id, role: row.role, reason: residency.reason,
+    });
+    return fail('blocked by residency: ' + (residency.reason || 'policy'));
+  }
+
+  const dest = storageDestinations.getDestinationWithCredentials(db, row.destination_id);
+  if (!dest) return fail('destination not found');
+
+  let fileList = (files && files.length) ? files : null;
+  if (!fileList) {
+    const ex = db.prepare(
+      'SELECT archive_path, manifest_path, manifest_sig_path, cosign_signature_path FROM forensic_exports WHERE id = ?'
+    ).get(row.export_id);
+    fileList = ex ? [ex.archive_path, ex.manifest_path, ex.manifest_sig_path, ex.cosign_signature_path] : [];
+  }
+
+  let pathPrefix = null;
+  try {
+    const route = storageRouting.getRouteForType(db, 'forensic_export');
+    pathPrefix = route && route.pathPrefix ? String(route.pathPrefix) : null;
+  } catch (_routeErr) {
+    pathPrefix = null;
+  }
+
+  db.prepare(
+    "UPDATE forensic_export_pushes SET status='running', attempt_count=?, last_attempt_at=datetime('now') WHERE id=?"
+  ).run(attemptCount, pushId);
+
+  let result;
+  try {
+    result = await stageAndPushExport(dest, row.export_id, fileList, manifestSha256 || null, pathPrefix, logger);
+  } catch (pushErr) {
+    return fail(pushErr.message);
+  }
+
+  db.prepare(
+    "UPDATE forensic_export_pushes SET status='succeeded', pushed_at=datetime('now'), size_pushed_bytes=?, destination_path=?, error_message=NULL, next_retry_at=NULL WHERE id=?"
+  ).run(result.bytesPushed || 0, result.destinationPath || null, pushId);
+  return {
+    ok: true,
+    destinationPath: result.destinationPath || null,
+    bytesPushed: result.bytesPushed || 0,
+    immutabilityVerified: result.immutabilityVerified || null,
+  };
+}
+
+// Returns one of:
+//   { attempted: false, configured: false }                       no route
+//   { attempted: true, configured: true, pushed, destinationRef,
+//     destinationPath, bytesPushed, immutabilityVerified,
+//     primaryReplicated, secondaryDestinationRef, secondaryReplicated }
+async function pushForensicExport(db, ctx) {
+  const logger = ctx.logger || console;
+
+  const route = storageRouting.getRouteForType(db, 'forensic_export');
+  if (!route.configured || !route.destinations || route.destinations.length === 0) {
+    return { attempted: false, configured: false };
+  }
+  const primaryView = route.destinations[0];
+  const secondaryView = route.destinations[1] || null;
+
+  const manifestSha256 = ctx.manifestBytes ? sliceSha256(ctx.manifestBytes) : null;
+  const files = ctx.files || [];
+
+  // Record a push row per destination (reusing an existing row if a prior call
+  // left one) and attempt each now. A failed copy is left for the retry sweep,
+  // sourced from the export's retained files.
+  const attemptRole = async (view, role) => {
+    if (!view) return { ok: false, skipped: true };
+    let pushId;
+    const existing = db.prepare(
+      'SELECT id FROM forensic_export_pushes WHERE export_id = ? AND role = ?'
+    ).get(ctx.exportId, role);
+    if (existing) {
+      pushId = existing.id;
+    } else {
+      pushId = db.prepare(
+        "INSERT INTO forensic_export_pushes (export_id, destination_id, role, status) VALUES (?, ?, ?, 'queued')"
+      ).run(ctx.exportId, view.id, role).lastInsertRowid;
+    }
+    return runExportPushAttempt(db, pushId, files, manifestSha256, { logger });
+  };
+
+  const primaryOutcome = await attemptRole(primaryView, 'primary');
+  const secondaryOutcome = await attemptRole(secondaryView, 'secondary');
+
+  return {
+    attempted: true,
+    configured: true,
+    pushed: primaryOutcome.ok === true,
+    destinationRef: primaryView.id,
+    destinationPath: primaryOutcome.destinationPath || null,
+    bytesPushed: primaryOutcome.bytesPushed || 0,
+    immutabilityVerified: primaryOutcome.immutabilityVerified || null,
+    primaryReplicated: primaryOutcome.ok === true,
+    secondaryDestinationRef: secondaryView ? secondaryView.id : null,
+    secondaryReplicated: secondaryOutcome.ok === true,
+  };
+}
+
+/**
+ * retryPendingExportPushes(db, options)
+ *
+ * The forensic replication sweep. Re-attempts every export push that has not yet
+ * landed and is due (status 'queued' or 'failed', attempts not exhausted,
+ * next_retry_at null or past), re-staging from the export's retained files.
+ * Mirrors the backup_pushes retry cadence; intended to be called on a schedule.
+ * A row that exhausts FORENSIC_MAX_ATTEMPTS stays 'failed' (next_retry_at null)
+ * and is not picked up again. Returns { scanned, succeeded, failed }.
+ */
+async function retryPendingExportPushes(db, options = {}) {
+  const logger = options.logger || console;
+  const limit = options.limit || 100;
+
+  const due = db.prepare(
+    "SELECT id FROM forensic_export_pushes WHERE status IN ('queued','failed') AND attempt_count < ? AND (next_retry_at IS NULL OR next_retry_at <= datetime('now')) ORDER BY id ASC LIMIT ?"
+  ).all(FORENSIC_MAX_ATTEMPTS, limit);
+
+  let succeeded = 0;
+  let failed = 0;
+  for (const r of due) {
+    try {
+      const res = await runExportPushAttempt(db, r.id, null, null, { logger });
+      if (res.ok) succeeded += 1;
+      else failed += 1;
+    } catch (sweepErr) {
+      failed += 1;
+      logger.error('forensic export retry sweep attempt crashed', { pushId: r.id, error: sweepErr.message });
+    }
+  }
+  return { scanned: due.length, succeeded, failed };
+}
+
 async function createForensicExport(db, request, opts) {
   if (!db) throw new Error('createForensicExport: db required');
   if (!request || !request.requestedByUserId) {
@@ -604,6 +872,43 @@ async function createForensicExport(db, request, opts) {
       exportId
     );
 
+    // Step 9 (B5q): push the sealed export to the configured forensic_export
+    // destination if one is routed. Additive and best-effort -- the local copy
+    // is already complete and is the primary delivery; a push failure never
+    // fails or rolls back the export. The outcome is logged and returned.
+    let pushOutcome = { attempted: false };
+    const pushLog = (opts && opts.logger) || console;
+    try {
+      pushOutcome = await pushForensicExport(db, {
+        exportId: exportId,
+        files: [archivePath, manifestPath, manifestSigPath, cosignPath],
+        manifestBytes: manifestBytes,
+        logger: pushLog,
+      });
+      if (pushOutcome.pushed) {
+        pushLog.info('forensic export pushed to destination', {
+          exportId: exportId,
+          destinationRef: pushOutcome.destinationRef,
+          destinationPath: pushOutcome.destinationPath,
+        });
+      } else if (pushOutcome.attempted) {
+        pushLog.warn('forensic export not pushed', {
+          exportId: exportId,
+          reason: pushOutcome.reason || (pushOutcome.blocked ? 'residency blocked' : 'unknown'),
+        });
+      }
+    } catch (pushErr) {
+      pushOutcome = {
+        attempted: true,
+        pushed: false,
+        error: String(pushErr && pushErr.message ? pushErr.message : pushErr),
+      };
+      pushLog.error('forensic export push failed (non-fatal)', {
+        exportId: exportId,
+        error: pushOutcome.error,
+      });
+    }
+
     return {
       id: exportId,
       archivePath,
@@ -614,6 +919,7 @@ async function createForensicExport(db, request, opts) {
       sizeBytes: gzBytes.length,
       signingKeyId: signingKey.id,
       signingKeyFingerprint: signingKey.fingerprint,
+      push: pushOutcome,
     };
   } catch (err) {
     // Cleanup partial files, stamp failure, and rethrow.
@@ -640,5 +946,7 @@ module.exports = {
   fetchAuthenticationLogsSlice,
   fetchUserAccessLogsSlice,
   // test-only
+  pushForensicExport,
+  retryPendingExportPushes,
   _registerFormatForTest,
 };

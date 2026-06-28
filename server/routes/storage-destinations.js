@@ -1,49 +1,52 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Backup Destinations Admin Routes
+// FIREALIVE — Storage Destinations Admin Routes
 //
-// Admin-only CRUD endpoints for managing off-host push destinations.
-// All operations go through services/backup-destinations.js which
+// Admin-only CRUD endpoints for managing off-host push destinations
+// (the generalized storage-destination registry: the targets for
+// backups, audit-log archives, forensic exports, snapshots, and CEF
+// archives). All operations go through services/storage-destinations.js
+// which
 // validates against the loaded adapter registry, encrypts credentials
 // at rest under Tier-1 AES-GCM, and exposes public (no-credentials)
 // retrieval paths.
 //
-// Mounted at /api/backup-destinations in server/index.js with
+// Mounted at /api/storage-destinations in server/index.js with
 // authMiddleware(['admin']) (commit 12 of this phase). The route
 // file does NOT apply auth itself.
 //
 // ENDPOINTS
 //
-//   GET    /api/backup-destinations
+//   GET    /api/storage-destinations
 //     List destinations (public view, with per-row push_stats).
-//     Query: ?enabled=true (only enabled), ?adapter=local|sftp
+//     Query: ?enabled=true (only enabled), ?adapter=local|sftp|s3|gcs|azure-blob
 //
-//   GET    /api/backup-destinations/adapters
+//   GET    /api/storage-destinations/adapters
 //     List available adapter implementations from the registry
 //     (name, description, supportedImmutabilityModes). Used by
 //     the admin UI to populate the "create destination" picker.
-//     Includes ADAPTERS_LANDING_IN_R3D4 with status='not-yet-implemented'
-//     so operators see what's coming.
+//     All five adapters (local, sftp, s3, gcs, azure-blob) are
+//     available.
 //
-//   GET    /api/backup-destinations/:id
+//   GET    /api/storage-destinations/:id
 //     Get single destination (public view + push_stats). 404 if missing.
 //
-//   POST   /api/backup-destinations
+//   POST   /api/storage-destinations
 //     Create new destination. Body validates against the adapter's
 //     contract. Returns the created public view. 400 on validation
 //     error with { error, field } pointing at the offending input.
 //
-//   PATCH  /api/backup-destinations/:id
+//   PATCH  /api/storage-destinations/:id
 //     Partial update. Adapter is immutable; attempts to change it
 //     are silently ignored. Omitted fields preserve existing values.
 //     Returns updated public view; 404 if missing.
 //
-//   DELETE /api/backup-destinations/:id
+//   DELETE /api/storage-destinations/:id
 //     Delete destination. Refused if push records reference it
 //     (returns 409 with reason='has_push_history'); operators
 //     should disable (PATCH enabled=false) instead to preserve
 //     audit continuity.
 //
-//   POST   /api/backup-destinations/:id/probe
+//   POST   /api/storage-destinations/:id/probe
 //     Run adapter.probe to test connectivity. Decrypts credentials
 //     just-in-time, calls the adapter, returns the probe result.
 //     Does NOT modify the destination row. The probe runs
@@ -64,7 +67,7 @@ const router = express.Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
-const backupDestinations = require('../services/backup-destinations');
+const storageDestinations = require('../services/storage-destinations');
 const dataResidency = require('../services/data-residency');
 const base = require('../services/destination-adapter-base');
 
@@ -81,7 +84,7 @@ router.get('/', (req, res) => {
     if (typeof req.query.adapter === 'string' && req.query.adapter !== '') {
       options.adapter = req.query.adapter;
     }
-    const destinations = backupDestinations.listDestinations(db, options);
+    const destinations = storageDestinations.listDestinations(db, options);
     auditLog(
       req.user?.id,
       'BACKUP_DESTINATIONS_LISTED',
@@ -90,7 +93,7 @@ router.get('/', (req, res) => {
     );
     res.json({ destinations });
   } catch (err) {
-    logger.error('routes/backup-destinations: list failed', { error: err.message });
+    logger.error('routes/storage-destinations: list failed', { error: err.message });
     res.status(500).json({ error: 'Failed to list destinations' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }
@@ -105,19 +108,10 @@ router.get('/adapters', (req, res) => {
       ...a,
       status: 'available',
     }));
-    const landingInR3d4 = backupDestinations.ADAPTERS_LANDING_IN_R3D4.map(name => ({
-      name,
-      description: 'Lands in R3d-4 alongside HSM/KMS work',
-      supportedImmutabilityModes: ['unknown'],
-      status: 'not-yet-implemented',
-    }));
-    // Filter out any landing-in-r3d4 names that happen to be already loaded
-    const loadedNames = new Set(loaded.map(a => a.name));
-    const upcoming = landingInR3d4.filter(a => !loadedNames.has(a.name));
-    auditLog(req.user?.id, 'BACKUP_DESTINATION_ADAPTERS_VIEWED', `loaded=${loaded.length} upcoming=${upcoming.length}`, req.ip);
-    res.json({ available: loaded, upcoming });
+    auditLog(req.user?.id, 'BACKUP_DESTINATION_ADAPTERS_VIEWED', `loaded=${loaded.length}`, req.ip);
+    res.json({ available: loaded });
   } catch (err) {
-    logger.error('routes/backup-destinations: adapters list failed', { error: err.message });
+    logger.error('routes/storage-destinations: adapters list failed', { error: err.message });
     res.status(500).json({ error: 'Failed to list adapters' });
   }
 });
@@ -128,12 +122,12 @@ router.get('/:id', (req, res) => {
   let db;
   try {
     db = getDb();
-    const destination = backupDestinations.getDestinationById(db, req.params.id);
+    const destination = storageDestinations.getDestinationById(db, req.params.id);
     if (!destination) return res.status(404).json({ error: 'Destination not found' });
     auditLog(req.user?.id, 'BACKUP_DESTINATION_VIEWED', `id=${destination.id} name=${destination.name} adapter=${destination.adapter}`, req.ip);
     res.json({ destination });
   } catch (err) {
-    logger.error('routes/backup-destinations: get failed', { id: req.params.id, error: err.message });
+    logger.error('routes/storage-destinations: get failed', { id: req.params.id, error: err.message });
     res.status(500).json({ error: 'Failed to get destination' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }
@@ -151,7 +145,7 @@ router.post('/', (req, res) => {
     db = getDb();
     let destination;
     try {
-      destination = backupDestinations.createDestination(db, req.body);
+      destination = storageDestinations.createDestination(db, req.body);
     } catch (err) {
       if (err.residencyBlocked) {
         auditLog(req.user?.id, 'RESIDENCY_DESTINATION_BLOCKED', 'name=' + (req.body.name || '?') + ' adapter=' + (req.body.adapter || '?') + ' ' + err.message, req.ip);
@@ -167,13 +161,13 @@ router.post('/', (req, res) => {
       throw err;
     }
     auditLog(req.user?.id, 'BACKUP_DESTINATION_CREATED', `id=${destination.id} name=${destination.name} adapter=${destination.adapter} immutability=${destination.immutability_mode} enabled=${destination.enabled}`, req.ip);
-    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/backup-destinations: residency reconcile failed', { error: e.message }); }
+    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/storage-destinations: residency reconcile failed', { error: e.message }); }
     if (destination.residencyWarning) {
       auditLog(req.user?.id, 'RESIDENCY_DESTINATION_WARNED', 'id=' + destination.id + ' name=' + destination.name + ' adapter=' + destination.adapter + ' ' + destination.residencyWarning, req.ip);
     }
     res.status(201).json({ destination });
   } catch (err) {
-    logger.error('routes/backup-destinations: create failed', { error: err.message });
+    logger.error('routes/storage-destinations: create failed', { error: err.message });
     res.status(500).json({ error: 'Failed to create destination' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }
@@ -191,7 +185,7 @@ router.patch('/:id', (req, res) => {
     db = getDb();
     let destination;
     try {
-      destination = backupDestinations.updateDestination(db, req.params.id, req.body);
+      destination = storageDestinations.updateDestination(db, req.params.id, req.body);
     } catch (err) {
       if (err.residencyBlocked) {
         auditLog(req.user?.id, 'RESIDENCY_DESTINATION_BLOCKED', 'id=' + req.params.id + ' ' + err.message, req.ip);
@@ -211,13 +205,13 @@ router.patch('/:id', (req, res) => {
     if (req.body.config !== undefined) changedFields.push('config');         // mention but don't log values
     if (req.body.credentials !== undefined) changedFields.push('credentials'); // mention but don't log values
     auditLog(req.user?.id, 'BACKUP_DESTINATION_UPDATED', `id=${destination.id} name=${destination.name} fields=${changedFields.join(',') || 'none'}`, req.ip);
-    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/backup-destinations: residency reconcile failed', { error: e.message }); }
+    try { dataResidency.reconcileTransfers(db); } catch (e) { logger.error('routes/storage-destinations: residency reconcile failed', { error: e.message }); }
     if (destination.residencyWarning) {
       auditLog(req.user?.id, 'RESIDENCY_DESTINATION_WARNED', 'id=' + destination.id + ' name=' + destination.name + ' adapter=' + destination.adapter + ' ' + destination.residencyWarning, req.ip);
     }
     res.json({ destination });
   } catch (err) {
-    logger.error('routes/backup-destinations: update failed', { id: req.params.id, error: err.message });
+    logger.error('routes/storage-destinations: update failed', { id: req.params.id, error: err.message });
     res.status(500).json({ error: 'Failed to update destination' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }
@@ -230,7 +224,7 @@ router.delete('/:id', (req, res) => {
   let db;
   try {
     db = getDb();
-    const result = backupDestinations.deleteDestination(db, req.params.id);
+    const result = storageDestinations.deleteDestination(db, req.params.id);
     if (result.deleted === false) {
       if (result.reason === 'not_found') {
         return res.status(404).json({ error: 'Destination not found' });
@@ -250,7 +244,7 @@ router.delete('/:id', (req, res) => {
     auditLog(req.user?.id, 'BACKUP_DESTINATION_DELETED', `id=${req.params.id}`, req.ip);
     res.json({ deleted: true });
   } catch (err) {
-    logger.error('routes/backup-destinations: delete failed', { id: req.params.id, error: err.message });
+    logger.error('routes/storage-destinations: delete failed', { id: req.params.id, error: err.message });
     res.status(500).json({ error: 'Failed to delete destination' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }
@@ -264,10 +258,10 @@ router.post('/:id/probe', async (req, res) => {
   try {
     db = getDb();
     // Verify the destination exists before running the probe
-    const dest = backupDestinations.getDestinationById(db, req.params.id);
+    const dest = storageDestinations.getDestinationById(db, req.params.id);
     if (!dest) return res.status(404).json({ error: 'Destination not found' });
 
-    const probeResult = await backupDestinations.probeDestination(db, req.params.id);
+    const probeResult = await storageDestinations.probeDestination(db, req.params.id);
     auditLog(
       req.user?.id,
       probeResult.ok ? 'BACKUP_DESTINATION_PROBE_OK' : 'BACKUP_DESTINATION_PROBE_FAILED',
@@ -276,7 +270,7 @@ router.post('/:id/probe', async (req, res) => {
     );
     res.json({ probe: probeResult });
   } catch (err) {
-    logger.error('routes/backup-destinations: probe failed', { id: req.params.id, error: err.message });
+    logger.error('routes/storage-destinations: probe failed', { id: req.params.id, error: err.message });
     res.status(500).json({ error: 'Failed to probe destination' });
   } finally {
     if (db) try { db.close(); } catch { /* swallow */ }

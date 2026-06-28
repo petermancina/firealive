@@ -307,6 +307,114 @@ const schedulerService = {
       }
     }));
 
+    // ── B5q: archival sealing -- audit-log + CEF stream into segment chains ─
+    //
+    // Seals new audit_log rows and the forwarded-CEF spool into their append-
+    // only segment chains (archive-segment.sealAndPush): FA-ENC1-encrypted,
+    // gap-evident, dual-written off-host copies, on top of the live tables. The
+    // audit-log pass drains in a bounded loop (one segment per batch) so a
+    // backlog -- e.g. the first run after archival is enabled, or after downtime
+    // -- catches up over successive ticks. Each pass has its own try/catch so a
+    // failure in one does not skip the other. Write job (gated by
+    // mayRunWriteJob). Schedule via ARCHIVE_SEAL_SCHEDULE; default hourly at :35
+    // (offset from the :15 backup-push retry and the top-of-hour jobs).
+    const archiveSealSchedule = process.env.ARCHIVE_SEAL_SCHEDULE || '35 * * * *';
+    this.jobs.push(cron.schedule(archiveSealSchedule, async () => {
+      if (!this.mayRunWriteJob()) return;
+      // Audit-log archival: drain new rows into the audit_log segment chain.
+      try {
+        const { getDb } = require('../db/init');
+        const auditArchive = require('./audit-archive');
+        const db = getDb();
+        try {
+          const MAX_ITERATIONS = 20; // bound the work per tick (<= 20 segments)
+          let segments = 0;
+          let rows = 0;
+          let iterations = 0;
+          while (iterations < MAX_ITERATIONS) {
+            const r = await auditArchive.archiveNewAuditEntries(db, { logger });
+            if (!r.archived) break;
+            segments += 1;
+            rows += r.rows;
+            iterations += 1;
+          }
+          if (segments > 0) {
+            logger.info('Scheduler: audit-log archival sweep complete', { segments, rows });
+          }
+        } finally {
+          try { db.close(); } catch { /* swallow */ }
+        }
+      } catch (err) {
+        logger.error('Scheduler: audit-log archival failed', { error: err.message });
+      }
+      // CEF stream archival: flush the SIEM CEF spool into the cef_archive chain.
+      try {
+        const { getDb } = require('../db/init');
+        const cefArchiveSpool = require('./cef-archive-spool');
+        const db = getDb();
+        try {
+          const r = await cefArchiveSpool.flush(db, { logger });
+          if (r.flushed) {
+            logger.info('Scheduler: CEF archive flush complete', { segments: (r.segments || []).length });
+          }
+        } finally {
+          try { db.close(); } catch { /* swallow */ }
+        }
+      } catch (err) {
+        logger.error('Scheduler: CEF archive flush failed', { error: err.message });
+      }
+    }));
+
+    // ── B5q: archive/forensic replication retry sweep ────────────────────
+    //
+    // The dual-write companion to the backup-push retry sweep above: re-pushes
+    // archive-segment secondary copies and forensic-export copies that have not
+    // yet landed and are due (retryPendingSegmentPushes / retryPendingExportPushes,
+    // same MAX_ATTEMPTS=5 backoff as backups). Guarantees the second copy lands
+    // even when a destination was briefly unreachable at seal time. Each sweep
+    // has its own try/catch. Write job. Schedule via ARCHIVE_PUSH_RETRY_SCHEDULE;
+    // default hourly at :50 (after the :35 seal, offset from :15).
+    const archivePushRetrySchedule = process.env.ARCHIVE_PUSH_RETRY_SCHEDULE || '50 * * * *';
+    this.jobs.push(cron.schedule(archivePushRetrySchedule, async () => {
+      if (!this.mayRunWriteJob()) return;
+      // Retry un-landed secondary segment pushes (audit_log + cef_archive).
+      try {
+        const { getDb } = require('../db/init');
+        const archiveSegment = require('./archive-segment');
+        const db = getDb();
+        try {
+          const r = await archiveSegment.retryPendingSegmentPushes(db, { logger });
+          if (r.scanned > 0) {
+            logger.info('Scheduler: archive segment push retry sweep complete', {
+              scanned: r.scanned, succeeded: r.succeeded, failed: r.failed,
+            });
+          }
+        } finally {
+          try { db.close(); } catch { /* swallow */ }
+        }
+      } catch (err) {
+        logger.error('Scheduler: archive segment push retry failed', { error: err.message });
+      }
+      // Retry un-landed forensic export pushes (primary + secondary).
+      try {
+        const { getDb } = require('../db/init');
+        const forensicExport = require('./forensic-export');
+        const db = getDb();
+        try {
+          const r = await forensicExport.retryPendingExportPushes(db, { logger });
+          if (r.scanned > 0) {
+            logger.info('Scheduler: forensic export push retry sweep complete', {
+              scanned: r.scanned, succeeded: r.succeeded, failed: r.failed,
+            });
+          }
+        } finally {
+          try { db.close(); } catch { /* swallow */ }
+        }
+      } catch (err) {
+        logger.error('Scheduler: forensic export push retry failed', { error: err.message });
+      }
+    }));
+
     // ── Email notification pipeline ──────────────────────────────────────
     const emailIntervalSec = parseInt(process.env.NOTIFICATIONS_EMAIL_INTERVAL_SEC || '60', 10);
     const emailCronExpr = emailIntervalSec >= 60

@@ -181,7 +181,7 @@ module.exports = (checks) => ({
       id: 'C1.2',
       name: 'Confidential Information Disposal',
       check: checks.checkRetentionPolicy,
-      mapping: 'backup_destinations.retention_days enforces destination-side pruning; offboarding workflow (active=0 + pseudonym rotation) implements right-to-erasure for analyst data; audit trail preserved separately for compliance retention.',
+      mapping: 'storage_destinations.retention_days enforces destination-side pruning; offboarding workflow (active=0 + pseudonym rotation) implements right-to-erasure for analyst data; audit trail preserved separately for compliance retention.',
     },
   ],
   customerResponsibility: [

@@ -88,6 +88,7 @@ const manifestSvc = require('./backup-manifest');
 const signingKeysSvc = require('./backup-signing-keys');
 const chainSvc = require('./backup-chain');
 const backupPushSvc = require('./backup-push');
+const storageRouting = require('./storage-routing');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -255,36 +256,25 @@ async function performBackup(type = 'on-demand', options = {}) {
   // tying transactions together.
   const db = getDb();
 
-  // R3l C58: resolve schedule's destination_filter if a scheduleId was
-  // passed via options. The scheduler (services/scheduler.js _runBackupJob)
-  // passes scheduleId; manual API pushes leave it undefined and get the
-  // pre-R3l behavior (push to every enabled destination).
-  // Resolved here once and threaded into both pushBackup callsites
-  // (synchronous awaitPush path and background async push path) so the
-  // filter applies regardless of which dispatch mode the caller chose.
-  let scheduleDestinationFilter = null;
-  if (options.scheduleId != null) {
-    try {
-      const sched = db.prepare(
-        'SELECT destination_filter FROM backup_schedules WHERE id = ?'
-      ).get(options.scheduleId);
-      if (sched && sched.destination_filter) {
-        try {
-          const parsed = JSON.parse(sched.destination_filter);
-          if (Array.isArray(parsed)) {
-            scheduleDestinationFilter = parsed;
-          }
-        } catch (parseErr) {
-          logger.warn('backup: malformed destination_filter JSON on schedule; treating as no filter', {
-            scheduleId: options.scheduleId, error: parseErr.message,
-          });
-        }
-      }
-    } catch (lookupErr) {
-      logger.warn('backup: failed to resolve destination_filter for schedule; treating as no filter', {
-        scheduleId: options.scheduleId, error: lookupErr.message,
-      });
+  // B5q (Revision v3): resolve the destinations for this backup's type via the
+  // storage-routing resolver -- a primary plus an optional secondary,
+  // capped at two. Backups go to the destinations an admin designates for the
+  // 'backup' type (snapshots inherit the backup route unless a 'snapshot' route
+  // is set), and nowhere else -- the legacy unbounded fan-out and the per-schedule
+  // destination_filter (R3l C58/C59) are retired. If no route is configured the
+  // backup is still created and chain-attested on-host; it simply is not pushed
+  // (the existing graceful-degradation posture) until an admin configures the route.
+  const backupCategory = type === 'snapshot' ? 'snapshot' : 'backup';
+  let backupDestinationRefs = [];
+  try {
+    const route = storageRouting.getRouteForType(db, backupCategory);
+    if (route.configured && Array.isArray(route.destinations)) {
+      backupDestinationRefs = route.destinations.map((d) => d.id);
     }
+  } catch (routeErr) {
+    logger.warn('backup: failed to resolve storage route; backup will not be pushed', {
+      category: backupCategory, error: routeErr.message,
+    });
   }
 
   // Insert the running row up front so partial failures are auditable.
@@ -492,9 +482,11 @@ async function performBackup(type = 'on-demand', options = {}) {
       try {
         pushResult = await backupPushSvc.pushBackup(db, backupId, {
           logger,
-          // R3l C58: respect schedule destination_filter when this backup
-          // run was triggered by a scheduled job (scheduleId passed in options).
-          destinationFilter: scheduleDestinationFilter,
+          // B5q (Revision v3): push to the resolved destination(s) for this type
+          // (primary + optional secondary). destinationRef carries the primary for
+          // back-compat; destinationRefs carries the full ordered list.
+          destinationRef: backupDestinationRefs[0] || null,
+          destinationRefs: backupDestinationRefs,
         });
       } catch (pushErr) {
         logger.error('backup: synchronous push orchestration crashed', { id: backupId, error: pushErr.message });
@@ -507,8 +499,9 @@ async function performBackup(type = 'on-demand', options = {}) {
           pushDb = getDb();
           const r = await backupPushSvc.pushBackup(pushDb, backupId, {
             logger,
-            // R3l C58: same destination_filter on background dispatch
-            destinationFilter: scheduleDestinationFilter,
+            // B5q (Revision v3): same resolved destination(s) on background dispatch
+            destinationRef: backupDestinationRefs[0] || null,
+            destinationRefs: backupDestinationRefs,
           });
           logger.info('backup: background push completed', {
             id: backupId,
