@@ -269,6 +269,7 @@ app.use('/api/apikeys', authMiddleware(['admin']), configLockChokepoint(), requi
 app.use('/api/backup', authMiddleware(['admin']), require('./routes/backup'));
 app.use('/api/backup-chain', authMiddleware(['admin']), require('./routes/backup-chain'));
 app.use('/api/storage-destinations', authMiddleware(['admin']), configLockChokepoint(), require('./routes/storage-destinations'));
+app.use('/api/storage-routing', authMiddleware(['admin']), configLockChokepoint(), require('./routes/storage-routing'));
 app.use('/api/backup-push', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-push'));
 app.use('/api/backup-schedules', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-schedules'));
 app.use('/api/gd-config', authMiddleware(['admin']), configLockChokepoint(), require('./routes/gd-config'));
