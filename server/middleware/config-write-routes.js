@@ -85,6 +85,7 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/auto-disable-routing/config' },
   { method: 'PUT',  path: '/api/global-dashboard/push-config' },
   { method: 'PUT',  path: '/api/ticketing/config' },
+  { method: 'PUT',  path: '/api/auto-update/config' },  // B5r: update-detection schedule (check-now + status are operational, pass through)
 ];
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
