@@ -54,6 +54,7 @@ const MIXED_ROUTERS = [
     label: `v${n}-features`,
   })),
   { file: path.join(SERVER, 'routes', 'ha.js'), mount: '/api/ha', label: 'ha' },
+  { file: path.join(SERVER, 'routes', 'auto-update.js'), mount: '/api/auto-update', label: 'auto-update' },  // B5r: detect-and-notify update router (PUT /config gated; check-now/status pass through)
 ];
 
 const ROUTE_RE = /router\.(put|post|patch|delete)\(\s*['"]([^'"]+)['"]/g;
