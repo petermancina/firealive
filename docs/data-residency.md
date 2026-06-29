@@ -48,20 +48,20 @@ customer-held encryption keys.
 
 ## What it does and does not enforce
 
-At this release the policy is **enforced for backup destinations** and
-**recorded for everything else**.
+At this release the policy is **enforced for every routed data type**, and for
+backup destinations at config time.
 
-- **Backup destinations** are gated at config time: creating or enabling a
+- **Routed data types** (backup, snapshot, audit log, forensic export, CEF
+  archive) are gated when their Storage Routing route is saved: the residency
+  gate runs against both the primary and the secondary destination, and a
   destination whose jurisdiction falls outside the permitted regions of an
-  enforce-mode category is refused, and the attempt is audited. The cross-border
-  transfer register is reconciled on every destination change.
-- **The other categories** (audit log, forensic export, snapshot, CEF archive)
-  are destination-agnostic today — you declare their permitted regions now, and
-  the register records them, but the routing that would carry them to specific
-  destinations does not yet exist. It arrives with **Storage Routing** (see
-  *What's next*), which will enforce this same policy for those routed types at
-  write time. Declaring them now means the policy is ready before the routing
-  ships.
+  enforce-mode category — or that is left undeclared — is refused with a 403 and
+  audited. A destination is declared and evaluated per data type it serves, so
+  the same bucket can be compliant for one type and not another.
+- **Backup destinations** are additionally gated at config time: creating or
+  enabling a destination outside an enforce-mode category's permitted regions is
+  refused, and the attempt is audited. The cross-border transfer register is
+  reconciled on every destination change and on every route save.
 - **The live deployment is never blocked.** Its category is `declare-only`: you
   record where the deployment runs, but the platform will not refuse its own
   operation on residency grounds. Blocking the live deployment would be a
@@ -221,12 +221,14 @@ jurisdiction involved, never an analyst's identity. The event set is closed:
 
 ---
 
-## What's next (Storage Routing)
+## Interaction with Storage Routing
 
-Storage Routing extends residency enforcement from backup destinations to the
-four routed storage types — backup, audit log, forensic export, and
-snapshot/CEF archive. When it ships, the permitted-region policy you declare for
-those categories now will be enforced at the point data is written to a routed
-destination, not only when a backup destination is configured. Declaring the
-policy ahead of the routing means the control is in place before the data starts
-moving.
+Storage Routing extends residency enforcement from backup destinations to all
+five routed storage types — backup, snapshot, audit log, forensic export, and
+CEF archive. The permitted-region policy you declare for a category is enforced
+when a route for that type is saved: the gate runs against both the route's
+primary and secondary destination, and an out-of-region or undeclared
+destination is refused under enforce mode. Because a destination is evaluated
+per data type it serves, the same destination can pass for one type and be
+refused for another. See `docs/storage-routing.md` for the routing model, the
+dual-write and replication behavior, and the per-type residency interaction.

@@ -374,6 +374,509 @@ const FeatureGate = ({ disabled, name, mode = "tab", children }) => (
   disabled ? <AdminDisabledPanel name={name} mode={mode} /> : children
 );
 
+// ── B5q: Storage Destinations registry ───────────────────────────────────────
+// Lists, tests, and manages the destinations every routed data type can be
+// written to. A destination is a place a copy lands (a local mount, SFTP, or a
+// cloud bucket) — not a route; routing data types to destinations happens in the
+// routing section below. The probe and every write run server-side; credentials
+// are encrypted at rest, decrypted just-in-time for a push or probe, and never
+// returned, so the public list and this client never hold a secret. On edit the
+// credential fields start blank and are sent only when re-entered — leaving them
+// blank preserves what is stored. addA is the activity-feed logger, from App.
+const STORAGE_ADAPTER_LABEL = { local:"Local mount", sftp:"SFTP", s3:"Amazon S3", "azure-blob":"Azure Blob", gcs:"Google Cloud Storage" };
+const STORAGE_IMMUTABILITY_LABEL = { none:"No immutability", "append-only":"Append-only", "object-lock":"Object Lock", unknown:"Unverified" };
+// Per-adapter form schema. config/creds drive the Add/Edit fields; the server is
+// the authority on what is actually required (the form surfaces its field
+// errors), so only clearly-required inputs are starred here. creds are optional
+// in the form because the valid subset depends on the chosen auth method.
+const STORAGE_ADAPTER_FIELDS = {
+  local: {
+    immutability: ["none", "append-only", "unknown"],
+    config: [{ k:"path", label:"Mount path", required:true, ph:"/mnt/backups" }],
+    creds: [],
+    credsNote: "",
+  },
+  sftp: {
+    immutability: ["none", "append-only", "unknown"],
+    config: [
+      { k:"host", label:"Host", required:true, ph:"backup.example.com" },
+      { k:"port", label:"Port", type:"number", ph:"22" },
+      { k:"username", label:"Username", required:true, ph:"backup" },
+      { k:"remote_path", label:"Remote path", required:true, ph:"/srv/backups" },
+      { k:"host_key", label:"Host key (pinned)", required:true, area:true, ph:"ssh-ed25519 AAAA…" },
+    ],
+    creds: [
+      { k:"password", label:"Password", sensitive:true },
+      { k:"private_key", label:"Private key (PEM)", sensitive:true, area:true },
+      { k:"private_key_passphrase", label:"Key passphrase", sensitive:true },
+    ],
+    credsNote: "Use a password, or a private key with an optional passphrase.",
+  },
+  s3: {
+    immutability: ["none", "append-only", "object-lock", "unknown"],
+    config: [
+      { k:"bucket", label:"Bucket", required:true, ph:"soc-backups" },
+      { k:"region", label:"Region", required:true, ph:"eu-central-1" },
+      { k:"endpoint", label:"Endpoint (S3-compatible, optional)", ph:"https://s3.eu.example.com" },
+      { k:"prefix", label:"Prefix (optional)", ph:"firealive/" },
+      { k:"sse_kms_key_id", label:"SSE-KMS key (optional)", ph:"arn:aws:kms:…" },
+    ],
+    creds: [
+      { k:"access_key_id", label:"Access key ID", sensitive:true },
+      { k:"secret_access_key", label:"Secret access key", sensitive:true },
+      { k:"session_token", label:"Session token (optional)", sensitive:true },
+    ],
+    credsNote: "Leave the keys blank to use the host's instance role / ambient credentials.",
+  },
+  gcs: {
+    immutability: ["none", "append-only", "object-lock", "unknown"],
+    config: [
+      { k:"bucket", label:"Bucket", required:true, ph:"soc-backups" },
+      { k:"project_id", label:"Project ID", required:true, ph:"my-project" },
+      { k:"prefix", label:"Prefix (optional)", ph:"firealive/" },
+    ],
+    creds: [
+      { k:"service_account_json", label:"Service account JSON", sensitive:true, area:true },
+    ],
+    credsNote: "Leave blank to use Application Default Credentials.",
+  },
+  "azure-blob": {
+    immutability: ["none", "append-only", "object-lock", "unknown"],
+    config: [
+      { k:"account_name", label:"Account name", required:true, ph:"socbackups" },
+      { k:"container_name", label:"Container", required:true, ph:"backups" },
+      { k:"endpoint_suffix", label:"Endpoint suffix (sovereign cloud, optional)", ph:"core.windows.net" },
+      { k:"prefix", label:"Prefix (optional)", ph:"firealive/" },
+    ],
+    creds: [
+      { k:"account_key", label:"Account key", sensitive:true, area:true },
+      { k:"sas_token", label:"SAS token", sensitive:true, area:true },
+      { k:"tenant_id", label:"Tenant ID (service principal)", sensitive:true },
+      { k:"client_id", label:"Client ID (service principal)", sensitive:true },
+      { k:"client_secret", label:"Client secret (service principal)", sensitive:true },
+    ],
+    credsNote: "Use one method: account key, SAS token, service principal (tenant + client + secret), or leave all blank for managed identity.",
+  },
+};
+const storageDestHint = (cfg) => {
+  if (!cfg || typeof cfg !== "object") return null;
+  const v = cfg.bucket || cfg.container_name || cfg.path || cfg.endpoint || cfg.host || cfg.account_name || cfg.prefix;
+  return v ? String(v) : null;
+};
+const emptyDestDraft = () => ({ id:null, name:"", adapter:"local", config:{}, creds:{}, immutability_mode:"unknown", retention_days:"", enabled:true });
+
+const StorageDestinations = ({ addA }) => {
+  const [dests, setDests] = useState(null); // null = loading, [] = empty, [...] = loaded
+  const [err, setErr] = useState(null);
+  const [probe, setProbe] = useState({}); // id -> "running" | { ok, error, detail }
+  const [modal, setModal] = useState(null); // null | "add" | "edit"
+  const [draft, setDraft] = useState(emptyDestDraft());
+  const [saving, setSaving] = useState(false);
+  const [formErr, setFormErr] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(false);
+
+  const load = async () => {
+    setErr(null);
+    const r = await api.get("/api/storage-destinations");
+    if (r && r.error) { setErr(r.error); setDests([]); return; }
+    setDests((r && r.destinations) || []);
+  };
+  useEffect(() => { load(); }, []);
+
+  const runProbe = async (id, name) => {
+    setProbe(p => ({ ...p, [id]: "running" }));
+    const r = await api.post("/api/storage-destinations/" + id + "/probe", {});
+    const res = (r && r.probe) ? r.probe : { ok:false, error:(r && r.error) || "Test failed" };
+    setProbe(p => ({ ...p, [id]: res }));
+    if (addA) addA(res.ok ? "STORAGE_DEST_TEST_OK" : "STORAGE_DEST_TEST_FAIL", name + ": " + (res.ok ? "reachable" : (res.error || "unreachable")));
+  };
+
+  const openAdd = () => { setDraft(emptyDestDraft()); setFormErr(null); setConfirmDel(false); setModal("add"); };
+  const openEdit = (d) => {
+    setDraft({ id:d.id, name:d.name, adapter:d.adapter, config:{ ...(d.config || {}) }, creds:{}, immutability_mode:d.immutability_mode || "unknown", retention_days:d.retention_days != null ? String(d.retention_days) : "", enabled:!!d.enabled });
+    setFormErr(null); setConfirmDel(false); setModal("edit");
+  };
+  const closeModal = () => { setModal(null); setSaving(false); setFormErr(null); setConfirmDel(false); };
+
+  const onAdapter = (adapter) => {
+    const modes = (STORAGE_ADAPTER_FIELDS[adapter] || {}).immutability || ["unknown"];
+    setDraft(d => ({ ...d, adapter, config:{}, creds:{}, immutability_mode: modes.includes(d.immutability_mode) ? d.immutability_mode : (modes.includes("unknown") ? "unknown" : modes[0]) }));
+  };
+
+  const buildPayload = () => {
+    const cfg = {};
+    for (const f of (STORAGE_ADAPTER_FIELDS[draft.adapter] || {}).config || []) {
+      const v = draft.config[f.k];
+      if (v !== undefined && v !== null && String(v) !== "") cfg[f.k] = f.type === "number" ? Number(v) : v;
+    }
+    const creds = {};
+    for (const f of (STORAGE_ADAPTER_FIELDS[draft.adapter] || {}).creds || []) {
+      const v = draft.creds[f.k];
+      if (v !== undefined && v !== null && String(v) !== "") creds[f.k] = v;
+    }
+    const payload = {
+      name: draft.name,
+      adapter: draft.adapter,
+      config: cfg,
+      immutability_mode: draft.immutability_mode,
+      retention_days: String(draft.retention_days) === "" ? null : Number(draft.retention_days),
+      enabled: !!draft.enabled,
+    };
+    // Send credentials only when re-entered; on edit, omitting them preserves
+    // what is stored, and for ambient/managed-identity adapters none are sent.
+    if (Object.keys(creds).length) payload.credentials = creds;
+    return payload;
+  };
+
+  const save = async () => {
+    if (!draft.name || String(draft.name).trim() === "") { setFormErr("Name is required."); return; }
+    setSaving(true); setFormErr(null);
+    const payload = buildPayload();
+    const r = modal === "add"
+      ? await api.post("/api/storage-destinations", payload)
+      : await api.patch("/api/storage-destinations/" + draft.id, payload);
+    if (r && r.error) {
+      setSaving(false);
+      setFormErr(r.error + (r.field ? " (" + r.field + ")" : ""));
+      return;
+    }
+    if (addA) addA(modal === "add" ? "STORAGE_DEST_CREATED" : "STORAGE_DEST_UPDATED", draft.name);
+    closeModal();
+    load();
+  };
+
+  const remove = async () => {
+    setSaving(true); setFormErr(null);
+    const r = await api.del("/api/storage-destinations/" + draft.id);
+    if (r && r.deleted) {
+      if (addA) addA("STORAGE_DEST_REMOVED", draft.name);
+      closeModal();
+      load();
+      return;
+    }
+    setSaving(false);
+    const hist = r && r.reason === "has_push_history";
+    setFormErr((r && r.error ? r.error : "Could not remove destination") + (hist ? " — disable it instead to keep audit continuity." : ""));
+    setConfirmDel(false);
+  };
+
+  const toggleEnabled = async (d) => {
+    const r = await api.patch("/api/storage-destinations/" + d.id, { enabled: !d.enabled });
+    if (r && r.error) { if (addA) addA("STORAGE_DEST_UPDATE_FAIL", d.name + ": " + r.error); return; }
+    if (addA) addA("STORAGE_DEST_UPDATED", d.name + ": " + (d.enabled ? "disabled" : "enabled"));
+    load();
+  };
+
+  const immColor = (m) => m === "object-lock" ? C.a : m === "append-only" ? C.i : m === "none" ? C.w : C.tm;
+  const sec = STORAGE_ADAPTER_FIELDS[draft.adapter] || {};
+  const field = (f, group) => {
+    const val = draft[group] && draft[group][f.k] != null ? draft[group][f.k] : "";
+    const set = (v) => setDraft(d => ({ ...d, [group]: { ...d[group], [f.k]: v } }));
+    const ph = f.ph || (group === "creds" && modal === "edit" ? "leave blank to keep current" : "");
+    if (f.area) return (
+      <div key={f.k} style={{marginBottom:14}}>
+        <M style={{color:C.tm,marginBottom:4,display:"block"}}>{f.label}{f.required?" *":""}</M>
+        <textarea value={val} onChange={e=>set(e.target.value)} placeholder={ph} rows={3} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12,fontFamily:"'IBM Plex Mono',monospace",resize:"vertical"}}/>
+      </div>
+    );
+    return <Input key={f.k} label={f.label + (f.required ? " *" : "")} type={f.sensitive ? "password" : f.type === "number" ? "number" : "text"} value={val} onChange={e=>set(e.target.value)} placeholder={ph}/>;
+  };
+
+  return (
+    <Card style={{marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:10,flexWrap:"wrap"}}>
+        <div style={{fontSize:13,fontWeight:500,color:C.i}}>Storage Destinations{Array.isArray(dests)&&dests.length>0?" ("+dests.length+")":""}</div>
+        <div style={{display:"flex",gap:6}}>
+          <Btn small primary onClick={openAdd}>Add destination</Btn>
+          <Btn small onClick={load}>Refresh</Btn>
+        </div>
+      </div>
+      <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>The places a copy can be written — a local mount, SFTP, or a cloud bucket. Register a destination here, then route data types to it in the routing section below. Test checks connectivity without writing anything.</M>
+
+      {err && (
+        <Card style={{marginBottom:10,padding:"10px 12px",borderColor:C.d+"40",background:C.dd}}>
+          <M style={{color:C.d}}>Couldn't load destinations: {err}</M>
+        </Card>
+      )}
+
+      {dests === null && <M style={{color:C.td}}>Loading destinations…</M>}
+
+      {Array.isArray(dests) && dests.length === 0 && !err && (
+        <M style={{color:C.td,display:"block"}}>No storage destinations yet. Add one to start sending backups, audit logs, and exports off-host.</M>
+      )}
+
+      {Array.isArray(dests) && dests.map(d => {
+        const pr = probe[d.id];
+        const hint = storageDestHint(d.config);
+        return (
+          <Card key={d.id} style={{marginBottom:10,padding:"12px 14px"}}>
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+              <div style={{minWidth:0,flex:1}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:5,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  {d.name}
+                  <Badge color={d.enabled?C.a:C.tm}>{d.enabled?"Enabled":"Disabled"}</Badge>
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <Badge color={C.i}>{STORAGE_ADAPTER_LABEL[d.adapter]||d.adapter}</Badge>
+                  <Badge color={immColor(d.immutability_mode)}>{STORAGE_IMMUTABILITY_LABEL[d.immutability_mode]||d.immutability_mode}</Badge>
+                  {d.retention_days?<Badge color={C.tm}>{d.retention_days}d retention</Badge>:null}
+                </div>
+                {hint && <M style={{color:C.td,display:"block",marginTop:6,wordBreak:"break-all"}}>{hint}</M>}
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <Btn small disabled={pr==="running"} onClick={()=>runProbe(d.id,d.name)}>{pr==="running"?"Testing…":"Test"}</Btn>
+                <Btn small onClick={()=>openEdit(d)}>Edit</Btn>
+                <Btn small onClick={()=>toggleEnabled(d)}>{d.enabled?"Disable":"Enable"}</Btn>
+              </div>
+            </div>
+            {pr && pr !== "running" && (
+              <div style={{marginTop:8,padding:"6px 10px",borderRadius:6,background:pr.ok?C.ad:C.dd,border:"1px solid "+((pr.ok?C.a:C.d)+"40")}}>
+                <M style={{color:pr.ok?C.a:C.d}}>{pr.ok ? ("Reachable" + (pr.detail ? " — " + pr.detail : "")) : ("Unreachable — " + (pr.error || "connection failed"))}</M>
+              </div>
+            )}
+          </Card>
+        );
+      })}
+
+      {modal && (
+        <Modal title={modal === "add" ? "Add storage destination" : "Edit storage destination"} onClose={closeModal} width={560}>
+          <Input label="Name *" value={draft.name} onChange={e=>setDraft(d=>({...d,name:e.target.value}))} placeholder="offsite-s3"/>
+          <Sel label="Type" value={draft.adapter} onChange={e=>onAdapter(e.target.value)} disabled={modal === "edit"}>
+            {Object.keys(STORAGE_ADAPTER_FIELDS).map(a=><option key={a} value={a}>{STORAGE_ADAPTER_LABEL[a]||a}</option>)}
+          </Sel>
+          {modal === "edit" && <M style={{color:C.td,display:"block",marginTop:-8,marginBottom:12}}>Type can't change after creation. Remove and re-add to switch.</M>}
+
+          <L style={{marginBottom:8}}>Location</L>
+          {(sec.config || []).map(f=>field(f,"config"))}
+
+          {(sec.creds || []).length > 0 && (<>
+            <L style={{marginBottom:8}}>Credentials</L>
+            {sec.credsNote && <M style={{color:C.td,display:"block",marginBottom:10,lineHeight:1.5}}>{sec.credsNote}</M>}
+            {sec.creds.map(f=>field(f,"creds"))}
+          </>)}
+
+          <L style={{marginBottom:8}}>Policy</L>
+          <Sel label="Immutability" value={draft.immutability_mode} onChange={e=>setDraft(d=>({...d,immutability_mode:e.target.value}))}>
+            {(sec.immutability || ["unknown"]).map(m=><option key={m} value={m}>{STORAGE_IMMUTABILITY_LABEL[m]||m}</option>)}
+          </Sel>
+          <Input label="Retention (days, optional)" type="number" value={draft.retention_days} onChange={e=>setDraft(d=>({...d,retention_days:e.target.value}))} placeholder="leave blank for the global default"/>
+          <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0 12px"}}>
+            <input type="checkbox" checked={draft.enabled} onChange={e=>setDraft(d=>({...d,enabled:e.target.checked}))}/>
+            <M style={{color:C.t}}>Enabled (routes may target it)</M>
+          </label>
+
+          {formErr && <Card style={{marginBottom:12,padding:"8px 12px",borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>{formErr}</M></Card>}
+
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <Btn primary disabled={saving} onClick={save}>{saving ? "Saving…" : (modal === "add" ? "Add destination" : "Save changes")}</Btn>
+            <Btn onClick={closeModal}>Cancel</Btn>
+            <div style={{flex:1}}/>
+            {modal === "edit" && !confirmDel && <Btn danger onClick={()=>setConfirmDel(true)}>Remove</Btn>}
+          </div>
+          {modal === "edit" && confirmDel && (
+            <Card style={{marginTop:12,padding:"10px 12px",borderColor:C.d+"40"}}>
+              <M style={{color:C.t,display:"block",marginBottom:8,lineHeight:1.5}}>Remove this destination permanently? Copies already written there are not deleted.</M>
+              <div style={{display:"flex",gap:8}}>
+                <Btn danger disabled={saving} onClick={remove}>{saving ? "Removing…" : "Remove permanently"}</Btn>
+                <Btn small onClick={()=>setConfirmDel(false)}>Keep</Btn>
+              </div>
+            </Card>
+          )}
+        </Modal>
+      )}
+    </Card>
+  );
+};
+
+// ── B5q: Storage Routing ──────────────────────────────────────────────────
+// Per-data-type routing: each routed type is written to a primary and, if set,
+// a secondary destination on every run -- a concurrent second copy, not
+// failover. Wired to /api/storage-routing GET/PUT and the per-type test probe;
+// the destinations themselves are managed in the registry above. Writes go
+// through the server's immutability + residency gates, whose typed failures are
+// surfaced inline per type. addA logs to the activity feed.
+const STORAGE_ROUTE_META = {
+  backup: { label: "Backups", desc: "Daily full + on-demand" },
+  audit_log: { label: "Audit logs", desc: "Append-only, tamper-evident chain" },
+  forensic_export: { label: "Forensic exports", desc: "Chain-of-custody signed" },
+  snapshot: { label: "Snapshots", desc: "Point-in-time captures" },
+  cef_archive: { label: "CEF archives", desc: "SIEM event archive for compliance" },
+};
+// B5q: the routed categories a destination can be declared/evaluated for.
+const RESIDENCY_CATEGORIES = [
+  { k: "backup", label: "Backups" },
+  { k: "audit_log", label: "Audit logs" },
+  { k: "forensic_export", label: "Forensic exports" },
+  { k: "snapshot", label: "Snapshots" },
+  { k: "cef_archive", label: "CEF archives" },
+];
+// Relative time + health-badge helpers for the routing replication status.
+const storageRelTime = (iso) => {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return null;
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.floor(sec / 60) + "m ago";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+  return Math.floor(sec / 86400) + "d ago";
+};
+const storageHealthBadge = (h) => {
+  const color = { failing: C.d, degraded: C.w, pending: C.i, healthy: C.a, idle: C.tm, unconfigured: C.td };
+  const label = { failing: "Failing", degraded: "Degraded", pending: "Pending", healthy: "Healthy", idle: "Idle", unconfigured: "Not routed" };
+  return { color: color[h] || C.tm, label: label[h] || h };
+};
+const StorageRouting = ({ addA }) => {
+  const [routes, setRoutes] = useState(null); // null = loading, [] = loaded/empty
+  const [dests, setDests] = useState([]);
+  const [err, setErr] = useState(null);
+  const [drafts, setDrafts] = useState({}); // dataType -> { destination_ref, secondary_destination_ref, path_prefix, enabled }
+  const [saving, setSaving] = useState({});
+  const [saveErr, setSaveErr] = useState({});
+  const [testing, setTesting] = useState({});
+  const [results, setResults] = useState({}); // dataType -> test result
+  const [repl, setRepl] = useState({}); // dataType -> replication status entry
+
+  const load = async () => {
+    setErr(null);
+    const [rr, dd, rp] = await Promise.all([
+      api.get("/api/storage-routing"),
+      api.get("/api/storage-destinations"),
+      api.get("/api/storage-routing/replication"),
+    ]);
+    if (rr && rr.error) { setErr(rr.error); setRoutes([]); return; }
+    const list = (rr && rr.routes) || [];
+    setRoutes(list);
+    setDests((dd && dd.destinations) || []);
+    const rmap = {};
+    if (rp && !rp.error && Array.isArray(rp.replication)) for (const e of rp.replication) rmap[e.dataType] = e;
+    setRepl(rmap);
+    const d0 = {};
+    for (const r of list) {
+      d0[r.dataType] = {
+        destination_ref: r.destinationRef || "",
+        secondary_destination_ref: r.secondaryDestinationRef || "",
+        path_prefix: r.pathPrefix || "",
+        enabled: !!r.enabled,
+      };
+    }
+    setDrafts(d0);
+  };
+  useEffect(() => { load(); }, []);
+
+  const setField = (type, k, v) => setDrafts(d => ({ ...d, [type]: { ...d[type], [k]: v } }));
+
+  const save = async (type) => {
+    const d = drafts[type] || {};
+    setSaving(s => ({ ...s, [type]: true }));
+    setSaveErr(e => ({ ...e, [type]: null }));
+    const payload = {
+      destination_ref: d.destination_ref || null,
+      secondary_destination_ref: d.secondary_destination_ref || null,
+      path_prefix: d.path_prefix || null,
+      enabled: !!d.enabled,
+    };
+    const r = await api.put("/api/storage-routing/" + type, payload);
+    if (r && r.error) {
+      setSaving(s => ({ ...s, [type]: false }));
+      setSaveErr(e => ({ ...e, [type]: r.error + (r.which ? " (" + r.which + ")" : "") }));
+      return;
+    }
+    if (addA) addA("STORAGE_ROUTING_SET", type + ": " + (payload.destination_ref || "none") + (payload.secondary_destination_ref ? " + " + payload.secondary_destination_ref : ""));
+    load();
+  };
+
+  const test = async (type) => {
+    setTesting(t => ({ ...t, [type]: true }));
+    const r = await api.post("/api/storage-routing/" + type + "/test", {});
+    setTesting(t => ({ ...t, [type]: false }));
+    setResults(rs => ({ ...rs, [type]: (r && !r.error) ? r : { error: (r && r.error) || "Test failed" } }));
+    if (addA) addA("STORAGE_ROUTING_TEST", type + ": " + (r && r.ok ? "reachable" : "see results"));
+  };
+
+  return (
+    <Card style={{marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:10,flexWrap:"wrap"}}>
+        <div style={{fontSize:13,fontWeight:500,color:C.i}}>Storage Routing</div>
+        <Btn small onClick={load}>Refresh</Btn>
+      </div>
+      <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Each data type is written to its primary and, if set, a secondary destination on every run -- a concurrent second copy, not failover. The secondary is what lets the data survive the loss of one location (on-host + primary + secondary satisfies 3-2-1), so frameworks expect one for anything you must retain.</M>
+
+      {err && <Card style={{marginBottom:10,padding:"10px 12px",borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Couldn't load routing: {err}</M></Card>}
+      {routes === null && <M style={{color:C.td}}>Loading routes…</M>}
+      {Array.isArray(routes) && dests.length === 0 && !err && <M style={{color:C.w,display:"block",marginBottom:10}}>No destinations registered yet -- add one above before routing.</M>}
+
+      {Array.isArray(routes) && routes.map(r => {
+        const type = r.dataType;
+        const meta = STORAGE_ROUTE_META[type] || { label: type, desc: "" };
+        const d = drafts[type] || { destination_ref: "", secondary_destination_ref: "", path_prefix: "", enabled: false };
+        const res = results[type];
+        return (
+          <Card key={type} style={{marginBottom:10,padding:"12px 14px"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+              <div>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>{meta.label}{repl[type]?<Badge color={storageHealthBadge(repl[type].health).color}>{storageHealthBadge(repl[type].health).label}</Badge>:null}</div>
+                <M style={{color:C.td}}>{meta.desc}</M>
+              </div>
+              <label style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="checkbox" checked={!!d.enabled} onChange={e=>setField(type,"enabled",e.target.checked)}/>
+                <M style={{color:C.t}}>Enabled</M>
+              </label>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <Sel label="Primary destination" value={d.destination_ref} onChange={e=>setField(type,"destination_ref",e.target.value)}>
+                <option value="">-- None --</option>
+                {dests.map(o=><option key={o.id} value={o.id}>{o.name}{o.enabled?"":" (disabled)"}</option>)}
+              </Sel>
+              <Sel label="Secondary destination" value={d.secondary_destination_ref} onChange={e=>setField(type,"secondary_destination_ref",e.target.value)}>
+                <option value="">-- None --</option>
+                {dests.filter(o=>o.id!==d.destination_ref).map(o=><option key={o.id} value={o.id}>{o.name}{o.enabled?"":" (disabled)"}</option>)}
+              </Sel>
+            </div>
+            <Input label="Path prefix (optional)" value={d.path_prefix} onChange={e=>setField(type,"path_prefix",e.target.value)} placeholder="firealive/backups/" maxLength={512}/>
+            {type==="snapshot" && <M style={{color:C.td,display:"block",marginBottom:8}}>If left unset, snapshots follow the backup route.</M>}
+            {saveErr[type] && <Card style={{marginBottom:8,padding:"6px 10px",borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>{saveErr[type]}</M></Card>}
+            <div style={{display:"flex",gap:6}}>
+              <Btn small primary disabled={!!saving[type]} onClick={()=>save(type)}>{saving[type]?"Saving…":"Save"}</Btn>
+              <Btn small disabled={!!testing[type]} onClick={()=>test(type)}>{testing[type]?"Testing…":"Test"}</Btn>
+            </div>
+            {repl[type] && Array.isArray(repl[type].destinations) && repl[type].destinations.length > 0 && (
+              <div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.b}`}}>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Replication{repl[type].inheritedFrom?` (follows ${repl[type].inheritedFrom})`:""}</M>
+                {repl[type].destinations.map((rd,i)=>{
+                  const hb = storageHealthBadge(rd.health);
+                  const c = rd.counts || {};
+                  return (
+                    <div key={i} style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:3}}>
+                      <Badge color={hb.color}>{hb.label}</Badge>
+                      <M style={{color:C.t}}>{rd.role}: {rd.destinationName||rd.destinationRef}{rd.destinationEnabled===false?" (disabled)":""}</M>
+                      <M style={{color:C.td}}>{c.succeeded||0} ok · {(c.queued||0)+(c.running||0)} pending · {c.failedRetrying||0} retrying · {c.failedPermanent||0} failed</M>
+                      {rd.lastSuccessAt && <M style={{color:C.td}}>· last OK {storageRelTime(rd.lastSuccessAt)}</M>}
+                      {(!rd.lastSuccessAt && rd.oldestPendingAt) && <M style={{color:C.td}}>· oldest pending {storageRelTime(rd.oldestPendingAt)}</M>}
+                    </div>
+                  );
+                })}
+                {repl[type].destinations.some(rd=>rd.lastError) && <M style={{color:C.d,display:"block",marginTop:2}}>{repl[type].destinations.find(rd=>rd.lastError).lastError}</M>}
+              </div>
+            )}
+            {res && (
+              <div style={{marginTop:8}}>
+                {res.error && <M style={{color:C.d}}>{res.error}</M>}
+                {!res.error && res.configured===false && <M style={{color:C.td}}>No destinations configured to test.</M>}
+                {!res.error && Array.isArray(res.results) && res.results.map((x,i)=>(
+                  <div key={i} style={{padding:"5px 10px",borderRadius:6,marginTop:4,background:x.ok?C.ad:C.dd,border:"1px solid "+((x.ok?C.a:C.d)+"40")}}>
+                    <M style={{color:x.ok?C.a:C.d}}>{x.role}: {x.name||x.ref} -- {x.ok?"reachable":("unreachable"+(x.error?" ("+x.error+")":""))}</M>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </Card>
+  );
+};
+
 function computeTH(analysts,sd){
   const n=analysts.filter(a=>a.available).length||1;
   const oc=sd.filter(d=>d.util>0.85).length;const ext=sd.filter(d=>d.util>0.85&&d.wo>=2).length;
@@ -2746,6 +3249,7 @@ function ManagementConsole() {
   const [recertCfg, setRecertCfg] = useState({intervalDays:90,enabled:true});
   const [geoFenceCfg, setGeoFenceCfg] = useState({enabled:false,enforceGeoLogin:true,trustedNetworks:[]});
   // B5n2: Data Residency state
+  const [resCategory, setResCategory] = useState("backup"); // B5q: which routed category's declarations are shown
   const [resCfg, setResCfg] = useState({enabled:false,primaryResidency:{country:"",region:"",providerDomicile:"",source:"declared"},categories:{},_loaded:false,_saving:false});
   const [resData, setResData] = useState({posture:null,destinations:[],transfers:[],register:null,_evaluating:false});
   const [resModal, setResModal] = useState(null);
@@ -3503,10 +4007,13 @@ function ManagementConsole() {
 
   const addA = (ty,dt) => setAudit(prev=>[...prev,{ts:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),ty,dt}]);
   // ── B5n2: Data Residency loader + mutation handlers ─────────────────────────
+  const loadResDestinations = (cat) => {
+    api.get("/api/data-residency/destinations?category="+encodeURIComponent(cat)).then(r=>{if(r&&Array.isArray(r.destinations))setResData(pr=>({...pr,destinations:r.destinations}));}).catch(()=>{});
+  };
   const loadResidency = () => {
     api.get("/api/data-residency/config").then(c=>{if(c&&!c.error)setResCfg(pr=>({...pr,enabled:!!c.enabled,primaryResidency:Object.assign({country:"",region:"",providerDomicile:"",source:"declared"},c.primaryResidency||{}),categories:c.categories||{},_loaded:true}));}).catch(()=>{});
     api.get("/api/data-residency/posture").then(r=>{if(r&&!r.error)setResData(pr=>({...pr,posture:r}));}).catch(()=>{});
-    api.get("/api/data-residency/destinations").then(r=>{if(r&&Array.isArray(r.destinations))setResData(pr=>({...pr,destinations:r.destinations}));}).catch(()=>{});
+    loadResDestinations(resCategory);
     api.get("/api/data-residency/transfers").then(r=>{if(r&&!r.error)setResData(pr=>({...pr,transfers:Array.isArray(r.transfers)?r.transfers:[],register:r.summary||null}));}).catch(()=>{});
   };
   useEffect(()=>{loadResidency();},[]);
@@ -3530,7 +4037,7 @@ function ManagementConsole() {
   };
   const saveDestinationDecl = async () => {
     const m=resModal; if(!m)return;
-    const r = await api.put("/api/data-residency/destinations/"+encodeURIComponent(m.ref),{declared_country:(m.declared_country||"").toUpperCase()||null,provider_domicile:(m.provider_domicile||"").toUpperCase()||null,key_custody:m.key_custody||null});
+    const r = await api.put("/api/data-residency/destinations/"+encodeURIComponent(m.ref),{category:m.category,declared_country:(m.declared_country||"").toUpperCase()||null,provider_domicile:(m.provider_domicile||"").toUpperCase()||null,key_custody:m.key_custody||null});
     if(r&&!r.error){addA("RESIDENCY_DESTINATION_SET","Declared jurisdiction for "+(m.name||m.ref));setResModal(null);loadResidency();}
     else window.alert("Save failed: "+((r&&r.error)||"error"));
   };
@@ -5685,26 +6192,8 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 .catch(e=>addA("BK_FAIL",e.message||"Failed to save schedule"));
             }}>Save</Btn>
           </Card>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:C.i,marginBottom:12}}>Storage Destination Configuration</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Route each data type to its appropriate storage destination. Each type can target a different system — backups to one location, audit logs to another, forensic exports to a third.</M>
-            {[{type:"Backups",desc:"Daily full + on-demand snapshots",ph:"s3://soc-wellbeing-backups/daily/",opts:["AWS S3","GCP Cloud Storage","Azure Blob","NFS/SMB Share","On-machine (local)","On-site NAS"]},
-              {type:"Audit Logs",desc:"Immutable, append-only, tamper-evident",ph:"s3://soc-audit-immutable/ (Object Lock enabled)",opts:["S3 Object Lock","Azure Immutable Blob","GCS Retention Lock","WORM NAS","Syslog (remote)"]},
-              {type:"Forensic Exports",desc:"Double-encrypted, chain-of-custody signed",ph:"s3://soc-forensics-air-gapped/",opts:["AWS S3 (separate account)","Air-gapped NAS","Azure Blob (isolated VNet)","GCS (separate project)","Removable media (USB/tape)"]},
-              {type:"Snapshots",desc:"Point-in-time captures before config changes + on-demand",ph:"s3://soc-wellbeing-snapshots/",opts:["AWS S3","GCP Cloud Storage","Azure Blob","NFS/SMB Share","Same as backups"]},
-              {type:"CEF Stream Archives",desc:"SIEM event archives for compliance",ph:"s3://soc-cef-archive/",opts:["AWS S3","Splunk SmartStore","GCS","Azure Blob","Elasticsearch cold tier"]}
-            ].map((d,i)=>(
-              <Card key={i} style={{marginBottom:10,padding:"12px 14px"}}>
-                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:2}}>{d.type}</div>
-                <M style={{color:C.td,display:"block",marginBottom:8}}>{d.desc}</M>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                  <Sel label="Destination">{d.opts.map(o=><option key={o} value={o}>{o}</option>)}</Sel>
-                  <Input label="Path / URI" placeholder={d.ph} maxLength={512}/>
-                </div>
-              </Card>
-            ))}
-            <Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"STORAGE_ROUTES_SAVED",detail:"Backup/log storage destinations configured"}).then(()=>addA("STORAGE_ROUTES_SAVED","Backup/log storage destinations configured"))}>Save Storage Routes</Btn>
-          </Card>
+          <StorageDestinations addA={addA} />
+          <StorageRouting addA={addA} />
           <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.a,marginBottom:10}}>Encryption at Rest</div>
             <M style={{color:C.t,lineHeight:1.8}}>
@@ -8774,15 +9263,21 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           )}
 
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:8}}>Backup Destinations ({resData.destinations.length})</div>
-            {resData.destinations.length===0&&<M style={{color:C.td,display:"block"}}>No backup destinations configured.</M>}
+            <div style={{fontSize:12,fontWeight:600,color:"#E8EDF5",marginBottom:6}}>Destination Jurisdiction by Data Type ({resData.destinations.length})</div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>A destination is declared and evaluated per data type it serves -- the same bucket can be compliant for backups but not for forensic exports. Pick a data type to view and set its destinations' jurisdictions.</M>
+            <div style={{maxWidth:260,marginBottom:10}}>
+              <Sel label="Data type" value={resCategory} onChange={e=>{const cat=e.target.value;setResCategory(cat);loadResDestinations(cat);}}>
+                {RESIDENCY_CATEGORIES.map(c=><option key={c.k} value={c.k}>{c.label}</option>)}
+              </Sel>
+            </div>
+            {resData.destinations.length===0&&<M style={{color:C.td,display:"block"}}>No destinations registered.</M>}
             {resData.destinations.map((d)=>(
               <div key={d.ref} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`}}>
                 <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                   <Badge color={C.tm}>{d.adapter}</Badge>
                   <M style={{color:C.t}}>{d.name}</M>
                   <Badge color={d.blocked?C.d:d.compliant?C.a:C.w}>{d.blocked?"BLOCKED":d.compliant?"COMPLIANT":"REVIEW"}</Badge>
-                  <Btn small onClick={()=>setResModal({kind:"dest",ref:d.ref,name:d.name,declared_country:(d.declaration&&d.declaration.declared_country)||"",provider_domicile:(d.declaration&&d.declaration.provider_domicile)||"",key_custody:(d.declaration&&d.declaration.key_custody)||""})}>Declare</Btn>
+                  <Btn small onClick={()=>setResModal({kind:"dest",category:resCategory,ref:d.ref,name:d.name,declared_country:(d.declaration&&d.declaration.declared_country)||"",provider_domicile:(d.declaration&&d.declaration.provider_domicile)||"",key_custody:(d.declaration&&d.declaration.key_custody)||""})}>Declare</Btn>
                 </div>
                 <M style={{color:C.tm,display:"block",marginTop:2}}>Jurisdiction: {d.jurisdiction||"(undeclared)"}{d.providerDomicile?(" \u00b7 provider domicile "+d.providerDomicile):""}{d.reason?(" \u00b7 "+d.reason):""}</M>
               </div>

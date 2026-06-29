@@ -30,6 +30,7 @@ const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 const storageRouting = require('../services/storage-routing');
 const storageDestinations = require('../services/storage-destinations');
+const replicationStatus = require('../services/replication-status');
 
 function actorOf(req) {
   return req.user && req.user.id ? req.user.id : 'system';
@@ -74,6 +75,25 @@ router.get('/', (req, res) => {
   } catch (err) {
     logger.error('routes/storage-routing: list failed', { error: err.message });
     return res.status(500).json({ error: 'failed to list storage routes' });
+  } finally {
+    try { db.close(); } catch { /* swallow */ }
+  }
+});
+
+// ── GET /replication ───────────────────────────────────────
+// Per-data-type replication health (is each routed type's copy landing on both
+// destinations). Read-only; defined before GET /:type so 'replication' is not
+// captured as a data type. Admin auth + the config-lock chokepoint are applied
+// at the mount.
+router.get('/replication', (req, res) => {
+  const db = getDb();
+  try {
+    const replication = replicationStatus.getReplicationStatus(db);
+    auditLog(actorOf(req), 'STORAGE_REPLICATION_VIEWED', `types=${replication.length}`, req.ip);
+    return res.json({ replication: replication });
+  } catch (err) {
+    logger.error('routes/storage-routing: replication status failed', { error: err.message });
+    return res.status(500).json({ error: 'failed to read replication status' });
   } finally {
     try { db.close(); } catch { /* swallow */ }
   }

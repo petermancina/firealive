@@ -1,6 +1,6 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.76 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**Version:** v1.0.77 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
 **E-fuse counter:** 69 (anti-rollback)
 
 -----
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.76) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.77) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -83,7 +83,8 @@ The Regional Server can run as an **active/passive** pair for automated failover
 |----------------------|------------------------------------------------------------------------------------------|
 |AI Burnout Engine     |Baseline creation, signal drift detection, AI message generation, training recommendations|
 |Assessment Service    |Create/assign/submit assessments, skill tracking, gap analysis                            |
-|Backup Service        |Real filesystem backups, SHA-256 integrity verification, scheduling                       |
+|Backup Service        |Encrypted full/incremental/differential backups, SHA-256 integrity, scheduling            |
+|Storage Routing       |Per-type destination routing, guaranteed dual-write replication, immutability + residency |
 |Compliance Scanner    |Real checks against actual app state for 16+ frameworks                                   |
 |Regression Runner     |Broad real-test suite over DB tables, crypto, integrations, and middleware                |
 |Integration Manager   |SOAR/Ticketing/SIEM/IAM connection testing and config storage                             |
@@ -208,7 +209,7 @@ FireAlive treats a running deployment as something that must continuously prove 
 
 Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before the first authenticator is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires a fresh WebAuthn step-up (a user-verified passkey assertion) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
 
-When locked, every configuration-write endpoint returns HTTP 423 Locked. A single registry-driven chokepoint covers all of them — not only the platform-config routers (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, backup destinations, backup push, audit retention, API keys) but also the in-app feature settings (EDR, posture, geo-fencing, threat-hunting, vulnerability scan, pseudonyms, recertification, access control, and the rest). Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing, scans, alert approvals) are unaffected, so production incident response is never blocked by the lock.
+When locked, every configuration-write endpoint returns HTTP 423 Locked. A single registry-driven chokepoint covers all of them — not only the platform-config routers (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, storage destinations, storage routing, backup push, audit retention, API keys) but also the in-app feature settings (EDR, posture, geo-fencing, threat-hunting, vulnerability scan, pseudonyms, recertification, access control, and the rest). Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing, scans, alert approvals) are unaffected, so production incident response is never blocked by the lock.
 
 Unlocking starts a sliding idle window: the platform auto-relocks after a period of no configuration activity (default 15 minutes, admin-configurable), so a walked-away admin session cannot leave configuration writable. A continuous-integration coverage guard fails the build if any configuration endpoint is ever added without being placed behind the lock.
 
