@@ -143,19 +143,19 @@ module.exports = (checks) => ({
       id: 'PR.PS-01',
       name: 'Configuration Management Practices are Established',
       check: checks.checkConfigLockState,
-      mapping: 'GD has no Config Lock server-side persistence as of v0.0.31; the frontend exposes a Config Lock toggle that POSTs to /api/config/lock, but no route handler exists on the server. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence (mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock.',
     },
     {
       id: 'PR.PS-02',
       name: 'Software is Maintained, Replaced, Removed Commensurate with Risk',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter is seeded by db-init.js but the GD has no package.json fuseCounter field and no startup integrity check comparing the two (planned for a future GD startup-verifier phase). AGPL-3.0 license provides transparency for software-maintenance auditing. Host OS / Node.js runtime / dependency patching is operator-managed.',
+      mapping: 'system_meta.fuse_counter is seeded by db-init.js and the GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing the two (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. AGPL-3.0 license provides transparency for software-maintenance auditing. Host OS / Node.js runtime / dependency patching is operator-managed.',
     },
     {
       id: 'PR.PS-05',
       name: 'Installation/Execution of Unauthorized Software is Prevented',
       check: checks.checkMalwareProtection,
-      mapping: 'GD has no in-platform malware scanner integration (no malware_scanner_integrations table) — by design, the GD does not currently process uploaded files from analysts. File-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS is operator-managed.',
+      mapping: 'The GD now has an in-platform host/endpoint EDR seam (the malware_scanner_integrations registry — eleven providers, credentials AES-256-GCM-encrypted), additive on top of the in-platform runtime-monitor baseline. By design the GD still does not process uploaded files from analysts; file-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS remains operator-managed defense-in-depth.',
     },
     // ── DETECT ───────────────────────────────────────────────────────────────
     {

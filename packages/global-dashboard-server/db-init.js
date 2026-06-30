@@ -502,6 +502,59 @@ CREATE TABLE IF NOT EXISTS system_health (
   connected_mcs INTEGER
 );
 
+-- ── Config Lock state (B6a — GD twin of the MC config-lock chokepoint) ──────
+-- Singleton (id = 1). When lock_active = 1 the GD config-lock chokepoint
+-- refuses every config-write request with 423 Locked until an admin clears
+-- the lock with a fresh hardware-passkey assertion (the gold-standard re-auth;
+-- GD login is already FIDO2). auto_relock_at / idle_minutes drive a sliding
+-- idle auto-relock so a walked-away-from admin session cannot leave the GD
+-- configuration writable indefinitely. The singleton is seeded below so the
+-- chokepoint always has a row to read (fail-safe if it is ever missing).
+CREATE TABLE IF NOT EXISTS config_lock_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  lock_active INTEGER NOT NULL DEFAULT 0 CHECK (lock_active IN (0, 1)),
+  locked_at INTEGER,
+  auto_relock_at INTEGER,
+  idle_minutes INTEGER NOT NULL DEFAULT 15,
+  locked_by_user_id TEXT
+);
+INSERT OR IGNORE INTO config_lock_state (id, lock_active, idle_minutes) VALUES (1, 0, 15);
+
+-- ── EDR / endpoint-monitoring integrations (B6a — GD self-protection) ───────
+-- The GD-side EDR / integration-manager seam: in-platform host/endpoint-
+-- monitoring integrations registered against the GD server ITSELF (the GD as a
+-- protected asset). Replaces the prior compliance "host EDR operator-managed
+-- off-platform" posture. The GD integration-health probing and the regression
+-- EDR/endpoint check read this registry. Kept lean for the GD's role (no file-
+-- scan stats — the GD scans no uploaded files); the vendor enum spans modern
+-- endpoint-protection / EDR platforms. credentials_encrypted is nullable
+-- (agent-based integrations may report to a console without GD-stored creds).
+CREATE TABLE IF NOT EXISTS malware_scanner_integrations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  provider_type TEXT NOT NULL CHECK (provider_type IN (
+    'crowdstrike_falcon',
+    'microsoft_defender_endpoint',
+    'sentinelone',
+    'palo_alto_cortex_xdr',
+    'trellix_edr',
+    'sophos_intercept_x',
+    'vmware_carbon_black',
+    'cisco_secure_endpoint',
+    'wazuh',
+    'elastic_defend',
+    'limacharlie'
+  )),
+  display_name TEXT NOT NULL,
+  endpoint TEXT,
+  credentials_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  configured_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  configured_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_test_at TEXT,
+  last_test_status TEXT CHECK (last_test_status IS NULL OR last_test_status IN ('success', 'failed')),
+  last_test_error TEXT
+);
+
 -- Generated reports
 CREATE TABLE IF NOT EXISTS reports (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
@@ -1049,6 +1102,31 @@ function initDb() {
   setCfg.run('posture_config', JSON.stringify({ enabled: true, require_on_connect: true }));
   setCfg.run('wifi_policy', JSON.stringify({ minimum_protocol: 'wpa2_enterprise' }));
   setCfg.run('signing_key_grace_period_minutes', '60');
+
+  // ── B6a — GD self-protection config defaults ───────────────────────────
+  // alert_routing_matrix: the SOC-grade per-severity channel matrix the GD
+  // alert-router fans out by (audit is always-on and NOT part of the matrix).
+  // Locked defaults: warning -> +siem; high -> +soar +siem +notification;
+  // critical -> all channels. Admin-overridable from the Monitoring tab.
+  setCfg.run('alert_routing_matrix', JSON.stringify({
+    info:     { soar: false, siem: false, email: false, notification: false, webhook: false },
+    warning:  { soar: false, siem: true,  email: false, notification: false, webhook: false },
+    high:     { soar: true,  siem: true,  email: false, notification: true,  webhook: false },
+    critical: { soar: true,  siem: true,  email: true,  notification: true,  webhook: true  }
+  }));
+  setCfg.run('alert_webhook_url', '');
+  // Integration-health probing: opt-in (default OFF) at the master and per-
+  // integration level, scoped to the GD's real dependencies (kms / storage /
+  // mc_trust). Mirrors the MC's default-off posture.
+  setCfg.run('integration_health_probes_enabled', 'false');
+  setCfg.run('integration_health_config', JSON.stringify({
+    kms:      { enabled: false },
+    storage:  { enabled: false },
+    mc_trust: { enabled: false }
+  }));
+  // Runtime-monitor sustained-load threshold overrides (empty object = use the
+  // SOC-grade defaults baked into services/gd-runtime-monitor.js).
+  setCfg.run('runtime_monitor_thresholds', JSON.stringify({}));
 
   // ── R3k C27 — Sub-phase 6 GD-side schema mirrors ──────────────────────
   //

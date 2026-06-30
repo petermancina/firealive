@@ -108,7 +108,7 @@ module.exports = (checks) => ({
       id: 'CE-2.2',
       name: 'Secure Configuration -- Change Control',
       check: checks.checkConfigLockState,
-      mapping: 'GD has no Config Lock server-side persistence as of v0.0.31; the frontend exposes a toggle that POSTs to /api/config/lock, but no route handler exists on the server. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock. Until then, configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     {
       id: 'CE-2.3',
@@ -152,14 +152,14 @@ module.exports = (checks) => ({
       id: 'CE-4.1',
       name: 'Malware Protection',
       check: checks.checkMalwareProtection,
-      mapping: 'GD has no in-platform malware scanner integration (no malware_scanner_integrations table) — by design, the GD does not currently process uploaded files from analysts. File-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) plus AV/EDR coverage across workstations interacting with the GD is operator-managed.',
+      mapping: 'The GD now has an in-platform host/endpoint EDR seam (the malware_scanner_integrations registry — eleven providers, credentials AES-256-GCM-encrypted), additive on top of the in-platform runtime-monitor baseline. By design the GD still does not process uploaded files from analysts; file-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) plus AV/EDR coverage across workstations interacting with the GD remains operator-managed defense-in-depth.',
     },
     // ── Control 5: Security Update Management ────────────────────────────────
     {
       id: 'CE-5.1',
       name: 'Security Update Management',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter tracks platform version (seeded by db-init.js). GD has no package.json fuseCounter field and no startup integrity check comparing the two (planned for a future GD startup-verifier phase). AGPL-3.0 source transparency for software-update auditing. Host OS / Node.js runtime / dependency patching is operator-managed; Cyber Essentials v3.2 requires high/critical patches within 14 days.',
+      mapping: 'system_meta.fuse_counter tracks platform version (seeded by db-init.js). The GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing it against system_meta.fuse_counter (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. AGPL-3.0 source transparency for software-update auditing. Host OS / Node.js runtime / dependency patching is operator-managed; Cyber Essentials v3.2 requires high/critical patches within 14 days.',
     },
   ],
   customerResponsibility: [

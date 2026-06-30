@@ -148,7 +148,7 @@ module.exports = (checks) => ({
       id: 'Art.47',
       name: 'Prevention Practices',
       check: checks.checkChangeManagement,
-      mapping: 'system_meta.fuse_counter + audit_log CONFIG_UPDATED events emitted by PUT /api/config/:key evidence preventive practices that address risks to data subject rights. Config Lock server-side persistence awaits a future BUILD-PLAN-v16 phase; until then, configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes). Art.47 requires processing agents to ensure personal data security throughout the processing lifecycle.',
+      mapping: 'system_meta.fuse_counter + audit_log CONFIG_UPDATED events emitted by PUT /api/config/:key evidence preventive practices that address risks to data subject rights. Config Lock server-side persistence is live (the config_lock_state singleton + the config-write chokepoint; unlock requires a fresh hardware-passkey assertion), additionally backed by route-middleware role gating (CISO-only writes). Art.47 requires processing agents to ensure personal data security throughout the processing lifecycle.',
     },
     {
       id: 'Art.48',

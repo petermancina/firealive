@@ -139,13 +139,13 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(e) [Acquisition]',
       name: 'Security in Acquisition, Development, Maintenance -- Config Lock',
       check: checks.checkConfigLockState,
-      mapping: 'GD has no Config Lock server-side persistence as of v0.0.31; the frontend exposes a toggle that POSTs to /api/config/lock, but no route handler exists on the server. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock. Until then, configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     {
       id: 'Art.21(2)(e) [Patch]',
       name: 'Security in Acquisition, Development, Maintenance -- Patch Management',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter tracks platform version. GD has no package.json fuseCounter field and no startup integrity check comparing the two (planned for a future GD startup-verifier phase). Patch management at the operator infrastructure layer is operator-managed using their patch-management procedure; npm audit / Snyk / Dependabot in CI is the SOC-grade norm for dependency tracking.',
+      mapping: 'system_meta.fuse_counter tracks platform version. The GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing it against system_meta.fuse_counter (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. Patch management at the operator infrastructure layer is operator-managed using their patch-management procedure; npm audit / Snyk / Dependabot in CI is the SOC-grade norm for dependency tracking.',
     },
     {
       id: 'Art.21(2)(f)',

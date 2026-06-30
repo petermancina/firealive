@@ -253,6 +253,130 @@ function MyMfaSecuritySection() {
 // Manages the GD-Server's own trusted attestation roots and the optional AAGUID
 // model allow-list via /api/iam/fido-* (gated to ciso server-side; the GD
 // server audits each change). At least one trusted root must always remain.
+function GdSelfProtectionConsole() {
+  const EDR_PROVIDERS = ["crowdstrike_falcon","microsoft_defender_endpoint","sentinelone","palo_alto_cortex_xdr","trellix_edr","sophos_intercept_x","vmware_carbon_black","cisco_secure_endpoint","wazuh","elastic_defend","limacharlie"];
+  const SEVERITIES = ["info","warning","high","critical"];
+  const CHANNELS = ["soar","siem","email","notification","webhook"];
+  const [siem,setSiem]=useState({endpoint:"",protocol:"tls"});
+  const [soar,setSoar]=useState({endpoint:"",has_auth_token:false});
+  const [soarToken,setSoarToken]=useState("");
+  const [webhook,setWebhook]=useState({configured:false,host:null});
+  const [webhookUrl,setWebhookUrl]=useState("");
+  const [matrix,setMatrix]=useState(null);
+  const [thresholds,setThresholds]=useState({});
+  const [ih,setIh]=useState({master:false,integrations:{kms:{enabled:false},storage:{enabled:false},mc_trust:{enabled:false}}});
+  const [ihResults,setIhResults]=useState(null);
+  const [ihRunning,setIhRunning]=useState(false);
+  const [edr,setEdr]=useState([]);
+  const [newEdr,setNewEdr]=useState({provider_type:"crowdstrike_falcon",display_name:"",endpoint:"",credentials:""});
+  const [runtime,setRuntime]=useState(null);
+  const [msg,setMsg]=useState("");
+  const [busy,setBusy]=useState(false);
+
+  const load=async()=>{
+    const s=await api.get("/api/self-protection/config/siem"); if(s&&!s.error)setSiem({endpoint:s.endpoint||"",protocol:s.protocol||"tls"});
+    const so=await api.get("/api/self-protection/config/soar"); if(so&&!so.error)setSoar({endpoint:so.endpoint||"",has_auth_token:!!so.has_auth_token});
+    const w=await api.get("/api/self-protection/config/webhook"); if(w&&!w.error)setWebhook({configured:!!w.configured,host:w.host||null});
+    const m=await api.get("/api/self-protection/config/alert-matrix"); if(m&&!m.error)setMatrix(m.matrix||null);
+    const t=await api.get("/api/self-protection/config/runtime-thresholds"); if(t&&!t.error)setThresholds(t.thresholds||{});
+    const i=await api.get("/api/self-protection/config/integration-health"); if(i&&!i.error)setIh({master:!!i.master,integrations:i.integrations||{kms:{enabled:false},storage:{enabled:false},mc_trust:{enabled:false}}});
+    const ir=await api.get("/api/self-protection/integration-health"); if(ir&&!ir.error)setIhResults(ir.ran===false?null:ir);
+    const e=await api.get("/api/self-protection/config/edr"); if(e&&!e.error)setEdr(Array.isArray(e.integrations)?e.integrations:[]);
+    const rt=await api.get("/api/self-protection/runtime/metrics"); if(rt&&!rt.error)setRuntime(rt);
+  };
+  useEffect(()=>{ load().catch(()=>{}); },[]);
+  const flash=(t)=>{ setMsg(t); setTimeout(()=>setMsg(""),4000); };
+
+  const saveSiem=async()=>{ setBusy(true); const r=await api.put("/api/self-protection/config/siem",{endpoint:siem.endpoint,protocol:siem.protocol}); setBusy(false); flash(r&&!r.error?"SIEM configuration saved":"SIEM save failed: "+(r&&r.error||"error")); };
+  const saveSoar=async()=>{ setBusy(true); const body={endpoint:soar.endpoint}; if(soarToken)body.auth_token=soarToken; const r=await api.put("/api/self-protection/config/soar",body); setBusy(false); if(r&&!r.error){setSoarToken("");flash("SOAR configuration saved");load().catch(()=>{});}else flash("SOAR save failed: "+(r&&r.error||"error")); };
+  const saveWebhook=async()=>{ setBusy(true); const r=await api.put("/api/self-protection/config/webhook",{url:webhookUrl}); setBusy(false); if(r&&!r.error){setWebhookUrl("");flash("Webhook saved");load().catch(()=>{});}else flash("Webhook save failed: "+(r&&r.error||"error")); };
+  const toggleMatrix=(sev,ch)=>{ setMatrix(prev=>{ const next=JSON.parse(JSON.stringify(prev||{})); next[sev]=next[sev]||{}; next[sev][ch]=!next[sev][ch]; return next; }); };
+  const saveMatrix=async()=>{ setBusy(true); const r=await api.put("/api/self-protection/config/alert-matrix",{matrix}); setBusy(false); flash(r&&!r.error?"Alert routing saved":"Routing save failed: "+(r&&r.error||"error")); };
+  const saveIh=async()=>{ setBusy(true); const r=await api.put("/api/self-protection/config/integration-health",{master:ih.master,integrations:ih.integrations}); setBusy(false); flash(r&&!r.error?"Probe configuration saved":"Save failed: "+(r&&r.error||"error")); };
+  const runIh=async()=>{ setIhRunning(true); const r=await api.post("/api/self-protection/integration-health/run",{}); setIhRunning(false); if(r&&!r.error){setIhResults(r);flash("Dependency probe run complete");}else flash("Probe run failed: "+(r&&r.error||"error")); };
+  const addEdr=async()=>{ if(!newEdr.display_name.trim()){flash("EDR display name is required");return;} setBusy(true); const body={provider_type:newEdr.provider_type,display_name:newEdr.display_name,enabled:true}; if(newEdr.endpoint)body.endpoint=newEdr.endpoint; if(newEdr.credentials)body.credentials=newEdr.credentials; const r=await api.post("/api/self-protection/config/edr",body); setBusy(false); if(r&&!r.error){setNewEdr({provider_type:"crowdstrike_falcon",display_name:"",endpoint:"",credentials:""});flash("EDR integration added");load().catch(()=>{});}else flash("Add EDR failed: "+(r&&r.error||"error")); };
+  const toggleEdr=async(it)=>{ const r=await api.put("/api/self-protection/config/edr/"+it.id,{enabled:!it.enabled}); if(r&&!r.error)load().catch(()=>{}); else flash("Toggle failed: "+(r&&r.error||"error")); };
+  const deleteEdr=async(it)=>{ const r=await api.del("/api/self-protection/config/edr/"+it.id); if(r&&!r.error){flash("EDR integration removed");load().catch(()=>{});}else flash("Delete failed: "+(r&&r.error||"error")); };
+
+  const statusColor=(st)=> st==="ok"?C.a:(["disabled","not_configured","not_implemented","deep_skipped"].indexOf(st)>=0?C.td:C.d);
+
+  return (<div>
+    <L>Monitoring Integrations</L>
+    <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Configure how the Global Dashboard protects itself: forward its own audit and security events to your SIEM/SOAR, alert on a webhook, probe the GD's own dependencies, and integrate an external EDR. These monitor the GD server itself, never analyst data.</M>
+    {msg&&<Card style={{borderColor:C.a+"40"}}><M style={{color:C.a}}>{msg}</M></Card>}
+
+    <Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>SIEM</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>Forward GD audit and security events (CEF) to your SIEM.</M>
+      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:8}}>
+        <Input label="Endpoint (host:port)" value={siem.endpoint} placeholder="siem.corp.com:6514" onChange={e=>setSiem({...siem,endpoint:e.target.value})}/>
+        <Sel label="Protocol" value={siem.protocol} onChange={e=>setSiem({...siem,protocol:e.target.value})}><option value="tls">TLS</option><option value="tcp">TCP</option><option value="udp">UDP</option></Sel>
+      </div>
+      <Btn small primary disabled={busy} onClick={saveSiem}>Save SIEM</Btn>
+    </Card>
+
+    <Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>SOAR</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>Dispatch GD security events to your SOAR for automated response.{soar.has_auth_token?" Auth token is set.":""}</M>
+      <Input label="Endpoint (https URL)" value={soar.endpoint} placeholder="https://soar.corp.com/ingest" onChange={e=>setSoar({...soar,endpoint:e.target.value})}/>
+      <Input label={soar.has_auth_token?"Replace auth token (blank keeps current)":"Auth token (optional)"} type="password" value={soarToken} placeholder="bearer token..." onChange={e=>setSoarToken(e.target.value)}/>
+      <Btn small primary disabled={busy} onClick={saveSoar}>Save SOAR</Btn>
+    </Card>
+
+    <Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>Alert webhook</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>{webhook.configured?"Currently posting to "+webhook.host+".":"No webhook configured."}</M>
+      <Input label="Webhook URL (blank clears)" value={webhookUrl} placeholder="https://hooks.example.com/..." onChange={e=>setWebhookUrl(e.target.value)}/>
+      <Btn small primary disabled={busy} onClick={saveWebhook}>Save Webhook</Btn>
+    </Card>
+
+    {matrix&&<Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>Alert routing</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>Which channels each severity fans out to (the audit log is always written).</M>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+        <thead><tr><th style={{textAlign:"left",color:C.td,padding:"4px"}}>severity</th>{CHANNELS.map(ch=><th key={ch} style={{color:C.td,padding:"4px"}}>{ch}</th>)}</tr></thead>
+        <tbody>{SEVERITIES.map(sev=><tr key={sev}><td style={{color:C.t,padding:"4px"}}>{sev}</td>{CHANNELS.map(ch=><td key={ch} style={{textAlign:"center",padding:"4px"}}><input type="checkbox" checked={!!(matrix[sev]&&matrix[sev][ch])} onChange={()=>toggleMatrix(sev,ch)}/></td>)}</tr>)}</tbody>
+      </table>
+      <Btn small primary disabled={busy} style={{marginTop:10}} onClick={saveMatrix}>Save Routing</Btn>
+    </Card>}
+
+    <Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>Dependency health probes</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>Probe the GD's own dependencies (signing-key store, backup storage, MC trust). Side-effect-free.</M>
+      <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}><input type="checkbox" checked={ih.master} onChange={e=>setIh({...ih,master:e.target.checked})}/><M style={{color:C.t}}>Enable probing</M></label>
+      {["kms","storage","mc_trust"].map(k=><label key={k} style={{display:"flex",alignItems:"center",gap:8,padding:"3px 0 3px 16px"}}><input type="checkbox" checked={!!(ih.integrations[k]&&ih.integrations[k].enabled)} onChange={e=>setIh({...ih,integrations:{...ih.integrations,[k]:{enabled:e.target.checked}}})}/><M style={{color:C.tm}}>{k}</M></label>)}
+      <div style={{display:"flex",gap:8,marginTop:8}}><Btn small primary disabled={busy} onClick={saveIh}>Save</Btn><Btn small disabled={ihRunning} onClick={runIh}>{ihRunning?"Running...":"Run Probe Now"}</Btn></div>
+      {ihResults&&ihResults.results&&<div style={{marginTop:10}}>{ihResults.results.map((r,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:`1px solid ${C.b}`}}><M style={{color:C.t}}>{r.label||r.integration}</M><M style={{color:statusColor(r.status),fontWeight:500}}>{r.status}</M></div>)}</div>}
+    </Card>
+
+    <Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>External EDR / endpoint monitoring</div>
+      <M style={{color:C.tm,display:"block",marginBottom:8}}>Register an external EDR provider. Credentials are encrypted at rest. The in-platform runtime-monitor provides the host-monitoring baseline regardless.</M>
+      {edr.map(it=><div key={it.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><div><M style={{color:C.t,fontWeight:500}}>{it.display_name}</M><M style={{color:C.td,display:"block",fontSize:9}}>{it.provider_type}{it.has_credentials?" - creds set":""}</M></div><div style={{display:"flex",gap:6,alignItems:"center"}}><Badge color={it.enabled?C.a:C.td}>{it.enabled?"enabled":"disabled"}</Badge><Btn small onClick={()=>toggleEdr(it)}>{it.enabled?"Disable":"Enable"}</Btn><Btn small style={{color:C.d,borderColor:C.d+"50"}} onClick={()=>deleteEdr(it)}>Remove</Btn></div></div>)}
+      <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${C.b}`}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          <Sel label="Provider" value={newEdr.provider_type} onChange={e=>setNewEdr({...newEdr,provider_type:e.target.value})}>{EDR_PROVIDERS.map(pv=><option key={pv} value={pv}>{pv}</option>)}</Sel>
+          <Input label="Display name" value={newEdr.display_name} placeholder="Prod Falcon" onChange={e=>setNewEdr({...newEdr,display_name:e.target.value})}/>
+          <Input label="Endpoint (optional)" value={newEdr.endpoint} placeholder="https://api.crowdstrike.com" onChange={e=>setNewEdr({...newEdr,endpoint:e.target.value})}/>
+          <Input label="Credentials (optional)" type="password" value={newEdr.credentials} placeholder="api key / token" onChange={e=>setNewEdr({...newEdr,credentials:e.target.value})}/>
+        </div>
+        <Btn small primary disabled={busy} onClick={addEdr}>Add EDR Integration</Btn>
+      </div>
+    </Card>
+
+    {runtime&&<Card>
+      <div style={{fontSize:12,fontWeight:600,color:C.t,marginBottom:8}}>Runtime monitor</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+        <div><div style={{color:C.a,fontWeight:600,fontSize:15}}>{(runtime.cpu==null?0:runtime.cpu)+"%"}</div><M style={{color:C.td}}>CPU</M></div>
+        <div><div style={{color:C.i,fontWeight:600,fontSize:15}}>{runtime.memMB==null?0:runtime.memMB}</div><M style={{color:C.td}}>Mem MB</M></div>
+        <div><div style={{color:C.p,fontWeight:600,fontSize:15}}>{runtime.fileCount==null?0:runtime.fileCount}</div><M style={{color:C.td}}>FIM files</M></div>
+        <div><div style={{color:C.t,fontWeight:600,fontSize:15}}>{runtime.dbReadsPerMin==null?0:runtime.dbReadsPerMin}</div><M style={{color:C.td}}>reads/min</M></div>
+      </div>
+      {Object.keys(thresholds).length>0&&<M style={{color:C.td,display:"block",marginTop:8}}>Thresholds: {Object.keys(thresholds).map(k=>k+"="+thresholds[k]).join(", ")}</M>}
+    </Card>}
+  </div>);
+}
+
 function GdFidoTrustSection() {
   const dangerBtn = { color: C.d, borderColor: C.d + "50" };
   const [roots, setRoots] = useState(null);
@@ -1666,7 +1790,7 @@ export default function GlobalDashboard() {
       <div style={{display:"flex",minHeight:"calc(100vh - 80px)"}}>
         <div style={{width:200,flexShrink:0,borderRight:`1px solid ${C.b}`,background:C.s,padding:"12px 0"}}>
           {navItems.map(n=><button key={n.id} onClick={()=>setTab(n.id)} style={{width:"100%",padding:"10px 16px",background:tab===n.id?"rgba(110,231,183,0.1)":"transparent",border:"none",borderLeft:tab===n.id?`3px solid ${C.a}`:"3px solid transparent",color:tab===n.id?C.a:C.td,fontSize:11,fontWeight:tab===n.id?600:400,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace",textAlign:"left"}}>{n.label}</button>)}
-          <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6)return;const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);showGdToast(r.lock_active?"Configurations locked":"Configurations unlocked");}else{showGdToast("Lock toggle failed: "+(r?.error||"unknown error"));}}} style={{width:"100%",marginTop:8,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?"rgba(239,68,68,0.2)":"rgba(110,231,183,0.2)"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"Unlock to Make Changes":"Lock All Configs"}</button>
+          <button onClick={async()=>{if(configLocked){const opt=await api.post("/api/config/lock/unlock-options",{});if(!opt||opt.error||!opt.options||!opt.challengeToken){showGdToast("Could not start unlock: "+(opt?.error||"unknown error"));return;}let cred;try{cred=await navigator.credentials.get({publicKey:deserializeAuthOptions(opt.options)});}catch(e){showGdToast("Passkey unlock cancelled");return;}const r=await api.post("/api/config/lock",{action:"unlock",response:serializeAssertion(cred),challengeToken:opt.challengeToken});if(r&&!r.error){setConfigLocked(!!r.lock_active);showGdToast("Configurations unlocked");}else{showGdToast("Unlock failed: "+(r?.error||"unknown error"));}}else{const r=await api.post("/api/config/lock",{action:"lock"});if(r&&!r.error){setConfigLocked(!!r.lock_active);showGdToast("Configurations locked");}else{showGdToast("Lock failed: "+(r?.error||"unknown error"));}}}} style={{width:"100%",marginTop:8,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?"rgba(239,68,68,0.2)":"rgba(110,231,183,0.2)"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"Unlock to Make Changes":"Lock All Configs"}</button>
         </div>
         <div style={{flex:1,padding:24,overflowY:"auto",animation:"fadeIn 0.3s ease"}}>
 
@@ -2197,24 +2321,21 @@ export default function GlobalDashboard() {
               <Card style={{textAlign:"center"}}><div style={{fontSize:22,fontWeight:600,color:C.w}}>{gdHealth.connectedMCs??regions.length}</div><M style={{color:C.td}}>Connected MCs</M></Card>
             </div>
             <Card><M style={{color:C.tm}}>{gdHealth.uptimeSec?"Server uptime: "+Math.floor(gdHealth.uptimeSec/3600)+"h "+Math.floor((gdHealth.uptimeSec%3600)/60)+"m":"Server uptime: —"} · Node: {gdHealth.nodeVersion||"—"} · Backend port: 4001</M></Card>
+            {gdHealth.metrics&&<div style={{marginTop:16}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.t,margin:"4px 0 8px"}}>Subsystem Health</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
+                <Card><M style={{color:C.td}}>Fleet</M><div style={{color:C.a,fontWeight:600,fontSize:15}}>{(gdHealth.metrics.fleet?.active??0)+" / "+(gdHealth.metrics.fleet?.total??0)}</div><M style={{color:C.td}}>active MC(s)</M></Card>
+                <Card><M style={{color:C.td}}>Signing keys</M><div style={{color:C.i,fontWeight:600,fontSize:15}}>{gdHealth.metrics.signing_keys?.active??0}</div><M style={{color:C.td}}>active{gdHealth.metrics.signing_keys?.pendingApproval?" · "+gdHealth.metrics.signing_keys.pendingApproval+" pending":""}</M></Card>
+                <Card><M style={{color:C.td}}>Audit chain</M><div style={{color:gdHealth.metrics.audit_integrity?.intact===false?C.d:C.a,fontWeight:600,fontSize:15}}>{gdHealth.metrics.audit_integrity?.entryCount??0}</div><M style={{color:C.td}}>entries{gdHealth.metrics.audit_integrity?.intact===false?" · BREAK":""}</M></Card>
+                <Card><M style={{color:C.td}}>Backup</M><div style={{color:C.t,fontWeight:600,fontSize:15}}>{gdHealth.metrics.backup?.lastStatus||"never"}</div><M style={{color:C.td}}>last status</M></Card>
+                <Card><M style={{color:C.td}}>Notifications</M><div style={{color:gdHealth.metrics.notifications?.unacknowledged?C.w:C.t,fontWeight:600,fontSize:15}}>{gdHealth.metrics.notifications?.unacknowledged??0}</div><M style={{color:C.td}}>unacknowledged</M></Card>
+                <Card><M style={{color:C.td}}>File integrity</M><div style={{color:C.t,fontWeight:600,fontSize:15}}>{gdHealth.metrics.runtime?.fimFiles??0}</div><M style={{color:C.td}}>files · {gdHealth.metrics.runtime?.dbReadsPerMin??0}/min reads</M></Card>
+              </div>
+            </div>}
           </div>)}
 
           {/* ══════════ MONITORING INTEGRATIONS ══════════ */}
-          {tab==="monitoring"&&(<div>
-            <L>Monitoring Integrations</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Connect this dashboard to your monitoring systems for compromise detection. Critical for protecting the CISO's view into all regional SOCs.</M>
-            {[{name:"SIEM",desc:"Forward all GD audit logs and auth logs to your SIEM"},{name:"SOAR",desc:"Trigger automated response on GD security events"},{name:"EDR/XDR",desc:"Endpoint detection for the GD server host"},{name:"ATP",desc:"Advanced threat protection scanning"},{name:"NGAV",desc:"Next-gen antivirus for the GD server"}].map(i=>(
-              <Card key={i.name} style={{marginBottom:10}}>
-                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:6}}>{i.name}</div>
-                <M style={{color:C.tm,display:"block",marginBottom:8}}>{i.desc}</M>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-                  <Input label="Endpoint" placeholder={"https://"+i.name.toLowerCase()+".corp.com/api"}/>
-                  <Input label="API Key" placeholder="api-key..." type="password"/>
-                </div>
-                <Btn small primary>Save {i.name} Config</Btn>
-              </Card>
-            ))}
-          </div>)}
+          {tab==="monitoring"&&(<GdSelfProtectionConsole/>)}
 
           {/* ══════════ IAM & ACCESS ══════════ */}
           {tab==="iam"&&(<div>
@@ -2273,7 +2394,7 @@ export default function GlobalDashboard() {
           {/* ══════════ COMPROMISE SCAN ══════════ */}
           {tab==="compromise"&&(<div>
             <L>Compromise Scan</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run a 10-point compromise check on the Global Dashboard server itself — binary integrity, database integrity, network connections, API tokens, TLS, audit log continuity, configuration drift, memory analysis, filesystem integrity, and encryption key validity. Results are audit-logged.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Run a read-only self-integrity check on the Global Dashboard server itself — database and audit-chain integrity, signing-key and encryption-key validity, hardware instance-anchor status, file-integrity, configuration-lock presence, memory, and Node runtime. Each check reports PASS, WARN, or FAIL; the overall result is clean, warnings, or compromised. Results are audit-logged.</M>
             <Btn primary disabled={compromiseRunning} onClick={async()=>{
               setCompromiseRunning(true);setCompromiseResult(null);
               const r=await api.post("/api/compromise-scan",{});
@@ -2287,9 +2408,9 @@ export default function GlobalDashboard() {
                   <M style={{color:C.t,fontWeight:500}}>Scan {compromiseResult.scanId?.slice(0,8)||""}</M>
                   <M style={{color:C.td,display:"block",fontSize:10}}>{compromiseResult.timestamp?new Date(compromiseResult.timestamp).toLocaleString():""}</M>
                 </div>
-                <Badge color={compromiseResult.overall==="clean"?C.a:C.d}>{compromiseResult.overall}</Badge>
+                <Badge color={compromiseResult.overall==="clean"?C.a:(compromiseResult.overall==="warnings"?C.w:C.d)}>{compromiseResult.overall}</Badge>
               </div>
-              {compromiseResult.tests?.map((t,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{t.name}</M><M style={{color:t.status==="pass"?C.a:C.d,fontWeight:500}}>{t.status?.toUpperCase()}</M></div>)}
+              {compromiseResult.tests?.map((t,i)=><div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}><div style={{display:"flex",justifyContent:"space-between"}}><M style={{color:C.t}}>{t.name}</M><M style={{color:t.status==="pass"?C.a:(t.status==="warn"?C.w:C.d),fontWeight:500}}>{t.status?.toUpperCase()}</M></div>{t.detail&&<M style={{color:C.td,display:"block",fontSize:10,marginTop:2}}>{t.detail}</M>}</div>)}
               <Btn small style={{marginTop:10}} onClick={()=>{const blob=new Blob([JSON.stringify(compromiseResult,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="compromise-scan-"+(compromiseResult.scanId?.slice(0,8)||Date.now())+".json";a.click();}}>Export Result</Btn>
             </Card>}
           </div>)}

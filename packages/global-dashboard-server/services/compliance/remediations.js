@@ -187,7 +187,7 @@ const REMEDIATIONS = {
       'Confirm system_meta.fuse_counter is set to a positive integer (seeded by db-init.js)',
       'All PUT /api/config/:key operations log a CONFIG_UPDATED event in audit_log automatically (built into the route handler)',
       'Review recent change events via GD -> Audit Logs -> filter by event_type = "CONFIG_UPDATED"',
-      'Note: package.json fuseCounter field is not yet present on the GD — checkAntiRollback covers the gap and the future startup-verifier phase',
+      'Note: package.json now carries a fuseCounter field (added in B6a, set to the platform anti-rollback floor). checkAntiRollback reports it as present-but-not-enforced; the boot-time comparison awaits the startup-verifier phase',
     ],
     uiPath: 'gd:audit',
   },
@@ -560,14 +560,13 @@ const REMEDIATIONS = {
   // ── checks/vuln.js ─────────────────────────────────────────────────────────
 
   checkMalwareProtection: {
-    summary: 'Configure host-level antivirus on the GD server OS',
+    summary: 'Verify in-platform runtime monitoring; optionally integrate an external EDR',
     steps: [
-      'CURRENT STATE: GD has no in-platform malware scanner integration (no analyst-data uploads to scan)',
-      'Operator-managed: install and maintain host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / SentinelOne / similar)',
-      'Configure on-access scanning of the GD\'s installation directory and GD_DB_PATH',
-      'FUTURE STATE: a future GD buildout phase may add the malware_scanner_integrations table once the GD begins receiving non-aggregate payloads from MCs (full backup pulls, log shipments, forensic artifact pushes)',
+      'BASELINE (in-platform, B6a): the GD runtime-monitor continuously checks file-integrity over the GD server tree and watches for resource anomalies; findings route through the alert-router to SIEM/SOAR/notification. Confirm it is running under Self-Protection > Runtime, or POST /api/compromise-scan for a point-in-time self-integrity check',
+      'EXTERNAL EDR (optional, additive): register a provider under Self-Protection > EDR / Endpoint Monitoring (POST /api/self-protection/config/edr). Supported: CrowdStrike Falcon, Microsoft Defender for Endpoint, SentinelOne, Palo Alto Cortex XDR, Trellix, Sophos Intercept X, VMware Carbon Black, Cisco Secure Endpoint, Wazuh, Elastic Defend, LimaCharlie. Credentials are stored AES-256-GCM-encrypted',
+      'HOST ANTIVIRUS (operator option, defense in depth): host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / similar) with on-access scanning of the installation directory and GD_DB_PATH remains a valid additional layer',
     ],
-    uiPath: null,
+    uiPath: 'gd:self-protection',
   },
 
   checkPatchManagement: {
@@ -680,9 +679,9 @@ const REMEDIATIONS = {
   checkAntiRollback: {
     summary: 'Wait for GD startup integrity verifier to ship',
     steps: [
-      'CURRENT STATE: GD has no startup version-vs-fuse comparison. system_meta.fuse_counter is informational; no enforcement happens at startup',
+      'CURRENT STATE: the GD manifest now declares a fuseCounter (added in B6a), but there is still no startup version-vs-fuse comparison; system_meta.fuse_counter remains informational with no enforcement at startup',
       'Operator-managed alternative: maintain deployment-artifact discipline (signed installers, verified sha256sum, container image signing) to prevent rollback at the build/deploy layer',
-      'FUTURE STATE: a future GD buildout phase should add a package.json fuseCounter field plus a startup check that refuses to start if package.json fuseCounter < system_meta.fuse_counter (the rollback signal)',
+      'FUTURE STATE: the GD startup-verifier phase should add the boot-time check that refuses to start if package.json fuseCounter < system_meta.fuse_counter (the rollback signal); the manifest fuseCounter field itself was added in B6a',
       'Track in your operator runbook to upgrade the GD to higher fuseCounter releases as they ship and not downgrade',
     ],
     uiPath: null,

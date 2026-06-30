@@ -58,11 +58,12 @@ function tableExists(db, name) {
 
 // ── checkIntegrationHealth ───────────────────────────────────────────────────
 // Verifies the GD's third-party data sources are healthy. Always checks
-// MC connection freshness (management_consoles.last_sync). When
-// integration_config lands (B5b v1.0.51 et seq.), also checks SOAR /
-// SIEM / cloud / IAM integration freshness via last_test_at. Returns
-// combined warning if any source is stale or errored; pass if all are
-// healthy.
+// MC connection freshness (management_consoles.last_sync). As of B6a also
+// checks the GD's own self-protection integrations -- the SIEM/SOAR alert-
+// routing config and the EDR seam (malware_scanner_integrations) -- and
+// remains forward-compatible with a future unified integration_config
+// table. Returns a combined warning if any source is stale or errored;
+// pass if all are healthy.
 //
 // Maps to controls including: SOC 2 CC9.2 Vendor Management, NIST CSF
 // GV.SC-04 / GV.SC-07, ISO 27001 A.5.21/A.5.22 ICT supply chain,
@@ -100,14 +101,41 @@ function checkIntegrationHealth(db) {
     ).all();
   }
 
+  // Layer 2b: B6a self-protection integrations (the GD's own SIEM/SOAR/EDR for
+  // protecting the GD server itself, never analyst data). SIEM/SOAR are config-
+  // key based (presence only; no per-config test timestamp); the EDR seam
+  // (malware_scanner_integrations) carries a per-integration last_test_status.
+  const gdReadJson = (key) => {
+    const row = db.prepare('SELECT value FROM config WHERE key = ?').get(key);
+    if (!row || !row.value) return null;
+    try { return JSON.parse(row.value); } catch { return null; }
+  };
+  const siemCfg = gdReadJson('siem_config');
+  const soarCfg = gdReadJson('soar_config');
+  const selfProt = [];
+  if (siemCfg && siemCfg.endpoint) selfProt.push('SIEM');
+  if (soarCfg && soarCfg.endpoint) selfProt.push('SOAR');
+  let edrErrored = [];
+  if (tableExists(db, 'malware_scanner_integrations')) {
+    const edr = db.prepare(
+      "SELECT display_name, last_test_status FROM malware_scanner_integrations WHERE enabled = 1"
+    ).all();
+    if (edr.length > 0) selfProt.push(edr.length + ' EDR');
+    edrErrored = edr.filter(r => r.last_test_status === 'failed');
+  }
+  const selfProtSummary = selfProt.length > 0
+    ? 'self-protection integrations: ' + selfProt.join(', ') + (edrErrored.length > 0 ? ' (' + edrErrored.length + ' EDR errored)' : '')
+    : 'no self-protection integrations configured (in-platform runtime-monitor provides the baseline)';
+
   const layer1Summary = activeMcs.length === 0
     ? 'no active MCs registered (third-party surface vacuously holds)'
     : `${activeMcs.length} active MC(s), ${staleMcs.length} with stale last_sync (>24h or NULL)`;
-  const layer2Summary = !integrationsChecked
-    ? 'integration_config table not yet present (B5b v1.0.51 et seq. will add SOAR/SIEM/IAM/cloud integrations)'
+  const integrationConfigSummary = !integrationsChecked
+    ? 'unified integration_config table not yet present'
     : `${operationalCount} operational integration(s), ${staleIntegrations.length} stale (>30d), ${erroredIntegrations.length} errored`;
+  const layer2Summary = `${integrationConfigSummary}; ${selfProtSummary}`;
 
-  if (staleMcs.length > 0 || staleIntegrations.length > 0 || erroredIntegrations.length > 0) {
+  if (staleMcs.length > 0 || staleIntegrations.length > 0 || erroredIntegrations.length > 0 || edrErrored.length > 0) {
     const issues = [];
     if (staleMcs.length > 0) {
       issues.push(`stale MCs: ${staleMcs.map(r => r.name || ('mc:' + r.id)).join(', ')}`);
@@ -117,6 +145,9 @@ function checkIntegrationHealth(db) {
     }
     if (staleIntegrations.length > 0) {
       issues.push(`stale integrations (>30d): ${staleIntegrations.map(r => r.integration_type).join(', ')}`);
+    }
+    if (edrErrored.length > 0) {
+      issues.push(`errored EDR integrations: ${edrErrored.map(r => r.display_name).join(', ')}`);
     }
     return {
       status: 'warning',

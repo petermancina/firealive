@@ -83,7 +83,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [19]',
       name: 'Implementation of Controls',
       check: checks.checkConfigLockState,
-      mapping: 'GD has no Config Lock server-side persistence as of v0.0.31; the frontend exposes a toggle that POSTs to /api/config/lock, but no route handler exists on the server. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock. Until then, configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     {
       id: 'CPS 234 [21]',

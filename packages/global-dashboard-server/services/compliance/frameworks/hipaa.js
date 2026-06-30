@@ -7,7 +7,7 @@
 // citation, same customerResponsibility list (framework-level facts),
 // adapted verifiedControls (GD has a different platform surface than
 // the MC: ciso/vp/readonly role model, no tier-based encryption, no
-// in-platform DR test, no Config Lock backend yet, MFA verify stub).
+// in-platform DR test, MFA verify stub).
 //
 // AUTHORITY
 //
@@ -99,7 +99,7 @@ module.exports = (checks) => ({
       id: '164.312(a)(2)(ii)',
       name: 'Emergency Access Procedure (Required)',
       check: checks.checkPrivilegedSeparation,
-      mapping: 'SoD model for the GD: 1-2 CISO-role users supports emergency-access continuity without standing emergency privileges. Required implementation specification. Note: GD Config Lock server-side persistence (which would gate emergency-access unlock with TOTP MFA) is not yet built; tracked as a future BUILD-PLAN-v16 phase.',
+      mapping: 'SoD model for the GD: 1-2 CISO-role users supports emergency-access continuity without standing emergency privileges. Required implementation specification. Note: GD Config Lock server-side persistence is live (config_lock_state + the config-write chokepoint), gating config changes behind a fresh hardware-passkey assertion (hardened beyond TOTP MFA).',
     },
     {
       id: '164.312(a)(2)(iii)',
@@ -289,7 +289,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(5)(ii)(B)',
       name: 'Protection from Malicious Software (Addressable)',
       category: 'procedural',
-      detail: 'Procedures for guarding against, detecting, and reporting malicious software. At the GD layer, host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) is operator-managed; the MC layer additionally provides 15-provider in-platform malware scanning for analyst data.',
+      detail: 'Procedures for guarding against, detecting, and reporting malicious software. At the GD layer, the GD now has an in-platform host/endpoint EDR seam (the malware_scanner_integrations registry, additive on the runtime-monitor baseline); host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) remains operator-managed defense-in-depth, and the MC layer additionally provides 15-provider in-platform malware scanning for analyst data.',
     },
     {
       id: '164.308(a)(5)(ii)(C)',

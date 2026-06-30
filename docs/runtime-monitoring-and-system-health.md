@@ -1,13 +1,13 @@
 # Runtime Monitoring & System Health
 
 This document describes the runtime-monitoring, alert-routing, and integration-health
-surface introduced in phase B3 (v1.0.50), and records the work that was deliberately
-deferred out of B3 so it stays tracked.
+surface introduced in phase B3 (v1.0.50) for the Management Console (MC) and the main
+server, and the matching **Global Dashboard (GD) self-protection** surface built in
+phase B6a (v1.0.79).
 
-It covers the Management Console (MC) and the main server. The Global Dashboard (GD)
-server and the Abuse Review Console (ARC) are addressed in the "Deferred work" section
-at the end — their in-platform self-protection is **not** built yet, and this document
-is the canonical record of that gap.
+The Abuse Review Console (ARC) is still outside this detection surface; its in-platform
+self-protection is **not** built yet, and the "Deferred work" section at the end is the
+canonical record of that remaining gap.
 
 ---
 
@@ -119,44 +119,172 @@ The canonical regression runner gained two integration-aware areas:
 
 ---
 
+## What B6a built (GD self-protection)
+
+B6a gives the **Global Dashboard server** its own in-platform self-protection, mirroring
+the B3 stack. Everything here monitors and protects the **GD server itself** — its file
+tree, its dependencies, its trust boundaries — and **never analyst data**, which the GD
+never holds. The pieces live under `packages/global-dashboard-server/services/` unless
+noted, and run on short-lived per-request SQLite connections like the rest of the GD.
+
+### Detection
+
+- **`gd-runtime-monitor.js`** — a recursive FIM over the GD server tree plus CPU /
+  memory / DB-read anomaly detection with the same hysteresis model as B3 (enter / exit
+  / dwell / cooldown). It starts at server boot, owns its own `unref()`'d timers, and
+  routes every alert through the GD alert-router. Threshold overrides are read from
+  `runtime_monitor_thresholds` and can be pushed live. The DB-read signal is fed a
+  per-request rate proxy from the request-logging middleware (a spike may indicate a
+  scan or exfiltration attempt against the GD query surface).
+
+### Routing
+
+- **`gd-alert-router.js`** — `routeGdAlert(db, alert)` with the same guarantees as the MC
+  router: **audit is always written first** (before de-duplication), a 10-minute
+  `type|severity` de-dup window, and isolated channels that never throw. Channels are
+  audit, SOAR, SIEM + email, an in-app notification on the GD's shared notification queue
+  (`type = 'security_alert'`), and webhook. There is **no websocket channel** — the GD
+  has no analyst clients. The default matrix matches the MC's (info → audit only;
+  warning adds SIEM; high adds SOAR + SIEM + notification; critical adds email + webhook)
+  and is overridable via `alert_routing_matrix`.
+- **`gd-siem-push.js` / `gd-siem-adapter.js`** — CEF over syslog (TCP/UDP/TLS) with a
+  `GlobalDashboard` device-product, plus operational alert email (recipients from the
+  GD `notification_config`, SMTP via environment).
+- **`gd-soar-push.js`** — a transport-only SOAR dispatch (the audit + matrix are handled
+  by the router, so SOAR never double-logs).
+
+### Metrics
+
+- **`gd-metrics-collector.js`** — `collect()` assembles a rollup of fleet, ingest
+  freshness, compliance coverage, signing-key status, audit-chain integrity, backup
+  status, unacknowledged notifications, integration health, runtime metrics, and system
+  version, plus a CEF rendering for SIEM pull. It backs `GET /api/system/health-metrics`
+  (the legacy cpu / memory / heap / uptime fields are preserved; the rollup is attached
+  under `metrics`).
+
+### Integration health (dependency probes)
+
+An **opt-in, read-only** probing layer over the GD's own dependencies — disabled by
+default at the master and per-integration level.
+
+- **`gd-integration-health.js` / `gd-integration-health-probes.js`** — the same gating
+  ladder and normalized statuses as B3, over three GD-specific probes: **kms** (the
+  active audit-chain signing keys plus the hardware keystore / instance anchor),
+  **storage** (writability of the GD backups directory), and **mc_trust** (active MCs vs
+  approved-active signing-key coverage, with pending / staleness freshness). A periodic,
+  `unref()`'d scheduler caches results to `integration_health_last_results`.
+
+### External EDR seam
+
+- **`malware_scanner_integrations`** (a GD table) plus CRUD under
+  `/api/self-protection/config/edr` register an external EDR provider (CrowdStrike
+  Falcon, Microsoft Defender for Endpoint, SentinelOne, Palo Alto Cortex XDR, Trellix,
+  Sophos Intercept X, VMware Carbon Black, Cisco Secure Endpoint, Wazuh, Elastic Defend,
+  LimaCharlie). Credentials are stored **AES-256-GCM-encrypted** and never returned. An
+  external EDR is **additive**: the in-platform runtime-monitor provides the
+  host-monitoring baseline, so none configured is acceptable.
+
+### Config Lock
+
+- **`config_lock_state`** (a singleton table), the registry-driven chokepoint
+  (`gd-config-lock.js` + `gd-config-write-routes.js`), and the `/api/config/lock` routes
+  freeze configuration-mutating requests while the platform is locked — a twin of the
+  MC's control. Engaging the lock is immediate; **releasing it requires a fresh
+  hardware-passkey (WebAuthn) assertion**, user-verified and bound to the CISO's own
+  passwordless credential (the GD is hardware-key-only — there is no TOTP path). An idle
+  window auto-re-locks an unlocked platform.
+
+### Compromise scan
+
+- **`POST /api/compromise-scan`** (CISO-only) runs eleven read-only self-integrity
+  checks of the GD server — database integrity, audit-chain continuity, signing-key
+  validity, hardware instance-anchor status, file-integrity, config-lock presence,
+  memory, Node runtime, and more. Each check reports `pass` / `warn` / `fail`; the
+  overall result is `clean` / `warnings` / `compromised`, and the run is audit-logged.
+
+### Alert sources
+
+The GD's own security events route through the alert-router so they fan out to
+SIEM/SOAR/notification/webhook in addition to the audit log: `INGEST_SIGNATURE_REJECTED`
+(a bad MC-push signature, at every ingest endpoint), `AUDIT_CHAIN_BREAK` (the manual
+integrity endpoint and the periodic integrity timer), and `MC_SIGNING_KEY_REJECTED` (a
+CISO rejecting an MC's signing key). The router's always-on audit preserves each event's
+existing audit row; the fan-out is additive.
+
+### Routes
+
+- **`/api/self-protection/*`** (CISO/VP) — configuration writes live under `/config`
+  (SIEM, SOAR, alert matrix, runtime thresholds, webhook, integration-health, EDR seam)
+  and are frozen by the config-lock chokepoint when locked; operational reads (`/status`,
+  `/integration-health` + `/integration-health/run`, `/runtime/metrics`,
+  `/runtime/alerts`) are never gated.
+- **`/api/config/lock`** — GET state, POST `/lock/unlock-options` (issue the unlock
+  challenge), POST engage / release.
+- **`/api/compromise-scan`** and **`/api/system/health-metrics`** as above.
+
+### UI
+
+The GD desktop **Monitoring Integrations** tab is a working self-protection console
+(SIEM/SOAR/webhook config, the alert-routing matrix editor, dependency-probe toggles with
+a run-now button and cached results, external-EDR CRUD, and live runtime-monitor
+metrics). The **System Health** tab adds a subsystem-health rollup from the metrics
+collector; the **Compromise Scan** tab renders the three-state results with per-check
+detail; and the **Config Lock** control engages immediately and unlocks via the
+hardware-passkey step-up.
+
+### Regression coverage
+
+The GD regression runner gained four B6a categories — `runtime_monitor`, `alert_routing`,
+`config_lock`, and `self_protection` — and the forward-aware SIEM/SOAR and
+integration-health checks auto-activate. The EDR check is no longer fail-closed-on-empty:
+because the in-platform runtime-monitor provides the baseline, an external EDR is
+additive and "none configured" is reported rather than failed.
+
+### Config keys (summary)
+
+`runtime_monitor_thresholds`, `alert_routing_matrix`, `alert_webhook_url`,
+`integration_health_probes_enabled`, `integration_health_config`,
+`integration_health_last_results`, `siem_config`, `soar_config`, and the GD
+`notification_config` (alert-email recipients). Tables: `config_lock_state`,
+`malware_scanner_integrations`.
+
+---
+
 ## Deferred work and known gaps
 
-B3 covers the **MC and main server**. During B3 an investigation found that the
-Global Dashboard server and the Abuse Review Console have **no in-platform runtime or
-endpoint self-protection** of their own. This is recorded here so it is not lost.
+B3 covered the **MC and main server**; B6a covered the **GD server**. The **Abuse Review
+Console (ARC)** remains outside the in-platform detection surface and is recorded here so
+it is not lost.
 
-### GD / ARC self-protection (deferred to a future, separately scoped phase)
+### ARC self-protection (deferred to a future, separately scoped phase)
 
-- The **GD server** today performs only aggregation, compliance, signing, and export.
-  It has none of the B3 stack: no runtime monitor, no alert router, no
-  metrics-collector, and no EDR / integration-manager surface. Compromise of the GD host
-  is not currently detected by the platform itself.
-- The **ARC** is likewise outside the B3 detection surface.
-- Two GD-facing B3 items were intentionally **dropped from B3 and moved to this deferred
-  scope**: the GD integration-health module and the GD System Health UI. The GD
-  regression suite already carries **forward-aware** SOAR/SIEM, required-EDR, and
-  `integration_health` checks; these are harmless skips today and are designed to
-  activate once the deferred phase ships the backing surface.
+- The **ARC** has none of the B3 / B6a stack: no runtime monitor, no alert router, no
+  metrics-collector, and no EDR / integration surface. Compromise of the ARC host is not
+  currently detected by the platform itself.
+- When that phase is carved, it should reuse the B6a GD pattern (a self-contained
+  runtime-monitor, alert-router, metrics-collector, integration-health harness, config
+  lock, and compromise scan) rather than inventing a parallel one.
 
-### Stale compliance mapping (debt)
+### Compliance mapping (resolved for the GD in B6a)
 
-The GD compliance framework files and check modules currently describe the GD host's
-EDR / endpoint monitoring as operator-managed and off-platform. Once the GD grows its
-own runtime-monitoring and integration surface, those `verifiedControls` / customer-
-responsibility mappings must be revisited so the compliance posture reflects what the
-platform actually enforces rather than deferring it to the operator.
+The GD compliance check modules and remediation map previously described the GD host's
+EDR / endpoint monitoring as operator-managed and off-platform, and Config Lock as a
+frontend-stubbed future phase. B6a revisited those mappings: the malware-protection
+remediation now points at the in-platform runtime-monitor baseline plus the external-EDR
+seam, the integration-health check recognizes the GD's SIEM/SOAR config and EDR seam, and
+the Config Lock check reports real lock state with hardware-passkey unlock. The
+equivalent ARC mappings remain to be revisited when ARC self-protection ships.
 
 ### Plan of record
 
-Before any new phase is carved for this work:
+Before any new phase is carved for the remaining ARC work:
 
-1. Read the full forward-phase list in the current build plan and check whether GD/ARC
-   host hardening (runtime monitoring, EDR/endpoint integration, alert routing,
-   integration health, detection telemetry) is **already slated** under an existing
-   phase (e.g. B4, B5a–B5g, H1–H3, C1–C3, K2/K3).
+1. Check the current build plan for whether ARC host hardening (runtime monitoring,
+   EDR/endpoint integration, alert routing, integration health, detection telemetry) is
+   already slated under an existing phase.
 2. Only define a **new** phase if there is a genuine uncovered gap.
-3. Either way, map the GD/ARC self-protection work **and** the stale compliance-mapping
-   fixes against the existing plan rather than bolting them onto an unrelated phase.
+3. Map the ARC self-protection work **and** its compliance-mapping fixes against the
+   existing plan, reusing the B6a GD implementation as the template.
 
 This document is the durable pointer for that follow-up; the GD regression note in
 `FEATURE-GUIDE.md` references it.

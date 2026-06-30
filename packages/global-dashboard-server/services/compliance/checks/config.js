@@ -12,17 +12,18 @@
 //
 // PLATFORM STATE NOTES (GD-specific gaps relative to MC)
 //
-//   - GD has no config_lock_state table. The GD frontend exposes a
-//     Config Lock toggle (firealive-gd jsx line 800) that POSTs to
-//     /api/config/lock, but the GD server has no route handler for
-//     that path — the feature is frontend-stubbed on the GD side.
-//     checkConfigLockState surfaces this honestly.
-//   - GD has no fuseCounter field in package.json. The MC's
-//     anti-rollback check (DB system_meta.fuse_counter vs package.json
-//     fuseCounter) cannot run on the GD because there is no package
-//     side to the comparison. The fuse value in system_meta exists
-//     but is decorative without a startup integrity check to enforce
-//     it.
+//   - GD Config Lock is fully implemented as of B6a: the config_lock_state
+//     singleton, the /api/config/lock routes (engage, and unlock via a
+//     fresh hardware passkey assertion), and the config-write chokepoint.
+//     checkConfigLockState reports real lock state.
+//   - GD package.json now carries a fuseCounter field (added in B6a,
+//     set to the platform anti-rollback floor). The MC's full anti-
+//     rollback check (refuse startup when package.json fuseCounter <
+//     system_meta.fuse_counter) still cannot run on the GD: there is
+//     no boot-time comparison yet. The manifest fuse and the seeded
+//     system_meta fuse are both present, but the value is reported,
+//     not enforced, until the GD startup-verifier phase wires the
+//     comparison. checkAntiRollback reports that posture.
 //   - GD has NODE_ENV references only in stub comments ("In
 //     production: ..."); no actual behavior is gated on NODE_ENV in
 //     the GD's index.js. checkSecureBaseline reports NODE_ENV as a
@@ -33,13 +34,11 @@
 // FORWARD-COMPATIBLE PATTERN
 //
 // Check functions in this file use a tableExists() helper to gracefully
-// handle GD platform features that are planned but not yet shipped. The
-// GD Config Lock server-side persistence (config_lock_state table +
-// /api/config/lock route handler) is a known gap — the frontend
-// exposes the Config Lock toggle but the backend is stubbed. When the
-// backend ships in a future BUILD-PLAN-v16 phase, checkConfigLockState
-// transitions automatically from "warning, deferred" to real lock-state
-// reporting without code changes here.
+// handle GD platform features behind a forward-compatible table probe.
+// GD Config Lock server-side persistence (the config_lock_state table +
+// the /api/config/lock routes + the config-write chokepoint) ships as of
+// B6a, so checkConfigLockState reports real lock state; the table-absent
+// path below is now a defensive fallback for incomplete initialization.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -54,27 +53,19 @@ function tableExists(db, name) {
 }
 
 // ── checkConfigLockState ─────────────────────────────────────────────────────
-// Verifies Config Lock state. Two-state behavior:
+// Verifies Config Lock state. As of B6a the GD has server-side Config
+// Lock persistence (the config_lock_state singleton, the /api/config/lock
+// routes, and the config-write chokepoint), so this check reports real
+// lock state:
 //
-//   CURRENT STATE (no config_lock_state table): GD's Config Lock
-//   server-side persistence is not yet built. The frontend exposes
-//   a Config Lock toggle (firealive-gd jsx) that POSTs to
-//   /api/config/lock, but no route handler exists on the GD server.
-//   Returns warning surfacing the gap; production deployments cannot
-//   achieve SOC-grade configuration immutability on the GD until
-//   server-side persistence ships.
+//   fail    -- config_lock_state row missing (incomplete initialization)
+//   warning -- NODE_ENV=production AND lock_active=0 (production should lock)
+//   pass    -- Config Lock active, or not active in a non-production env
 //
-//   FUTURE STATE (config_lock_state table present): A future
-//   BUILD-PLAN-v16 phase introduces the GD Config Lock server-side
-//   persistence — mirroring MC's R3e (v1.0.32) pattern with a
-//   config_lock_state singleton row, /api/config/lock route handler,
-//   and TOTP-MFA-gated unlock workflow. The function applies the same
-//   pattern as MC: fail if config_lock_state row missing, warn if
-//   NODE_ENV=production AND lock_active=0, pass if locked or
-//   non-production.
-//
-// Forward-compatible: behavior expands automatically when the table
-// and route ship.
+// Unlock requires the ciso role + a fresh hardware passkey (WebAuthn)
+// assertion (the GD is hardware-key-only; there is no TOTP path). If the
+// config_lock_state table is somehow absent, the defensive fallback below
+// returns a warning pointing at db-init.js.
 //
 // Maps to controls including: SOC 2 CC8.1 Change Management,
 // NIST CSF PR.PS-01 Configuration Management, ISO 27001 A.8.9
@@ -96,13 +87,13 @@ function checkConfigLockState(db) {
     if (isProduction && lockState.lock_active === 0) {
       return {
         status: 'warning',
-        detail: 'NODE_ENV=production on the GD but Config Lock is not active (lock_active = 0). Production deployments should enable Config Lock to prevent unauthorized platform-configuration changes. Toggle via admin Config Lock UI with TOTP MFA.',
+        detail: 'NODE_ENV=production on the GD but Config Lock is not active (lock_active = 0). Production deployments should enable Config Lock to prevent unauthorized platform-configuration changes. Engage via the Config Lock control with a hardware passkey (WebAuthn) assertion.',
       };
     }
     if (lockState.lock_active === 1) {
       return {
         status: 'pass',
-        detail: `GD Config Lock active (locked_at=${lockState.locked_at}, locked_by_user_id=${lockState.locked_by_user_id || 'NULL'}). Platform-configuration routes gated; modifications require unlock + ciso role + TOTP MFA.`,
+        detail: `GD Config Lock active (locked_at=${lockState.locked_at}, locked_by_user_id=${lockState.locked_by_user_id || 'NULL'}). Platform-configuration routes gated; unlock requires the ciso role + a fresh hardware passkey (WebAuthn) assertion.`,
       };
     }
     return {
@@ -112,7 +103,7 @@ function checkConfigLockState(db) {
   }
   return {
     status: 'warning',
-    detail: 'GD has no Config Lock server-side persistence as of v0.0.31. The frontend exposes a Config Lock toggle (firealive-gd jsx) that POSTs to /api/config/lock, but the config_lock_state table is not present and no route handler exists. SOC-grade configuration immutability on the GD is unavailable until server-side persistence ships in a future BUILD-PLAN-v16 phase (mirroring MC\'s R3e v1.0.32 pattern). Until then, configuration-change discipline is operator-managed: route-middleware role gating (CISO-only on PUT /api/config/:key) enforces who CAN change configuration, not whether changes are permitted at all in a locked-down posture. When the table and route ship, this check reports real lock state automatically.',
+    detail: 'config_lock_state table unexpectedly absent on the GD. Server-side Config Lock ships as of B6a (the config_lock_state singleton, the /api/config/lock routes, and the config-write chokepoint); a missing table indicates incomplete initialization. Re-run db-init.js to create it, after which this check reports real lock state automatically.',
   };
 }
 
@@ -161,13 +152,14 @@ function checkChangeManagement(db) {
 }
 
 // ── checkAntiRollback ────────────────────────────────────────────────────────
-// Verifies anti-rollback fuse posture. Unlike MC, the GD has no
-// package.json fuseCounter field and no startup integrity check that
-// compares package.json fuseCounter against system_meta.fuse_counter.
-// The fuse value in system_meta exists (seeded by db-init.js with a
-// hardcoded value) but is decorative without enforcement. Returns
-// warning explaining the gap; pass on the fuse value being a valid
-// integer, since that's the only signal available.
+// Verifies anti-rollback fuse posture. The GD package.json now carries
+// a fuseCounter field (added in B6a), but unlike the MC there is still
+// no startup integrity check comparing package.json fuseCounter against
+// system_meta.fuse_counter. The seeded system_meta fuse and the new
+// manifest fuse are both present, but the value is reported rather than
+// enforced until the startup-verifier phase wires the boot-time check.
+// Returns warning explaining the remaining gap; pass on the fuse value
+// being a valid integer, since that's the runtime signal available.
 //
 // Maps to controls including: SOC 2 CC8.1, NIST CSF PR.PS-01,
 // ISO 27001 A.8.9, NIST 800-53 SI-7 / SA-22, DORA Art.6.
@@ -188,7 +180,7 @@ function checkAntiRollback(db) {
   }
   return {
     status: 'warning',
-    detail: `GD has no startup anti-rollback enforcement. system_meta.fuse_counter=${dbFuse} is set (seeded by db-init.js) but the GD has no package.json fuseCounter field and no startup check comparing the two. The fuse value is informational rather than enforcing. A future GD enhancement should add a package.json fuseCounter field plus a startup integrity check that refuses to start if package.json fuseCounter < system_meta.fuse_counter (the rollback signal).`,
+    detail: `GD anti-rollback is reported, not yet enforced. system_meta.fuse_counter=${dbFuse} is set (seeded by db-init.js) and package.json now carries a fuseCounter field (added in B6a, set to the platform anti-rollback floor), but there is still no startup check comparing the two. The fuse value is informational until the GD startup-verifier phase adds a boot-time integrity check that refuses to start if package.json fuseCounter < system_meta.fuse_counter (the rollback signal).`,
   };
 }
 

@@ -151,7 +151,7 @@ module.exports = (checks) => ({
       id: 'A.8.7',
       name: 'Protection Against Malware',
       check: checks.checkMalwareProtection,
-      mapping: 'Protection against malware implemented and supported by appropriate user awareness. GD has no in-platform malware scanner integration (no malware_scanner_integrations table) — by design, the GD does not currently process uploaded files from analysts. File-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) is operator-managed.',
+      mapping: 'Protection against malware implemented and supported by appropriate user awareness. The GD now has an in-platform host/endpoint EDR seam (the malware_scanner_integrations registry — eleven providers, credentials AES-256-GCM-encrypted), additive on top of the in-platform runtime-monitor baseline. By design the GD still does not process uploaded files from analysts; file-content scanning at the analyst-data layer is enforced at the MC. Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) remains operator-managed defense-in-depth.',
     },
     {
       id: 'A.8.8',
@@ -163,7 +163,7 @@ module.exports = (checks) => ({
       id: 'A.8.9',
       name: 'Configuration Management',
       check: checks.checkConfigLockState,
-      mapping: 'Configurations, including security configurations, of hardware, software, services and networks established, documented, implemented, monitored and reviewed. GD has no Config Lock server-side persistence as of v0.0.31; the frontend exposes a toggle that POSTs to /api/config/lock, but no route handler exists. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock.',
+      mapping: 'Configurations, including security configurations, of hardware, software, services and networks established, documented, implemented, monitored and reviewed. GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock.',
     },
     {
       id: 'A.8.13',

@@ -99,7 +99,7 @@ module.exports = (checks) => ({
       id: 'CC6.8',
       name: 'Malicious Software Prevention',
       check: checks.checkMalwareProtection,
-      mapping: 'GD has no in-platform malware scanner integration (no malware_scanner_integrations table) — by design, the GD does not currently process uploaded files from analysts (file-content scanning is enforced at the MC layer). Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) is operator-managed.',
+      mapping: 'The GD now has an in-platform host/endpoint EDR seam (the malware_scanner_integrations registry — eleven providers, credentials AES-256-GCM-encrypted), additive on top of the in-platform runtime-monitor baseline. By design the GD still does not process uploaded files from analysts (file-content scanning is enforced at the MC layer). Host-level antivirus on the GD server OS (Microsoft Defender / ClamAV / CrowdStrike Falcon agent / similar) remains operator-managed defense-in-depth.',
     },
     // ── CC7 System Operations ────────────────────────────────────────────────
     {
@@ -137,20 +137,20 @@ module.exports = (checks) => ({
       id: 'CC8.1',
       name: 'Change Management Process',
       check: checks.checkChangeManagement,
-      mapping: 'Anti-rollback fuse_counter in system_meta (seeded by db-init.js); audit_log records every configuration change via CONFIG_UPDATED events emitted by PUT /api/config/:key. AGPL-3.0 source transparency for code-level changes. Note: package.json fuseCounter field and startup fuse-vs-package comparison await a future GD startup-verifier phase.',
+      mapping: 'Anti-rollback fuse_counter in system_meta (seeded by db-init.js); audit_log records every configuration change via CONFIG_UPDATED events emitted by PUT /api/config/:key. AGPL-3.0 source transparency for code-level changes. Note: package.json now carries a fuseCounter field (added in B6a); the startup fuse-vs-package comparison that would enforce it awaits a future GD startup-verifier phase.',
     },
     {
       id: 'CC8.1 [Config Lock]',
       name: 'Configuration Change Restriction',
       check: checks.checkConfigLockState,
-      mapping: 'GD has no Config Lock server-side persistence as of v0.0.31. The frontend exposes a Config Lock toggle that POSTs to /api/config/lock, but no route handler exists on the server. A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence (mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock); until then, configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     // ── CC9 Risk Mitigation ──────────────────────────────────────────────────
     {
       id: 'CC9.1',
       name: 'Risk Mitigation Activities',
       check: checks.checkBackups,
-      mapping: 'Defense-in-depth on the GD\'s current surface: multi-destination backups, encrypted backup option, rate limiting, MFA enrollment, role-based access, audit logging. Several SOC-grade defenses (hash chain, Config Lock backend, anti-replay, signing keys, KMS) await specific BUILD-PLAN-v16 phases (B5a, future Config Lock phase, R3g PR3 signing keys, future GD KMS phase).',
+      mapping: 'Defense-in-depth on the GD\'s current surface: multi-destination backups, encrypted backup option, rate limiting, MFA enrollment, role-based access, audit logging, Config Lock (server-side, hardware-passkey unlock). Several SOC-grade defenses (hash chain, anti-replay, signing keys, KMS) await specific BUILD-PLAN-v16 phases (B5a, R3g PR3 signing keys, future GD KMS phase).',
     },
     {
       id: 'CC9.2',
