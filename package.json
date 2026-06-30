@@ -34,7 +34,7 @@
     "@aws-sdk/lib-storage": "^3.1076.0",
     "@azure/identity": "^4.0.0",
     "@azure/keyvault-keys": "^4.10.2",
-    "@azure/storage-blob": "^12.32.0",
+    "@azure/storage-blob": "^12.33.0",
     "@google-cloud/kms": "^5.5.1",
     "@google-cloud/storage": "^7.21.0",
     "@mongodb-js/zstd": "^7.0.0",
