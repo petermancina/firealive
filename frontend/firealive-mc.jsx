@@ -3034,7 +3034,15 @@ function ManagementConsole() {
       if (r?.fuseLastIncrement) setAppFuseLastIncrement(r.fuseLastIncrement);
     }).catch(()=>{});
   }, []);
-  const [updateCheck, setUpdateCheck] = useState(null); // null | "checking" | {available,version} | "current"
+  useEffect(()=>{
+    api.get("/api/auto-update/config").then(r=>{ if(r&&r.config) setUpdCfg(pr=>({...pr,...r.config})); }).catch(()=>{});
+    api.get("/api/auto-update/status").then(r=>{ if(r&&!r.error) setUpdStatus(r); }).catch(()=>{});
+  }, []);
+  const [updateCheck, setUpdateCheck] = useState(null); // check-now result: null | "checking" | {result,latestVersion,releaseUrl,...} | {error}
+  const [updCfg, setUpdCfg] = useState({enabled:false,frequency:"weekly",dayOfWeek:1,dayOfMonth:1,timeUtc:"03:00",notifyLead:false});
+  const [updStatus, setUpdStatus] = useState(null); // {currentVersion,enabled,updateAvailable,latestVersion,releaseUrl,lastCheckedAt,lastResult}
+  const [updSaving, setUpdSaving] = useState(false);
+  const [updBannerDismissed, setUpdBannerDismissed] = useState(()=>{ try { return localStorage.getItem("fa_upd_dismissed")||""; } catch(_e){ return ""; } });
   const [routingCaps, setRC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,a.tier===3?5:a.tier===2?3:2])));
   const [unsaved, setUnsaved] = useState(false);
   // R3j C8: routing-tab canonical wiring state. routingHydrated gates the
@@ -4178,9 +4186,27 @@ function ManagementConsole() {
     setNewA({tier:1,shift:"day",hostname:"",ip:"",geoCountry:""});
   };
 
-  const checkUpdate = () => {
+  const checkUpdate = async () => {
     setUpdateCheck("checking");
-    setTimeout(()=>setUpdateCheck({available:true,version:"0.0.29",notes:"Enhanced federation support, multi-site deployment, OODA training module."}),1500);
+    try {
+      const r = await api.post("/api/auto-update/check-now", {});
+      setUpdateCheck(r && !r.error ? r : (r || {result:"source_unreachable"}));
+      api.get("/api/auto-update/status").then(s=>{ if(s&&!s.error) setUpdStatus(s); }).catch(()=>{});
+      if (r && r.error) addA("UPDATE_CHECK_RAN", r.error);
+      else if (r) addA("UPDATE_CHECK_RAN", "Manual update check: "+r.result+(r.latestVersion?" ("+r.latestVersion+")":""));
+    } catch (e) {
+      setUpdateCheck({result:"source_unreachable"});
+    }
+  };
+  const saveUpdCfg = async () => {
+    setUpdSaving(true);
+    try {
+      const r = await api.put("/api/auto-update/config", updCfg);
+      if (r && r.error) { addA("AUTO_UPDATE_CONFIG_SET", "Save failed: "+r.error); }
+      else { if (r && r.config) setUpdCfg(pr=>({...pr,...r.config})); addA("AUTO_UPDATE_CONFIG_SET", "Update schedule saved"); }
+    } catch (e) {
+      addA("AUTO_UPDATE_CONFIG_SET", "Save failed");
+    } finally { setUpdSaving(false); }
   };
 
   // ── v1.0.0: Grouped navigation (was 57 flat tabs, now 12 categories) ──
@@ -4785,6 +4811,12 @@ function ManagementConsole() {
         return null;
       })()}
       {panicError&&(<div style={{padding:"8px 24px",background:C.d+"22",color:C.d,fontSize:11,textAlign:"center",borderBottom:`1px solid ${C.d}40`}}>Panic toggle error: {panicError} <button onClick={()=>setPanicError(null)} style={{marginLeft:8,background:"transparent",border:"none",color:C.d,cursor:"pointer",textDecoration:"underline"}}>dismiss</button></div>)}
+      {updStatus&&updStatus.updateAvailable&&updStatus.latestVersion&&updStatus.latestVersion!==updBannerDismissed&&(
+        <div style={{padding:"10px 24px",background:C.id,color:C.i,fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.i}40`}}>
+          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test in a lab before applying.</span>
+          <button onClick={()=>{ const v=updStatus.latestVersion; setUpdBannerDismissed(v); try{localStorage.setItem("fa_upd_dismissed",v);}catch(_e){} }} style={{marginLeft:12,background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11,whiteSpace:"nowrap"}}>dismiss</button>
+        </div>
+      )}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
@@ -6483,56 +6515,47 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {tab==="updates"&&(<div>
           <L>Updates & Versioning</L>
           <Card style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
               <div><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>FireAlive — SOC Analyst Wellbeing Platform</div><M style={{color:C.tm}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · AGPL-3.0</M></div>
-              <Btn primary onClick={checkUpdate} disabled={updateCheck==="checking"}>{updateCheck==="checking"?"Checking...":"Check for Updates"}</Btn>
+              <Btn primary onClick={checkUpdate} disabled={updateCheck==="checking"}>{updateCheck==="checking"?"Checking…":"Check now"}</Btn>
             </div>
+            <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>FireAlive checks this project's GitHub Releases for a newer stable release and notifies you. It never downloads or installs an update — download it from GitHub, test it in a lab sandbox, then deploy on your own change-management schedule.</M>
+            {updStatus&&updStatus.lastCheckedAt&&(
+              <M style={{color:C.td,display:"block",marginBottom:10}}>Last checked: {new Date(String(updStatus.lastCheckedAt).replace(" ","T")+"Z").toLocaleString()} · {updStatus.lastResult==="available"?"update available":updStatus.lastResult==="source_unreachable"?"source unreachable":"up to date"}</M>
+            )}
             {updateCheck&&updateCheck!=="checking"&&(
-              updateCheck.available?
-              <Card style={{padding:12,borderColor:C.a+"30",marginBottom:12}}>
-                <div style={{marginBottom:10}}><M style={{color:C.a,fontWeight:500}}>Update available: v{updateCheck.version}</M><br/><M style={{color:C.tm}}>{updateCheck.notes}</M></div>
-                <div style={{display:"flex",gap:8}}>
-                  <Btn primary onClick={()=>{addA("UPDATE_TO_LAB",`v${updateCheck.version} sent to testing lab`);setUpdateCheck(null);}}>Send to Testing Lab</Btn>
-                  <Btn danger onClick={()=>{addA("UPDATE_DIRECT",`v${appVersion} to v${updateCheck.version} · Direct deploy · Fuse incremented`);setUpdateCheck(null);}}>Deploy Direct (Skip Lab)</Btn>
-                </div>
-              </Card>:
-              <Card style={{padding:12,marginBottom:12}}><M style={{color:C.a}}>Latest version.</M></Card>
+              updateCheck.error?
+                <Card style={{padding:12,borderColor:C.w+"30"}}><M style={{color:C.w}}>{updateCheck.error}</M></Card>:
+              updateCheck.result==="available"?
+                <Card style={{padding:12,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500}}>Update available: {updateCheck.latestVersion}</M>{updateCheck.releaseUrl&&<><br/><a href={updateCheck.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,fontSize:10,textDecoration:"none"}}>View release notes on GitHub →</a></>}<br/><M style={{color:C.tm}}>Download and test in a lab before applying.</M></Card>:
+              updateCheck.result==="source_unreachable"?
+                <Card style={{padding:12,borderColor:C.w+"30"}}><M style={{color:C.w}}>Could not reach the update source (GitHub). Your version status is unchanged; try again later.</M></Card>:
+                <Card style={{padding:12}}><M style={{color:C.a}}>You are running the latest stable release.</M></Card>
             )}
           </Card>
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Automatic Update Schedule</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Configure when the platform checks for updates. Choose timing that avoids peak SOC hours.</M>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" defaultChecked={true} style={{accentColor:C.a}}/>Enable automatic update checks</label>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Automatic Update Checks</div>
+            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Opt-in. When enabled, FireAlive checks GitHub Releases on the schedule below (UTC) and notifies you of a newer version. Off by default — leave it off for air-gapped deployments and check manually. This is the only outbound call FireAlive makes, and it sends no data.</M>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={updCfg.enabled} onChange={e=>setUpdCfg(pr=>({...pr,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable automatic update checks</label>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
-              <Sel label="Frequency"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="biweekly">Biweekly</option><option value="monthly">Monthly</option></Sel>
-              <Sel label="Day(s) of week"><option value="sun">Sunday</option><option value="mon">Monday</option><option value="tue">Tuesday</option><option value="wed">Wednesday</option><option value="thu">Thursday</option><option value="fri">Friday</option><option value="sat">Saturday</option></Sel>
-              <Input label="Time (UTC)" type="time" defaultValue="03:00"/>
+              <Sel label="Frequency" value={updCfg.frequency} onChange={e=>setUpdCfg(pr=>({...pr,frequency:e.target.value}))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></Sel>
+              {updCfg.frequency==="weekly"?
+                <Sel label="Day of week" value={String(updCfg.dayOfWeek)} onChange={e=>setUpdCfg(pr=>({...pr,dayOfWeek:Number(e.target.value)}))}><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></Sel>:
+               updCfg.frequency==="monthly"?
+                <Sel label="Day of month" value={String(updCfg.dayOfMonth)} onChange={e=>setUpdCfg(pr=>({...pr,dayOfMonth:Number(e.target.value)}))}>{Array.from({length:28},(_,i)=>i+1).map(d=><option key={d} value={String(d)}>{d}</option>)}</Sel>:
+                <div/>}
+              <Input label="Time (UTC)" type="time" value={updCfg.timeUtc} onChange={e=>setUpdCfg(pr=>({...pr,timeUtc:e.target.value}))}/>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
-              <Sel label="On update found"><option value="notify">Notify lead only</option><option value="lab">Send to testing lab automatically</option><option value="lab_auto">Send to lab + auto-deploy on approval</option></Sel>
-              <Sel label="Notification channel"><option value="console">Console alert only</option><option value="email">Email</option><option value="slack">Slack/Teams webhook</option><option value="all">All channels</option></Sel>
-            </div>
-            <Btn primary style={{marginTop:12}} onClick={()=>api.post("/api/audit/mc-event",{event_type:"AUTO_UPDATE_SCHEDULE",detail:"Auto-update schedule configured"}).then(()=>addA("AUTO_UPDATE_SCHEDULE","Auto-update schedule configured"))}>Save Schedule</Btn>
-          </Card>
-          <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Testing Lab Integration</div>
-            <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Configure your enterprise testing/staging environment. Signed artifacts are delivered for validation before production deployment.</M>
-            <Input label="Lab staging API endpoint" placeholder="https://lab.example.com/staging/upload" maxLength={512}/>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Lab API key / service account" placeholder="svc-soc-updates" maxLength={256}/>
-              <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:4,display:"block"}}>Lab API secret</M><input type="password" placeholder="Stored in secrets manager" maxLength={512} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}}/></div>
-            </div>
-            <Input label="Approval webhook" placeholder="https://updates.example.com/webhooks/approve" maxLength={512}/>
-            <Input label="Rejection webhook" placeholder="https://updates.example.com/webhooks/reject" maxLength={512}/>
-            <Sel label="Lab protocol"><option value="rest">REST API (push artifact)</option><option value="s3">S3/GCS/Blob</option><option value="artifactory">JFrog Artifactory</option><option value="nexus">Sonatype Nexus</option><option value="ghcr">GitHub Container Registry</option></Sel>
-            <Card style={{padding:10,marginTop:8,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Pipeline Flow</M><M style={{color:C.tm,lineHeight:1.8}}>Check for update → Verify Ed25519 signature → Push to lab → Functional + security + compatibility tests → Lab approval webhook → Deploy → Increment anti-rollback fuse → Notify lead</M></Card>
-            <div style={{display:"flex",gap:8,marginTop:12}}><Btn primary onClick={()=>api.post("/api/audit/mc-event",{event_type:"LAB_CONFIG_SAVED",detail:"Testing lab integration configured"}).then(()=>addA("LAB_CONFIG_SAVED","Testing lab integration configured"))}>Save Lab Config</Btn><Btn onClick={()=>api.post("/api/audit/mc-event",{event_type:"LAB_TEST_CONNECTION",detail:"Testing connection to lab endpoint..."}).then(()=>addA("LAB_TEST_CONNECTION","Testing connection to lab endpoint..."))}>Test Connection</Btn></div>
+            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginTop:6,marginBottom:6}}><input type="checkbox" checked={updCfg.notifyLead} onChange={e=>setUpdCfg(pr=>({...pr,notifyLead:e.target.checked}))} style={{accentColor:C.a}}/>Also notify the team lead through their configured channels</label>
+            <M style={{color:C.td,display:"block",marginBottom:8,lineHeight:1.6}}>The persistent in-app banner is always shown when an update is available; this option adds a one-time notification per new version.</M>
+            <Btn primary disabled={updSaving} style={{marginTop:6}} onClick={saveUpdCfg}>{updSaving?"Saving…":"Save schedule"}</Btn>
           </Card>
           <Card style={{marginBottom:16,borderColor:C.d+"30"}}>
             <div style={{fontSize:13,fontWeight:500,color:C.d,marginBottom:10}}>Version & Anti-Rollback Status</div>
-            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · Fuse counter: {appFuse||"…"} · Last increment: {appFuseLastIncrement||"…"} · Signed: Ed25519 ✓</M>
+            <M style={{color:C.w,lineHeight:1.8}}>Version {appVersion||"loading…"} · Build {appBuild||"loading…"} · Fuse counter: {appFuse||"…"} · Last increment: {appFuseLastIncrement||"…"}</M>
+            <M style={{color:C.tm,display:"block",marginTop:6,lineHeight:1.6}}>The anti-rollback fuse prevents installing an older build over a newer one. Update detection never reports a downgrade.</M>
           </Card>
-          <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture & Encrypted Transport</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture details — anti-rollback protection, defense in depth (6 layers), zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud VPC private endpoints with KMS envelope encryption, SD-WAN WireGuard tunnels, VDI TLS 1.3 session tunnels with cert pinning, zero trust overlay), supply chain security, and OS compatibility — are documented in the project README on GitHub. See: github.com/petermancina/firealive</M></Card>
+          <Card style={{padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500,display:"block",marginBottom:6}}>Security Architecture</M><M style={{color:C.tm,lineHeight:1.8}}>Full security architecture — anti-rollback protection, defense in depth, zero trust, least privilege, encrypted transport topologies (on-prem mTLS/SPIFFE, cloud private endpoints with KMS envelope encryption, SD-WAN tunnels, VDI session tunnels with cert pinning), supply-chain security, and OS compatibility — is documented in the project README on GitHub. See: github.com/petermancina/firealive</M></Card>
         </div>)}
 
         {/* ══════════ CLIENT NOTIFICATIONS CONFIG ══════════ */}

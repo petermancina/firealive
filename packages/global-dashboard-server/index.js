@@ -2724,6 +2724,190 @@ app.put('/api/notifications/config', authMiddleware(['ciso']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to save notification config' }); }
 });
 
+// ── B5r: automated update detection (GD) ─────────────────────────────────────
+// Detect-and-notify only. The GD-server checks THIS repo's GitHub Releases for a
+// newer stable release (services/update-check) and surfaces the result in the
+// App Updates tab + the update-available banner. It never downloads, routes, or
+// installs an update. Opt-in (off by default), so air-gapped GD deployments stay
+// dark. The GD is read-only with no notification channels, so the banner is the
+// only notification (no notifyLead). Config is the GD config key
+// auto_update_schedule_config; each check is recorded in auto_update_check_log.
+// The periodic checker (a single timer) is started in the boot callback below.
+
+const GD_UPDATE_CONFIG_DEFAULTS = {
+  enabled: false,
+  frequency: 'weekly',   // 'daily' | 'weekly' | 'monthly'
+  dayOfWeek: 1,          // 0-6 (Sunday=0)
+  dayOfMonth: 1,         // 1-28
+  timeUtc: '03:00',      // HH:MM UTC
+};
+
+function parseGdUpdateConfig(value) {
+  if (!value) return Object.assign({}, GD_UPDATE_CONFIG_DEFAULTS);
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.assign({}, GD_UPDATE_CONFIG_DEFAULTS, parsed);
+    }
+  } catch (e) { /* fall through to defaults on a corrupt value */ }
+  return Object.assign({}, GD_UPDATE_CONFIG_DEFAULTS);
+}
+
+function gdAllDigits(str) {
+  if (typeof str !== 'string' || str.length === 0) return false;
+  for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); if (c < 48 || c > 57) return false; }
+  return true;
+}
+
+function gdValidateUpdateConfig(body) {
+  const out = Object.assign({}, GD_UPDATE_CONFIG_DEFAULTS);
+  if (typeof body.enabled !== 'boolean') return { ok: false, error: 'enabled must be a boolean' };
+  out.enabled = body.enabled;
+  if (['daily', 'weekly', 'monthly'].indexOf(body.frequency) === -1) return { ok: false, error: "frequency must be 'daily', 'weekly', or 'monthly'" };
+  out.frequency = body.frequency;
+  if (body.dayOfWeek !== undefined && body.dayOfWeek !== null) {
+    if (!Number.isInteger(body.dayOfWeek) || body.dayOfWeek < 0 || body.dayOfWeek > 6) return { ok: false, error: 'dayOfWeek must be an integer 0-6 (Sunday=0)' };
+    out.dayOfWeek = body.dayOfWeek;
+  }
+  if (body.dayOfMonth !== undefined && body.dayOfMonth !== null) {
+    if (!Number.isInteger(body.dayOfMonth) || body.dayOfMonth < 1 || body.dayOfMonth > 28) return { ok: false, error: 'dayOfMonth must be an integer 1-28' };
+    out.dayOfMonth = body.dayOfMonth;
+  }
+  const t = body.timeUtc;
+  if (typeof t !== 'string') return { ok: false, error: "timeUtc must be 'HH:MM' (24-hour UTC)" };
+  const tp = t.split(':');
+  if (tp.length !== 2 || !gdAllDigits(tp[0]) || !gdAllDigits(tp[1]) || tp[0].length < 1 || tp[0].length > 2 || tp[1].length !== 2) {
+    return { ok: false, error: "timeUtc must be 'HH:MM' (24-hour UTC)" };
+  }
+  const hh = Number(tp[0]); const mm = Number(tp[1]);
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return { ok: false, error: "timeUtc must be 'HH:MM' (24-hour UTC)" };
+  out.timeUtc = (tp[0].length === 1 ? '0' + tp[0] : tp[0]) + ':' + tp[1];
+  return { ok: true, config: out };
+}
+
+// Most recent cadence boundary at or before `now` (UTC). The scheduled check is
+// due when the last scheduled check predates this boundary (downtime catch-up).
+function gdMostRecentUpdateBoundary(config, now) {
+  const parts = String(config.timeUtc || '03:00').split(':');
+  const hh = Number(parts[0]) || 0;
+  const mm = Number(parts[1]) || 0;
+  const todayAtTime = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hh, mm, 0, 0));
+  if (config.frequency === 'daily') {
+    return todayAtTime.getTime() <= now.getTime() ? todayAtTime : new Date(todayAtTime.getTime() - 86400000);
+  }
+  if (config.frequency === 'monthly') {
+    const dom = config.dayOfMonth || 1;
+    const thisMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), dom, hh, mm, 0, 0));
+    if (thisMonth.getTime() <= now.getTime()) return thisMonth;
+    let y = now.getUTCFullYear(); let m = now.getUTCMonth() - 1;
+    if (m < 0) { m = 11; y -= 1; }
+    return new Date(Date.UTC(y, m, dom, hh, mm, 0, 0));
+  }
+  const dow = (config.dayOfWeek === undefined || config.dayOfWeek === null) ? 1 : config.dayOfWeek;
+  let d = todayAtTime;
+  for (let i = 0; i < 8; i++) {
+    if (d.getUTCDay() === dow && d.getTime() <= now.getTime()) return d;
+    d = new Date(d.getTime() - 86400000);
+  }
+  return d;
+}
+
+function gdIsScheduledUpdateCheckDue(config, lastScheduledIso, now) {
+  const boundary = gdMostRecentUpdateBoundary(config, now);
+  if (!lastScheduledIso) return true;
+  const last = new Date(String(lastScheduledIso).replace(' ', 'T') + 'Z');
+  if (isNaN(last.getTime())) return true;
+  return last.getTime() < boundary.getTime();
+}
+
+// Run a check now (shared by the manual endpoint and the periodic checker).
+// Records the outcome in auto_update_check_log and audits it. Returns the
+// result plus the running version. Never throws from the network path.
+async function gdRunUpdateCheck(triggerKind) {
+  const updateCheck = require('./services/update-check');
+  const currentVersion = (require('./package.json').version) || '0.0.0';
+  const kind = triggerKind === 'manual' ? 'manual' : 'scheduled';
+  const r = await updateCheck.checkForUpdate({ currentVersion });
+  let db;
+  try {
+    db = getDb();
+    db.prepare(
+      "INSERT INTO auto_update_check_log (current_version, result, latest_version, release_url, notified, trigger_kind) VALUES (?, ?, ?, ?, 0, ?)"
+    ).run(currentVersion, r.result, r.latestVersion, r.releaseUrl, kind);
+    if (r.result === 'available') {
+      appendGdAuditEntry(db, { userId: 'system', eventType: 'UPDATE_AVAILABLE', detail: `latest=${r.latestVersion} current=${currentVersion}`, severity: 'info' });
+    } else if (r.result === 'source_unreachable') {
+      appendGdAuditEntry(db, { userId: 'system', eventType: 'UPDATE_SOURCE_UNREACHABLE', detail: `current=${currentVersion}`, severity: 'info' });
+    } else {
+      appendGdAuditEntry(db, { userId: 'system', eventType: 'UPDATE_CHECK_RAN', detail: `trigger=${kind} result=none current=${currentVersion}`, severity: 'info' });
+    }
+  } finally {
+    if (db) try { db.close(); } catch (_e) { /* ignore */ }
+  }
+  return Object.assign({ currentVersion }, r);
+}
+
+let gdLastManualUpdateCheckMs = 0;
+const GD_MANUAL_UPDATE_CHECK_MIN_INTERVAL_MS = 60 * 1000;
+
+// GET /api/auto-update/config -- the schedule config (safe defaults when unset).
+app.get('/api/auto-update/config', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value FROM config WHERE key = 'auto_update_schedule_config'").get();
+    db.close();
+    res.json({ config: parseGdUpdateConfig(row ? row.value : null) });
+  } catch (e) { res.status(500).json({ error: 'Failed to read update schedule config' }); }
+});
+
+// PUT /api/auto-update/config -- set the schedule config (ciso; validated + audited).
+app.put('/api/auto-update/config', authMiddleware(['ciso']), (req, res) => {
+  const v = gdValidateUpdateConfig(req.body || {});
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  try {
+    const db = getDb();
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('auto_update_schedule_config', ?)").run(JSON.stringify(v.config));
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'AUTO_UPDATE_CONFIG_SET', detail: `enabled=${v.config.enabled}, frequency=${v.config.frequency}, timeUtc=${v.config.timeUtc}`, ip: req.ip, severity: 'info' });
+    db.close();
+    res.json({ ok: true, config: v.config });
+  } catch (e) { res.status(500).json({ error: 'Failed to save update schedule config' }); }
+});
+
+// POST /api/auto-update/check-now -- run a check immediately (rate-limited).
+app.post('/api/auto-update/check-now', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const now = Date.now();
+  const sinceMs = now - gdLastManualUpdateCheckMs;
+  if (sinceMs < GD_MANUAL_UPDATE_CHECK_MIN_INTERVAL_MS) {
+    return res.status(429).json({ error: 'A manual update check ran recently. Please wait a moment before checking again.', retryAfterSec: Math.ceil((GD_MANUAL_UPDATE_CHECK_MIN_INTERVAL_MS - sinceMs) / 1000) });
+  }
+  gdLastManualUpdateCheckMs = now;
+  try {
+    const r = await gdRunUpdateCheck('manual');
+    res.json({ result: r.result, currentVersion: r.currentVersion, latestVersion: r.latestVersion, releaseUrl: r.releaseUrl, releaseName: r.releaseName, checkedAt: r.checkedAt });
+  } catch (e) {
+    res.json({ result: 'source_unreachable', currentVersion: (require('./package.json').version) || null, latestVersion: null, releaseUrl: null, checkedAt: new Date().toISOString() });
+  }
+});
+
+// GET /api/auto-update/status -- lean state for the banner + last-check display.
+app.get('/api/auto-update/status', authMiddleware(['ciso', 'vp']), (req, res) => {
+  try {
+    const updateCheck = require('./services/update-check');
+    const currentVersion = (require('./package.json').version) || null;
+    const db = getDb();
+    const cfgRow = db.prepare("SELECT value FROM config WHERE key = 'auto_update_schedule_config'").get();
+    const cfg = parseGdUpdateConfig(cfgRow ? cfgRow.value : null);
+    const lastRow = db.prepare("SELECT checked_at, result FROM auto_update_check_log ORDER BY id DESC LIMIT 1").get();
+    const lastDet = db.prepare("SELECT result, latest_version, release_url FROM auto_update_check_log WHERE result IN ('available', 'none') ORDER BY id DESC LIMIT 1").get();
+    db.close();
+    let updateAvailable = false; let latestVersion = null; let releaseUrl = null;
+    if (lastDet && lastDet.result === 'available' && lastDet.latest_version && updateCheck.isStrictlyNewer(lastDet.latest_version, currentVersion)) {
+      updateAvailable = true; latestVersion = lastDet.latest_version; releaseUrl = lastDet.release_url || null;
+    }
+    res.json({ currentVersion, enabled: cfg.enabled, updateAvailable, latestVersion, releaseUrl, lastCheckedAt: lastRow ? lastRow.checked_at : null, lastResult: lastRow ? lastRow.result : null });
+  } catch (e) { res.status(500).json({ error: 'Failed to read update status' }); }
+});
+
 // ── Reports ──────────────────────────────────────────────────────────────────
 // U4: report-model helpers for signed GD report exports. humanize / fmtVal /
 // flattenToBullets are verbatim from the MC reports route. reportModel is
@@ -3733,6 +3917,33 @@ function runGdRegression(db) {
       throw new Error('GD export-encryption does not require gd-encryption (KEK path not wired)');
     }
     return 'sealArtifact/openArtifact present; default scheme gd-tier1; wraps via gd-encryption';
+  });
+
+  // ── Automated Update Detection (4) ─────────────────────────────────────
+  record('auto_update', 'auto_update_check_log table present', () => {
+    const r = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'auto_update_check_log'").get();
+    if (!r || r.c !== 1) throw new Error('auto_update_check_log table missing');
+    return 'present';
+  });
+  record('auto_update', 'update-check service loads + exports', () => {
+    const uc = require('./services/update-check');
+    if (typeof uc.checkForUpdate !== 'function' || typeof uc.isStrictlyNewer !== 'function') {
+      throw new Error('update-check service missing checkForUpdate/isStrictlyNewer');
+    }
+    return 'ok';
+  });
+  record('auto_update', 'version comparison dry-run (no network)', () => {
+    const uc = require('./services/update-check');
+    if (uc.isStrictlyNewer('v1.0.79', '1.0.78') !== true) throw new Error('newer not detected');
+    if (uc.isStrictlyNewer('1.0.78', '1.0.78') !== false) throw new Error('equal treated as newer');
+    if (uc.isStrictlyNewer('1.0.70', '1.0.78') !== false) throw new Error('older treated as newer (downgrade)');
+    if (uc.isStrictlyNewer('garbage', '1.0.78') !== false) throw new Error('malformed treated as newer');
+    return 'newer/equal/older/malformed all correct';
+  });
+  record('auto_update', 'schedule config readable', () => {
+    const row = db.prepare("SELECT value FROM config WHERE key = 'auto_update_schedule_config'").get();
+    parseGdUpdateConfig(row ? row.value : null); // must not throw; defaults when unset
+    return row ? 'config present' : 'unset (defaults apply)';
   });
 
   const passed = tests.filter(t => t.status === 'pass').length;
@@ -5550,6 +5761,37 @@ https.createServer({
 }, app).listen(PORT, () => {
   console.log(`FireAlive Global Dashboard Server v0.0.31 running on https://localhost:${PORT} (HTTPS/mTLS)`);
   console.log('Awaiting aggregate data pushes from Regional Servers');
+
+  // ── B5r: automated update-detection periodic checker ──────────────────────
+  // The GD-server has no general scheduler (by design), so a single hourly timer
+  // drives the opt-in update check: when enabled, on each tick it runs the check
+  // if a daily/weekly/monthly cadence boundary has passed since the last
+  // scheduled check (so a window missed during downtime is caught on the next
+  // tick). Detect-and-notify only; the App Updates banner (GET
+  // /api/auto-update/status) is the notification. The timer is unref()'d so it
+  // never holds the process open on its own.
+  const gdUpdateCheckTimer = setInterval(() => {
+    let db;
+    let config = null;
+    let lastScheduledIso = null;
+    try {
+      db = getDb();
+      const cfgRow = db.prepare("SELECT value FROM config WHERE key = 'auto_update_schedule_config'").get();
+      config = parseGdUpdateConfig(cfgRow ? cfgRow.value : null);
+      if (config.enabled) {
+        const lastRow = db.prepare("SELECT checked_at FROM auto_update_check_log WHERE trigger_kind = 'scheduled' ORDER BY id DESC LIMIT 1").get();
+        lastScheduledIso = lastRow ? lastRow.checked_at : null;
+      }
+    } catch (e) {
+      config = null;
+    } finally {
+      if (db) try { db.close(); } catch (_e) { /* ignore */ }
+    }
+    if (!config || !config.enabled) return;
+    if (!gdIsScheduledUpdateCheckDue(config, lastScheduledIso, new Date())) return;
+    gdRunUpdateCheck('scheduled').catch((e) => { try { console.error('GD update-detection check failed:', e.message); } catch (_e) { /* ignore */ } });
+  }, 60 * 60 * 1000);
+  if (gdUpdateCheckTimer && typeof gdUpdateCheckTimer.unref === 'function') gdUpdateCheckTimer.unref();
 });
 
 module.exports = app;

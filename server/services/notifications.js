@@ -141,6 +141,11 @@ const EVENT_TYPES = {
     description: 'A new tier-3 abuse case (urgent conduct: slurs, threats, harassment) was sealed to you for review. Review it immediately in the Peer Conduct tab of the Management Console. Content is decrypted only on your device; the server never sees it. In-app delivery cannot be turned off for this event.',
     mandatoryInApp: true,
   },
+  update_available: {
+    label: 'A new FireAlive version is available',
+    default: { in_app: 1, email: 1, sms: 0, desktop: 1 },
+    description: 'A newer FireAlive release was detected on GitHub. Download and test it in a lab sandbox before applying -- FireAlive never installs updates automatically. (Leads and admins.)',
+  },
 };
 
 function isKnownEventType(eventType) {

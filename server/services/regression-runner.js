@@ -2990,6 +2990,36 @@ class RegressionRunner {
       return 'abstains on null/single signal; fences + demotes on dual isolation';
     });
 
+    // ── Automated Update Detection (B5r) ───────────────────────────
+    // Detect-and-notify only: these confirm the evidence table, the network
+    // service and its exports, the version-comparison logic (no network), and
+    // that the schedule config is readable. They never reach the network.
+    await check('auto_update', 'Update-check log table present', () => {
+      const r = this.db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'auto_update_check_log'").get();
+      if (!r || r.c !== 1) throw new Error('auto_update_check_log table missing');
+      return 'auto_update_check_log present';
+    });
+    await check('auto_update', 'Update-check service loads and exports', () => {
+      const uc = require('./update-check');
+      if (typeof uc.checkForUpdate !== 'function' || typeof uc.isStrictlyNewer !== 'function') {
+        throw new Error('update-check service missing checkForUpdate/isStrictlyNewer');
+      }
+      return 'checkForUpdate + isStrictlyNewer exported';
+    });
+    await check('auto_update', 'Version comparison dry-run (no network)', () => {
+      const uc = require('./update-check');
+      if (uc.isStrictlyNewer('v1.0.79', '1.0.78') !== true) throw new Error('newer not detected');
+      if (uc.isStrictlyNewer('1.0.78', '1.0.78') !== false) throw new Error('equal treated as newer');
+      if (uc.isStrictlyNewer('1.0.70', '1.0.78') !== false) throw new Error('older treated as newer (downgrade)');
+      if (uc.isStrictlyNewer('garbage', '1.0.78') !== false) throw new Error('malformed treated as newer');
+      return 'newer/equal/older/malformed all correct';
+    });
+    await check('auto_update', 'Schedule config readable', () => {
+      const row = this.db.prepare("SELECT value FROM team_config WHERE key = 'auto_update_schedule_config'").get();
+      if (row && row.value) { JSON.parse(row.value); return 'config present and parseable'; }
+      return 'unset (defaults apply)';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

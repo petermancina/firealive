@@ -9,6 +9,111 @@ const { logger } = require('./logger');
 const { versionLabel } = require('../lib/version');
 const notifications = require('./notifications');
 
+// ── B5r: automated update-detection helpers ──────────────────────────────────
+// The schedule config lives in the team_config key auto_update_schedule_config
+// (written by routes/auto-update.js, the source of truth). These defaults mirror
+// that route so a partial or absent row still yields a complete, safe config.
+const UPDATE_CONFIG_DEFAULTS = {
+  enabled: false,
+  frequency: 'weekly',   // 'daily' | 'weekly' | 'monthly'
+  dayOfWeek: 1,          // 0-6 (Sunday=0)
+  dayOfMonth: 1,         // 1-28
+  timeUtc: '03:00',      // HH:MM UTC
+  notifyLead: false,
+};
+
+function parseUpdateConfig(value) {
+  if (!value) return Object.assign({}, UPDATE_CONFIG_DEFAULTS);
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.assign({}, UPDATE_CONFIG_DEFAULTS, parsed);
+    }
+  } catch (e) {
+    /* fall through to defaults on a corrupt value */
+  }
+  return Object.assign({}, UPDATE_CONFIG_DEFAULTS);
+}
+
+// The most recent cadence boundary at or before `now` (a Date), computed in UTC.
+// A scheduled check is due when the last scheduled check predates this boundary,
+// so a window missed during downtime is caught on the next hourly tick.
+function mostRecentUpdateBoundary(config, now) {
+  const parts = String(config.timeUtc || '03:00').split(':');
+  const hh = Number(parts[0]) || 0;
+  const mm = Number(parts[1]) || 0;
+  const todayAtTime = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hh, mm, 0, 0));
+
+  if (config.frequency === 'daily') {
+    return todayAtTime.getTime() <= now.getTime()
+      ? todayAtTime
+      : new Date(todayAtTime.getTime() - 86400000);
+  }
+
+  if (config.frequency === 'monthly') {
+    const dom = config.dayOfMonth || 1;
+    const thisMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), dom, hh, mm, 0, 0));
+    if (thisMonth.getTime() <= now.getTime()) return thisMonth;
+    let y = now.getUTCFullYear();
+    let m = now.getUTCMonth() - 1;
+    if (m < 0) { m = 11; y -= 1; }
+    return new Date(Date.UTC(y, m, dom, hh, mm, 0, 0));
+  }
+
+  // weekly (default)
+  const dow = (config.dayOfWeek === undefined || config.dayOfWeek === null) ? 1 : config.dayOfWeek;
+  let d = todayAtTime;
+  for (let i = 0; i < 8; i++) {
+    if (d.getUTCDay() === dow && d.getTime() <= now.getTime()) return d;
+    d = new Date(d.getTime() - 86400000);
+  }
+  return d;
+}
+
+// True when a scheduled check is due. A never-run schedule is due at the next
+// tick (prompt initial status once an admin enables it); thereafter it is due
+// once each cadence boundary passes. checked_at is SQLite UTC ("YYYY-MM-DD
+// HH:MM:SS"); parse it as UTC.
+function isScheduledUpdateCheckDue(config, lastScheduledIso, now) {
+  const boundary = mostRecentUpdateBoundary(config, now);
+  if (!lastScheduledIso) return true;
+  const last = new Date(String(lastScheduledIso).replace(' ', 'T') + 'Z');
+  if (isNaN(last.getTime())) return true;
+  return last.getTime() < boundary.getTime();
+}
+
+// Optional once-per-version channel notice. The persistent in-app banner is the
+// primary notification; this fires only when notifyLead is set, to lead/admins,
+// each respecting their own channel preferences.
+function notifyLeadOfUpdate(result, currentVersion) {
+  try {
+    const recipients = notifications.getEligibleRecipients('update_available', {
+      roles: ['lead', 'admin'],
+      activeOnly: true,
+    });
+    const latest = result.latestVersion || 'a new version';
+    let notified = 0;
+    for (const recipientId of recipients) {
+      try {
+        notifications.notify({
+          recipientId,
+          eventType: 'update_available',
+          title: 'A new FireAlive version is available',
+          body: `${latest} is available on GitHub (you are running ${currentVersion}). Download and test it in a lab sandbox before applying -- FireAlive never installs updates automatically. Open the Updates tab to review.`,
+          linkTab: 'updates',
+          linkParams: null,
+        });
+        notified++;
+      } catch (notifyErr) {
+        logger.warn('update-detection: notify recipient failed (non-fatal)', { recipientId, error: notifyErr.message });
+      }
+    }
+    logger.info(`update-detection: notified ${notified} lead/admin recipient(s) of ${latest}`);
+  } catch (e) {
+    logger.error('update-detection: lead notification failed', { error: e.message });
+  }
+}
+
 const schedulerService = {
   jobs: [],
   haTimers: [],
@@ -706,6 +811,88 @@ const schedulerService = {
         }
       } catch (err) {
         logger.error('Scheduler: scheduled replenishment failed', { error: err.message });
+      }
+    }));
+
+    // ── B5r: automated update-detection check (opt-in, detect-and-notify) ─────
+    // When enabled, checks THIS repo's GitHub Releases for a newer stable
+    // release on the configured cadence and records the outcome; never
+    // downloads, routes, or installs anything. HA-gated by mayRunWriteJob() so
+    // only the write-authority node checks and notifies (a pair never
+    // double-notifies). Hourly tick + cadence-due gate catches a window missed
+    // during downtime on the next tick. A once-per-version channel notice to
+    // lead/admins fires only when notifyLead is set; the persistent in-app
+    // banner (GET /api/auto-update/status) is the primary notification.
+    this.jobs.push(cron.schedule('0 * * * *', async () => {
+      if (!this.mayRunWriteJob()) return;
+      try {
+        const { getDb } = require('../db/init');
+        const { auditLog } = require('../middleware/audit');
+        const { version: APP_VERSION } = require('../lib/version');
+        const updateCheck = require('./update-check');
+
+        // Read config + last scheduled check, then release the connection
+        // before the network call.
+        let config;
+        let lastScheduledIso = null;
+        const db = getDb();
+        try {
+          const cfgRow = db.prepare("SELECT value FROM team_config WHERE key = 'auto_update_schedule_config'").get();
+          config = parseUpdateConfig(cfgRow ? cfgRow.value : null);
+          if (config.enabled) {
+            const lastRow = db.prepare(
+              "SELECT checked_at FROM auto_update_check_log WHERE trigger_kind = 'scheduled' ORDER BY id DESC LIMIT 1"
+            ).get();
+            lastScheduledIso = lastRow ? lastRow.checked_at : null;
+          }
+        } finally {
+          db.close();
+        }
+
+        if (!config.enabled) return;
+        if (!isScheduledUpdateCheckDue(config, lastScheduledIso, new Date())) return;
+
+        // Fail-safe network check (never throws).
+        const r = await updateCheck.checkForUpdate({ currentVersion: APP_VERSION });
+
+        // Record the outcome + decide whether a one-time notice is owed.
+        let shouldNotify = false;
+        const db2 = getDb();
+        try {
+          db2.prepare(
+            "INSERT INTO auto_update_check_log (current_version, result, latest_version, release_url, notified, trigger_kind) " +
+            "VALUES (?, ?, ?, ?, 0, 'scheduled')"
+          ).run(APP_VERSION, r.result, r.latestVersion, r.releaseUrl);
+
+          if (r.result === 'available') {
+            auditLog(null, 'UPDATE_AVAILABLE', `latest=${r.latestVersion} current=${APP_VERSION}`, null);
+          } else if (r.result === 'source_unreachable') {
+            auditLog(null, 'UPDATE_SOURCE_UNREACHABLE', `current=${APP_VERSION}`, null);
+          } else {
+            auditLog(null, 'UPDATE_CHECK_RAN', `trigger=scheduled result=none current=${APP_VERSION}`, null);
+          }
+
+          if (r.result === 'available' && config.notifyLead && r.latestVersion) {
+            const alreadyNotified = db2.prepare(
+              "SELECT 1 FROM auto_update_check_log WHERE latest_version = ? AND notified = 1 LIMIT 1"
+            ).get(r.latestVersion);
+            if (!alreadyNotified) {
+              // Mark this run notified BEFORE dispatch so a transient notify
+              // failure cannot trigger repeated re-notification on later ticks.
+              db2.prepare(
+                "UPDATE auto_update_check_log SET notified = 1 " +
+                "WHERE id = (SELECT MAX(id) FROM auto_update_check_log WHERE latest_version = ? AND trigger_kind = 'scheduled')"
+              ).run(r.latestVersion);
+              shouldNotify = true;
+            }
+          }
+        } finally {
+          db2.close();
+        }
+
+        if (shouldNotify) notifyLeadOfUpdate(r, APP_VERSION);
+      } catch (err) {
+        logger.error('Scheduler: update-detection check failed', { error: err.message });
       }
     }));
 

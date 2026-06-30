@@ -729,6 +729,11 @@ export default function GlobalDashboard() {
   const [gdVersion, setGdVersion] = useState(null);
   const [gdToast, setGdToast] = useState(null);
   const showGdToast = (msg) => { setGdToast(msg); setTimeout(() => setGdToast(null), 3000); };
+  const [updCfg, setUpdCfg] = useState({enabled:false,frequency:"weekly",dayOfWeek:1,dayOfMonth:1,timeUtc:"03:00"});
+  const [updStatus, setUpdStatus] = useState(null); // {currentVersion,enabled,updateAvailable,latestVersion,releaseUrl,lastCheckedAt,lastResult}
+  const [updCheck, setUpdCheck] = useState(null); // check-now result: null | "checking" | {result,...} | {error}
+  const [updSaving, setUpdSaving] = useState(false);
+  const [updBannerDismissed, setUpdBannerDismissed] = useState(()=>{ try { return localStorage.getItem("fa_gd_upd_dismissed")||""; } catch(_e){ return ""; } });
   // R3k C40 — GD Cloud & IaC + CI/CD server-side wiring
   const [gdIacProvider, setGdIacProvider] = useState("");
   const [gdIacTool, setGdIacTool] = useState("");
@@ -1070,6 +1075,36 @@ export default function GlobalDashboard() {
       if (r && !r.error && r.version) setGdVersion(r.version);
     });
   }, [stage, gdVersion]);
+
+  // B5r: load the update schedule config + current status once the app is
+  // entered, so the App Updates tab and the update-available banner reflect
+  // server state. Detect-and-notify only; nothing is downloaded or installed.
+  useEffect(() => {
+    if (stage !== "app") return;
+    api.get("/api/auto-update/config").then(r => { if (r && r.config) setUpdCfg(pr => ({ ...pr, ...r.config })); });
+    api.get("/api/auto-update/status").then(r => { if (r && !r.error) setUpdStatus(r); });
+  }, [stage]);
+
+  const gdCheckUpdate = async () => {
+    setUpdCheck("checking");
+    try {
+      const r = await api.post("/api/auto-update/check-now", {});
+      setUpdCheck(r && !r.error ? r : (r || { result: "source_unreachable" }));
+      api.get("/api/auto-update/status").then(s => { if (s && !s.error) setUpdStatus(s); });
+    } catch (e) {
+      setUpdCheck({ result: "source_unreachable" });
+    }
+  };
+  const gdSaveUpdCfg = async () => {
+    setUpdSaving(true);
+    try {
+      const r = await api.put("/api/auto-update/config", updCfg);
+      if (r && r.error) { showGdToast("Save failed: " + r.error); }
+      else { if (r && r.config) setUpdCfg(pr => ({ ...pr, ...r.config })); showGdToast("Update schedule saved"); }
+    } catch (e) {
+      showGdToast("Save failed");
+    } finally { setUpdSaving(false); }
+  };
 
   // Load query templates when the query tab is first opened. Populates the
   // template dropdown with the server-side registry; without this, the CISO
@@ -1603,6 +1638,12 @@ export default function GlobalDashboard() {
           </div>
         </Card>
       </div>}
+      {updStatus&&updStatus.updateAvailable&&updStatus.latestVersion&&updStatus.latestVersion!==updBannerDismissed&&(
+        <div style={{padding:"10px 24px",background:C.i+"18",color:C.i,fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.i}40`,fontFamily:"'IBM Plex Mono',monospace"}}>
+          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test before applying.</span>
+          <button onClick={()=>{const v=updStatus.latestVersion;setUpdBannerDismissed(v);try{localStorage.setItem("fa_gd_upd_dismissed",v);}catch(_e){}}} style={{marginLeft:12,background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11,whiteSpace:"nowrap"}}>dismiss</button>
+        </div>
+      )}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div>
           <M style={{color:C.td,letterSpacing:2,textTransform:"uppercase",fontSize:9,display:"block",marginBottom:6}}>
@@ -3046,25 +3087,38 @@ export default function GlobalDashboard() {
           {/* ══════════ APP UPDATES ══════════ */}
           {tab==="app_updates"&&(<div>
             <L>App Updates</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>The Global Dashboard updates independently of any regional MC. Updates are retrieved, lab-tested, and applied automatically on a schedule.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>The Global Dashboard checks this project's GitHub Releases for a newer stable release and notifies you here. It never downloads or installs an update — download it from GitHub, test it, then apply it on your own change-management schedule.</M>
             {configLocked&&<Card style={{borderColor:C.d+"40",marginBottom:12,padding:10}}><M style={{color:C.d}}>LOCK Configurations locked. Unlock with MFA to make changes.</M></Card>}
             <Card style={{marginBottom:12}}>
-              <M style={{color:C.a,fontWeight:500,display:"block",marginBottom:8}}>Current version: v{gdVersion||"…"}</M>
-              <Sel label="Update channel"><option value="stable">Stable</option><option value="preview">Preview (early access)</option></Sel>
-              <Sel label="Auto-update schedule"><option value="daily">Check daily</option><option value="weekly">Check weekly</option><option value="manual">Manual only</option></Sel>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked disabled={configLocked}/><M style={{color:C.t}}>Lab-test updates before applying to production</M></label>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked disabled={configLocked}/><M style={{color:C.t}}>Auto-rollback if post-update health check fails</M></label>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <M style={{color:C.a,fontWeight:500}}>Current version: v{gdVersion||"…"}</M>
+                <Btn small primary onClick={gdCheckUpdate} disabled={updCheck==="checking"}>{updCheck==="checking"?"Checking…":"Check now"}</Btn>
+              </div>
+              {updStatus&&updStatus.lastCheckedAt&&(
+                <M style={{color:C.td,display:"block",marginBottom:8}}>Last checked: {new Date(String(updStatus.lastCheckedAt).replace(" ","T")+"Z").toLocaleString()} · {updStatus.lastResult==="available"?"update available":updStatus.lastResult==="source_unreachable"?"source unreachable":"up to date"}</M>
+              )}
+              {updCheck&&updCheck!=="checking"&&(
+                updCheck.error?
+                  <M style={{color:C.w,display:"block"}}>{updCheck.error}</M>:
+                updCheck.result==="available"?
+                  <M style={{color:C.i,display:"block"}}>Update available: {updCheck.latestVersion}{updCheck.releaseUrl&&<> · <a href={updCheck.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i}}>release notes</a></>}</M>:
+                updCheck.result==="source_unreachable"?
+                  <M style={{color:C.w,display:"block"}}>Could not reach the update source (GitHub). Version status unchanged; try again later.</M>:
+                  <M style={{color:C.a,display:"block"}}>Running the latest stable release.</M>
+              )}
             </Card>
             <Card style={{marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Lab Testing Environment</div>
-              <M style={{color:C.tm,display:"block",marginBottom:10}}>Before applying updates to the production dashboard, send them to a lab environment for validation.</M>
-              <Input label="Lab server endpoint" placeholder="https://gd-lab.corp.com:4001"/>
-              <Input label="Lab test duration (minutes)" placeholder="30" type="number"/>
-              <Sel label="Lab test scope"><option value="full">Full regression + health check</option><option value="quick">Quick health check only</option><option value="custom">Custom test suite</option></Sel>
-              <Btn primary disabled={configLocked}>Save Lab Config</Btn>
-            </Card>
-            <Card>
-              <Btn primary>Check for Updates Now</Btn>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Automatic Update Checks</div>
+              <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Opt-in. When enabled, the dashboard checks GitHub Releases on the schedule below (UTC) and shows a banner when a newer version exists. Off by default — leave it off for air-gapped deployments and check manually. This check is the only outbound call and sends no data.</M>
+              <label style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",marginBottom:8}}><input type="checkbox" checked={updCfg.enabled} disabled={configLocked} onChange={e=>setUpdCfg(pr=>({...pr,enabled:e.target.checked}))}/><M style={{color:C.t}}>Enable automatic update checks</M></label>
+              <Sel label="Frequency" value={updCfg.frequency} disabled={configLocked} onChange={e=>setUpdCfg(pr=>({...pr,frequency:e.target.value}))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></Sel>
+              {updCfg.frequency==="weekly"?
+                <Sel label="Day of week" value={String(updCfg.dayOfWeek)} disabled={configLocked} onChange={e=>setUpdCfg(pr=>({...pr,dayOfWeek:Number(e.target.value)}))}><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></Sel>:
+               updCfg.frequency==="monthly"?
+                <Sel label="Day of month" value={String(updCfg.dayOfMonth)} disabled={configLocked} onChange={e=>setUpdCfg(pr=>({...pr,dayOfMonth:Number(e.target.value)}))}>{Array.from({length:28},(_,i)=>i+1).map(d=><option key={d} value={String(d)}>{d}</option>)}</Sel>:
+                null}
+              <Input label="Time (UTC)" type="time" value={updCfg.timeUtc} disabled={configLocked} onChange={e=>setUpdCfg(pr=>({...pr,timeUtc:e.target.value}))}/>
+              <Btn primary disabled={configLocked||updSaving} onClick={gdSaveUpdCfg}>{updSaving?"Saving…":"Save schedule"}</Btn>
             </Card>
           </div>)}
 

@@ -1295,6 +1295,41 @@ function initDb() {
     console.error('The GD will start, but hardware-credential login hardening is not in place: the trusted-root tables or the webauthn_credentials hardware columns may be missing, so hardware-gated passkey enrollment and login cannot function. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB.');
   }
 
+  // ── B5r: automated update-detection check log (GD) ────────────────────────
+  // Append-only evidence trail for the GD's update-detection feature. Each row
+  // records one update check -- scheduled (the GD-server's periodic checker) or
+  // manual ("check now") -- capturing when it ran, the running GD version at the
+  // time, the outcome, the latest release tag + URL when one was found, whether
+  // a notice has fired for that version, and the trigger. Detect-and-notify
+  // only: the GD never downloads, routes, or installs an update; this backs the
+  // App Updates tab last-/next-check display and the update-available banner.
+  // result is a closed enum: 'none' (running the latest, or no stable release
+  // published yet -- a 404 during the pre-release era), 'available' (a strictly-
+  // newer stable release exists -- never a downgrade), or 'source_unreachable'
+  // (network/timeout/unexpected response -- never reported as up-to-date).
+  // Idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS auto_update_check_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        checked_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+        current_version TEXT    NOT NULL,
+        result          TEXT    NOT NULL CHECK (result IN ('none', 'available', 'source_unreachable')),
+        latest_version  TEXT,
+        release_url     TEXT,
+        notified        INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0, 1)),
+        trigger_kind    TEXT    NOT NULL DEFAULT 'scheduled' CHECK (trigger_kind IN ('scheduled', 'manual'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_update_check_log_checked_at
+        ON auto_update_check_log (checked_at DESC);
+    `);
+    const auGdUpdateLogPresent = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'auto_update_check_log'").get().c;
+    console.log(`B5r migration: GD automated update-check log ready (${auGdUpdateLogPresent} table present)`);
+  } catch (b5rGdUpdateLogMigrationErr) {
+    console.error('B5r GD update-check log migration FAILED:', b5rGdUpdateLogMigrationErr.message);
+    console.error('The GD will start, but the automated update-detection feature cannot record check results: the auto_update_check_log table may be missing, so the App Updates tab last-check display and the update-available banner have no data source. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.');
+  }
+
   console.log('Global Dashboard database initialized at', DB_PATH);
   require('./services/gd-seed-fido-roots').seedFidoRoots(db);
   db.close();

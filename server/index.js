@@ -365,6 +365,8 @@ app.use('/api/geoip', authMiddleware(['admin']), configLockChokepoint(), require
 app.use('/api/geo-fence', authMiddleware(['admin']), configLockChokepoint(), require('./routes/geo-fence'));
 // B5n2: data residency -- policy, jurisdiction declarations, transfer register, posture (admin).
 app.use('/api/data-residency', authMiddleware(['admin']), configLockChokepoint(), require('./routes/data-residency'));
+// B5r: automated update detection -- detect-and-notify schedule config + manual check + status (admin).
+app.use('/api/auto-update', authMiddleware(['admin']), configLockChokepoint(), require('./routes/auto-update'));
 // Dedicated limiter for the external-facing threat-hunting feed. Automated
 // consumers (XDR/ATP/NGAV/MSP) reach these routes over mTLS, and the TAXII
 // surface is mounted outside /api so apiLimiter does not cover it. A per-IP

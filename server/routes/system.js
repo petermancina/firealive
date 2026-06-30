@@ -4,7 +4,6 @@
 // GET  /api/system/version    — version info + fuse counter
 // GET  /api/system/config     — system configuration
 // POST /api/system/fuse-check — verify anti-rollback fuse
-// POST /api/system/update-check — check for updates (simulated)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
@@ -148,26 +147,6 @@ router.post('/fuse-check', (req, res) => {
     logger.error('Fuse check error', { error: err.message });
     res.status(500).json({ error: 'Failed to check fuse counter' });
   }
-});
-
-// ── Update Check ─────────────────────────────────────────────────────────────
-// Returns the running version. In a real deployment this would also poll a
-// secure update server (Ed25519-signed release feed) for the latest available
-// version. Until that infrastructure exists, this endpoint simply reports the
-// current version and explicitly notes that no update server is configured.
-router.post('/update-check', (req, res) => {
-  const currentVersion = APP_VERSION;
-
-  auditLog(req.user?.id, 'UPDATE_CHECK', `current=${currentVersion}`, req.ip);
-
-  res.json({
-    currentVersion,
-    latestVersion: null,
-    updateAvailable: false,
-    updateServerConfigured: false,
-    note: 'No update server configured. Configure FIREALIVE_UPDATE_SERVER_URL to enable update checks.',
-    checkedAt: new Date().toISOString(),
-  });
 });
 
 // ── System Config ────────────────────────────────────────────────────────────

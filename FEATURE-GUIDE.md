@@ -1313,20 +1313,19 @@ This way users can still see what FireAlive offers without being confused about 
 
 ### Updates
 
-**What it’s for:** Update orchestration that does NOT force production updates automatically. The lead controls where update packages get sent — straight to production, to a lab environment, or to another repository for review. Once an update has been retrieved and sent to the lab, the org’s existing change-management process takes over: their developers do regression testing and security testing in the lab independently. FireAlive includes a regression test runner the lead CAN run inside the lab if they want, but FireAlive doesn’t try to automate the entire change-management workflow — that varies too much across orgs.
+**What it’s for:** Telling the lead when a newer FireAlive release is available — and nothing more. FireAlive checks this project’s GitHub Releases for a newer stable release and surfaces it; it never downloads, stages, lab-tests, or installs an update. The lead reads the release notes, downloads the new release from GitHub, validates it through the org’s own change-management process (a lab or staging deployment, regression testing, security review — whatever the org requires), and installs it on their own schedule. Auto-applying updates to a production security tool is bad practice and varies too much across orgs to automate; FireAlive surfaces the signal reliably and leaves the upgrade as a deliberate, operator-owned action.
 
-After the org’s change-management approves the update, the lead pushes it to production from the same Updates tab. Production deployment includes rolling restart and a fuse counter increment to prevent rollback to a now-vulnerable version.
+The check is **opt-in and off by default** (air-gapped deployments stay dark), **zero-telemetry** (a plain GET to `api.github.com` carrying no body or query string), **fail-safe** (any network problem reports "source unreachable", never a false "up to date"), and **anti-rollback** (only a strictly-newer tag is reported — never a downgrade). The Regional Server runs the check on behalf of the MC and the analyst clients; analyst clients never call out. Notification is a persistent, dismissible in-app banner, plus an optional once-per-version notice to the lead through their configured channel. The full behavior is documented in `docs/automatic-updates.md`.
 
 **Workflow:**
 
-1. Update available — lead notified through configured channel
-1. Lead opens Updates tab
-1. Lead chooses destination: lab environment, alternate repository, or directly to production (rare; usually for emergency hotfixes)
-1. Update package is fetched and routed to the chosen destination
-1. (For lab destination) Org’s developers run their own regression and security tests in the lab — possibly using FireAlive’s built-in regression runner inside the lab, or their own tools
-1. Org’s change management process approves or rejects the update independently
-1. After approval: lead returns to Updates tab and pushes the update from lab to production
-1. Production deployment: rolling restart, fuse counter increment, audit log entry
+1. (Optional) Lead enables automatic checks on the Updates tab and sets a frequency (daily/weekly/monthly) and time (UTC); the check is off until enabled
+1. On the schedule — or when the lead clicks **Check now** — the Regional Server queries GitHub Releases for the newest stable release
+1. If a strictly-newer release exists, a persistent banner appears and (if enabled) the lead is notified once for that version through their configured channel
+1. Lead opens the linked GitHub release and reads the release notes
+1. Lead downloads the installer and validates it through the org’s change-management process (lab/staging, regression, security review) — FireAlive’s regression runner is available for this
+1. Lead installs the new release on the production host; the anti-rollback fuse advances and refuses any later downgrade
+1. Each check is recorded in `auto_update_check_log` and audited; the banner clears automatically once the running version catches up
 
 ### Troubleshooter
 
