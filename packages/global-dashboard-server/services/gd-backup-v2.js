@@ -58,6 +58,8 @@ const signingKeysSvc = require('./gd-backup-signing-keys');
 const chainSvc = require('./gd-backup-chain');
 const storageRouting = require('./gd-storage-routing');
 const storagePush = require('./gd-storage-push');
+const walExtractor = require('./gd-wal-extractor');
+const walCheckpoint = require('./gd-wal-checkpoint');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -74,6 +76,10 @@ function resolveDbPath(options) {
   return (options && options.dbPath)
     || process.env.GD_DB_PATH
     || path.join(__dirname, '..', 'data', 'global-dashboard.db');
+}
+
+function resolveWalPath(options) {
+  return resolveDbPath(options) + '-wal';
 }
 
 function ensureDir(dir) {
@@ -401,8 +407,24 @@ async function performV2Backup(db, options = {}) {
   `).run(backupId, signingKey.id);
 
   try {
-    // 1. Consistent snapshot -> bytes
-    const dbBytes = snapshotDbBytes(db, backupsDir, backupId, options);
+    // 1. Consistent snapshot -> bytes, capturing the WAL baseline so this full
+    // backup can anchor incrementals. Read the WAL tail BEFORE the VACUUM (so the
+    // recorded position is at/behind the snapshot's consistent point -- an
+    // incremental capturing from it overlaps safely and never gaps), and hold
+    // autocheckpoint off across both so the WAL isn't re-salted in between. A DB
+    // not in WAL mode simply records no baseline (incrementals then escalate).
+    let walEndPosition = null;
+    let dbBytes;
+    await walCheckpoint.withAutoCheckpointDisabled(db, async () => {
+      const walPath = resolveWalPath(options);
+      if (fs.existsSync(walPath)) {
+        const pos = walExtractor.getWalCurrentPosition(walPath);
+        if (pos.exists) {
+          walEndPosition = walExtractor.serializeWalPosition({ offset: pos.offset, frameNo: pos.frameNo });
+        }
+      }
+      dbBytes = snapshotDbBytes(db, backupsDir, backupId, options);
+    });
 
     // 2. tar + gzip + AES-256-GCM
     const archive = await archiveSvc.buildArchive(dbBytes, 'global-dashboard.db', { compressionLevel });
@@ -468,6 +490,7 @@ async function performV2Backup(db, options = {}) {
           manifest_sig_path = ?,
           wrapped_key_path = ?,
           destination = ?,
+          wal_end_position = ?,
           retention_until = datetime('now', ?)
       WHERE id = ?
     `).run(
@@ -478,6 +501,7 @@ async function performV2Backup(db, options = {}) {
       manifestSigPath,
       wrappedKeyPath,
       archivePath,
+      walEndPosition,
       `+${retentionDays} days`,
       backupId,
     );
@@ -559,6 +583,7 @@ async function performV2Backup(db, options = {}) {
       size_bytes: totalSize,
       manifest_sha256: manifestSha256,
       status: 'verified',
+      wal_end_position: walEndPosition,
       chain_entry: chainEntry,
       chain_error: chainError,
       push,
