@@ -37,7 +37,7 @@ const gdIntegrationHealth = require('./services/gd-integration-health');
 const { GdMetricsCollector } = require('./services/gd-metrics-collector');
 const { configLockChokepoint } = require('./services/gd-config-lock');
 const { isGdConfigWriteRequest } = require('./services/gd-config-write-routes');
-const gdBackup = require('./services/gd-backup');
+const gdBackupFullSuite = require('./services/gd-backup-full-suite');
 const storageRouting = require('./services/gd-storage-routing');
 const storagePush = require('./services/gd-storage-push');
 const backupV2 = require('./services/gd-backup-v2');
@@ -4195,12 +4195,13 @@ function runGdRegression(db) {
     const v2 = require('./services/gd-backup-v2');
     const inc = require('./services/gd-backup-incremental');
     const diff = require('./services/gd-backup-differential');
-    const base = require('./services/gd-backup');
+    const fullSuite = require('./services/gd-backup-full-suite');
     if (typeof v2.performV2Backup !== 'function') throw new Error('performV2Backup missing');
+    if (typeof v2.performSnapshotBackup !== 'function') throw new Error('performSnapshotBackup missing');
     if (typeof inc.performIncrementalBackup !== 'function') throw new Error('performIncrementalBackup missing');
     if (typeof diff.performDifferentialBackup !== 'function') throw new Error('performDifferentialBackup missing');
-    if (typeof base.performFullSuiteBackup !== 'function' || typeof base.performSnapshot !== 'function') throw new Error('full-suite/snapshot missing');
-    return 'v2, incremental, differential, full-suite, snapshot callable';
+    if (typeof fullSuite.performFullSuiteBackup !== 'function') throw new Error('full-suite missing');
+    return 'v2, snapshot, incremental, differential, full-suite callable (all encrypted)';
   });
   record('backup_strategy', 'v2 lineage columns present', () => {
     const cols = db.prepare('PRAGMA table_info(backups)').all().map((c) => c.name);
@@ -4690,35 +4691,11 @@ app.post('/api/cicd/webhook-secret/rotate', authMiddleware(['ciso']), (req, res)
 
 // ── Full-Suite Backup (R3k C33, Sub-phase 6 final) ───────────────────────────
 //
-// GD-side adaptation of MC's R3k C7+C8 full-suite backup. The MC
-// full-suite path sits atop a v2 backup engine (separate manifest +
-// archive + signature + wrapped-key files). GD has only v1 backups
-// (single tar.gz at backups.destination, SHA-256 in backups.hash),
-// so this is a v1-shape implementation rather than a v2 extension:
-//
-//   Output:    data/backups/<id>-firealive-gd-full-suite.tar.gz
-//   Archive:   global-dashboard.db
-//              config-snapshot.json    (all rows from config table)
-//              version-manifest.json   (version, fuse, build_id,
-//                                       MCs total/active, signing_keys
-//                                       total/active, captured_at)
-//   Hash:      SHA-256 of the tar.gz, stored in backups.hash.
-//   DB row:    backups.type='full', destination=<archive path>,
-//              size_bytes, hash, status='completed'.
-//
-// The destination filename embeds the literal token 'full-suite' so
-// operators (and the future restore path) can distinguish full-suite
-// archives from plain v1 single-DB snapshots by inspection, without
-// the schema needing a 'kind' column. The R3k C26 regression runner's
-// "backups v2-aware" check will continue to report fail on GD since
-// the v2 columns it asserts are intentionally absent here — that
-// gap stays diagnostic surface noting the GD's v1 posture.
-//
-// SIGNING: deferred. MC's full-suite is signed via the v2 manifest
-// signature. The GD v1 shape doesn't have manifest separation; a
-// future migration to a v2-style backup engine on GD would unlock
-// cosign-signed archives. For now, the SHA-256 in backups.hash
-// provides tamper-detect integrity.
+// Full-suite backup: the complete-state DR archive (DB snapshot + config
+// snapshot + version manifest), produced by gd-backup-full-suite through the
+// v2 encrypted-and-signed pipeline -- four-file layout (encrypted archive +
+// wrapped key + signed manifest + signature), recorded type='full'
+// format_version=2, chain-attested, routed + pushed. No plaintext at rest.
 //
 //   POST /api/backup/full-suite   ciso
 
@@ -4726,8 +4703,8 @@ app.post('/api/backup/full-suite', authMiddleware(['ciso']), async (req, res) =>
   let db;
   try {
     db = getDb();
-    const result = await gdBackup.performFullSuiteBackup(db, {});
-    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'FULL_SUITE_BACKUP_CREATED', detail: `id=${result.id} size=${result.size_bytes} hash=${result.hash.slice(0, 16)}`, severity: 'info' });
+    const result = await gdBackupFullSuite.performFullSuiteBackup(db, {});
+    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'FULL_SUITE_BACKUP_CREATED', detail: `id=${result.id} size=${result.size_bytes} manifest=${(result.manifest_sha256 || '').slice(0, 16)}`, severity: 'info' });
     db.close();
     res.json(result);
   } catch (err) {
@@ -5898,7 +5875,6 @@ const gdStorageRetryTimer = setInterval(() => {
   let db;
   try { db = getDb(); } catch (e) { console.error('GD storage retry-sweep: getDb failed:', e.message); return; }
   Promise.resolve()
-    .then(() => gdBackup.retryDueBackupPushes(db))
     .then(() => backupV2.retryDueV2BackupPushes(db))
     .then(() => archiveSegment.retryPendingSegmentPushes(db))
     .then(() => storagePush.retryDuePushes(db, { pushTable: 'forensic_export_pushes', rebuildContext: rebuildForensicExportContext }))
@@ -6014,8 +5990,8 @@ function gdScheduleIsDue(schedule, now) {
 async function gdRunScheduledBackup(db, schedule) {
   const type = String(schedule.type || 'full').toLowerCase();
   if (type === 'v2' || type === 'full') return backupV2.performV2Backup(db, {});
-  if (type === 'full-suite') return gdBackup.performFullSuiteBackup(db, {});
-  if (type === 'snapshot') return gdBackup.performSnapshot(db, {});
+  if (type === 'full-suite') return gdBackupFullSuite.performFullSuiteBackup(db, {});
+  if (type === 'snapshot') return backupV2.performSnapshotBackup(db, {});
   if (type === 'incremental') {
     const r = await incrementalSvc.performIncrementalBackup(db, {});
     if (!r.ok) throw new Error(r.error || 'incremental backup failed');

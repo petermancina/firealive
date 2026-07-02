@@ -150,6 +150,30 @@ does not create one. See **Shared responsibility**.
 
 ---
 
+## Fleet residency (Global Dashboard)
+
+The Global Dashboard oversees a fleet of Management Consoles, and its residency
+posture surfaces one dimension the MC does not have: **where the consoles in the
+fleet themselves sit**. Each active management console carries a region and,
+optionally, a declared country and regulatory framework. The GD's
+`GET /api/data-residency/posture` returns a `fleet` block that, for every active
+console, resolves its jurisdiction — the declared country, else inferred from its
+region (a cloud region mapped to a country), else undeclared — and flags whether
+its flow **to** the GD crosses a border: a console whose jurisdiction differs from
+the GD's declared primary residency is marked cross-border. The block carries the
+per-console verdicts, a cross-border count, and a by-country rollup, and the GD
+console renders it under **Data Sovereignty → Console fleet residency**.
+
+Fleet residency is **record-and-surface only**. Unlike a routed backup
+destination, an MC-to-GD flow is never blocked — surfacing a cross-border console
+is a compliance signal for the CISO to review and document, not a gate. This is a
+hard invariant of the trust-realm boundary: the GD enforces residency only on its
+**own** routed storage destinations (see **Interaction with Storage Routing**),
+never on the consoles that report to it. Offboarded and inactive consoles are
+excluded; with no declared GD primary residency, nothing is cross-border.
+
+---
+
 ## Cloud self-region detection
 
 In Cloud Mode, FireAlive reads the deployment's region from the instance metadata

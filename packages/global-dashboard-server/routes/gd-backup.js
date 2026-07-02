@@ -20,8 +20,8 @@
 //
 // Trigger dispatch:
 //   v2 / full    -> gd-backup-v2.performV2Backup            (WAL-tracked v2 full)
-//   full-suite   -> gd-backup.performFullSuiteBackup        (v1-shape comprehensive)
-//   snapshot     -> gd-backup.performSnapshot               (v1-shape point-in-time)
+//   full-suite   -> gd-backup-full-suite.performFullSuiteBackup  (encrypted comprehensive)
+//   snapshot     -> gd-backup-v2.performSnapshotBackup       (encrypted point-in-time)
 //   incremental  -> gd-backup-incremental.performIncrementalBackup
 //   differential -> gd-backup-differential.performDifferentialBackup
 //
@@ -44,7 +44,7 @@ const router = require('express').Router();
 const { getDb } = require('../db-init');
 const { appendGdAuditEntry } = require('../services/gd-audit-chain');
 const backupV2 = require('../services/gd-backup-v2');
-const backupSvc = require('../services/gd-backup');
+const fullSuiteSvc = require('../services/gd-backup-full-suite');
 const incrementalSvc = require('../services/gd-backup-incremental');
 const differentialSvc = require('../services/gd-backup-differential');
 const chainSvc = require('../services/gd-backup-chain');
@@ -113,12 +113,10 @@ router.post('/', async (req, res) => {
     if (requestedStrategy === 'v2' || requestedStrategy === 'full') {
       result = await backupV2.performV2Backup(db, {});
     } else if (requestedStrategy === 'full-suite') {
-      result = await backupSvc.performFullSuiteBackup(db, {});
-      if (result && result.format_version === undefined) result.format_version = 1;
+      result = await fullSuiteSvc.performFullSuiteBackup(db, {});
       actualStrategy = 'full-suite';
     } else if (requestedStrategy === 'snapshot') {
-      result = await backupSvc.performSnapshot(db, {});
-      if (result && result.format_version === undefined) result.format_version = 1;
+      result = await backupV2.performSnapshotBackup(db, {});
       actualStrategy = 'snapshot';
     } else if (requestedStrategy === 'incremental') {
       const incResult = await incrementalSvc.performIncrementalBackup(db, {});

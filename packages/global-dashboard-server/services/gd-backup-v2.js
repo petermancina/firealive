@@ -274,8 +274,8 @@ function removeBackupArtifactDir(backupRow, backupsDir) {
 // backup_pushes row per destination (primary + optional secondary). A backup
 // with no route stays on-host. Mirrors gd-backup.js's push wiring for the
 // four-file artifact.
-async function pushV2BackupArtifact(db, { backupId, sourceDir, files, manifestSha256, options = {} }) {
-  const route = storageRouting.getRouteForType(db, 'backup');
+async function pushV2BackupArtifact(db, { backupId, sourceDir, files, manifestSha256, dataType = 'backup', options = {} }) {
+  const route = storageRouting.getRouteForType(db, dataType);
   if (!route.configured || !route.destinations || route.destinations.length === 0) {
     return { pushed: false, configured: false, reason: 'no destination configured' };
   }
@@ -367,13 +367,14 @@ async function retryDueV2BackupPushes(db, options = {}) {
  *   retentionDays       retention window applied to this backup's retention_until
  *   sourceFuseCounter / sourceSchemaVersion  manifest source metadata overrides
  *
- * Returns { id, format_version: 2, type: 'full', backup_dir, manifest_path,
+ * Returns { id, format_version: 2, type: 'full'|'snapshot', backup_dir, manifest_path,
  * archive_path, manifest_sig_path, wrapped_key_path, size_bytes, manifest_sha256,
  * status: 'verified', chain_entry, chain_error, push }.
  *
  * Throws on failure of the backup itself (row already marked 'failed').
  */
 async function performV2Backup(db, options = {}) {
+  const mode = options.mode === 'snapshot' ? 'snapshot' : 'full';
   const backupsDir = resolveBackupsDir(options);
   const compressionLevel = options.compressionLevel != null ? options.compressionLevel : archiveSvc.DEFAULT_GZIP_LEVEL;
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;
@@ -403,24 +404,28 @@ async function performV2Backup(db, options = {}) {
 
   db.prepare(`
     INSERT INTO backups (id, type, status, format_version, signing_key_id, created_at)
-    VALUES (?, 'full', 'running', 2, ?, datetime('now'))
-  `).run(backupId, signingKey.id);
+    VALUES (?, ?, 'running', 2, ?, datetime('now'))
+  `).run(backupId, mode, signingKey.id);
 
   try {
-    // 1. Consistent snapshot -> bytes, capturing the WAL baseline so this full
-    // backup can anchor incrementals. Read the WAL tail BEFORE the VACUUM (so the
-    // recorded position is at/behind the snapshot's consistent point -- an
-    // incremental capturing from it overlaps safely and never gaps), and hold
-    // autocheckpoint off across both so the WAL isn't re-salted in between. A DB
-    // not in WAL mode simply records no baseline (incrementals then escalate).
+    // 1. Consistent snapshot -> bytes. A 'full' also captures the WAL baseline so it
+    // can anchor incrementals: read the WAL tail BEFORE the VACUUM (so the recorded
+    // position is at/behind the snapshot's consistent point -- an incremental
+    // capturing from it overlaps safely and never gaps), holding autocheckpoint off
+    // across both so the WAL isn't re-salted in between. A 'snapshot' is a standalone
+    // point-in-time backup: it records no WAL baseline and never anchors an
+    // incremental. A DB not in WAL mode records no baseline either (incrementals then
+    // escalate).
     let walEndPosition = null;
     let dbBytes;
     await walCheckpoint.withAutoCheckpointDisabled(db, async () => {
-      const walPath = resolveWalPath(options);
-      if (fs.existsSync(walPath)) {
-        const pos = walExtractor.getWalCurrentPosition(walPath);
-        if (pos.exists) {
-          walEndPosition = walExtractor.serializeWalPosition({ offset: pos.offset, frameNo: pos.frameNo });
+      if (mode === 'full') {
+        const walPath = resolveWalPath(options);
+        if (fs.existsSync(walPath)) {
+          const pos = walExtractor.getWalCurrentPosition(walPath);
+          if (pos.exists) {
+            walEndPosition = walExtractor.serializeWalPosition({ offset: pos.offset, frameNo: pos.frameNo });
+          }
         }
       }
       dbBytes = snapshotDbBytes(db, backupsDir, backupId, options);
@@ -439,7 +444,7 @@ async function performV2Backup(db, options = {}) {
     // 4. Build the canonical manifest
     const manifestObj = manifestSvc.buildManifest({
       backupId,
-      backupType: 'full',
+      backupType: mode,
       fileHashes: {
         archive:    { sizeBytes: archive.sizeBytes, sha256: archive.sha256 },
         wrappedKey: { sizeBytes: wrappedKey.length,  sha256: wrappedKeySha },
@@ -520,7 +525,7 @@ async function performV2Backup(db, options = {}) {
         eventType: 'CREATE',
         backupId,
         payload: {
-          backup_type: 'full',
+          backup_type: mode,
           format_version: 2,
           manifest_sha256: manifestSha256,
           archive_sha256: archiveEntry ? archiveEntry.sha256 : null,
@@ -560,7 +565,8 @@ async function performV2Backup(db, options = {}) {
     if (hashed.ok) {
       try {
         push = await pushV2BackupArtifact(db, {
-          backupId, sourceDir: finalDir, files: hashed.files, manifestSha256, options,
+          backupId, sourceDir: finalDir, files: hashed.files, manifestSha256,
+          dataType: mode === 'snapshot' ? 'snapshot' : 'backup', options,
         });
       } catch (pushErr) {
         console.error('gd-backup-v2: push orchestration crashed:', pushErr.message);
@@ -574,7 +580,7 @@ async function performV2Backup(db, options = {}) {
     return {
       id: backupId,
       format_version: 2,
-      type: 'full',
+      type: mode,
       backup_dir: finalDir,
       manifest_path: manifestPath,
       archive_path: archivePath,
@@ -605,9 +611,18 @@ async function performV2Backup(db, options = {}) {
   }
 }
 
+// Convenience wrapper: a standalone point-in-time single-DB backup. Same encrypted
+// four-file artifact as a full backup, recorded type='snapshot' and routed to the
+// snapshot category, but with no WAL baseline -- a snapshot is never an incremental
+// anchor.
+async function performSnapshotBackup(db, options = {}) {
+  return performV2Backup(db, { ...options, mode: 'snapshot' });
+}
+
 module.exports = {
   // public API
   performV2Backup,
+  performSnapshotBackup,
   cleanOldBackups,
   retryDueV2BackupPushes,
 

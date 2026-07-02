@@ -906,6 +906,17 @@ export default function GlobalDashboard() {
   // R3k C41 — GD Full-suite backup wiring
   const [gdBackupBusy, setGdBackupBusy] = useState(false);
   const [gdBackupResult, setGdBackupResult] = useState(null);
+  const [gdBackupStrategy, setGdBackupStrategy] = useState("v2");
+  const [gdBackups, setGdBackups] = useState([]);
+  const [gdVerifyResults, setGdVerifyResults] = useState({});
+  const [gdVerifyingId, setGdVerifyingId] = useState(null);
+  const [gdChain, setGdChain] = useState(null);
+  const [gdChainVerify, setGdChainVerify] = useState(null);
+  const [gdChainBusy, setGdChainBusy] = useState(false);
+  const [dataSov, setDataSov] = useState(null);
+  const [dataSovCfg, setDataSovCfg] = useState(null);
+  const [dataSovSaving, setDataSovSaving] = useState(false);
+  const [dataSovMsg, setDataSovMsg] = useState(null);
   const [welcomeStep, setWelcomeStep] = useState(0);
   const [queryText, setQueryText] = useState("");
   const [queryResults, setQueryResults] = useState(null);
@@ -1188,7 +1199,63 @@ export default function GlobalDashboard() {
     api.get('/api/system/health-metrics').then(r => {
       if (r && !r.error) setGdHealth(r);
     });
+    api.get('/api/backup').then(r => {
+      if (r && !r.error) setGdBackups(r.backups || []);
+    });
+    api.get('/api/backup/chain').then(r => {
+      if (r && !r.error) setGdChain(r);
+    });
   }, [stage, tab]);
+
+  // Load the live data-residency posture and the editable policy config when the
+  // Data Sovereignty tab is active.
+  useEffect(() => {
+    if (stage !== "app" || tab !== "data_sov") return;
+    api.get('/api/data-residency/posture').then(r => {
+      if (r && !r.error) setDataSov(r);
+    });
+    api.get('/api/data-residency/config').then(r => {
+      if (r && !r.error) setDataSovCfg(r);
+    });
+  }, [stage, tab]);
+
+  // Update one category's mode or permitted regions in the editable policy.
+  const setDataSovCat = (cat, field, value) => setDataSovCfg(cfg => ({
+    ...cfg,
+    categories: { ...(cfg.categories || {}), [cat]: { ...((cfg.categories || {})[cat] || {}), [field]: value } },
+  }));
+
+  // Save the edited policy, then refresh the posture so the verdicts below update.
+  const saveDataSovCfg = async () => {
+    if (!dataSovCfg) return;
+    setDataSovSaving(true); setDataSovMsg(null);
+    const r = await api.put('/api/data-residency/config', dataSovCfg);
+    if (r.error) {
+      setDataSovMsg({ ok: false, text: r.message || r.error });
+    } else {
+      setDataSovMsg({ ok: true, text: 'Policy saved.' });
+      const p = await api.get('/api/data-residency/posture');
+      if (p && !p.error) setDataSov(p);
+    }
+    setDataSovSaving(false);
+  };
+
+  // Verify a single backup: the server re-hashes the archive and manifest and checks
+  // the Ed25519 signature, returning verified / tampered / missing.
+  const verifyGdBackup = async (id) => {
+    setGdVerifyingId(id);
+    const r = await api.post(`/api/backup/${id}/verify`, {});
+    setGdVerifyResults(prev => ({ ...prev, [id]: r && r.error ? { status: 'error', message: r.message || r.error } : r }));
+    setGdVerifyingId(null);
+  };
+
+  // Verify the whole attestation chain: hash linkage plus each entry's signature.
+  const verifyGdChain = async () => {
+    setGdChainBusy(true); setGdChainVerify(null);
+    const r = await api.post('/api/backup/chain/verify', {});
+    setGdChainVerify(r && r.error ? { ok: false, reason: r.message || r.error } : r);
+    setGdChainBusy(false);
+  };
 
   // Load the GD-Server app version once the app is entered (any role), so the
   // header, footer, and App Updates view show the live shipped version instead
@@ -2672,29 +2739,77 @@ export default function GlobalDashboard() {
               ))}
             </Card>
             <Card style={{marginBottom:12}}>
-              <Btn primary disabled={gdBackupBusy} onClick={async()=>{
-                setGdBackupBusy(true);setGdBackupResult(null);
-                const r=await api.post("/api/backup/full-suite",{});
-                if(r.error){
-                  setGdBackupResult({ok:false,message:r.message||r.error});
-                }else{
-                  setGdBackupResult({ok:true,data:r});
-                  setGdAudit(a=>[{ts:new Date().toISOString(),event:"FULL_SUITE_BACKUP_CREATED",detail:"id="+r.id+" size="+r.size_bytes+" hash="+(r.hash||"").slice(0,16)},...a]);
-                }
-                setGdBackupBusy(false);
-              }}>{gdBackupBusy?"Creating full-suite backup...":"Trigger Manual Backup Now"}</Btn>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Create Backup</div>
+              <M style={{color:C.tm,display:"block",marginBottom:10}}>Encrypted v2 backups are WAL-tracked and chain-attested. Incremental and differential capture deltas against the last full and escalate to a full automatically when no baseline exists. Full-suite captures complete state (database, configs, version manifest).</M>
+              <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,alignItems:"end"}}>
+                <Sel label="Strategy" value={gdBackupStrategy} onChange={e=>setGdBackupStrategy(e.target.value)}>
+                  <option value="v2">Full — encrypted (v2)</option>
+                  <option value="incremental">Incremental</option>
+                  <option value="differential">Differential</option>
+                  <option value="snapshot">Snapshot</option>
+                  <option value="full-suite">Full-suite — complete state</option>
+                </Sel>
+                <Btn primary disabled={gdBackupBusy} onClick={async()=>{
+                  setGdBackupBusy(true);setGdBackupResult(null);
+                  const r=await api.post("/api/backup",{strategy:gdBackupStrategy});
+                  if(r.error){
+                    setGdBackupResult({ok:false,message:r.message||r.error});
+                  }else{
+                    setGdBackupResult({ok:true,data:r});
+                    setGdAudit(a=>[{ts:new Date().toISOString(),event:"BACKUP_CREATED",detail:"id="+(r.id||"?")+" strategy="+(r.actual_strategy||gdBackupStrategy)+(r.escalated?" (escalated: "+r.escalation_reason+")":"")},...a]);
+                    api.get('/api/backup').then(l=>{if(l&&!l.error)setGdBackups(l.backups||[]);});
+                  }
+                  setGdBackupBusy(false);
+                }}>{gdBackupBusy?"Creating backup...":"Create backup"}</Btn>
+              </div>
               {gdBackupResult&&gdBackupResult.ok&&<Card style={{marginTop:10,padding:10,borderColor:C.a+"30"}}>
-                <div style={{fontSize:11,fontWeight:500,color:C.a,marginBottom:6}}>Full-suite backup created</div>
-                <M style={{color:C.tm,display:"block",marginBottom:2}}>Backup ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{gdBackupResult.data.id}</span></M>
-                <M style={{color:C.tm,display:"block",marginBottom:2}}>Size: {(gdBackupResult.data.size_bytes/1024/1024).toFixed(2)} MB</M>
-                <M style={{color:C.tm,display:"block",marginBottom:2}}>Archive: <code style={{background:C.s,padding:"2px 4px",borderRadius:3,fontSize:9}}>{gdBackupResult.data.destination}</code></M>
-                <M style={{color:C.tm,display:"block",marginBottom:2}}>SHA-256: <span style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:9}}>{(gdBackupResult.data.hash||"").slice(0,32)}...</span></M>
-                {gdBackupResult.data.manifest&&<M style={{color:C.td,display:"block",marginTop:4,fontSize:9}}>Format: {gdBackupResult.data.manifest.format} · MCs: {gdBackupResult.data.manifest.management_consoles.active}/{gdBackupResult.data.manifest.management_consoles.total} active</M>}
+                <div style={{fontSize:11,fontWeight:500,color:C.a,marginBottom:6}}>Backup created{gdBackupResult.data.escalated?" (escalated to full)":""}</div>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>ID: <span style={{fontFamily:"'IBM Plex Mono',monospace",color:C.t}}>{gdBackupResult.data.id}</span></M>
+                <M style={{color:C.tm,display:"block",marginBottom:2}}>Strategy: {gdBackupResult.data.actual_strategy||gdBackupResult.data.type||"—"}{gdBackupResult.data.format_version?" · format v"+gdBackupResult.data.format_version:""}</M>
+                {gdBackupResult.data.size_bytes!=null&&<M style={{color:C.tm,display:"block",marginBottom:2}}>Size: {(gdBackupResult.data.size_bytes/1024/1024).toFixed(2)} MB</M>}
+                {gdBackupResult.data.wal_end_position&&<M style={{color:C.td,display:"block",fontSize:9}}>WAL position: {gdBackupResult.data.wal_end_position}{gdBackupResult.data.page_count!=null?" · "+gdBackupResult.data.page_count+" pages":""}</M>}
+                {gdBackupResult.data.manifest_sha256&&<M style={{color:C.td,display:"block",fontSize:9}}>Manifest SHA-256: {(gdBackupResult.data.manifest_sha256||"").slice(0,32)}...</M>}
+                {gdBackupResult.data.escalation_reason&&<M style={{color:C.w,display:"block",fontSize:9,marginTop:2}}>Escalation reason: {gdBackupResult.data.escalation_reason}</M>}
               </Card>}
               {gdBackupResult&&!gdBackupResult.ok&&<Card style={{marginTop:10,padding:10,borderColor:C.d+"40"}}>
                 <div style={{fontSize:11,fontWeight:500,color:C.d,marginBottom:4}}>Backup failed</div>
                 <M style={{color:C.tm,lineHeight:1.6,display:"block"}}>{gdBackupResult.message}</M>
               </Card>}
+            </Card>
+            <Card style={{marginBottom:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Backup attestation chain</div>
+                <Btn small disabled={gdChainBusy} onClick={verifyGdChain}>{gdChainBusy?"Verifying...":"Verify chain"}</Btn>
+              </div>
+              {!gdChain?<M style={{color:C.td,fontStyle:"italic"}}>Loading chain state...</M>:(
+                <M style={{color:C.tm,display:"block"}}>{gdChain.totalEntries} entr{gdChain.totalEntries===1?"y":"ies"}{gdChain.head?" · head "+gdChain.head.eventType+" ("+String(gdChain.head.id).slice(0,8)+")":" · no entries yet"}</M>
+              )}
+              {gdChainVerify&&(<div style={{marginTop:8,padding:"8px 10px",background:C.s,borderRadius:4,borderLeft:`2px solid ${gdChainVerify.ok?C.a:C.d}`}}>
+                {gdChainVerify.ok
+                  ? <M style={{color:C.a}}>Chain intact — {gdChainVerify.entriesVerified} entries verified.</M>
+                  : <M style={{color:C.d}}>Chain broken{gdChainVerify.brokenAtId?" at "+String(gdChainVerify.brokenAtId).slice(0,8):""}: {gdChainVerify.reason||gdChainVerify.detail||"verification failed"}</M>}
+              </div>)}
+            </Card>
+            <Card style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Recent backups</div>
+              {gdBackups.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No backups recorded yet.</M>:gdBackups.slice(0,12).map(b=>{
+                const v=gdVerifyResults[b.id];
+                return <div key={b.id} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 78px 84px 116px 62px",gap:8,alignItems:"center"}}>
+                    <M style={{color:C.t,fontSize:10}}>{b.type}{b.format_version===2?" · v2":""}</M>
+                    <M style={{color:C.tm,fontSize:10}}>{b.size_bytes!=null?(b.size_bytes/1024/1024).toFixed(1)+" MB":"—"}</M>
+                    <Badge color={b.status==="verified"||b.status==="completed"?C.a:b.status==="failed"?C.d:C.w}>{b.status}</Badge>
+                    <M style={{color:C.td,fontSize:9}}>{b.created_at?new Date(String(b.created_at).replace(" ","T")+"Z").toLocaleString():"—"}</M>
+                    <Btn small disabled={gdVerifyingId===b.id} onClick={()=>verifyGdBackup(b.id)}>{gdVerifyingId===b.id?"...":"Verify"}</Btn>
+                  </div>
+                  {v&&(<div style={{marginTop:6,padding:"6px 8px",background:C.s,borderRadius:4,borderLeft:`2px solid ${v.status==="verified"?C.a:v.status==="tampered"?C.d:C.w}`}}>
+                    <Badge color={v.status==="verified"?C.a:v.status==="tampered"?C.d:v.status==="missing"?C.w:C.td}>{v.status}</Badge>
+                    {v.checks&&<M style={{color:C.tm,display:"block",marginTop:4,fontSize:9}}>manifest {v.checks.manifestHash&&v.checks.manifestHash.matches?"ok":"MISMATCH"} · signature {v.checks.signature&&v.checks.signature.valid?"valid":"INVALID"} · archive {v.checks.archiveHash&&v.checks.archiveHash.matches?"ok":"MISMATCH"} · key {v.checks.wrappedKeyHash&&v.checks.wrappedKeyHash.matches?"ok":"MISMATCH"}</M>}
+                    {v.format_version===1&&<M style={{color:C.tm,display:"block",marginTop:4,fontSize:9}}>stored {(v.storedHash||"").slice(0,12)} vs current {(v.currentHash||"").slice(0,12)} — {v.matches?"match":"MISMATCH"}</M>}
+                    {v.message&&<M style={{color:C.td,display:"block",marginTop:4,fontSize:9}}>{v.message}</M>}
+                  </div>)}
+                </div>;
+              })}
             </Card>
             <Card>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Restore from Backup</div>
@@ -2708,20 +2823,73 @@ export default function GlobalDashboard() {
 
           {/* ══════════ DATA SOVEREIGNTY ══════════ */}
           {tab==="data_sov"&&(<div>
-            <L>Data Sovereignty & Geo-Fencing</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Ensure aggregate data from regional MCs respects jurisdictional data residency requirements. The GD Server stores only aggregate metrics, never individual analyst data.</M>
-            <Card style={{marginBottom:12}}>
-              {[{region:"EU/EEA",framework:"GDPR",status:"Not assessed"},{region:"US",framework:"SOX / HIPAA",status:"Not assessed"},{region:"UK",framework:"UK GDPR",status:"Not assessed"},{region:"APAC",framework:"PDPA / PIPL",status:"Not assessed"}].map((r,i)=>(
-                <div key={i} style={{padding:"8px 0",borderBottom:`1px solid ${C.b}`,display:"flex",justifyContent:"space-between"}}>
-                  <M style={{color:C.t}}>{r.region} ({r.framework})</M>
-                  <Badge color={r.status==="Not assessed"?C.a:C.w}>{r.status}</Badge>
+            <L>Data Sovereignty &amp; Geo-Fencing</L>
+            <M style={{color:C.tm,display:"block",marginBottom:16}}>Where this Global Dashboard's own backups and archives are permitted to reside, and where the managed console fleet sits. Enforcement applies to the GD's routed storage destinations; fleet residency is recorded and surfaced for review, never used to block a management console. Sourced from <code>/api/data-residency/posture</code>.</M>
+            {dataSovCfg&&(<Card style={{marginBottom:16}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.t,marginBottom:12}}>Configure residency policy</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+                <Sel label="Enforcement" value={dataSovCfg.enabled?"on":"off"} onChange={e=>setDataSovCfg({...dataSovCfg,enabled:e.target.value==="on"})}>
+                  <option value="off">Off — record only</option>
+                  <option value="on">On — enforce policy</option>
+                </Sel>
+                <Sel label="Declared primary residency" value={(dataSovCfg.primaryResidency&&dataSovCfg.primaryResidency.country)||""} onChange={e=>setDataSovCfg({...dataSovCfg,primaryResidency:{...(dataSovCfg.primaryResidency||{}),country:e.target.value||null}})}>
+                  <option value="">Not set</option>
+                  {[["US","United States"],["CA","Canada"],["GB","United Kingdom"],["DE","Germany"],["FR","France"],["CH","Switzerland"],["SE","Sweden"],["IE","Ireland"],["IL","Israel"],["AE","United Arab Emirates"],["IN","India"],["SG","Singapore"],["JP","Japan"],["KR","South Korea"],["AU","Australia"],["ZA","South Africa"],["BR","Brazil"]].map(o=><option key={o[0]} value={o[0]}>{o[1]} ({o[0]})</option>)}
+                </Sel>
+              </div>
+              <div style={{fontSize:11,color:C.tm,margin:"2px 0 10px"}}>Per-category rules. Permitted regions are comma-separated ISO country codes or blocs (e.g. US, EU, UK, EEA). Enforce blocks a non-compliant destination; warn records it.</div>
+              {["backup","audit_log","forensic_export","snapshot","cef_archive"].map(cat=>{
+                const sc=(dataSovCfg.categories&&dataSovCfg.categories[cat])||{mode:"warn",permittedRegions:[]};
+                return <div key={cat} style={{display:"grid",gridTemplateColumns:"150px 110px 1fr",gap:10,alignItems:"center",marginBottom:8}}>
+                  <M style={{color:C.tm}}>{cat}</M>
+                  <select value={sc.mode||"warn"} onChange={e=>setDataSovCat(cat,"mode",e.target.value)} style={{padding:8,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11}}>
+                    <option value="warn">warn</option><option value="enforce">enforce</option>
+                  </select>
+                  <input value={(sc.permittedRegions||[]).join(", ")} onChange={e=>setDataSovCat(cat,"permittedRegions",e.target.value.split(",").map(s=>s.trim()).filter(Boolean))} placeholder="US, EU" style={{padding:8,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11}}/>
+                </div>;
+              })}
+              <div style={{display:"flex",gap:12,alignItems:"center",marginTop:12}}>
+                <Btn primary disabled={dataSovSaving} onClick={saveDataSovCfg}>{dataSovSaving?"Saving...":"Save policy"}</Btn>
+                {dataSovMsg&&<M style={{color:dataSovMsg.ok?C.a:C.d}}>{dataSovMsg.text}</M>}
+              </div>
+            </Card>)}
+            {!dataSov?<M style={{color:C.tm}}>Loading residency posture...</M>:(<div>
+              <Card>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <div style={{fontSize:13,fontWeight:600,color:C.t}}>Residency policy</div>
+                  <Badge color={dataSov.enabled?C.a:C.td}>{dataSov.enabled?"ENFORCED":"OFF"}</Badge>
                 </div>
+                <M style={{color:C.tm,display:"block"}}>Declared primary residency: <span style={{color:C.t}}>{dataSov.primaryResidency.declared.country||"not set"}</span>{dataSov.primaryResidency.declared.region?" · "+dataSov.primaryResidency.declared.region:""}{dataSov.primaryResidency.declared.providerDomicile?" · provider "+dataSov.primaryResidency.declared.providerDomicile:""}</M>
+              </Card>
+
+              <div style={{fontSize:13,fontWeight:600,color:C.t,margin:"18px 0 8px"}}>Routed storage destinations</div>
+              {(!dataSov.destinations||dataSov.destinations.length===0)?<M style={{color:C.td,fontStyle:"italic"}}>No storage destinations configured yet.</M>:dataSov.destinations.map(d=>(
+                <Card key={d.ref} style={{padding:"12px 16px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div><span style={{color:C.t,fontSize:12,fontWeight:600}}>{d.name}</span> <M style={{color:C.td}}>({d.adapter})</M></div>
+                    <Badge color={d.blocked?C.d:d.compliant?C.a:C.w}>{d.blocked?"BLOCKED":d.compliant?"COMPLIANT":"REVIEW"}</Badge>
+                  </div>
+                  <M style={{color:C.tm,display:"block",marginTop:4}}>Jurisdiction: {d.jurisdiction||"undeclared"}{d.providerDomicile?" · provider "+d.providerDomicile:""}{d.reason?" — "+d.reason:""}</M>
+                </Card>
               ))}
-            </Card>
-            <Card>
-              <Sel label="GD Server data residency"><option value="">Select...</option><option>US</option><option>Canada</option><option>UK</option><option>EU</option><option>Germany</option><option>France</option><option>Switzerland</option><option>Sweden</option><option>Ireland</option><option>Israel</option><option>UAE</option><option>India</option><option>Singapore</option><option>Japan</option><option>Korea</option><option>Australia</option><option>South Africa</option><option>Brazil</option></Sel>
-              <M style={{color:C.td,display:"block",marginTop:8}}>All data stored on this server remains in the selected jurisdiction. Regional MCs push aggregate data to this location only.</M>
-            </Card>
+
+              <div style={{fontSize:13,fontWeight:600,color:C.t,margin:"18px 0 8px"}}>Console fleet residency</div>
+              <M style={{color:C.td,display:"block",marginBottom:10}}>{dataSov.fleet.total} active console(s) · {dataSov.fleet.crossBorder} with a cross-border flow to this GD. Recorded and surfaced; never blocks a management console.</M>
+              {dataSov.fleet.consoles.length===0?<M style={{color:C.td,fontStyle:"italic"}}>No active management consoles.</M>:dataSov.fleet.consoles.map(c=>(
+                <Card key={c.id} style={{padding:"10px 16px",marginBottom:8}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div><span style={{color:C.t,fontSize:12}}>{c.name}</span> <M style={{color:C.td}}> · {c.region}</M></div>
+                    <Badge color={c.crossBorder?C.w:C.a}>{c.crossBorder?"CROSS-BORDER":"IN-REGION"}</Badge>
+                  </div>
+                  <M style={{color:C.tm,display:"block",marginTop:3}}>Jurisdiction: {c.country||"undeclared"} · framework: {c.regulatoryFramework}</M>
+                </Card>
+              ))}
+
+              <div style={{fontSize:13,fontWeight:600,color:C.t,margin:"18px 0 8px"}}>Cross-border transfer register</div>
+              <Card style={{padding:"12px 16px"}}>
+                <M style={{color:C.tm}}>{dataSov.register.transfers} transfer(s) recorded · {dataSov.register.documented} documented · {dataSov.register.blocked} blocked by policy.</M>
+              </Card>
+            </div>)}
 </div>)}
 
           {/* ══════════ RECERTIFICATION ══════════ */}

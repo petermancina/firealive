@@ -1,6 +1,6 @@
 # Full-Suite Backup
 
-FireAlive's full-suite backup endpoint produces an archive bundling the entire instance — database, configuration, version manifest, and (on MC-side) signing-key material — into a single tar.gz suitable for disaster-recovery restoration. This document describes the architecture, the MC-side v2 vs GD-side v1 shape divergence, the operating procedures, and how full-suite backups interact with the two-person restore approval workflow.
+FireAlive's full-suite backup endpoint produces an archive bundling the entire instance — database, configuration, version manifest, and (on MC-side) signing-key material — into an encrypted, signed, four-file artifact suitable for disaster-recovery restoration. This document describes the architecture, the per-realm bundle contents (both realms use the same v2 engine), the operating procedures, and how full-suite backups interact with the two-person restore approval workflow.
 
 ## Why this exists
 
@@ -10,11 +10,11 @@ Three operator problems motivate the feature:
 - **No archive-level signature.** A backup file on backup media is a download without provenance. An attacker with access to a backup destination (NAS, S3, SFTP) can swap a malicious archive for a legitimate one and the restore endpoint cannot tell.
 - **No tamper-evident manifest.** A backup file taken at 02:00 last Tuesday should still verify as that file when an auditor checks it next quarter. Without a manifest hash committed at backup time, drift between "what we backed up" and "what's on the backup volume" is invisible.
 
-The full-suite backup endpoint resolves all three by capturing the entire suite (DB + config + signing keys + version manifest) into one archive, computing a SHA-256 hash of the archive at write time, and (on MC-side) Cosign-signing the manifest separately so that an offline auditor can verify both the archive integrity and the manifest authenticity.
+The full-suite backup endpoint resolves all three by capturing the entire suite (DB + config + signing keys + version manifest) into an AES-256-GCM-encrypted archive, wrapping the archive's data key to the operator's KEK, and (on MC-side) Cosign-signing the manifest separately so that an offline auditor can verify both the archive integrity and the manifest authenticity.
 
 ## Architecture overview: MC vs GD
 
-The full-suite backup lives at two architectural locations with different shapes due to backup-schema divergence between MC and GD:
+The full-suite backup lives on both realms atop the same v2 backup engine. What differs is only the bundle contents each realm captures:
 
 ### MC-side: v2 backup engine
 
@@ -33,28 +33,26 @@ data/backups/<id>/
 
 The four-file layout separates the signed-and-verified manifest from the data archive. An auditor can verify the manifest signature without unpacking the archive, then verify the archive's SHA-256 against the manifest's recorded hash. The wrapped-key file holds an AES-256-GCM-wrapped data encryption key sealed to the operator's KEK; restoration requires both the archive and the wrapped-key (the archive alone is undecryptable).
 
-### GD-side: v1 backups schema
+### GD-side
 
-- **Helper:** `gdPerformFullSuiteBackup` (inline in `packages/global-dashboard-server/index.js`)
-- **Route:** `POST /api/backup/full-suite` (ciso JWT)
-- **Schema:** `backups` v1 (single `destination` column, SHA-256 in `hash` column, no v2 columns).
-- **Output (single-archive layout):**
+- **Service:** `packages/global-dashboard-server/services/gd-backup-full-suite.js`
+- **Route:** `POST /api/backup/full-suite` (ciso JWT); also `POST /api/backup?strategy=full-suite`
+- **Schema:** the GD `backups` table with `format_version`, `manifest_path`, `archive_path`, `manifest_sig_path`, `wrapped_key_path`, `signing_key_id`. Full-suite is recorded `type='full'`, `format_version=2` (the GD distinguishes strategies by `type`, without a separate `kind` column).
+- **Output (v2 four-file layout):**
 
 ```
-data/backups/
-  <id>-firealive-gd-full-suite.tar.gz
+data/backups/<id>-fullsuite/
+  archive.tar.gz.enc     ← AES-256-GCM-encrypted bundle (DB + config + version manifest)
+  wrapped-key.bin        ← bundle data key wrapped to the GD Tier-1 KEK
+  manifest.json          ← canonical manifest with per-file SHA-256
+  manifest.sig           ← Ed25519 signature over manifest.json
 ```
 
-The archive bundles `global-dashboard.db`, `config-snapshot.json`, and `version-manifest.json` in one tar.gz. The SHA-256 of the entire archive lives in `backups.hash`. The literal token `firealive-gd-full-suite` in the filename distinguishes full-suite archives from plain v1 single-DB backups by inspection.
+The GD bundle (`global-dashboard.db` + `config-snapshot.json` + `version-manifest.json`) is tarred, then run through the same pipeline as a single-DB v2 backup: that tar is the encrypted archive's payload, its data key is wrapped to the GD Tier-1 KEK, and a canonical manifest is Ed25519-signed. Every full-suite backup is also appended to the backup attestation chain. Restoration requires both the archive and the wrapped key — the archive alone is undecryptable.
 
-### Why the divergence
+### Realm parity
 
-GD has not yet been migrated to the v2 backup engine. Implementing a parallel v2 engine for GD purely to enable full-suite backups would have doubled the Sub-phase 6 lift. The pragmatic path was a v1-shape adaptation that captures the same logical contents (DB + config + version manifest) in a single hashed archive without a separate manifest, signature, or wrapped key.
-
-The cost of this divergence is documented:
-
-- The MC-side regression runner's `backups v2-aware` check intentionally fails on GD because the v2 columns it asserts are intentionally absent from GD's schema. This is diagnostic surface flagging the GD's v1 backup posture, not an error.
-- GD full-suite archives have SHA-256 tamper-detect (anyone can verify the archive matches `backups.hash` after retrieval) but no archive-level Cosign signature. A future GD v2 backup engine migration would unlock cosign-signed archives and a passing regression check.
+Both realms run the identical v2 engine; there is no format divergence. The GD was brought to full MC backup parity in Sub-phase 6b — the v2 engine, WAL-tracked incremental and differential backups, and the encrypted full-suite and snapshot strategies. The GD runs on the CISO's machine, arguably the most sensitive host in the deployment, so no backup strategy writes plaintext to disk or off-site: the encrypted, signed, chain-attested four-file artifact is the only shape produced. The GD's own regression suite asserts every strategy is callable and encrypted.
 
 ## What's in a bundle
 
@@ -89,7 +87,7 @@ The cost of this divergence is documented:
 
 The manifest is signed with the active `backup_signing_keys` row's Ed25519 key. The signature lives at `data/backups/<id>/signature` as a Cosign-format blob.
 
-### GD v1 manifest schema (in-archive)
+### GD version manifest (inside the bundle)
 
 ```json
 {
@@ -107,11 +105,11 @@ The manifest is signed with the active `backup_signing_keys` row's Ed25519 key. 
 }
 ```
 
-GD's `version-manifest.json` lives inside the archive rather than separately. There is no GD-side signature on the manifest — the SHA-256 of the entire archive in `backups.hash` is the integrity gate.
+GD's `version-manifest.json` lives inside the archive rather than separately. There is a separate canonical `manifest.json`, Ed25519-signed exactly as on the MC — the signed manifest is the integrity gate.
 
 ## The capture pipeline
 
-Both MC and GD follow the same five logical steps with implementation differences:
+Both realms follow the same v2 pipeline:
 
 1. **DB snapshot via VACUUM INTO.** Both sides issue `VACUUM INTO '<workdir>/<db-file>'` against SQLite. This is the canonical SQLite hot-snapshot method — it produces a transactionally consistent copy without locking the live database. Falls back to `fs.copyFileSync` on the rare older SQLite build that restricts VACUUM INTO.
 
@@ -119,9 +117,9 @@ Both MC and GD follow the same five logical steps with implementation difference
 
 3. **Version manifest.** Both sides write `version-manifest.json` with the snapshot metadata (version, fuse, build_id, table counts).
 
-4. **Archive assembly.** Both sides shell out to `tar -czf <archive>.tar.gz -C <workdir> .` to bundle the workdir into a gzipped tarball.
+4. **Archive assembly + encryption.** Both sides tar the workdir into a single bundle, then encrypt it under a fresh AES-256-GCM data key, producing `archive.tar.gz.enc`. The plaintext bundle never touches the backup destination.
 
-5. **Hashing + persistence + (MC-only) signing.** Both sides compute SHA-256 of the archive bytes. MC additionally invokes Cosign to sign the separate manifest.json and writes the wrapped-key file. Both insert a row into `backups` with the archive path, size, and hash.
+5. **Key wrapping, signing, persistence, attestation.** Both sides wrap the data key to the operator's KEK (`wrapped-key`), build a canonical `manifest.json` with per-file SHA-256 and sign it (MC: Cosign; GD: Ed25519), atomically write the four files, insert a `backups` row (`format_version=2`), and append a CREATE entry to the backup attestation chain.
 
 ## Routes
 
@@ -156,13 +154,17 @@ Success response (GD):
 ```json
 {
   "id": "1a2b3c4d5e6f7a8b",
+  "format_version": 2,
   "type": "full",
   "kind": "full-suite",
-  "destination": "/path/.../1a2b3c4d5e6f7a8b-firealive-gd-full-suite.tar.gz",
+  "manifest_path": "data/backups/1a2b3c4d5e6f7a8b-fullsuite/manifest.json",
+  "archive_path": "data/backups/1a2b3c4d5e6f7a8b-fullsuite/archive.tar.gz.enc",
+  "manifest_sig_path": "data/backups/1a2b3c4d5e6f7a8b-fullsuite/manifest.sig",
+  "wrapped_key_path": "data/backups/1a2b3c4d5e6f7a8b-fullsuite/wrapped-key.bin",
   "size_bytes": 4194304,
-  "hash": "sha256:abc123...",
-  "manifest": { ... in-archive manifest object ... },
-  "status": "completed"
+  "manifest_sha256": "abc123...",
+  "status": "verified",
+  "chain_entry": { "id": 42, "this_hash": "..." }
 }
 ```
 
@@ -199,7 +201,7 @@ The events persist in the standard audit log surface and are queryable via the a
 
 ## Storage and retention
 
-Full-suite archives live under `data/backups/` on the FireAlive host. The MC v2 layout uses one subdirectory per backup containing four files; the GD v1 layout uses one tarball per backup directly under `data/backups/`.
+Full-suite archives live under `data/backups/` on the FireAlive host. Both realms use the v2 layout: one subdirectory per backup containing the four files (encrypted archive, wrapped key, manifest, signature).
 
 Neither side applies automatic retention to full-suite archives — these are operator-curated artifacts. The recommended pattern is to push archives off-host to long-term backup storage (S3 with Object Lock, Azure Blob immutable, off-site NAS with WORM) immediately after each backup completes, then prune local copies on the org's standard rotation cadence.
 
@@ -220,8 +222,8 @@ Operators with mixed backup types should label them clearly in their storage des
 
 | Threat | Mitigation |
 |--------|------------|
-| Backup archive replaced on backup media | MC: Cosign signature on manifest detects tampering offline. GD: SHA-256 in `backups.hash` detects tampering when matched against retrieved archive. |
-| Captured config exposes secrets | MC v2: backup content key is wrapped to operator's KEK; archive is undecryptable without the KEK. GD v1: archive contains plaintext config; operators must store full-suite archives only in encrypted destinations. |
+| Backup archive replaced on backup media | Both realms: the manifest signature detects tampering offline (MC: Cosign; GD: Ed25519), and the archive's SHA-256 is verified against the signed manifest before restore. |
+| Captured config exposes secrets | Both realms: the backup content key is wrapped to the operator's KEK (GD: Tier-1 KEK); the archive is undecryptable without the KEK, so a captured archive discloses nothing. |
 | Captured signing-key material exfiltration | MC: private keys remain Tier-1-KEK-wrapped in `cloud_iac_signing_keys.private_key_wrapped`; archive includes only the wrapped form. Recovery requires the receiving instance to have the same KEK. |
 | Restore of malicious archive overwrites live data | Two-person restore approval workflow (see `docs/two-person-restore.md`) prevents single-admin destructive action. |
 | Rollback via restoring an old backup | Fuse-counter check at startup detects: post-restore fuse counter is recorded in `system_meta`; a restore that lowers it without operator override fails to start. |
