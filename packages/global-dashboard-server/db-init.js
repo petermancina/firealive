@@ -462,8 +462,72 @@ CREATE TABLE IF NOT EXISTS backups (
   hash TEXT,
   destination TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  retention_until TEXT
+  retention_until TEXT,
+  -- v2 encrypted-backup format columns (MC-grade parity). format_version 1 is
+  -- the v1-shape full-suite / snapshot; 2 is the encrypted four-file backup.
+  -- The type column carries the strategy (full/incremental/differential/snapshot).
+  format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2)),
+  manifest_path TEXT,                               -- v2 only: manifest.json path
+  archive_path TEXT,                                -- v2 only: archive.tar.gz.enc path
+  manifest_sig_path TEXT,                           -- v2 only: manifest.sig path
+  wrapped_key_path TEXT,                            -- v2 only: wrapped-key.bin path
+  signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT,
+  parent_backup_id TEXT REFERENCES backups(id),         -- immediate predecessor in the chain
+  parent_full_backup_id TEXT REFERENCES backups(id),    -- anchor full backup (O(1) short-circuit)
+  wal_start_position TEXT,                          -- serialized WAL frame ref
+  wal_end_position TEXT,                            -- serialized WAL frame ref (next backup's start)
+  page_count INTEGER                                -- integrity verification anchor
 );
+
+-- Backup manifest signing keys (dedicated GD backup Ed25519 family; separate
+-- from the archive-chain / audit / report / MC-trust families). Signs v3 backup
+-- manifests and the backup attestation chain. Fingerprint-addressed so historical
+-- manifests stay verifiable across rotation. Also holds external-registered
+-- foreign public keys (verification-only) for cross-deployment restore.
+CREATE TABLE IF NOT EXISTS backup_signing_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_key TEXT NOT NULL,                         -- PEM Ed25519 public key (SPKI)
+  public_key_fingerprint TEXT,                      -- SHA-256 hex of SPKI DER (64 chars); set on every insert
+  private_key_encrypted TEXT,                       -- GD Tier-1 wrapped {v,iv,tag,ciphertext}; NULL for external-registered
+  is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+  key_origin TEXT NOT NULL DEFAULT 'local-generated' CHECK (key_origin IN ('local-generated', 'external-registered')),
+  key_label TEXT,                                   -- operator description for external-registered keys
+  registered_by_user_id TEXT,                       -- who registered a foreign public key (NULL for local)
+  registered_at TEXT,                               -- when registered (NULL for local)
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_out_at TEXT,                              -- when is_active flipped 1->0, or external key revoked
+  notes TEXT,
+  -- Local-generated keys MUST have a private key; external-registered MUST NOT,
+  -- MUST be inactive (verification-only), and MUST carry registration metadata.
+  CHECK (
+    (key_origin = 'local-generated' AND private_key_encrypted IS NOT NULL)
+    OR
+    (key_origin = 'external-registered' AND private_key_encrypted IS NULL AND is_active = 0
+     AND registered_by_user_id IS NOT NULL AND registered_at IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active ON backup_signing_keys(is_active);
+CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_fp ON backup_signing_keys(public_key_fingerprint);
+
+-- Backup attestation chain: Ed25519-signed, prev-hash-linked log of backup
+-- operations (append-only, forward-tamper-evident). Signed by the active backup
+-- signing key (fingerprint-addressed, survives rotation).
+CREATE TABLE IF NOT EXISTS backup_chain (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,                                   -- prior entry's this_hash; NULL at genesis
+  this_hash TEXT NOT NULL,                          -- SHA-256(prev_hash || canonical_payload || created_at)
+  signature TEXT NOT NULL,                          -- Ed25519 over this_hash bytes (base64)
+  signing_key_fingerprint TEXT NOT NULL,            -- backup_signing_keys fingerprint that signed this entry
+  event_type TEXT NOT NULL CHECK (event_type IN ('CREATE', 'VERIFY', 'RESTORE_REQUEST', 'RESTORE_COMPLETE', 'DELETE_DENIED')),
+  backup_id TEXT,                                   -- soft reference; chain persists even if the backup row is gone
+  payload TEXT NOT NULL,                            -- canonicalized JSON
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_backup_chain_id ON backup_chain(id);
+CREATE INDEX IF NOT EXISTS idx_backup_chain_backup ON backup_chain(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_chain_event ON backup_chain(event_type);
+CREATE TRIGGER IF NOT EXISTS backup_chain_no_update BEFORE UPDATE ON backup_chain BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete BEFORE DELETE ON backup_chain BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
 
 -- Backup schedules
 CREATE TABLE IF NOT EXISTS backup_schedules (
@@ -476,7 +540,10 @@ CREATE TABLE IF NOT EXISTS backup_schedules (
   retention_days INTEGER DEFAULT 90,
   encrypted INTEGER DEFAULT 1,
   regulatory_preset TEXT DEFAULT 'none',
-  active INTEGER DEFAULT 1
+  active INTEGER DEFAULT 1,
+  last_status TEXT,
+  last_run TEXT,
+  last_error TEXT
 );
 
 -- Notification config and history
@@ -899,6 +966,232 @@ CREATE TABLE IF NOT EXISTS mc_instance_collisions (
   seen_at TEXT DEFAULT (datetime('now'))
 );
 
+
+-- B6b: STORAGE DESTINATION ROUTING + SEALED ARCHIVE SEGMENTS (GD twin of B5q)
+-- The GD's own storage subsystem: a generalized destinations registry, a
+-- per-data-type routing map, the guaranteed dual-write push-tracking tables,
+-- and the shared sealed archive-segment chain used by the GD audit-log and
+-- CEF archival writers. The GD routes its own artifacts under its own
+-- anchor/KEK; it is never a write-path into the Regional Server's
+-- destinations. Routes/pushes are operational state (NOT golden-baseline).
+
+CREATE TABLE IF NOT EXISTS storage_destinations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  adapter TEXT NOT NULL
+    CHECK (adapter IN ('local', 'sftp', 's3', 'azure-blob', 'gcs')),
+  config TEXT NOT NULL,
+  credentials_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1
+    CHECK (enabled IN (0, 1)),
+  immutability_mode TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (immutability_mode IN ('none', 'append-only', 'object-lock', 'unknown')),
+  retention_days INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_destinations_enabled
+  ON storage_destinations(enabled) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_storage_destinations_adapter
+  ON storage_destinations(adapter);
+
+-- Routing map: one row per routed data type. destination_ref is a SOFT ref to
+-- storage_destinations.id (NULL = unconfigured; for 'snapshot', NULL means
+-- inherit the 'backup' route). options carries per-type JSON (cadence,
+-- immutability_required, ...). The PRIMARY KEY on data_type encodes the
+-- one-destination-per-type rule -- there is no fan-out.
+CREATE TABLE IF NOT EXISTS storage_destination_routes (
+  data_type TEXT PRIMARY KEY
+    CHECK (data_type IN ('backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive')),
+  destination_ref TEXT,
+  secondary_destination_ref TEXT,
+  path_prefix TEXT,
+  options TEXT,
+  enabled INTEGER NOT NULL DEFAULT 0
+    CHECK (enabled IN (0, 1)),
+  updated_by TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Per-push tracking for backups (primary + secondary), with retry state.
+CREATE TABLE IF NOT EXISTS backup_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  backup_id TEXT NOT NULL,
+  destination_id TEXT NOT NULL
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_backup
+  ON backup_pushes(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_destination
+  ON backup_pushes(destination_id);
+CREATE INDEX IF NOT EXISTS idx_backup_pushes_retry_scan
+  ON backup_pushes(status, next_retry_at);
+
+-- Sealed archive-segment chain (audit_log + cef_archive). Each segment
+-- references the prior segment's hash, so the series is tamper-evident (a
+-- changed segment breaks this_hash) and gap-evident (a removed segment breaks
+-- the prev_hash link). Append-only, mirroring the GD audit / forensic chains.
+CREATE TABLE IF NOT EXISTS storage_archive_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  category TEXT NOT NULL
+    CHECK (category IN ('audit_log', 'cef_archive')),
+  sequence INTEGER NOT NULL,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  range_start TEXT,
+  range_end TEXT,
+  bytes INTEGER,
+  manifest_signature TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_archive_segments_category_seq
+  ON storage_archive_segments(category, sequence DESC);
+
+CREATE TRIGGER IF NOT EXISTS storage_archive_segments_no_update
+  BEFORE UPDATE ON storage_archive_segments
+  BEGIN SELECT RAISE(ABORT, 'storage_archive_segments is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS storage_archive_segments_no_delete
+  BEFORE DELETE ON storage_archive_segments
+  BEGIN SELECT RAISE(ABORT, 'storage_archive_segments is append-only'); END;
+
+-- Per-push tracking for archive segments (mirrors backup_pushes). The
+-- append-only segment row carries the integrity chain only; this mutable
+-- table records every push (primary + secondary) and its retry state.
+-- source_artifact_path is the retained pending copy to re-push from.
+CREATE TABLE IF NOT EXISTS archive_segment_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  segment_id INTEGER NOT NULL
+    REFERENCES storage_archive_segments(id) ON DELETE RESTRICT,
+  destination_id TEXT NOT NULL
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  role TEXT NOT NULL
+    CHECK (role IN ('primary', 'secondary')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  source_artifact_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (segment_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_segment_pushes_retry
+  ON archive_segment_pushes(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_archive_segment_pushes_segment
+  ON archive_segment_pushes(segment_id);
+
+-- Per-push tracking for forensic exports (same shape), keyed by forensic_exports.
+CREATE TABLE IF NOT EXISTS forensic_export_pushes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  export_id TEXT NOT NULL
+    REFERENCES forensic_exports(id) ON DELETE RESTRICT,
+  destination_id TEXT NOT NULL
+    REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  role TEXT NOT NULL
+    CHECK (role IN ('primary', 'secondary')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+  pushed_at TEXT,
+  size_pushed_bytes INTEGER,
+  destination_path TEXT,
+  error_message TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  source_artifact_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (export_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_forensic_export_pushes_retry
+  ON forensic_export_pushes(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_forensic_export_pushes_export
+  ON forensic_export_pushes(export_id);
+
+-- Dedicated Ed25519 family signing the GD archive-segment manifests. Private
+-- material is GD-Tier-1-KEK-wrapped; one active key at a time (partial index).
+CREATE TABLE IF NOT EXISTS archive_chain_signing_keys (
+  id TEXT PRIMARY KEY,
+  public_key TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  rotated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_chain_signing_keys_active
+  ON archive_chain_signing_keys(active) WHERE active = 1;
+
+
+-- B6b: DATA RESIDENCY (GD twin of B5n2 -- jurisdiction declarations + register)
+-- Per-destination jurisdiction declarations for the GD's own routed-artifact
+-- destinations, plus the derived cross-border transfer register. The GD
+-- residency policy itself lives in the config table under 'gd_residency'
+-- (the gd-data-residency service defaults it when the key is absent, mirroring
+-- the Regional). The transfer register also records the MC -> GD aggregate-
+-- metric-push cross-border flows (reconciled from management_consoles): the GD
+-- records these flows, it never blocks an MC push on residency grounds. Both
+-- tables are operational state (NOT golden-baseline). storage_destinations
+-- carries no region column, so declarations are keyed by destination_ref.
+CREATE TABLE IF NOT EXISTS data_residency_destinations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_kind  TEXT NOT NULL,
+  destination_ref   TEXT NOT NULL,
+  declared_country  TEXT,
+  declared_region   TEXT,
+  provider_domicile TEXT,
+  key_custody       TEXT,
+  auto_detected     INTEGER NOT NULL DEFAULT 0
+    CHECK (auto_detected IN (0, 1)),
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_residency_dest
+  ON data_residency_destinations(destination_kind, destination_ref);
+
+CREATE TABLE IF NOT EXISTS data_residency_transfers (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  transfer_key         TEXT NOT NULL UNIQUE,
+  data_category        TEXT NOT NULL,
+  source_jurisdiction  TEXT,
+  dest_jurisdiction    TEXT,
+  destination_ref      TEXT,
+  provider_domicile    TEXT,
+  foreign_law_exposure TEXT,
+  key_custody          TEXT,
+  mechanism            TEXT NOT NULL DEFAULT 'unset'
+    CHECK (mechanism IN ('adequacy', 'scc', 'bcr', 'derogation', 'none', 'unset')),
+  mechanism_notes      TEXT,
+  status               TEXT NOT NULL DEFAULT 'undocumented'
+    CHECK (status IN ('documented', 'undocumented', 'blocked')),
+  detected_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  reviewed_at          TEXT,
+  reviewed_by          TEXT,
+  next_review_at       TEXT
+);
+
 INSERT OR IGNORE INTO config (key, value)
   VALUES ('instance_label', 'FireAlive Global Dashboard (unconfigured)');
 `;
@@ -913,6 +1206,48 @@ function getDb() {
 function initDb() {
   const db = getDb();
   db.exec(SCHEMA);
+
+  // B6b: add backup-run status columns to backup_schedules.
+  // The canonical CREATE TABLE above includes last_status / last_run /
+  // last_error for fresh installs. Deploys that ran an earlier GD build have
+  // backup_schedules without them; add via ALTER TABLE ADD COLUMN. Guarded by
+  // PRAGMA table_info so the block is skipped (and never re-runs) once present.
+  try {
+    const bsCols = db.prepare("PRAGMA table_info(backup_schedules)").all();
+    if (!bsCols.some(c => c.name === 'last_status')) {
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN last_status TEXT;`);
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN last_run TEXT;`);
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN last_error TEXT;`);
+      console.log('Migrated backup_schedules: added last_status / last_run / last_error columns');
+    }
+  } catch (e) {
+    console.error('backup_schedules status-column migration failed:', e.message);
+  }
+
+  // v2 encrypted-backup + WAL/chain columns on `backups` (MC-grade parity).
+  // Existing GD installs created `backups` without them; add via guarded ALTER
+  // TABLE ADD COLUMN. backup_signing_keys already exists (created by the SCHEMA
+  // exec above), so the signing_key_id FK resolves. Idempotent: guarded by
+  // PRAGMA table_info so the block is skipped once the columns are present.
+  try {
+    const bCols = db.prepare("PRAGMA table_info(backups)").all();
+    if (!bCols.some(c => c.name === 'format_version')) {
+      db.exec(`ALTER TABLE backups ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2));`);
+      db.exec(`ALTER TABLE backups ADD COLUMN manifest_path TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN archive_path TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN manifest_sig_path TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN wrapped_key_path TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN signing_key_id INTEGER REFERENCES backup_signing_keys(id);`);
+      db.exec(`ALTER TABLE backups ADD COLUMN parent_backup_id TEXT REFERENCES backups(id);`);
+      db.exec(`ALTER TABLE backups ADD COLUMN parent_full_backup_id TEXT REFERENCES backups(id);`);
+      db.exec(`ALTER TABLE backups ADD COLUMN wal_start_position TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN wal_end_position TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN page_count INTEGER;`);
+      console.log('Migrated backups: added v2 encrypted-backup + WAL/chain columns');
+    }
+  } catch (gdBackupV2ColsErr) {
+    console.error('GD v2 backup columns migration failed:', gdBackupV2ColsErr.message);
+  }
 
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
   //

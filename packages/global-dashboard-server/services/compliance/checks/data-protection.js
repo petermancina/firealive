@@ -31,7 +31,7 @@
 //     offboarded_at set) preserving audit continuity;
 //     (b) pseudonym rotation re-keys analyst data, effectively
 //     erasing the link between identity and behavioral signals.
-//   - Planned backup_destinations.encryption_enabled column -> does
+//   - Planned storage_destinations.encryption_enabled column -> does
 //     not exist. Encryption state is composite: credentials encrypted
 //     at rest (credentials_encrypted column), backup content with
 //     Tier-3/Tier-1 columns already encrypted at column level (those
@@ -149,7 +149,7 @@ function checkDataSubjectRights(db) {
 // ── checkRetentionPolicy ─────────────────────────────────────────────────────
 // Verifies retention policies are configured on backup destinations.
 // The platform stores retention_days per destination in
-// backup_destinations; audit_log retention is unbounded (the platform
+// storage_destinations; audit_log retention is unbounded (the platform
 // does not auto-truncate). Warning if no backup destination has
 // retention configured; pass if any do.
 //
@@ -159,7 +159,7 @@ function checkDataSubjectRights(db) {
 // limitation, HIPAA 164.316(b)(2) Time limit.
 function checkRetentionPolicy(db) {
   const destinations = db.prepare(
-    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1"
+    "SELECT COUNT(*) AS c FROM storage_destinations WHERE enabled = 1"
   ).get();
   if (destinations.c === 0) {
     return {
@@ -168,7 +168,7 @@ function checkRetentionPolicy(db) {
     };
   }
   const withRetention = db.prepare(
-    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1 AND retention_days IS NOT NULL"
+    "SELECT COUNT(*) AS c FROM storage_destinations WHERE enabled = 1 AND retention_days IS NOT NULL"
   ).get();
   if (withRetention.c === 0) {
     return {
@@ -196,7 +196,7 @@ function checkRetentionPolicy(db) {
 // GDPR Art.32.
 function checkBackupEncryption(db) {
   const destinations = db.prepare(
-    "SELECT adapter, credentials_encrypted FROM backup_destinations WHERE enabled = 1"
+    "SELECT adapter, credentials_encrypted FROM storage_destinations WHERE enabled = 1"
   ).all();
   if (destinations.length === 0) {
     return {
@@ -241,7 +241,7 @@ function checkCrossBorderTransferControls(db) {
     "SELECT COUNT(*) AS c FROM users WHERE active = 1 AND geo_country IS NOT NULL"
   ).get();
   const destinations = db.prepare(
-    "SELECT COUNT(*) AS c FROM backup_destinations WHERE enabled = 1"
+    "SELECT COUNT(*) AS c FROM storage_destinations WHERE enabled = 1"
   ).get();
   if (withGeo.c === 0) {
     return {

@@ -12,14 +12,15 @@
 //
 // PLATFORM STATE NOTES (GD-specific gaps relative to MC)
 //
-//   - GD has no backup_pushes history table. The backups table is the
-//     direct record of completed backups; rows are inserted by the
-//     /api/backups/trigger endpoint (CISO-only) and presumably by a
-//     scheduler (not yet wired in v0.0.31).
-//   - GD has no backup_destinations table. Each backup_schedules row
-//     has a single destination column (string) and an encrypted
-//     boolean; there is no separate destinations registry with
-//     adapter configs.
+//   - The backups table is the direct record of completed backups;
+//     rows are inserted by the v2 backup services (POST /api/backup,
+//     CISO-only) and by the backup scheduler. Per-destination push
+//     history now lives in the backup_pushes table.
+//   - The destinations registry is storage_destinations (adapter
+//     configs, credentials, immutability, and routing). This check
+//     keys off the destination column on each backup_schedules row,
+//     so it reflects scheduled-backup fan-out coverage rather than the
+//     registry itself.
 //   - GD has no restore_approvals table. The MC's DR test gauge is
 //     restore_approvals.status='consumed' rows; the GD has no
 //     restore workflow at all and therefore no DR test signal of
@@ -61,7 +62,7 @@ function checkBackupFrequency(db) {
   if (total.c === 0) {
     return {
       status: 'warning',
-      detail: `No completed backups recorded on the GD. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be wiring through to backups table insertion. Trigger a manual backup via POST /api/backups/trigger to bootstrap.`,
+      detail: `No completed backups recorded on the GD. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be wiring through to backups table insertion. Trigger a manual backup via POST /api/backup to bootstrap.`,
     };
   }
   if (recent.c === 0) {

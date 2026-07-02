@@ -59,6 +59,11 @@ class GdSiemAdapter {
     const type = String(eventType || 'GD_EVENT').replace(/[|\\]/g, '_');
     const safe = String(detail == null ? '' : detail).replace(/[|\\]/g, '_');
     const cef = `CEF:0|FireAlive|GlobalDashboard|${_pkgVersion}|${type}|${type}|${severity}|msg=${safe} ts=${new Date().toISOString()}`;
+    // B6b: tee the emitted CEF event into the cef_archive spool so the archive
+    // captures the full SIEM stream (best-effort; skips the connectivity self-test).
+    if (type !== 'GD_SIEM_TEST') {
+      try { require('./gd-cef-archive-spool').appendLine(cef); } catch (_e) { /* non-fatal */ }
+    }
     return this.sendRaw(cef);
   }
 

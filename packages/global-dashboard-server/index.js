@@ -9,6 +9,7 @@
 
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const rateLimit = require('express-rate-limit');
 const { isIP } = require('net');
 const helmet = require('helmet');
@@ -36,6 +37,15 @@ const gdIntegrationHealth = require('./services/gd-integration-health');
 const { GdMetricsCollector } = require('./services/gd-metrics-collector');
 const { configLockChokepoint } = require('./services/gd-config-lock');
 const { isGdConfigWriteRequest } = require('./services/gd-config-write-routes');
+const gdBackup = require('./services/gd-backup');
+const storageRouting = require('./services/gd-storage-routing');
+const storagePush = require('./services/gd-storage-push');
+const backupV2 = require('./services/gd-backup-v2');
+const archiveSegment = require('./services/gd-archive-segment');
+const auditArchive = require('./services/gd-audit-archive');
+const cefSpool = require('./services/gd-cef-archive-spool');
+const incrementalSvc = require('./services/gd-backup-incremental');
+const differentialSvc = require('./services/gd-backup-differential');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 const exportEncryption = require('./services/export-encryption');
 const { migrateExportsAtRest } = require('./services/export-encryption-migration');
@@ -268,6 +278,16 @@ app.use('/api/config', authMiddleware(), require('./routes/config-lock'));
 // under /config and are frozen by the chokepoint when locked; operational reads
 // are never gated.
 app.use('/api/self-protection', authMiddleware(['ciso', 'vp']), require('./routes/self-protection'));
+
+// B6b: storage-destination registry + routing, data-residency policy, and v2 backup
+// control. All ciso-gated; configuration writes sit behind the config-lock chokepoint
+// mounted above (backup trigger/verify are operational and never frozen). The
+// gd-backup router lives at /api/backup; the existing POST /api/backup/full-suite
+// still resolves via router fall-through, and GET /api/backups (list) stays for now.
+app.use('/api/storage-destinations', authMiddleware(['ciso']), require('./routes/storage-destinations'));
+app.use('/api/storage-routing', authMiddleware(['ciso']), require('./routes/storage-routing'));
+app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-residency'));
+app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -3428,18 +3448,6 @@ app.get('/api/backups', authMiddleware(['ciso', 'vp']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to list backups' }); }
 });
 
-app.post('/api/backups/trigger', authMiddleware(['ciso']), (req, res) => {
-  try {
-    const { type = 'full', destination = 'local' } = req.body;
-    const db = getDb();
-    const id = crypto.randomBytes(4).toString('hex');
-    db.prepare("INSERT INTO backups (id, type, destination, hash) VALUES (?, ?, ?, ?)").run(id, type, destination, crypto.randomBytes(16).toString('hex'));
-    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'BACKUP_TRIGGERED', detail: `${type} to ${destination}` });
-    db.close();
-    res.json({ success: true, backupId: id });
-  } catch (e) { res.status(500).json({ error: 'Backup trigger failed' }); }
-});
-
 app.get('/api/backup-schedules', authMiddleware(['ciso', 'vp']), (req, res) => {
   try {
     const db = getDb();
@@ -4121,6 +4129,102 @@ function runGdRegression(db) {
     return 'metrics-collector + integration-health loadable';
   });
 
+  // ── Storage routing (B6b) (3) ──────────────────────────────
+  record('storage_routing', 'valid data types defined', () => {
+    const sr = require('./services/gd-storage-routing');
+    const expected = ['backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive'];
+    const got = sr.VALID_DATA_TYPES || [];
+    const missing = expected.filter((t) => got.indexOf(t) === -1);
+    if (missing.length > 0) throw new Error('missing routed data types: ' + missing.join(', '));
+    return expected.length + ' routed data types';
+  });
+  record('storage_routing', 'route resolution shape', () => {
+    const sr = require('./services/gd-storage-routing');
+    const route = sr.getRouteForType(db, 'backup');
+    if (!route || !Array.isArray(route.destinations) || route.dataType !== 'backup' || typeof route.configured !== 'boolean') {
+      throw new Error('getRouteForType returned an unexpected shape');
+    }
+    return 'route shape ok (configured=' + route.configured + ')';
+  });
+  record('storage_routing', 'route write + snapshot inheritance', () => {
+    const sr = require('./services/gd-storage-routing');
+    const mem = gdCloneSchema(db);
+    mem.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('data_residency_config', ?)")
+      .run(JSON.stringify({ enabled: false, primaryResidency: {}, categories: {} }));
+    mem.prepare("INSERT INTO storage_destinations (id, name, adapter, config, enabled, immutability_mode) VALUES ('rr-dest', 'RR', 'local', '{\"path\":\"/tmp/gd-rr\"}', 1, 'none')").run();
+    const w = sr.writeRoute(mem, 'backup', { destination_ref: 'rr-dest', enabled: true });
+    if (!w.ok) throw new Error('writeRoute failed: ' + (w.code || w.error));
+    const route = sr.getRouteForType(mem, 'backup');
+    if (!route.destinations.some((d) => d.id === 'rr-dest')) throw new Error('backup route did not resolve destination');
+    const snap = sr.getRouteForType(mem, 'snapshot');
+    if (snap.inheritedFrom !== 'backup') throw new Error('snapshot did not inherit backup route');
+    return 'write + snapshot inheritance ok';
+  });
+
+  // ── Data residency (B6b) (3) ───────────────────────────────
+  record('data_residency', 'region-to-country resolution', () => {
+    const regions = require('./services/gd-residency-regions');
+    const de = regions.regionToCountry('eu-central-1');
+    const us = regions.regionToCountry('us-east-1');
+    if (!de || de.country !== 'DE') throw new Error('eu-central-1 did not resolve to DE');
+    if (!us || us.country !== 'US') throw new Error('us-east-1 did not resolve to US');
+    return 'region resolution ok';
+  });
+  record('data_residency', 'config default fail-safe', () => {
+    const dr = require('./services/gd-data-residency');
+    const cfg = dr.loadResidencyConfig(db);
+    if (!cfg || typeof cfg.enabled !== 'boolean' || typeof cfg.categories !== 'object' || typeof cfg.primaryResidency !== 'object') {
+      throw new Error('loadResidencyConfig returned an unexpected shape');
+    }
+    return 'config shape ok (enabled=' + cfg.enabled + ')';
+  });
+  record('data_residency', 'enforce blocks non-permitted region', () => {
+    const dr = require('./services/gd-data-residency');
+    const mem = gdCloneSchema(db);
+    mem.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('data_residency_config', ?)")
+      .run(JSON.stringify({ enabled: true, primaryResidency: { country: 'US' }, categories: { backup: { mode: 'enforce', permittedRegions: ['US'] } } }));
+    const de = dr.evaluateConfig(mem, 'backup', 's3', { region: 'eu-central-1', bucket: 'b' }, null);
+    if (!de.blocked) throw new Error('DE destination not blocked under enforce US');
+    const us = dr.evaluateConfig(mem, 'backup', 's3', { region: 'us-east-1', bucket: 'b' }, null);
+    if (us.blocked) throw new Error('US destination wrongly blocked under enforce US');
+    return 'enforce blocks DE, allows US';
+  });
+
+  // ── Backup strategy (B6b) (3) ──────────────────────────────
+  record('backup_strategy', 'strategy services callable', () => {
+    const v2 = require('./services/gd-backup-v2');
+    const inc = require('./services/gd-backup-incremental');
+    const diff = require('./services/gd-backup-differential');
+    const base = require('./services/gd-backup');
+    if (typeof v2.performV2Backup !== 'function') throw new Error('performV2Backup missing');
+    if (typeof inc.performIncrementalBackup !== 'function') throw new Error('performIncrementalBackup missing');
+    if (typeof diff.performDifferentialBackup !== 'function') throw new Error('performDifferentialBackup missing');
+    if (typeof base.performFullSuiteBackup !== 'function' || typeof base.performSnapshot !== 'function') throw new Error('full-suite/snapshot missing');
+    return 'v2, incremental, differential, full-suite, snapshot callable';
+  });
+  record('backup_strategy', 'v2 lineage columns present', () => {
+    const cols = db.prepare('PRAGMA table_info(backups)').all().map((c) => c.name);
+    const required = ['parent_backup_id', 'parent_full_backup_id', 'wal_start_position', 'wal_end_position', 'page_count'];
+    const missing = required.filter((c) => cols.indexOf(c) === -1);
+    if (missing.length > 0) throw new Error('lineage columns missing: ' + missing.join(', '));
+    return 'incremental/differential lineage columns present';
+  });
+  record('backup_strategy', 'manifest signing round-trip', () => {
+    if (!process.env.GD_ENCRYPTION_KEY) return SKIP('GD_ENCRYPTION_KEY not set');
+    const signingKeys = require('./services/gd-backup-signing-keys');
+    const mem = gdCloneSchema(db);
+    signingKeys.ensureActiveKeypair(mem);
+    const bytes = Buffer.from('gd-regression-manifest');
+    const signed = signingKeys.signManifest(mem, bytes);
+    if (!signingKeys.verifyManifest(mem, bytes, signed.signature, signed.signingKeyId)) {
+      throw new Error('freshly signed manifest failed to verify');
+    }
+    if (signingKeys.verifyManifest(mem, Buffer.from('tampered'), signed.signature, signed.signingKeyId)) {
+      throw new Error('tampered manifest verified as valid');
+    }
+    return 'sign + verify + tamper-detect ok';
+  });
+
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;
   const skipped = tests.filter(t => t.status === 'skip').length;
@@ -4618,122 +4722,11 @@ app.post('/api/cicd/webhook-secret/rotate', authMiddleware(['ciso']), (req, res)
 //
 //   POST /api/backup/full-suite   ciso
 
-function gdPerformFullSuiteBackup(db, options) {
-  const fs = require('fs');
-  const path = require('path');
-  const { execFileSync } = require('child_process');
-
-  const backupsDir =
-    options.backupsDir
-    || process.env.GD_BACKUPS_DIR
-    || path.join(__dirname, 'data', 'backups');
-  if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
-
-  const id = crypto.randomBytes(8).toString('hex');
-  const workDir = path.join(backupsDir, `_work-${id}`);
-  fs.mkdirSync(workDir, { recursive: true });
-
-  try {
-    // 1. Copy DB snapshot
-    if (!fs.existsSync(DB_PATH)) {
-      throw new Error(`GD database not found at ${DB_PATH}`);
-    }
-    const dbCopyPath = path.join(workDir, 'global-dashboard.db');
-    // Use VACUUM INTO for a transactionally-consistent snapshot
-    // rather than a raw file copy (which races against in-flight
-    // writes). VACUUM INTO is the SQLite-canonical hot-snapshot
-    // method.
-    try {
-      db.prepare(`VACUUM INTO ?`).run(dbCopyPath);
-    } catch (vacErr) {
-      // Fallback to raw copy if VACUUM INTO fails (rare; some
-      // older SQLite builds restricted it).
-      fs.copyFileSync(DB_PATH, dbCopyPath);
-    }
-
-    // 2. config-snapshot.json
-    const configRows = db.prepare('SELECT key, value FROM config').all();
-    const configSnap = {};
-    for (const r of configRows) configSnap[r.key] = r.value;
-    fs.writeFileSync(
-      path.join(workDir, 'config-snapshot.json'),
-      JSON.stringify(configSnap, null, 2),
-      'utf8',
-    );
-
-    // 3. version-manifest.json
-    const mcs = db.prepare("SELECT COUNT(*) AS n FROM management_consoles").get().n;
-    const mcsActive = db.prepare("SELECT COUNT(*) AS n FROM management_consoles WHERE status='active'").get().n;
-    const sks = db.prepare("SELECT COUNT(*) AS n FROM signing_keys").get().n;
-    const sksActive = db.prepare("SELECT COUNT(*) AS n FROM signing_keys WHERE status='active'").get().n;
-    let versionInfo = { version: 'unknown', fuse_counter: null, build_id: null };
-    try {
-      const pkg = require('./package.json');
-      versionInfo = {
-        version: pkg.version || 'unknown',
-        fuse_counter: typeof pkg.fuseCounter === 'number' ? pkg.fuseCounter : null,
-        build_id: pkg.buildId || null,
-      };
-    } catch (e) { /* keep defaults */ }
-    const manifest = {
-      format: 'firealive-gd-full-suite-v1',
-      backup_id: id,
-      captured_at: new Date().toISOString(),
-      version: versionInfo,
-      management_consoles: { total: mcs, active: mcsActive },
-      signing_keys: { total: sks, active: sksActive },
-      side: 'gd',
-    };
-    fs.writeFileSync(
-      path.join(workDir, 'version-manifest.json'),
-      JSON.stringify(manifest, null, 2),
-      'utf8',
-    );
-
-    // 4. tar+gzip the workdir into a single archive
-    const archivePath = path.join(backupsDir, `${id}-firealive-gd-full-suite.tar.gz`);
-    execFileSync(
-      'tar',
-      ['-czf', archivePath, '-C', workDir, '.'],
-      { stdio: ['ignore', 'ignore', 'pipe'] },
-    );
-
-    // 5. SHA-256 of the archive
-    const archiveBytes = fs.readFileSync(archivePath);
-    const sha256 = crypto.createHash('sha256').update(archiveBytes).digest('hex');
-    const sizeBytes = archiveBytes.length;
-
-    // 6. INSERT backups row
-    db.prepare(
-      `INSERT INTO backups (id, type, status, size_bytes, hash, destination, created_at)
-       VALUES (?, 'full', 'completed', ?, ?, ?, datetime('now'))`,
-    ).run(id, sizeBytes, sha256, archivePath);
-
-    // 7. Cleanup workdir (archive remains)
-    fs.rmSync(workDir, { recursive: true, force: true });
-
-    return {
-      id,
-      type: 'full',
-      kind: 'full-suite',
-      destination: archivePath,
-      size_bytes: sizeBytes,
-      hash: sha256,
-      manifest,
-      status: 'completed',
-    };
-  } catch (err) {
-    try { if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); }
-    catch (cleanupErr) { /* swallow */ }
-    throw err;
-  }
-}
-
-app.post('/api/backup/full-suite', authMiddleware(['ciso']), (req, res) => {
+app.post('/api/backup/full-suite', authMiddleware(['ciso']), async (req, res) => {
   let db;
   try {
     db = getDb();
-    const result = gdPerformFullSuiteBackup(db, {});
+    const result = await gdBackup.performFullSuiteBackup(db, {});
     appendGdAuditEntry(db, { userId: req.user.id, eventType: 'FULL_SUITE_BACKUP_CREATED', detail: `id=${result.id} size=${result.size_bytes} hash=${result.hash.slice(0, 16)}`, severity: 'info' });
     db.close();
     res.json(result);
@@ -5495,6 +5488,46 @@ function appendForensicChainEntry(db, opts) {
 // ── POST /api/forensic-exports — create + run ─────────────────────────────
 // VP only (creator role for the separate-actor pair)
 
+// B6b: replicate a completed forensic export to the forensic_export-routed
+// destination(s) via the storage resolver (dual-write + retry-eligible). Mirrors
+// the backup push wiring; forensic_export_pushes carries a primary/secondary role.
+async function gdPushForensicExport(db, exp, options = {}) {
+  const route = storageRouting.getRouteForType(db, 'forensic_export');
+  if (!route.configured || !route.destinations || route.destinations.length === 0) {
+    return { pushed: false, configured: false, reason: 'no destination configured' };
+  }
+  const destinations = storagePush.attachCredentials(db, route.destinations);
+  if (destinations.length === 0) {
+    return { pushed: false, configured: false, reason: 'no usable destination' };
+  }
+  const specs = [{ name: path.basename(exp.archivePath), absolutePath: exp.archivePath }];
+  if (exp.manifestPath) specs.push({ name: path.basename(exp.manifestPath), absolutePath: exp.manifestPath });
+  if (exp.manifestSigPath) specs.push({ name: path.basename(exp.manifestSigPath), absolutePath: exp.manifestSigPath });
+  if (exp.cosignSignaturePath) specs.push({ name: path.basename(exp.cosignSignaturePath), absolutePath: exp.cosignSignaturePath });
+  const hashed = storagePush.hashFilesForContext(specs);
+  if (!hashed.ok) {
+    return { pushed: false, configured: true, reason: hashed.error };
+  }
+  const artifactContext = {
+    artifactId: exp.id,
+    sourceDir: path.dirname(exp.archivePath),
+    files: hashed.files,
+    manifestSha256: exp.archiveSha256 || null,
+    createdAt: new Date().toISOString(),
+  };
+  const insertRow = (dbh, destination, role) => dbh.prepare(
+    "INSERT INTO forensic_export_pushes (export_id, destination_id, role, status, attempt_count, source_artifact_path) VALUES (?, ?, ?, 'queued', 0, ?)"
+  ).run(exp.id, destination.id, role, exp.archivePath).lastInsertRowid;
+  const result = await storagePush.pushToDestinations(db, {
+    pushTable: 'forensic_export_pushes',
+    artifactContext,
+    destinations,
+    insertRow,
+    options,
+  });
+  return { pushed: true, configured: true, destinations: result.destinations };
+}
+
 app.post('/api/forensic-exports', authMiddleware(['vp']), async (req, res) => {
   const {
     rationale,
@@ -5509,8 +5542,9 @@ app.post('/api/forensic-exports', authMiddleware(['vp']), async (req, res) => {
     return res.status(400).json({ error: 'outputFormats (non-empty array) required' });
   }
 
+  let db;
   try {
-    const db = getDb();
+    db = getDb();
     const result = await forensicExport.createForensicExport(db, {
       requestedByUserId: req.user.id,
       rationale: rationale || null,
@@ -5530,7 +5564,23 @@ app.post('/api/forensic-exports', authMiddleware(['vp']), async (req, res) => {
       ' size=' + result.sizeBytes + ' sha256=' + (result.archiveSha256 || '').slice(0, 16),
       req.ip, 'info'
     );
-    res.json(result);
+    // B6b: replicate the export to the forensic_export-routed destination(s) via
+    // the storage resolver. Best-effort -- the export already exists locally; a
+    // push failure is recorded for the retry sweep and does not fail the request.
+    let push = { pushed: false, configured: false };
+    try {
+      push = await gdPushForensicExport(db, result);
+      if (push.pushed) {
+        auditLogForensic(req.user.id, 'FORENSIC_EXPORT_PUSHED',
+          'id=' + result.id + ' destinations=' + (push.destinations ? push.destinations.length : 0), req.ip, 'info');
+      }
+    } catch (pushErr) {
+      console.error('forensic export push failed:', pushErr.message);
+      push = { pushed: false, configured: true, error: pushErr.message };
+      auditLogForensic(req.user.id, 'FORENSIC_EXPORT_PUSH_FAILED',
+        'id=' + result.id + ' error=' + (pushErr.message || '').slice(0, 160), req.ip, 'warning');
+    }
+    res.json({ ...result, push });
   } catch (err) {
     console.error('forensic export creation failed:', err.message);
     auditLogForensic(req.user.id, 'FORENSIC_EXPORT_FAILED',
@@ -5540,6 +5590,8 @@ app.post('/api/forensic-exports', authMiddleware(['vp']), async (req, res) => {
       return res.status(400).json({ error: err.message });
     }
     res.status(500).json({ error: 'Forensic export creation failed', message: err.message });
+  } finally {
+    if (db) { try { db.close(); } catch (_) { /* ignore */ } }
   }
 });
 
@@ -5801,6 +5853,215 @@ const gdAuditIntegrityTimer = setInterval(() => {
   }
 }, GD_AUDIT_INTEGRITY_INTERVAL_MS);
 if (gdAuditIntegrityTimer && typeof gdAuditIntegrityTimer.unref === 'function') gdAuditIntegrityTimer.unref();
+
+
+// B6b: periodic storage maintenance.
+// Three unref'd timers, each opening a fresh db per cycle and never blocking
+// shutdown, mirroring gdAuditIntegrityTimer. Async work closes its db in the
+// promise chain's finally (not a synchronous finally) so the connection outlives
+// the in-flight retries/seals. Guarded so an un-migrated database logs and skips.
+
+// rebuildContext for forensic-export push retries: re-hash the export's files from
+// the forensic_exports row referenced by the push, so a due push can be re-attempted.
+function rebuildForensicExportContext(db, pushRow) {
+  const exp = db.prepare(
+    'SELECT id, archive_path, manifest_path, manifest_sig_path, cosign_signature_path, archive_sha256 '
+    + 'FROM forensic_exports WHERE id = ?'
+  ).get(pushRow.export_id);
+  if (!exp) return { ok: false, error: 'forensic export row no longer exists', fatal: true };
+  const specs = [{ name: path.basename(exp.archive_path), absolutePath: exp.archive_path }];
+  if (exp.manifest_path) specs.push({ name: path.basename(exp.manifest_path), absolutePath: exp.manifest_path });
+  if (exp.manifest_sig_path) specs.push({ name: path.basename(exp.manifest_sig_path), absolutePath: exp.manifest_sig_path });
+  if (exp.cosign_signature_path) specs.push({ name: path.basename(exp.cosign_signature_path), absolutePath: exp.cosign_signature_path });
+  for (const s of specs) {
+    if (!s.absolutePath || !fs.existsSync(s.absolutePath)) {
+      return { ok: false, error: 'forensic export file missing on disk: ' + s.name, fatal: true };
+    }
+  }
+  const hashed = storagePush.hashFilesForContext(specs);
+  if (!hashed.ok) return { ok: false, error: hashed.error, fatal: true };
+  return {
+    ok: true,
+    artifactContext: {
+      artifactId: exp.id,
+      sourceDir: path.dirname(exp.archive_path),
+      files: hashed.files,
+      manifestSha256: exp.archive_sha256 || null,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+// Retry-sweep (hourly): re-attempt due pushes across every push table.
+const GD_STORAGE_RETRY_INTERVAL_MS = 3600000;
+const gdStorageRetryTimer = setInterval(() => {
+  let db;
+  try { db = getDb(); } catch (e) { console.error('GD storage retry-sweep: getDb failed:', e.message); return; }
+  Promise.resolve()
+    .then(() => gdBackup.retryDueBackupPushes(db))
+    .then(() => backupV2.retryDueV2BackupPushes(db))
+    .then(() => archiveSegment.retryPendingSegmentPushes(db))
+    .then(() => storagePush.retryDuePushes(db, { pushTable: 'forensic_export_pushes', rebuildContext: rebuildForensicExportContext }))
+    .catch((e) => console.error('GD storage retry-sweep error:', e.message))
+    .finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
+}, GD_STORAGE_RETRY_INTERVAL_MS);
+if (gdStorageRetryTimer && typeof gdStorageRetryTimer.unref === 'function') gdStorageRetryTimer.unref();
+
+// Archival-seal (hourly): archive new audit rows and flush the CEF spool into
+// sealed, pushed segments.
+const GD_ARCHIVAL_SEAL_INTERVAL_MS = 3600000;
+const gdArchivalSealTimer = setInterval(() => {
+  let db;
+  try { db = getDb(); } catch (e) { console.error('GD archival-seal: getDb failed:', e.message); return; }
+  Promise.resolve()
+    .then(() => auditArchive.archiveNewAuditEntries(db))
+    .then(() => cefSpool.flush(db))
+    .catch((e) => console.error('GD archival-seal error:', e.message))
+    .finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
+}, GD_ARCHIVAL_SEAL_INTERVAL_MS);
+if (gdArchivalSealTimer && typeof gdArchivalSealTimer.unref === 'function') gdArchivalSealTimer.unref();
+
+// Retention (daily): prune backups past their retention_until. Synchronous.
+const GD_BACKUP_RETENTION_INTERVAL_MS = 86400000;
+const gdBackupRetentionTimer = setInterval(() => {
+  let db;
+  try {
+    db = getDb();
+    backupV2.cleanOldBackups(db);
+  } catch (e) {
+    console.error('GD backup retention error:', e.message);
+  } finally {
+    if (db) { try { db.close(); } catch (_e) { /* ignore */ } }
+  }
+}, GD_BACKUP_RETENTION_INTERVAL_MS);
+if (gdBackupRetentionTimer && typeof gdBackupRetentionTimer.unref === 'function') gdBackupRetentionTimer.unref();
+
+
+// B6b: backup scheduler.
+// An unref'd interval reads active backup_schedules, fires the ones whose scheduled
+// time has passed since their last run, and records last_status/last_run/last_error.
+// The GD schedule table has no next_run column, so due-ness is computed on the fly
+// from frequency + time + day + last_run. Fresh db per cycle; async firing closes db
+// in the promise chain's finally. Overlapping runs across ticks are avoided by
+// claiming last_run before firing; the HA sole-writer lease arrives in a later phase.
+
+// Next scheduled fire strictly after fromTime, in UTC. Returns a Date, or null for an
+// invalid/unschedulable configuration. schedule.day is day-of-week (0-6) for weekly
+// and day-of-month (1-31) for monthly.
+function gdScheduleNextFireTime(schedule, fromTime) {
+  const VALID = ['hourly', 'daily', 'weekly', 'monthly'];
+  const frequency = String(schedule.frequency || '').toLowerCase();
+  if (VALID.indexOf(frequency) === -1) return null;
+  const from = new Date(fromTime);
+  if (isNaN(from.getTime())) return null;
+  if (frequency === 'hourly') {
+    const next = new Date(from);
+    next.setUTCMinutes(0, 0, 0);
+    if (next <= from) next.setUTCHours(next.getUTCHours() + 1);
+    return next;
+  }
+  const m = /^(\d{1,2}):(\d{2})$/.exec(schedule.time || '02:00');
+  if (!m) return null;
+  const hours = parseInt(m[1], 10);
+  const minutes = parseInt(m[2], 10);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  if (frequency === 'daily') {
+    const next = new Date(from);
+    next.setUTCHours(hours, minutes, 0, 0);
+    if (next <= from) next.setUTCDate(next.getUTCDate() + 1);
+    return next;
+  }
+  if (frequency === 'weekly') {
+    const dow = parseInt(schedule.day, 10);
+    if (!Number.isInteger(dow) || dow < 0 || dow > 6) return null;
+    const next = new Date(from);
+    next.setUTCHours(hours, minutes, 0, 0);
+    let daysAhead = (dow - next.getUTCDay() + 7) % 7;
+    if (daysAhead === 0 && next <= from) daysAhead = 7;
+    next.setUTCDate(next.getUTCDate() + daysAhead);
+    return next;
+  }
+  // monthly
+  const dom = parseInt(schedule.day, 10);
+  if (!Number.isInteger(dom) || dom < 1 || dom > 31) return null;
+  const next = new Date(from);
+  next.setUTCHours(hours, minutes, 0, 0);
+  const dim = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
+  next.setUTCDate(Math.min(dom, dim));
+  if (next <= from) {
+    next.setUTCMonth(next.getUTCMonth() + 1, 1);
+    const dim2 = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
+    next.setUTCDate(Math.min(dom, dim2));
+  }
+  return next;
+}
+
+// Due when never run, or its next fire after last_run has arrived. last_run is a
+// SQLite UTC datetime ('YYYY-MM-DD HH:MM:SS'). An unschedulable config is not due.
+function gdScheduleIsDue(schedule, now) {
+  if (!schedule.last_run) return true;
+  const raw = String(schedule.last_run);
+  const lastRun = new Date(raw.replace(' ', 'T') + (/[zZ]$/.test(raw) ? '' : 'Z'));
+  if (isNaN(lastRun.getTime())) return true;
+  const nextFire = gdScheduleNextFireTime(schedule, lastRun);
+  if (!nextFire) return false;
+  return nextFire <= now;
+}
+
+// Fire one scheduled backup by type, routed + pushed by the service. Throws on
+// failure so the caller can record last_error; incremental/differential escalate to
+// a full backup internally when no parent/anchor exists.
+async function gdRunScheduledBackup(db, schedule) {
+  const type = String(schedule.type || 'full').toLowerCase();
+  if (type === 'v2' || type === 'full') return backupV2.performV2Backup(db, {});
+  if (type === 'full-suite') return gdBackup.performFullSuiteBackup(db, {});
+  if (type === 'snapshot') return gdBackup.performSnapshot(db, {});
+  if (type === 'incremental') {
+    const r = await incrementalSvc.performIncrementalBackup(db, {});
+    if (!r.ok) throw new Error(r.error || 'incremental backup failed');
+    return r;
+  }
+  if (type === 'differential') {
+    const r = await differentialSvc.performDifferentialBackup(db, {});
+    if (!r.ok) throw new Error(r.error || 'differential backup failed');
+    return r;
+  }
+  throw new Error('unknown backup schedule type: ' + type);
+}
+
+const GD_BACKUP_SCHEDULER_INTERVAL_MS = 900000;  // 15 min
+const gdBackupSchedulerTimer = setInterval(() => {
+  let db;
+  try { db = getDb(); } catch (e) { console.error('GD backup scheduler: getDb failed:', e.message); return; }
+  let due;
+  try {
+    const now = new Date();
+    due = db.prepare('SELECT * FROM backup_schedules WHERE active = 1').all().filter((s) => gdScheduleIsDue(s, now));
+  } catch (e) {
+    console.error('GD backup scheduler: read failed:', e.message);
+    try { db.close(); } catch (_e) { /* ignore */ }
+    return;
+  }
+  if (due.length === 0) { try { db.close(); } catch (_e) { /* ignore */ } return; }
+  (async () => {
+    for (const s of due) {
+      // Claim the slot first so a slow backup is not re-fired by the next tick.
+      try { db.prepare("UPDATE backup_schedules SET last_run = datetime('now') WHERE id = ?").run(s.id); } catch (_e) { /* ignore */ }
+      try {
+        const result = await gdRunScheduledBackup(db, s);
+        const bid = result && (result.id || result.backupId) ? (result.id || result.backupId) : 'unknown';
+        db.prepare("UPDATE backup_schedules SET last_status = 'success', last_error = NULL WHERE id = ?").run(s.id);
+        console.log('GD backup scheduler: schedule', s.id, 'type', s.type, 'fired backup', bid);
+      } catch (e) {
+        try {
+          db.prepare("UPDATE backup_schedules SET last_status = 'failed', last_error = ? WHERE id = ?").run(String(e.message || '').slice(0, 500), s.id);
+        } catch (_e) { /* recording best-effort */ }
+        console.error('GD backup scheduler: schedule', s.id, 'failed:', e.message);
+      }
+    }
+  })().catch((e) => console.error('GD backup scheduler run error:', e.message)).finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
+}, GD_BACKUP_SCHEDULER_INTERVAL_MS);
+if (gdBackupSchedulerTimer && typeof gdBackupSchedulerTimer.unref === 'function') gdBackupSchedulerTimer.unref();
 
 
 // ── B5b: HTTPS/mTLS bootstrap ────────────────────────────────────────────────
