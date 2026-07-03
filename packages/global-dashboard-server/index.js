@@ -280,6 +280,7 @@ app.use('/api/config', authMiddleware(), require('./routes/config-lock'));
 // under /config and are frozen by the chokepoint when locked; operational reads
 // are never gated.
 app.use('/api/self-protection', authMiddleware(['ciso', 'vp']), require('./routes/self-protection'));
+app.use('/api/malware-scanners', authMiddleware(['ciso']), require('./routes/gd-malware-scanners'));
 
 // B6b: storage-destination registry + routing, data-residency policy, and v2 backup
 // control. All ciso-gated; configuration writes sit behind the config-lock chokepoint
