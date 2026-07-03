@@ -34,10 +34,14 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 //   /api/malware-scanners        -- the EDR scanner-management surface (add /
 //        update / delete / scan-mode / test). Reads (list, get scan-mode) are
 //        safe methods and pass.
+//   /api/config-baseline         -- config snapshots + golden baseline; mount-
+//        gated to cover the :id and /keys routes (save, register/revoke key,
+//        import, revert, delete). Reads (list, diff, export, get keys) pass.
 const CONFIG_WRITE_MOUNTS = [
   '/api/self-protection/config',
   '/api/backup-schedules',
   '/api/malware-scanners',
+  '/api/config-baseline',
 ];
 
 // Exact config-write endpoints inside mixed routers (operational siblings such
