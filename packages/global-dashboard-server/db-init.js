@@ -462,72 +462,8 @@ CREATE TABLE IF NOT EXISTS backups (
   hash TEXT,
   destination TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  retention_until TEXT,
-  -- v2 encrypted-backup format columns (MC-grade parity). format_version 1 is
-  -- the v1-shape full-suite / snapshot; 2 is the encrypted four-file backup.
-  -- The type column carries the strategy (full/incremental/differential/snapshot).
-  format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2)),
-  manifest_path TEXT,                               -- v2 only: manifest.json path
-  archive_path TEXT,                                -- v2 only: archive.tar.gz.enc path
-  manifest_sig_path TEXT,                           -- v2 only: manifest.sig path
-  wrapped_key_path TEXT,                            -- v2 only: wrapped-key.bin path
-  signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT,
-  parent_backup_id TEXT REFERENCES backups(id),         -- immediate predecessor in the chain
-  parent_full_backup_id TEXT REFERENCES backups(id),    -- anchor full backup (O(1) short-circuit)
-  wal_start_position TEXT,                          -- serialized WAL frame ref
-  wal_end_position TEXT,                            -- serialized WAL frame ref (next backup's start)
-  page_count INTEGER                                -- integrity verification anchor
+  retention_until TEXT
 );
-
--- Backup manifest signing keys (dedicated GD backup Ed25519 family; separate
--- from the archive-chain / audit / report / MC-trust families). Signs v3 backup
--- manifests and the backup attestation chain. Fingerprint-addressed so historical
--- manifests stay verifiable across rotation. Also holds external-registered
--- foreign public keys (verification-only) for cross-deployment restore.
-CREATE TABLE IF NOT EXISTS backup_signing_keys (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  public_key TEXT NOT NULL,                         -- PEM Ed25519 public key (SPKI)
-  public_key_fingerprint TEXT,                      -- SHA-256 hex of SPKI DER (64 chars); set on every insert
-  private_key_encrypted TEXT,                       -- GD Tier-1 wrapped {v,iv,tag,ciphertext}; NULL for external-registered
-  is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
-  key_origin TEXT NOT NULL DEFAULT 'local-generated' CHECK (key_origin IN ('local-generated', 'external-registered')),
-  key_label TEXT,                                   -- operator description for external-registered keys
-  registered_by_user_id TEXT,                       -- who registered a foreign public key (NULL for local)
-  registered_at TEXT,                               -- when registered (NULL for local)
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  rotated_out_at TEXT,                              -- when is_active flipped 1->0, or external key revoked
-  notes TEXT,
-  -- Local-generated keys MUST have a private key; external-registered MUST NOT,
-  -- MUST be inactive (verification-only), and MUST carry registration metadata.
-  CHECK (
-    (key_origin = 'local-generated' AND private_key_encrypted IS NOT NULL)
-    OR
-    (key_origin = 'external-registered' AND private_key_encrypted IS NULL AND is_active = 0
-     AND registered_by_user_id IS NOT NULL AND registered_at IS NOT NULL)
-  )
-);
-CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_active ON backup_signing_keys(is_active);
-CREATE INDEX IF NOT EXISTS idx_backup_signing_keys_fp ON backup_signing_keys(public_key_fingerprint);
-
--- Backup attestation chain: Ed25519-signed, prev-hash-linked log of backup
--- operations (append-only, forward-tamper-evident). Signed by the active backup
--- signing key (fingerprint-addressed, survives rotation).
-CREATE TABLE IF NOT EXISTS backup_chain (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  prev_hash TEXT,                                   -- prior entry's this_hash; NULL at genesis
-  this_hash TEXT NOT NULL,                          -- SHA-256(prev_hash || canonical_payload || created_at)
-  signature TEXT NOT NULL,                          -- Ed25519 over this_hash bytes (base64)
-  signing_key_fingerprint TEXT NOT NULL,            -- backup_signing_keys fingerprint that signed this entry
-  event_type TEXT NOT NULL CHECK (event_type IN ('CREATE', 'VERIFY', 'RESTORE_REQUEST', 'RESTORE_COMPLETE', 'DELETE_DENIED')),
-  backup_id TEXT,                                   -- soft reference; chain persists even if the backup row is gone
-  payload TEXT NOT NULL,                            -- canonicalized JSON
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_backup_chain_id ON backup_chain(id);
-CREATE INDEX IF NOT EXISTS idx_backup_chain_backup ON backup_chain(backup_id);
-CREATE INDEX IF NOT EXISTS idx_backup_chain_event ON backup_chain(event_type);
-CREATE TRIGGER IF NOT EXISTS backup_chain_no_update BEFORE UPDATE ON backup_chain BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
-CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete BEFORE DELETE ON backup_chain BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
 
 -- Backup schedules
 CREATE TABLE IF NOT EXISTS backup_schedules (
@@ -1222,31 +1158,6 @@ function initDb() {
     }
   } catch (e) {
     console.error('backup_schedules status-column migration failed:', e.message);
-  }
-
-  // v2 encrypted-backup + WAL/chain columns on `backups` (MC-grade parity).
-  // Existing GD installs created `backups` without them; add via guarded ALTER
-  // TABLE ADD COLUMN. backup_signing_keys already exists (created by the SCHEMA
-  // exec above), so the signing_key_id FK resolves. Idempotent: guarded by
-  // PRAGMA table_info so the block is skipped once the columns are present.
-  try {
-    const bCols = db.prepare("PRAGMA table_info(backups)").all();
-    if (!bCols.some(c => c.name === 'format_version')) {
-      db.exec(`ALTER TABLE backups ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2));`);
-      db.exec(`ALTER TABLE backups ADD COLUMN manifest_path TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN archive_path TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN manifest_sig_path TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN wrapped_key_path TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN signing_key_id INTEGER REFERENCES backup_signing_keys(id);`);
-      db.exec(`ALTER TABLE backups ADD COLUMN parent_backup_id TEXT REFERENCES backups(id);`);
-      db.exec(`ALTER TABLE backups ADD COLUMN parent_full_backup_id TEXT REFERENCES backups(id);`);
-      db.exec(`ALTER TABLE backups ADD COLUMN wal_start_position TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN wal_end_position TEXT;`);
-      db.exec(`ALTER TABLE backups ADD COLUMN page_count INTEGER;`);
-      console.log('Migrated backups: added v2 encrypted-backup + WAL/chain columns');
-    }
-  } catch (gdBackupV2ColsErr) {
-    console.error('GD v2 backup columns migration failed:', gdBackupV2ColsErr.message);
   }
 
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──

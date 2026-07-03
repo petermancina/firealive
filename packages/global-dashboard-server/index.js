@@ -194,6 +194,8 @@ app.use('/api', (req, res, next) => {
   next();
 });
 app.use('/api', configLockChokepoint());
+// B6c: mode-gated pre-auth VM-attestation gate; refuses the whole /api surface on an easily-copied+quarantined instance or an unverified cloud confidential VM. No-op on bare-metal.
+app.use('/api/', require('./services/gd-vm-attestation').gdVmAttestation());
 
 // Device-key proof-of-possession gate (D28). For a device-bound session (the
 // token carries an RFC 7800 cnf.jkt), every request must present a fresh,
@@ -6140,6 +6142,69 @@ try {
   console.error('The GD Server requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
   process.exit(1);
 }
+
+// B6c: resolve and hardware-seal the GD deployment mode (bare-metal /
+// virtualized / cloud / sdn / sase), the GD twin of the Regional Server's
+// deployment mode. Provisioning-only: FIREALIVE_GD_DEPLOYMENT_MODE seals the
+// mode once against the GD anchor established above, and the sealed record is
+// authoritative on every later boot. SDN and SASE compose with a host substrate
+// declared via the required FIREALIVE_GD_SUBSTRATE; an absent, invalid, or
+// weaker-than-detected substrate halts the GD (fail-closed, anti-downgrade). A
+// synchronous snapshot is published immediately (fail-safe bare-metal until a
+// seal exists) and refreshed after any first-boot seal, so downstream gating
+// never reads an undefined mode.
+const gdDeploymentMode = require('./services/gd-deployment-mode');
+try {
+  const modeDb0 = getDb();
+  try { app.locals.gdDeploymentMode = gdDeploymentMode.summary(modeDb0); }
+  finally { modeDb0.close(); }
+} catch (gdModeSnapErr) {
+  app.locals.gdDeploymentMode = {
+    mode: 'bare-metal', configured: false, recordPresent: false,
+    virtualized: false, cloud: false, sdn: false, sase: false, networkMode: null,
+    substrate: null, substrateVirtualized: false, substrateCloud: false,
+    easilyCopied: false, ccRequired: false, hypervisor: null,
+  };
+}
+(async () => {
+  const modeDb = getDb();
+  try {
+    const envMode = process.env.FIREALIVE_GD_DEPLOYMENT_MODE;
+    if (envMode && !gdDeploymentMode.isConfigured(modeDb)) {
+      if (gdDeploymentMode.MODES.indexOf(envMode) === -1) {
+        console.warn('Ignoring invalid FIREALIVE_GD_DEPLOYMENT_MODE: ' + envMode + ' (valid: ' + gdDeploymentMode.MODES.join(', ') + ')');
+      } else if (envMode === gdDeploymentMode.SDN || envMode === gdDeploymentMode.SASE) {
+        const declared = process.env.FIREALIVE_GD_SUBSTRATE;
+        if (gdDeploymentMode.SUBSTRATES.indexOf(declared) === -1) {
+          console.error(envMode + ' mode requires FIREALIVE_GD_SUBSTRATE to be one of ' + gdDeploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed). Got: ' + (declared || 'unset'));
+          process.exit(1);
+        }
+        const detected = await gdDeploymentMode.detectSubstrate(modeDb);
+        const substrateRank = { 'bare-metal': 0, 'virtualized': 1, 'cloud': 2 };
+        if (substrateRank[detected] > substrateRank[declared]) {
+          console.error('FIREALIVE_GD_SUBSTRATE declares a weaker host substrate (' + declared + ') than detection proves (' + detected + '); refusing to start (anti-downgrade, fail-closed).');
+          process.exit(1);
+        }
+        gdDeploymentMode.setMode(modeDb, envMode, { substrate: declared });
+        console.log('GD deployment mode provisioned and sealed: ' + envMode + ' (substrate ' + declared + ', detected ' + detected + ')');
+      } else {
+        gdDeploymentMode.setMode(modeDb, envMode);
+        console.log('GD deployment mode provisioned and sealed: ' + envMode);
+      }
+    } else if (envMode && gdDeploymentMode.getMode(modeDb) !== envMode) {
+      console.warn('FIREALIVE_GD_DEPLOYMENT_MODE (' + envMode + ') differs from the sealed mode (' + gdDeploymentMode.getMode(modeDb) + '); the sealed mode is authoritative.');
+    }
+    app.locals.gdDeploymentMode = gdDeploymentMode.summary(modeDb);
+    if (app.locals.gdDeploymentMode.networkMode && !app.locals.gdDeploymentMode.substrate) {
+      console.warn('This ' + app.locals.gdDeploymentMode.networkMode + ' GD deployment has no sealed host substrate and runs on the strict TPM path; re-provision with FIREALIVE_GD_SUBSTRATE to enable substrate-specific protections.');
+    }
+    console.log('GD deployment mode: ' + JSON.stringify(app.locals.gdDeploymentMode));
+  } catch (gdModeErr) {
+    console.error('GD deployment mode resolution failed; defaulting to bare-metal (strict): ' + gdModeErr.message);
+  } finally {
+    modeDb.close();
+  }
+})();
 
 // B5g: re-seal any legacy plaintext forensic export artifacts at
 // rest. Fire-and-forget at startup (the GD uses short-lived DB connections);
