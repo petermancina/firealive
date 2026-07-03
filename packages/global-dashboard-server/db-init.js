@@ -599,27 +599,35 @@ INSERT OR IGNORE INTO config_lock_state (id, lock_active, idle_minutes) VALUES (
 CREATE TABLE IF NOT EXISTS malware_scanner_integrations (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   provider_type TEXT NOT NULL CHECK (provider_type IN (
+    'clamav',
+    'virustotal',
     'crowdstrike_falcon',
-    'microsoft_defender_endpoint',
+    'microsoft_defender',
     'sentinelone',
-    'palo_alto_cortex_xdr',
-    'trellix_edr',
-    'sophos_intercept_x',
-    'vmware_carbon_black',
-    'cisco_secure_endpoint',
-    'wazuh',
-    'elastic_defend',
-    'limacharlie'
+    'cisco_amp',
+    'fortinet_fortisandbox',
+    'trellix_atd',
+    'sophos_intelix',
+    'joe_sandbox',
+    'hybrid_analysis',
+    'palo_alto_wildfire',
+    'blackberry_cylance',
+    'trend_micro_ddan',
+    'kaspersky_sandbox'
   )),
   display_name TEXT NOT NULL,
-  endpoint TEXT,
-  credentials_encrypted TEXT,
+  credentials_encrypted TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 1000),
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
   configured_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   configured_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_test_at TEXT,
   last_test_status TEXT CHECK (last_test_status IS NULL OR last_test_status IN ('success', 'failed')),
-  last_test_error TEXT
+  last_test_error TEXT,
+  last_scan_at TEXT,
+  total_scans INTEGER NOT NULL DEFAULT 0,
+  total_threats_detected INTEGER NOT NULL DEFAULT 0,
+  total_failures INTEGER NOT NULL DEFAULT 0
 );
 
 -- Generated reports
@@ -1341,6 +1349,44 @@ function initDb() {
     }
   } catch (gdBackupV2ColsErr) {
     console.error('GD v2 backup columns migration failed:', gdBackupV2ColsErr.message);
+  }
+
+  // EDR scan engine: bring malware_scanner_integrations to the anti-malware
+  // engine's schema. The GD's pre-engine table (11 EDR-endpoint providers, an
+  // endpoint column, no priority/telemetry) had no scan engine behind it and
+  // holds no rows, so it is safe to recreate. SQLite cannot ALTER a CHECK
+  // constraint, so the provider-set and constraint change needs a recreate, not
+  // an ALTER. Guarded by PRAGMA table_info so it runs once and never re-runs.
+  try {
+    const msCols = db.prepare("PRAGMA table_info(malware_scanner_integrations)").all().map((c) => c.name);
+    const preEngine = msCols.length > 0 && (msCols.includes('endpoint') || !msCols.includes('priority'));
+    if (preEngine) {
+      db.exec('DROP TABLE IF EXISTS malware_scanner_integrations');
+      db.exec(`CREATE TABLE IF NOT EXISTS malware_scanner_integrations (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        provider_type TEXT NOT NULL CHECK (provider_type IN (
+          'clamav', 'virustotal', 'crowdstrike_falcon', 'microsoft_defender',
+          'sentinelone', 'cisco_amp', 'fortinet_fortisandbox', 'trellix_atd',
+          'sophos_intelix', 'joe_sandbox', 'hybrid_analysis', 'palo_alto_wildfire',
+          'blackberry_cylance', 'trend_micro_ddan', 'kaspersky_sandbox'
+        )),
+        display_name TEXT NOT NULL,
+        credentials_encrypted TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 1000),
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        configured_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        configured_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_test_at TEXT,
+        last_test_status TEXT CHECK (last_test_status IS NULL OR last_test_status IN ('success', 'failed')),
+        last_test_error TEXT,
+        last_scan_at TEXT,
+        total_scans INTEGER NOT NULL DEFAULT 0,
+        total_threats_detected INTEGER NOT NULL DEFAULT 0,
+        total_failures INTEGER NOT NULL DEFAULT 0
+      )`);
+    }
+  } catch (msScannerErr) {
+    console.error('malware_scanner_integrations engine-schema migration failed:', msScannerErr.message);
   }
 
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──

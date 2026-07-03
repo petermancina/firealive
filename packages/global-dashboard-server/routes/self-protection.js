@@ -13,9 +13,8 @@
 // /config and are never gated. GET requests under /config are reads (safe
 // method) and pass the chokepoint regardless.
 //
-// Secrets are never returned: the SOAR auth token, the webhook URL path, and the
-// EDR credentials are masked or omitted on read. EDR credentials are stored
-// AES-256-GCM-encrypted (gd-encryption.encryptConfig).
+// Secrets are never returned: the SOAR auth token and the webhook URL path are
+// masked or omitted on read.
 //
 // AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -23,16 +22,10 @@
 const router = require('express').Router();
 const { getDb } = require('../db-init');
 const { appendGdAuditEntry } = require('../services/gd-audit-chain');
-const gdEncryption = require('../services/gd-encryption');
 const { gdRuntimeMonitor } = require('../services/gd-runtime-monitor');
 const gdIntegrationHealth = require('../services/gd-integration-health');
 const { loadMatrix } = require('../services/gd-alert-router');
 
-const EDR_PROVIDERS = [
-  'crowdstrike_falcon', 'microsoft_defender_endpoint', 'sentinelone', 'palo_alto_cortex_xdr',
-  'trellix_edr', 'sophos_intercept_x', 'vmware_carbon_black', 'cisco_secure_endpoint',
-  'wazuh', 'elastic_defend', 'limacharlie',
-];
 const SIEM_PROTOCOLS = ['tcp', 'udp', 'tls'];
 const SEVERITIES = ['info', 'warning', 'high', 'critical'];
 const MATRIX_CHANNELS = ['soar', 'siem', 'email', 'notification', 'webhook'];
@@ -194,73 +187,6 @@ router.put('/config/integration-health', (req, res) => {
       _writeJson(db, 'integration_health_config', cur);
     }
     _audit(db, req, 'SELF_PROTECTION_INTEGRATION_HEALTH_CONFIGURED', `master=${b.master}`);
-    return res.json({ ok: true });
-  } catch (e) { return res.status(500).json({ error: 'Internal error' }); }
-  finally { try { db.close(); } catch (_) { /* ignore */ } }
-});
-
-// ── EDR seam CRUD (malware_scanner_integrations; credentials encrypted) ──
-function _edrRow(r) {
-  return {
-    id: r.id, provider_type: r.provider_type, display_name: r.display_name, endpoint: r.endpoint,
-    enabled: r.enabled === 1, has_credentials: !!r.credentials_encrypted,
-    configured_by: r.configured_by, configured_at: r.configured_at,
-    last_test_at: r.last_test_at, last_test_status: r.last_test_status, last_test_error: r.last_test_error,
-  };
-}
-router.get('/config/edr', (req, res) => {
-  const db = getDb();
-  try { const rows = db.prepare('SELECT * FROM malware_scanner_integrations ORDER BY configured_at DESC').all(); return res.json({ integrations: rows.map(_edrRow) }); }
-  catch (e) { return res.status(500).json({ error: 'Internal error' }); }
-  finally { try { db.close(); } catch (_) { /* ignore */ } }
-});
-router.post('/config/edr', (req, res) => {
-  const b = req.body || {};
-  if (!EDR_PROVIDERS.includes(b.provider_type)) return res.status(400).json({ error: 'provider_type must be a supported EDR provider', code: 'INVALID_INPUT', supported: EDR_PROVIDERS });
-  if (typeof b.display_name !== 'string' || !b.display_name.trim()) return res.status(400).json({ error: 'display_name is required', code: 'INVALID_INPUT' });
-  let credsEnc = null;
-  if (b.credentials !== undefined && b.credentials !== null && b.credentials !== '') {
-    try { credsEnc = gdEncryption.encryptConfig(b.credentials); } catch (e) { return res.status(500).json({ error: 'Could not encrypt credentials' }); }
-  }
-  const db = getDb();
-  try {
-    const id = require('crypto').randomBytes(16).toString('hex');
-    db.prepare('INSERT INTO malware_scanner_integrations (id, provider_type, display_name, endpoint, credentials_encrypted, enabled, configured_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(id, b.provider_type, b.display_name.trim(), b.endpoint || null, credsEnc, b.enabled ? 1 : 0, req.user ? req.user.id : null);
-    _audit(db, req, 'SELF_PROTECTION_EDR_ADDED', `id=${id} provider=${b.provider_type} name="${b.display_name.trim()}"`);
-    return res.status(201).json({ ok: true, id });
-  } catch (e) { return res.status(500).json({ error: 'Internal error', detail: e.message }); }
-  finally { try { db.close(); } catch (_) { /* ignore */ } }
-});
-router.put('/config/edr/:id', (req, res) => {
-  const b = req.body || {};
-  const id = req.params.id;
-  const db = getDb();
-  try {
-    const row = db.prepare('SELECT * FROM malware_scanner_integrations WHERE id = ?').get(id);
-    if (!row) return res.status(404).json({ error: 'EDR integration not found', code: 'NOT_FOUND' });
-    const display_name = typeof b.display_name === 'string' && b.display_name.trim() ? b.display_name.trim() : row.display_name;
-    const endpoint = b.endpoint !== undefined ? (b.endpoint || null) : row.endpoint;
-    const enabled = typeof b.enabled === 'boolean' ? (b.enabled ? 1 : 0) : row.enabled;
-    let credsEnc = row.credentials_encrypted;
-    if (b.credentials === '') credsEnc = null;
-    else if (b.credentials !== undefined && b.credentials !== null) {
-      try { credsEnc = gdEncryption.encryptConfig(b.credentials); } catch (e) { return res.status(500).json({ error: 'Could not encrypt credentials' }); }
-    }
-    db.prepare('UPDATE malware_scanner_integrations SET display_name = ?, endpoint = ?, enabled = ?, credentials_encrypted = ? WHERE id = ?')
-      .run(display_name, endpoint, enabled, credsEnc, id);
-    _audit(db, req, 'SELF_PROTECTION_EDR_UPDATED', `id=${id}`);
-    return res.json({ ok: true });
-  } catch (e) { return res.status(500).json({ error: 'Internal error' }); }
-  finally { try { db.close(); } catch (_) { /* ignore */ } }
-});
-router.delete('/config/edr/:id', (req, res) => {
-  const id = req.params.id;
-  const db = getDb();
-  try {
-    const info = db.prepare('DELETE FROM malware_scanner_integrations WHERE id = ?').run(id);
-    if (!info.changes) return res.status(404).json({ error: 'EDR integration not found', code: 'NOT_FOUND' });
-    _audit(db, req, 'SELF_PROTECTION_EDR_REMOVED', `id=${id}`);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: 'Internal error' }); }
   finally { try { db.close(); } catch (_) { /* ignore */ } }

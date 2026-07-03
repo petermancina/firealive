@@ -25,15 +25,19 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 // Config-only mounts: ANY mutating request under one of these prefixes is a
 // configuration change.
-//   /api/self-protection/config  — the B6a self-protection config sub-router
-//        (SIEM/SOAR/alert-matrix/runtime-thresholds/webhook/integration-health/
-//        EDR seam). The router's operational endpoints (status reads, run-now
-//        probe, runtime metrics) live OUTSIDE /config and are not gated.
-//   /api/backup-schedules        — backup schedule configuration (the manual
+//   /api/self-protection/config  -- the self-protection config sub-router
+//        (SIEM/SOAR/alert-matrix/runtime-thresholds/webhook/integration-health).
+//        The router's operational endpoints (status reads, run-now probe,
+//        runtime metrics) live OUTSIDE /config and are not gated.
+//   /api/backup-schedules        -- backup schedule configuration (the manual
 //        trigger and full-suite run are operational and live elsewhere).
+//   /api/malware-scanners        -- the EDR scanner-management surface (add /
+//        update / delete / scan-mode / test). Reads (list, get scan-mode) are
+//        safe methods and pass.
 const CONFIG_WRITE_MOUNTS = [
   '/api/self-protection/config',
   '/api/backup-schedules',
+  '/api/malware-scanners',
 ];
 
 // Exact config-write endpoints inside mixed routers (operational siblings such
