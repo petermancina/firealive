@@ -617,6 +617,20 @@ function gdCountLoginMethodsExcluding(db, userId, excludePasskeyId) {
   return (pk.c || 0) + (cert.c || 0);
 }
 
+app.post('/api/mfa/stepup/options', authMiddleware(['ciso', 'vp']), async (req, res) => {
+  const db = getDb();
+  try {
+    const rp = gdWebauthn.getRpConfig(db);
+    const creds = db.prepare('SELECT credential_id AS credentialId, transports FROM webauthn_credentials WHERE user_id = ? AND is_passwordless = 1').all(req.user.id);
+    if (!creds.length) {
+      return res.status(409).json({ error: 'step-up requires an enrolled passwordless passkey; none found for this account', code: 'NO_STEPUP_CREDENTIAL' });
+    }
+    const { options, challengeToken } = await gdWebauthn.beginStepUp({ rp, allowCredentials: creds, userId: req.user.id });
+    return res.json({ options, challengeToken });
+  } catch (e) { return res.status(500).json({ error: 'could not start step-up', code: 'INTERNAL' }); }
+  finally { try { db.close(); } catch (_) { /* ignore */ } }
+});
+
 app.post('/api/mfa/passkey/register-options', authMiddleware(['ciso', 'vp']), async (req, res) => {
   const db = getDb();
   try {

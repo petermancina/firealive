@@ -348,12 +348,57 @@ async function finishAuthentication({ rp, response, challengeToken, credential, 
   };
 }
 
+// -- Step-up (re-prove the hardware credential for a sensitive action) --
+// A fresh, user-verified assertion separate from login-time auth, used to gate
+// sensitive operations so that even a hijacked session cannot perform them
+// without live access to the operator's authenticator.
+async function beginStepUp({ rp, allowCredentials = [], userId }) {
+  const options = await generateAuthenticationOptions({
+    rpID: rp.rpID,
+    allowCredentials: (allowCredentials || []).map((c) => ({
+      id: c.credentialId,
+      transports: parseTransports(c.transports),
+    })),
+    userVerification: 'required',
+  });
+  // Bind the challenge to the acting user (sub) so a step-up challenge minted for
+  // one user cannot be presented by another.
+  const challengeToken = issueChallengeToken(options.challenge, { purpose: 'stepup', sub: userId });
+  return { options, challengeToken };
+}
+
+async function finishStepUp({ rp, response, challengeToken, credential, expectedUserId }) {
+  const decoded = readChallengeToken(challengeToken, 'stepup');
+  if (!expectedUserId || decoded.sub !== expectedUserId) {
+    throw new Error('challenge token user mismatch');
+  }
+  const verification = await verifyAuthenticationResponse({
+    response,
+    expectedChallenge: decoded.wa_challenge,
+    expectedOrigin: rp.origin,
+    expectedRPID: rp.rpID,
+    credential: {
+      id: credential.credentialId,
+      publicKey: new Uint8Array(Buffer.from(credential.publicKey, 'base64url')),
+      counter: typeof credential.counter === 'number' ? credential.counter : 0,
+      transports: parseTransports(credential.transports),
+    },
+    requireUserVerification: true,
+  });
+  return {
+    verified: !!verification.verified,
+    newCounter: verification.authenticationInfo ? verification.authenticationInfo.newCounter : null,
+  };
+}
+
 module.exports = {
   getRpConfig,
   beginRegistration,
   finishRegistration,
   beginAuthentication,
   finishAuthentication,
+  beginStepUp,
+  finishStepUp,
   // Hardware-credential attestation gate (B5n3)
   assertHardwareCredential,
   HardwareCredentialError,
