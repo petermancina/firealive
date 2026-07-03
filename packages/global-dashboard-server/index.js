@@ -194,6 +194,8 @@ app.use('/api', (req, res, next) => {
   next();
 });
 app.use('/api', configLockChokepoint());
+// B6c: mode-gated pre-auth VM-attestation gate; refuses the whole /api surface on an easily-copied+quarantined instance or an unverified cloud confidential VM. No-op on bare-metal.
+app.use('/api/', require('./services/gd-vm-attestation').gdVmAttestation());
 
 // Device-key proof-of-possession gate (D28). For a device-bound session (the
 // token carries an RFC 7800 cnf.jkt), every request must present a fresh,
