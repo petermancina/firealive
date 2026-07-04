@@ -6017,7 +6017,7 @@ const gdArchivalSealTimer = setInterval(() => {
 }, GD_ARCHIVAL_SEAL_INTERVAL_MS);
 if (gdArchivalSealTimer && typeof gdArchivalSealTimer.unref === 'function') gdArchivalSealTimer.unref();
 
-// Retention (daily): prune backups past their retention_until. Synchronous.
+// Retention (daily): delete backup artifacts older than the retention window (mtime). Synchronous.
 const GD_BACKUP_RETENTION_INTERVAL_MS = 86400000;
 const gdBackupRetentionTimer = setInterval(() => {
   let db;
