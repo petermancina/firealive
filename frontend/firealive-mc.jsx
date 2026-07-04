@@ -2857,9 +2857,10 @@ function ManagementConsole() {
       name: newSchedule.name || null,
       type: newSchedule.type,
       frequency: newSchedule.frequency,
-      time: newSchedule.frequency === "hourly" ? null : newSchedule.time,
+      time: newSchedule.frequency === "hourly" || newSchedule.frequency === "interval" ? null : newSchedule.time,
       day_of_week: newSchedule.frequency === "weekly" ? newSchedule.day_of_week : null,
       day_of_month: newSchedule.frequency === "monthly" ? newSchedule.day_of_month : null,
+      interval_minutes: newSchedule.frequency === "interval" ? newSchedule.interval_minutes : null,
       destination: newSchedule.destination,
       retention_days: typeof newSchedule.retention_days === "string"
         ? (parseInt(newSchedule.retention_days, 10) || 0)
@@ -2905,7 +2906,7 @@ function ManagementConsole() {
       // Reset form.
       setNewSchedule({
         name: "", type: "full", frequency: "daily", time: "02:00",
-        day_of_week: 0, day_of_month: 1, destination: "local",
+        day_of_week: 0, day_of_month: 1, interval_minutes: 60, destination: "local",
         retention_days: 30, encrypted: true, regulatory_preset_id: null,
         active: true,
         // R3l C59: reset Workstream 3 fields to safe defaults
@@ -3373,7 +3374,7 @@ function ManagementConsole() {
   // the form.
   const [newSchedule, setNewSchedule] = useState({
     name: "", type: "full", frequency: "daily", time: "02:00",
-    day_of_week: 0, day_of_month: 1, destination: "local",
+    day_of_week: 0, day_of_month: 1, interval_minutes: 60, destination: "local",
     retention_days: 30, encrypted: true, regulatory_preset_id: null,
     active: true,
     // R3l C59: Workstream 3 schema fields with safe defaults
@@ -9489,10 +9490,12 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <option value="full">Full</option><option value="incremental">Incremental</option><option value="differential">Differential</option><option value="snapshot">Snapshot</option>
               </Sel>
               <Sel label="Frequency" value={newSchedule.frequency} onChange={e=>setNewSchedule(p=>({...p,frequency:e.target.value}))}>
-                <option value="hourly">Hourly</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+                <option value="hourly">Hourly</option><option value="interval">Every N minutes</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
               </Sel>
               {newSchedule.frequency==="hourly" ? (
                 <div><M style={{color:C.td,fontSize:11,display:"block",marginTop:18}}>Fires at the top of every hour</M></div>
+              ) : newSchedule.frequency==="interval" ? (
+                <Input label="Every (minutes, 15-1440)" value={newSchedule.interval_minutes} onChange={e=>setNewSchedule(p=>({...p,interval_minutes:parseInt(e.target.value,10)||0}))} type="number" min={15} max={1440}/>
               ) : (
                 <Input label="Time (HH:MM)" value={newSchedule.time} onChange={e=>setNewSchedule(p=>({...p,time:e.target.value}))} type="time"/>
               )}
@@ -9504,6 +9507,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             )}
             {newSchedule.frequency==="monthly" && (
               <Input label="Day of month (1-31)" value={newSchedule.day_of_month} onChange={e=>setNewSchedule(p=>({...p,day_of_month:parseInt(e.target.value,10)||1}))} type="number" min={1} max={31}/>
+            )}
+            {newSchedule.frequency==="interval" && (
+              <M style={{color:C.td,fontSize:11,display:"block",marginTop:6}}>Backs up every {newSchedule.interval_minutes||"N"} minute{newSchedule.interval_minutes===1?"":"s"} -- your recovery point objective is at most {newSchedule.interval_minutes||"N"} minute{newSchedule.interval_minutes===1?"":"s"}. Range 15-1440 min; for an RPO under an hour, pair a short interval with the Incremental backup type plus a periodic Full.</M>
             )}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
               <Sel label="Destination" value={newSchedule.destination} onChange={e=>setNewSchedule(p=>({...p,destination:e.target.value}))}>

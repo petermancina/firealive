@@ -456,7 +456,7 @@ CREATE TABLE IF NOT EXISTS config (
 -- Backup records
 CREATE TABLE IF NOT EXISTS backups (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
+  type TEXT NOT NULL CHECK (type IN ('scheduled', 'on-demand', 'snapshot')),
   size_bytes INTEGER,
   file_path TEXT,                                   -- v1 only; NULL for v2
   sha256_hash TEXT,                                 -- v1: hash of the .db file; v2: hash of manifest.json
@@ -532,20 +532,45 @@ CREATE TRIGGER IF NOT EXISTS backup_chain_no_update BEFORE UPDATE ON backup_chai
 CREATE TRIGGER IF NOT EXISTS backup_chain_no_delete BEFORE DELETE ON backup_chain BEGIN SELECT RAISE(ABORT, 'backup_chain is append-only'); END;
 
 -- Backup schedules
+CREATE TABLE IF NOT EXISTS regulatory_presets (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  min_retention_days INTEGER NOT NULL,
+  required_encryption TEXT NOT NULL
+    CHECK (required_encryption IN ('AES-256', 'none')),
+  recommended_frequency TEXT NOT NULL,
+  recommended_destination_type TEXT,
+  framework_citation TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS backup_schedules (
-  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-  type TEXT NOT NULL,
-  frequency TEXT NOT NULL,
-  time TEXT,
-  day TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT,
+  interval TEXT,
+  retention TEXT,
   destination TEXT,
-  retention_days INTEGER DEFAULT 90,
   encrypted INTEGER DEFAULT 1,
-  regulatory_preset TEXT DEFAULT 'none',
   active INTEGER DEFAULT 1,
-  last_status TEXT,
   last_run TEXT,
-  last_error TEXT
+  created_at TEXT,
+  name TEXT,
+  regulatory_preset_id TEXT
+    REFERENCES regulatory_presets(id) ON DELETE SET NULL,
+  time TEXT,
+  day_of_week INTEGER,
+  day_of_month INTEGER,
+  next_run TEXT,
+  last_status TEXT,
+  last_error TEXT,
+  backup_kind TEXT NOT NULL DEFAULT 'full-suite'
+    CHECK (backup_kind IN ('single-db', 'full-suite')),
+  backup_strategy TEXT NOT NULL DEFAULT 'full'
+    CHECK (backup_strategy IN ('full', 'incremental', 'differential', 'snapshot')),
+  destination_filter TEXT,
+  max_chain_depth INTEGER,
+  interval_minutes INTEGER
 );
 
 -- Notification config and history
@@ -1655,6 +1680,148 @@ function initDb() {
     console.error('backups schema-parity migration failed:', bkErr.message);
   }
 
+
+  // ── B6c PR-post3 — rename backups.type value 'daily-auto' -> 'scheduled' ──
+  //
+  // Same rationale and derive-from-live-DDL approach as the Regional Server:
+  // the auto-backup trigger renames to 'scheduled' so the label is accurate
+  // once schedules can fire sub-daily. SQLite cannot ALTER a CHECK, so backups
+  // is rebuilt from the live table's stored SQL (every column, default, FK, and
+  // CHECK preserved byte-identically; only the type CHECK's enum values change),
+  // copying rows with type='daily-auto' mapped to 'scheduled'. Guarded on the
+  // live CHECK still naming 'daily-auto', so it no-ops on fresh installs and
+  // already-migrated databases. Idempotent and data-preserving.
+  try {
+    const backupsTableRow = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'backups'")
+      .get();
+    if (backupsTableRow && backupsTableRow.sql && backupsTableRow.sql.indexOf('daily-auto') !== -1) {
+      console.log('backups migration (B6c post-3): renaming type value daily-auto -> scheduled');
+      let newBackupsDdl = backupsTableRow.sql.replace(/daily-auto/g, 'scheduled');
+      newBackupsDdl = newBackupsDdl.replace(
+        /CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("backups"|backups)/i,
+        'CREATE TABLE backups_new'
+      );
+      db.pragma('foreign_keys = OFF');
+      try {
+        const renameBackups = db.transaction(() => {
+          db.exec(newBackupsDdl);
+          const backupColNames = db
+            .prepare("PRAGMA table_info(backups)")
+            .all()
+            .map((c) => '"' + c.name + '"');
+          const colList = backupColNames.join(', ');
+          const selectList = backupColNames
+            .map((c) => (c === '"type"'
+              ? "CASE WHEN type = 'daily-auto' THEN 'scheduled' ELSE type END"
+              : c))
+            .join(', ');
+          db.exec('INSERT INTO backups_new (' + colList + ') SELECT ' + selectList + ' FROM backups');
+          db.exec('DROP TABLE backups');
+          db.exec('ALTER TABLE backups_new RENAME TO backups');
+        });
+        renameBackups();
+        console.log('backups migration (B6c post-3): renamed daily-auto rows to scheduled');
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (backupsRenameMigrationErr) {
+    console.error('backups migration (B6c post-3) failed (non-fatal):', backupsRenameMigrationErr.message);
+  }
+
+  // ── B6c PR-post3 — seed regulatory_presets + reshape backup_schedules ──
+  //
+  // The GD adopts the Regional Server's backup-schedules service verbatim,
+  // which requires the Regional backup_schedules shape and the regulatory_
+  // presets table (get() LEFT-JOINs it; applyPresetFloor and getPresets read
+  // it). Seed the same 7 framework presets, then rebuild the GD's legacy
+  // backup_schedules (frequency/day/regulatory_preset/retention_days on a TEXT
+  // id) into the Regional shape (interval/day_of_week/day_of_month/next_run/...
+  // on an INTEGER AUTOINCREMENT id, plus backup_kind/strategy/interval_minutes),
+  // preserving existing rows. Both guarded and idempotent.
+  try {
+    const seedPresets = [
+      { id: 'hipaa', name: 'HIPAA', description: 'Protected health information - 6-year retention, AES-256, daily backup', min_retention_days: 2190, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: 'offsite', framework_citation: '45 CFR 164.316(b)(2)(i)' },
+      { id: 'sox', name: 'SOX', description: 'Financial audit trails - 7-year retention, AES-256, daily backup', min_retention_days: 2555, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: 'offsite', framework_citation: '17 CFR 210.2-06 / 18 USC 1520' },
+      { id: 'pci_dss', name: 'PCI-DSS', description: 'Cardholder data - 1-year retention, AES-256, daily backup', min_retention_days: 365, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: 'air_gapped', framework_citation: 'PCI DSS v4.0 Requirement 10.7.1' },
+      { id: 'gdpr', name: 'GDPR', description: 'EU personal data - 30-day minimum, AES-256, EU-region destination', min_retention_days: 30, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: 'offsite', framework_citation: 'Articles 5(1)(e), 25, 32, Chapter V' },
+      { id: 'nist_csf', name: 'NIST CSF', description: 'Cybersecurity Framework 2.0 - flexible retention, AES-256 required', min_retention_days: 365, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: null, framework_citation: 'NIST CSF 2.0 PR.DS-11' },
+      { id: 'iso_27001', name: 'ISO 27001', description: 'Information security management - flexible retention, AES-256 required', min_retention_days: 365, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: null, framework_citation: 'ISO/IEC 27001:2022 Annex A.8.13' },
+      { id: 'soc_2', name: 'SOC 2', description: 'Trust Services Criteria - flexible retention, AES-256 required', min_retention_days: 365, required_encryption: 'AES-256', recommended_frequency: 'daily', recommended_destination_type: null, framework_citation: 'TSC CC9.1 / CC6.1' },
+    ];
+    const insertPreset = db.prepare(
+      'INSERT OR IGNORE INTO regulatory_presets '
+      + '(id, name, description, min_retention_days, required_encryption, '
+      + 'recommended_frequency, recommended_destination_type, framework_citation) '
+      + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    let seededPresetCount = 0;
+    for (const p of seedPresets) {
+      const r = insertPreset.run(p.id, p.name, p.description, p.min_retention_days,
+        p.required_encryption, p.recommended_frequency, p.recommended_destination_type,
+        p.framework_citation);
+      if (r.changes > 0) seededPresetCount += 1;
+    }
+    if (seededPresetCount > 0) {
+      console.log('B6c post-3 migration: seeded ' + seededPresetCount + ' regulatory preset(s)');
+    }
+  } catch (presetSeedErr) {
+    console.error('B6c post-3 migration (regulatory_presets seed) failed (non-fatal):', presetSeedErr.message);
+  }
+  try {
+    const bsCols = db.prepare("PRAGMA table_info(backup_schedules)").all().map((c) => c.name);
+    if (bsCols.includes('frequency') && !bsCols.includes('interval')) {
+      console.log('B6c post-3 migration: reshaping backup_schedules to Regional shape');
+      const legacyRows = db.prepare("SELECT * FROM backup_schedules").all();
+      db.pragma('foreign_keys = OFF');
+      try {
+        const reshapeSchedules = db.transaction(() => {
+          db.exec("ALTER TABLE backup_schedules RENAME TO backup_schedules_legacy");
+          db.exec(
+            'CREATE TABLE backup_schedules ('
+            + 'id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, interval TEXT, '
+            + 'retention TEXT, destination TEXT, encrypted INTEGER DEFAULT 1, '
+            + 'active INTEGER DEFAULT 1, last_run TEXT, created_at TEXT, name TEXT, '
+            + 'regulatory_preset_id TEXT REFERENCES regulatory_presets(id) ON DELETE SET NULL, '
+            + 'time TEXT, day_of_week INTEGER, day_of_month INTEGER, next_run TEXT, '
+            + 'last_status TEXT, last_error TEXT, '
+            + "backup_kind TEXT NOT NULL DEFAULT 'full-suite' CHECK (backup_kind IN ('single-db', 'full-suite')), "
+            + "backup_strategy TEXT NOT NULL DEFAULT 'full' CHECK (backup_strategy IN ('full', 'incremental', 'differential', 'snapshot')), "
+            + 'destination_filter TEXT, max_chain_depth INTEGER, interval_minutes INTEGER)'
+          );
+          const ins = db.prepare(
+            'INSERT INTO backup_schedules '
+            + '(type, interval, retention, destination, encrypted, active, last_run, '
+            + 'created_at, name, regulatory_preset_id, time, day_of_week, day_of_month, '
+            + 'next_run, last_status, last_error, backup_kind, backup_strategy, '
+            + 'destination_filter, max_chain_depth, interval_minutes) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          );
+          const nowIso = new Date().toISOString();
+          for (const r of legacyRows) {
+            ins.run(
+              r.type,
+              r.frequency,
+              (r.retention_days != null ? String(r.retention_days) + ' days' : null),
+              r.destination, r.encrypted, r.active, r.last_run,
+              nowIso, null, null, r.time,
+              (r.frequency === 'weekly' && r.day != null ? parseInt(r.day, 10) : null),
+              (r.frequency === 'monthly' && r.day != null ? parseInt(r.day, 10) : null),
+              null, r.last_status, r.last_error, 'full-suite', 'full', null, null, null,
+            );
+          }
+          db.exec("DROP TABLE backup_schedules_legacy");
+        });
+        reshapeSchedules();
+        console.log('B6c post-3 migration: reshaped ' + legacyRows.length + ' backup schedule(s) to Regional shape');
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (bsReshapeErr) {
+    console.error('B6c post-3 migration (backup_schedules reshape) failed (non-fatal):', bsReshapeErr.message);
+  }
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
   //
   // The canonical CREATE TABLE above includes approval_status, approved_at,

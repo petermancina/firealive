@@ -1,19 +1,19 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Backup Schedules Routes
+// ===============================================================================
+// FIREALIVE -- Backup Schedules Routes
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // HTTP surface for the multi-schedule backup subsystem. Mounted at
 // /api/backup-schedules in server/index.js with authMiddleware(['admin'])
-// and configLockGate() — matching the established posture for
+// and configLockGate() -- matching the established posture for
 // backup-destinations, backup-push, and gd-config (all of which are
 // admin-only platform-config surfaces gated by the config lock).
 //
 // The route file itself does NOT apply auth or the config-lock gate;
 // both are applied at mount time in index.js. Inside the file, the
 // only role-vs-action checks needed are within-admin distinctions
-// that don't exist here — every endpoint is uniformly admin-grade.
+// that don't exist here -- every endpoint is uniformly admin-grade.
 //
 // ENDPOINT INVENTORY
 //
@@ -83,16 +83,20 @@
 // with the broader backup-destinations / backup-push pattern; an
 // operator wanting to inspect schedules during a locked window
 // unlocks via POST /api/config/lock first.
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 const express = require('express');
 const router = express.Router();
-const backupSchedules = require('../services/backup-schedules');
-const { getDb } = require('../db/init');
-const { logger } = require('../services/logger');
-const { auditLog } = require('../middleware/audit');
+const gdBackupSchedules = require('../services/gd-backup-schedules');
+const { getDb } = require('../db-init');
+const logger = {
+  error: (m, o) => console.error('[gd-backup-schedules] ' + m, o || ''),
+  warn: (m, o) => console.warn('[gd-backup-schedules] ' + m, o || ''),
+  info: (m, o) => console.log('[gd-backup-schedules] ' + m, o || ''),
+};
+const { appendGdAuditEntry } = require('../services/gd-audit-chain');
 
-// ── Helper: write an explicit audit_log row ──────────────────────────
+// -- Helper: write an explicit audit_log row --------------------------
 //
 // The auditMiddleware writes a generic API-action row on every call.
 // This helper writes an additional row with a queryable event_type
@@ -100,29 +104,30 @@ const { auditLog } = require('../middleware/audit');
 // helper-pay routes (LEADERBOARD_OPT_IN_FLIPPED,
 // LEADERBOARD_SOCKPUPPET_CONFIRMED, etc.).
 //
-// Failures are logged and swallowed — the canonical operation
+// Failures are logged and swallowed -- the canonical operation
 // has already committed (or already failed); audit-log write
 // failure must not change the response semantics.
 function writeAuditEvent(req, eventType, detail) {
+  let adb = null;
   try {
-    auditLog(
-      req.user ? req.user.id : null,
+    adb = getDb();
+    appendGdAuditEntry(adb, {
+      userId: req.user ? req.user.id : 'anonymous',
       eventType,
-      JSON.stringify(detail || {}),
-      req.ip || null,
-    );
-  } catch (auditErr) {
-    logger.warn('backup-schedules audit-log write failed', {
-      eventType,
-      error: auditErr.message,
+      detail: JSON.stringify(detail || {}),
+      ip: req.ip || null,
     });
+  } catch (auditErr) {
+    logger.warn('audit-log write failed', { eventType, error: auditErr.message });
+  } finally {
+    if (adb) { try { adb.close(); } catch (_e) { /* idempotent */ } }
   }
 }
 
-// ── GET /api/backup-schedules ────────────────────────────────────────
+// -- GET /api/backup-schedules ----------------------------------------
 router.get('/', (req, res) => {
   try {
-    const schedules = backupSchedules.list();
+    const schedules = gdBackupSchedules.list();
     res.json({ schedules });
   } catch (err) {
     logger.error('GET /api/backup-schedules failed', { error: err.message });
@@ -130,14 +135,14 @@ router.get('/', (req, res) => {
   }
 });
 
-// ── GET /api/backup-schedules/presets ────────────────────────────────
+// -- GET /api/backup-schedules/presets --------------------------------
 //
 // Declared BEFORE the /:id paths so Express does not match 'presets'
 // as an :id parameter. (Not strictly required since no GET /:id
 // endpoint exists, but explicit ordering prevents future drift.)
 router.get('/presets', (req, res) => {
   try {
-    const presets = backupSchedules.getPresets();
+    const presets = gdBackupSchedules.getPresets();
     res.json({ presets });
   } catch (err) {
     logger.error('GET /api/backup-schedules/presets failed', { error: err.message });
@@ -145,15 +150,15 @@ router.get('/presets', (req, res) => {
   }
 });
 
-// ── POST /api/backup-schedules ───────────────────────────────────────
+// -- POST /api/backup-schedules ---------------------------------------
 //
 // Two-phase write:
 //   1. Detect overlap with other active schedules. If overlaps
-//      and !force_queue → 409 SCHEDULE_OVERLAP.
+//      and !force_queue -> 409 SCHEDULE_OVERLAP.
 //   2. Service.create() validates fields + applies preset floor +
 //      INSERTs the row + computes next_run.
 //
-// The two phases are NOT atomic — there is a small window between
+// The two phases are NOT atomic -- there is a small window between
 // overlap check and INSERT during which another operator could
 // create a conflicting schedule. The window is operator-tolerable
 // because: (a) backup schedule creation is an admin-grade action,
@@ -167,11 +172,11 @@ router.post('/', (req, res) => {
   const body = req.body || {};
 
   try {
-    const { overlaps } = backupSchedules.detectOverlap(db, body, null);
+    const { overlaps } = gdBackupSchedules.detectOverlap(db, body, null);
     if (overlaps.length > 0 && body.force_queue !== true) {
       return res.status(409).json({
         error: 'SCHEDULE_OVERLAP',
-        message: `Schedule overlaps with ${overlaps.length} existing fire time(s) within ${backupSchedules.OVERLAP_WINDOW_MIN} minutes. Retry with force_queue=true to confirm.`,
+        message: `Schedule overlaps with ${overlaps.length} existing fire time(s) within ${gdBackupSchedules.OVERLAP_WINDOW_MIN} minutes. Retry with force_queue=true to confirm.`,
         overlaps,
       });
     }
@@ -183,7 +188,7 @@ router.post('/', (req, res) => {
       });
     }
 
-    const schedule = backupSchedules.create(body);
+    const schedule = gdBackupSchedules.create(body);
     writeAuditEvent(req, 'BACKUP_SCHEDULE_CREATED', {
       scheduleId: schedule.id,
       name: schedule.name,
@@ -239,7 +244,7 @@ router.post('/', (req, res) => {
   }
 });
 
-// ── PUT /api/backup-schedules/:id ────────────────────────────────────
+// -- PUT /api/backup-schedules/:id ------------------------------------
 router.put('/:id', (req, res) => {
   const db = getDb();
   const id = parseInt(req.params.id, 10);
@@ -253,11 +258,11 @@ router.put('/:id', (req, res) => {
   try {
     // Overlap detection excludes the same row being updated so the
     // schedule does not conflict with itself.
-    const { overlaps } = backupSchedules.detectOverlap(db, body, id);
+    const { overlaps } = gdBackupSchedules.detectOverlap(db, body, id);
     if (overlaps.length > 0 && body.force_queue !== true) {
       return res.status(409).json({
         error: 'SCHEDULE_OVERLAP',
-        message: `Schedule overlaps with ${overlaps.length} existing fire time(s) within ${backupSchedules.OVERLAP_WINDOW_MIN} minutes. Retry with force_queue=true to confirm.`,
+        message: `Schedule overlaps with ${overlaps.length} existing fire time(s) within ${gdBackupSchedules.OVERLAP_WINDOW_MIN} minutes. Retry with force_queue=true to confirm.`,
         overlaps,
       });
     }
@@ -270,7 +275,7 @@ router.put('/:id', (req, res) => {
       });
     }
 
-    const schedule = backupSchedules.update(id, body);
+    const schedule = gdBackupSchedules.update(id, body);
     if (!schedule) {
       return res.status(404).json({ error: 'SCHEDULE_NOT_FOUND',
         message: `Schedule #${id} does not exist` });
@@ -319,7 +324,7 @@ router.put('/:id', (req, res) => {
   }
 });
 
-// ── DELETE /api/backup-schedules/:id ─────────────────────────────────
+// -- DELETE /api/backup-schedules/:id ---------------------------------
 router.delete('/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) {
@@ -331,7 +336,7 @@ router.delete('/:id', (req, res) => {
   let scheduleName = null;
   let presetId = null;
   try {
-    const existing = backupSchedules.get(id);
+    const existing = gdBackupSchedules.get(id);
     if (existing) {
       scheduleName = existing.name;
       presetId = existing.regulatory_preset_id;
@@ -344,7 +349,7 @@ router.delete('/:id', (req, res) => {
   }
 
   try {
-    const result = backupSchedules.deleteSchedule(id);
+    const result = gdBackupSchedules.deleteSchedule(id);
     if (!result.deleted) {
       return res.status(404).json({ error: 'SCHEDULE_NOT_FOUND',
         message: `Schedule #${id} does not exist` });

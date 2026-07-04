@@ -39,7 +39,7 @@
 //
 // CALLERS
 //
-//   server/services/scheduler.js    — daily-auto cron trigger
+//   server/services/scheduler.js    — scheduled cron trigger
 //   server/routes/backup.js         — POST /api/backup (after route
 //                                     update in commit 12)
 //
@@ -217,7 +217,7 @@ async function snapshotSourceDb(snapshotPath) {
  * table.
  *
  * Inputs:
- *   type     'on-demand' | 'daily-auto' | 'snapshot'
+ *   type     'on-demand' | 'scheduled' | 'snapshot'
  *   options  optional overrides:
  *     backupDir            override BACKUP_DIR / BACKUP_PATH env var
  *     compressionLevel     zstd level (default 3)
@@ -233,7 +233,7 @@ async function snapshotSourceDb(snapshotPath) {
  * status='failed' before the throw, so auditability is preserved.
  */
 async function performBackup(type = 'on-demand', options = {}) {
-  if (!['daily-auto', 'on-demand', 'snapshot'].includes(type)) {
+  if (!['scheduled', 'on-demand', 'snapshot'].includes(type)) {
     throw new Error(`performBackup: invalid type '${type}'`);
   }
 

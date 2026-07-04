@@ -62,7 +62,7 @@ router.get('/', (req, res) => {
 // parameter -- not in v1.0.30 scope.
 //
 // Calls performBackup('on-demand') from services/backup.js, which is
-// the same engine the scheduler uses for daily-auto backups. Both
+// the same engine the scheduler uses for scheduled backups. Both
 // triggers produce v2 backups in v1.0.30+.
 router.post('/', async (req, res) => {
   // R3l C67: per-strategy on-demand dispatch. Strategy comes from the

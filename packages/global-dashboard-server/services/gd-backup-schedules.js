@@ -1,8 +1,8 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Backup Schedules Service
+// ===============================================================================
+// FIREALIVE -- Backup Schedules Service
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 //
 // Multi-schedule backup with regulatory framework presets. Operators
 // configure as many independent backup schedules as they need; each
@@ -15,7 +15,7 @@
 //
 //   - This service owns the SCHEDULE definitions (when to back up,
 //     under what compliance framework). It does NOT execute the
-//     backups themselves — the scheduler service tickles backup
+//     backups themselves -- the scheduler service tickles backup
 //     execution via the existing R3d backup pipeline (encrypted
 //     manifests, signing keys, chain integrity).
 //
@@ -37,7 +37,7 @@
 //   the preset's MINIMUM compliance values to the schedule. The
 //   operator may go HIGHER but NOT lower. The auditor's question
 //   is "what's your retention?" not "what preset did you pick?",
-//   so the floor needs teeth — preserved at the service layer
+//   so the floor needs teeth -- preserved at the service layer
 //   via applyPresetFloor() throwing RETENTION_BELOW_FLOOR or
 //   ENCRYPTION_REQUIRED when a violation is attempted.
 //
@@ -57,7 +57,7 @@
 //   the operator confirm queuing the second schedule behind the
 //   first.
 //
-//   The window is ±5 minutes because backup operations can have
+//   The window is +/-5 minutes because backup operations can have
 //   variable execution duration (DB size, destination latency)
 //   and starting two backups at the same moment risks I/O
 //   contention on the source DB or destination. A 5-minute
@@ -88,14 +88,14 @@
 //     INVALID_DAY_OF_WEEK      400  day_of_week not in 0..6
 //     INVALID_DAY_OF_MONTH     400  day_of_month not in 1..31
 //
-//   SCHEDULE_OVERLAP is NOT thrown by the service — the route
+//   SCHEDULE_OVERLAP is NOT thrown by the service -- the route
 //   handler calls detectOverlap() and returns 409 itself when
 //   the returned overlaps list is non-empty AND the request did
 //   not include force_queue=true.
 
-const { getDb } = require('../db/init');
+const { getDb } = require('../db-init');
 
-// ── Tunable constants ────────────────────────────────────────────────
+// -- Tunable constants ------------------------------------------------
 
 const OVERLAP_WINDOW_MIN = 5;        // minutes between fire times to consider overlap
 const OVERLAP_LOOKAHEAD = 10;        // number of future fires to compute per schedule for overlap check
@@ -115,7 +115,7 @@ const MAX_INTERVAL_MINUTES = 1440;
 const VALID_BACKUP_KINDS = ['single-db', 'full-suite'];
 const VALID_BACKUP_STRATEGIES = ['full', 'incremental', 'differential', 'snapshot'];
 
-// ── Error helper ─────────────────────────────────────────────────────
+// -- Error helper -----------------------------------------------------
 
 function makeError(code, message) {
   const err = new Error(message);
@@ -123,11 +123,11 @@ function makeError(code, message) {
   return err;
 }
 
-// ── nextFireTime ─────────────────────────────────────────────────────
+// -- nextFireTime -----------------------------------------------------
 //
 // Pure function: given a schedule record and an optional reference
 // time, returns the next ISO timestamp at which the schedule should
-// fire. Returns null when the schedule is inactive (active=0) — the
+// fire. Returns null when the schedule is inactive (active=0) -- the
 // scheduler treats null next_run as "do not register this schedule".
 //
 // Frequency semantics:
@@ -274,7 +274,7 @@ function _legacyIntervalToFrequency(interval) {
   return null;
 }
 
-// ── applyPresetFloor ─────────────────────────────────────────────────
+// -- applyPresetFloor -------------------------------------------------
 //
 // Validates a schedule's retention_days and encrypted fields against
 // the preset's floor. Throws on violation; otherwise returns the
@@ -324,7 +324,7 @@ function _parseRetentionDays(retentionDays, retentionString) {
   return null;
 }
 
-// ── detectOverlap ────────────────────────────────────────────────────
+// -- detectOverlap ----------------------------------------------------
 //
 // For the proposed schedule data, compute the first OVERLAP_LOOKAHEAD
 // fire times. Then for each OTHER active schedule, compute its first
@@ -383,7 +383,7 @@ function _computeFireSeries(schedule) {
   return fires;
 }
 
-// ── Public CRUD ──────────────────────────────────────────────────────
+// -- Public CRUD ------------------------------------------------------
 
 function list() {
   const db = getDb();
@@ -559,7 +559,7 @@ function getPresets() {
   ).all();
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────
+// -- Internal helpers -------------------------------------------------
 
 // Normalize a DB row into the schedule shape that nextFireTime expects.
 // The row may have legacy interval and modern frequency; nextFireTime
@@ -679,7 +679,7 @@ function _validateScheduleFields(data) {
   }
 }
 
-// ── Module exports ───────────────────────────────────────────────────
+// -- Module exports ---------------------------------------------------
 
 module.exports = {
   list,

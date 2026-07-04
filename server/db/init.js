@@ -735,7 +735,7 @@ CREATE TABLE IF NOT EXISTS notification_config (
 
 CREATE TABLE IF NOT EXISTS backups (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
+  type TEXT NOT NULL CHECK (type IN ('scheduled', 'on-demand', 'snapshot')),
   size_bytes INTEGER,
   file_path TEXT,                                   -- v1 only; NULL for v2
   sha256_hash TEXT,                                 -- v1: hash of the .db file; v2: hash of manifest.json
@@ -6192,6 +6192,27 @@ function initDb() {
     console.error('The hard-coded MAX_CHAIN_DEPTH=1000 in restore-chain.js still protects against runaway walks.');
   }
 
+  // ── B6c PR-post3: backup_schedules.interval_minutes column ────────────
+  //
+  // Carries the sub-daily cadence (minutes) for frequency='interval'
+  // schedules -- the arbitrary-interval auto-backup capability for data-
+  // recovery policies with an RPO under 24h. Nullable INTEGER; NULL for
+  // non-interval schedules. The [15, 1440] bound is enforced in
+  // backup-schedules.js (not a DB CHECK) so the floor/ceiling live in one
+  // place and can be tuned without a schema rebuild. Guarded ADD COLUMN
+  // keeps existing rows at NULL -- zero-disruption migration.
+  try {
+    const post3SchedCols = db.prepare("PRAGMA table_info(backup_schedules)").all().map(c => c.name);
+    if (!post3SchedCols.includes('interval_minutes')) {
+      db.exec(`ALTER TABLE backup_schedules ADD COLUMN interval_minutes INTEGER`);
+      console.log('B6c post-3 migration: added backup_schedules.interval_minutes column (NULL = non-interval schedule)');
+    } else {
+      console.log('B6c post-3 migration: backup_schedules.interval_minutes column already present, skipping');
+    }
+  } catch (post3IntervalColErr) {
+    console.error('B6c post-3 migration (interval_minutes) failed (non-fatal):', post3IntervalColErr.message);
+  }
+
   // ── R3i C11: legacy backup_config singleton backfill ─────────────────
   //
   // Pre-R3i installs stored a single backup config as a JSON blob in
@@ -6984,6 +7005,62 @@ function initDb() {
     console.error(
       'The server will start, but the comprehensive backup path (POST /api/backup/full-suite) will fail to record kind=full-suite rows until this migration completes successfully. The canonical single-DB backup path (existing /api/backup) continues to function — its INSERTs omit kind and rely on the DEFAULT, which works once the column is added.'
     );
+  }
+
+  // ── B6c PR-post3 — rename backups.type value 'daily-auto' -> 'scheduled' ──
+  //
+  // The auto-backup trigger enum renames 'daily-auto' to 'scheduled' so the
+  // label stays accurate once schedules can fire sub-daily (an hourly or
+  // 15-minute backup is not "daily"). The strategy already lives in
+  // backup_strategy; type carries only the trigger.
+  //
+  // SQLite cannot ALTER a CHECK, so backups is rebuilt. The new-table DDL is
+  // DERIVED from the live table's stored SQL so every column, default, foreign
+  // key, and CHECK is preserved byte-identically -- only the type CHECK's enum
+  // values change. Rows are copied with type='daily-auto' mapped to 'scheduled'.
+  // Foreign keys OFF for the rebuild (backups has only self-referential FKs).
+  // Guarded on the live CHECK still naming 'daily-auto' (from sqlite_master), so
+  // it is a no-op on fresh installs and already-migrated databases. Idempotent.
+  try {
+    const backupsTableRow = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'backups'")
+      .get();
+    if (backupsTableRow && backupsTableRow.sql && backupsTableRow.sql.indexOf('daily-auto') !== -1) {
+      console.log('backups migration (B6c post-3): renaming type value daily-auto -> scheduled');
+      let newBackupsDdl = backupsTableRow.sql.replace(/daily-auto/g, 'scheduled');
+      newBackupsDdl = newBackupsDdl.replace(
+        /CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("backups"|backups)/i,
+        'CREATE TABLE backups_new'
+      );
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(newBackupsDdl);
+        const backupColNames = db
+          .prepare("PRAGMA table_info(backups)")
+          .all()
+          .map(c => '"' + c.name + '"');
+        const colList = backupColNames.join(', ');
+        const selectList = backupColNames
+          .map(c => (c === '"type"'
+            ? "CASE WHEN type = 'daily-auto' THEN 'scheduled' ELSE type END"
+            : c))
+          .join(', ');
+        const copiedCount = db.prepare('SELECT COUNT(*) AS n FROM backups').get().n;
+        db.exec('INSERT INTO backups_new (' + colList + ') SELECT ' + selectList + ' FROM backups');
+        db.exec('DROP TABLE backups');
+        db.exec('ALTER TABLE backups_new RENAME TO backups');
+        db.exec('COMMIT');
+        console.log('backups migration (B6c post-3): renamed, preserved ' + copiedCount + ' backup row(s)');
+      } catch (renameRebuildErr) {
+        db.exec('ROLLBACK');
+        throw renameRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (backupsRenameMigrationErr) {
+    console.error('backups migration (B6c post-3) failed (non-fatal):', backupsRenameMigrationErr.message);
   }
 
   // ── R3k C12 — cloud_packages table ────────────────────────────────────

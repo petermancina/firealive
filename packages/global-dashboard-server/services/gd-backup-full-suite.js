@@ -108,7 +108,7 @@ async function performFullSuiteBackup(db, options = {}) {
     : parseInt(process.env.GD_BACKUP_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
   // The backups.type column is the trigger (Regional parity); the strategy is
   // backup_strategy. A full-suite is an on-demand full unless a scheduler drives it.
-  const triggerType = options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand';
+  const triggerType = options.triggerType === 'scheduled' ? 'scheduled' : 'on-demand';
 
   if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
   backupV2.cleanStaleTempDirs(backupsDir);

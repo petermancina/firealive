@@ -41,11 +41,10 @@ const gdBackupFullSuite = require('./services/gd-backup-full-suite');
 const storageRouting = require('./services/gd-storage-routing');
 const storagePush = require('./services/gd-storage-push');
 const backupV2 = require('./services/gd-backup-v2');
+const { gdBackupScheduler } = require('./services/gd-backup-scheduler');
 const archiveSegment = require('./services/gd-archive-segment');
 const auditArchive = require('./services/gd-audit-archive');
 const cefSpool = require('./services/gd-cef-archive-spool');
-const incrementalSvc = require('./services/gd-backup-incremental');
-const differentialSvc = require('./services/gd-backup-differential');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 const exportEncryption = require('./services/export-encryption');
 const { migrateExportsAtRest } = require('./services/export-encryption-migration');
@@ -295,6 +294,7 @@ app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
 app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
+app.use('/api/backup-schedules', authMiddleware(['ciso']), require('./routes/gd-backup-schedules'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -3469,26 +3469,6 @@ app.get('/api/backups', authMiddleware(['ciso', 'vp']), (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to list backups' }); }
 });
 
-app.get('/api/backup-schedules', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const db = getDb();
-    const schedules = db.prepare("SELECT * FROM backup_schedules WHERE active = 1").all();
-    db.close();
-    res.json({ schedules });
-  } catch (e) { res.status(500).json({ error: 'Failed to list backup schedules' }); }
-});
-
-app.post('/api/backup-schedules', authMiddleware(['ciso']), (req, res) => {
-  try {
-    const { type, frequency, time, day, destination, retentionDays, encrypted, regulatoryPreset } = req.body;
-    const db = getDb();
-    const id = crypto.randomBytes(4).toString('hex');
-    db.prepare("INSERT INTO backup_schedules (id, type, frequency, time, day, destination, retention_days, encrypted, regulatory_preset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(id, type, frequency, time || '02:00', day || null, destination || 'local', retentionDays || 90, encrypted ? 1 : 0, regulatoryPreset || 'none');
-    db.close();
-    res.json({ success: true, id });
-  } catch (e) { res.status(500).json({ error: 'Failed to create backup schedule' }); }
-});
 
 // ── Compromise Scan (self-scan of GD Server) ─────────────────────────────────
 // B6a: real point-in-time self-integrity scan of the GD-server. Every check is
@@ -3857,6 +3837,58 @@ function runGdRegression(db) {
       throw new Error(`latest backup id=${latest.id} status=${latest.status}`);
     }
     return `latest id=${latest.id} status=${latest.status}`;
+  });
+
+  // ── Backup scheduler (7) ────────────────────────────────────────────────
+  record('backup_scheduler', 'gd-backup-schedules service loads + nextFireTime', () => {
+    const svc = require('./services/gd-backup-schedules');
+    if (typeof svc.nextFireTime !== 'function') throw new Error('nextFireTime missing');
+    const daily = svc.nextFireTime({ active: 1, interval: 'daily', time: '02:00' });
+    if (!daily) throw new Error('daily schedule did not compute a fire time');
+    const interval = svc.nextFireTime(
+      { active: 1, interval: 'interval', interval_minutes: 30, created_at: '2026-01-01T00:00:00Z' },
+      new Date('2026-01-01T00:10:00Z'),
+    );
+    if (interval !== '2026-01-01T00:30:00.000Z') throw new Error('interval fire grid wrong: ' + interval);
+    return 'nextFireTime computes daily + interval fires';
+  });
+  record('backup_scheduler', 'interval floor/ceiling enforced', () => {
+    const svc = require('./services/gd-backup-schedules');
+    const anchor = { active: 1, interval: 'interval', created_at: '2026-01-01T00:00:00Z' };
+    if (svc.nextFireTime(Object.assign({}, anchor, { interval_minutes: 14 })) !== null) throw new Error('interval_minutes=14 (below floor) not rejected');
+    if (svc.nextFireTime(Object.assign({}, anchor, { interval_minutes: 1441 })) !== null) throw new Error('interval_minutes=1441 (above ceiling) not rejected');
+    if (typeof svc.nextFireTime(Object.assign({}, anchor, { interval_minutes: 15 })) !== 'string') throw new Error('interval_minutes=15 (floor) should fire');
+    return 'floor 15 / ceiling 1440 enforced';
+  });
+  record('backup_scheduler', 'gd-backup-scheduler loads + cron mapping', () => {
+    const { gdBackupScheduler } = require('./services/gd-backup-scheduler');
+    if (typeof gdBackupScheduler.start !== 'function') throw new Error('scheduler.start missing');
+    if (gdBackupScheduler._scheduleToCronExpression({ interval: 'interval', interval_minutes: 45 }) !== '* * * * *') throw new Error('interval cron mapping wrong');
+    if (gdBackupScheduler._scheduleToCronExpression({ interval: 'daily', time: '02:00' }) !== '0 2 * * *') throw new Error('daily cron mapping wrong');
+    return 'per-schedule cron mapping correct (interval -> per-minute)';
+  });
+  record('backup_scheduler', 'backup_schedules MC-shape columns', () => {
+    const cols = db.prepare('PRAGMA table_info(backup_schedules)').all().map((c) => c.name);
+    const required = ['interval', 'day_of_week', 'day_of_month', 'next_run', 'created_at', 'regulatory_preset_id', 'backup_kind', 'backup_strategy', 'interval_minutes'];
+    const missing = required.filter((c) => !cols.includes(c));
+    if (missing.length > 0) throw new Error('MC-shape columns missing: ' + missing.join(', '));
+    return 'MC-shape columns present';
+  });
+  record('backup_scheduler', 'regulatory_presets seeded', () => {
+    const n = db.prepare('SELECT COUNT(*) AS n FROM regulatory_presets').get().n;
+    if (n < 7) throw new Error('expected 7 regulatory presets, found ' + n);
+    return n + ' presets seeded';
+  });
+  record('backup_scheduler', 'schedule route mounts', () => {
+    if (typeof require('./routes/gd-backup-schedules') !== 'function') throw new Error('gd-backup-schedules route not a router');
+    return 'router loadable';
+  });
+  record('backup_scheduler', 'scheduled trigger in backups CHECK (not daily-auto)', () => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='backups'").get();
+    if (!row || !row.sql) throw new Error('backups DDL not found');
+    if (row.sql.indexOf("'scheduled'") === -1) throw new Error("backups.type CHECK missing 'scheduled'");
+    if (row.sql.indexOf('daily-auto') !== -1) throw new Error("backups.type CHECK still names 'daily-auto'");
+    return 'type CHECK names scheduled, not daily-auto';
   });
 
   // ── Audit chain (1) ────────────────────────────────────────────────────
@@ -6041,123 +6073,7 @@ if (gdBackupRetentionTimer && typeof gdBackupRetentionTimer.unref === 'function'
 // in the promise chain's finally. Overlapping runs across ticks are avoided by
 // claiming last_run before firing; the HA sole-writer lease arrives in a later phase.
 
-// Next scheduled fire strictly after fromTime, in UTC. Returns a Date, or null for an
-// invalid/unschedulable configuration. schedule.day is day-of-week (0-6) for weekly
-// and day-of-month (1-31) for monthly.
-function gdScheduleNextFireTime(schedule, fromTime) {
-  const VALID = ['hourly', 'daily', 'weekly', 'monthly'];
-  const frequency = String(schedule.frequency || '').toLowerCase();
-  if (VALID.indexOf(frequency) === -1) return null;
-  const from = new Date(fromTime);
-  if (isNaN(from.getTime())) return null;
-  if (frequency === 'hourly') {
-    const next = new Date(from);
-    next.setUTCMinutes(0, 0, 0);
-    if (next <= from) next.setUTCHours(next.getUTCHours() + 1);
-    return next;
-  }
-  const m = /^(\d{1,2}):(\d{2})$/.exec(schedule.time || '02:00');
-  if (!m) return null;
-  const hours = parseInt(m[1], 10);
-  const minutes = parseInt(m[2], 10);
-  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
-  if (frequency === 'daily') {
-    const next = new Date(from);
-    next.setUTCHours(hours, minutes, 0, 0);
-    if (next <= from) next.setUTCDate(next.getUTCDate() + 1);
-    return next;
-  }
-  if (frequency === 'weekly') {
-    const dow = parseInt(schedule.day, 10);
-    if (!Number.isInteger(dow) || dow < 0 || dow > 6) return null;
-    const next = new Date(from);
-    next.setUTCHours(hours, minutes, 0, 0);
-    let daysAhead = (dow - next.getUTCDay() + 7) % 7;
-    if (daysAhead === 0 && next <= from) daysAhead = 7;
-    next.setUTCDate(next.getUTCDate() + daysAhead);
-    return next;
-  }
-  // monthly
-  const dom = parseInt(schedule.day, 10);
-  if (!Number.isInteger(dom) || dom < 1 || dom > 31) return null;
-  const next = new Date(from);
-  next.setUTCHours(hours, minutes, 0, 0);
-  const dim = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
-  next.setUTCDate(Math.min(dom, dim));
-  if (next <= from) {
-    next.setUTCMonth(next.getUTCMonth() + 1, 1);
-    const dim2 = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
-    next.setUTCDate(Math.min(dom, dim2));
-  }
-  return next;
-}
 
-// Due when never run, or its next fire after last_run has arrived. last_run is a
-// SQLite UTC datetime ('YYYY-MM-DD HH:MM:SS'). An unschedulable config is not due.
-function gdScheduleIsDue(schedule, now) {
-  if (!schedule.last_run) return true;
-  const raw = String(schedule.last_run);
-  const lastRun = new Date(raw.replace(' ', 'T') + (/[zZ]$/.test(raw) ? '' : 'Z'));
-  if (isNaN(lastRun.getTime())) return true;
-  const nextFire = gdScheduleNextFireTime(schedule, lastRun);
-  if (!nextFire) return false;
-  return nextFire <= now;
-}
-
-// Fire one scheduled backup by type, routed + pushed by the service. Throws on
-// failure so the caller can record last_error; incremental/differential escalate to
-// a full backup internally when no parent/anchor exists.
-async function gdRunScheduledBackup(db, schedule) {
-  const type = String(schedule.type || 'full').toLowerCase();
-  if (type === 'v2' || type === 'full') return backupV2.performV2Backup(db, {});
-  if (type === 'full-suite') return gdBackupFullSuite.performFullSuiteBackup(db, {});
-  if (type === 'snapshot') return backupV2.performSnapshotBackup(db, {});
-  if (type === 'incremental') {
-    const r = await incrementalSvc.performIncrementalBackup(db, {});
-    if (!r.ok) throw new Error(r.error || 'incremental backup failed');
-    return r;
-  }
-  if (type === 'differential') {
-    const r = await differentialSvc.performDifferentialBackup(db, {});
-    if (!r.ok) throw new Error(r.error || 'differential backup failed');
-    return r;
-  }
-  throw new Error('unknown backup schedule type: ' + type);
-}
-
-const GD_BACKUP_SCHEDULER_INTERVAL_MS = 900000;  // 15 min
-const gdBackupSchedulerTimer = setInterval(() => {
-  let db;
-  try { db = getDb(); } catch (e) { console.error('GD backup scheduler: getDb failed:', e.message); return; }
-  let due;
-  try {
-    const now = new Date();
-    due = db.prepare('SELECT * FROM backup_schedules WHERE active = 1').all().filter((s) => gdScheduleIsDue(s, now));
-  } catch (e) {
-    console.error('GD backup scheduler: read failed:', e.message);
-    try { db.close(); } catch (_e) { /* ignore */ }
-    return;
-  }
-  if (due.length === 0) { try { db.close(); } catch (_e) { /* ignore */ } return; }
-  (async () => {
-    for (const s of due) {
-      // Claim the slot first so a slow backup is not re-fired by the next tick.
-      try { db.prepare("UPDATE backup_schedules SET last_run = datetime('now') WHERE id = ?").run(s.id); } catch (_e) { /* ignore */ }
-      try {
-        const result = await gdRunScheduledBackup(db, s);
-        const bid = result && (result.id || result.backupId) ? (result.id || result.backupId) : 'unknown';
-        db.prepare("UPDATE backup_schedules SET last_status = 'success', last_error = NULL WHERE id = ?").run(s.id);
-        console.log('GD backup scheduler: schedule', s.id, 'type', s.type, 'fired backup', bid);
-      } catch (e) {
-        try {
-          db.prepare("UPDATE backup_schedules SET last_status = 'failed', last_error = ? WHERE id = ?").run(String(e.message || '').slice(0, 500), s.id);
-        } catch (_e) { /* recording best-effort */ }
-        console.error('GD backup scheduler: schedule', s.id, 'failed:', e.message);
-      }
-    }
-  })().catch((e) => console.error('GD backup scheduler run error:', e.message)).finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
-}, GD_BACKUP_SCHEDULER_INTERVAL_MS);
-if (gdBackupSchedulerTimer && typeof gdBackupSchedulerTimer.unref === 'function') gdBackupSchedulerTimer.unref();
 
 
 // ── B5b: HTTPS/mTLS bootstrap ────────────────────────────────────────────────
@@ -6359,6 +6275,10 @@ https.createServer({
 }, app).listen(PORT, () => {
   console.log(`FireAlive Global Dashboard Server v0.0.31 running on https://localhost:${PORT} (HTTPS/mTLS)`);
   console.log('Awaiting aggregate data pushes from Regional Servers');
+
+  // Start the DB-driven backup scheduler (per-schedule node-cron jobs +
+  // per-minute reload poll). Replaces the former inline setInterval scheduler.
+  try { gdBackupScheduler.start(); } catch (e) { console.error('GD backup scheduler failed to start:', e.message); }
 
   // ── B5r: automated update-detection periodic checker ──────────────────────
   // The GD-server has no general scheduler (by design), so a single hourly timer

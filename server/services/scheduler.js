@@ -1319,7 +1319,7 @@ const schedulerService = {
         try {
           logger.info('Starting legacy env-var scheduled backup');
           const { performBackup } = require('./backup');
-          performBackup('daily-auto');
+          performBackup('scheduled');
         } catch (err) {
           logger.error('Scheduler: legacy backup failed', { error: err.message });
         }
@@ -1345,6 +1345,20 @@ const schedulerService = {
       if (!schedule || schedule.active === 0) {
         logger.warn('Scheduler: backup fire for missing/inactive schedule', { scheduleId });
         return;
+      }
+
+      // Interval schedules are registered on a per-minute cron (an arbitrary
+      // cadence cannot be a single cron expression), so gate each tick on
+      // next_run: fire only once the interval has elapsed. Non-interval
+      // schedules fire on a precise cron and always proceed. A null next_run
+      // (interval never computed -- e.g. malformed interval_minutes) is treated
+      // as not-due, so a bad row can never trigger a per-minute backup storm.
+      const fireFrequency = schedule.frequency
+        || this._legacyIntervalToFrequency(schedule.interval);
+      if (fireFrequency === 'interval') {
+        if (!schedule.next_run || new Date() < new Date(schedule.next_run)) {
+          return;
+        }
       }
 
       // Compute the NEXT fire time (after this one) and write it back.
@@ -1384,7 +1398,7 @@ const schedulerService = {
       //   (full-suite, snapshot)    -> performFullSuiteBackup with type='snapshot'
       //   (single-db,  snapshot)    -> performBackup with type='snapshot'
       //
-      // The legacy schedule.type column ('daily-auto'/'on-demand'/'snapshot')
+      // The legacy schedule.type column ('scheduled'/'on-demand'/'snapshot')
       // is still passed as the underlying TYPE parameter to whichever
       // function is dispatched. kind+strategy are the dispatch axes;
       // type is the parameter the dispatched function takes.
@@ -1400,7 +1414,7 @@ const schedulerService = {
       // and survives any schema-skew edge case during in-place upgrades.
       const kind = schedule.backup_kind || 'full-suite';
       const strategy = schedule.backup_strategy || 'full';
-      const legacyType = schedule.type === 'snapshot' ? 'snapshot' : 'daily-auto';
+      const legacyType = schedule.type === 'snapshot' ? 'snapshot' : 'scheduled';
       const backupType = strategy === 'snapshot' ? 'snapshot' : legacyType;
       const startedAt = new Date().toISOString();
 
@@ -1522,6 +1536,19 @@ const schedulerService = {
     const frequency = schedule.frequency
       || this._legacyIntervalToFrequency(schedule.interval);
     if (!frequency) return null;
+
+    // Interval schedules fire on a per-minute cron; _runBackupJob gates each
+    // tick on next_run so the backup runs only once interval_minutes has
+    // elapsed. An arbitrary cadence (e.g. 45 or 90 min) cannot be expressed as
+    // a single cron expression, so the per-minute-tick-plus-next_run-gate model
+    // is used. interval_minutes bounds ([15,1440]) are enforced by
+    // backup-schedules.js at create/update; a defensive positive-integer check
+    // here avoids registering a runaway per-minute job for a malformed row.
+    if (frequency === 'interval') {
+      const im = schedule.interval_minutes;
+      if (typeof im !== 'number' || !Number.isInteger(im) || im <= 0) return null;
+      return '* * * * *';
+    }
 
     const time = schedule.time || '02:00';
     const timeMatch = /^(\d{1,2}):(\d{2})$/.exec(time);

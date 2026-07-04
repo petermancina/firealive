@@ -27,7 +27,7 @@
 //   server/services/scheduler.js -- cron job (commits 10-11 of this
 //   phase). Default schedule: daily at 03:00 (configurable via
 //   CHAIN_VERIFY_SCHEDULE env var). Picks a different hour from
-//   the daily-auto backup at 02:00 so they don't pile up on the
+//   the scheduled backup at 02:00 so they don't pile up on the
 //   same minute.
 //
 //   server/routes/backup-chain.js -- the GET /verify endpoint

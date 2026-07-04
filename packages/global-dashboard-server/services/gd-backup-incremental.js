@@ -249,7 +249,7 @@ async function performIncrementalBackup(db, options = {}) {
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;
   const kekReference = options.kekReference || keyWrapSvc.DEFAULT_KEK_REFERENCE;
   // Regional parity: backups.type is the trigger; backup_strategy is 'incremental'.
-  const triggerType = options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand';
+  const triggerType = options.triggerType === 'scheduled' ? 'scheduled' : 'on-demand';
 
   ensureDir(backupsDir);
 

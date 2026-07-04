@@ -342,7 +342,7 @@ async function buildBundle(workDir) {
  * options:
  *   type                Trigger type for the backups.type column.
  *                       Accepted: 'on-demand' (operator-triggered,
- *                       default) | 'daily-auto' (scheduler-
+ *                       default) | 'scheduled' (scheduler-
  *                       triggered) | 'snapshot' (pre-restore
  *                       snapshot).
  *   backupDir           Override BACKUP_DIR / BACKUP_PATH env vars.
@@ -368,7 +368,7 @@ async function buildBundle(workDir) {
  */
 async function performFullSuiteBackup(options = {}) {
   const type = options.type || 'on-demand';
-  if (!['daily-auto', 'on-demand', 'snapshot'].includes(type)) {
+  if (!['scheduled', 'on-demand', 'snapshot'].includes(type)) {
     throw new Error(`performFullSuiteBackup: invalid type '${type}'`);
   }
 

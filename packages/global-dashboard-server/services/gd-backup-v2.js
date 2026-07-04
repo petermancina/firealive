@@ -324,11 +324,11 @@ async function retryDueV2BackupPushes(db, options = {}) {
 async function performV2Backup(db, options = {}) {
   const mode = options.mode === 'snapshot' ? 'snapshot' : 'full';
   // Regional parity: backup_strategy is the strategy (full/snapshot); type is the
-  // trigger (snapshot for a snapshot, else on-demand/daily-auto); kind='single-db'.
+  // trigger (snapshot for a snapshot, else on-demand/scheduled); kind='single-db'.
   const backupStrategy = mode;
   const triggerType = mode === 'snapshot'
     ? 'snapshot'
-    : (options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand');
+    : (options.triggerType === 'scheduled' ? 'scheduled' : 'on-demand');
   const backupsDir = resolveBackupsDir(options);
   const compressionLevel = options.compressionLevel != null ? options.compressionLevel : archiveSvc.DEFAULT_GZIP_LEVEL;
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;

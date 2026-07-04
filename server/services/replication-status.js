@@ -48,7 +48,7 @@ const MAX_ATTEMPTS = 5;
 // is always one of storageRouting.VALID_DATA_TYPES (a fixed allow-list), so these
 // fragments are constants -- no external input is interpolated into SQL.
 const SOURCES = {
-  backup: { table: 'backup_pushes', fk: 'backup_id', parent: 'backups', parentKey: 'id', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.type IN ('daily-auto', 'on-demand')" },
+  backup: { table: 'backup_pushes', fk: 'backup_id', parent: 'backups', parentKey: 'id', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.type IN ('scheduled', 'on-demand')" },
   snapshot: { table: 'backup_pushes', fk: 'backup_id', parent: 'backups', parentKey: 'id', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.type = 'snapshot'" },
   audit_log: { table: 'archive_segment_pushes', fk: 'segment_id', parent: 'storage_archive_segments', parentKey: 'id', join: 'JOIN storage_archive_segments s ON s.id = p.segment_id', filter: "s.category = 'audit_log'" },
   cef_archive: { table: 'archive_segment_pushes', fk: 'segment_id', parent: 'storage_archive_segments', parentKey: 'id', join: 'JOIN storage_archive_segments s ON s.id = p.segment_id', filter: "s.category = 'cef_archive'" },

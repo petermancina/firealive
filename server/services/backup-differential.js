@@ -177,7 +177,7 @@ function buildDifferentialManifest(args) {
  */
 async function performDifferentialBackup(options = {}) {
   const type = options.type || 'on-demand';
-  if (!['daily-auto', 'on-demand', 'snapshot'].includes(type)) {
+  if (!['scheduled', 'on-demand', 'snapshot'].includes(type)) {
     throw new Error(`performDifferentialBackup: invalid type '${type}'`);
   }
 

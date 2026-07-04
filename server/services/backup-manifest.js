@@ -126,7 +126,7 @@ function parse(manifestBytes) {
  *   backupId            (string, required)  — UUID or random hex; the
  *                                              backup directory name
  *                                              suffix
- *   backupType          (string, required)  — 'daily-auto' | 'on-demand'
+ *   backupType          (string, required)  — 'scheduled' | 'on-demand'
  *                                              | 'snapshot'
  *   createdAt           (string, optional)  — ISO 8601; defaults to now
  *   fileHashes          (object, required)  — { archive: { sizeBytes,
@@ -178,8 +178,8 @@ function buildManifest(opts) {
       throw new Error(`buildManifest: opts.${required} required`);
     }
   }
-  if (!['daily-auto', 'on-demand', 'snapshot'].includes(opts.backupType)) {
-    throw new Error(`buildManifest: backupType must be daily-auto|on-demand|snapshot, got '${opts.backupType}'`);
+  if (!['scheduled', 'on-demand', 'snapshot'].includes(opts.backupType)) {
+    throw new Error(`buildManifest: backupType must be scheduled|on-demand|snapshot, got '${opts.backupType}'`);
   }
   if (!opts.fileHashes.archive || !opts.fileHashes.wrappedKey) {
     throw new Error('buildManifest: fileHashes.archive and fileHashes.wrappedKey both required');
@@ -283,8 +283,8 @@ function validateStructure(manifest) {
   if (typeof manifest.backup_id !== 'string' || !manifest.backup_id) {
     return { ok: false, error: 'backup_id must be a non-empty string' };
   }
-  if (!['daily-auto', 'on-demand', 'snapshot'].includes(manifest.backup_type)) {
-    return { ok: false, error: `backup_type must be daily-auto|on-demand|snapshot, got '${manifest.backup_type}'` };
+  if (!['scheduled', 'on-demand', 'snapshot'].includes(manifest.backup_type)) {
+    return { ok: false, error: `backup_type must be scheduled|on-demand|snapshot, got '${manifest.backup_type}'` };
   }
   if (!Array.isArray(manifest.files) || manifest.files.length !== TRACKED_FILENAMES.length) {
     return { ok: false, error: `files must be an array of ${TRACKED_FILENAMES.length} entries` };
