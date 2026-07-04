@@ -455,28 +455,30 @@ CREATE TABLE IF NOT EXISTS config (
 
 -- Backup records
 CREATE TABLE IF NOT EXISTS backups (
-  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-  type TEXT NOT NULL CHECK (type IN ('full', 'incremental', 'differential', 'snapshot')),
-  status TEXT DEFAULT 'completed',
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
   size_bytes INTEGER,
-  hash TEXT,
-  destination TEXT,
+  file_path TEXT,                                   -- v1 only; NULL for v2
+  sha256_hash TEXT,                                 -- v1: hash of the .db file; v2: hash of manifest.json
+  status TEXT DEFAULT 'running'
+    CHECK (status IN ('running', 'verified', 'failed')),
   created_at TEXT DEFAULT (datetime('now')),
-  retention_until TEXT,
-  -- v2 encrypted-backup format columns (MC-grade parity). format_version 1 is
-  -- the v1-shape full-suite / snapshot; 2 is the encrypted four-file backup.
-  -- The type column carries the strategy (full/incremental/differential/snapshot).
-  format_version INTEGER NOT NULL DEFAULT 1 CHECK (format_version IN (1, 2)),
+  format_version INTEGER NOT NULL DEFAULT 1
+    CHECK (format_version IN (1, 2)),
   manifest_path TEXT,                               -- v2 only: manifest.json path
   archive_path TEXT,                                -- v2 only: archive.tar.gz.enc path
   manifest_sig_path TEXT,                           -- v2 only: manifest.sig path
   wrapped_key_path TEXT,                            -- v2 only: wrapped-key.bin path
   signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT,
+  backup_strategy TEXT NOT NULL DEFAULT 'full'
+    CHECK (backup_strategy IN ('full', 'incremental', 'differential', 'snapshot')),
   parent_backup_id TEXT REFERENCES backups(id),         -- immediate predecessor in the chain
   parent_full_backup_id TEXT REFERENCES backups(id),    -- anchor full backup (O(1) short-circuit)
   wal_start_position TEXT,                          -- serialized WAL frame ref
   wal_end_position TEXT,                            -- serialized WAL frame ref (next backup's start)
-  page_count INTEGER                                -- integrity verification anchor
+  page_count INTEGER,                               -- integrity verification anchor
+  kind TEXT NOT NULL DEFAULT 'single-db'
+    CHECK (kind IN ('single-db', 'full-suite'))
 );
 
 -- Backup manifest signing keys (dedicated GD backup Ed25519 family; separate
@@ -752,18 +754,40 @@ CREATE TABLE IF NOT EXISTS report_signing_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   public_key TEXT NOT NULL,                         -- PEM-encoded Ed25519 public key (SPKI)
   public_key_fingerprint TEXT NOT NULL,             -- SHA-256 hex of SPKI DER bytes (64 chars)
-  private_key_encrypted TEXT NOT NULL,              -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext}
+  private_key_encrypted TEXT,                       -- Tier-1 AES-256-GCM JSON {iv, tag, ciphertext};
+                                                    -- NULL for key_origin='external-registered'
+                                                    -- (only the public part of a foreign key).
   is_active INTEGER NOT NULL DEFAULT 0
     CHECK (is_active IN (0, 1)),
+  key_origin TEXT NOT NULL DEFAULT 'local-generated'
+    CHECK (key_origin IN ('local-generated', 'external-registered')),
+  registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  registered_at TEXT,
+  key_label TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   rotated_out_at TEXT,
-  notes TEXT
+  notes TEXT,
+  -- Local-generated keys MUST have a private key (we created it). External-
+  -- registered keys MUST NOT (we hold only a foreign deployment's public part),
+  -- MUST be inactive (verification-only), and MUST carry registration metadata.
+  CHECK (
+    (key_origin = 'local-generated'
+     AND private_key_encrypted IS NOT NULL)
+    OR
+    (key_origin = 'external-registered'
+     AND private_key_encrypted IS NULL
+     AND is_active = 0
+     AND registered_at IS NOT NULL
+     AND registered_by_user_id IS NOT NULL)
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
   ON report_signing_keys(is_active) WHERE is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
   ON report_signing_keys(public_key_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_report_signing_keys_origin
+  ON report_signing_keys(key_origin);
 
 CREATE TABLE IF NOT EXISTS report_verifications (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -1296,6 +1320,71 @@ CREATE TABLE IF NOT EXISTS config_snapshots (
   payload TEXT NOT NULL,
   sha256 TEXT NOT NULL
 );
+
+-- Restore approvals: the lifecycle ledger for a restore request, targeting a
+-- local backup OR an external source (XOR, enforced below). The approval mode
+-- and window are captured at creation from system_meta; chain_request_entry_id
+-- is a forensic anchor to the chain entry documenting the destructive restore.
+CREATE TABLE IF NOT EXISTS restore_approvals (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  backup_id TEXT,
+  source_id TEXT,
+  external_backup_id TEXT,
+  requested_by_user_id TEXT NOT NULL,
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  request_reason TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+  approval_mode_at_creation TEXT NOT NULL
+    CHECK (approval_mode_at_creation IN ('strict', 'delayed-self-approval', 'disabled')),
+  approval_window_hours INTEGER NOT NULL,
+  approved_by_user_id TEXT,
+  approved_at TEXT,
+  approval_method TEXT
+    CHECK (approval_method IS NULL OR approval_method IN
+      ('second-person-totp', 'delayed-self-totp', 'disabled-mode-bypass')),
+  denied_by_user_id TEXT,
+  denied_at TEXT,
+  denial_reason TEXT,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  chain_request_entry_id INTEGER,
+  client_ip_at_request TEXT,
+  client_ip_at_approval TEXT,
+  CHECK (
+    (backup_id IS NOT NULL AND source_id IS NULL AND external_backup_id IS NULL)
+    OR
+    (backup_id IS NULL AND source_id IS NOT NULL AND external_backup_id IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_backup
+  ON restore_approvals(backup_id);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_source
+  ON restore_approvals(source_id, external_backup_id);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_status
+  ON restore_approvals(status);
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
+  ON restore_approvals(expires_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
+  ON restore_approvals(requested_by_user_id);
+
+-- External restore sources: registered off-box locations (network share, NAS,
+-- S3, Azure blob, SFTP) a backup can be pulled from for a restore. Credentials
+-- and the optional backup decryption key are Tier-1 encrypted at rest.
+CREATE TABLE IF NOT EXISTS external_restore_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  source_type TEXT NOT NULL
+    CHECK (source_type IN ('network_share', 'nas', 's3', 'azure_blob', 'sftp')),
+  path TEXT NOT NULL,
+  credentials_encrypted TEXT NOT NULL,
+  backup_decryption_key_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
+);
 `;
 
 function getDb() {
@@ -1387,6 +1476,183 @@ function initDb() {
     }
   } catch (msScannerErr) {
     console.error('malware_scanner_integrations engine-schema migration failed:', msScannerErr.message);
+  }
+
+  // Extend report_signing_keys for cross-deployment golden-baseline verification:
+  // relax private_key_encrypted to NULL for external-registered keys and add
+  // key_origin / registered_by_user_id / registered_at / key_label, with a
+  // table-level CHECK enforcing the local-vs-external XOR. SQLite cannot ALTER a
+  // NOT NULL or add a CHECK, so the table is recreated and existing rows (all
+  // local-generated) are copied. Guarded by the key_origin column so it runs
+  // once and is idempotent. Mirrors the Regional Server.
+  try {
+    const rskCols = db.prepare("PRAGMA table_info(report_signing_keys)").all().map((c) => c.name);
+    if (rskCols.length && !rskCols.includes('key_origin')) {
+      const existingRskRows = db.prepare("SELECT * FROM report_signing_keys").all();
+      db.pragma('foreign_keys = OFF');
+      try {
+        const migrateRsk = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE report_signing_keys_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              public_key TEXT NOT NULL,
+              public_key_fingerprint TEXT NOT NULL,
+              private_key_encrypted TEXT,
+              is_active INTEGER NOT NULL DEFAULT 0
+                CHECK (is_active IN (0, 1)),
+              key_origin TEXT NOT NULL DEFAULT 'local-generated'
+                CHECK (key_origin IN ('local-generated', 'external-registered')),
+              registered_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+              registered_at TEXT,
+              key_label TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              rotated_out_at TEXT,
+              notes TEXT,
+              CHECK (
+                (key_origin = 'local-generated'
+                 AND private_key_encrypted IS NOT NULL)
+                OR
+                (key_origin = 'external-registered'
+                 AND private_key_encrypted IS NULL
+                 AND is_active = 0
+                 AND registered_at IS NOT NULL
+                 AND registered_by_user_id IS NOT NULL)
+              )
+            );
+          `);
+          const insertRsk = db.prepare(`
+            INSERT INTO report_signing_keys_new
+              (id, public_key, public_key_fingerprint, private_key_encrypted,
+               is_active, key_origin, registered_by_user_id, registered_at,
+               key_label, created_at, rotated_out_at, notes)
+            VALUES (?, ?, ?, ?, ?, 'local-generated', NULL, NULL, NULL, ?, ?, ?)
+          `);
+          for (const row of existingRskRows) {
+            insertRsk.run(
+              row.id,
+              row.public_key,
+              row.public_key_fingerprint,
+              row.private_key_encrypted,
+              row.is_active,
+              row.created_at,
+              row.rotated_out_at,
+              row.notes
+            );
+          }
+          db.exec(`
+            DROP TABLE report_signing_keys;
+            ALTER TABLE report_signing_keys_new RENAME TO report_signing_keys;
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_active
+              ON report_signing_keys(is_active) WHERE is_active = 1;
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_fingerprint
+              ON report_signing_keys(public_key_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_report_signing_keys_origin
+              ON report_signing_keys(key_origin);
+          `);
+        });
+        migrateRsk();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (rskErr) {
+    console.error('report_signing_keys external-key migration failed:', rskErr.message);
+  }
+
+  // Bring the backups table to exact Regional Server schema parity: type becomes
+  // the trigger (daily-auto/on-demand/snapshot), the strategy moves to a new
+  // backup_strategy column, hash -> sha256_hash, destination -> file_path, and
+  // kind + the Regional status CHECK are added, so the restore chain and all
+  // backup code are byte-for-byte twins of the Regional Server. SQLite cannot
+  // rename a column or alter a CHECK, so the table is rebuilt and existing rows
+  // are mapped over (their old type -> backup_strategy; trigger defaults to
+  // on-demand, or snapshot; status 'completed' -> 'verified'). Guarded by the
+  // backup_strategy column so it runs once and is idempotent.
+  try {
+    const bkCols = db.prepare("PRAGMA table_info(backups)").all().map((c) => c.name);
+    if (bkCols.length && !bkCols.includes('backup_strategy')) {
+      const existingBackups = db.prepare("SELECT * FROM backups").all();
+      db.pragma('foreign_keys = OFF');
+      try {
+        const migrateBackups = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE backups_new (
+              id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+              type TEXT NOT NULL CHECK (type IN ('daily-auto', 'on-demand', 'snapshot')),
+              size_bytes INTEGER,
+              file_path TEXT,
+              sha256_hash TEXT,
+              status TEXT DEFAULT 'running'
+                CHECK (status IN ('running', 'verified', 'failed')),
+              created_at TEXT DEFAULT (datetime('now')),
+              format_version INTEGER NOT NULL DEFAULT 1
+                CHECK (format_version IN (1, 2)),
+              manifest_path TEXT,
+              archive_path TEXT,
+              manifest_sig_path TEXT,
+              wrapped_key_path TEXT,
+              signing_key_id INTEGER REFERENCES backup_signing_keys(id) ON DELETE RESTRICT,
+              backup_strategy TEXT NOT NULL DEFAULT 'full'
+                CHECK (backup_strategy IN ('full', 'incremental', 'differential', 'snapshot')),
+              parent_backup_id TEXT REFERENCES backups(id),
+              parent_full_backup_id TEXT REFERENCES backups(id),
+              wal_start_position TEXT,
+              wal_end_position TEXT,
+              page_count INTEGER,
+              kind TEXT NOT NULL DEFAULT 'single-db'
+                CHECK (kind IN ('single-db', 'full-suite'))
+            );
+          `);
+          const insertBk = db.prepare(`
+            INSERT INTO backups_new
+              (id, type, size_bytes, file_path, sha256_hash, status, created_at,
+               format_version, manifest_path, archive_path, manifest_sig_path,
+               wrapped_key_path, signing_key_id, backup_strategy, parent_backup_id,
+               parent_full_backup_id, wal_start_position, wal_end_position, page_count,
+               kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const r of existingBackups) {
+            const oldType = r.type || 'full';
+            const triggerType = (oldType === 'snapshot') ? 'snapshot' : 'on-demand';
+            const strategy = ['full', 'incremental', 'differential', 'snapshot'].includes(oldType) ? oldType : 'full';
+            const status = (r.status === 'completed' || r.status == null) ? 'verified'
+              : (['running', 'verified', 'failed'].includes(r.status) ? r.status : 'verified');
+            insertBk.run(
+              r.id,
+              triggerType,
+              r.size_bytes != null ? r.size_bytes : null,
+              r.destination != null ? r.destination : (r.file_path != null ? r.file_path : null),
+              r.hash != null ? r.hash : (r.sha256_hash != null ? r.sha256_hash : null),
+              status,
+              r.created_at,
+              r.format_version != null ? r.format_version : 1,
+              r.manifest_path != null ? r.manifest_path : null,
+              r.archive_path != null ? r.archive_path : null,
+              r.manifest_sig_path != null ? r.manifest_sig_path : null,
+              r.wrapped_key_path != null ? r.wrapped_key_path : null,
+              r.signing_key_id != null ? r.signing_key_id : null,
+              strategy,
+              r.parent_backup_id != null ? r.parent_backup_id : null,
+              r.parent_full_backup_id != null ? r.parent_full_backup_id : null,
+              r.wal_start_position != null ? r.wal_start_position : null,
+              r.wal_end_position != null ? r.wal_end_position : null,
+              r.page_count != null ? r.page_count : null,
+              'single-db'
+            );
+          }
+          db.exec(`
+            DROP TABLE backups;
+            ALTER TABLE backups_new RENAME TO backups;
+          `);
+        });
+        migrateBackups();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (bkErr) {
+    console.error('backups schema-parity migration failed:', bkErr.message);
   }
 
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
@@ -1562,6 +1828,10 @@ function initDb() {
   setMeta.run('app_type', 'global_dashboard_server');
   setMeta.run('schema_version', '1');
   setMeta.run('installed_at', new Date().toISOString());
+  // Restore approval policy (single-CISO model): default to delayed-self-approval
+  // with a 24-hour window. Managed by gd-restore-approval-policy.
+  setMeta.run('restore_approval_mode', 'delayed-self-approval');
+  setMeta.run('restore_approval_window_hours', '24');
 
   // Default configs
   const setCfg = db.prepare('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)');

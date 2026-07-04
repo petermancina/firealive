@@ -51,10 +51,10 @@
 // CP-9 System Backup, DORA Art.12, HIPAA 164.308(a)(7)(ii)(A).
 function checkBackupFrequency(db) {
   const recent = db.prepare(
-    "SELECT COUNT(*) AS c FROM backups WHERE status = 'completed' AND created_at > datetime('now', '-48 hours')"
+    "SELECT COUNT(*) AS c FROM backups WHERE status = 'verified' AND created_at > datetime('now', '-48 hours')"
   ).get();
   const total = db.prepare(
-    "SELECT COUNT(*) AS c FROM backups WHERE status = 'completed'"
+    "SELECT COUNT(*) AS c FROM backups WHERE status = 'verified'"
   ).get();
   const activeSchedules = db.prepare(
     "SELECT COUNT(*) AS c FROM backup_schedules WHERE active = 1"
@@ -62,18 +62,18 @@ function checkBackupFrequency(db) {
   if (total.c === 0) {
     return {
       status: 'warning',
-      detail: `No completed backups recorded on the GD. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be wiring through to backups table insertion. Trigger a manual backup via POST /api/backup to bootstrap.`,
+      detail: `No verified backups recorded on the GD. ${activeSchedules.c} active backup schedule(s) configured; if non-zero, the scheduler may not be wiring through to backups table insertion. Trigger a manual backup via POST /api/backup to bootstrap.`,
     };
   }
   if (recent.c === 0) {
     return {
       status: 'warning',
-      detail: `${total.c} historical completed backup(s) on the GD but none in the last 48 hours. ${activeSchedules.c} active schedule(s) — scheduler may have stalled.`,
+      detail: `${total.c} historical verified backup(s) on the GD but none in the last 48 hours. ${activeSchedules.c} active schedule(s) — scheduler may have stalled.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Backup frequency: ${recent.c} completed backup(s) in last 48 hours (${total.c} historical total). ${activeSchedules.c} active backup schedule(s). Each backup records SHA-256 hash for integrity verification.`,
+    detail: `Backup frequency: ${recent.c} verified backup(s) in last 48 hours (${total.c} historical total). ${activeSchedules.c} active backup schedule(s). Each backup records SHA-256 hash for integrity verification.`,
   };
 }
 

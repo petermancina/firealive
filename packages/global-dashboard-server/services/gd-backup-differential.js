@@ -18,7 +18,7 @@
 //      any kind.
 //   2. Frame range: always [anchor.wal_end_position, current], so each successive
 //      differential captures progressively more frames since the anchor.
-//   3. Row linkage: type='differential', with parent_backup_id and
+//   3. Row linkage: backup_strategy='differential', with parent_backup_id and
 //      parent_full_backup_id both pointing at the anchor (equal for any
 //      differential -- a quick row-level discriminator from incrementals).
 //
@@ -75,10 +75,10 @@ function resolveWalPath(options) {
  */
 function findDifferentialAnchor(db) {
   return db.prepare(`
-    SELECT id, type, parent_full_backup_id, wal_start_position, wal_end_position, page_count, created_at
+    SELECT id, backup_strategy, parent_full_backup_id, wal_start_position, wal_end_position, page_count, created_at
       FROM backups
      WHERE status = 'verified'
-       AND type = 'full'
+       AND backup_strategy = 'full'
        AND wal_end_position IS NOT NULL
        AND format_version = 2
      ORDER BY created_at DESC, rowid DESC
@@ -92,7 +92,7 @@ function findDifferentialAnchor(db) {
  * pointing at the anchor full (parent and anchor are the same for a differential).
  */
 function buildDifferentialManifest(args) {
-  const required = ['backupId', 'anchorBackupId', 'walStartPosition', 'walEndPosition',
+  const required = ['backupId', 'backupType', 'anchorBackupId', 'walStartPosition', 'walEndPosition',
     'pageCount', 'pageSize', 'archiveFile', 'wrappedKeyFile', 'signingKeyId',
     'signingKeyFingerprint', 'sourceFuseCounter'];
   for (const k of required) {
@@ -103,7 +103,8 @@ function buildDifferentialManifest(args) {
   return {
     format_version: manifestSvc.MANIFEST_FORMAT_VERSION,
     backup_id: String(args.backupId),
-    backup_type: 'differential',
+    backup_strategy: 'differential',
+    backup_type: args.backupType,
     created_at: args.createdAt || new Date().toISOString(),
     // For differentials, parent and anchor are the same.
     parent_backup_id: String(args.anchorBackupId),
@@ -148,9 +149,8 @@ async function performDifferentialBackup(db, options = {}) {
   const compressionLevel = options.compressionLevel != null ? options.compressionLevel : archiveSvc.DEFAULT_GZIP_LEVEL;
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;
   const kekReference = options.kekReference || keyWrapSvc.DEFAULT_KEK_REFERENCE;
-  const retentionDays = options.retentionDays != null
-    ? options.retentionDays
-    : parseInt(process.env.GD_BACKUP_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
+  // Regional parity: backups.type is the trigger; backup_strategy is 'differential'.
+  const triggerType = options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand';
 
   ensureDir(backupsDir);
 
@@ -263,6 +263,7 @@ async function performDifferentialBackup(db, options = {}) {
 
     const manifest = buildDifferentialManifest({
       backupId,
+      backupType: triggerType,
       anchorBackupId: anchor.id,
       walStartPosition: anchor.wal_end_position,
       walEndPosition,
@@ -299,23 +300,20 @@ async function performDifferentialBackup(db, options = {}) {
     const totalSize = [archivePath, wrappedKeyPath, manifestPath, manifestSigPath]
       .reduce((sum, p) => sum + fs.statSync(p).size, 0);
 
-    // Insert row: type='differential', parent + anchor both the anchor full.
+    // Insert row: backup_strategy='differential', parent + anchor both the anchor full.
     db.prepare(`
-      INSERT INTO backups (id, type, size_bytes, hash, status, created_at,
+      INSERT INTO backups (id, type, backup_strategy, kind, size_bytes, sha256_hash, status, created_at,
                            format_version, manifest_path, archive_path,
                            manifest_sig_path, wrapped_key_path, signing_key_id,
                            parent_backup_id, parent_full_backup_id,
-                           wal_start_position, wal_end_position, page_count,
-                           destination, retention_until)
-      VALUES (?, 'differential', ?, ?, 'verified', datetime('now'),
+                           wal_start_position, wal_end_position, page_count)
+      VALUES (?, ?, 'differential', 'single-db', ?, ?, 'verified', datetime('now'),
               2, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?,
-              ?, datetime('now', ?))
+              ?, ?, ?, ?, ?)
     `).run(
-      backupId, totalSize, manifestSha256,
+      backupId, triggerType, totalSize, manifestSha256,
       manifestPath, archivePath, manifestSigPath, wrappedKeyPath, signingKey.id,
       anchor.id, anchor.id, anchor.wal_end_position, walEndPosition, collectedFrames.length,
-      archivePath, `+${retentionDays} days`,
     );
 
     console.log(`gd-backup-differential: differential ${backupId} verified (anchor ${anchor.id}, ${collectedFrames.length} pages)`);

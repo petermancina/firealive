@@ -281,6 +281,7 @@ app.use('/api/config', authMiddleware(), require('./routes/config-lock'));
 // are never gated.
 app.use('/api/self-protection', authMiddleware(['ciso', 'vp']), require('./routes/self-protection'));
 app.use('/api/malware-scanners', authMiddleware(['ciso']), require('./routes/gd-malware-scanners'));
+app.use('/api/config-baseline', authMiddleware(['ciso']), require('./routes/gd-config-baseline'));
 
 // B6b: storage-destination registry + routing, data-residency policy, and v2 backup
 // control. All ciso-gated; configuration writes sit behind the config-lock chokepoint
@@ -291,6 +292,9 @@ app.use('/api/storage-destinations', authMiddleware(['ciso']), require('./routes
 app.use('/api/storage-routing', authMiddleware(['ciso']), require('./routes/storage-routing'));
 app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-residency'));
 app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
+app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
+app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
+app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -4295,6 +4299,53 @@ function runGdRegression(db) {
     return 'sign + verify + tamper-detect ok';
   });
 
+  record('restore', 'restore-chain + swap + approvals loadable', () => {
+    const rc = require('./services/gd-restore-chain');
+    const swap = require('./services/gd-db-restore-swap');
+    const appr = require('./services/gd-restore-approvals');
+    if (typeof rc.walkChain !== 'function' || typeof rc.replayChain !== 'function') throw new Error('gd-restore-chain missing walkChain/replayChain');
+    if (typeof swap.restoreDatabaseFromArchive !== 'function') throw new Error('gd-db-restore-swap missing restoreDatabaseFromArchive');
+    if (typeof appr.createApprovalRequest !== 'function' || typeof appr.consumeApproval !== 'function') throw new Error('gd-restore-approvals missing lifecycle methods');
+    return 'restore-chain + db-restore-swap + approvals present';
+  });
+  record('restore', 'restore route + restore_approvals table', () => {
+    if (typeof require('./routes/gd-restore') !== 'function') throw new Error('gd-restore route not a router');
+    db.prepare('SELECT COUNT(*) AS c FROM restore_approvals').get();
+    return 'router + restore_approvals table accessible';
+  });
+  record('external-restore', 'service + allow-list + five adapters loadable', () => {
+    const svc = require('./services/gd-external-restore');
+    const al = require('./services/gd-external-restore-allow-list');
+    if (typeof svc.createSource !== 'function' || typeof svc.executeRestore !== 'function') throw new Error('gd-external-restore missing methods');
+    if (typeof al.validateAllowedHost !== 'function') throw new Error('gd-external-restore-allow-list missing validateAllowedHost');
+    for (const a of ['network-share', 'nas', 's3', 'azure-blob', 'sftp']) {
+      const mod = require('./services/gd-external-restore/' + a);
+      if (typeof mod.listBackups !== 'function' || typeof mod.fetchFile !== 'function') throw new Error(a + ' adapter missing listBackups/fetchFile');
+    }
+    return 'service + allow-list + 5 adapters present';
+  });
+  record('external-restore', 'route + external_restore_sources table', () => {
+    if (typeof require('./routes/gd-external-restore') !== 'function') throw new Error('gd-external-restore route not a router');
+    db.prepare('SELECT COUNT(*) AS c FROM external_restore_sources').get();
+    return 'router + external_restore_sources table accessible';
+  });
+  record('migration', 'golden-baseline + bundle/reconcile/apply loadable', () => {
+    const gb = require('./services/gd-golden-baseline');
+    const b = require('./services/gd-migration-bundle');
+    const r = require('./services/gd-migration-reconcile');
+    const a = require('./services/gd-migration-apply');
+    if (typeof gb.captureBaseline !== 'function' || typeof gb.applyBaseline !== 'function') throw new Error('gd-golden-baseline missing captureBaseline/applyBaseline');
+    if (typeof b.composeMigrationBundle !== 'function' || !b.BASELINE_FILENAME) throw new Error('gd-migration-bundle missing composeMigrationBundle or BASELINE_FILENAME');
+    if (typeof r.planReconciliation !== 'function') throw new Error('gd-migration-reconcile missing planReconciliation');
+    if (typeof a.applyReconciliation !== 'function') throw new Error('gd-migration-apply missing applyReconciliation');
+    return 'golden-baseline + bundle (config layer) + reconcile + apply present';
+  });
+  record('migration', 'route + gd_migration_bundles table', () => {
+    if (typeof require('./routes/gd-migration') !== 'function') throw new Error('gd-migration route not a router');
+    db.prepare('SELECT COUNT(*) AS c FROM gd_migration_bundles').get();
+    return 'router + gd_migration_bundles table accessible';
+  });
+
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;
   const skipped = tests.filter(t => t.status === 'skip').length;
@@ -5966,7 +6017,7 @@ const gdArchivalSealTimer = setInterval(() => {
 }, GD_ARCHIVAL_SEAL_INTERVAL_MS);
 if (gdArchivalSealTimer && typeof gdArchivalSealTimer.unref === 'function') gdArchivalSealTimer.unref();
 
-// Retention (daily): prune backups past their retention_until. Synchronous.
+// Retention (daily): delete backup artifacts older than the retention window (mtime). Synchronous.
 const GD_BACKUP_RETENTION_INTERVAL_MS = 86400000;
 const gdBackupRetentionTimer = setInterval(() => {
   let db;

@@ -42,9 +42,11 @@ const ARCHIVE_FILENAME        = 'archive.tar.gz.enc';
 const WRAPPED_KEY_FILENAME    = 'wrapped-key.bin';
 const MANIFEST_FILENAME       = 'manifest.json';
 
-// GD backup strategy enum (mirrors backups.type). Distinct from the Regional
-// backup-type enum.
-const BACKUP_TYPES = ['full', 'incremental', 'differential', 'snapshot'];
+// Manifest backup_type enum = the trigger (daily-auto/on-demand/snapshot), a twin
+// of the Regional manifest. The strategy (full/incremental/differential/snapshot)
+// is carried by backups.backup_strategy and, on incremental/differential manifests,
+// by a backup_strategy field.
+const BACKUP_TYPES = ['daily-auto', 'on-demand', 'snapshot'];
 
 // Files the manifest enumerates and hashes. The manifest itself and its
 // signature file are NOT in this list -- the manifest can't hash itself, and
@@ -111,7 +113,7 @@ function parse(manifestBytes) {
  *
  * opts:
  *   backupId              (string, required)  -- the backup directory name suffix
- *   backupType            (string, required)  -- full|incremental|differential|snapshot
+ *   backupType            (string, required)  -- daily-auto|on-demand|snapshot
  *   createdAt             (string, optional)  -- ISO 8601; defaults to now
  *   fileHashes            (object, required)  -- { archive: { sizeBytes, sha256 },
  *                                                 wrappedKey: { sizeBytes, sha256 } }

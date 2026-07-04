@@ -17,7 +17,7 @@
 // (gd-backup-chain), and a routed push of all four files through the shared GD
 // storage-push engine (gd-storage-routing + gd-storage-push). This twins the
 // Regional backup engine, adapted for the GD: gzip, the gd-tier1 key-wrapping
-// scheme, the GD backups schema (type='full', format_version=2, hash/destination
+// scheme, the GD backups schema (backup_strategy, kind, format_version=2, sha256_hash,
 // columns), the passed-in DB connection (never self-opened/closed), and
 // VACUUM INTO for the consistent snapshot.
 //
@@ -30,8 +30,8 @@
 //                                  marked 'failed' before the throw for audit). A
 //                                  chain-append failure or a push failure does NOT
 //                                  throw -- the backup succeeds in degraded mode.
-//   cleanOldBackups(db, options)   retention: removes expired backups (both files
-//                                  and rows), protecting any backup still serving as
+//   cleanOldBackups(db, options)   retention: deletes backup artifacts older than the
+//                                 window by filesystem mtime (Regional model; no DB prune).
 //                                  a parent anchor for a non-expired incremental/
 //                                  differential.
 //   retryDueV2BackupPushes(db, options)  retry sweep for failed v2 backup pushes.
@@ -170,102 +170,50 @@ function cleanStaleTempDirs(backupsDir) {
 
 // -- Retention ----------------------------------------------------------------
 
-// Delete expired backups (files + rows). A backup is expired when its
-// retention_until has passed, or (when retention_until is unset) when its
-// created_at is older than the retention window. An expired backup is NOT
-// deleted while it still serves as a parent anchor (parent_backup_id or
-// parent_full_backup_id) for any non-expired backup, so a live incremental or
-// differential never loses its base. The attestation chain is append-only, so a
-// deleted backup's CREATE entry remains as immutable history. Best-effort;
-// per-backup failures are logged and skipped. Returns { deleted, checked }.
+// Delete backup artifacts whose mtime is older than the retention window --
+// the Regional Server's filesystem retention model (Regional: cleanOldBackups in
+// backup.js). Retention is disk-space cleanup by mtime, not a database operation:
+// backup rows are not queried or deleted, and there is no per-backup retention
+// column. Temp/work staging entries (handled by cleanStaleTempDirs) are skipped.
+// Best-effort; per-entry failures are logged and skipped. Returns { deleted, checked }.
 function cleanOldBackups(db, options = {}) {
   const retentionDays = options.retentionDays != null
     ? options.retentionDays
     : parseInt(process.env.GD_BACKUP_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
   const backupsDir = path.resolve(resolveBackupsDir(options));
-  const modifier = `-${retentionDays} days`;
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
 
   let checked = 0;
   let deleted = 0;
   try {
-    // Expired candidates: retention_until in the past, OR retention_until unset
-    // and created_at older than the window.
-    const candidates = db.prepare(`
-      SELECT id, destination, manifest_path, archive_path, manifest_sig_path, wrapped_key_path
-      FROM backups
-      WHERE (retention_until IS NOT NULL AND retention_until < datetime('now'))
-         OR (retention_until IS NULL AND created_at < datetime('now', ?))
-    `).all(modifier);
-
-    // Anchor guard: a backup id that is a parent of some NON-expired backup.
-    const isLiveAnchor = db.prepare(`
-      SELECT 1 FROM backups child
-      WHERE (child.parent_backup_id = ? OR child.parent_full_backup_id = ?)
-        AND NOT (
-          (child.retention_until IS NOT NULL AND child.retention_until < datetime('now'))
-          OR (child.retention_until IS NULL AND child.created_at < datetime('now', ?))
-        )
-      LIMIT 1
-    `);
-
-    // Compute the deletable set (expired candidates that do NOT still anchor a
-    // non-expired backup).
-    const deletable = [];
-    for (const b of candidates) {
-      checked++;
-      if (isLiveAnchor.get(b.id, b.id, modifier)) {
-        console.log(`gd-backup-v2: retention skip ${b.id} (still anchors a non-expired backup)`);
-        continue;
-      }
-      deletable.push(b);
-    }
-
-    // Remove parent-reference FK edges among the deletable set BEFORE deleting,
-    // so deletion order is irrelevant: a parent and its (also-expired) child can
-    // both be removed without a self-referential FK failure, at any chain depth.
-    // The anchor guard already guarantees no non-expired backup references any
-    // deletable row.
-    const nullParents = db.prepare(
-      'UPDATE backups SET parent_backup_id = NULL, parent_full_backup_id = NULL WHERE id = ?'
-    );
-    for (const b of deletable) {
-      try { nullParents.run(b.id); } catch (_e) { /* best-effort */ }
-    }
-
-    for (const b of deletable) {
+    if (!fs.existsSync(backupsDir)) return { deleted, checked };
+    for (const ent of fs.readdirSync(backupsDir, { withFileTypes: true })) {
+      // Skip temp (.<name>.tmp) and work (_work-*) staging entries.
+      if (ent.name.startsWith('.') || ent.name.startsWith('_')) continue;
+      const isDir = ent.isDirectory();
+      const isBackupFile = ent.isFile()
+        && (ent.name.endsWith('.db') || ent.name.endsWith('.db.gz') || ent.name.endsWith('.tar.gz'));
+      if (!isDir && !isBackupFile) continue;
+      const fullPath = path.join(backupsDir, ent.name);
       try {
-        removeBackupArtifactDir(b, backupsDir);
-        db.prepare('DELETE FROM backups WHERE id = ?').run(b.id);
+        checked++;
+        const stat = fs.statSync(fullPath);
+        if (stat.mtimeMs >= cutoff) continue;
+        if (isDir) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(fullPath);
+        }
         deleted++;
-        console.log(`gd-backup-v2: retention deleted backup ${b.id}`);
+        console.log(`gd-backup-v2: retention deleted ${ent.name}`);
       } catch (delErr) {
-        console.warn(`gd-backup-v2: retention failed for ${b.id}:`, delErr.message);
+        console.warn(`gd-backup-v2: retention cleanup failed for ${ent.name}:`, delErr.message);
       }
     }
   } catch (err) {
     console.warn('gd-backup-v2: cleanOldBackups failed:', err.message);
   }
   return { deleted, checked };
-}
-
-// Remove a backup's on-disk per-backup directory, derived from any of its stored
-// file paths. Only removes a directory that resolves inside backupsDir (safety
-// against a corrupted/absolute path escaping the backups tree).
-function removeBackupArtifactDir(backupRow, backupsDir) {
-  const anyPath = backupRow.destination
-    || backupRow.manifest_path || backupRow.archive_path
-    || backupRow.manifest_sig_path || backupRow.wrapped_key_path;
-  if (!anyPath) return;
-  const artifactDir = path.resolve(path.dirname(anyPath));
-  const withSep = backupsDir.endsWith(path.sep) ? backupsDir : backupsDir + path.sep;
-  if (artifactDir !== backupsDir && !artifactDir.startsWith(withSep)) {
-    // Path escapes the backups tree; refuse to delete it.
-    console.warn(`gd-backup-v2: retention refusing to delete out-of-tree dir ${artifactDir}`);
-    return;
-  }
-  if (fs.existsSync(artifactDir)) {
-    fs.rmSync(artifactDir, { recursive: true, force: true });
-  }
 }
 
 // -- Push (four-file) ---------------------------------------------------------
@@ -309,7 +257,7 @@ async function pushV2BackupArtifact(db, { backupId, sourceDir, files, manifestSh
 // row's stored file paths. Used by the storage-push retry sweep.
 function rebuildV2BackupContext(db, pushRow) {
   const backup = db.prepare(`
-    SELECT id, destination, hash, created_at,
+    SELECT id, sha256_hash, created_at,
            manifest_path, archive_path, manifest_sig_path, wrapped_key_path
     FROM backups WHERE id = ?
   `).get(pushRow.backup_id);
@@ -336,7 +284,7 @@ function rebuildV2BackupContext(db, pushRow) {
       artifactId: backup.id,
       sourceDir,
       files: hashed.files,
-      manifestSha256: backup.hash,
+      manifestSha256: backup.sha256_hash,
       createdAt: backup.created_at,
     },
   };
@@ -364,7 +312,7 @@ async function retryDueV2BackupPushes(db, options = {}) {
  *   compressionLevel    gzip level (default gd-backup-archive.DEFAULT_GZIP_LEVEL)
  *   keyWrappingScheme   'gd-tier1' (default)
  *   kekReference        'GD_ENCRYPTION_KEY' (default)
- *   retentionDays       retention window applied to this backup's retention_until
+ *   retentionDays       filesystem retention window (mtime) applied by cleanOldBackups
  *   sourceFuseCounter / sourceSchemaVersion  manifest source metadata overrides
  *
  * Returns { id, format_version: 2, type: 'full'|'snapshot', backup_dir, manifest_path,
@@ -375,6 +323,12 @@ async function retryDueV2BackupPushes(db, options = {}) {
  */
 async function performV2Backup(db, options = {}) {
   const mode = options.mode === 'snapshot' ? 'snapshot' : 'full';
+  // Regional parity: backup_strategy is the strategy (full/snapshot); type is the
+  // trigger (snapshot for a snapshot, else on-demand/daily-auto); kind='single-db'.
+  const backupStrategy = mode;
+  const triggerType = mode === 'snapshot'
+    ? 'snapshot'
+    : (options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand');
   const backupsDir = resolveBackupsDir(options);
   const compressionLevel = options.compressionLevel != null ? options.compressionLevel : archiveSvc.DEFAULT_GZIP_LEVEL;
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;
@@ -403,9 +357,9 @@ async function performV2Backup(db, options = {}) {
   const { sourceFuseCounter, sourceSchemaVersion } = readSourceMeta(db, options);
 
   db.prepare(`
-    INSERT INTO backups (id, type, status, format_version, signing_key_id, created_at)
-    VALUES (?, ?, 'running', 2, ?, datetime('now'))
-  `).run(backupId, mode, signingKey.id);
+    INSERT INTO backups (id, type, backup_strategy, kind, status, format_version, signing_key_id, created_at)
+    VALUES (?, ?, ?, 'single-db', 'running', 2, ?, datetime('now'))
+  `).run(backupId, triggerType, backupStrategy, signingKey.id);
 
   try {
     // 1. Consistent snapshot -> bytes. A 'full' also captures the WAL baseline so it
@@ -444,7 +398,7 @@ async function performV2Backup(db, options = {}) {
     // 4. Build the canonical manifest
     const manifestObj = manifestSvc.buildManifest({
       backupId,
-      backupType: mode,
+      backupType: triggerType,
       fileHashes: {
         archive:    { sizeBytes: archive.sizeBytes, sha256: archive.sha256 },
         wrappedKey: { sizeBytes: wrappedKey.length,  sha256: wrappedKeySha },
@@ -482,21 +436,19 @@ async function performV2Backup(db, options = {}) {
     const manifestPath     = path.join(finalDir, manifestSvc.MANIFEST_FILENAME);
     const manifestSigPath  = path.join(finalDir, manifestSvc.SIGNATURE_FILENAME);
 
-    // 8. Update the row: verified + paths + size + retention_until
+    // 8. Update the row: verified + paths + size. file_path stays NULL (v2).
     const totalSize = [archivePath, wrappedKeyPath, manifestPath, manifestSigPath]
       .reduce((sum, p) => sum + fs.statSync(p).size, 0);
     db.prepare(`
       UPDATE backups
       SET status = 'verified',
           size_bytes = ?,
-          hash = ?,
+          sha256_hash = ?,
           manifest_path = ?,
           archive_path = ?,
           manifest_sig_path = ?,
           wrapped_key_path = ?,
-          destination = ?,
-          wal_end_position = ?,
-          retention_until = datetime('now', ?)
+          wal_end_position = ?
       WHERE id = ?
     `).run(
       totalSize,
@@ -505,9 +457,7 @@ async function performV2Backup(db, options = {}) {
       archivePath,
       manifestSigPath,
       wrappedKeyPath,
-      archivePath,
       walEndPosition,
-      `+${retentionDays} days`,
       backupId,
     );
 

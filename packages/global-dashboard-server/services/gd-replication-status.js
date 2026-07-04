@@ -12,7 +12,7 @@
 //
 //   1. Per-type mapping is via the PARENT artifact, not the push table. The push
 //      tables do not store the data type, and two data types share one table:
-//      backup vs snapshot both live in backup_pushes (split by backups.type), and
+//      backup vs snapshot both live in backup_pushes (split by backups.backup_strategy), and
 //      audit_log vs cef_archive both live in archive_segment_pushes (split by the
 //      segment category). A naive one-table-per-type summary would merge them.
 //
@@ -42,8 +42,8 @@ const { MAX_ATTEMPTS } = require('./gd-storage-push');
 // `type` column carries the backup strategy: backup covers full/incremental/
 // differential, snapshot is its own type.
 const SOURCES = {
-  backup: { table: 'backup_pushes', parent: 'backups', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.type IN ('full', 'incremental', 'differential')" },
-  snapshot: { table: 'backup_pushes', parent: 'backups', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.type = 'snapshot'" },
+  backup: { table: 'backup_pushes', parent: 'backups', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.backup_strategy IN ('full', 'incremental', 'differential')" },
+  snapshot: { table: 'backup_pushes', parent: 'backups', join: 'JOIN backups b ON b.id = p.backup_id', filter: "b.backup_strategy = 'snapshot'" },
   audit_log: { table: 'archive_segment_pushes', parent: 'storage_archive_segments', join: 'JOIN storage_archive_segments s ON s.id = p.segment_id', filter: "s.category = 'audit_log'" },
   cef_archive: { table: 'archive_segment_pushes', parent: 'storage_archive_segments', join: 'JOIN storage_archive_segments s ON s.id = p.segment_id', filter: "s.category = 'cef_archive'" },
   forensic_export: { table: 'forensic_export_pushes', parent: 'forensic_exports', join: '', filter: '' },

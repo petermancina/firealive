@@ -11,7 +11,7 @@
 // Distinct from gd-backup-v2's single-DB full only in what the archive payload
 // contains (a multi-file bundle vs one DB) and in that it never records a WAL
 // baseline -- a full-suite bundle is not a single-DB archive, so an incremental
-// must never anchor on it. Recorded as type='full', format_version=2.
+// must never anchor on it. Recorded as backup_strategy='full', kind='full-suite', format_version=2.
 
 'use strict';
 
@@ -96,7 +96,7 @@ function buildBundleBytes(db, backupsDir, backupId, options) {
 
 // performFullSuiteBackup(db, options) -- mirrors gd-backup-v2.performV2Backup with the
 // comprehensive bundle as the archive payload. Produces the four-file encrypted
-// artifact, records type='full'/format_version=2 (no WAL baseline), chain-attests,
+// artifact, records backup_strategy='full'/kind='full-suite'/format_version=2 (no WAL baseline), chain-attests,
 // and routes + pushes.
 async function performFullSuiteBackup(db, options = {}) {
   const backupsDir = backupV2.resolveBackupsDir(options);
@@ -106,6 +106,9 @@ async function performFullSuiteBackup(db, options = {}) {
   const retentionDays = options.retentionDays != null
     ? options.retentionDays
     : parseInt(process.env.GD_BACKUP_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
+  // The backups.type column is the trigger (Regional parity); the strategy is
+  // backup_strategy. A full-suite is an on-demand full unless a scheduler drives it.
+  const triggerType = options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand';
 
   if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
   backupV2.cleanStaleTempDirs(backupsDir);
@@ -127,9 +130,9 @@ async function performFullSuiteBackup(db, options = {}) {
   const { sourceFuseCounter, sourceSchemaVersion } = backupV2.readSourceMeta(db, options);
 
   db.prepare(`
-    INSERT INTO backups (id, type, status, format_version, signing_key_id, created_at)
-    VALUES (?, 'full', 'running', 2, ?, datetime('now'))
-  `).run(backupId, signingKey.id);
+    INSERT INTO backups (id, type, backup_strategy, kind, status, format_version, signing_key_id, created_at)
+    VALUES (?, ?, 'full', 'full-suite', 'running', 2, ?, datetime('now'))
+  `).run(backupId, triggerType, signingKey.id);
 
   try {
     // 1. Build the comprehensive bundle -> bytes.
@@ -145,7 +148,7 @@ async function performFullSuiteBackup(db, options = {}) {
     // 4. Build the canonical manifest.
     const manifestObj = manifestSvc.buildManifest({
       backupId,
-      backupType: 'full',
+      backupType: triggerType,
       fileHashes: {
         archive:    { sizeBytes: archive.sizeBytes, sha256: archive.sha256 },
         wrappedKey: { sizeBytes: wrappedKey.length,  sha256: wrappedKeySha },
@@ -183,25 +186,23 @@ async function performFullSuiteBackup(db, options = {}) {
     const manifestPath    = path.join(finalDir, manifestSvc.MANIFEST_FILENAME);
     const manifestSigPath = path.join(finalDir, manifestSvc.SIGNATURE_FILENAME);
 
-    // 8. Update the row: verified + paths + size + retention. No wal_end_position --
-    // a full-suite bundle never anchors an incremental.
+    // 8. Update the row: verified + paths + size. No wal_end_position -- a
+    // full-suite bundle never anchors an incremental. file_path stays NULL (v2).
     const totalSize = [archivePath, wrappedKeyPath, manifestPath, manifestSigPath]
       .reduce((sum, p) => sum + fs.statSync(p).size, 0);
     db.prepare(`
       UPDATE backups
       SET status = 'verified',
           size_bytes = ?,
-          hash = ?,
+          sha256_hash = ?,
           manifest_path = ?,
           archive_path = ?,
           manifest_sig_path = ?,
-          wrapped_key_path = ?,
-          destination = ?,
-          retention_until = datetime('now', ?)
+          wrapped_key_path = ?
       WHERE id = ?
     `).run(
       totalSize, manifestSha256, manifestPath, archivePath, manifestSigPath,
-      wrappedKeyPath, archivePath, `+${retentionDays} days`, backupId,
+      wrappedKeyPath, backupId,
     );
 
     console.log(`gd-backup-full-suite: backup ${backupId} verified (${totalSize} bytes, manifest ${manifestSha256.slice(0, 16)})`);

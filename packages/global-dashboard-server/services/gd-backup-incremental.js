@@ -83,12 +83,12 @@ function resolveWalPath(options) {
 /**
  * Find the most recent backup eligible to be an incremental parent:
  * status='verified', wal_end_position set, format_version=2, newest first.
- * (The GD `type` column carries the strategy; any v2 backup with a WAL end
- * position -- full or incremental -- can be a parent.) Returns the row or null.
+ * (backup_strategy carries the strategy; any v2 backup with a WAL end position --
+ * full or incremental -- can be a parent.) Returns the row or null.
  */
 function findIncrementalParent(db) {
   return db.prepare(`
-    SELECT id, type, parent_full_backup_id, wal_start_position, wal_end_position, page_count, created_at
+    SELECT id, backup_strategy, parent_full_backup_id, wal_start_position, wal_end_position, page_count, created_at
       FROM backups
      WHERE status = 'verified'
        AND wal_end_position IS NOT NULL
@@ -100,12 +100,12 @@ function findIncrementalParent(db) {
 
 /**
  * Resolve the anchor full backup id for an incremental whose immediate parent is
- * parentRow. If the parent is a full backup (type='full', no parent_full_backup_id),
- * the parent IS the anchor; otherwise inherit the parent's anchor.
+ * parentRow. If the parent is a full backup (backup_strategy='full', no
+ * parent_full_backup_id), the parent IS the anchor; otherwise inherit its anchor.
  */
 function resolveAnchorFullBackupId(parentRow) {
   if (!parentRow) return null;
-  if (parentRow.parent_full_backup_id == null && parentRow.type === 'full') {
+  if (parentRow.parent_full_backup_id == null && parentRow.backup_strategy === 'full') {
     return parentRow.id;
   }
   return parentRow.parent_full_backup_id;
@@ -152,7 +152,7 @@ function buildFramesBundle(pageSize, frames) {
  * shared manifest/signing services.
  */
 function buildIncrementalManifest(args) {
-  const required = ['backupId', 'parentBackupId', 'parentFullBackupId', 'walStartPosition',
+  const required = ['backupId', 'backupType', 'parentBackupId', 'parentFullBackupId', 'walStartPosition',
     'walEndPosition', 'pageCount', 'pageSize', 'archiveFile', 'wrappedKeyFile',
     'signingKeyId', 'signingKeyFingerprint', 'sourceFuseCounter'];
   for (const k of required) {
@@ -163,7 +163,8 @@ function buildIncrementalManifest(args) {
   return {
     format_version: manifestSvc.MANIFEST_FORMAT_VERSION,
     backup_id: String(args.backupId),
-    backup_type: 'incremental',
+    backup_strategy: 'incremental',
+    backup_type: args.backupType,
     created_at: args.createdAt || new Date().toISOString(),
     parent_backup_id: String(args.parentBackupId),
     parent_full_backup_id: String(args.parentFullBackupId),
@@ -247,9 +248,8 @@ async function performIncrementalBackup(db, options = {}) {
   const compressionLevel = options.compressionLevel != null ? options.compressionLevel : archiveSvc.DEFAULT_GZIP_LEVEL;
   const keyWrappingScheme = options.keyWrappingScheme || keyWrapSvc.DEFAULT_SCHEME;
   const kekReference = options.kekReference || keyWrapSvc.DEFAULT_KEK_REFERENCE;
-  const retentionDays = options.retentionDays != null
-    ? options.retentionDays
-    : parseInt(process.env.GD_BACKUP_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
+  // Regional parity: backups.type is the trigger; backup_strategy is 'incremental'.
+  const triggerType = options.triggerType === 'daily-auto' ? 'daily-auto' : 'on-demand';
 
   ensureDir(backupsDir);
 
@@ -380,6 +380,7 @@ async function performIncrementalBackup(db, options = {}) {
 
     const manifest = buildIncrementalManifest({
       backupId,
+      backupType: triggerType,
       parentBackupId: parent.id,
       parentFullBackupId: anchorFullBackupId,
       walStartPosition: parent.wal_end_position,
@@ -418,23 +419,20 @@ async function performIncrementalBackup(db, options = {}) {
     const totalSize = [archivePath, wrappedKeyPath, manifestPath, manifestSigPath]
       .reduce((sum, p) => sum + fs.statSync(p).size, 0);
 
-    // 5. Insert backups row (type='incremental', v2, parent linkage, WAL positions)
+    // 5. Insert backups row (backup_strategy='incremental', v2, parent linkage, WAL)
     db.prepare(`
-      INSERT INTO backups (id, type, size_bytes, hash, status, created_at,
+      INSERT INTO backups (id, type, backup_strategy, kind, size_bytes, sha256_hash, status, created_at,
                            format_version, manifest_path, archive_path,
                            manifest_sig_path, wrapped_key_path, signing_key_id,
                            parent_backup_id, parent_full_backup_id,
-                           wal_start_position, wal_end_position, page_count,
-                           destination, retention_until)
-      VALUES (?, 'incremental', ?, ?, 'verified', datetime('now'),
+                           wal_start_position, wal_end_position, page_count)
+      VALUES (?, ?, 'incremental', 'single-db', ?, ?, 'verified', datetime('now'),
               2, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?,
-              ?, datetime('now', ?))
+              ?, ?, ?, ?, ?)
     `).run(
-      backupId, totalSize, manifestSha256,
+      backupId, triggerType, totalSize, manifestSha256,
       manifestPath, archivePath, manifestSigPath, wrappedKeyPath, signingKey.id,
       parent.id, anchorFullBackupId, parent.wal_end_position, walEndPosition, collectedFrames.length,
-      archivePath, `+${retentionDays} days`,
     );
 
     console.log(`gd-backup-incremental: incremental ${backupId} verified (parent ${parent.id}, anchor ${anchorFullBackupId}, ${collectedFrames.length} pages)`);

@@ -76,7 +76,7 @@ router.get('/', (req, res) => {
   try {
     db = getDb();
     const backups = db.prepare(
-      'SELECT id, type, size_bytes, hash, destination, status, created_at, retention_until, '
+      'SELECT id, type, backup_strategy, kind, size_bytes, sha256_hash, file_path, status, created_at, '
       + 'format_version, manifest_path, archive_path, manifest_sig_path, wrapped_key_path, '
       + 'signing_key_id, parent_backup_id, parent_full_backup_id, '
       + 'wal_start_position, wal_end_position, page_count '
@@ -312,7 +312,7 @@ router.get('/:id/chain', (req, res) => {
     let allRestorable = !brokenParent;
     let totalPageCount = 0;
     const chainSummary = chain.map(function (link) {
-      const strategy = link.type || 'full';
+      const strategy = link.backup_strategy || 'full';
       const pageCount = link.page_count || 0;
       totalPageCount += pageCount;
 
@@ -323,7 +323,7 @@ router.get('/:id/chain', (req, res) => {
         filesToCheck.push({ label: 'signature', path: link.manifest_sig_path });
         filesToCheck.push({ label: 'wrappedKey', path: link.wrapped_key_path });
       } else {
-        filesToCheck.push({ label: 'artifact', path: link.destination });
+        filesToCheck.push({ label: 'artifact', path: link.file_path });
       }
 
       const missingFiles = filesToCheck.filter(function (f) { return !f.path || !fs.existsSync(f.path); }).map(function (f) { return f.label; });
@@ -373,7 +373,7 @@ router.post('/:id/verify', (req, res) => {
   try {
     db = getDb();
     const backup = db.prepare(
-      'SELECT id, type, size_bytes, hash, destination, status, created_at, format_version, '
+      'SELECT id, type, backup_strategy, kind, size_bytes, sha256_hash, file_path, status, created_at, format_version, '
       + 'manifest_path, archive_path, manifest_sig_path, wrapped_key_path, signing_key_id '
       + 'FROM backups WHERE id = ?'
     ).get(req.params.id);
@@ -382,19 +382,19 @@ router.post('/:id/verify', (req, res) => {
     if (backup.status === 'running') return res.json({ status: 'running', message: 'Backup still in progress' });
     if (backup.status === 'failed') return res.json({ status: 'failed', message: 'Backup creation previously failed; cannot verify' });
 
-    // v1 path: single artifact at destination, hash = artifact sha256.
+    // v1 path: single artifact at file_path, sha256_hash = artifact sha256.
     if (backup.format_version === 1 || backup.format_version === null || backup.format_version === undefined) {
-      if (!backup.destination || !fs.existsSync(backup.destination)) {
-        return res.json({ status: 'missing', format_version: 1, message: 'v1 backup artifact not found on disk', expectedPath: backup.destination });
+      if (!backup.file_path || !fs.existsSync(backup.file_path)) {
+        return res.json({ status: 'missing', format_version: 1, message: 'v1 backup artifact not found on disk', expectedPath: backup.file_path });
       }
-      const buf = fs.readFileSync(backup.destination);
+      const buf = fs.readFileSync(backup.file_path);
       const currentHash = sha256Hex(buf);
-      const matches = currentHash === backup.hash;
+      const matches = currentHash === backup.sha256_hash;
       _audit(db, req, 'BACKUP_VERIFIED', 'id=' + backup.id + ' format=v1 match=' + matches);
       return res.json({
         status: matches ? 'verified' : 'tampered',
         format_version: 1,
-        storedHash: backup.hash,
+        storedHash: backup.sha256_hash,
         currentHash: currentHash,
         sizeBytes: buf.length,
         matches: matches,
@@ -402,7 +402,7 @@ router.post('/:id/verify', (req, res) => {
     }
 
     // v2 path: four-file layout; manifest hash + Ed25519 signature + in-manifest
-    // file hashes. hash column holds the manifest sha256 for v2 backups.
+    // file hashes. sha256_hash column holds the manifest sha256 for v2 backups.
     if (backup.format_version === 2) {
       const filePaths = {
         manifest: backup.manifest_path,
@@ -420,7 +420,7 @@ router.post('/:id/verify', (req, res) => {
 
       const manifestBytes = fs.readFileSync(filePaths.manifest);
       const manifestSha = sha256Hex(manifestBytes);
-      const hashMatches = manifestSha === backup.hash;
+      const hashMatches = manifestSha === backup.sha256_hash;
 
       let signatureValid = false;
       let signatureError = null;
@@ -472,7 +472,7 @@ router.post('/:id/verify', (req, res) => {
         sizeBytes: backup.size_bytes,
         matches: allValid,
         checks: {
-          manifestHash: { stored: backup.hash, actual: manifestSha, matches: hashMatches },
+          manifestHash: { stored: backup.sha256_hash, actual: manifestSha, matches: hashMatches },
           signature: { valid: signatureValid, error: signatureError, signing_key_id: backup.signing_key_id },
           archiveHash: { manifest: archiveExpected, actual: archiveSha, matches: archiveMatches },
           wrappedKeyHash: { manifest: wrappedExpected, actual: wrappedSha, matches: wrappedMatches },

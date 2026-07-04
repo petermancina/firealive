@@ -221,7 +221,7 @@ function checkBackups(db) {
   }
   return {
     status: recent.c > 0 ? 'pass' : 'warning',
-    detail: `${total.c} backups total, ${recent.c} in last 7 days. ${schedules.c} active backup schedule(s). SHA-256 hash recorded per backup (backups.hash column) for integrity verification.`,
+    detail: `${total.c} backups total, ${recent.c} in last 7 days. ${schedules.c} active backup schedule(s). SHA-256 hash recorded per backup (backups.sha256_hash column) for integrity verification.`,
   };
 }
 

@@ -17,8 +17,8 @@
 // WHAT IS IN THE DOMAIN (the explicit allowlist below)
 //   - config-table configuration keys (CONFIG_TABLE_KEYS)
 //   - the dedicated configuration tables (TABLE_SECTIONS): storage
-//     destinations + their routing, data-residency destinations, backup
-//     schedules, and the EDR / malware-scanner integrations
+//     destinations + their routing, data-residency destinations, and backup
+//     schedules
 //
 // The GD has no team_config table, so unlike the Regional Server there is no
 // team_config KV section and no legacy (schema version 0) snapshot shape; every
@@ -26,9 +26,13 @@
 //
 // WHAT IS NEVER IN A BASELINE (hard exclusions)
 //   - secret material of any kind: encrypted credential blobs
-//     (storage_destinations.credentials_encrypted,
-//     malware_scanner_integrations.credentials_encrypted) and the
-//     cicd_webhook_secret config key
+//     (storage_destinations.credentials_encrypted) and the cicd_webhook_secret
+//     config key
+//   - the EDR / malware-scanner integrations table
+//     (malware_scanner_integrations): its whole configuration is a NOT NULL
+//     encrypted-credentials secret, so it cannot travel in a secrets-free
+//     baseline; it is reconfigured directly or restored from a backup, matching
+//     the Regional Server (which also excludes its scanner table)
 //   - every signing-key table (backup / archive-chain / audit / report /
 //     forensic / MC-trust) and the CA: keys are deployment identity, not
 //     configuration
@@ -145,13 +149,6 @@ const TABLE_SECTIONS = [
     configCols: ['type', 'frequency', 'time', 'day', 'destination', 'retention_days',
       'encrypted', 'regulatory_preset', 'active'],
     secretCols: [],
-  },
-  {
-    table: 'malware_scanner_integrations', mode: 'rows', matchKey: 'display_name',
-    orderBy: 'display_name', noIdCarry: true,
-    configCols: ['provider_type', 'display_name', 'endpoint', 'enabled'],
-    secretCols: ['credentials_encrypted'],
-    secretDisables: { credentials_encrypted: 'enabled' },
   },
 ];
 

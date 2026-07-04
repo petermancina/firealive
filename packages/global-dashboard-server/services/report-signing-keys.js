@@ -40,6 +40,28 @@
 const crypto = require('crypto');
 const { encryptConfig, decryptConfig } = require('./gd-encryption');
 
+// -- Typed errors (used by the external-registration trust API) --------------
+
+const CODES = {
+  INVALID_PEM: 'INVALID_PEM',
+  WRONG_KEY_TYPE: 'WRONG_KEY_TYPE',
+  WRONG_KEY_USAGE: 'WRONG_KEY_USAGE',
+  DUPLICATE_FINGERPRINT: 'DUPLICATE_FINGERPRINT',
+  KEY_NOT_FOUND: 'KEY_NOT_FOUND',
+  NOT_EXTERNAL_KEY: 'NOT_EXTERNAL_KEY',
+  ALREADY_REVOKED: 'ALREADY_REVOKED',
+  INVALID_INPUT: 'INVALID_INPUT',
+};
+
+class SigningKeyError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'SigningKeyError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
 // ── Keypair generation + fingerprint ──────────────────────────────────────
 
 /**
@@ -89,7 +111,7 @@ function computePublicKeyFingerprint(publicKeyPem) {
 function getActiveRow(db) {
   return db.prepare(`
     SELECT id, public_key, public_key_fingerprint, private_key_encrypted,
-           is_active, created_at
+           is_active, key_origin, created_at
     FROM report_signing_keys
     WHERE is_active = 1
     LIMIT 1
@@ -98,11 +120,22 @@ function getActiveRow(db) {
 
 function getRowByFingerprint(db, fingerprint) {
   return db.prepare(`
-    SELECT id, public_key, public_key_fingerprint, is_active,
+    SELECT id, public_key, public_key_fingerprint, is_active, key_origin,
+           registered_by_user_id, registered_at, key_label,
            created_at, rotated_out_at, notes
     FROM report_signing_keys
     WHERE public_key_fingerprint = ?
   `).get(fingerprint);
+}
+
+function getRowById(db, id) {
+  return db.prepare(`
+    SELECT id, public_key, public_key_fingerprint, is_active, key_origin,
+           registered_by_user_id, registered_at, key_label,
+           created_at, rotated_out_at, notes
+    FROM report_signing_keys
+    WHERE id = ?
+  `).get(id);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -162,6 +195,11 @@ function getActiveReportKey(db) {
   if (!row) {
     throw new Error('no active report signing key exists; call ensureActiveReportKeypair(db) at server boot');
   }
+  // Defense in depth: the schema CHECK already forbids an external-registered
+  // key from being active, but never sign with anything but a local keypair.
+  if (row.key_origin && row.key_origin !== 'local-generated') {
+    throw new Error(`active report signing key is not local-generated (origin=${row.key_origin}); refusing to sign`);
+  }
   const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
   return {
     id: row.id,
@@ -176,22 +214,28 @@ function getActiveReportKey(db) {
  * getReportVerificationKey(db, fingerprint)
  *
  * Return the public key needed to verify a report signature recorded with the
- * given key_fingerprint. Resolves regardless of whether the key is currently
- * active or has been rotated out, so historical report signatures stay
- * verifiable. Public-only -- never decrypts the private key.
+ * given key_fingerprint. A local-generated key resolves regardless of whether
+ * it is currently active or has been rotated out, so historical report
+ * signatures stay verifiable forever. An external-registered key that has been
+ * revoked (rotated_out_at set) resolves to null and fails closed -- once trust
+ * in a foreign deployment's key is revoked, signatures by it are untrusted.
+ * Public-only -- never decrypts the private key.
  *
  * Returns: { id, publicKey: KeyObject, publicKeyPem, publicKeyFingerprint,
- *            isActive } or null if no key with that fingerprint exists.
+ *            isActive, keyOrigin } or null if no usable key with that
+ *            fingerprint exists.
  */
 function getReportVerificationKey(db, fingerprint) {
   const row = getRowByFingerprint(db, fingerprint);
   if (!row) return null;
+  if (row.key_origin === 'external-registered' && row.rotated_out_at) return null;
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),
     publicKeyPem: row.public_key,
     publicKeyFingerprint: row.public_key_fingerprint,
     isActive: row.is_active === 1,
+    keyOrigin: row.key_origin,
   };
 }
 
@@ -253,27 +297,44 @@ function rotateReportKeypair(db, options = {}) {
  *   rotatedOutAt, notes, reportsSignedCount
  * }
  */
-function listReportKeys(db) {
-  const rows = db.prepare(`
+function listReportKeys(db, options = {}) {
+  let query = `
     SELECT
       rsk.id,
       rsk.public_key,
       rsk.public_key_fingerprint,
       rsk.is_active,
+      rsk.key_origin,
+      rsk.registered_by_user_id,
+      rsk.registered_at,
+      rsk.key_label,
       rsk.created_at,
       rsk.rotated_out_at,
       rsk.notes,
       (SELECT COUNT(*) FROM report_verifications
         WHERE key_fingerprint = rsk.public_key_fingerprint) AS reports_signed_count
     FROM report_signing_keys rsk
-    ORDER BY rsk.created_at DESC
-  `).all();
+  `;
+  const params = [];
+  if (options.origin) {
+    if (!['local-generated', 'external-registered'].includes(options.origin)) {
+      throw new SigningKeyError(CODES.INVALID_INPUT, `origin must be 'local-generated' or 'external-registered', got '${options.origin}'`);
+    }
+    query += ` WHERE rsk.key_origin = ?`;
+    params.push(options.origin);
+  }
+  query += ` ORDER BY rsk.created_at DESC`;
+  const rows = db.prepare(query).all(...params);
 
   return rows.map(r => ({
     id: r.id,
     publicKeyPem: r.public_key,
     publicKeyFingerprint: r.public_key_fingerprint,
     isActive: r.is_active === 1,
+    keyOrigin: r.key_origin,
+    registeredByUserId: r.registered_by_user_id,
+    registeredAt: r.registered_at,
+    keyLabel: r.key_label,
     createdAt: r.created_at,
     rotatedOutAt: r.rotated_out_at,
     notes: r.notes,
@@ -340,7 +401,181 @@ function verifyReportDigest(db, digestBytes, signature, keyFingerprint) {
   return crypto.verify(null, bytes, verKey.publicKey, signature);
 }
 
+// -- External-registered key trust (cross-deployment verification) -----------
+
+/**
+ * validateExternalPublicKey(pem)
+ *
+ * Parse and validate a foreign deployment's report-signing PUBLIC key PEM.
+ * Rejects a private-key paste outright (crypto.createPublicKey would silently
+ * derive the public half from a private key, so without this an operator could
+ * accidentally submit -- and expose -- their own private key). Requires an
+ * Ed25519 public key. Returns the canonical SPKI PEM plus the SHA-256 DER
+ * fingerprint.
+ *
+ * Returns: { publicKeyPem, publicKeyFingerprint }
+ *
+ * Throws SigningKeyError on any validation failure.
+ */
+function validateExternalPublicKey(pem) {
+  if (typeof pem !== 'string' || !pem.trim()) {
+    throw new SigningKeyError(CODES.INVALID_PEM, 'public key PEM must be a non-empty string');
+  }
+  // Reject a private-key paste outright. Public keys cannot be loaded as private
+  // keys, so this only ever rejects actual private-key input.
+  let looksPrivate = false;
+  try {
+    crypto.createPrivateKey(pem);
+    looksPrivate = true;
+  } catch (err) {
+    looksPrivate = false;
+  }
+  if (looksPrivate) {
+    throw new SigningKeyError(CODES.WRONG_KEY_USAGE, 'this looks like a private key; paste the PUBLIC key only');
+  }
+  let keyObj;
+  try {
+    keyObj = crypto.createPublicKey(pem);
+  } catch (err) {
+    throw new SigningKeyError(CODES.INVALID_PEM, `failed to parse public key PEM: ${err.message}`);
+  }
+  if (keyObj.asymmetricKeyType !== 'ed25519') {
+    throw new SigningKeyError(
+      CODES.WRONG_KEY_TYPE,
+      `expected Ed25519 public key, got ${keyObj.asymmetricKeyType || 'unknown'}`,
+    );
+  }
+  if (keyObj.type !== 'public') {
+    throw new SigningKeyError(
+      CODES.WRONG_KEY_USAGE,
+      `expected a public key, got ${keyObj.type}`,
+    );
+  }
+  const canonicalPem = keyObj.export({ type: 'spki', format: 'pem' });
+  const der = keyObj.export({ type: 'spki', format: 'der' });
+  const publicKeyFingerprint = crypto.createHash('sha256').update(der).digest('hex');
+  return { publicKeyPem: canonicalPem, publicKeyFingerprint };
+}
+
+/**
+ * registerExternalKey(db, args)
+ *
+ * Register a foreign deployment's Ed25519 report-signing PUBLIC key so this
+ * deployment can verify golden-baseline bundles exported by it. Inserts a row
+ * with key_origin='external-registered', is_active=0 (verification-only),
+ * private_key_encrypted=NULL, and the registration metadata. The schema CHECK
+ * enforces those invariants; this function adds the application-level checks
+ * (key parses as Ed25519, fingerprint not already present).
+ *
+ * args:
+ *   publicKeyPem        (string, required) - foreign deployment's pubkey
+ *   registeredByUserId  (string, required) - admin performing registration
+ *                                            (audit trail; required by CHECK)
+ *   keyLabel            (string, optional) - operator-friendly description
+ *   notes               (string, optional)
+ *
+ * Returns: { id, publicKeyFingerprint, registeredAt }
+ *
+ * Throws SigningKeyError: INVALID_PEM | WRONG_KEY_TYPE | WRONG_KEY_USAGE |
+ *   DUPLICATE_FINGERPRINT | INVALID_INPUT.
+ */
+function registerExternalKey(db, args = {}) {
+  const { publicKeyPem, registeredByUserId, keyLabel = null, notes = null } = args;
+
+  if (typeof registeredByUserId !== 'string' || !registeredByUserId.trim()) {
+    throw new SigningKeyError(CODES.INVALID_INPUT, 'registeredByUserId is required');
+  }
+  if (keyLabel !== null && (typeof keyLabel !== 'string' || keyLabel.length > 200)) {
+    throw new SigningKeyError(CODES.INVALID_INPUT, 'keyLabel must be a string up to 200 chars or null');
+  }
+
+  const { publicKeyPem: canonicalPem, publicKeyFingerprint } = validateExternalPublicKey(publicKeyPem);
+
+  // The same key bytes must not exist as multiple rows, whether the existing
+  // row is local-generated, active external, or revoked external.
+  const existing = getRowByFingerprint(db, publicKeyFingerprint);
+  if (existing) {
+    throw new SigningKeyError(
+      CODES.DUPLICATE_FINGERPRINT,
+      `a key with fingerprint ${publicKeyFingerprint} is already registered (id=${existing.id}, origin=${existing.key_origin})`,
+      { existingId: existing.id, existingOrigin: existing.key_origin },
+    );
+  }
+
+  const result = db.prepare(`
+    INSERT INTO report_signing_keys
+      (public_key, public_key_fingerprint, private_key_encrypted,
+       is_active, key_origin,
+       registered_by_user_id, registered_at, key_label, notes)
+    VALUES (?, ?, NULL, 0, 'external-registered', ?, datetime('now'), ?, ?)
+  `).run(canonicalPem, publicKeyFingerprint, registeredByUserId, keyLabel, notes);
+
+  const inserted = db.prepare(
+    'SELECT registered_at FROM report_signing_keys WHERE id = ?'
+  ).get(result.lastInsertRowid);
+
+  return {
+    id: result.lastInsertRowid,
+    publicKeyFingerprint,
+    registeredAt: inserted ? inserted.registered_at : null,
+  };
+}
+
+/**
+ * revokeExternalKey(db, id)
+ *
+ * Revoke trust in a previously registered external key by setting
+ * rotated_out_at = now. The row is preserved (audit trail), but
+ * getReportVerificationKey then returns null for it, so any future baseline
+ * signed by it fails verification. Refuses to touch local-generated keys
+ * (those retire via rotateReportKeypair).
+ *
+ * Returns: { id, publicKeyFingerprint, rotatedOutAt }
+ *
+ * Throws SigningKeyError: KEY_NOT_FOUND | NOT_EXTERNAL_KEY | ALREADY_REVOKED.
+ */
+function revokeExternalKey(db, id) {
+  const row = getRowById(db, id);
+  if (!row) {
+    throw new SigningKeyError(CODES.KEY_NOT_FOUND, `no report signing key with id ${id}`);
+  }
+  if (row.key_origin !== 'external-registered') {
+    throw new SigningKeyError(
+      CODES.NOT_EXTERNAL_KEY,
+      `key id ${id} is ${row.key_origin}, not external-registered; use rotateReportKeypair() to retire local-generated keys`,
+      { keyOrigin: row.key_origin },
+    );
+  }
+  if (row.rotated_out_at) {
+    throw new SigningKeyError(
+      CODES.ALREADY_REVOKED,
+      `external key id ${id} is already revoked (at ${row.rotated_out_at})`,
+      { rotatedOutAt: row.rotated_out_at },
+    );
+  }
+
+  db.prepare(`
+    UPDATE report_signing_keys
+    SET rotated_out_at = datetime('now')
+    WHERE id = ? AND key_origin = 'external-registered' AND rotated_out_at IS NULL
+  `).run(id);
+
+  const updated = db.prepare(
+    'SELECT rotated_out_at FROM report_signing_keys WHERE id = ?'
+  ).get(id);
+
+  return {
+    id: row.id,
+    publicKeyFingerprint: row.public_key_fingerprint,
+    rotatedOutAt: updated ? updated.rotated_out_at : null,
+  };
+}
+
 module.exports = {
+  // Errors
+  SigningKeyError,
+  CODES,
+
   generateKeypair,
   computePublicKeyFingerprint,
   ensureActiveReportKeypair,
@@ -350,4 +585,9 @@ module.exports = {
   listReportKeys,
   signReportDigest,
   verifyReportDigest,
+
+  // External-registered key trust (cross-deployment verification)
+  validateExternalPublicKey,
+  registerExternalKey,
+  revokeExternalKey,
 };
