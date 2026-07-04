@@ -13,7 +13,7 @@
 // PLATFORM STATE NOTES (GD-specific gaps relative to MC)
 //
 //   - GD has no backup_signing_keys table. GD-side backups are
-//     SHA-256-hashed (backups.hash column) but the hashes are not
+//     SHA-256-hashed (backups.sha256_hash column) but the hashes are not
 //     cryptographically signed; there is no Ed25519 key registry for
 //     GD's own backup manifests. The MC PR1 implementation of
 //     checkKeyRotation queries that registry; the GD version returns
