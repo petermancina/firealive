@@ -209,7 +209,7 @@ const REMEDIATIONS = {
       'Navigate to GD -> Backup',
       'Add at least one backup schedule via POST /api/backup-schedules with frequency, destination, encrypted=true, retention_days',
       'Trigger a manual backup via POST /api/backups/trigger to bootstrap the backups table',
-      'Each backup records a SHA-256 hash (backups.hash column) for integrity verification',
+      'Each backup records a SHA-256 hash (backups.sha256_hash column) for integrity verification',
       'For redundancy: configure at least two schedules pointing to different destinations (see checkBackupMultiDestination)',
     ],
     uiPath: 'gd:backup',
