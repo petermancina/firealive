@@ -294,6 +294,7 @@ app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-
 app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
+app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
