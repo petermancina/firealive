@@ -292,6 +292,7 @@ app.use('/api/storage-destinations', authMiddleware(['ciso']), require('./routes
 app.use('/api/storage-routing', authMiddleware(['ciso']), require('./routes/storage-routing'));
 app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-residency'));
 app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
+app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
