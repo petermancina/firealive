@@ -21,7 +21,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db-init');
 const { appendGdAuditEntry } = require('../services/gd-audit-chain');
-const sdnMode = require('./gd-sdn-mode');
+const sdnMode = require('../services/gd-sdn-mode');
 
 // Map a service error to an HTTP status. Validation -> 400, missing -> 404,
 // otherwise 500.
