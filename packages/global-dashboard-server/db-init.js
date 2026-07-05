@@ -1280,14 +1280,13 @@ CREATE TABLE IF NOT EXISTS gd_sdn_posture_state (
   last_transition_event_id TEXT REFERENCES gd_sdn_posture_events(id)
 );
 
-CREATE TABLE IF NOT EXISTS gd_sdn_segments (
-  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  cidr TEXT NOT NULL,
-  label TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 
+CREATE TABLE IF NOT EXISTS gd_sdn_network_map (
+  id TEXT PRIMARY KEY DEFAULT 'default',
+  permitted_segments TEXT DEFAULT '[]',   -- JSON array of CIDRs/segments the GD's own components may use (admission allow-list)
+  updated_by TEXT REFERENCES users(id),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS gd_sase_posture_events (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   event_type TEXT NOT NULL CHECK (event_type IN (
@@ -1297,15 +1296,6 @@ CREATE TABLE IF NOT EXISTS gd_sase_posture_events (
   severity TEXT DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'critical')),
   detail TEXT,
   observed_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS gd_sase_posture_state (
-  id TEXT PRIMARY KEY DEFAULT 'default',
-  current_state TEXT NOT NULL DEFAULT 'healthy'
-    CHECK (current_state IN ('healthy', 'degraded')),
-  state_since TEXT DEFAULT (datetime('now')),
-  last_eval_at TEXT,
-  last_transition_event_id TEXT REFERENCES gd_sase_posture_events(id)
 );
 
 CREATE TABLE IF NOT EXISTS gd_migration_bundles (
@@ -1821,6 +1811,20 @@ function initDb() {
     }
   } catch (bsReshapeErr) {
     console.error('B6c post-3 migration (backup_schedules reshape) failed (non-fatal):', bsReshapeErr.message);
+  }
+
+  // -- B6c PR-4 (network modes): drop orphan SDN/SASE tables --------------
+  // gd_sdn_segments and gd_sase_posture_state were PR-1 GD reinventions with
+  // no counterpart in the Regional model (which holds permitted segments in
+  // sdn_network_map, and derives the SASE latch from posture events). Neither
+  // was ever wired to code. Dropped in favor of gd_sdn_network_map (the
+  // Regional model tailored to the GD's read-only admission role). No data
+  // loss: both were empty config tables. Idempotent (DROP TABLE IF EXISTS).
+  try {
+    db.exec('DROP TABLE IF EXISTS gd_sdn_segments');
+    db.exec('DROP TABLE IF EXISTS gd_sase_posture_state');
+  } catch (dropOrphanSdnErr) {
+    console.error('B6c PR-4 migration (drop orphan SDN/SASE tables) failed (non-fatal):', dropOrphanSdnErr.message);
   }
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
   //

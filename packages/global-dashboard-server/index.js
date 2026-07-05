@@ -196,6 +196,15 @@ app.use('/api', configLockChokepoint());
 // B6c: mode-gated pre-auth VM-attestation gate; refuses the whole /api surface on an easily-copied+quarantined instance or an unverified cloud confidential VM. No-op on bare-metal.
 app.use('/api/', require('./services/gd-vm-attestation').gdVmAttestation());
 
+// B6c PR-4: mode-gated SDN/SASE network-mode gates (no-ops outside their mode).
+// Admission gates first -- turn away an unpermitted (SDN) or unsanctioned (SASE)
+// origin before auth work -- then the degraded-posture fail-safe lockdowns, in
+// the Regional middleware order. Mounted before per-route auth.
+app.use('/api/', require('./services/gd-sdn-admission').sdnAdmission());
+app.use('/api/', require('./services/gd-sase-admission').saseAdmission());
+app.use('/api/', require('./services/gd-sdn-fail-safe').sdnFailSafe());
+app.use('/api/', require('./services/gd-sase-fail-safe').saseFailSafe());
+
 // Device-key proof-of-possession gate (D28). For a device-bound session (the
 // token carries an RFC 7800 cnf.jkt), every request must present a fresh,
 // single-use proof that the caller still holds the bound hardware key: the
@@ -294,6 +303,8 @@ app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
 app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
+app.use('/api/sdn', authMiddleware(['ciso']), require('./routes/gd-sdn'));
+app.use('/api/sase', authMiddleware(['ciso']), require('./routes/gd-sase'));
 app.use('/api/backup-schedules', authMiddleware(['ciso']), require('./routes/gd-backup-schedules'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
@@ -3889,6 +3900,84 @@ function runGdRegression(db) {
     if (row.sql.indexOf("'scheduled'") === -1) throw new Error("backups.type CHECK missing 'scheduled'");
     if (row.sql.indexOf('daily-auto') !== -1) throw new Error("backups.type CHECK still names 'daily-auto'");
     return 'type CHECK names scheduled, not daily-auto';
+  });
+
+  // ── SDN mode (6) ────────────────────────────────────────────────────────
+  record('sdn_mode', 'SDN mode/admission/fail-safe modules load', () => {
+    const mode = require('./services/gd-sdn-mode');
+    const adm = require('./services/gd-sdn-admission');
+    const fs = require('./services/gd-sdn-fail-safe');
+    if (typeof mode.getNetworkMap !== 'function' || typeof mode.getPosture !== 'function') throw new Error('gd-sdn-mode missing exports');
+    if (typeof adm.sdnAdmission !== 'function') throw new Error('gd-sdn-admission missing sdnAdmission');
+    if (typeof fs.sdnFailSafe !== 'function') throw new Error('gd-sdn-fail-safe missing sdnFailSafe');
+    return 'mode + admission + fail-safe loaded';
+  });
+  record('sdn_mode', 'gd_sdn_network_map present; orphan gd_sdn_segments gone', () => {
+    const tabs = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('gd_sdn_network_map', 'gd_sdn_segments')").all().map((r) => r.name);
+    if (tabs.indexOf('gd_sdn_network_map') === -1) throw new Error('gd_sdn_network_map missing');
+    if (tabs.indexOf('gd_sdn_segments') !== -1) throw new Error('orphan gd_sdn_segments still present');
+    return 'network_map present, segments orphan dropped';
+  });
+  record('sdn_mode', 'permitted-segment IP matcher (IPv4 exact + CIDR)', () => {
+    const adm = require('./services/gd-sdn-admission');
+    if (adm._ipMatchesEntry('10.0.0.5', '10.0.0.0/24') !== true) throw new Error('in-segment IP not matched');
+    if (adm._ipMatchesEntry('10.0.1.5', '10.0.0.0/24') !== false) throw new Error('out-of-segment IP matched');
+    if (adm._ipMatchesEntry('1.2.3.4', '1.2.3.4') !== true) throw new Error('exact IPv4 not matched');
+    return 'in-segment admits, out-of-segment refuses';
+  });
+  record('sdn_mode', 'posture read returns a latch flag', () => {
+    const mode = require('./services/gd-sdn-mode');
+    const p = mode.getPosture(db, { recentLimit: 5 });
+    if (!p || typeof p.degraded !== 'boolean') throw new Error('getPosture did not return a degraded flag');
+    return 'posture degraded=' + p.degraded;
+  });
+  record('sdn_mode', 'SDN route mounts', () => {
+    if (typeof require('./routes/gd-sdn') !== 'function') throw new Error('gd-sdn route not a router');
+    return 'router loadable';
+  });
+  record('sdn_mode', 'read-only tailoring: no controller events / no integration_id', () => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='gd_sdn_posture_events'").get();
+    if (!row || !row.sql) throw new Error('gd_sdn_posture_events DDL not found');
+    const sql = row.sql;
+    if (sql.indexOf('probe') !== -1 || sql.indexOf('topology_read') !== -1 || sql.indexOf('segmentation_read') !== -1) throw new Error('controller event types present (drifted toward controller model)');
+    const cols = db.prepare('PRAGMA table_info(gd_sdn_posture_events)').all().map((c) => c.name);
+    if (cols.indexOf('integration_id') !== -1) throw new Error('integration_id present (drifted toward controller model)');
+    return 'admission-scoped, no controller integration surface';
+  });
+
+  // ── SASE mode (5) ───────────────────────────────────────────────────────
+  record('sase_mode', 'SASE mode/admission/fail-safe modules load', () => {
+    const mode = require('./services/gd-sase-mode');
+    const adm = require('./services/gd-sase-admission');
+    const fs = require('./services/gd-sase-fail-safe');
+    if (typeof mode.getSaseConfig !== 'function' || typeof mode.getPosture !== 'function') throw new Error('gd-sase-mode missing exports');
+    if (typeof adm.saseAdmission !== 'function') throw new Error('gd-sase-admission missing saseAdmission');
+    if (typeof fs.saseFailSafe !== 'function') throw new Error('gd-sase-fail-safe missing saseFailSafe');
+    return 'mode + admission + fail-safe loaded';
+  });
+  record('sase_mode', 'gd_sase_posture_events present; orphan gd_sase_posture_state gone', () => {
+    const tabs = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('gd_sase_posture_events', 'gd_sase_posture_state')").all().map((r) => r.name);
+    if (tabs.indexOf('gd_sase_posture_events') === -1) throw new Error('gd_sase_posture_events missing');
+    if (tabs.indexOf('gd_sase_posture_state') !== -1) throw new Error('orphan gd_sase_posture_state still present');
+    return 'posture_events present, posture_state orphan dropped';
+  });
+  record('sase_mode', 'connector-source normalization (dedup + shape)', () => {
+    const mode = require('./services/gd-sase-mode');
+    const out = mode.normalizeConnectorSources(['10.0.0.0/24', '10.0.0.0/24', 'FD00::/8']);
+    if (out.length !== 2 || out[0] !== '10.0.0.0/24' || out[1] !== 'fd00::/8') throw new Error('normalization wrong: ' + JSON.stringify(out));
+    let bad = null; try { mode.normalizeConnectorSources(['bad!!']); } catch (e) { bad = e.code; }
+    if (bad !== 'INVALID_CONNECTOR_SOURCES') throw new Error('bad source not rejected');
+    return 'dedup + lowercase + shape enforced';
+  });
+  record('sase_mode', 'posture read returns a latch flag', () => {
+    const mode = require('./services/gd-sase-mode');
+    const p = mode.getPosture(db, { recentLimit: 5 });
+    if (!p || typeof p.degraded !== 'boolean') throw new Error('getPosture did not return a degraded flag');
+    return 'posture degraded=' + p.degraded;
+  });
+  record('sase_mode', 'SASE route mounts', () => {
+    if (typeof require('./routes/gd-sase') !== 'function') throw new Error('gd-sase route not a router');
+    return 'router loadable';
   });
 
   // ── Audit chain (1) ────────────────────────────────────────────────────
