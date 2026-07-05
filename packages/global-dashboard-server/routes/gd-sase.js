@@ -22,7 +22,7 @@
 const router = require('express').Router();
 const { getDb } = require('../db-init');
 const { appendGdAuditEntry } = require('../services/gd-audit-chain');
-const saseMode = require('./gd-sase-mode');
+const saseMode = require('../services/gd-sase-mode');
 
 const VALID_PROVIDERS = ['zscaler', 'netskope', 'palo_alto_prisma', 'cato', 'cloudflare', 'fortinet'];
 
