@@ -53,6 +53,10 @@ const crypto = require('crypto');
 
 let cachedKek = null;
 let fallbackWarned = false;
+// Cloud Mode latch: once the boot flips this (in cloud mode, before any Tier-1
+// operation), the GD_JWT_SECRET KEK fallback is refused -- only a dedicated
+// GD_ENCRYPTION_KEY from the cloud secret store is accepted (fail-closed).
+let cloudKekRequired = false;
 
 function deriveKek() {
   if (cachedKek) return cachedKek;
@@ -66,6 +70,16 @@ function deriveKek() {
     }
     cachedKek = Buffer.from(explicit, 'hex');
     return cachedKek;
+  }
+
+  // Cloud Mode: the Tier-1 KEK must be a dedicated GD_ENCRYPTION_KEY sourced from
+  // the cloud secret store. On a confidential VM the whole security model is the
+  // sealed instance, so Tier-1 data must never be keyed off the JWT secret --
+  // refuse the fallback fail-closed rather than silently weakening the KEK.
+  if (cloudKekRequired) {
+    throw new Error(
+      'Cloud Mode requires a dedicated GD_ENCRYPTION_KEY (32-byte hex) sourced from the cloud secret store; the GD_JWT_SECRET KEK fallback is refused on a confidential VM (fail-closed). Generate with `openssl rand -hex 32` and provide it via the cloud secret store.',
+    );
   }
 
   const jwtSecret = process.env.GD_JWT_SECRET;
@@ -127,13 +141,25 @@ function decryptConfig(envelope) {
   return JSON.parse(plaintext.toString('utf8'));
 }
 
+// Called by the GD boot in Cloud Mode, before any Tier-1 operation: from now on
+// the GD_JWT_SECRET KEK fallback is refused and only a dedicated GD_ENCRYPTION_KEY
+// is accepted. Clears any cached KEK so the rule applies even if a KEK was already
+// derived earlier in boot (a JWT-derived KEK is discarded and re-derived under the
+// cloud rule, which then fails closed if GD_ENCRYPTION_KEY is absent).
+function requireCloudKek() {
+  cloudKekRequired = true;
+  cachedKek = null;
+}
+
 function _resetKekCache() {
   cachedKek = null;
   fallbackWarned = false;
+  cloudKekRequired = false;
 }
 
 module.exports = {
   encryptConfig,
   decryptConfig,
   _resetKekCache,
+  requireCloudKek,
 };

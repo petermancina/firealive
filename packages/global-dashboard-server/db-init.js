@@ -2086,11 +2086,10 @@ function initDb() {
       CREATE TABLE IF NOT EXISTS cloud_packages (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
         provider TEXT NOT NULL
-          CHECK (provider IN ('aws', 'azure', 'gcp', 'hetzner', 'ovhcloud', 'exoscale')),
+          CHECK (provider IN ('aws', 'azure', 'gcp')),
         iac_tool TEXT NOT NULL
           CHECK (iac_tool IN (
-            'terraform', 'pulumi', 'cloudformation', 'docker-compose',
-            'docker-manifest', 'kubernetes', 'helm', 'bicep', 'gcp-dm'
+            'terraform', 'pulumi', 'cloudformation', 'bicep', 'gcp-dm'
           )),
         generated_at TEXT NOT NULL DEFAULT (datetime('now')),
         generated_by INTEGER NOT NULL REFERENCES users(id),
@@ -2112,6 +2111,67 @@ function initDb() {
       CREATE INDEX IF NOT EXISTS idx_gd_cloud_packages_generated_at
         ON cloud_packages (generated_at);
     `);
+
+    // B6c PR-5: tighten cloud_packages CHECK to confidential-VM-only formats.
+    // The monolithic cloud-iac-bundle that emitted container formats + extra
+    // providers is deleted; the modular generator only produces confidential-VM
+    // formats (aws/azure/gcp x terraform/pulumi/cloudformation/bicep/gcp-dm). The
+    // CREATE above already carries the tightened CHECK for fresh installs; an
+    // existing install with the wide (bundle-era) CHECK is rebuilt here, and any
+    // non-conforming rows (container / extra-provider bundles) are dropped.
+    const cloudPkgRow = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cloud_packages'")
+      .get();
+    if (cloudPkgRow && cloudPkgRow.sql
+        && (cloudPkgRow.sql.indexOf('hetzner') !== -1 || cloudPkgRow.sql.indexOf('docker-compose') !== -1)) {
+      console.log('cloud_packages migration (B6c PR-5): tightening CHECK to confidential-VM-only formats');
+      db.pragma('foreign_keys = OFF');
+      try {
+        const tightenCloudPkg = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE cloud_packages_new (
+              id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+              provider TEXT NOT NULL
+                CHECK (provider IN ('aws', 'azure', 'gcp')),
+              iac_tool TEXT NOT NULL
+                CHECK (iac_tool IN (
+                  'terraform', 'pulumi', 'cloudformation', 'bicep', 'gcp-dm'
+                )),
+              generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              generated_by INTEGER NOT NULL REFERENCES users(id),
+              bundle_dir_path TEXT NOT NULL,
+              bundle_archive_path TEXT NOT NULL,
+              manifest_sha256 TEXT NOT NULL,
+              sbom_path TEXT NOT NULL,
+              sbom_sha256 TEXT NOT NULL,
+              signature_path TEXT NOT NULL,
+              signature_sha256 TEXT NOT NULL,
+              signing_key_id TEXT NOT NULL REFERENCES cloud_iac_signing_keys(id),
+              install_snapshot_json TEXT NOT NULL,
+              size_bytes INTEGER NOT NULL
+            );
+          `);
+          const cols = db
+            .prepare("PRAGMA table_info(cloud_packages)")
+            .all()
+            .map((c) => '"' + c.name + '"')
+            .join(', ');
+          db.exec(
+            'INSERT INTO cloud_packages_new (' + cols + ') SELECT ' + cols + ' FROM cloud_packages'
+            + " WHERE provider IN ('aws', 'azure', 'gcp')"
+            + " AND iac_tool IN ('terraform', 'pulumi', 'cloudformation', 'bicep', 'gcp-dm')"
+          );
+          db.exec('DROP TABLE cloud_packages');
+          db.exec('ALTER TABLE cloud_packages_new RENAME TO cloud_packages');
+          db.exec('CREATE INDEX IF NOT EXISTS idx_gd_cloud_packages_provider_tool ON cloud_packages (provider, iac_tool)');
+          db.exec('CREATE INDEX IF NOT EXISTS idx_gd_cloud_packages_generated_at ON cloud_packages (generated_at)');
+        });
+        tightenCloudPkg();
+        console.log('cloud_packages migration (B6c PR-5): CHECK tightened; non-conforming rows dropped; indexes rebuilt');
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS cicd_configs (

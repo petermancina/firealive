@@ -25,7 +25,6 @@ const gdDeviceKey = require('./services/gd-device-key');
 const gdPop = require('./services/gd-pop');
 const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
-const cloudIacBundle = require('./services/cloud-iac-bundle');
 const cicdBundle = require('./services/cicd-bundle');
 const forensicExport = require('./services/forensic-export');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
@@ -305,6 +304,7 @@ app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-
 app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
 app.use('/api/sdn', authMiddleware(['ciso']), require('./routes/gd-sdn'));
 app.use('/api/sase', authMiddleware(['ciso']), require('./routes/gd-sase'));
+app.use('/api/cloud', authMiddleware(['ciso']), require('./routes/gd-cloud'));
 app.use('/api/backup-schedules', authMiddleware(['ciso']), require('./routes/gd-backup-schedules'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
@@ -4467,6 +4467,78 @@ function runGdRegression(db) {
     return 'router + gd_migration_bundles table accessible';
   });
 
+  // B6c PR-5: Cloud Mode -- confidential-VM attestation + modular cloud-IaC.
+  record('cloud_attestation', 'verifiers + orchestrator + metadata + mode + mitigations load', () => {
+    const sev = require('./services/gd-attestation-sev-snp');
+    const tdx = require('./services/gd-attestation-tdx');
+    const att = require('./services/gd-cloud-attestation');
+    const meta = require('./services/gd-cloud-metadata');
+    const mode = require('./services/gd-cloud-mode');
+    const mit = require('./services/gd-guest-mitigations');
+    if (!sev || !tdx) throw new Error('attestation verifiers not loadable');
+    if (typeof att.verifyAttestation !== 'function') throw new Error('gd-cloud-attestation.verifyAttestation missing');
+    if (typeof meta.readCloudMetadata !== 'function') throw new Error('gd-cloud-metadata.readCloudMetadata missing');
+    if (typeof mode.getCloudConfig !== 'function' || typeof mode.pinMeasurement !== 'function') throw new Error('gd-cloud-mode api missing');
+    if (typeof mit.evaluateMitigations !== 'function') throw new Error('gd-guest-mitigations.evaluateMitigations missing');
+    return 'sev-snp + tdx verifiers, orchestrator, metadata, mode, mitigations all load';
+  });
+  record('cloud_attestation', 'KEK gate refuses JWT-secret fallback in cloud mode (fail-closed)', () => {
+    const encPath = require.resolve('./services/gd-encryption');
+    const origMod = require.cache[encPath];
+    const savedKek = process.env.GD_ENCRYPTION_KEY;
+    const savedJwt = process.env.GD_JWT_SECRET;
+    try {
+      delete require.cache[encPath];
+      delete process.env.GD_ENCRYPTION_KEY;
+      process.env.GD_JWT_SECRET = 'x'.repeat(32);
+      const freshEnc = require('./services/gd-encryption');
+      if (typeof freshEnc.requireCloudKek !== 'function') throw new Error('gd-encryption.requireCloudKek missing');
+      freshEnc.requireCloudKek();
+      let threw = false;
+      try { freshEnc.encryptConfig({ probe: 1 }); } catch (e) { threw = true; }
+      if (!threw) throw new Error('cloud-mode KEK did not fail closed without GD_ENCRYPTION_KEY');
+      return 'requireCloudKek() forces GD_ENCRYPTION_KEY; JWT-secret fallback refused';
+    } finally {
+      if (savedKek === undefined) delete process.env.GD_ENCRYPTION_KEY; else process.env.GD_ENCRYPTION_KEY = savedKek;
+      if (savedJwt === undefined) delete process.env.GD_JWT_SECRET; else process.env.GD_JWT_SECRET = savedJwt;
+      if (origMod) require.cache[encPath] = origMod; else delete require.cache[encPath];
+    }
+  });
+  record('cloud_iac', 'IaC generator + 5 templates load; matrix confidential-VM-only', () => {
+    const gen = require('./services/gd-cloud-iac-generator');
+    const matrix = gen.PROVIDER_TOOL_MATRIX || {};
+    const provs = Object.keys(matrix).sort().join(',');
+    if (provs !== 'aws,azure,gcp') throw new Error('provider matrix not confidential-VM-only: ' + provs);
+    const allTools = Object.keys(matrix).reduce((acc, k) => acc.concat(matrix[k]), []);
+    const banned = ['docker-compose', 'docker-manifest', 'kubernetes', 'helm'];
+    for (let i = 0; i < allTools.length; i += 1) {
+      if (banned.indexOf(allTools[i]) !== -1) throw new Error('container iac_tool in matrix: ' + allTools[i]);
+    }
+    const templates = ['terraform', 'pulumi', 'bicep', 'cloudformation', 'gcp-dm'];
+    for (let j = 0; j < templates.length; j += 1) {
+      const mod = require('./services/gd-cloud-iac-templates/' + templates[j]);
+      if (typeof mod.render !== 'function') throw new Error('template ' + templates[j] + ' missing render()');
+    }
+    return 'generator loads; matrix aws/azure/gcp x confidential-VM formats; 5 templates render()';
+  });
+  record('cloud_iac', 'monolithic cloud-iac-bundle removed', () => {
+    if (fs.existsSync(path.join(__dirname, 'services', 'cloud-iac-bundle.js'))) throw new Error('cloud-iac-bundle.js still present');
+    return 'services/cloud-iac-bundle.js is gone';
+  });
+  record('cloud_iac', 'cloud_packages CHECK admits no container / extra-provider values', () => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='cloud_packages'").get();
+    if (!row || !row.sql) throw new Error('cloud_packages table missing');
+    const banned = ['hetzner', 'ovhcloud', 'exoscale', 'docker-compose', 'docker-manifest', 'kubernetes', 'helm'];
+    for (let i = 0; i < banned.length; i += 1) {
+      if (row.sql.indexOf(banned[i]) !== -1) throw new Error('cloud_packages CHECK still admits: ' + banned[i]);
+    }
+    return 'cloud_packages CHECK is confidential-VM-only (no container / extra-provider values)';
+  });
+  record('cloud_iac', 'cloud route mounts', () => {
+    if (typeof require('./routes/gd-cloud') !== 'function') throw new Error('gd-cloud route not a router');
+    return 'routes/gd-cloud is a mountable router';
+  });
+
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;
   const skipped = tests.filter(t => t.status === 'skip').length;
@@ -4499,160 +4571,6 @@ app.post('/api/regression-test', authMiddleware(['ciso']), (req, res) => {
 
 // ── Cloud & IaC Generator (R3k C30, Sub-phase 6) ─────────────────────────────
 //
-// GD-side equivalent of MC's /api/cloud/* surface. Generates deploy-
-// ment bundles for FIREALIVE GD-server itself (image
-// ghcr.io/petermancina/firealive-gd, port 4001) rather than for MC-
-// server. Consumes cloud-iac-bundle.js (R3k C29) which collapses
-// MC's R3k C9-C22 services into one consolidated module.
-//
-//   GET  /api/cloud/providers                provider x iac_tool matrix
-//                                            + secrets mapping
-//   POST /api/cloud/package                  generate bundle. Body:
-//                                            {provider, iac_tool}.
-//                                            Returns full result manifest.
-//   GET  /api/cloud/packages                 list past bundles (100 most
-//                                            recent, reverse-chrono).
-//   GET  /api/cloud/packages/:id             fetch row + parsed snapshot.
-//   GET  /api/cloud/packages/:id/download    stream bundle.tar.gz.
-//   GET  /api/cloud/packages/:id/public-key  retrieve the verifier PEM
-//                                            for the signing key that
-//                                            produced this bundle's sig.
-//   POST /api/cloud/signing-keys/rotate      operator-triggered rotation.
-//
-// AUTH: ciso for write ops (generate, rotate); ciso + vp for reads.
-// 503 mapped from SyftNotInstalledError / CosignNotInstalledError so
-// the operator sees a clear install-command message when the
-// supply-chain binaries are missing.
-
-app.get('/api/cloud/providers', authMiddleware(['ciso', 'vp']), (req, res) => {
-  res.json({
-    provider_tool_matrix: cloudIacBundle.PROVIDER_TOOL_MATRIX,
-    secrets_mapping: cloudIacBundle.SECRETS_MAPPING_BY_PROVIDER,
-    deploy_shape: cloudIacBundle.GD_DEPLOY_SHAPE,
-  });
-});
-
-app.post('/api/cloud/package', authMiddleware(['ciso']), (req, res) => {
-  const { provider, iac_tool } = req.body || {};
-  if (!provider || !iac_tool) {
-    return res.status(400).json({
-      error: 'provider and iac_tool are required',
-      providers: Object.keys(cloudIacBundle.PROVIDER_TOOL_MATRIX),
-    });
-  }
-  let db;
-  try {
-    db = getDb();
-    const result = cloudIacBundle.generatePackage(db, provider, iac_tool, { userId: req.user.id });
-    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CLOUD_PACKAGE_GENERATED', detail: `id=${result.id} provider=${provider} iac_tool=${iac_tool}`, severity: 'info' });
-    db.close();
-    res.json(result);
-  } catch (err) {
-    if (db) { try { db.close(); } catch (_) { /* ignore */ } }
-    if (err.name === 'SyftNotInstalledError' || err.code === 'SYFT_NOT_INSTALLED') {
-      return res.status(503).json({ error: 'Syft not installed', message: err.message, code: 'SYFT_NOT_INSTALLED' });
-    }
-    if (err.name === 'CosignNotInstalledError' || err.code === 'COSIGN_NOT_INSTALLED') {
-      return res.status(503).json({ error: 'Cosign not installed', message: err.message, code: 'COSIGN_NOT_INSTALLED' });
-    }
-    if (/^invalid (provider|\(provider)/.test(err.message)) {
-      return res.status(400).json({ error: err.message });
-    }
-    try {
-      const adb = getDb();
-      appendGdAuditEntry(adb, { userId: req.user.id, eventType: 'CLOUD_PACKAGE_FAILED', detail: `provider=${provider} iac_tool=${iac_tool} error=${(err.message || '').slice(0, 200)}`, severity: 'warning' });
-      adb.close();
-    } catch (_) { /* swallow audit failure */ }
-    res.status(500).json({ error: 'Cloud package generation failed', message: err.message });
-  }
-});
-
-app.get('/api/cloud/packages', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const db = getDb();
-    const rows = db
-      .prepare(
-        `SELECT id, provider, iac_tool, generated_at, generated_by,
-                bundle_archive_path, manifest_sha256, sbom_sha256,
-                signature_sha256, signing_key_id, size_bytes
-           FROM cloud_packages
-           ORDER BY generated_at DESC
-           LIMIT 100`,
-      )
-      .all();
-    db.close();
-    res.json({ packages: rows });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to list cloud packages', message: e.message });
-  }
-});
-
-app.get('/api/cloud/packages/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const db = getDb();
-    const row = db.prepare('SELECT * FROM cloud_packages WHERE id = ?').get(req.params.id);
-    db.close();
-    if (!row) return res.status(404).json({ error: 'package not found' });
-    let snapshot = null;
-    try { snapshot = JSON.parse(row.install_snapshot_json); } catch (e) { /* leave null */ }
-    res.json({ ...row, install_snapshot: snapshot });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to fetch package', message: e.message });
-  }
-});
-
-app.get('/api/cloud/packages/:id/download', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const db = getDb();
-    const row = db.prepare('SELECT bundle_archive_path, provider, iac_tool FROM cloud_packages WHERE id = ?').get(req.params.id);
-    db.close();
-    if (!row) return res.status(404).json({ error: 'package not found' });
-    const fs = require('fs');
-    if (!fs.existsSync(row.bundle_archive_path)) {
-      return res.status(410).json({ error: 'bundle archive no longer on disk' });
-    }
-    res.setHeader('Content-Disposition', `attachment; filename="firealive-gd-${row.provider}-${row.iac_tool}-${req.params.id}.tar.gz"`);
-    res.setHeader('Content-Type', 'application/gzip');
-    fs.createReadStream(row.bundle_archive_path).pipe(res);
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to download package', message: e.message });
-  }
-});
-
-app.get('/api/cloud/packages/:id/public-key', authMiddleware(['ciso', 'vp']), (req, res) => {
-  try {
-    const db = getDb();
-    const row = db.prepare('SELECT signing_key_id FROM cloud_packages WHERE id = ?').get(req.params.id);
-    if (!row) { db.close(); return res.status(404).json({ error: 'package not found' }); }
-    const key = cloudIacBundle.signingKeys.getVerificationKey(db, row.signing_key_id);
-    db.close();
-    if (!key) return res.status(404).json({ error: 'signing key not found' });
-    res.json({
-      key_id: key.id,
-      public_key_pem: key.publicKeyPem,
-      algorithm: key.algorithm,
-      status: key.status,
-      fingerprint_sha256: key.publicKeyFingerprint,
-      created_at: key.createdAt,
-      rotated_at: key.rotatedAt,
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to fetch public key', message: e.message });
-  }
-});
-
-app.post('/api/cloud/signing-keys/rotate', authMiddleware(['ciso']), (req, res) => {
-  try {
-    const db = getDb();
-    const result = cloudIacBundle.signingKeys.rotateActiveKey(db);
-    appendGdAuditEntry(db, { userId: req.user.id, eventType: 'CLOUD_SIGNING_KEY_ROTATED', detail: `oldId=${result.oldId || '(none)'} newId=${result.newId}`, severity: 'info' });
-    db.close();
-    res.json({ rotated: true, ...result });
-  } catch (e) {
-    res.status(500).json({ error: 'Signing key rotation failed', message: e.message });
-  }
-});
-
 // ── CI/CD Pipeline Generator (R3k C32, Sub-phase 6) ──────────────────────────
 //
 // GD-side equivalent of MC's /api/cicd/* surface (R3k C24). Generates
@@ -6327,6 +6245,113 @@ try {
   } finally {
     modeDb.close();
   }
+
+    // B6c PR-5: confidential-VM boot gate. On a cloud substrate, confidential
+    // computing is REQUIRED and fully attested before the GD serves any request:
+    // requireCloudKek() seals the Tier-1 KEK to the cloud secret store (no JWT-
+    // secret fallback); verifyAttestation fetches a signed SEV-SNP / TDX report and
+    // verifies its vendor chain, the nonce, and the configured TCB floor (fail
+    // closed if not verified); guest CPU side-channel mitigations are checked; spot
+    // / autoscaled / ephemeral-fleet instances are refused; single-tenant hardware
+    // is required when configured; the launch measurement is pinned on first use
+    // and required to match on every boot; the result is published on
+    // app.locals.gdCloudAttestation for the pre-auth gate; and periodic re-
+    // attestation is scheduled. Any error halts the GD -- it never silently
+    // downgrades. The pre-auth gd-vm-attestation gate refuses /api/ until this gate
+    // publishes a verified result, which covers the async-boot window.
+    if (app.locals.gdDeploymentMode && app.locals.gdDeploymentMode.substrateCloud === true) {
+      try {
+        require('./services/gd-encryption').requireCloudKek();
+        const cloudAttestation = require('./services/gd-cloud-attestation');
+        const cloudMetadata = require('./services/gd-cloud-metadata');
+        const cloudMode = require('./services/gd-cloud-mode');
+        const guestMitigations = require('./services/gd-guest-mitigations');
+
+        let cloudConfig = null;
+        const cfgDb = getDb();
+        try { cloudConfig = cloudMode.getCloudConfig(cfgDb); } finally { cfgDb.close(); }
+
+        const att = cloudAttestation.verifyAttestation({ tcbFloor: cloudConfig ? cloudConfig.tcbFloor : undefined });
+        if (!att.verified) {
+          console.error('A cloud substrate requires confidential computing, but the attestation report did not verify; refusing to start (fail-closed)', att.reason);
+          process.exit(1);
+        }
+        console.log('Confidential computing attested (tech ' + att.tech + ', platformValidationPending=' + att.platformValidationPending + ')');
+
+        const mit = guestMitigations.evaluateMitigations();
+        if (!mit.ok) {
+          console.error('Guest CPU cross-tenant side-channel mitigations are not satisfied; refusing to start (fail-closed): ' + guestMitigations.summarize(mit));
+          process.exit(1);
+        }
+        console.log('Guest CPU side-channel mitigations verified: ' + guestMitigations.summarize(mit));
+
+        const meta = await cloudMetadata.readCloudMetadata();
+        if (meta && (meta.spot === true || meta.autoscaled === true)) {
+          console.error('A cloud substrate refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed): ' + JSON.stringify({ spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider }));
+          process.exit(1);
+        }
+        if (cloudConfig && cloudConfig.requireDedicatedTenancy === true && !cloudMetadata.isDedicatedTenancy(meta)) {
+          console.error('requireDedicatedTenancy is set but the instance is not on single-tenant hardware; refusing to start (fail-closed): ' + JSON.stringify({ tenancy: meta ? meta.tenancy : null, provider: meta ? meta.provider : null }));
+          process.exit(1);
+        }
+
+        const recDb = getDb();
+        try {
+          if (att.measurement) {
+            const pin = cloudMode.pinMeasurement(recDb, att.measurement);
+            if (!pin.matched) {
+              console.error('The confidential-VM launch measurement does not match the pinned value; refusing to start (fail-closed, measurement TOFU) (tech ' + att.tech + ')');
+              process.exit(1);
+            }
+            if (pin.firstPin) console.log('Confidential-VM launch measurement pinned (trust-on-first-use) (tech ' + att.tech + ')');
+          }
+          cloudMode.recordAttestation(recDb, { tech: att.tech, tcb: att.tcb || att.tcbSvn || null, measurement: att.measurement || null, verified: att.verified, platformValidationPending: att.platformValidationPending });
+        } finally {
+          recDb.close();
+        }
+
+        app.locals.gdCloudAttestation = { verified: true, tech: att.tech, platformValidationPending: att.platformValidationPending, reason: att.reason, measurement: att.measurement || null };
+        app.locals.gdCloudMetadata = meta || null;
+        console.log('Confidential-VM substrate attested and sealed: ' + JSON.stringify({ mode: app.locals.gdDeploymentMode.mode, provider: meta ? meta.provider : null }));
+
+        const REATTEST_INTERVAL_MS = 60 * 60 * 1000;
+        const reattestTimer = setInterval(function () {
+          try {
+            const rdb = getDb();
+            try {
+              const cfg = cloudMode.getCloudConfig(rdb);
+              const re = cloudAttestation.verifyAttestation({ tcbFloor: cfg ? cfg.tcbFloor : undefined });
+              let ok = re.verified;
+              let reason = re.reason;
+              if (ok && re.measurement) {
+                const pin = cloudMode.pinMeasurement(rdb, re.measurement);
+                if (!pin.matched) { ok = false; reason = 'launch measurement changed since pin'; }
+              }
+              if (ok) {
+                const m2 = guestMitigations.evaluateMitigations();
+                if (!m2.ok) { ok = false; reason = 'guest mitigations regressed: ' + guestMitigations.summarize(m2); }
+              }
+              if (ok) {
+                cloudMode.recordAttestation(rdb, { tech: re.tech, tcb: re.tcb || re.tcbSvn || null, measurement: re.measurement || null, verified: true, platformValidationPending: re.platformValidationPending });
+                app.locals.gdCloudAttestation = { verified: true, tech: re.tech, platformValidationPending: re.platformValidationPending, reason: re.reason, measurement: re.measurement || null };
+              } else {
+                console.error('Periodic confidential-VM re-attestation failed; marking attestation unverified (pre-auth gate will refuse): ' + reason);
+                app.locals.gdCloudAttestation = { verified: false, tech: re.tech || att.tech, reason: reason };
+              }
+            } finally {
+              rdb.close();
+            }
+          } catch (reErr) {
+            console.error('Periodic confidential-VM re-attestation errored; marking attestation unverified: ' + reErr.message);
+            app.locals.gdCloudAttestation = { verified: false, reason: 're-attestation error: ' + reErr.message };
+          }
+        }, REATTEST_INTERVAL_MS);
+        if (reattestTimer && typeof reattestTimer.unref === 'function') reattestTimer.unref();
+      } catch (cloudBootErr) {
+        console.error('Confidential-VM boot gate failed; refusing to start (fail-closed, no downgrade): ' + cloudBootErr.message);
+        process.exit(1);
+      }
+    }
 })();
 
 // B5g: re-seal any legacy plaintext forensic export artifacts at
