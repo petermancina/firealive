@@ -31,7 +31,7 @@
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1076.0",
     "@aws-sdk/client-s3": "^3.1080.0",
-    "@aws-sdk/lib-storage": "^3.1076.0",
+    "@aws-sdk/lib-storage": "^3.1080.0",
     "@azure/identity": "^4.0.0",
     "@azure/keyvault-keys": "^4.10.2",
     "@azure/storage-blob": "^12.33.0",
