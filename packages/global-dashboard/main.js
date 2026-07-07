@@ -99,11 +99,11 @@ ipcMain.handle('deployment:getLocalMode', async () => {
   }
 });
 
-ipcMain.handle('deployment:setLocalMode', async (_e, { mode } = {}) => {
+ipcMain.handle('deployment:setLocalMode', async (_e, { mode, substrate } = {}) => {
   try {
     const lm = localMode();
-    lm.setMode(mode);
-    return { ok: true, mode: lm.getMode() };
+    lm.setMode(mode, substrate);
+    return { ok: true, mode: lm.getMode(), substrate: (typeof lm.getSubstrate === 'function' ? lm.getSubstrate() : null) };
   } catch (e) {
     return { error: e.message };
   }

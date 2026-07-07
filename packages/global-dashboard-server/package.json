@@ -1,8 +1,8 @@
 {
   "name": "firealive-global-dashboard-server",
-  "version": "1.0.80",
-  "fuseCounter": 73,
-  "buildId": "20260702.1",
+  "version": "1.0.81",
+  "fuseCounter": 74,
+  "buildId": "20260706.1",
   "description": "FireAlive Global Dashboard — Independent Backend Server",
   "main": "index.js",
   "scripts": {

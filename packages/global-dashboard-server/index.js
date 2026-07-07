@@ -301,10 +301,11 @@ app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-
 app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
+app.use('/api/restore-approvals', authMiddleware(['ciso']), require('./routes/gd-restore-approvals'));
 app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
 app.use('/api/sdn', authMiddleware(['ciso']), require('./routes/gd-sdn'));
 app.use('/api/sase', authMiddleware(['ciso']), require('./routes/gd-sase'));
-app.use('/api/cloud', authMiddleware(['ciso']), require('./routes/gd-cloud'));
+app.use('/api/cloud', authMiddleware(['ciso', 'vp']), require('./routes/gd-cloud'));
 app.use('/api/backup-schedules', authMiddleware(['ciso']), require('./routes/gd-backup-schedules'));
 
 // ── Health Check ─────────────────────────────────────────────────────────────
@@ -4434,6 +4435,12 @@ function runGdRegression(db) {
     db.prepare('SELECT COUNT(*) AS c FROM restore_approvals').get();
     return 'router + restore_approvals table accessible';
   });
+  record('restore-approvals', 'restore-approvals route + service lifecycle', () => {
+    if (typeof require('./routes/gd-restore-approvals') !== 'function') throw new Error('gd-restore-approvals route not a router');
+    const ra = require('./services/gd-restore-approvals');
+    if (typeof ra.approve !== 'function' || typeof ra.deny !== 'function' || typeof ra.listPending !== 'function') throw new Error('gd-restore-approvals service missing approve/deny/listPending');
+    return 'router + service approve/deny/listPending present';
+  });
   record('external-restore', 'service + allow-list + five adapters loadable', () => {
     const svc = require('./services/gd-external-restore');
     const al = require('./services/gd-external-restore-allow-list');
@@ -4537,6 +4544,23 @@ function runGdRegression(db) {
   record('cloud_iac', 'cloud route mounts', () => {
     if (typeof require('./routes/gd-cloud') !== 'function') throw new Error('gd-cloud route not a router');
     return 'routes/gd-cloud is a mountable router';
+  });
+  record('cloud_iac', 'cloud write endpoints are ciso-only (vp is read-oversight)', () => {
+    const cloudRoute = require('./routes/gd-cloud');
+    if (typeof cloudRoute.requireCiso !== 'function') throw new Error('gd-cloud requireCiso step-up missing');
+    const call = (role) => {
+      let code = 200; let nexted = false;
+      const res = { status: (c) => { code = c; return res; }, json: () => res };
+      cloudRoute.requireCiso(role ? { user: { role: role } } : {}, res, () => { nexted = true; });
+      return { code: code, nexted: nexted };
+    };
+    const vp = call('vp');
+    if (vp.nexted || vp.code !== 403) throw new Error('vp was not rejected by requireCiso');
+    const ciso = call('ciso');
+    if (!ciso.nexted) throw new Error('ciso was rejected by requireCiso');
+    const anon = call(null);
+    if (anon.nexted || anon.code !== 403) throw new Error('missing-user was not rejected');
+    return 'requireCiso rejects vp + missing-user (403), admits ciso; writes stay ciso-only';
   });
 
   const passed = tests.filter(t => t.status === 'pass').length;

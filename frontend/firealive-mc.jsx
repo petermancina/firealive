@@ -2739,12 +2739,7 @@ function ManagementConsole() {
     Promise.all([
       api.get("/api/backup-schedules"),
       api.get("/api/backup-schedules/presets"),
-      // R3l C59: fetch backup_destinations so the Add Schedule form's
-      // destination_filter summary panel can show which destinations
-      // match the operator's current filter. Failures here are
-      // non-fatal — the form still works without the panel.
-      api.get("/api/backup-destinations").catch(() => null),
-    ]).then(([sRes, pRes, dRes])=>{
+    ]).then(([sRes, pRes])=>{
       if (sRes?.error) {
         setSchedulesError(sRes.message || "Could not load schedules.");
         setSchedules([]);
@@ -2756,15 +2751,10 @@ function ManagementConsole() {
       } else {
         setPresets(Array.isArray(pRes?.presets) ? pRes.presets : []);
       }
-      // R3l C59: destinations list — keep only enabled ones; the summary
-      // panel surfaces "X of Y enabled destinations match this filter"
-      const destList = (dRes && Array.isArray(dRes.destinations)) ? dRes.destinations : [];
-      setEnabledDestinations(destList.filter(d => d.enabled === 1 || d.enabled === true));
     }).catch(()=>{
       setSchedulesError("Could not reach the server.");
       setSchedules([]);
       setPresets([]);
-      setEnabledDestinations([]);
     }).finally(()=>setSchedulesLoading(false));
   }, [tab]);
 
@@ -2829,7 +2819,6 @@ function ManagementConsole() {
       retention_days: preset.min_retention_days,
       encrypted: preset.required_encryption === "AES-256",
       frequency: preset.recommended_frequency || prev.frequency,
-      destination: preset.recommended_destination_type || prev.destination,
     }));
   };
 
@@ -2845,14 +2834,6 @@ function ManagementConsole() {
   const submitNewSchedule = async (forceQueue = false) => {
     setAddBusy(true);
     setAddError(null);
-    // R3l C59: parse destination_filter from the comma-separated text
-    // input into an array of trimmed non-empty tags. Empty string and
-    // "no tags entered" both become null so the schema column receives
-    // NULL ("no filter" / push to all enabled destinations).
-    const filterTags = (newSchedule.destination_filter || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
     const body = {
       name: newSchedule.name || null,
       type: newSchedule.type,
@@ -2861,7 +2842,6 @@ function ManagementConsole() {
       day_of_week: newSchedule.frequency === "weekly" ? newSchedule.day_of_week : null,
       day_of_month: newSchedule.frequency === "monthly" ? newSchedule.day_of_month : null,
       interval_minutes: newSchedule.frequency === "interval" ? newSchedule.interval_minutes : null,
-      destination: newSchedule.destination,
       retention_days: typeof newSchedule.retention_days === "string"
         ? (parseInt(newSchedule.retention_days, 10) || 0)
         : newSchedule.retention_days,
@@ -2873,7 +2853,6 @@ function ManagementConsole() {
       // precise error code on invalid values (see C57 routes change).
       backup_kind: newSchedule.backup_kind,
       backup_strategy: newSchedule.backup_strategy,
-      destination_filter: filterTags.length > 0 ? filterTags : null,
       // R3l C74: max_chain_depth as positive integer or null. Empty
       // string from the form means null (= use global default).
       max_chain_depth: (()=>{
@@ -2906,11 +2885,11 @@ function ManagementConsole() {
       // Reset form.
       setNewSchedule({
         name: "", type: "full", frequency: "daily", time: "02:00",
-        day_of_week: 0, day_of_month: 1, interval_minutes: 60, destination: "local",
+        day_of_week: 0, day_of_month: 1, interval_minutes: 60,
         retention_days: 30, encrypted: true, regulatory_preset_id: null,
         active: true,
         // R3l C59: reset Workstream 3 fields to safe defaults
-        backup_kind: "full-suite", backup_strategy: "full", destination_filter: "",
+        backup_kind: "full-suite", backup_strategy: "full",
         // R3l C74: reset max_chain_depth back to empty (= use global)
         max_chain_depth: "",
       });
@@ -3374,11 +3353,11 @@ function ManagementConsole() {
   // the form.
   const [newSchedule, setNewSchedule] = useState({
     name: "", type: "full", frequency: "daily", time: "02:00",
-    day_of_week: 0, day_of_month: 1, interval_minutes: 60, destination: "local",
+    day_of_week: 0, day_of_month: 1, interval_minutes: 60,
     retention_days: 30, encrypted: true, regulatory_preset_id: null,
     active: true,
     // R3l C59: Workstream 3 schema fields with safe defaults
-    backup_kind: "full-suite", backup_strategy: "full", destination_filter: "",
+    backup_kind: "full-suite", backup_strategy: "full",
     // R3l C74: max_chain_depth empty string means "use global default
     // (system_meta.max_chain_depth, seeded to 100 by the C73 migration)".
     // Operators who want per-schedule control enter a positive integer
@@ -3386,21 +3365,6 @@ function ManagementConsole() {
     // out-of-bounds values with INVALID_MAX_CHAIN_DEPTH.
     max_chain_depth: "",
   });
-  // R3l C59: enabled backup_destinations cache for the destination_filter
-  // summary panel. Fetched lazily when the Backup Schedules tab opens
-  // (same effect that loads schedules + presets) so an operator can see
-  // which destinations their filter actually matches before saving.
-  const [enabledDestinations, setEnabledDestinations] = useState([]);
-  // R3l C60: quick-form state for the Backup & Storage Routing tab's
-  // inline "Backup Scheduler" card. Pre-R3l, that card's selectors were
-  // cosmetic and the Save button posted hardcoded values; C60 adds three
-  // wired selectors so kind/strategy/filter chosen here actually reach
-  // the server. Existing legacy fields on that card remain cosmetic for
-  // backward-compat; the Add Schedule form in the Backup Schedules tab
-  // (C59) is the canonical full-fidelity entry point.
-  const [qkBackupKind, setQkBackupKind] = useState("full-suite");
-  const [qkBackupStrategy, setQkBackupStrategy] = useState("full");
-  const [qkDestinationFilter, setQkDestinationFilter] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState(null);
   const [overlapConfirm, setOverlapConfirm] = useState(null);
@@ -6184,47 +6148,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
         {/* BACKUP */}
         {tab==="backup"&&(<div>
           <L>Backup, Recovery & Storage Routing</L>
-          <Card style={{marginBottom:16,borderColor:C.i+"30"}}>
-            <div style={{fontSize:13,fontWeight:600,color:C.i,marginBottom:10}}>Backup Scheduler</div>
-            <Sel label="Type"><option>Full</option><option>DB only</option><option>Configs</option><option>Audit</option></Sel>
-            <Sel label="Interval"><option>Every 4hr</option><option>Every 8hr</option><option>Daily 02:00</option><option>Weekly Sun</option></Sel>
-            <Sel label="Retention"><option>7 days</option><option>30 days</option><option>90 days</option><option>1 year</option></Sel>
-            <Input label="Destination" placeholder="smb://backup/"/>
-            {/* R3l C60: kind/strategy/filter wired through the qk* state declared above. */}
-            <Sel label="Data scope" value={qkBackupKind} onChange={e=>setQkBackupKind(e.target.value)}>
-              <option value="full-suite">Full suite (configs + audit + keys + DB)</option>
-              <option value="single-db">Database file only</option>
-            </Sel>
-            <Sel label="Strategy" value={qkBackupStrategy} onChange={e=>setQkBackupStrategy(e.target.value)}>
-              <option value="full">Full</option>
-              <option value="incremental">Incremental (WAL-based)</option>
-              <option value="differential">Differential (since anchor)</option>
-              <option value="snapshot">Snapshot (point-in-time)</option>
-            </Sel>
-            <Input label="Destination filter (comma-separated tags; empty = all)" value={qkDestinationFilter} onChange={e=>setQkDestinationFilter(e.target.value)} placeholder="e.g. offsite, encrypted"/>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}>
-              <input type="checkbox" defaultChecked/>
-              <M style={{color:C.t}}>Encrypt (AES-256)</M>
-            </label>
-            <Btn primary style={{marginTop:8}} onClick={()=>{
-              const tags = (qkDestinationFilter || "").split(",").map(s=>s.trim()).filter(Boolean);
-              api.post("/api/backup-schedules", {
-                name: "Backup tab quick-save",
-                type: "full",
-                frequency: "daily",
-                time: "02:00",
-                destination: "local",
-                retention_days: 30,
-                encrypted: true,
-                active: true,
-                // R3l C60: kind/strategy/filter parity with the full Add Schedule form
-                backup_kind: qkBackupKind,
-                backup_strategy: qkBackupStrategy,
-                destination_filter: tags.length > 0 ? tags : null,
-              }).then(r=>addA("BK","Backup schedule saved (id="+(r&&r.schedule?r.schedule.id:"?")+")"))
-                .catch(e=>addA("BK_FAIL",e.message||"Failed to save schedule"));
-            }}>Save</Btn>
-          </Card>
           <StorageDestinations addA={addA} />
           <StorageRouting addA={addA} />
           <Card style={{marginBottom:16,borderColor:C.a+"30"}}>
@@ -9449,7 +9372,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                 <div key={s.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
                   <div style={{flex:1}}>
                     <M style={{color:C.t,fontWeight:500}}>{s.name || "Schedule #"+s.id} · {s.type || "full"} · {freq}{day?" ("+day+")":""}{s.time?" at "+s.time:""}</M>
-                    <M style={{color:C.td,display:"block"}}>Destination: {s.destination || "—"} · Retention: {s.retention || "—"} · {s.encrypted?"Encrypted":"⚠ UNENCRYPTED"}{presetTag}</M>
+                    <M style={{color:C.td,display:"block"}}>Retention: {s.retention || "—"} · {s.encrypted?"Encrypted":"⚠ UNENCRYPTED"}{presetTag}</M>
                     <M style={{color:C.td,display:"block",fontSize:11}}>Next run: {nextRunDisplay} · Last run: <span style={{color:statusColor}}>{lastRunDisplay}{s.last_status?" ("+s.last_status+")":""}</span>{s.last_error?" · Error: "+s.last_error:""}</M>
                   </div>
                   <div style={{display:"flex",gap:6,alignItems:"center"}}>
@@ -9511,10 +9434,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {newSchedule.frequency==="interval" && (
               <M style={{color:C.td,fontSize:11,display:"block",marginTop:6}}>Backs up every {newSchedule.interval_minutes||"N"} minute{newSchedule.interval_minutes===1?"":"s"} -- your recovery point objective is at most {newSchedule.interval_minutes||"N"} minute{newSchedule.interval_minutes===1?"":"s"}. Range 15-1440 min; for an RPO under an hour, pair a short interval with the Incremental backup type plus a periodic Full.</M>
             )}
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginTop:8}}>
-              <Sel label="Destination" value={newSchedule.destination} onChange={e=>setNewSchedule(p=>({...p,destination:e.target.value}))}>
-                <option value="local">Local storage</option><option value="s3">AWS S3</option><option value="azure_blob">Azure Blob</option><option value="gcs">GCS</option><option value="nfs">NFS share</option><option value="offsite">Offsite (generic)</option><option value="air_gapped">Air-gapped</option><option value="tape">Tape (LTO)</option>
-              </Sel>
+            <div style={{marginTop:8}}>
               <Sel label={"Regulatory preset"+(activePreset?" — "+activePreset.framework_citation:"")} value={newSchedule.regulatory_preset_id || ""} onChange={e=>applyPresetDefaults(e.target.value || null)}>
                 <option value="">None (full flexibility)</option>
                 {presets.map(p=>(<option key={p.id} value={p.id}>{p.name} — {p.description}</option>))}
@@ -9550,54 +9470,6 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   <option value="snapshot">Snapshot (point-in-time)</option>
                 </Sel>
               </div>
-              <div style={{marginTop:8}}>
-                <Input
-                  label="Destination filter — required tags (comma-separated; empty = all enabled destinations)"
-                  value={newSchedule.destination_filter}
-                  onChange={e=>setNewSchedule(p=>({...p,destination_filter:e.target.value}))}
-                  placeholder="e.g. offsite, encrypted"
-                />
-              </div>
-              {(() => {
-                // Summary panel: previews which destinations the current
-                // filter selects. Mirrors the server-side matcher logic
-                // in services/backup-push.js destinationMatchesFilter so
-                // the operator sees push outcome before saving.
-                const filterTags = (newSchedule.destination_filter || "").split(",").map(s=>s.trim()).filter(Boolean);
-                const matchedDests = enabledDestinations.filter(d => {
-                  if (filterTags.length === 0) return true;
-                  let tags = [];
-                  if (d.tags) {
-                    try {
-                      const parsed = JSON.parse(d.tags);
-                      if (Array.isArray(parsed)) tags = parsed.filter(t => typeof t === "string");
-                    } catch (_) { /* malformed JSON → no tags */ }
-                  }
-                  return filterTags.some(f => tags.includes(f));
-                });
-                const enabledCount = enabledDestinations.length;
-                const matchedCount = matchedDests.length;
-                const noFilter = filterTags.length === 0;
-                const noMatch = !noFilter && matchedCount === 0;
-                return (
-                  <div style={{marginTop:8,padding:"8px 10px",background:noMatch?"#3a1e1e":"#1A1F25",borderRadius:4,fontSize:11}}>
-                    <div style={{color:noMatch?C.d:C.tm,marginBottom:(matchedCount>0&&!noFilter)?4:0,lineHeight:1.5}}>
-                      {enabledCount === 0
-                        ? "No enabled backup destinations are configured. Backups will stay on-host only regardless of filter."
-                        : noFilter
-                          ? `No filter active — backups push to all ${enabledCount} enabled destination${enabledCount===1?"":"s"}.`
-                          : noMatch
-                            ? `Filter [${filterTags.join(", ")}] excludes all ${enabledCount} enabled destinations. Backups will stay on-host only. Tag a destination or expand the filter to enable remote pushes.`
-                            : `Filter [${filterTags.join(", ")}] matches ${matchedCount} of ${enabledCount} enabled destination${enabledCount===1?"":"s"}.`}
-                    </div>
-                    {matchedCount > 0 && !noFilter && (
-                      <div style={{color:C.t,fontSize:11}}>
-                        Matching: {matchedDests.map(d => d.name).join(", ")}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
             </div>
             {/* R3l C74: chain-depth override input. Sits between the data-
                 scope-and-strategy sub-card and the encrypt checkbox so it

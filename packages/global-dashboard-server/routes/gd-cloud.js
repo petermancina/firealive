@@ -14,10 +14,13 @@
 //   GET  /api/cloud/packages/:id/public-key  retrieve the verifier PEM
 //   POST /api/cloud/signing-keys/rotate      operator-triggered key rotation
 //
-// Auth is applied at the mount in index.js (authMiddleware). The GD is JWT-only on
-// this surface (the api_key path is MC->GD metrics push, not user auth), so no
-// per-handler api-key gate is needed. Error mapping matches the SOC-grade Sigstore-
-// or-503 / SBOM-or-503 contract: Syft/Cosign missing -> 503, bad pair -> 400.
+// Auth: the mount in index.js applies authMiddleware(['ciso','vp']) -- the oversight
+// role 'vp' may READ (list/fetch/download/verify), matching how the GD gates every
+// comparable security-operational surface (audit logs, compliance, cloud-vuln, cicd
+// configs). The two WRITE endpoints (generate package, rotate signing key) step up to
+// ciso-only via requireCiso below -- separation of duties: oversight reads, ciso acts.
+// The GD is JWT-only here (the api_key path is MC->GD metrics push, not user auth).
+// Error mapping matches the SOC-grade contract: Syft/Cosign missing -> 503, bad -> 400.
 //
 // ASCII only; no template literals in stored strings.
 
@@ -46,6 +49,17 @@ function auditLog(userId, eventType, detail, severity) {
   }
 }
 
+// -- Write step-up: ciso only ------------------------------------------------
+// The mount admits ciso + vp; vp is read-only oversight. Package generation and
+// signing-key rotation are write actions restricted to ciso. req.user.role is set
+// by the mount-level authMiddleware.
+function requireCiso(req, res, next) {
+  if (!req.user || req.user.role !== 'ciso') {
+    return res.status(403).json({ error: 'ciso role required for this action' });
+  }
+  return next();
+}
+
 // -- GET /providers -----------------------------------------------------------
 
 router.get('/providers', (req, res) => {
@@ -57,7 +71,7 @@ router.get('/providers', (req, res) => {
 
 // -- POST /package ------------------------------------------------------------
 
-router.post('/package', (req, res) => {
+router.post('/package', requireCiso, (req, res) => {
   const body = req.body || {};
   const provider = body.provider;
   const iacTool = body.iac_tool;
@@ -176,7 +190,7 @@ router.get('/packages/:id/public-key', (req, res) => {
 
 // -- POST /signing-keys/rotate ------------------------------------------------
 
-router.post('/signing-keys/rotate', (req, res) => {
+router.post('/signing-keys/rotate', requireCiso, (req, res) => {
   const db = getDb();
   try {
     const result = cloudIacSigningKeys.rotateActiveKey(db);
@@ -191,3 +205,4 @@ router.post('/signing-keys/rotate', (req, res) => {
 });
 
 module.exports = router;
+module.exports.requireCiso = requireCiso;
