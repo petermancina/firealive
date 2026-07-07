@@ -4501,14 +4501,66 @@ function runGdRegression(db) {
       const freshEnc = require('./services/gd-encryption');
       if (typeof freshEnc.requireCloudKek !== 'function') throw new Error('gd-encryption.requireCloudKek missing');
       freshEnc.requireCloudKek();
+      freshEnc._resetKekCache();
       let threw = false;
       try { freshEnc.encryptConfig({ probe: 1 }); } catch (e) { threw = true; }
       if (!threw) throw new Error('cloud-mode KEK did not fail closed without GD_ENCRYPTION_KEY');
-      return 'requireCloudKek() forces GD_ENCRYPTION_KEY; JWT-secret fallback refused';
+      return 'Tier-1 KEK fails closed in cloud mode without a hardware-sealed GD_ENCRYPTION_KEY (raw/JWT refused, universal under D26)';
     } finally {
       if (savedKek === undefined) delete process.env.GD_ENCRYPTION_KEY; else process.env.GD_ENCRYPTION_KEY = savedKek;
       if (savedJwt === undefined) delete process.env.GD_JWT_SECRET; else process.env.GD_JWT_SECRET = savedJwt;
       if (origMod) require.cache[encPath] = origMod; else delete require.cache[encPath];
+    }
+  });
+  record('gd_tier1_kek', 'recovery code round-trips to the identical KEK', () => {
+    const kek = require('./services/gd-tier1-kek');
+    const raw = kek.generateKek();
+    const code = kek.makeRecoveryCode(raw, 'regression-passphrase-xyz');
+    const back = kek.recoverKekFromCode(code, 'regression-passphrase-xyz');
+    if (Buffer.compare(raw, back) !== 0) throw new Error('recovered KEK differs from the original');
+    if (code.indexOf(kek.RECOVERY_PREFIX) !== 0) throw new Error('recovery code prefix wrong');
+    return 'makeRecoveryCode -> recoverKekFromCode yields the identical 32-byte KEK';
+  });
+  record('gd_tier1_kek', 'a raw GD_ENCRYPTION_KEY is refused (no fallback)', () => {
+    const kek = require('./services/gd-tier1-kek');
+    const savedKek = process.env.GD_ENCRYPTION_KEY;
+    try {
+      kek._resetCacheForTests();
+      process.env.GD_ENCRYPTION_KEY = 'a'.repeat(64);
+      let threw = false;
+      try { kek.resolveTier1Kek(); } catch (e) { threw = true; }
+      if (!threw) throw new Error('a raw hex GD_ENCRYPTION_KEY was accepted (must be refused)');
+      return 'resolveTier1Kek refuses a raw key -- only a hardware-sealed wrapper is accepted';
+    } finally {
+      kek._resetCacheForTests();
+      if (savedKek === undefined) delete process.env.GD_ENCRYPTION_KEY; else process.env.GD_ENCRYPTION_KEY = savedKek;
+    }
+  });
+  record('gd_tier1_kek', 'fails closed when GD_ENCRYPTION_KEY is unset', () => {
+    const kek = require('./services/gd-tier1-kek');
+    const savedKek = process.env.GD_ENCRYPTION_KEY;
+    try {
+      kek._resetCacheForTests();
+      delete process.env.GD_ENCRYPTION_KEY;
+      let threw = false;
+      try { kek.resolveTier1Kek(); } catch (e) { threw = true; }
+      if (!threw) throw new Error('resolveTier1Kek did not fail closed with GD_ENCRYPTION_KEY unset');
+      return 'resolveTier1Kek fails closed when GD_ENCRYPTION_KEY is unset';
+    } finally {
+      kek._resetCacheForTests();
+      if (savedKek === undefined) delete process.env.GD_ENCRYPTION_KEY; else process.env.GD_ENCRYPTION_KEY = savedKek;
+    }
+  });
+  record('gd_tier1_kek', 'installRuntimeKek installs the HA-promotion KEK', () => {
+    const kek = require('./services/gd-tier1-kek');
+    try {
+      kek._resetCacheForTests();
+      const shared = Buffer.alloc(32, 9);
+      kek.installRuntimeKek(shared);
+      if (Buffer.compare(kek.resolveTier1Kek(), shared) !== 0) throw new Error('resolveTier1Kek did not return the installed KEK');
+      return 'installRuntimeKek caches the shared KEK for the promoted node (fail-closed on non-32-byte)';
+    } finally {
+      kek._resetCacheForTests();
     }
   });
   record('cloud_iac', 'IaC generator + 5 templates load; matrix confidential-VM-only', () => {
@@ -6272,8 +6324,9 @@ try {
 
     // B6c PR-5: confidential-VM boot gate. On a cloud substrate, confidential
     // computing is REQUIRED and fully attested before the GD serves any request:
-    // requireCloudKek() seals the Tier-1 KEK to the cloud secret store (no JWT-
-    // secret fallback); verifyAttestation fetches a signed SEV-SNP / TDX report and
+    // the GD Tier-1 KEK is hardware-sealed to the confidential VM's vTPM
+    // (decision D26; gd-tier1-kek), so no raw key is ever placed in the
+    // environment; verifyAttestation fetches a signed SEV-SNP / TDX report and
     // verifies its vendor chain, the nonce, and the configured TCB floor (fail
     // closed if not verified); guest CPU side-channel mitigations are checked; spot
     // / autoscaled / ephemeral-fleet instances are refused; single-tenant hardware
@@ -6285,7 +6338,6 @@ try {
     // publishes a verified result, which covers the async-boot window.
     if (app.locals.gdDeploymentMode && app.locals.gdDeploymentMode.substrateCloud === true) {
       try {
-        require('./services/gd-encryption').requireCloudKek();
         const cloudAttestation = require('./services/gd-cloud-attestation');
         const cloudMetadata = require('./services/gd-cloud-metadata');
         const cloudMode = require('./services/gd-cloud-mode');

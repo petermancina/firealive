@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL DASHBOARD — Tier-1 Encryption Helper (R3k C28)
+// FIREALIVE GLOBAL DASHBOARD — Tier-1 Encryption Helper (R3k C28; hardware-sealed KEK, B6d)
 //
 // AES-256-GCM wrap/unwrap of small JSON config blobs (signing-key
 // private PEMs, etc). Parallel to MC's server/services/encryption.js
@@ -11,29 +11,22 @@
 // Per the locked R3k Sub-phase 6 design decision: the GD-server has
 // its OWN signing keys and its OWN wrapping KEK distinct from the
 // MC's. This file's encrypt/decrypt functions are the floor that
-// distinction sits on. An MC compromise that leaks
-// TIER1_ENCRYPTION_KEY does not pivot into a GD compromise; an
-// operator who replaces GD's KEK does not need to re-key any MC.
+// distinction sits on. An MC compromise that leaks the MC's KEK does
+// not pivot into a GD compromise; an operator who replaces GD's KEK
+// does not need to re-key any MC.
 //
-// KEY MATERIAL
-// ============
+// KEY MATERIAL (hardware-sealed, B6d)
+// ===================================
 //
-// Env var (in priority order):
-//
-//   GD_ENCRYPTION_KEY      preferred; 32-byte hex (64 chars) Key-
-//                          Encryption-Key supplied by deployment.
-//
-//   GD_JWT_SECRET          fallback; hashed via SHA-256 to derive a
-//                          32-byte key. Less ideal — couples
-//                          encryption-at-rest to the JWT signing
-//                          secret — but keeps the GD operable on
-//                          installs that haven't yet provisioned a
-//                          dedicated GD_ENCRYPTION_KEY. Emits a
-//                          warning to the console at first use.
-//
-//   (none)                 deriveKey throws. The GD will not start
-//                          a Sub-phase-6 generator route without a
-//                          usable KEK source.
+// The Tier-1 KEK is resolved from gd-tier1-kek -- the single hardware-
+// sealed resolver, the GD twin of the regional server's tier1-kek.
+// Under decision D26 the KEK is hardware-sealed and fail-closed for
+// EVERY deployment mode: GD_ENCRYPTION_KEY carries an opaque wrapper
+// that only the GD host TPM 2.0 / Secure Enclave can unseal. A raw key
+// is REFUSED and the former GD_JWT_SECRET-derived fallback is retired
+// -- no weak KEK source survives on the GD (parity with the MC). See
+// gd-tier1-kek.js for provisioning, the one-time recovery code, and the
+// HA-promotion install path.
 //
 // FORMAT
 // ======
@@ -50,53 +43,15 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
+const gdTier1Kek = require('./gd-tier1-kek');
 
-let cachedKek = null;
-let fallbackWarned = false;
-// Cloud Mode latch: once the boot flips this (in cloud mode, before any Tier-1
-// operation), the GD_JWT_SECRET KEK fallback is refused -- only a dedicated
-// GD_ENCRYPTION_KEY from the cloud secret store is accepted (fail-closed).
-let cloudKekRequired = false;
-
+// Resolve the GD Tier-1 KEK from the hardware-sealed resolver. gd-tier1-kek reads
+// GD_ENCRYPTION_KEY (a hardware-sealed wrapper), unseals it on this GD hardware,
+// and caches it -- refusing a raw key and the retired GD_JWT_SECRET fallback
+// (fail-closed, every mode). At GD HA promotion the promoted passive installs the
+// shared KEK there, so this resolves the shared key from that point on.
 function deriveKek() {
-  if (cachedKek) return cachedKek;
-
-  const explicit = process.env.GD_ENCRYPTION_KEY;
-  if (explicit) {
-    if (!/^[0-9a-fA-F]{64}$/.test(explicit)) {
-      throw new Error(
-        'GD_ENCRYPTION_KEY is set but is not exactly 64 hex chars (32 bytes). Generate with `openssl rand -hex 32` and set as GD_ENCRYPTION_KEY in the GD-server environment.',
-      );
-    }
-    cachedKek = Buffer.from(explicit, 'hex');
-    return cachedKek;
-  }
-
-  // Cloud Mode: the Tier-1 KEK must be a dedicated GD_ENCRYPTION_KEY sourced from
-  // the cloud secret store. On a confidential VM the whole security model is the
-  // sealed instance, so Tier-1 data must never be keyed off the JWT secret --
-  // refuse the fallback fail-closed rather than silently weakening the KEK.
-  if (cloudKekRequired) {
-    throw new Error(
-      'Cloud Mode requires a dedicated GD_ENCRYPTION_KEY (32-byte hex) sourced from the cloud secret store; the GD_JWT_SECRET KEK fallback is refused on a confidential VM (fail-closed). Generate with `openssl rand -hex 32` and provide it via the cloud secret store.',
-    );
-  }
-
-  const jwtSecret = process.env.GD_JWT_SECRET;
-  if (jwtSecret) {
-    if (!fallbackWarned) {
-      console.warn(
-        '[gd-encryption] WARNING: GD_ENCRYPTION_KEY not set; deriving Tier-1 KEK from GD_JWT_SECRET via SHA-256. For SOC-grade posture, set a dedicated 32-byte GD_ENCRYPTION_KEY (openssl rand -hex 32) and migrate any wrapped configs before retiring this fallback.',
-      );
-      fallbackWarned = true;
-    }
-    cachedKek = crypto.createHash('sha256').update(jwtSecret).digest();
-    return cachedKek;
-  }
-
-  throw new Error(
-    'gd-encryption: neither GD_ENCRYPTION_KEY nor GD_JWT_SECRET is set. The GD-server cannot wrap or unwrap Tier-1 configs (signing keys, etc.) without a KEK source.',
-  );
+  return gdTier1Kek.resolveTier1Kek();
 }
 
 function encryptConfig(obj) {
@@ -141,20 +96,19 @@ function decryptConfig(envelope) {
   return JSON.parse(plaintext.toString('utf8'));
 }
 
-// Called by the GD boot in Cloud Mode, before any Tier-1 operation: from now on
-// the GD_JWT_SECRET KEK fallback is refused and only a dedicated GD_ENCRYPTION_KEY
-// is accepted. Clears any cached KEK so the rule applies even if a KEK was already
-// derived earlier in boot (a JWT-derived KEK is discarded and re-derived under the
-// cloud rule, which then fails closed if GD_ENCRYPTION_KEY is absent).
-function requireCloudKek() {
-  cloudKekRequired = true;
-  cachedKek = null;
-}
+// Retained for the Cloud Mode boot caller. Under B6d the Tier-1 KEK is hardware-
+// sealed and fail-closed for EVERY mode (gd-tier1-kek refuses a raw key and the
+// GD_JWT_SECRET fallback), so Cloud Mode no longer needs a separate KEK rule --
+// hardware-sealing is universal and strictly stronger than the former secret-store
+// requirement. This is now a no-op; the caller is retired in the Cloud Mode
+// KEK-gate commit.
+function requireCloudKek() {}
 
+// Clear the resolved-KEK cache. The cache now lives in gd-tier1-kek (not this
+// module), so delegate -- callers and tests that re-require gd-encryption no
+// longer reset the KEK by that alone.
 function _resetKekCache() {
-  cachedKek = null;
-  fallbackWarned = false;
-  cloudKekRequired = false;
+  gdTier1Kek._resetCacheForTests();
 }
 
 module.exports = {
