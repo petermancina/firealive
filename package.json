@@ -1,0 +1,69 @@
+{
+  "name": "firealive",
+  "version": "1.0.81",
+  "fuseCounter": 74,
+  "buildId": "20260706.1",
+  "description": "FireAlive — SOC Analyst Wellbeing Platform. Burnout-aware ticket routing, peer skill-share, post-incident wellness, skills assessments, and team health monitoring with privacy-first architecture.",
+  "main": "server/index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/petermancina/firealive.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "AGPL-3.0-or-later",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/petermancina/firealive/issues"
+  },
+  "homepage": "https://github.com/petermancina/firealive#readme",
+  "overrides": {
+    "uuid": "^11.1.1",
+    "protobufjs": "^7.6.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-kms": "^3.1076.0",
+    "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/lib-storage": "^3.1076.0",
+    "@azure/identity": "^4.0.0",
+    "@azure/keyvault-keys": "^4.10.2",
+    "@azure/storage-blob": "^12.33.0",
+    "@google-cloud/kms": "^5.5.1",
+    "@google-cloud/storage": "^7.21.0",
+    "@mongodb-js/zstd": "^7.0.0",
+    "@simplewebauthn/server": "^13.3.1",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.11.1",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "docx": "^9.7.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "ldapts": "^8.1.8",
+    "node-cron": "^4.5.0",
+    "node-llama-cpp": "^3.18.1",
+    "nodemailer": "^9.0.1",
+    "pdfkit": "^0.19.1",
+    "qrcode": "^1.5.4",
+    "ssh2": "^1.15.0",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
+    "undici": "^7.28.0",
+    "winston": "^3.19.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "electron": "^42.5.1",
+    "electron-builder": "^26.15.3"
+  }
+}
