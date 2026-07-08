@@ -10,10 +10,15 @@
 // the jobs when the active-schedule signature changes (create / update / delete)
 // and drives the per-minute ticks that interval schedules ride on.
 //
-// HA note: the Regional scheduler fronts every fire with mayRunWriteJob() (the
-// sole-writer lease). The GD runs single-instance today, so mayRunWriteJob()
-// here is an always-allow placeholder. The sole-writer lease is a later GD
-// phase -- this is a deliberate no-op, not a weakened guard.
+// This is the GD's general scheduler: the backup jobs above plus the B6d HA
+// cadence. mayRunWriteJob() is now the real sole-writer gate (gd-ha-lease via
+// haWriteAuthority) -- it fails OPEN for a standalone (unpaired) node so single-
+// instance deployments are unaffected, and suppresses autonomous write work only
+// on a positively-confirmed paired passive (or an active that has lost its lease).
+// The HA ticks (heartbeat, replication shipping, lag) run on setInterval at
+// config-driven periods in haTimers, re-registerable via reloadHaJobs() on a live
+// /ha/config change. The failure-detection tick and the heartbeat's self-fence /
+// role-reconcile reactions land with gd-ha-failover (PR-3).
 
 const cron = require('node-cron');
 const { getDb } = require('../db-init');
@@ -23,9 +28,13 @@ const gdBackupScheduler = {
   backupJobs: new Map(),
   reloadJob: null,
   _lastBackupSignature: '',
+  haTimers: [],
+  _haHeartbeatBusy: false,
+  _haShipBusy: false,
 
   start() {
     this._registerBackupJobs();
+    this._registerHaJobs();
     this.reloadJob = cron.schedule('* * * * *', () => {
       if (!this.mayRunWriteJob()) return;
       this._maybeReloadBackupJobs();
@@ -41,11 +50,60 @@ const gdBackupScheduler = {
       try { this.reloadJob.stop(); } catch (_e) { /* idempotent */ }
       this.reloadJob = null;
     }
+    try { this.haTimers.forEach((t) => clearInterval(t)); } catch (_e) { /* idempotent */ }
+    this.haTimers = [];
   },
 
-  // Always-allow placeholder; see the HA note at the top of this file.
-  mayRunWriteJob() {
+  // Returns null (a no-op signal) unless HA is enabled in config AND a peer is
+  // paired; otherwise returns { cfg, role }. Any error (HA tables absent on a
+  // fresh DB) is treated as "not configured" so the HA jobs stay silent.
+  haReplicationContext(db) {
+    try {
+      const row = db.prepare("SELECT value FROM config WHERE key = 'ha_config'").get();
+      if (!row) return null;
+      let cfg;
+      try { cfg = JSON.parse(row.value) || {}; } catch (parseErr) { return null; }
+      if (!cfg.enabled) return null;
+      const peer = db.prepare("SELECT status FROM gd_ha_peer WHERE status = 'paired' LIMIT 1").get();
+      if (!peer) return null;
+      const node = db.prepare("SELECT role FROM gd_ha_node WHERE id = 'self'").get() || { role: 'standalone' };
+      return { cfg: cfg, role: node.role };
+    } catch (ctxErr) {
+      return null;
+    }
+  },
+
+  // Single source of truth for "may this node write?", shared with the data layer
+  // (gd-ha-lease.assertWriteAuthority/iAmActive). Suppress autonomous scheduler
+  // work ONLY when positively confirmed a paired passive; fail OPEN on every other
+  // case (standalone, HA tables absent, probe error) so single-instance
+  // deployments are never affected. A paired active is allowed only while it still
+  // holds a valid current-epoch lease.
+  haWriteAuthority(db) {
+    const ctx = this.haReplicationContext(db);
+    if (!ctx) return true;
+    if (ctx.role === 'passive') return false;
+    if (ctx.role === 'active') {
+      try { return require('./gd-ha-lease').iAmActive(db); } catch (leaseErr) { return true; }
+    }
     return true;
+  },
+
+  // Self-contained write-authority probe for the cron callbacks: opens a short-
+  // lived connection, asks haWriteAuthority, closes it. A passive (or an active
+  // that has lost its lease) returns false and the calling job skips. Fails OPEN
+  // on any error: a probe failure must never freeze a single-instance node's jobs.
+  mayRunWriteJob() {
+    try {
+      const db = getDb();
+      try {
+        return this.haWriteAuthority(db);
+      } finally {
+        db.close();
+      }
+    } catch (probeErr) {
+      return true;
+    }
   },
 
   _registerBackupJobs() {
@@ -313,6 +371,123 @@ const gdBackupScheduler = {
       }
     } catch (err) {
       console.error('GD scheduler: poll-and-reload failed:', err.message);
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
+    }
+  },
+
+  // ── B6d HA cadence (heartbeat / replication ship / lag) ──────────────────
+  // setInterval ticks at config-driven periods, tracked in haTimers so
+  // reloadHaJobs() can re-register on a live /ha/config change. Each tick self-
+  // gates by role via haReplicationContext and no-ops unless HA is enabled AND
+  // paired. The passive failure-detection tick and the heartbeat's failover
+  // reactions (adopt-higher-epoch role reconcile, isolation self-fence) land with
+  // gd-ha-failover in PR-3.
+
+  _haIntervals() {
+    let cfg = {};
+    let db = null;
+    try {
+      db = getDb();
+      const row = db.prepare("SELECT value FROM config WHERE key = 'ha_config'").get();
+      if (row) { try { cfg = JSON.parse(row.value) || {}; } catch (parseErr) { cfg = {}; } }
+    } catch (readErr) {
+      cfg = {};
+    } finally {
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
+    }
+    const clamp = (v, dflt) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1) return dflt;
+      return Math.min(Math.floor(n), 3600);
+    };
+    return { heartbeatSec: clamp(cfg.heartbeatIntervalSec, 5), syncSec: clamp(cfg.syncIntervalSec, 5), lagSec: 15 };
+  },
+
+  _registerHaJobs() {
+    const iv = this._haIntervals();
+    this.haTimers.push(setInterval(() => { this._haHeartbeatTick(); }, iv.heartbeatSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haShipTick(); }, iv.syncSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haLagTick(); }, iv.lagSec * 1000));
+    console.log('GD scheduler: HA jobs registered (heartbeat ' + iv.heartbeatSec + 's, ship ' + iv.syncSec + 's, lag ' + iv.lagSec + 's)');
+  },
+
+  // Re-register the HA ticks with the current config intervals. Called from PUT
+  // /ha/config so an interval change takes effect live, no restart.
+  reloadHaJobs() {
+    try { this.haTimers.forEach((t) => clearInterval(t)); } catch (clearErr) { /* ignore */ }
+    this.haTimers = [];
+    this._registerHaJobs();
+  },
+
+  // Active only: renew this node's lease (keeping the write-authority window
+  // fresh), then deliver the heartbeat to the passive over the peer link,
+  // recording peer contact on success. (PR-3 adds here: adopt a higher epoch from
+  // the reply + reconcile role, and run the isolation self-fence.)
+  async _haHeartbeatTick() {
+    if (this._haHeartbeatBusy) return;
+    this._haHeartbeatBusy = true;
+    let db = null;
+    try {
+      db = getDb();
+      const ctx = this.haReplicationContext(db);
+      if (ctx && ctx.role === 'active') {
+        const haLease = require('./gd-ha-lease');
+        const haPeerLink = require('./gd-ha-peer-link');
+        const haLiveness = require('./gd-ha-liveness');
+        const ttl = (ctx.cfg.leaseTtlSec && ctx.cfg.leaseTtlSec > 0) ? ctx.cfg.leaseTtlSec : 30;
+        haLease.renewLease(db, ttl);
+        const localEpoch = haLease.currentEpoch(db);
+        const lease = haLease.getLease(db) || {};
+        try {
+          await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', { epoch: localEpoch, leaseExpiresAt: lease.lease_expires_at || null }, {});
+          haLiveness.recordPeerContact();
+        } catch (sendErr) {
+          // Passive unreachable this tick; not fatal (it runs its own detector in PR-3).
+        }
+      }
+    } catch (err) {
+      console.error('GD scheduler: HA heartbeat failed:', err && err.message ? err.message : err);
+    } finally {
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
+      this._haHeartbeatBusy = false;
+    }
+  },
+
+  // Active only: ship pending journal rows to the paired passive; a no-op when
+  // nothing is pending.
+  async _haShipTick() {
+    if (this._haShipBusy) return;
+    this._haShipBusy = true;
+    let db = null;
+    try {
+      db = getDb();
+      const ctx = this.haReplicationContext(db);
+      if (ctx && ctx.role === 'active') {
+        const haReplication = require('./gd-ha-replication');
+        const haPeerLink = require('./gd-ha-peer-link');
+        await haReplication.shipOnce(db, haPeerLink.peerSender(db, '/api/ha/peer/replicate'));
+      }
+    } catch (err) {
+      console.error('GD scheduler: HA replication shipping failed:', err && err.message ? err.message : err);
+    } finally {
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
+      this._haShipBusy = false;
+    }
+  },
+
+  // Refreshes gd_ha_replication_state.lag_seconds so GET /ha/status reports real
+  // lag. No-op unless HA is enabled AND paired.
+  _haLagTick() {
+    let db = null;
+    try {
+      db = getDb();
+      const ctx = this.haReplicationContext(db);
+      if (ctx) {
+        require('./gd-ha-replication').computeLag(db);
+      }
+    } catch (err) {
+      console.error('GD scheduler: HA lag update failed:', err && err.message ? err.message : err);
+    } finally {
       if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
     }
   },

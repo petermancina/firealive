@@ -104,6 +104,7 @@ const CONFIG_TABLE_KEYS = [
   'alert_routing_matrix',
   'auto_update_schedule_config',
   'data_residency_config',
+  'ha_config',
   'integration_health_probes_enabled',
   'max_chain_depth',
   'notification_config',

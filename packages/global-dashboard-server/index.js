@@ -102,6 +102,18 @@ app.use(cors({
   credentials: true,
 }));
 app.use(compression());
+
+// B6d: HA peer endpoints (mTLS peer-to-peer) + pair-init (token-gated). Mounted
+// BEFORE the global body parser and the client middleware chain (rate limit,
+// attestation/admission, PoP, config-lock, client-activity) so peer-to-peer HA
+// traffic bypasses the client-oriented gates -- its auth is the pinned mTLS cert
+// (requirePeerCert) or the one-time pairing token, not a JWT or PoP proof. Each
+// gets its own large-limit JSON parser (replication batches + baseline snapshots).
+const { requirePeerCert: gdHaRequirePeerCert } = require('./services/gd-ha-peer-link');
+const gdHaRoute = require('./routes/gd-ha');
+app.use('/api/ha/peer', gdHaRequirePeerCert(getDb), express.json({ limit: '256mb' }), gdHaRoute.peerRouter);
+app.use('/api/ha/pair-init', express.json({ limit: '10mb' }), gdHaRoute.pairInitRouter);
+
 app.use(express.json({
   limit: '10mb',
   // R3g PR3: capture the raw request body for MC signature verification.
@@ -153,6 +165,19 @@ const apiLimiter = rateLimit({
   validate: true,
 });
 app.use('/api/', apiLimiter);
+
+// B6d: HA liveness. Stamp the last real client API request so the active's
+// self-fence (gd-ha-failover.checkSelfFence) can tell whether the SOC is still
+// reaching this node. Excludes the peer control plane (/api/ha/peer/*, which is
+// peer-to-peer, not a client) and the health endpoint (load-balancer probes).
+// Bookkeeping only; never blocks a request.
+const gdHaLiveness = require('./services/gd-ha-liveness');
+app.use('/api/', (req, res, next) => {
+  if (!req.path.startsWith('/api/ha/peer') && req.path !== '/api/health') {
+    try { gdHaLiveness.recordClientRequest(); } catch (_e) { /* never block on liveness bookkeeping */ }
+  }
+  next();
+});
 
 // Request logging
 app.use((req, res, next) => {
@@ -289,6 +314,12 @@ app.use('/api/config', authMiddleware(), require('./routes/config-lock'));
 app.use('/api/self-protection', authMiddleware(['ciso', 'vp']), require('./routes/self-protection'));
 app.use('/api/malware-scanners', authMiddleware(['ciso']), require('./routes/gd-malware-scanners'));
 app.use('/api/config-baseline', authMiddleware(['ciso']), require('./routes/gd-config-baseline'));
+
+// B6d: HA operator control plane (config/status/pair/pairing-token). ciso-gated +
+// behind the config-lock chokepoint (HA config writes are lockable). Mounted AFTER
+// the /api/ha/peer + /api/ha/pair-init routers (registered early, before the body
+// parser) so those prefixes match first.
+app.use('/api/ha', authMiddleware(['ciso']), configLockChokepoint(), gdHaRoute.configRouter);
 
 // B6b: storage-destination registry + routing, data-residency policy, and v2 backup
 // control. All ciso-gated; configuration writes sit behind the config-lock chokepoint
@@ -3903,7 +3934,106 @@ function runGdRegression(db) {
     return 'type CHECK names scheduled, not daily-auto';
   });
 
-  // ── SDN mode (6) ────────────────────────────────────────────────────────
+  // -- B6d: GD High Availability (active/passive, opt-in) --------------------
+  record('gd_high_availability', 'HA schema present (5 tables + epoch-monotonic trigger)', () => {
+    const need = ['gd_ha_node', 'gd_ha_peer', 'gd_ha_lease', 'gd_ha_replication_journal', 'gd_ha_replication_state'];
+    const missing = need.filter((t) => !db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t));
+    if (missing.length) throw new Error('missing HA tables: ' + missing.join(', '));
+    if (!db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='gd_ha_lease_epoch_monotonic'").get()) {
+      throw new Error('missing trigger gd_ha_lease_epoch_monotonic');
+    }
+    return '5 tables + epoch guard present';
+  });
+  record('gd_high_availability', 'Write-authority lease API present', () => {
+    const hl = require('./services/gd-ha-lease');
+    const need = ['assertWriteAuthority', 'iAmActive', 'currentEpoch', 'renewLease', 'recordPeerHeartbeat', 'claimNextEpoch'];
+    const missing = need.filter((f) => typeof hl[f] !== 'function');
+    if (missing.length) throw new Error('gd-ha-lease missing: ' + missing.join(', '));
+    return need.length + ' functions present';
+  });
+  record('gd_high_availability', 'Write authority fails open on a standalone node', () => {
+    const hl = require('./services/gd-ha-lease');
+    const roleRow = db.prepare("SELECT role FROM gd_ha_node WHERE id='self'").get();
+    if (roleRow && roleRow.role !== 'standalone') {
+      return 'node role ' + roleRow.role + '; standalone fail-open check n/a';
+    }
+    hl.assertWriteAuthority(db); // standalone -> must return without throwing
+    return 'standalone write allowed (no throw)';
+  });
+  record('gd_high_availability', 'HA route exports three routers', () => {
+    const r = require('./routes/gd-ha');
+    for (const k of ['configRouter', 'peerRouter', 'pairInitRouter']) {
+      if (!r[k]) throw new Error('gd-ha route missing ' + k);
+    }
+    return 'configRouter + peerRouter + pairInitRouter exported';
+  });
+  record('gd_high_availability', 'Scheduler HA write-gate + tick API present', () => {
+    const { gdBackupScheduler } = require('./services/gd-backup-scheduler');
+    const need = ['haReplicationContext', 'haWriteAuthority', 'mayRunWriteJob', '_registerHaJobs', 'reloadHaJobs', '_haIntervals'];
+    const missing = need.filter((f) => typeof gdBackupScheduler[f] !== 'function');
+    if (missing.length) throw new Error('scheduler missing: ' + missing.join(', '));
+    return need.length + ' methods present';
+  });
+  record('gd_high_availability', 'Liveness tracker records + snapshots', () => {
+    const hl = require('./services/gd-ha-liveness');
+    hl.recordClientRequest();
+    hl.recordPeerContact();
+    const snap = hl.snapshot();
+    if (!snap || !Number.isFinite(Date.parse(snap.lastClientRequestAt)) || !Number.isFinite(Date.parse(snap.lastPeerContactAt))) {
+      throw new Error('liveness snapshot missing timestamps');
+    }
+    return 'records + snapshots ISO timestamps';
+  });
+  record('gd_high_availability', 'Per-mode pairing gate present (non-cloud allowed)', () => {
+    const hm = require('./services/gd-ha-modes');
+    if (typeof hm.assertModePairingAllowed !== 'function' || typeof hm.registerHaSegments !== 'function') {
+      throw new Error('gd-ha-modes API missing');
+    }
+    const mode = require('./services/gd-deployment-mode').getMode(db);
+    if (mode !== 'cloud') {
+      const r = hm.assertModePairingAllowed(db, {});
+      if (!r || r.allowed !== true) throw new Error('non-cloud pairing not allowed');
+      return mode + ' pairing allowed';
+    }
+    return 'cloud mode; attestation-gated (not exercised here)';
+  });
+  record('gd_high_availability', 'Replication apply enforces epoch fence + table allow-list', () => {
+    const Database = require('better-sqlite3');
+    const rep = require('./services/gd-ha-replication');
+    const t = new Database(':memory:');
+    try {
+      t.exec("CREATE TABLE gd_ha_lease (id TEXT PRIMARY KEY, epoch INTEGER); INSERT INTO gd_ha_lease VALUES ('current', 5);"
+        + "CREATE TABLE gd_ha_replication_state (id TEXT PRIMARY KEY, last_applied_lsn INTEGER DEFAULT 0, last_apply_at TEXT);"
+        + "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT); CREATE TABLE audit_log (id TEXT PRIMARY KEY, entry TEXT);");
+      const stale = rep.applyBatch(t, { rows: [{ lsn: 1, epoch: 3, table_name: 'users', op: 'INSERT', pk_json: '{"id":"x"}', row_json: '{"id":"x","name":"n"}' }] });
+      if (stale.ok !== false || stale.reason !== 'stale_epoch') throw new Error('stale epoch not fenced');
+      const excl = rep.applyBatch(t, { rows: [{ lsn: 2, epoch: 5, table_name: 'audit_log', op: 'INSERT', pk_json: '{"id":"a"}', row_json: '{"id":"a","entry":"x"}' }] });
+      if (excl.ok !== false || excl.reason !== 'unreplicated_table') throw new Error('excluded table not refused');
+      return 'epoch fence + allow-list enforced';
+    } finally {
+      t.close();
+    }
+  });
+  record('gd_high_availability', 'Pairing token is single-use + timing-safe', () => {
+    const Database = require('better-sqlite3');
+    const crypto = require('crypto');
+    const hp = require('./services/gd-ha-pairing');
+    const t = new Database(':memory:');
+    try {
+      t.exec("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);");
+      const token = 'gd-ha-regression-token';
+      const rec = { hash: crypto.createHash('sha256').update(token).digest('hex'), expiresAt: new Date(Date.now() + 60000).toISOString() };
+      t.prepare("INSERT INTO config (key, value) VALUES ('ha_pairing_token', ?)").run(JSON.stringify(rec));
+      if (hp.consumePairingToken(t, token) !== true) throw new Error('valid token not accepted');
+      if (hp.consumePairingToken(t, token) !== false) throw new Error('token accepted twice (not single-use)');
+      if (hp.consumePairingToken(t, 'wrong') !== false) throw new Error('wrong token accepted');
+      return 'single-use + wrong-token rejected';
+    } finally {
+      t.close();
+    }
+  });
+
+  // \u2500\u2500 SDN mode (6) ────────────────────────────────────────────────────────
   record('sdn_mode', 'SDN mode/admission/fail-safe modules load', () => {
     const mode = require('./services/gd-sdn-mode');
     const adm = require('./services/gd-sdn-admission');

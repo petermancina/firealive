@@ -2384,6 +2384,87 @@ function initDb() {
     console.error('The GD will start, but the automated update-detection feature cannot record check results: the auto_update_check_log table may be missing, so the App Updates tab last-check display and the update-available banner have no data source. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.');
   }
 
+  // ── B6d: opt-in active/passive High Availability schema ─────────────────────
+  // The GD twin of the regional server's ha_* tables (server/db/init.js). Five
+  // tables back warm active/passive HA: gd_ha_node (this node's role and its
+  // anchor-signed, hardware-sealed X25519 wrap keys plus the pre-wrapped promotion
+  // KEK), gd_ha_lease (the sole-writer lease + monotonic epoch), gd_ha_peer (the
+  // paired peer's pinned anchor and mTLS cert), gd_ha_replication_journal (the
+  // trigger-captured committed row-changes shipped to the passive), and
+  // gd_ha_replication_state (the ship/ack/apply cursors + replication lag). HA is
+  // disabled by default (the ha_config key stays { enabled: false }); the tables
+  // are inert until an operator opts in and pairs a peer. Idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gd_ha_node (
+        id TEXT PRIMARY KEY DEFAULT 'self' CHECK (id = 'self'),
+        role TEXT NOT NULL DEFAULT 'standalone' CHECK (role IN ('standalone', 'active', 'passive')),
+        wrap_public_pem TEXT,
+        wrap_private_sealed TEXT,
+        wrap_pubkey_anchor_sig TEXT,
+        sealed_promotion_kek TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS gd_ha_lease (
+        id TEXT PRIMARY KEY DEFAULT 'current' CHECK (id = 'current'),
+        epoch INTEGER NOT NULL DEFAULT 0,
+        holder TEXT NOT NULL DEFAULT 'none' CHECK (holder IN ('self', 'peer', 'none')),
+        lease_expires_at TEXT,
+        last_heartbeat_at TEXT,
+        term_started_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS gd_ha_peer (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        peer_endpoint TEXT NOT NULL,
+        peer_anchor_fingerprint TEXT NOT NULL,
+        peer_anchor_public_pem TEXT NOT NULL,
+        peer_wrap_public_pem TEXT NOT NULL,
+        peer_cert_fingerprint TEXT NOT NULL,
+        peer_ca_pem TEXT,
+        status TEXT NOT NULL DEFAULT 'pairing' CHECK (status IN ('pairing', 'paired', 'revoked')),
+        paired_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(peer_anchor_fingerprint)
+      );
+      CREATE TABLE IF NOT EXISTS gd_ha_replication_journal (
+        lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch INTEGER NOT NULL,
+        txn_marker TEXT,
+        table_name TEXT NOT NULL,
+        op TEXT NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+        pk_json TEXT NOT NULL,
+        row_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        shipped INTEGER NOT NULL DEFAULT 0 CHECK (shipped IN (0, 1))
+      );
+      CREATE TABLE IF NOT EXISTS gd_ha_replication_state (
+        id TEXT PRIMARY KEY DEFAULT 'self' CHECK (id = 'self'),
+        last_journaled_lsn INTEGER NOT NULL DEFAULT 0,
+        last_shipped_lsn INTEGER NOT NULL DEFAULT 0,
+        last_acked_lsn INTEGER NOT NULL DEFAULT 0,
+        last_applied_lsn INTEGER NOT NULL DEFAULT 0,
+        last_apply_at TEXT,
+        lag_seconds REAL NOT NULL DEFAULT 0,
+        baseline_at TEXT
+      );
+      -- Monotonic epoch guard: the lease epoch may only increase. A recovered
+      -- old active that re-claims a lower epoch is aborted here, so promotion is
+      -- one-way and split-brain cannot resurrect a stale writer.
+      CREATE TRIGGER IF NOT EXISTS gd_ha_lease_epoch_monotonic
+        BEFORE UPDATE ON gd_ha_lease
+        WHEN NEW.epoch < OLD.epoch
+        BEGIN SELECT RAISE(ABORT, 'gd_ha_lease epoch must not decrease'); END;
+    `);
+    const gdHaTablesPresent = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name LIKE 'gd_ha_%'").get().c;
+    const gdHaEpochTrigger = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name = 'gd_ha_lease_epoch_monotonic'").get().c;
+    console.log(`B6d migration: GD High Availability schema ready (${gdHaTablesPresent} of 5 gd_ha_* tables present, epoch guard ${gdHaEpochTrigger ? 'on' : 'MISSING'})`);
+  } catch (b6dGdHaSchemaMigrationErr) {
+    console.error('B6d GD HA schema migration FAILED:', b6dGdHaSchemaMigrationErr.message);
+    console.error('The GD will start, but opt-in active/passive High Availability cannot function: one or more gd_ha_* tables (gd_ha_node, gd_ha_lease, gd_ha_peer, gd_ha_replication_journal, gd_ha_replication_state) may be missing, so pairing, replication, and automated failover are unavailable. Recovery: run the CREATE TABLE statements above in a SQLite shell against the production DB.');
+  }
+
   console.log('Global Dashboard database initialized at', DB_PATH);
   require('./services/gd-seed-fido-roots').seedFidoRoots(db);
   db.close();
