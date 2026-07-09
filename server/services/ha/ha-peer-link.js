@@ -28,7 +28,14 @@ const path = require('path');
 const crypto = require('crypto');
 const { DB_PATH } = require('../../db/init');
 const { getClientCertThumbprint } = require('../../middleware/auth');
-const { auditLog } = require('../../middleware/audit');
+// Audit through the connection the gate is holding, never a second one. requirePeerCert
+// is handed a db GETTER, so its caller -- including a test or a drill -- decides which
+// database the gate consults; auditLog() opens its own via getDb() and ignored that,
+// always writing to the live hash-chained log. A gate run against any other database
+// would therefore forge an HA_PEER_REJECTED row an auditor reads as real. auditLogOn
+// appends on the given handle and gates SIEM streaming on isLiveChain(db), so a real
+// rejection records and streams exactly as before.
+const { auditLogOn } = require('../../middleware/audit');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
@@ -199,19 +206,31 @@ function requirePeerCert(getDbFn) {
       const peer = getPeer(db);
       const thumb = getClientCertThumbprint(req);
       const pinned = peer ? (peer.peer_cert_fingerprint || '').toLowerCase() : null;
-      try { db.close(); } catch (closeErr) { /* ignore */ }
-      db = null;
-      if (!peer || !thumb || !pinned || thumb !== pinned) {
+      const rejected = (!peer || !thumb || !pinned || thumb !== pinned);
+      // Audit BEFORE the connection is closed, so the rejection is recorded in the same
+      // database the gate consulted. The close still happens ahead of next(), so a
+      // permitted request does not carry this connection into the handlers.
+      if (rejected) {
         try {
-          auditLog(null, 'HA_PEER_REJECTED',
+          auditLogOn(db, null, 'HA_PEER_REJECTED',
             'Peer link request with ' + (thumb ? 'unrecognized' : 'absent') + ' client certificate', req.ip);
         } catch (auditErr) { /* never let logging change the gate decision */ }
+      }
+      try { db.close(); } catch (closeErr) { /* ignore */ }
+      db = null;
+      if (rejected) {
         return res.status(401).json({ error: 'peer authentication failed' });
       }
       return next();
     } catch (err) {
+      // If the gate failed before a handle existed, ask the injected getter for one so
+      // the audit still lands in the caller's database, never a second live connection.
+      try {
+        const adb = db || getDbFn();
+        auditLogOn(adb, null, 'HA_PEER_REJECTED', 'Peer link gate error', req.ip);
+        if (!db) { try { adb.close(); } catch (closeErr) { /* ignore */ } }
+      } catch (auditErr) { /* never let logging change the gate decision */ }
       try { if (db) db.close(); } catch (closeErr) { /* ignore */ }
-      try { auditLog(null, 'HA_PEER_REJECTED', 'Peer link gate error', req.ip); } catch (auditErr) { /* ignore */ }
       return res.status(401).json({ error: 'peer authentication failed' });
     }
   };

@@ -3014,6 +3014,146 @@ class RegressionRunner {
     // so the fail-back re-promotion TIED the peer's epoch, leaving two actives at one
     // epoch -- a split-brain produced by the drill meant to prove failover was safe.
     // These two checks make the class fail in CI rather than in the field.
+    // Replace comments, string literals, and regex literals with equivalent whitespace,
+    // preserving newlines. A regex-based stripper cannot do this: it desynchronises on a
+    // double-quoted string containing an apostrophe ("'") or on a regex literal (/'/g),
+    // after which the rest of the file is treated as string content and silently skipped.
+    // ha-pairing.js contains exactly that construct in restoreBaseline, and roughly two
+    // thirds of it was invisible to the previous scan -- a source guard that cannot see
+    // the source is worse than none, because it reports clean.
+    const haStripNonCode = (src) => {
+      const n = src.length;
+      let out = '';
+      let i = 0;
+      let prev = '';
+      const blank = (ch) => (ch === '\n' ? '\n' : ' ');
+      while (i < n) {
+        const c = src[i];
+        const d = src[i + 1];
+        if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') { out += ' '; i += 1; } continue; }
+        if (c === '/' && d === '*') {
+          out += '  '; i += 2;
+          while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { out += blank(src[i]); i += 1; }
+          out += '  '; i += 2; continue;
+        }
+        if (c === "'" || c === '"' || c === '`') {
+          const q = c; out += ' '; i += 1;
+          while (i < n) {
+            if (src[i] === '\\') { out += '  '; i += 2; continue; }
+            if (src[i] === q) { out += ' '; i += 1; break; }
+            out += blank(src[i]); i += 1;
+          }
+          prev = 'x'; continue;
+        }
+        if (c === '/' && prev && '(,=:[!&|?{};+-*%~^<>'.indexOf(prev) !== -1) {
+          out += ' '; i += 1;
+          let inClass = false;
+          while (i < n) {
+            const e = src[i];
+            if (e === '\\') { out += '  '; i += 2; continue; }
+            if (e === '\n') break;
+            if (e === '[') inClass = true;
+            else if (e === ']') inClass = false;
+            else if (e === '/' && !inClass) { out += ' '; i += 1; break; }
+            out += ' '; i += 1;
+          }
+          while (i < n && /[a-z]/.test(src[i])) { out += ' '; i += 1; }
+          prev = 'x'; continue;
+        }
+        out += c;
+        if (!/\s/.test(c)) prev = c;
+        i += 1;
+      }
+      return out;
+    };
+
+    // Brace-matched function bodies, so a call is attributed to the function making it.
+    const haFunctions = (src) => {
+      const out = [];
+      const re = /(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*\{/g;
+      let m;
+      while ((m = re.exec(src)) !== null) {
+        let i = re.lastIndex - 1;
+        let depth = 0;
+        for (; i < src.length; i += 1) {
+          if (src[i] === '{') depth += 1;
+          else if (src[i] === '}') { depth -= 1; if (depth === 0) break; }
+        }
+        out.push({ name: m[1], body: src.slice(m.index, i + 1) });
+      }
+      return out;
+    };
+
+    await check('high_availability', 'Alert router withholds the replicated notification row on a passive', async () => {
+      // `notifications` is a REPLICATED table and _chNotification is the only channel
+      // that writes one. Timer-driven alerts (the runtime monitor, the bandwidth
+      // monitor) reach the router without passing the request-layer write guard, so a
+      // confirmed passive would insert rows the active never had -- diverging the pair.
+      // The alert must not be lost either: audit is dispatched before the de-dup gate,
+      // unconditionally, into the node-local hash-chained audit_log.
+      const crypto = require('crypto');
+      const { routeAlert, MATRIX_CONFIG_KEY } = require('./alert-router');
+      // A notification-only matrix keeps this drill off SOAR / SIEM / email / webhook,
+      // and severity 'high' avoids the critical path's urgent-refresh broadcast.
+      const matrix = { high: { soar: false, siem: false, email: false, notification: true, webhook: false } };
+      const liveNotifs = () => this.db
+        .prepare("SELECT COUNT(*) AS n FROM notifications WHERE event_type LIKE 'HA_REGRESSION_PROBE_%'").get().n;
+      const liveAudits = () => this.db
+        .prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type LIKE 'HA_REGRESSION_PROBE_%'").get().n;
+      const liveNotifsBefore = liveNotifs();
+      const liveAuditsBefore = liveAudits();
+      const setup = (haCfg, paired, role) => {
+        const mem = cloneLiveSchema(this.db);
+        mem.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run(MATRIX_CONFIG_KEY, JSON.stringify(matrix));
+        mem.prepare("INSERT INTO users (id, username, role, name, active) VALUES ('ha-reg-admin', 'ha-reg-admin', 'admin', 'HA Regression Admin', 1)").run();
+        if (haCfg) mem.prepare("INSERT INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(haCfg));
+        if (paired) {
+          mem.prepare("INSERT INTO ha_peer (peer_endpoint, peer_anchor_fingerprint, peer_anchor_public_pem, peer_wrap_public_pem, peer_cert_fingerprint, status) VALUES ('https://peer:8443', 'fp', 'pem', 'pem', 'certfp', 'paired')").run();
+        }
+        if (role) mem.prepare("INSERT OR REPLACE INTO ha_node (id, role) VALUES ('self', ?)").run(role);
+        return mem;
+      };
+      // A distinct type per case: the de-dup gate is module-level and keyed on
+      // (type|severity), so reusing one type would suppress the later calls and the
+      // passive would show zero rows because it was DEDUPED rather than gated -- a check
+      // that could not fail.
+      const probeType = () => 'HA_REGRESSION_PROBE_' + crypto.randomBytes(6).toString('hex');
+      const notifRows = (mem) => mem.prepare('SELECT COUNT(*) AS n FROM notifications').get().n;
+      const auditRows = (mem, t) => mem.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE event_type = ?').get(t).n;
+      const chan = (out, name) => out.channels.find((c) => c.channel === name);
+
+      // Standalone and a paired active both write the replicated row: the gate fails open.
+      for (const [label, haCfg, paired, role] of [['standalone', null, false, null], ['paired active', { enabled: true }, true, 'active']]) {
+        const mem = setup(haCfg, paired, role);
+        const type = probeType();
+        try {
+          const out = await routeAlert(mem, { type: type, severity: 'high', message: 'sole-writer regression probe' });
+          if (out.deduped) throw new Error(label + ': the probe was de-duplicated, so nothing was asserted');
+          if (notifRows(mem) !== 1) throw new Error(label + ' must write the notification row (got ' + notifRows(mem) + ')');
+          const n = chan(out, 'notification');
+          if (n && n.status === 'skipped_ha_passive') throw new Error(label + ' was wrongly treated as a passive');
+        } finally { mem.close(); }
+      }
+
+      // A confirmed paired passive withholds the replicated row -- and only that.
+      const mem = setup({ enabled: true }, true, 'passive');
+      const type = probeType();
+      try {
+        const out = await routeAlert(mem, { type: type, severity: 'high', message: 'sole-writer regression probe' });
+        if (out.deduped) throw new Error('the passive probe was de-duplicated, so nothing was asserted');
+        if (notifRows(mem) !== 0) throw new Error('a confirmed passive must not write the replicated notification row');
+        const n = chan(out, 'notification');
+        if (!n || n.status !== 'skipped_ha_passive') throw new Error('the passive skip must be reported as skipped_ha_passive, not hidden');
+        // The alert is not lost, and the audit lands where the router was told to write.
+        const a = chan(out, 'audit');
+        if (!a || a.ok !== true) throw new Error('the audit channel must still fire on a passive');
+        if (auditRows(mem, type) !== 1) throw new Error('the alert must be audited into the connection the router was handed');
+      } finally { mem.close(); }
+
+      if (liveNotifs() !== liveNotifsBefore) throw new Error('the regression probe wrote a notification row into the LIVE database');
+      if (liveAudits() !== liveAuditsBefore) throw new Error('the regression probe forged an alert row into the LIVE audit chain');
+      return 'standalone + active write; passive withholds only the replicated row; audit lands in the clone, live chain untouched';
+    });
     await check('high_availability', 'Peer response resolves the body; .json wrapper reads throw', () => {
       const { parsePeerResponse } = require('./ha/ha-peer-link');
       if (typeof parsePeerResponse !== 'function') throw new Error('ha-peer-link.parsePeerResponse not exported');
@@ -3034,29 +3174,35 @@ class RegressionRunner {
     await check('high_availability', 'No HA source reads .json off a peer-link result', () => {
       const fsMod = require('fs');
       const pathMod = require('path');
+      // The full HA surface. A guard that is not looking somewhere reports clean: the
+      // audit-connection guard's first target list omitted the peer links and this
+      // scheduler, and three real sites sat outside it until VERIFY-MERGE swept
+      // independently.
       const targets = [
         '../routes/ha.js',
+        '../middleware/ha-write-guard.js',
+        './alert-router.js',
+        './scheduler.js',
+        './ha/ha-cdc.js',
+        './ha/ha-failover.js',
+        './ha/ha-keys.js',
+        './ha/ha-lease.js',
+        './ha/ha-liveness.js',
+        './ha/ha-modes.js',
+        './ha/ha-pairing.js',
         './ha/ha-peer-link.js',
         './ha/ha-replication.js',
-        './ha/ha-failover.js',
-        './ha/ha-pairing.js',
-        './scheduler.js',
       ];
-      // Comments and string literals are stripped first, so the scan never flags the
-      // prose that names the wrong idiom on purpose. res.json(...) is the response
-      // helper and is the only permitted receiver.
-      const codeOnly = (src) => src
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-        .replace(/'(?:\\.|[^'\\])*'/g, "''")
-        .replace(/"(?:\\.|[^"\\])*"/g, '""');
+      // haStripNonCode blanks comments, strings, and regex literals, so the scan never
+      // flags the prose that names the wrong idiom on purpose. res.json(...) is the
+      // response helper and is the only permitted receiver.
       const offenders = [];
       let scanned = 0;
       for (const rel of targets) {
         const abs = pathMod.join(__dirname, rel);
         if (!fsMod.existsSync(abs)) continue;
         scanned += 1;
-        const code = codeOnly(fsMod.readFileSync(abs, 'utf8'));
+        const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
         const re = /([A-Za-z_$][A-Za-z0-9_$]*)\.json\b/g;
         let m;
         while ((m = re.exec(code)) !== null) {
@@ -3065,6 +3211,56 @@ class RegressionRunner {
       }
       if (offenders.length) throw new Error('peer-link result read via a .json wrapper: ' + offenders.join(', '));
       return scanned + ' HA sources scanned; no wrapper reads';
+    });
+    await check('high_availability', 'HA modules audit through the connection they are handed', () => {
+      // Seven modules across both servers took a database handle, mutated it, and then
+      // audited through a SECOND connection opened with getDb(). On a live node both
+      // point at one file, so nothing was visibly wrong -- but handed any other database
+      // (a hermetic clone, a drill) the change lands in one place and the tamper-evident
+      // audit row in another, forging events an auditor reads as real. Two rules catch
+      // both shapes: the direct call, and the local-helper form where getDb() sits one
+      // indirection below the function that received the db.
+      const fsMod = require('fs');
+      const pathMod = require('path');
+      // The full HA surface, not a hand-picked subset. The first version of this list
+      // omitted ha-peer-link.js and this scheduler, and passed while both audited
+      // through a second connection. Files that open a connection but never audit
+      // (ha-write-guard, and the scheduler once fixed) are included deliberately: rule 1
+      // requires BOTH, so they pass, and adding them means a future audit call in any of
+      // them is caught on the day it is written.
+      const targets = [
+        '../routes/ha.js',
+        '../middleware/ha-write-guard.js',
+        './alert-router.js',
+        './scheduler.js',
+        './ha/ha-cdc.js',
+        './ha/ha-failover.js',
+        './ha/ha-keys.js',
+        './ha/ha-lease.js',
+        './ha/ha-liveness.js',
+        './ha/ha-modes.js',
+        './ha/ha-pairing.js',
+        './ha/ha-peer-link.js',
+        './ha/ha-replication.js',
+      ];
+      const offenders = [];
+      let scanned = 0;
+      for (const rel of targets) {
+        const abs = pathMod.join(__dirname, rel);
+        if (!fsMod.existsSync(abs)) continue;
+        scanned += 1;
+        const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
+        for (const fn of haFunctions(code)) {
+          if (/\bgetDb\s*\(/.test(fn.body) && /\bappendAuditEntry\s*\(/.test(fn.body)) {
+            offenders.push(rel + ': ' + fn.name + '() opens a connection and appends an audit entry');
+          }
+        }
+        const calls = (code.match(/\bauditLog\s*\(/g) || []).length;
+        const defs = (code.match(/function\s+auditLog\s*\(/g) || []).length;
+        if (calls > defs) offenders.push(rel + ': calls a connection-opening auditLog(); use auditLogOn(db, ...)');
+      }
+      if (offenders.length) throw new Error('HA module audits through a second connection: ' + offenders.join(', '));
+      return scanned + ' HA sources scanned; all audit through the connection they are handed';
     });
     await check('high_availability', 'A promoting node claims a STRICTLY HIGHER epoch than its peer', () => {
       // The monotonic lease trigger forbids an epoch DECREASE, not a TIE. A node

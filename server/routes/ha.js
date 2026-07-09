@@ -20,7 +20,15 @@ const router = require('express').Router(); // configRouter
 const peerRouter = require('express').Router();
 const pairInitRouter = require('express').Router();
 const { getDb } = require('../db/init');
-const { auditLog } = require('../middleware/audit');
+// Audit through the connection each handler already holds, not a second one. auditLog()
+// opens its own via getDb(); every handler here opens a db for the life of the request
+// and closes it in a finally, so the extra connection bought nothing and split each
+// operation from its audit record across two handles. auditLogOn appends on the given
+// handle and gates SIEM streaming on isLiveChain(db), so a real HA admin action records
+// and streams exactly as before. This is the pattern that let ha-failover, ha-pairing,
+// and the alert router's audit channel forge rows into the live chain when handed any
+// other database; the HA control plane should not model it.
+const { auditLogOn } = require('../middleware/audit');
 const { requireObjectBody } = require('../middleware/body-validation');
 const { getClientCertThumbprint } = require('../middleware/auth');
 const haPairing = require('../services/ha/ha-pairing');
@@ -116,7 +124,7 @@ router.put('/config', requireObjectBody, (req, res) => {
   try {
     const merged = Object.assign({}, DEFAULT_HA_CONFIG, req.body);
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(merged));
-    auditLog(actor(req), 'HA_CONFIG_UPDATED', 'Mode: active_passive, enabled: ' + (merged.enabled ? 'yes' : 'no'), req.ip);
+    auditLogOn(db, actor(req), 'HA_CONFIG_UPDATED', 'Mode: active_passive, enabled: ' + (merged.enabled ? 'yes' : 'no'), req.ip);
     // Apply the new intervals live: re-register the HA scheduler ticks so a
     // changed heartbeat/replication interval takes effect without a restart.
     try { require('../services/scheduler').schedulerService.reloadHaJobs(); } catch (reloadErr) { /* scheduler not running; next start reads the saved config */ }
@@ -196,7 +204,7 @@ router.post('/pair', requireObjectBody, async (req, res) => {
       return res.status(409).json({ error: 'already paired with a peer' });
     }
     const cfg = loadHaConfig(db);
-    auditLog(actor(req), 'HA_PAIR_INITIATED', 'Pairing with ' + peerEndpoint, req.ip);
+    auditLogOn(db, actor(req), 'HA_PAIR_INITIATED', 'Pairing with ' + peerEndpoint, req.ip);
     const result = await haPairing.beginPairing(db, peerEndpoint, token, {
       selfEndpoint: cfg.selfEndpoint,
       leaseTtlSec: cfg.leaseTtlSec,
@@ -204,7 +212,7 @@ router.post('/pair', requireObjectBody, async (req, res) => {
     res.json({ success: true, role: result.role, peerFingerprint: result.peerFingerprint });
   } catch (pairErr) {
     const detail = (pairErr && pairErr.message) ? pairErr.message : 'error';
-    try { auditLog(actor(req), 'HA_PAIR_FAILED', 'Pairing with ' + peerEndpoint + ' failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
+    try { auditLogOn(db, actor(req), 'HA_PAIR_FAILED', 'Pairing with ' + peerEndpoint + ' failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
     res.status(502).json({ error: 'pairing failed', detail: detail });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
@@ -232,11 +240,11 @@ router.post('/manual-failover', requireObjectBody, async (req, res) => {
       // is no .json wrapper. Reading r.json yielded undefined, so the peer's real
       // epoch and promoted flag were never observed.
       const peer = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {}) || {};
-      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
+      auditLogOn(db, actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
       res.json({ ok: true, role: 'passive', peerPromoted: peer.promoted !== false, peerEpoch: peer.epoch || null });
     } catch (sendErr) {
       const m = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'error';
-      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
+      auditLogOn(db, actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
       res.json({ ok: true, role: 'passive', peerPromoted: false, note: 'peer will promote via failure detection' });
     }
   } catch (failErr) {
@@ -258,7 +266,7 @@ router.post('/test-failover', requireObjectBody, async (req, res) => {
     if (!peerPaired(db)) {
       return res.status(409).json({ error: 'no paired peer for a failover self-test' });
     }
-    try { auditLog(actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
+    try { auditLogOn(db, actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
     const t0 = Date.now();
     const fromEpoch = haLease.currentEpoch(db);
     const checksumBefore = dataChecksum(db);
@@ -300,7 +308,7 @@ router.post('/test-failover', requireObjectBody, async (req, res) => {
       restored: restored,
       epoch: haLease.currentEpoch(db),
     };
-    try { auditLog(actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
+    try { auditLogOn(db, actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
     res.json(result);
   } catch (testErr) {
     res.status(500).json({ error: 'self-test error', detail: (testErr && testErr.message) ? testErr.message.slice(0, 160) : 'error' });

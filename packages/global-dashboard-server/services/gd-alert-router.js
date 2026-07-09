@@ -242,4 +242,21 @@ async function _run(handler, name, db, alert) {
   }
 }
 
-module.exports = { routeGdAlert, loadMatrix, DEFAULT_MATRIX, SEVERITIES, CHANNELS, MATRIX_CONFIG_KEY };
+// _chNotification and _chAudit are exported so the regression can assert the HA
+// sole-writer property directly and synchronously: the replicated `notifications`
+// row is withheld on a confirmed passive, while the node-local audit append still
+// happens. routeGdAlert is async, and the GD regression runner invokes checks
+// synchronously, so a check that awaited the router would record a pending Promise
+// as a pass and assert nothing. Exporting the two channels keeps the assertion on
+// the real code rather than a copy of its condition. Both are pure (db, alert)
+// functions; neither is intended for use outside the router and the regression.
+module.exports = {
+  routeGdAlert,
+  loadMatrix,
+  DEFAULT_MATRIX,
+  SEVERITIES,
+  CHANNELS,
+  MATRIX_CONFIG_KEY,
+  _chNotification,
+  _chAudit,
+};

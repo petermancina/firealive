@@ -4066,6 +4066,76 @@ function runGdRegression(db) {
   // check write their audit rows into the temp database; the self-fence check asserts
   // that the live hash-chained audit_log gains nothing, so a self-test can never
   // forge HA_SELF_FENCED events into a log an auditor reads as real.
+  // Replace comments, string literals, and regex literals with equivalent whitespace,
+  // preserving newlines. A regex-based stripper cannot do this: it desynchronises on a
+  // double-quoted string containing an apostrophe ("'") or on a regex literal (/'/g),
+  // after which the rest of the file is treated as string content and silently skipped.
+  // gd-ha-pairing.js contains exactly that construct in restoreBaseline, and roughly
+  // two thirds of it was invisible to the previous scan -- a source guard that cannot
+  // see the source is worse than none, because it reports clean.
+  const haStripNonCode = (src) => {
+    const n = src.length;
+    let out = '';
+    let i = 0;
+    let prev = '';
+    const blank = (ch) => (ch === '\n' ? '\n' : ' ');
+    while (i < n) {
+      const c = src[i];
+      const d = src[i + 1];
+      if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') { out += ' '; i += 1; } continue; }
+      if (c === '/' && d === '*') {
+        out += '  '; i += 2;
+        while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { out += blank(src[i]); i += 1; }
+        out += '  '; i += 2; continue;
+      }
+      if (c === "'" || c === '"' || c === '`') {
+        const q = c; out += ' '; i += 1;
+        while (i < n) {
+          if (src[i] === '\\') { out += '  '; i += 2; continue; }
+          if (src[i] === q) { out += ' '; i += 1; break; }
+          out += blank(src[i]); i += 1;
+        }
+        prev = 'x'; continue;
+      }
+      if (c === '/' && prev && '(,=:[!&|?{};+-*%~^<>'.indexOf(prev) !== -1) {
+        out += ' '; i += 1;
+        let inClass = false;
+        while (i < n) {
+          const e = src[i];
+          if (e === '\\') { out += '  '; i += 2; continue; }
+          if (e === '\n') break;
+          if (e === '[') inClass = true;
+          else if (e === ']') inClass = false;
+          else if (e === '/' && !inClass) { out += ' '; i += 1; break; }
+          out += ' '; i += 1;
+        }
+        while (i < n && /[a-z]/.test(src[i])) { out += ' '; i += 1; }
+        prev = 'x'; continue;
+      }
+      out += c;
+      if (!/\s/.test(c)) prev = c;
+      i += 1;
+    }
+    return out;
+  };
+
+  // Brace-matched function bodies, so a call is attributed to the function making it.
+  const haFunctions = (src) => {
+    const out = [];
+    const re = /(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*\{/g;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      let i = re.lastIndex - 1;
+      let depth = 0;
+      for (; i < src.length; i += 1) {
+        if (src[i] === '{') depth += 1;
+        else if (src[i] === '}') { depth -= 1; if (depth === 0) break; }
+      }
+      out.push({ name: m[1], body: src.slice(m.index, i + 1) });
+    }
+    return out;
+  };
+
   const haCloneSchema = (live, names) => {
     const Database = require('better-sqlite3');
     const mem = new Database(':memory:');
@@ -4265,32 +4335,142 @@ function runGdRegression(db) {
     if (call('PUT', '/api/ha/config') !== 'pass') throw new Error('/api/ha/config must be exempt');
     return 'fails open here; /ha control plane exempt for POST/PUT';
   });
-  record('gd_high_availability', 'No HA source reads .json off a peer-link result', () => {
+  record('gd_high_availability', 'Alert router withholds the replicated notification row on a passive', () => {
+    // notifications is a REPLICATED table and _chNotification is the only channel that
+    // writes one. Timer-driven alerts reach the router without passing the request-layer
+    // write guard, so a confirmed passive would insert rows the active never had. The
+    // alert must not be lost either: _chAudit writes to the node-local hash-chained
+    // audit_log regardless of role, and the outbound channels still fire.
+    //
+    // The channels are called directly because routeGdAlert is async and this runner
+    // invokes checks synchronously -- awaiting it would record a pending Promise as a
+    // pass and assert nothing.
+    const router = require('./services/gd-alert-router');
+    if (typeof router._chNotification !== 'function' || typeof router._chAudit !== 'function') {
+      throw new Error('gd-alert-router did not export the channels under assertion');
+    }
+    const alert = { type: 'HA_REGRESSION_PROBE', severity: 'critical', message: 'sole-writer regression probe' };
+    const liveRows = () => db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE type = 'security_alert'").get().n;
+    const liveBefore = liveRows();
+    const setup = (cfg, paired, role) => {
+      const mem = haCloneSchema(db, ['config', 'gd_ha_peer', 'gd_ha_node', 'notifications', 'audit_log']);
+      if (cfg) mem.prepare("INSERT INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(cfg));
+      if (paired) {
+        mem.prepare("INSERT INTO gd_ha_peer (peer_endpoint, peer_anchor_fingerprint, peer_anchor_public_pem, peer_wrap_public_pem, peer_cert_fingerprint, status) VALUES ('https://peer:8443', 'fp', 'pem', 'pem', 'certfp', 'paired')").run();
+      }
+      if (role) mem.prepare("INSERT INTO gd_ha_node (id, role) VALUES ('self', ?)").run(role);
+      return mem;
+    };
+    const notifRows = (m) => m.prepare("SELECT COUNT(*) AS n FROM notifications").get().n;
+    const auditRows = (m) => m.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'HA_REGRESSION_PROBE'").get().n;
+
+    // Standalone and a paired active both write the replicated row (fail open / allowed).
+    for (const [label, cfg, paired, role] of [['standalone', null, false, null], ['paired active', { enabled: true }, true, 'active']]) {
+      const mem = setup(cfg, paired, role);
+      try {
+        const r = router._chNotification(mem, alert);
+        if (notifRows(mem) !== 1) throw new Error(label + ' must write the notification row');
+        if (r && r.status === 'skipped_ha_passive') throw new Error(label + ' was wrongly treated as a passive');
+        router._chAudit(mem, alert);
+        if (auditRows(mem) !== 1) throw new Error(label + ' must append the audit row');
+      } finally { mem.close(); }
+    }
+
+    // A confirmed paired passive withholds the replicated row -- and only that.
+    const mem = setup({ enabled: true }, true, 'passive');
+    try {
+      const r = router._chNotification(mem, alert);
+      if (notifRows(mem) !== 0) throw new Error('a confirmed passive must not write the replicated notification row');
+      if (!r || r.status !== 'skipped_ha_passive') throw new Error('the passive skip must be reported as skipped_ha_passive, not hidden');
+      // The alert is not lost: the node-local audit append is independent of the gate.
+      router._chAudit(mem, alert);
+      if (auditRows(mem) !== 1) throw new Error('a passive must still append the alert to its node-local audit chain');
+    } finally { mem.close(); }
+
+    if (liveRows() !== liveBefore) throw new Error('the regression probe wrote a notification row into the LIVE database');
+    return 'standalone + active write; passive withholds only the replicated row; audit fires in every role';
+  });
+  record('gd_high_availability', 'HA modules audit through the connection they are handed', () => {
+    // Seven modules across both servers took a database handle, mutated it, and then
+    // audited through a SECOND connection opened with getDb(). On a live node both
+    // point at one file, so nothing was visibly wrong -- but handed any other database
+    // (a hermetic clone, a drill) the change lands in one place and the tamper-evident
+    // audit row in another, forging events an auditor reads as real. Two rules catch
+    // both shapes: the direct call, and the local-helper form where getDb() sits one
+    // indirection below the function that received the db.
     const fsMod = require('fs');
     const pathMod = require('path');
+    // The full HA surface, not a hand-picked subset. The first version of this list
+    // omitted gd-ha-peer-link.js and the scheduler, and passed while gd-ha-peer-link
+    // audited peer-gate rejections through a second connection. Files that open a
+    // connection but never audit (gd-ha-write-guard, gd-backup-scheduler) are included
+    // deliberately: rule 1 requires BOTH, so they pass, and adding them means a future
+    // audit call in either one is caught on the day it is written.
     const targets = [
       'routes/gd-ha.js',
+      'services/gd-ha-cdc.js',
+      'services/gd-ha-failover.js',
+      'services/gd-ha-keys.js',
+      'services/gd-ha-lease.js',
+      'services/gd-ha-liveness.js',
+      'services/gd-ha-modes.js',
+      'services/gd-ha-pairing.js',
       'services/gd-ha-peer-link.js',
       'services/gd-ha-replication.js',
-      'services/gd-ha-failover.js',
-      'services/gd-ha-pairing.js',
+      'services/gd-ha-write-guard.js',
+      'services/gd-alert-router.js',
       'services/gd-backup-scheduler.js',
     ];
-    // Comments and string literals are stripped first, so the scan never flags the
-    // prose that names the wrong idiom on purpose. res.json(...) is the response
-    // helper and is the only permitted receiver.
-    const codeOnly = (src) => src
-      .replace(/\/\*[\s\S]*?\*\//g, ' ')
-      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
-      .replace(/'(?:\\.|[^'\\])*'/g, "''")
-      .replace(/"(?:\\.|[^"\\])*"/g, '""');
     const offenders = [];
     let scanned = 0;
     for (const rel of targets) {
       const abs = pathMod.join(__dirname, rel);
       if (!fsMod.existsSync(abs)) continue;
       scanned += 1;
-      const code = codeOnly(fsMod.readFileSync(abs, 'utf8'));
+      const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
+      for (const fn of haFunctions(code)) {
+        if (/\bgetDb\s*\(/.test(fn.body) && /\bappendGdAuditEntry\s*\(/.test(fn.body)) {
+          offenders.push(rel + ': ' + fn.name + '() opens a connection and appends an audit entry');
+        }
+      }
+      const calls = (code.match(/\bauditLog\s*\(/g) || []).length;
+      const defs = (code.match(/function\s+auditLog\s*\(/g) || []).length;
+      if (calls > defs) offenders.push(rel + ': calls a connection-opening auditLog(); audit through the injected db');
+    }
+    if (offenders.length) throw new Error('HA module audits through a second connection: ' + offenders.join(', '));
+    return scanned + ' HA sources scanned; all audit through the connection they are handed';
+  });
+  record('gd_high_availability', 'No HA source reads .json off a peer-link result', () => {
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    // The full HA surface. A guard that is not looking somewhere reports clean: the
+    // audit-connection guard's first target list omitted the peer links, and three real
+    // sites sat outside it until VERIFY-MERGE swept independently.
+    const targets = [
+      'routes/gd-ha.js',
+      'services/gd-ha-cdc.js',
+      'services/gd-ha-failover.js',
+      'services/gd-ha-keys.js',
+      'services/gd-ha-lease.js',
+      'services/gd-ha-liveness.js',
+      'services/gd-ha-modes.js',
+      'services/gd-ha-pairing.js',
+      'services/gd-ha-peer-link.js',
+      'services/gd-ha-replication.js',
+      'services/gd-ha-write-guard.js',
+      'services/gd-alert-router.js',
+      'services/gd-backup-scheduler.js',
+    ];
+    // haStripNonCode blanks comments, strings, and regex literals, so the scan never
+    // flags the prose that names the wrong idiom on purpose. res.json(...) is the
+    // response helper and is the only permitted receiver.
+    const offenders = [];
+    let scanned = 0;
+    for (const rel of targets) {
+      const abs = pathMod.join(__dirname, rel);
+      if (!fsMod.existsSync(abs)) continue;
+      scanned += 1;
+      const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
       const re = /([A-Za-z_$][A-Za-z0-9_$]*)\.json\b/g;
       let m;
       while ((m = re.exec(code)) !== null) {

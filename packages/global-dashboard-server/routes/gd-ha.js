@@ -75,17 +75,19 @@ function dataChecksum(db) {
   }
 }
 
-// Append a GD audit entry on a short-lived connection (the GD route audit
-// pattern). Never lets logging change an operation outcome.
-function auditLog(userId, eventType, detail, ip) {
-  let adb = null;
+// Append the audit entry on the SAME connection the handler is already using, rather
+// than opening a second one via getDb(). Every handler here holds an open db for the
+// life of the request and closes it in a finally, so a second connection bought
+// nothing and split the operation from its audit record across two handles. On a live
+// node both point at one file, so nothing was visibly wrong -- but it is the pattern
+// that let gd-ha-failover and gd-ha-pairing forge audit rows into the live chain when
+// handed any other database, and the HA control plane should not model it. Never lets
+// logging change an operation outcome, so failures are swallowed.
+function safeAudit(db, userId, eventType, detail, ip) {
   try {
-    adb = getDb();
-    appendGdAuditEntry(adb, { userId: userId, eventType: eventType, detail: detail, ip: ip });
+    appendGdAuditEntry(db, { userId: userId, eventType: eventType, detail: detail, ip: ip });
   } catch (err) {
-    console.error('gd-ha route audit append failed:', err && err.message ? err.message : err);
-  } finally {
-    if (adb) { try { adb.close(); } catch (closeErr) { /* ignore */ } }
+    try { console.error('gd-ha route audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
   }
 }
 
@@ -240,7 +242,7 @@ configRouter.put('/config', requireObjectBody, (req, res) => {
   try {
     const merged = Object.assign({}, DEFAULT_HA_CONFIG, req.body);
     db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify(merged));
-    auditLog(actor(req), 'HA_CONFIG_UPDATED', 'Mode: active_passive, enabled: ' + (merged.enabled ? 'yes' : 'no'), req.ip);
+    safeAudit(db, actor(req), 'HA_CONFIG_UPDATED', 'Mode: active_passive, enabled: ' + (merged.enabled ? 'yes' : 'no'), req.ip);
     // Apply the new intervals live: re-register the HA scheduler ticks so a
     // changed heartbeat/replication interval takes effect without a restart.
     try { require('../services/gd-backup-scheduler').gdBackupScheduler.reloadHaJobs(); } catch (reloadErr) { /* scheduler not running; next start reads the saved config */ }
@@ -317,7 +319,7 @@ configRouter.post('/pairing-token', (req, res) => {
     }
     const cfg = loadHaConfig(db);
     const result = gdHaPairing.generatePairingToken(db, cfg.pairingTokenTtlSec);
-    auditLog(actor(req), 'HA_PAIRING_TOKEN_ISSUED', 'One-time pairing token issued (this node standby)', req.ip);
+    safeAudit(db, actor(req), 'HA_PAIRING_TOKEN_ISSUED', 'One-time pairing token issued (this node standby)', req.ip);
     res.json({ bootstrap: result.bootstrap, expiresAt: result.expiresAt });
   } catch (tokErr) {
     res.status(500).json({ error: 'Failed to generate pairing token' });
@@ -340,7 +342,7 @@ configRouter.post('/pair', requireObjectBody, async (req, res) => {
       return res.status(409).json({ error: 'already paired with a peer' });
     }
     const cfg = loadHaConfig(db);
-    auditLog(actor(req), 'HA_PAIR_INITIATED', 'Pairing with ' + peerEndpoint, req.ip);
+    safeAudit(db, actor(req), 'HA_PAIR_INITIATED', 'Pairing with ' + peerEndpoint, req.ip);
     const result = await gdHaPairing.beginPairing(db, peerEndpoint, token, {
       selfEndpoint: cfg.selfEndpoint,
       leaseTtlSec: cfg.leaseTtlSec,
@@ -348,7 +350,7 @@ configRouter.post('/pair', requireObjectBody, async (req, res) => {
     res.json({ success: true, role: result.role, peerFingerprint: result.peerFingerprint });
   } catch (pairErr) {
     const detail = (pairErr && pairErr.message) ? pairErr.message : 'error';
-    try { auditLog(actor(req), 'HA_PAIR_FAILED', 'Pairing with ' + peerEndpoint + ' failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
+    try { safeAudit(db, actor(req), 'HA_PAIR_FAILED', 'Pairing with ' + peerEndpoint + ' failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
     res.status(502).json({ error: 'pairing failed', detail: detail });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
@@ -372,11 +374,11 @@ configRouter.post('/manual-failover', requireObjectBody, async (req, res) => {
     gdHaFailover.demote(db, 'manual', {});
     try {
       const peer = await gdHaPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {}) || {};
-      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
+      safeAudit(db, actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
       res.json({ ok: true, role: 'passive', peerPromoted: peer.promoted !== false, peerEpoch: peer.epoch || null });
     } catch (sendErr) {
       const m = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'error';
-      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
+      safeAudit(db, actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
       res.json({ ok: true, role: 'passive', peerPromoted: false, note: 'peer will promote via failure detection' });
     }
   } catch (failErr) {
@@ -401,7 +403,7 @@ configRouter.post('/self-test', requireObjectBody, async (req, res) => {
     if (!peerPaired(db)) {
       return res.status(409).json({ error: 'no paired peer for a failover self-test' });
     }
-    try { auditLog(actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
+    try { safeAudit(db, actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
     const t0 = Date.now();
     const fromEpoch = gdHaLease.currentEpoch(db);
     const checksumBefore = dataChecksum(db);
@@ -440,7 +442,7 @@ configRouter.post('/self-test', requireObjectBody, async (req, res) => {
       restored: restored,
       epoch: gdHaLease.currentEpoch(db),
     };
-    try { auditLog(actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
+    try { safeAudit(db, actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
     res.json(result);
   } catch (testErr) {
     res.status(500).json({ error: 'self-test error', detail: (testErr && testErr.message) ? testErr.message.slice(0, 160) : 'error' });

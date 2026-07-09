@@ -80,8 +80,17 @@ function _deduped(type, severity) {
 // ── Channel handlers (each best-effort, isolated, never throws upward) ─────────
 
 function _chAudit(db, alert) {
-  const { auditLog } = require('../middleware/audit');
-  auditLog(null, alert.type || 'SYSTEM_ALERT', alert.message || '');
+  // Audit through the connection the router was handed, not a second one. auditLog()
+  // opens its own via getDb(), so this channel ignored its `db` argument entirely: an
+  // alert routed against any database other than the live one -- the regression drives
+  // routeAlert against a hermetic clone -- wrote the notification into the clone while
+  // writing the audit row into the LIVE hash-chained audit_log, forging an event an
+  // auditor reads as real. auditLogOn appends on the given handle and gates SIEM
+  // streaming on isLiveChain(db), so a genuine alert still records and streams exactly
+  // as before, one connection lighter, and a drill neither forges a row nor pages the
+  // SOC. The GD twin (gd-alert-router) already audits through its db argument.
+  const { auditLogOn } = require('../middleware/audit');
+  auditLogOn(db, null, alert.type || 'SYSTEM_ALERT', alert.message || '');
   return { status: 'sent' };
 }
 

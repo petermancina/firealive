@@ -215,7 +215,7 @@ const schedulerService = {
       try {
         const { getDb } = require('../db/init');
         const approvalsSvc = require('./restore-approvals');
-        const { auditLog } = require('../middleware/audit');
+        const { auditLogOn } = require('../middleware/audit');
         const db = getDb();
         const result = approvalsSvc.expirePending(db);
         const total =
@@ -229,11 +229,17 @@ const schedulerService = {
             approved_consumption: result.approved_consumption_expired_ids.length,
           });
           // One audit event per non-empty class with the IDs in detail.
+          // Audited through `db`, the connection this job already holds and mutated
+          // via expirePending(db). auditLog() would open a second one, so a job driven
+          // against any other database would apply the sweep there while writing the
+          // audit rows into the live hash-chained log, forging events an auditor reads
+          // as real.
           // Splitting by class lets SIEM rules alert on unusual ratios
           // (e.g. high consumption-deadline expiry could indicate a
           // workflow problem where admins approve but never consume).
           if (result.strict_pending_expired_ids.length > 0) {
-            auditLog(
+            auditLogOn(
+              db,
               null,
               'RESTORE_APPROVAL_EXPIRED_STRICT_PENDING',
               `count=${result.strict_pending_expired_ids.length} ` +
@@ -242,7 +248,8 @@ const schedulerService = {
             );
           }
           if (result.delayed_self_hard_expired_ids.length > 0) {
-            auditLog(
+            auditLogOn(
+              db,
               null,
               'RESTORE_APPROVAL_EXPIRED_DELAYED_SELF_HARD',
               `count=${result.delayed_self_hard_expired_ids.length} ` +
@@ -251,7 +258,8 @@ const schedulerService = {
             );
           }
           if (result.approved_consumption_expired_ids.length > 0) {
-            auditLog(
+            auditLogOn(
+              db,
               null,
               'RESTORE_APPROVAL_EXPIRED_CONSUMPTION_DEADLINE',
               `count=${result.approved_consumption_expired_ids.length} ` +
@@ -827,7 +835,7 @@ const schedulerService = {
       if (!this.mayRunWriteJob()) return;
       try {
         const { getDb } = require('../db/init');
-        const { auditLog } = require('../middleware/audit');
+        const { auditLogOn } = require('../middleware/audit');
         const { version: APP_VERSION } = require('../lib/version');
         const updateCheck = require('./update-check');
 
@@ -865,11 +873,11 @@ const schedulerService = {
           ).run(APP_VERSION, r.result, r.latestVersion, r.releaseUrl);
 
           if (r.result === 'available') {
-            auditLog(null, 'UPDATE_AVAILABLE', `latest=${r.latestVersion} current=${APP_VERSION}`, null);
+            auditLogOn(db2, null, 'UPDATE_AVAILABLE', `latest=${r.latestVersion} current=${APP_VERSION}`, null);
           } else if (r.result === 'source_unreachable') {
-            auditLog(null, 'UPDATE_SOURCE_UNREACHABLE', `current=${APP_VERSION}`, null);
+            auditLogOn(db2, null, 'UPDATE_SOURCE_UNREACHABLE', `current=${APP_VERSION}`, null);
           } else {
-            auditLog(null, 'UPDATE_CHECK_RAN', `trigger=scheduled result=none current=${APP_VERSION}`, null);
+            auditLogOn(db2, null, 'UPDATE_CHECK_RAN', `trigger=scheduled result=none current=${APP_VERSION}`, null);
           }
 
           if (r.result === 'available' && config.notifyLead && r.latestVersion) {

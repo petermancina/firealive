@@ -34,7 +34,15 @@ const haKeys = require('./ha-keys');
 const haPeerLink = require('./ha-peer-link');
 const haCdc = require('./ha-cdc');
 const haReplication = require('./ha-replication');
-const { auditLog } = require('../../middleware/audit');
+// Audit through the connection this module was handed, never a second one. auditLog()
+// opens its own via getDb(), so pairing -- which mutates ha_node, ha_lease, and ha_peer
+// on the injected db -- would apply the role change to that database while writing
+// HA_PAIRED into whatever getDb() points at. On a live node they are the same file, so
+// nothing was visibly wrong; against any other database (a hermetic regression clone,
+// a drill) the pairing lands in one place and the tamper-evident audit row in another.
+// auditLogOn appends on the given handle and gates SIEM streaming on isLiveChain(db),
+// so a real pairing records and streams exactly as before.
+const { auditLogOn } = require('../../middleware/audit');
 const ca = require('../ca');
 const mode = require('../deployment-mode');
 const cloudAttestation = require('../cloud-attestation');
@@ -332,12 +340,15 @@ function pairingRequest(endpoint, body, peerCaCertPem, peerLeafThumb, opts) {
       res.on('data', function (c) { chunks.push(c); });
       res.on('end', function () {
         const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error('ha-pairing: pair-init HTTP ' + res.statusCode + ' ' + text.slice(0, 200)));
-          return;
-        }
-        try { resolve({ json: text ? JSON.parse(text) : {} }); }
-        catch (jsonErr) { reject(new Error('ha-pairing: malformed pair-init response')); }
+        // One contract for every peer response on the HA surface: resolve the parsed
+        // BODY. This used to resolve a { json } wrapper while ha-peer-link.sendToPeer
+        // resolved the body, so two contradictory shapes lived in one subsystem -- the
+        // precise confusion that let /test-failover read `.json` off sendToPeer, receive
+        // undefined, skip adopting the peer's epoch, and tie it on re-promotion: two
+        // actives at one epoch. parsePeerResponse also attaches the fail-loud accessor,
+        // so a future `.json` read throws at the misuse site instead of yielding undefined.
+        try { resolve(haPeerLink.parsePeerResponse(text, res.statusCode)); }
+        catch (parseErr) { reject(parseErr); }
       });
     });
     req.on('timeout', function () { req.destroy(new Error('ha-pairing: pair-init timeout')); });
@@ -365,7 +376,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
   const selfEndpoint = (opts && opts.selfEndpoint) || null;
   const myBundle = buildIdentityBundle(db, selfEndpoint, attestationNonce(boot.token));
   const init = await pairingRequest(peerEndpoint, { token: boot.token, bundle: myBundle }, peerCaCertPem, peerLeafThumb, opts);
-  const peerBundle = init.json && init.json.bundle;
+  const peerBundle = init && init.bundle;
   if (!verifyPeerBundle(peerBundle)) {
     throw new Error('ha-pairing: peer bundle failed verification');
   }
@@ -397,7 +408,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
 
   finalizeRole(db, 'active', opts);
   try { haModes.registerHaSegments(db); } catch (segErr) { /* SDN segment registration is best-effort */ }
-  try { auditLog(null, 'HA_PAIRED', 'Paired with standby ' + peerEndpoint + ' (this node active)', null); } catch (auditErr) { /* ignore */ }
+  try { auditLogOn(db, null, 'HA_PAIRED', 'Paired with standby ' + peerEndpoint + ' (this node active)', null); } catch (auditErr) { /* ignore */ }
   return { role: 'active', peerEndpoint: peerEndpoint, peerFingerprint: peerBundle.anchorFingerprint };
 }
 
@@ -444,7 +455,7 @@ function receiveBaseline(db, snapshotB64, opts) {
   } finally {
     try { fs.unlinkSync(tmp); } catch (unlinkErr) { /* ignore */ }
   }
-  try { auditLog(null, 'HA_PAIRED', 'Paired with active peer (this node passive)', null); } catch (auditErr) { /* ignore */ }
+  try { auditLogOn(db, null, 'HA_PAIRED', 'Paired with active peer (this node passive)', null); } catch (auditErr) { /* ignore */ }
   return { ok: true, role: 'passive' };
 }
 

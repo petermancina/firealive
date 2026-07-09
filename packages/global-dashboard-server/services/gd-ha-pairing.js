@@ -33,7 +33,6 @@ const haPeerLink = require('./gd-ha-peer-link');
 const haCdc = require('./gd-ha-cdc');
 const haReplication = require('./gd-ha-replication');
 const { appendGdAuditEntry } = require('./gd-audit-chain');
-const { getDb } = require('../db-init');
 const ca = require('./gd-ca');
 const mode = require('./gd-deployment-mode');
 const cloudAttestation = require('./gd-cloud-attestation');
@@ -46,17 +45,18 @@ const PAIR_INIT_PATH = '/api/ha/pair-init';
 const PAIR_SECRET_PATH = '/api/ha/peer/pair-secret';
 const PAIR_BASELINE_PATH = '/api/ha/peer/pair-baseline';
 
-// Append a GD audit entry on its own short-lived connection (the GD route audit
-// pattern). Never lets logging change a pairing outcome.
-function auditLog(userId, eventType, detail, ip) {
-  let adb = null;
+// Append the audit entry on the SAME connection this module is mutating, rather than
+// opening a second one via getDb(). Pairing writes gd_ha_node, gd_ha_lease, and
+// gd_ha_peer through the injected db; on a live node a second connection points at the
+// same file, so nothing was visibly wrong, but against any other handle -- a hermetic
+// regression clone, a drill -- the role change lands in one database and the
+// tamper-evident HA_PAIRED row in another, forging an event an auditor reads as real.
+// Never lets logging change a pairing outcome, so failures are swallowed.
+function safeAudit(db, eventType, detail) {
   try {
-    adb = getDb();
-    appendGdAuditEntry(adb, { userId: userId, eventType: eventType, detail: detail, ip: ip });
+    appendGdAuditEntry(db, { userId: null, eventType: eventType, detail: detail, ip: null });
   } catch (err) {
-    console.error('gd-ha-pairing audit append failed:', err && err.message ? err.message : err);
-  } finally {
-    if (adb) { try { adb.close(); } catch (closeErr) { /* ignore */ } }
+    try { console.error('gd-ha-pairing audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
   }
 }
 
@@ -345,12 +345,14 @@ function pairingRequest(endpoint, body, peerCaCertPem, peerLeafThumb, opts) {
       res.on('data', function (c) { chunks.push(c); });
       res.on('end', function () {
         const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error('gd-ha-pairing: pair-init HTTP ' + res.statusCode + ' ' + text.slice(0, 200)));
-          return;
-        }
-        try { resolve({ json: text ? JSON.parse(text) : {} }); }
-        catch (jsonErr) { reject(new Error('gd-ha-pairing: malformed pair-init response')); }
+        // One contract for every peer response on the HA surface: resolve the parsed
+        // BODY. This used to resolve a { json } wrapper while gd-ha-peer-link.sendToPeer
+        // resolved the body, so two contradictory shapes lived in one subsystem -- the
+        // precise confusion whose sibling let the failover self-test tie the peer's epoch
+        // and split-brain the pair. parsePeerResponse also attaches the fail-loud accessor,
+        // so a future `.json` read throws at the misuse site instead of yielding undefined.
+        try { resolve(haPeerLink.parsePeerResponse(text, res.statusCode)); }
+        catch (parseErr) { reject(parseErr); }
       });
     });
     req.on('timeout', function () { req.destroy(new Error('gd-ha-pairing: pair-init timeout')); });
@@ -378,7 +380,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
   const selfEndpoint = (opts && opts.selfEndpoint) || null;
   const myBundle = buildIdentityBundle(db, selfEndpoint, attestationNonce(boot.token));
   const init = await pairingRequest(peerEndpoint, { token: boot.token, bundle: myBundle }, peerCaCertPem, peerLeafThumb, opts);
-  const peerBundle = init.json && init.json.bundle;
+  const peerBundle = init && init.bundle;
   if (!verifyPeerBundle(peerBundle)) {
     throw new Error('gd-ha-pairing: peer bundle failed verification');
   }
@@ -410,7 +412,7 @@ async function beginPairing(db, peerEndpoint, bootstrapCode, opts) {
 
   finalizeRole(db, 'active', opts);
   try { haModes.registerHaSegments(db); } catch (segErr) { /* SDN segment registration is best-effort */ }
-  try { auditLog(null, 'HA_PAIRED', 'Paired with standby ' + peerEndpoint + ' (this node active)', null); } catch (auditErr) { /* ignore */ }
+  safeAudit(db, 'HA_PAIRED', 'Paired with standby ' + peerEndpoint + ' (this node active)');
   return { role: 'active', peerEndpoint: peerEndpoint, peerFingerprint: peerBundle.anchorFingerprint };
 }
 
@@ -457,7 +459,7 @@ function receiveBaseline(db, snapshotB64, opts) {
   } finally {
     try { fs.unlinkSync(tmp); } catch (unlinkErr) { /* ignore */ }
   }
-  try { auditLog(null, 'HA_PAIRED', 'Paired with active peer (this node passive)', null); } catch (auditErr) { /* ignore */ }
+  safeAudit(db, 'HA_PAIRED', 'Paired with active peer (this node passive)');
   return { ok: true, role: 'passive' };
 }
 
