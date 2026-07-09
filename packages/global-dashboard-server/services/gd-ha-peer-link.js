@@ -91,6 +91,43 @@ function getPeer(db) {
 // Outbound: POST JSON to peer_endpoint + pathSuffix over pinned mTLS. Resolves
 // with the parsed JSON body; rejects on pin mismatch, transport error, timeout,
 // or a non-2xx status.
+// CONTRACT: sendToPeer resolves the PARSED RESPONSE BODY. There is no { json }
+// wrapper -- callers read body fields directly (reply.epoch, ack.ok). This is the
+// single place that shape is decided, so it is exported and asserted by the
+// regression rather than left as an implicit convention.
+//
+// A silent misread is the failure mode worth engineering against: `reply.json.epoch`
+// yields undefined, so a guarded branch simply never fires and nothing complains.
+// Every parsed object therefore carries a non-enumerable `json` accessor that THROWS
+// a descriptive error. It is invisible to JSON.stringify, object spread, Object.keys,
+// and for...in, and it defers entirely to a real `json` field if a peer ever sends
+// one -- but a caller reaching for the old wrapper fails loudly, at the misuse site.
+//
+// Throws on a non-2xx status or a malformed body; returns {} for an empty body.
+function parsePeerResponse(text, statusCode) {
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new Error('gd-ha-peer-link: peer returned HTTP ' + statusCode + ' ' + String(text || '').slice(0, 200));
+  }
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (jsonErr) {
+    throw new Error('gd-ha-peer-link: malformed JSON from peer');
+  }
+  if (body && typeof body === 'object' && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'json')) {
+    Object.defineProperty(body, 'json', {
+      enumerable: false,
+      configurable: true,
+      get: function () {
+        throw new Error('gd-ha-peer-link: sendToPeer resolves the response body directly; '
+          + 'there is no .json wrapper. Read the field off the body (e.g. reply.epoch).');
+      },
+    });
+  }
+  return body;
+}
+
 function sendToPeer(db, pathSuffix, payload, opts) {
   return new Promise(function (resolve, reject) {
     const peer = getPeer(db);
@@ -154,14 +191,10 @@ function sendToPeer(db, pathSuffix, payload, opts) {
       res.on('data', function (chunk) { chunks.push(chunk); });
       res.on('end', function () {
         const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error('gd-ha-peer-link: peer returned HTTP ' + res.statusCode + ' ' + text.slice(0, 200)));
-          return;
-        }
         try {
-          resolve(text ? JSON.parse(text) : {});
-        } catch (jsonErr) {
-          reject(new Error('gd-ha-peer-link: malformed JSON from peer'));
+          resolve(parsePeerResponse(text, res.statusCode));
+        } catch (parseErr) {
+          reject(parseErr);
         }
       });
     });
@@ -215,6 +248,7 @@ module.exports = {
   normalizeThumb,
   localTlsMaterial,
   localCertThumbprint,
+  parsePeerResponse,
   sendToPeer,
   peerSender,
   requirePeerCert,

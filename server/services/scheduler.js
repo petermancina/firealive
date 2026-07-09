@@ -1052,7 +1052,10 @@ const schedulerService = {
               leaseExpiresAt: lease.lease_expires_at || null
             }, {});
             haLiveness.recordPeerContact();
-            const peerEpoch = reply && reply.json && reply.json.epoch;
+            // sendToPeer resolves the parsed response BODY; there is no .json
+            // wrapper. Reading reply.json yielded undefined, so a superseded active
+            // never adopted the peer's higher epoch from its own heartbeat reply.
+            const peerEpoch = reply && reply.epoch;
             if (peerEpoch && localEpoch && peerEpoch > localEpoch) {
               haLease.recordPeerHeartbeat(db, peerEpoch, null);
               require('./ha/ha-failover').reconcileRole(db);

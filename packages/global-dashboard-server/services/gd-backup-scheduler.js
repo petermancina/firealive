@@ -26,6 +26,7 @@ const gdBackupSchedules = require('./gd-backup-schedules');
 
 const gdBackupScheduler = {
   backupJobs: new Map(),
+  jobs: [],
   reloadJob: null,
   _lastBackupSignature: '',
   haTimers: [],
@@ -35,6 +36,7 @@ const gdBackupScheduler = {
   start() {
     this._registerBackupJobs();
     this._registerHaJobs();
+    this._registerMaintenanceJobs();
     this.reloadJob = cron.schedule('* * * * *', () => {
       if (!this.mayRunWriteJob()) return;
       this._maybeReloadBackupJobs();
@@ -52,6 +54,10 @@ const gdBackupScheduler = {
     }
     try { this.haTimers.forEach((t) => clearInterval(t)); } catch (_e) { /* idempotent */ }
     this.haTimers = [];
+    for (const job of this.jobs) {
+      try { job.stop(); } catch (_e) { /* idempotent */ }
+    }
+    this.jobs = [];
   },
 
   // Returns null (a no-op signal) unless HA is enabled in config AND a peer is
@@ -103,6 +109,113 @@ const gdBackupScheduler = {
       }
     } catch (probeErr) {
       return true;
+    }
+  },
+
+  // -- B6d: maintenance jobs (non-backup, non-HA periodic work) ---------------
+  //
+  // Integration-health probes the configured KMS / storage / MC-trust integrations
+  // and caches the result. It ran on a bare setInterval in index.js; it now lives
+  // here, fronted by mayRunWriteJob() like every other periodic write job. This is
+  // required for HA correctness: cacheResults writes the `config` table, which IS
+  // replicated, so a confirmed paired passive running the probe would overwrite a
+  // replicated row the active owns -- diverging the pair, and on promotion making
+  // the standby's locally-cached value canonical. A passive instead receives the
+  // active's cached results by replication. mayRunWriteJob() fails OPEN, so a
+  // standalone GD probes exactly as before. Skipping the job on a passive also
+  // avoids doubling the outbound probe load on the external integrations.
+  _registerMaintenanceJobs() {
+    try {
+      // Cadences are env-overridable and staggered off the top of the hour,
+      // mirroring the MC scheduler (its push-retry runs at :15, archive-seal at
+      // :35) so the sweeps never pile up on each other.
+      const retrySchedule = process.env.GD_STORAGE_RETRY_SCHEDULE || '15 * * * *';
+      const sealSchedule = process.env.GD_ARCHIVAL_SEAL_SCHEDULE || '35 * * * *';
+      const retentionSchedule = process.env.GD_BACKUP_RETENTION_SCHEDULE || '30 3 * * *';
+
+      this.jobs.push(cron.schedule('*/15 * * * *', () => {
+        if (!this.mayRunWriteJob()) return;
+        this._runIntegrationHealth();
+      }));
+      this.jobs.push(cron.schedule(retrySchedule, () => {
+        if (!this.mayRunWriteJob()) return;
+        this._runStorageRetrySweep();
+      }));
+      this.jobs.push(cron.schedule(sealSchedule, () => {
+        if (!this.mayRunWriteJob()) return;
+        this._runArchivalSeal();
+      }));
+      this.jobs.push(cron.schedule(retentionSchedule, () => {
+        if (!this.mayRunWriteJob()) return;
+        this._runBackupRetention();
+      }));
+      console.log('GD scheduler: maintenance jobs registered (integration-health every 15m, storage-retry '
+        + retrySchedule + ', archival-seal ' + sealSchedule + ', backup-retention ' + retentionSchedule + ')');
+    } catch (registerErr) {
+      console.error('GD scheduler: maintenance job registration failed:', registerErr.message);
+    }
+  },
+
+  // Retry-sweep: re-attempt due pushes across every push table. Writes the
+  // replicated *_pushes / segment tables AND performs outbound cloud uploads, so a
+  // passive must never run it -- two nodes sweeping would double-upload the same
+  // segments and race the push-state rows.
+  _runStorageRetrySweep() {
+    let db = null;
+    try { db = getDb(); } catch (e) { console.error('GD scheduler: storage retry-sweep getDb failed:', e.message); return; }
+    const backupV2 = require('./gd-backup-v2');
+    const archiveSegment = require('./gd-archive-segment');
+    const storagePush = require('./gd-storage-push');
+    const { rebuildForensicExportContext } = require('./forensic-export');
+    Promise.resolve()
+      .then(() => backupV2.retryDueV2BackupPushes(db))
+      .then(() => archiveSegment.retryPendingSegmentPushes(db))
+      .then(() => storagePush.retryDuePushes(db, { pushTable: 'forensic_export_pushes', rebuildContext: rebuildForensicExportContext }))
+      .catch((e) => console.error('GD scheduler: storage retry-sweep error:', e && e.message ? e.message : e))
+      .finally(() => { try { db.close(); } catch (_e) { /* idempotent */ } });
+  },
+
+  // Archival-seal: archive new audit rows and flush the CEF spool into sealed,
+  // pushed segments. The passive's own audit_log rows are node-local and persist;
+  // sealing resumes when it promotes, so nothing is lost by skipping this.
+  _runArchivalSeal() {
+    let db = null;
+    try { db = getDb(); } catch (e) { console.error('GD scheduler: archival-seal getDb failed:', e.message); return; }
+    const auditArchive = require('./gd-audit-archive');
+    const cefSpool = require('./gd-cef-archive-spool');
+    Promise.resolve()
+      .then(() => auditArchive.archiveNewAuditEntries(db))
+      .then(() => cefSpool.flush(db))
+      .catch((e) => console.error('GD scheduler: archival-seal error:', e && e.message ? e.message : e))
+      .finally(() => { try { db.close(); } catch (_e) { /* idempotent */ } });
+  },
+
+  // Retention: delete backup artifacts older than the retention window (mtime).
+  // Synchronous. The sharpest reason this set is gated -- a passive running it
+  // would delete artifacts the active still owns and diverge the backups table.
+  _runBackupRetention() {
+    let db = null;
+    try {
+      db = getDb();
+      require('./gd-backup-v2').cleanOldBackups(db);
+    } catch (e) {
+      console.error('GD scheduler: backup retention error:', e && e.message ? e.message : e);
+    } finally {
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
+    }
+  },
+
+  _runIntegrationHealth() {
+    let db = null;
+    try {
+      db = getDb();
+      const gdIntegrationHealth = require('./gd-integration-health');
+      Promise.resolve(gdIntegrationHealth.runAndCache(db))
+        .catch((err) => console.error('GD scheduler: integration-health probe failed:', err && err.message ? err.message : err))
+        .finally(() => { if (db) { try { db.close(); } catch (_e) { /* idempotent */ } } });
+    } catch (err) {
+      console.error('GD scheduler: integration-health job threw:', err && err.message ? err.message : err);
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
     }
   },
 
@@ -406,9 +519,10 @@ const gdBackupScheduler = {
   _registerHaJobs() {
     const iv = this._haIntervals();
     this.haTimers.push(setInterval(() => { this._haHeartbeatTick(); }, iv.heartbeatSec * 1000));
+    this.haTimers.push(setInterval(() => { this._haDetectTick(); }, iv.heartbeatSec * 1000));
     this.haTimers.push(setInterval(() => { this._haShipTick(); }, iv.syncSec * 1000));
     this.haTimers.push(setInterval(() => { this._haLagTick(); }, iv.lagSec * 1000));
-    console.log('GD scheduler: HA jobs registered (heartbeat ' + iv.heartbeatSec + 's, ship ' + iv.syncSec + 's, lag ' + iv.lagSec + 's)');
+    console.log('GD scheduler: HA jobs registered (heartbeat/detect ' + iv.heartbeatSec + 's, ship ' + iv.syncSec + 's, lag ' + iv.lagSec + 's)');
   },
 
   // Re-register the HA ticks with the current config intervals. Called from PUT
@@ -439,10 +553,32 @@ const gdBackupScheduler = {
         const localEpoch = haLease.currentEpoch(db);
         const lease = haLease.getLease(db) || {};
         try {
-          await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', { epoch: localEpoch, leaseExpiresAt: lease.lease_expires_at || null }, {});
+          const reply = await haPeerLink.sendToPeer(db, '/api/ha/peer/heartbeat', { epoch: localEpoch, leaseExpiresAt: lease.lease_expires_at || null }, {});
           haLiveness.recordPeerContact();
+          // If the peer reports a higher epoch it has promoted -- this node is a
+          // superseded active and must step down (the stale-epoch fence).
+          const peerEpoch = reply && reply.epoch;
+          if (peerEpoch && localEpoch && peerEpoch > localEpoch) {
+            haLease.recordPeerHeartbeat(db, peerEpoch, null);
+            require('./gd-ha-failover').reconcileRole(db);
+          }
         } catch (sendErr) {
-          // Passive unreachable this tick; not fatal (it runs its own detector in PR-3).
+          // Passive unreachable this tick; not fatal (it runs its own detector).
+        }
+        // Isolation self-fence, gated by a grace window since this node took the
+        // lease so a freshly promoted active is not demoted on stale liveness
+        // before traffic/peer contact resumes. Age is computed in SQL (UTC-safe)
+        // from term_started_at; checkSelfFence then demotes only when BOTH the
+        // client and peer signals are present and stale.
+        try {
+          const graceSec = (ctx.cfg.selfFenceTimeoutSec && ctx.cfg.selfFenceTimeoutSec > 0) ? ctx.cfg.selfFenceTimeoutSec : 60;
+          const ageRow = db.prepare("SELECT CAST((julianday('now') - julianday(term_started_at)) * 86400 AS REAL) AS age FROM gd_ha_lease WHERE id = 'current'").get();
+          const ageSec = (ageRow && Number.isFinite(ageRow.age)) ? ageRow.age : null;
+          if (ageSec !== null && ageSec > graceSec) {
+            require('./gd-ha-failover').checkSelfFence(db, haLiveness.snapshot());
+          }
+        } catch (fenceErr) {
+          // Self-fence is a safety net; never let it disrupt the heartbeat.
         }
       }
     } catch (err) {
@@ -450,6 +586,24 @@ const gdBackupScheduler = {
     } finally {
       if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
       this._haHeartbeatBusy = false;
+    }
+  },
+
+  // Passive only: when the active's delivered heartbeat has gone stale past the
+  // configured miss-count, evaluatePromotion claims the next epoch, installs the
+  // sealed promotion material, and flips this node to active.
+  _haDetectTick() {
+    let db = null;
+    try {
+      db = getDb();
+      const ctx = this.haReplicationContext(db);
+      if (ctx && ctx.role === 'passive') {
+        require('./gd-ha-failover').evaluatePromotion(db, {});
+      }
+    } catch (err) {
+      console.error('GD scheduler: HA failure detection failed:', err && err.message ? err.message : err);
+    } finally {
+      if (db) { try { db.close(); } catch (_e) { /* idempotent */ } }
     }
   },
 

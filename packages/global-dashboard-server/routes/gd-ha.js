@@ -23,6 +23,8 @@ const { getDb } = require('../db-init');
 const gdHaPairing = require('../services/gd-ha-pairing');
 const gdHaReplication = require('../services/gd-ha-replication');
 const gdHaLease = require('../services/gd-ha-lease');
+const gdHaFailover = require('../services/gd-ha-failover');
+const gdHaPeerLink = require('../services/gd-ha-peer-link');
 const deploymentMode = require('../services/gd-deployment-mode');
 const { appendGdAuditEntry } = require('../services/gd-audit-chain');
 
@@ -50,6 +52,27 @@ function loadHaConfig(db) {
 
 function actor(req) {
   return (req.user && req.user.id) ? req.user.id : 'system';
+}
+
+const PEER_LEASE_PATH = '/api/ha/peer/lease';
+
+function nodeRole(db) {
+  const row = db.prepare("SELECT role FROM gd_ha_node WHERE id = 'self'").get();
+  return row ? row.role : 'standalone';
+}
+
+function peerPaired(db) {
+  return !!db.prepare("SELECT 1 FROM gd_ha_peer WHERE status = 'paired' LIMIT 1").get();
+}
+
+// A lightweight integrity fingerprint over stable replicated reference data,
+// compared across the pair and before/after a drill to confirm no rows were lost.
+function dataChecksum(db) {
+  try {
+    return 'u' + db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+  } catch (e) {
+    return 'na';
+  }
 }
 
 // Append a GD audit entry on a short-lived connection (the GD route audit
@@ -89,11 +112,11 @@ function getClientCertThumbprint(req) {
   }
 }
 
-// Apply an inbound peer epoch signal (heartbeat): adopt the monotonic epoch. The
-// role-reconcile that steps down a now-superseded active is failover behavior and
-// is added here with gd-ha-failover (PR-3).
+// Apply an inbound peer epoch signal (heartbeat or lease assertion): adopt the
+// monotonic epoch and step down if we are a now-superseded active.
 function applyPeerLeaseSignal(db, body) {
   const r = gdHaLease.recordPeerHeartbeat(db, body.epoch, body.leaseExpiresAt);
+  gdHaFailover.reconcileRole(db);
   return { ok: r.ok !== false, epoch: gdHaLease.currentEpoch(db), reason: r.reason || null };
 }
 
@@ -151,6 +174,28 @@ peerRouter.post('/heartbeat', requireObjectBody, (req, res) => {
     res.json(applyPeerLeaseSignal(db, req.body || {}));
   } catch (hbErr) {
     res.status(500).json({ error: 'heartbeat error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+// Graceful-handover promotion: the former active stepped down and is telling this
+// node to take over now, rather than waiting for failure detection. Idempotent --
+// a node that already promoted (via detection) simply acknowledges.
+peerRouter.post('/lease', requireObjectBody, (req, res) => {
+  const db = getDb();
+  try {
+    const body = req.body || {};
+    if (body.handover === true) {
+      if (nodeRole(db) === 'passive') {
+        const r = gdHaFailover.promote(db, {});
+        return res.json({ ok: true, promoted: true, role: 'active', epoch: r.epoch, checksum: dataChecksum(db) });
+      }
+      return res.json({ ok: true, promoted: false, role: nodeRole(db), epoch: gdHaLease.currentEpoch(db), checksum: dataChecksum(db) });
+    }
+    res.json(applyPeerLeaseSignal(db, body));
+  } catch (leaseErr) {
+    res.status(500).json({ error: 'lease error' });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }
@@ -305,6 +350,100 @@ configRouter.post('/pair', requireObjectBody, async (req, res) => {
     const detail = (pairErr && pairErr.message) ? pairErr.message : 'error';
     try { auditLog(actor(req), 'HA_PAIR_FAILED', 'Pairing with ' + peerEndpoint + ' failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
     res.status(502).json({ error: 'pairing failed', detail: detail });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+// Graceful manual failover, initiated ON THE ACTIVE. Step down FIRST so this node
+// stops writing before the peer promotes -- the make-before-break order that
+// guarantees no split-brain. If the handover signal cannot be delivered, the peer
+// still promotes via failure detection; this node stays passive either way.
+configRouter.post('/manual-failover', requireObjectBody, async (req, res) => {
+  const db = getDb();
+  try {
+    if (nodeRole(db) !== 'active') {
+      return res.status(409).json({ error: 'manual failover is initiated on the active node (it must step down first)' });
+    }
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'no paired peer to fail over to' });
+    }
+    const fromEpoch = gdHaLease.currentEpoch(db);
+    gdHaFailover.demote(db, 'manual', {});
+    try {
+      const peer = await gdHaPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {}) || {};
+      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
+      res.json({ ok: true, role: 'passive', peerPromoted: peer.promoted !== false, peerEpoch: peer.epoch || null });
+    } catch (sendErr) {
+      const m = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'error';
+      auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Stepped down; handover signal failed (' + m + '); peer will promote via detection', req.ip);
+      res.json({ ok: true, role: 'passive', peerPromoted: false, note: 'peer will promote via failure detection' });
+    }
+  } catch (failErr) {
+    res.status(500).json({ error: 'manual failover error', detail: (failErr && failErr.message) ? failErr.message.slice(0, 160) : 'error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+// Failover self-test (drill), run FROM THE ACTIVE: fail over to the peer, measure
+// it, verify the peer serves and its data matches, then fail back. Reports real
+// measured numbers, never a hard-coded claim. Fail-back adopts the peer's new epoch
+// FIRST so this node's re-promotion claims a strictly higher one -- a same-epoch
+// re-promotion would put both nodes at the same epoch (split-brain). A failback
+// failure leaves the peer active at a valid higher epoch, which is safe.
+configRouter.post('/self-test', requireObjectBody, async (req, res) => {
+  const db = getDb();
+  try {
+    if (nodeRole(db) !== 'active') {
+      return res.status(409).json({ error: 'the failover self-test is run from the active node' });
+    }
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'no paired peer for a failover self-test' });
+    }
+    try { auditLog(actor(req), 'HA_TEST_STARTED', 'HA failover self-test started', req.ip); } catch (auditErr) { /* ignore */ }
+    const t0 = Date.now();
+    const fromEpoch = gdHaLease.currentEpoch(db);
+    const checksumBefore = dataChecksum(db);
+    gdHaFailover.demote(db, 'test', {});
+    let promoteResp = {};
+    try {
+      promoteResp = await gdHaPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, test: true, fromEpoch: fromEpoch }, {}) || {};
+    } catch (sendErr) {
+      try { gdHaFailover.promote(db, {}); } catch (restoreErr) { /* best-effort restore */ }
+      return res.status(502).json({ ok: false, error: 'self-test could not promote the peer', detail: (sendErr && sendErr.message) ? sendErr.message.slice(0, 160) : 'error' });
+    }
+    const failoverMs = Date.now() - t0;
+    const served = promoteResp.role === 'active' && promoteResp.promoted !== false;
+    const integrityOk = !!promoteResp.checksum && promoteResp.checksum === checksumBefore;
+
+    const tBack0 = Date.now();
+    let restored = false;
+    try {
+      if (promoteResp.epoch) {
+        gdHaLease.recordPeerHeartbeat(db, promoteResp.epoch, null);
+      }
+      gdHaFailover.promote(db, {});
+      const lease = gdHaLease.getLease(db) || {};
+      const back = await gdHaPeerLink.sendToPeer(db, PEER_LEASE_PATH, { epoch: gdHaLease.currentEpoch(db), leaseExpiresAt: lease.lease_expires_at || null }, {});
+      restored = !!(back && back.ok);
+    } catch (backErr) {
+      restored = false;
+    }
+    const failbackMs = Date.now() - tBack0;
+    const result = {
+      ok: true,
+      failoverTimeMs: failoverMs,
+      failbackTimeMs: failbackMs,
+      served: served,
+      integrityOk: integrityOk,
+      restored: restored,
+      epoch: gdHaLease.currentEpoch(db),
+    };
+    try { auditLog(actor(req), 'HA_TEST_COMPLETE', 'HA self-test: failover ' + failoverMs + 'ms, served=' + served + ', integrity=' + integrityOk + ', restored=' + restored, req.ip); } catch (auditErr) { /* ignore */ }
+    res.json(result);
+  } catch (testErr) {
+    res.status(500).json({ error: 'self-test error', detail: (testErr && testErr.message) ? testErr.message.slice(0, 160) : 'error' });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }

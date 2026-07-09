@@ -228,8 +228,10 @@ router.post('/manual-failover', requireObjectBody, async (req, res) => {
     // make-before-break order that guarantees no split-brain.
     haFailover.demote(db, 'manual', {});
     try {
-      const r = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {});
-      const peer = (r && r.json) ? r.json : {};
+      // sendToPeer resolves the parsed response BODY (single resolve path); there
+      // is no .json wrapper. Reading r.json yielded undefined, so the peer's real
+      // epoch and promoted flag were never observed.
+      const peer = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, fromEpoch: fromEpoch }, {}) || {};
       auditLog(actor(req), 'HA_MANUAL_FAILOVER', 'Graceful failover: stepped down, peer promoted to epoch ' + (peer.epoch || '?'), req.ip);
       res.json({ ok: true, role: 'passive', peerPromoted: peer.promoted !== false, peerEpoch: peer.epoch || null });
     } catch (sendErr) {
@@ -264,8 +266,7 @@ router.post('/test-failover', requireObjectBody, async (req, res) => {
     haFailover.demote(db, 'test', {});
     let promoteResp = {};
     try {
-      const r = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, test: true, fromEpoch: fromEpoch }, {});
-      promoteResp = (r && r.json) ? r.json : {};
+      promoteResp = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { handover: true, test: true, fromEpoch: fromEpoch }, {}) || {};
     } catch (sendErr) {
       try { haFailover.promote(db, {}); } catch (restoreErr) { /* best-effort restore */ }
       return res.status(502).json({ ok: false, error: 'self-test could not promote the peer', detail: (sendErr && sendErr.message) ? sendErr.message.slice(0, 160) : 'error' });
@@ -285,7 +286,7 @@ router.post('/test-failover', requireObjectBody, async (req, res) => {
       haFailover.promote(db, {});
       const lease = haLease.getLease(db) || {};
       const back = await haPeerLink.sendToPeer(db, PEER_LEASE_PATH, { epoch: haLease.currentEpoch(db), leaseExpiresAt: lease.lease_expires_at || null }, {});
-      restored = !!(back && back.json && back.json.ok);
+      restored = !!(back && back.ok);
     } catch (backErr) {
       restored = false;
     }

@@ -627,6 +627,42 @@ async function createForensicExport(db, request, opts) {
   }
 }
 
+// Rebuild the artifact context for a pending forensic-export push, so a retry
+// sweep can re-upload without the original in-request context. Relocated here
+// from index.js (B6d): the storage retry sweep moved onto the scheduler's
+// write-gated maintenance jobs, and the sweep needs this rebuilder from outside
+// index.js. gd-storage-push is required lazily to keep the module graph acyclic.
+// Returns { ok, artifactContext } or { ok:false, error, fatal }.
+function rebuildForensicExportContext(db, pushRow) {
+  const storagePush = require('./gd-storage-push');
+  const exp = db.prepare(
+    'SELECT id, archive_path, manifest_path, manifest_sig_path, cosign_signature_path, archive_sha256 '
+    + 'FROM forensic_exports WHERE id = ?'
+  ).get(pushRow.export_id);
+  if (!exp) return { ok: false, error: 'forensic export row no longer exists', fatal: true };
+  const specs = [{ name: path.basename(exp.archive_path), absolutePath: exp.archive_path }];
+  if (exp.manifest_path) specs.push({ name: path.basename(exp.manifest_path), absolutePath: exp.manifest_path });
+  if (exp.manifest_sig_path) specs.push({ name: path.basename(exp.manifest_sig_path), absolutePath: exp.manifest_sig_path });
+  if (exp.cosign_signature_path) specs.push({ name: path.basename(exp.cosign_signature_path), absolutePath: exp.cosign_signature_path });
+  for (const s of specs) {
+    if (!s.absolutePath || !fs.existsSync(s.absolutePath)) {
+      return { ok: false, error: 'forensic export file missing on disk: ' + s.name, fatal: true };
+    }
+  }
+  const hashed = storagePush.hashFilesForContext(specs);
+  if (!hashed.ok) return { ok: false, error: hashed.error, fatal: true };
+  return {
+    ok: true,
+    artifactContext: {
+      artifactId: exp.id,
+      sourceDir: path.dirname(exp.archive_path),
+      files: hashed.files,
+      manifestSha256: exp.archive_sha256 || null,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
 module.exports = {
   createForensicExport,
   ensureActiveSigningKey,
@@ -638,6 +674,7 @@ module.exports = {
   fetchBackupChainSlice,
   fetchIncidentRecordsSlice,
   fetchAuthenticationLogsSlice,
+  rebuildForensicExportContext,
   fetchUserAccessLogsSlice,
   // test-only
   _registerFormatForTest,

@@ -2957,6 +2957,14 @@ class RegressionRunner {
       const isoSec = 30;
       const stale = new Date(Date.now() - (isoSec + 120) * 1000).toISOString();
       const fresh = new Date().toISOString();
+      // A drill must never forge a fence event. ha-failover audits through the
+      // connection it mutates (auditLogOn), so a fence exercised against this
+      // hermetic clone must record HA_SELF_FENCED in the CLONE and leave the live
+      // hash-chained audit_log -- which an operator or auditor reads as a record of
+      // real events -- untouched. Both halves are asserted below.
+      const liveFenceRows = () => this.db
+        .prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'HA_SELF_FENCED'").get().n;
+      const liveBefore = liveFenceRows();
       const setup = () => {
         const mem = cloneLiveSchema(this.db);
         mem.prepare("INSERT OR REPLACE INTO ha_node (id, role) VALUES ('self', 'active')").run();
@@ -2979,15 +2987,99 @@ class RegressionRunner {
         const r = hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: fresh });
         if (r.fenced !== false) throw new Error('a fresh client signal must not fence (got ' + JSON.stringify(r) + ')');
       } finally { mem.close(); }
-      // 3. Both signals stale -> fence and demote to passive.
+      // 3. Both signals stale -> fence and demote to passive, auditing INTO the clone.
       mem = setup();
       try {
         const r = hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: stale });
         if (r.fenced !== true) throw new Error('dual isolation must fence (got ' + JSON.stringify(r) + ')');
         const role = mem.prepare("SELECT role FROM ha_node WHERE id = 'self'").get().role;
         if (role !== 'passive') throw new Error('self-fence did not demote to passive (role=' + role + ')');
+        const clonedRows = mem
+          .prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'HA_SELF_FENCED'").get().n;
+        if (clonedRows !== 1) {
+          throw new Error('the fence audited ' + clonedRows + ' rows into the clone; it must audit through the connection it mutates');
+        }
       } finally { mem.close(); }
-      return 'abstains on null/single signal; fences + demotes on dual isolation';
+      // 4. The live tamper-evident chain must be untouched by the drill.
+      if (liveFenceRows() !== liveBefore) {
+        throw new Error('the self-fence check forged an HA_SELF_FENCED row into the LIVE audit chain');
+      }
+      return 'abstains on null/single signal; fences + demotes on dual isolation; audits into the clone, live chain untouched';
+    });
+
+    // ── B6d: peer-response contract ────────────────────────────────────
+    // sendToPeer resolves the PARSED RESPONSE BODY; there is no { json } wrapper.
+    // Three call sites once read `.json` and silently received undefined. The worst
+    // consequence was in the failover self-test: the peer's epoch was never adopted,
+    // so the fail-back re-promotion TIED the peer's epoch, leaving two actives at one
+    // epoch -- a split-brain produced by the drill meant to prove failover was safe.
+    // These two checks make the class fail in CI rather than in the field.
+    await check('high_availability', 'Peer response resolves the body; .json wrapper reads throw', () => {
+      const { parsePeerResponse } = require('./ha/ha-peer-link');
+      if (typeof parsePeerResponse !== 'function') throw new Error('ha-peer-link.parsePeerResponse not exported');
+      const body = parsePeerResponse('{"epoch":9,"ok":true}', 200);
+      if (body.epoch !== 9 || body.ok !== true) throw new Error('body fields not readable directly');
+      if (JSON.stringify(parsePeerResponse('', 200)) !== '{}') throw new Error('empty body should yield {}');
+      let loud = false;
+      try { void body.json; } catch (e) { loud = /no .json wrapper/.test(e.message); }
+      if (!loud) throw new Error('.json wrapper read did not throw');
+      let http = false;
+      try { parsePeerResponse('stale', 409); } catch (e) { http = /HTTP 409/.test(e.message); }
+      if (!http) throw new Error('non-2xx did not throw');
+      let bad = false;
+      try { parsePeerResponse('not json', 200); } catch (e) { bad = /malformed JSON/.test(e.message); }
+      if (!bad) throw new Error('malformed body did not throw');
+      return 'body parsed directly; .json throws; non-2xx + malformed throw';
+    });
+    await check('high_availability', 'No HA source reads .json off a peer-link result', () => {
+      const fsMod = require('fs');
+      const pathMod = require('path');
+      const targets = [
+        '../routes/ha.js',
+        './ha/ha-peer-link.js',
+        './ha/ha-replication.js',
+        './ha/ha-failover.js',
+        './ha/ha-pairing.js',
+        './scheduler.js',
+      ];
+      // Comments and string literals are stripped first, so the scan never flags the
+      // prose that names the wrong idiom on purpose. res.json(...) is the response
+      // helper and is the only permitted receiver.
+      const codeOnly = (src) => src
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+        .replace(/'(?:\\.|[^'\\])*'/g, "''")
+        .replace(/"(?:\\.|[^"\\])*"/g, '""');
+      const offenders = [];
+      let scanned = 0;
+      for (const rel of targets) {
+        const abs = pathMod.join(__dirname, rel);
+        if (!fsMod.existsSync(abs)) continue;
+        scanned += 1;
+        const code = codeOnly(fsMod.readFileSync(abs, 'utf8'));
+        const re = /([A-Za-z_$][A-Za-z0-9_$]*)\.json\b/g;
+        let m;
+        while ((m = re.exec(code)) !== null) {
+          if (m[1] !== 'res') offenders.push(rel + ': ' + m[1] + '.json');
+        }
+      }
+      if (offenders.length) throw new Error('peer-link result read via a .json wrapper: ' + offenders.join(', '));
+      return scanned + ' HA sources scanned; no wrapper reads';
+    });
+    await check('high_availability', 'A promoting node claims a STRICTLY HIGHER epoch than its peer', () => {
+      // The monotonic lease trigger forbids an epoch DECREASE, not a TIE. A node
+      // re-promoting after its peer claimed epoch N must adopt N first, so
+      // claimNextEpoch yields N+1. Skipping the adoption yields N again: two actives
+      // at one epoch. This asserts the primitive the self-test depends on.
+      const hl = require('./ha/ha-lease');
+      const mem = cloneLiveSchema(this.db);
+      try {
+        mem.prepare("INSERT OR REPLACE INTO ha_lease (id, epoch, holder) VALUES ('current', 5, 'self')").run();
+        hl.recordPeerHeartbeat(mem, 6, null);
+        const claimed = hl.claimNextEpoch(mem, 30);
+        if (claimed <= 6) throw new Error('claimed epoch ' + claimed + ' ties or trails the peer (split-brain)');
+        return 'adopted peer epoch 6, claimed ' + claimed;
+      } finally { mem.close(); }
     });
 
     // ── Automated Update Detection (B5r) ───────────────────────────

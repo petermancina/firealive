@@ -7,7 +7,8 @@
 // is verified by GET /api/audit/integrity and the periodic integrity check.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const { getDb } = require('../db/init');
+const path = require('path');
+const { getDb, DB_PATH } = require('../db/init');
 const { logger } = require('../services/logger');
 const { cefDeviceVersion } = require('../lib/version');
 const { appendAuditEntry } = require('../services/audit-chain');
@@ -70,20 +71,55 @@ function auditMiddleware(req, res, next) {
  * @param {string} detail - Human-readable detail string
  * @param {string} [ip] - Optional IP address; pass req.ip from route handlers
  */
-function auditLog(userId, eventType, detail, ip) {
+// Is this handle the real, durable audit chain -- the configured live database?
+// A ':memory:' clone (the regression's hermetic copies) or any other file is not.
+// The question is deliberately NOT "was a connection supplied": in production the
+// callers always supply a live handle, so keying off injection would silence SIEM
+// for every real failover.
+function isLiveChain(db) {
   try {
-    const db = getDb();
+    if (!db || typeof db.name !== 'string' || !db.name || db.name === ':memory:') {
+      return false;
+    }
+    return path.resolve(db.name) === path.resolve(DB_PATH);
+  } catch (pathErr) {
+    return false;
+  }
+}
+
+// Append a business event on a caller-supplied connection. Callers that already
+// hold a handle (HA failover mutating ha_node/ha_lease) must audit THROUGH it, so
+// the state change and its audit record always land in the same database.
+//
+// SIEM streaming is gated on that database actually BEING the live chain. A drill
+// or a regression that exercises promote/demote against a scratch copy therefore
+// records the event where the change happened and streams nothing -- it can neither
+// forge a row into the tamper-evident chain an auditor reads, nor page a SOC with a
+// fence that never occurred. A real failover, on the live handle, streams as before.
+function auditLogOn(db, userId, eventType, detail, ip) {
+  try {
     const cef = formatCEF(eventType, userId, detail, ip);
     // Same chained append path as the middleware — business events are part of
     // the same tamper-evident chain.
     appendAuditEntry(db, { userId, eventType, detail, ip, cef });
-    db.close();
 
-    if (process.env.SIEM_ENABLED === 'true') {
+    if (isLiveChain(db) && process.env.SIEM_ENABLED === 'true') {
       streamToSIEM(cef);
     }
   } catch (err) {
     logger.error('Audit log write failed', { error: err.message });
+  }
+}
+
+function auditLog(userId, eventType, detail, ip) {
+  let db = null;
+  try {
+    db = getDb();
+    auditLogOn(db, userId, eventType, detail, ip);
+  } catch (err) {
+    logger.error('Audit log write failed', { error: err.message });
+  } finally {
+    if (db) { try { db.close(); } catch (closeErr) { /* ignore */ } }
   }
 }
 
@@ -109,4 +145,4 @@ function streamToSIEM(cefMessage) {
   }
 }
 
-module.exports = { auditMiddleware, auditLog, formatCEF };
+module.exports = { auditMiddleware, auditLog, auditLogOn, isLiveChain, formatCEF };

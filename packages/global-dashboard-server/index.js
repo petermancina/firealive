@@ -28,22 +28,18 @@ const signingKeysSvc = require('./services/signing-keys');
 const cicdBundle = require('./services/cicd-bundle');
 const forensicExport = require('./services/forensic-export');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
-// B6a: GD self-protection wiring (runtime monitor, alert routing, integration
-// health, metrics collector, the config-lock chokepoint + its write registry).
+// B6a: GD self-protection wiring (runtime monitor, alert routing, metrics
+// collector, the config-lock chokepoint + its write registry). Integration-health
+// is driven by the scheduler (B6d), not from here.
 const { routeGdAlert } = require('./services/gd-alert-router');
 const { gdRuntimeMonitor } = require('./services/gd-runtime-monitor');
-const gdIntegrationHealth = require('./services/gd-integration-health');
 const { GdMetricsCollector } = require('./services/gd-metrics-collector');
 const { configLockChokepoint } = require('./services/gd-config-lock');
 const { isGdConfigWriteRequest } = require('./services/gd-config-write-routes');
 const gdBackupFullSuite = require('./services/gd-backup-full-suite');
 const storageRouting = require('./services/gd-storage-routing');
 const storagePush = require('./services/gd-storage-push');
-const backupV2 = require('./services/gd-backup-v2');
 const { gdBackupScheduler } = require('./services/gd-backup-scheduler');
-const archiveSegment = require('./services/gd-archive-segment');
-const auditArchive = require('./services/gd-audit-archive');
-const cefSpool = require('./services/gd-cef-archive-spool');
 const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 const exportEncryption = require('./services/export-encryption');
 const { migrateExportsAtRest } = require('./services/export-encryption-migration');
@@ -58,7 +54,9 @@ const {
 
 const app = express();
 const PORT = process.env.GD_PORT || 4001;
-const JWT_SECRET = process.env.GD_JWT_SECRET || crypto.randomBytes(32).toString('hex');
+// The session JWT secret is held in gd-jwt-secret (mutable) so HA promotion can
+// install the shared secret at runtime; read it through getJwtSecret() everywhere.
+const { getJwtSecret } = require('./services/gd-jwt-secret');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 //
@@ -160,7 +158,12 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: (req) => req.path === '/api/health',
+  // Mounted at '/api/', so Express strips the mount path and req.path here is
+  // '/health'. Compare against originalUrl, the convention the config-lock
+  // chokepoint and the device-PoP gate already follow, or the skip never fires and
+  // the load balancer's health probes are rate-limited -- which can make the LB
+  // declare a perfectly healthy active down and trigger a needless failover.
+  skip: (req) => ((req.originalUrl || req.url || '').split('?')[0]) === '/api/health',
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });
@@ -173,9 +176,15 @@ app.use('/api/', apiLimiter);
 // Bookkeeping only; never blocks a request.
 const gdHaLiveness = require('./services/gd-ha-liveness');
 app.use('/api/', (req, res, next) => {
-  if (!req.path.startsWith('/api/ha/peer') && req.path !== '/api/health') {
-    try { gdHaLiveness.recordClientRequest(); } catch (_e) { /* never block on liveness bookkeeping */ }
-  }
+  // The exclusion rule lives in gd-ha-liveness.shouldStampClientRequest, exported so
+  // the regression can assert it. Pass originalUrl: this middleware is mounted at
+  // '/api/', and Express strips the mount path, so req.path here is '/health', never
+  // '/api/health'.
+  try {
+    if (gdHaLiveness.shouldStampClientRequest(req.originalUrl || req.url)) {
+      gdHaLiveness.recordClientRequest();
+    }
+  } catch (_e) { /* never block on liveness bookkeeping */ }
   next();
 });
 
@@ -210,7 +219,7 @@ app.use('/api', (req, res, next) => {
       const fullPath = (req.originalUrl || req.url || '').split('?')[0];
       if (isGdConfigWriteRequest(req.method, fullPath)) {
         const token = (req.headers.authorization || '').replace('Bearer ', '');
-        if (token) { try { req.user = jwt.verify(token, JWT_SECRET); } catch (_e) { /* leave unset */ } }
+        if (token) { try { req.user = jwt.verify(token, getJwtSecret()); } catch (_e) { /* leave unset */ } }
       }
     }
   } catch (_e) { /* ignore */ }
@@ -228,6 +237,21 @@ app.use('/api/', require('./services/gd-sdn-admission').sdnAdmission());
 app.use('/api/', require('./services/gd-sase-admission').saseAdmission());
 app.use('/api/', require('./services/gd-sdn-fail-safe').sdnFailSafe());
 app.use('/api/', require('./services/gd-sase-fail-safe').saseFailSafe());
+
+// B6d: HA request-layer write guard. On a confirmed passive (HA enabled + paired +
+// node role passive) it refuses mutating requests (POST/PUT/PATCH/DELETE) with 503
+// `ha_passive_read_only`, so a misrouted, retried, or directly-addressed write can
+// never make the standby diverge from the active. Reads always pass, and the /ha
+// control plane is exempt: HA admin (pair, config, manual-failover, self-test) must
+// stay reachable to operate or recover the standby. The peer data plane is mounted
+// earlier, ahead of the body parser, so it never reaches here. No-op on standalone
+// and on the active; fails open on any uncertainty.
+//
+// Mounted last among the global gates, after admission and the fail-safes, so an
+// unadmitted or fail-safe-blocked caller is rejected on its own terms and never
+// learns this node's HA role. Placed pre-auth because the check is on node role,
+// not on the user -- the same reasoning as the Regional Server's placement.
+app.use('/api/', require('./services/gd-ha-write-guard').haWriteGuard());
 
 // Device-key proof-of-possession gate (D28). For a device-bound session (the
 // token carries an RFC 7800 cnf.jkt), every request must present a fresh,
@@ -276,7 +300,7 @@ const authMiddleware = (roles, options) => (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Authentication required' });
   let decoded;
   try {
-    decoded = jwt.verify(token, JWT_SECRET);
+    decoded = jwt.verify(token, getJwtSecret());
   } catch (e) { return res.status(401).json({ error: 'Invalid or expired token' }); }
   if (roles && !roles.includes(decoded.role)) return res.status(403).json({ error: 'Insufficient permissions' });
   req.user = decoded;
@@ -416,7 +440,7 @@ function gdResolveLoginDeviceKey(db, user, req) {
 function gdIssuePasswordlessSession(db, user, req, method, cnf) {
   const claims = { id: user.id, username: user.username, role: user.role, name: user.name };
   if (cnf) claims.cnf = cnf;
-  const token = jwt.sign(claims, JWT_SECRET, { expiresIn: '8h' });
+  const token = jwt.sign(claims, getJwtSecret(), { expiresIn: '8h' });
   db.prepare("INSERT INTO auth_log (username, action, ip, method) VALUES (?, 'LOGIN_SUCCESS', ?, ?)").run(user.username, req.ip, method);
   db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(user.id);
   try { appendGdAuditEntry(db, { userId: user.id, eventType: 'LOGIN_SUCCESS', detail: `user=${user.username} role=${user.role} method=${method} aal=high devicebound=${!!cnf}`, ip: req.ip, severity: 'info' }); } catch (_) { /* audit best-effort */ }
@@ -3528,7 +3552,7 @@ function gdRunCompromiseScan(db) {
   add('Binary integrity', () => { let m = null; try { m = gdRuntimeMonitor.getMetrics(); } catch (_e) { m = null; } return (m && m.fileCount) ? PASS(m.fileCount + ' server files under file-integrity monitoring') : WARN('runtime file-integrity monitor not yet active'); });
   add('Database integrity', () => { const r = db.prepare('PRAGMA integrity_check').get(); const v = r ? (r.integrity_check || Object.values(r)[0]) : null; return v === 'ok' ? PASS('PRAGMA integrity_check: ok') : FAIL('integrity_check: ' + v); });
   add('Network connections', () => PASS('app-layer HTTPS/mTLS listener healthy; host-level connection monitoring is operator-managed (EDR)'));
-  add('API token validation', () => (JWT_SECRET && JWT_SECRET.length >= 16) ? PASS('signing secret configured') : FAIL('signing secret weak or unset'));
+  add('API token validation', () => { const s = getJwtSecret(); return (s && s.length >= 16) ? PASS('signing secret configured') : FAIL('signing secret weak or unset'); });
   add('TLS certificate', () => PASS('server bound over HTTPS/mTLS'));
   add('Audit log continuity', () => {
     const cp = db.prepare('SELECT head_hash, entry_count FROM audit_chain_checkpoint ORDER BY id DESC LIMIT 1').get();
@@ -3742,7 +3766,8 @@ function runGdRegression(db) {
 
   // ── Auth (8) ───────────────────────────────────────────────────────────
   record('auth', 'JWT_SECRET configured', () => {
-    if (!JWT_SECRET || typeof JWT_SECRET !== 'string' || JWT_SECRET.length < 16) {
+    const s = getJwtSecret();
+    if (!s || typeof s !== 'string' || s.length < 16) {
       throw new Error('JWT_SECRET missing or too short');
     }
     if (!process.env.GD_JWT_SECRET) return 'using ephemeral fallback (set GD_JWT_SECRET for persistence across restarts)';
@@ -3751,7 +3776,7 @@ function runGdRegression(db) {
   record('auth', 'JWT session round-trip (HS256 sign / verify / tamper-reject)', () => {
     // Passwordless system: the only login-time secret exercised here is the
     // JWT session token. There is no password hash and no TOTP.
-    const secret = JWT_SECRET || crypto.randomBytes(32).toString('hex');
+    const secret = getJwtSecret() || crypto.randomBytes(32).toString('hex');
     const token = jwt.sign({ sub: 'regression', t: Date.now() }, secret, { algorithm: 'HS256', expiresIn: '60s' });
     const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });
     if (!decoded || decoded.sub !== 'regression') throw new Error('JWT did not round-trip the claim');
@@ -4031,6 +4056,249 @@ function runGdRegression(db) {
     } finally {
       t.close();
     }
+  });
+
+  // -- B6d PR-3: automated failover, write-guard, peer-response contract --------
+  //
+  // Stateful checks run against hermetic in-memory databases whose schema is CLONED
+  // FROM THE LIVE DATABASE, so they can never drift from production DDL. Because
+  // gd-ha-failover audits through the connection it mutates, promote/demote inside a
+  // check write their audit rows into the temp database; the self-fence check asserts
+  // that the live hash-chained audit_log gains nothing, so a self-test can never
+  // forge HA_SELF_FENCED events into a log an auditor reads as real.
+  const haCloneSchema = (live, names) => {
+    const Database = require('better-sqlite3');
+    const mem = new Database(':memory:');
+    for (const n of names) {
+      const row = live.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(n);
+      if (row && row.sql) mem.exec(row.sql);
+    }
+    return mem;
+  };
+
+  record('gd_high_availability', 'Failover promotion API present', () => {
+    const hf = require('./services/gd-ha-failover');
+    const need = ['evaluatePromotion', 'promote', 'demote', 'reconcileRole', 'activeIsDown', 'inCooldown', 'checkSelfFence', 'getFailoverConfig'];
+    const missing = need.filter((f) => typeof hf[f] !== 'function');
+    if (missing.length) throw new Error('gd-ha-failover missing: ' + missing.join(', '));
+    return need.length + ' functions present';
+  });
+  record('gd_high_availability', 'Request-layer write guard present; this node not blocked', () => {
+    const g = require('./services/gd-ha-write-guard');
+    if (typeof g.haWriteGuard !== 'function' || typeof g.isConfirmedPassive !== 'function') throw new Error('gd-ha-write-guard API missing');
+    if (g.isConfirmedPassive(db) !== false) throw new Error('this node misclassified as a confirmed passive');
+    if (typeof g.haWriteGuard() !== 'function') throw new Error('haWriteGuard() did not return a middleware');
+    return 'guard present; this node not blocked';
+  });
+  record('gd_high_availability', 'Write guard recognises a paired passive; fails open otherwise', () => {
+    const g = require('./services/gd-ha-write-guard');
+    const t = haCloneSchema(db, ['config', 'gd_ha_peer', 'gd_ha_node']);
+    try {
+      t.prepare("INSERT INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify({ enabled: true }));
+      t.prepare("INSERT INTO gd_ha_peer (peer_endpoint, peer_anchor_fingerprint, peer_anchor_public_pem, peer_wrap_public_pem, peer_cert_fingerprint, status) VALUES ('https://peer:8443', 'fp', 'pem', 'pem', 'certfp', 'paired')").run();
+      t.prepare("INSERT INTO gd_ha_node (id, role) VALUES ('self', 'passive')").run();
+      if (g.isConfirmedPassive(t) !== true) throw new Error('paired passive not recognised');
+      t.prepare("UPDATE gd_ha_node SET role = 'active' WHERE id = 'self'").run();
+      if (g.isConfirmedPassive(t) !== false) throw new Error('active misclassified as passive');
+      t.prepare("UPDATE gd_ha_node SET role = 'passive' WHERE id = 'self'").run();
+      t.prepare('DELETE FROM gd_ha_peer').run();
+      if (g.isConfirmedPassive(t) !== false) throw new Error('unpaired passive must fail open');
+      return 'passive blocked; active + unpaired fail open';
+    } finally {
+      t.close();
+    }
+  });
+  record('gd_high_availability', 'Detector honors heartbeat interval; no promotion before the first heartbeat', () => {
+    const hf = require('./services/gd-ha-failover');
+    const t = haCloneSchema(db, ['gd_ha_lease']);
+    try {
+      const cfg = { missCount: 3, heartbeatIntervalSec: 5, promotionCooldownSec: 60, selfFenceTimeoutSec: 60, leaseTtlSec: 30 };
+      t.prepare("INSERT INTO gd_ha_lease (id, epoch, last_heartbeat_at) VALUES ('current', 1, datetime('now'))").run();
+      if (hf.activeIsDown(t, cfg) !== false) throw new Error('fresh heartbeat wrongly declared down');
+      t.prepare("UPDATE gd_ha_lease SET last_heartbeat_at = datetime('now', '-600 seconds') WHERE id = 'current'").run();
+      if (hf.activeIsDown(t, cfg) !== true) throw new Error('stale heartbeat not detected');
+      t.prepare("UPDATE gd_ha_lease SET last_heartbeat_at = NULL WHERE id = 'current'").run();
+      if (hf.activeIsDown(t, cfg) !== false) throw new Error('a never-heard-from active must not be declared down');
+      return 'fresh=up, stale=down, never-heard=up';
+    } finally {
+      t.close();
+    }
+  });
+  record('gd_high_availability', 'Self-fence abstains without two signals; fences without touching the live audit chain', () => {
+    const hf = require('./services/gd-ha-failover');
+    const stale = new Date(Date.now() - 600000).toISOString();
+    const fresh = new Date().toISOString();
+    const liveFenceRows = () => db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'HA_SELF_FENCED'").get().n;
+    const before = liveFenceRows();
+    const setup = () => {
+      const mem = haCloneSchema(db, ['gd_ha_node', 'gd_ha_lease', 'config', 'audit_log']);
+      mem.prepare("INSERT INTO gd_ha_node (id, role) VALUES ('self', 'active')").run();
+      mem.prepare("INSERT INTO gd_ha_lease (id, epoch, holder, term_started_at) VALUES ('current', 1, 'self', datetime('now'))").run();
+      mem.prepare("INSERT INTO config (key, value) VALUES ('ha_config', ?)").run(JSON.stringify({ enabled: true, selfFenceTimeoutSec: 30 }));
+      return mem;
+    };
+    let mem = setup();
+    try {
+      if (hf.checkSelfFence(mem, {}).reason !== 'insufficient_signal') throw new Error('null signals must not fence');
+      if (hf.checkSelfFence(mem, { lastPeerContactAt: stale }).reason !== 'insufficient_signal') throw new Error('peer signal alone must not fence');
+      if (hf.checkSelfFence(mem, { lastClientRequestAt: stale }).reason !== 'insufficient_signal') throw new Error('client signal alone must not fence');
+      if (hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: fresh }).fenced !== false) throw new Error('a serving active must never be fenced');
+    } finally { mem.close(); }
+    mem = setup();
+    try {
+      if (hf.checkSelfFence(mem, { lastPeerContactAt: stale, lastClientRequestAt: stale }).fenced !== true) throw new Error('a fully isolated active must fence');
+      if (mem.prepare("SELECT role FROM gd_ha_node WHERE id = 'self'").get().role !== 'passive') throw new Error('fenced node did not demote');
+    } finally { mem.close(); }
+    if (liveFenceRows() !== before) throw new Error('the self-fence check wrote HA_SELF_FENCED into the LIVE audit chain');
+    return 'one signal abstains; both stale fences + demotes; live audit chain untouched';
+  });
+  record('gd_high_availability', 'Promotion refuses without sealed material; role unchanged', () => {
+    const hf = require('./services/gd-ha-failover');
+    const t = haCloneSchema(db, ['gd_ha_node', 'gd_ha_lease', 'config', 'audit_log']);
+    try {
+      t.prepare("INSERT INTO gd_ha_node (id, role) VALUES ('self', 'passive')").run();
+      let refused = false;
+      try { hf.promote(t, {}); } catch (e) { refused = /no sealed promotion material/.test(e.message); }
+      if (!refused) throw new Error('promoted without sealed promotion material');
+      if (t.prepare("SELECT role FROM gd_ha_node WHERE id = 'self'").get().role !== 'passive') throw new Error('role changed on a refused promotion');
+      return 'refuses; role unchanged';
+    } finally {
+      t.close();
+    }
+  });
+  record('gd_high_availability', 'A promoting node claims a STRICTLY HIGHER epoch than its peer', () => {
+    // The monotonic trigger forbids an epoch DECREASE, not a TIE. A node re-promoting
+    // after its peer claimed epoch N must adopt N first, so claimNextEpoch yields N+1.
+    // Skipping the adoption yields N again -- two actives at one epoch, a split-brain.
+    // This is precisely the defect that shipped in the Regional Server's self-test.
+    const hl = require('./services/gd-ha-lease');
+    const t = haCloneSchema(db, ['gd_ha_lease']);
+    try {
+      t.prepare("INSERT INTO gd_ha_lease (id, epoch, holder) VALUES ('current', 5, 'self')").run();
+      hl.recordPeerHeartbeat(t, 6, null);
+      const claimed = hl.claimNextEpoch(t, 30);
+      if (claimed <= 6) throw new Error('claimed epoch ' + claimed + ' ties or trails the peer (split-brain)');
+      return 'adopted peer epoch 6, claimed ' + claimed;
+    } finally {
+      t.close();
+    }
+  });
+  record('gd_high_availability', 'Per-mode promotion gate present; non-cloud allows', () => {
+    const hm = require('./services/gd-ha-modes');
+    if (typeof hm.assertModePromotionAllowed !== 'function') throw new Error('gd-ha-modes.assertModePromotionAllowed missing');
+    const mode = require('./services/gd-deployment-mode').getMode(db);
+    if (mode !== 'cloud') {
+      const r = hm.assertModePromotionAllowed(db);
+      if (!r || r.allowed !== true) throw new Error(mode + ' promotion wrongly gated');
+      return mode + ' promotion allowed (no attestation gate)';
+    }
+    return 'cloud mode; promotion re-attests the local confidential VM (fail-closed)';
+  });
+  record('gd_high_availability', 'Peer response resolves the body; .json wrapper reads throw', () => {
+    const { parsePeerResponse } = require('./services/gd-ha-peer-link');
+    if (typeof parsePeerResponse !== 'function') throw new Error('gd-ha-peer-link.parsePeerResponse not exported');
+    const body = parsePeerResponse('{"epoch":9,"ok":true}', 200);
+    if (body.epoch !== 9 || body.ok !== true) throw new Error('body fields not readable directly');
+    if (JSON.stringify(parsePeerResponse('', 200)) !== '{}') throw new Error('empty body should yield {}');
+    let loud = false;
+    try { void body.json; } catch (e) { loud = /no .json wrapper/.test(e.message); }
+    if (!loud) throw new Error('.json wrapper read did not throw');
+    let http = false;
+    try { parsePeerResponse('stale', 409); } catch (e) { http = /HTTP 409/.test(e.message); }
+    if (!http) throw new Error('non-2xx did not throw');
+    let bad = false;
+    try { parsePeerResponse('not json', 200); } catch (e) { bad = /malformed JSON/.test(e.message); }
+    if (!bad) throw new Error('malformed body did not throw');
+    return 'body parsed directly; .json throws; non-2xx + malformed throw';
+  });
+  record('gd_high_availability', 'Client-activity predicate excludes probes and the peer plane', () => {
+    // The self-fence checks reason about timestamps handed to them directly, so they
+    // cannot catch a middleware that stamps the WRONG requests. This asserts the
+    // predicate that decides which requests count as a client reaching this node.
+    // It once compared against req.path under an '/api/' mount, where Express has
+    // already stripped the prefix, so every load-balancer probe stamped activity and
+    // the isolation fence could never fire.
+    const lv = require('./services/gd-ha-liveness');
+    if (typeof lv.shouldStampClientRequest !== 'function') throw new Error('gd-ha-liveness.shouldStampClientRequest not exported');
+    const mustNot = ['/api/health', '/api/health?probe=1', '/api/ha/peer', '/api/ha/peer/replicate', '/api/ha/peer/heartbeat'];
+    for (const p of mustNot) {
+      if (lv.shouldStampClientRequest(p) !== false) throw new Error(p + ' must not stamp client activity');
+    }
+    const must = ['/api/analysts', '/api/ha/status', '/api/ha/peers', '/api/health/deep'];
+    for (const p of must) {
+      if (lv.shouldStampClientRequest(p) !== true) throw new Error(p + ' must stamp client activity');
+    }
+    // Unknown input stamps: never age the client signal on doubt, or a serving active
+    // could self-fence and leave the pair with no writer.
+    for (const p of [null, undefined, '']) {
+      if (lv.shouldStampClientRequest(p) !== true) throw new Error('an unknown path must stamp (fail safe)');
+    }
+    // The stripped form is what the bug passed; it must NOT be mistaken for the health
+    // endpoint, which is why callers pass originalUrl.
+    if (lv.shouldStampClientRequest('/health') !== true) throw new Error('the stripped path must not match the health exclusion');
+    return mustNot.length + ' excluded, ' + must.length + ' stamped, unknown fails safe';
+  });
+  record('gd_high_availability', 'Write guard refuses passive writes and exempts the /ha control plane', () => {
+    // Exercises the mounted middleware itself, with the mount-path stripping Express
+    // performs at app.use('/api/', ...) reproduced, so the exemption regex is tested
+    // in the form it actually sees.
+    const { haWriteGuard } = require('./services/gd-ha-write-guard');
+    const guard = haWriteGuard();
+    const strip = (u) => (u.startsWith('/api/') ? u.slice(4) : u);
+    const call = (method, url) => {
+      let nexted = false;
+      let status = null;
+      let code = null;
+      const req = { method: method, path: strip(url), originalUrl: url };
+      const res = { status: (c) => { status = c; return { json: (b) => { code = b && b.code; } }; } };
+      guard(req, res, () => { nexted = true; });
+      return nexted ? 'pass' : status + ':' + code;
+    };
+    // On this node (standalone or active) the guard must never block: it fails open.
+    if (call('POST', '/api/analysts') !== 'pass') throw new Error('the guard blocked a write on a node that is not a confirmed passive');
+    if (call('GET', '/api/analysts') !== 'pass') throw new Error('a read was blocked');
+    // The HA control plane is exempt regardless of role, or a passive could never be
+    // paired, promoted, drilled, or reconfigured.
+    for (const p of ['/api/ha/pair', '/api/ha/manual-failover', '/api/ha/self-test']) {
+      if (call('POST', p) !== 'pass') throw new Error(p + ' must be exempt from the write guard');
+    }
+    if (call('PUT', '/api/ha/config') !== 'pass') throw new Error('/api/ha/config must be exempt');
+    return 'fails open here; /ha control plane exempt for POST/PUT';
+  });
+  record('gd_high_availability', 'No HA source reads .json off a peer-link result', () => {
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    const targets = [
+      'routes/gd-ha.js',
+      'services/gd-ha-peer-link.js',
+      'services/gd-ha-replication.js',
+      'services/gd-ha-failover.js',
+      'services/gd-ha-pairing.js',
+      'services/gd-backup-scheduler.js',
+    ];
+    // Comments and string literals are stripped first, so the scan never flags the
+    // prose that names the wrong idiom on purpose. res.json(...) is the response
+    // helper and is the only permitted receiver.
+    const codeOnly = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+      .replace(/'(?:\\.|[^'\\])*'/g, "''")
+      .replace(/"(?:\\.|[^"\\])*"/g, '""');
+    const offenders = [];
+    let scanned = 0;
+    for (const rel of targets) {
+      const abs = pathMod.join(__dirname, rel);
+      if (!fsMod.existsSync(abs)) continue;
+      scanned += 1;
+      const code = codeOnly(fsMod.readFileSync(abs, 'utf8'));
+      const re = /([A-Za-z_$][A-Za-z0-9_$]*)\.json\b/g;
+      let m;
+      while ((m = re.exec(code)) !== null) {
+        if (m[1] !== 'res') offenders.push(rel + ': ' + m[1] + '.json');
+      }
+    }
+    if (offenders.length) throw new Error('peer-link result read via a .json wrapper: ' + offenders.join(', '));
+    return scanned + ' HA sources scanned; no wrapper reads';
   });
 
   // \u2500\u2500 SDN mode (6) ────────────────────────────────────────────────────────
@@ -6171,6 +6439,17 @@ app.get('/api/audit/integrity', authMiddleware(['ciso', 'vp']), async (req, res)
 // AUDIT_CHAIN_BREAK audit row. Hourly; fresh db per cycle; unref() so the timer
 // never blocks process shutdown. Guarded so an un-migrated database (init-db
 // not yet run) logs and skips rather than crashing.
+//
+// HA note (B6d): this timer is DELIBERATELY NOT gated on the HA write-authority.
+// Every node -- active or passive -- must keep verifying its OWN audit hash chain:
+// the standby is a live, attackable server, and gating this would blind its
+// tamper-evidence, the opposite of what HA is for. It is safe to leave ungated
+// because it writes nothing that replicates: createCheckpoint writes
+// audit_chain_checkpoint and a break records an audit_log row, and BOTH tables are
+// excluded from replication (gd-ha-cdc), so they are node-local. Its only other
+// effect is an alert, and the alert router already withholds the one replicated
+// row (notifications) on a passive while still auditing and paging. Do not "fix"
+// this by adding a write gate.
 const GD_AUDIT_INTEGRITY_INTERVAL_MS = 3600000;
 const gdAuditIntegrityTimer = setInterval(() => {
   let db;
@@ -6197,86 +6476,14 @@ const gdAuditIntegrityTimer = setInterval(() => {
 if (gdAuditIntegrityTimer && typeof gdAuditIntegrityTimer.unref === 'function') gdAuditIntegrityTimer.unref();
 
 
-// B6b: periodic storage maintenance.
-// Three unref'd timers, each opening a fresh db per cycle and never blocking
-// shutdown, mirroring gdAuditIntegrityTimer. Async work closes its db in the
-// promise chain's finally (not a synchronous finally) so the connection outlives
-// the in-flight retries/seals. Guarded so an un-migrated database logs and skips.
-
-// rebuildContext for forensic-export push retries: re-hash the export's files from
-// the forensic_exports row referenced by the push, so a due push can be re-attempted.
-function rebuildForensicExportContext(db, pushRow) {
-  const exp = db.prepare(
-    'SELECT id, archive_path, manifest_path, manifest_sig_path, cosign_signature_path, archive_sha256 '
-    + 'FROM forensic_exports WHERE id = ?'
-  ).get(pushRow.export_id);
-  if (!exp) return { ok: false, error: 'forensic export row no longer exists', fatal: true };
-  const specs = [{ name: path.basename(exp.archive_path), absolutePath: exp.archive_path }];
-  if (exp.manifest_path) specs.push({ name: path.basename(exp.manifest_path), absolutePath: exp.manifest_path });
-  if (exp.manifest_sig_path) specs.push({ name: path.basename(exp.manifest_sig_path), absolutePath: exp.manifest_sig_path });
-  if (exp.cosign_signature_path) specs.push({ name: path.basename(exp.cosign_signature_path), absolutePath: exp.cosign_signature_path });
-  for (const s of specs) {
-    if (!s.absolutePath || !fs.existsSync(s.absolutePath)) {
-      return { ok: false, error: 'forensic export file missing on disk: ' + s.name, fatal: true };
-    }
-  }
-  const hashed = storagePush.hashFilesForContext(specs);
-  if (!hashed.ok) return { ok: false, error: hashed.error, fatal: true };
-  return {
-    ok: true,
-    artifactContext: {
-      artifactId: exp.id,
-      sourceDir: path.dirname(exp.archive_path),
-      files: hashed.files,
-      manifestSha256: exp.archive_sha256 || null,
-      createdAt: new Date().toISOString(),
-    },
-  };
-}
-
-// Retry-sweep (hourly): re-attempt due pushes across every push table.
-const GD_STORAGE_RETRY_INTERVAL_MS = 3600000;
-const gdStorageRetryTimer = setInterval(() => {
-  let db;
-  try { db = getDb(); } catch (e) { console.error('GD storage retry-sweep: getDb failed:', e.message); return; }
-  Promise.resolve()
-    .then(() => backupV2.retryDueV2BackupPushes(db))
-    .then(() => archiveSegment.retryPendingSegmentPushes(db))
-    .then(() => storagePush.retryDuePushes(db, { pushTable: 'forensic_export_pushes', rebuildContext: rebuildForensicExportContext }))
-    .catch((e) => console.error('GD storage retry-sweep error:', e.message))
-    .finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
-}, GD_STORAGE_RETRY_INTERVAL_MS);
-if (gdStorageRetryTimer && typeof gdStorageRetryTimer.unref === 'function') gdStorageRetryTimer.unref();
-
-// Archival-seal (hourly): archive new audit rows and flush the CEF spool into
-// sealed, pushed segments.
-const GD_ARCHIVAL_SEAL_INTERVAL_MS = 3600000;
-const gdArchivalSealTimer = setInterval(() => {
-  let db;
-  try { db = getDb(); } catch (e) { console.error('GD archival-seal: getDb failed:', e.message); return; }
-  Promise.resolve()
-    .then(() => auditArchive.archiveNewAuditEntries(db))
-    .then(() => cefSpool.flush(db))
-    .catch((e) => console.error('GD archival-seal error:', e.message))
-    .finally(() => { try { db.close(); } catch (_e) { /* ignore */ } });
-}, GD_ARCHIVAL_SEAL_INTERVAL_MS);
-if (gdArchivalSealTimer && typeof gdArchivalSealTimer.unref === 'function') gdArchivalSealTimer.unref();
-
-// Retention (daily): delete backup artifacts older than the retention window (mtime). Synchronous.
-const GD_BACKUP_RETENTION_INTERVAL_MS = 86400000;
-const gdBackupRetentionTimer = setInterval(() => {
-  let db;
-  try {
-    db = getDb();
-    backupV2.cleanOldBackups(db);
-  } catch (e) {
-    console.error('GD backup retention error:', e.message);
-  } finally {
-    if (db) { try { db.close(); } catch (_e) { /* ignore */ } }
-  }
-}, GD_BACKUP_RETENTION_INTERVAL_MS);
-if (gdBackupRetentionTimer && typeof gdBackupRetentionTimer.unref === 'function') gdBackupRetentionTimer.unref();
-
+// B6b: periodic storage maintenance -- moved to the scheduler (B6d).
+// The retry sweep, archival seal, and backup retention were bare unref'd timers
+// here. They now run as write-gated maintenance jobs on gd-backup-scheduler,
+// fronted by mayRunWriteJob(), because each writes REPLICATED tables (backups /
+// backup_pushes / archive_segment_pushes / storage_archive_segments) and the
+// retention job also deletes artifact files: a confirmed paired passive running
+// them would diverge the pair, double-upload segments, and delete backups the
+// active still owns. rebuildForensicExportContext moved to services/forensic-export.
 
 // B6b: backup scheduler.
 // An unref'd interval reads active backup_schedules, fires the ones whose scheduled
@@ -6601,14 +6808,23 @@ https.createServer({
   try { gdBackupScheduler.start(); } catch (e) { console.error('GD backup scheduler failed to start:', e.message); }
 
   // ── B5r: automated update-detection periodic checker ──────────────────────
-  // The GD-server has no general scheduler (by design), so a single hourly timer
-  // drives the opt-in update check: when enabled, on each tick it runs the check
-  // if a daily/weekly/monthly cadence boundary has passed since the last
-  // scheduled check (so a window missed during downtime is caught on the next
+  // An hourly timer drives the opt-in update check: when enabled, on each tick it
+  // runs the check if a daily/weekly/monthly cadence boundary has passed since the
+  // last scheduled check (so a window missed during downtime is caught on the next
   // tick). Detect-and-notify only; the App Updates banner (GET
   // /api/auto-update/status) is the notification. The timer is unref()'d so it
   // never holds the process open on its own.
+  //
+  // HA note (B6d): fronted by the scheduler's write-authority gate. gdRunUpdateCheck
+  // writes auto_update_check_log, a REPLICATED table, so a confirmed paired passive
+  // must not run it -- the active checks and the row replicates in. It stays a timer
+  // rather than moving onto the scheduler because gdRunUpdateCheck is also invoked by
+  // the manual-check route (which the request-layer write-guard already 503s on a
+  // passive); gating in place applies the identical fail-open predicate without
+  // relocating route-shared logic. mayRunWriteJob() fails OPEN, so a standalone GD
+  // checks exactly as before.
   const gdUpdateCheckTimer = setInterval(() => {
+    if (!gdBackupScheduler.mayRunWriteJob()) return;
     let db;
     let config = null;
     let lastScheduledIso = null;
@@ -6649,13 +6865,10 @@ https.createServer({
     gdRuntimeMonitor.start();
   } catch (e) { try { console.error('GD runtime-monitor start failed:', e.message); } catch (_e) { /* ignore */ } }
 
-  // Periodic integration-health probe run + cache (kms / storage / mc-trust).
-  // Unref()'d so it never holds the process open on its own.
-  const gdIntegrationHealthTimer = setInterval(() => {
-    const idb = getDb();
-    Promise.resolve(gdIntegrationHealth.runAndCache(idb)).catch(() => { /* isolated */ }).finally(() => { try { idb.close(); } catch (_e) { /* ignore */ } });
-  }, 15 * 60 * 1000);
-  if (gdIntegrationHealthTimer && typeof gdIntegrationHealthTimer.unref === 'function') gdIntegrationHealthTimer.unref();
+  // Integration-health probe + cache (kms / storage / mc-trust) runs on the
+  // scheduler's write-gated maintenance job (gd-backup-scheduler), not a bare
+  // timer here: cacheResults writes the replicated `config` table, so it must be
+  // fronted by the HA sole-writer gate.
 });
 
 module.exports = app;

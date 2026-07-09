@@ -92,6 +92,30 @@ async function _chSoar(db, alert) {
 }
 
 function _chNotification(db, alert) {
+  // HA sole-writer (B5o). `notifications` is a REPLICATED table, and this is the
+  // only channel that writes one. Timer-driven alerts (the runtime monitor's FIM /
+  // CPU / memory / db-read signals, the bandwidth monitor) reach this router
+  // without passing the request-layer write-guard, because they originate from an
+  // interval and not an HTTP request. On a confirmed paired passive these inserts
+  // would create rows the active never had -- diverging the pair and colliding on
+  // the primary key when the active's rows replicate in.
+  //
+  // The alert is NOT lost. _chAudit runs first, unconditionally and before de-dup,
+  // into the hash-chained audit_log, which is excluded from replication and is
+  // therefore node-local and tamper-evident; the outbound channels (soar / siem /
+  // email / webhook) still fire, so a tampered standby still pages the operator.
+  // Only the replicated row is withheld. Fails OPEN: any probe error is treated as
+  // "not a passive", so a standalone or active node always writes the notification.
+  let passive = false;
+  try {
+    passive = require('../middleware/ha-write-guard').isConfirmedPassive(db);
+  } catch (probeErr) {
+    passive = false;
+  }
+  if (passive) {
+    return { status: 'skipped_ha_passive' };
+  }
+
   // Direct in-app insert to active admins/leads — independent of per-analyst
   // notification preferences (operational alerts are not user-muteable).
   const recipients = db.prepare("SELECT id FROM users WHERE role IN ('admin','lead') AND active = 1").all();
