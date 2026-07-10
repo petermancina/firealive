@@ -32,7 +32,7 @@ const haKeys = require('./gd-ha-keys');
 const haPeerLink = require('./gd-ha-peer-link');
 const haCdc = require('./gd-ha-cdc');
 const haReplication = require('./gd-ha-replication');
-const { appendGdAuditEntry } = require('./gd-audit-chain');
+const { auditHaEvent } = require('./gd-ha-audit');
 const ca = require('./gd-ca');
 const mode = require('./gd-deployment-mode');
 const cloudAttestation = require('./gd-cloud-attestation');
@@ -45,19 +45,21 @@ const PAIR_INIT_PATH = '/api/ha/pair-init';
 const PAIR_SECRET_PATH = '/api/ha/peer/pair-secret';
 const PAIR_BASELINE_PATH = '/api/ha/peer/pair-baseline';
 
-// Append the audit entry on the SAME connection this module is mutating, rather than
-// opening a second one via getDb(). Pairing writes gd_ha_node, gd_ha_lease, and
-// gd_ha_peer through the injected db; on a live node a second connection points at the
-// same file, so nothing was visibly wrong, but against any other handle -- a hermetic
-// regression clone, a drill -- the role change lands in one database and the
-// tamper-evident HA_PAIRED row in another, forging an event an auditor reads as real.
-// Never lets logging change a pairing outcome, so failures are swallowed.
+// Record a pairing event: append the audit row through the connection this module is
+// mutating -- never a second one, or the role change would land in one database and the
+// tamper-evident HA_PAIRED row in another -- and stream it to the operator's SIEM when
+// that connection IS the durable chain. Both halves and the severity table live in
+// gd-ha-audit, shared with failover, the peer gate, and the HA control plane.
+//
+// HA_PAIRED is a warning: pairing changes the trust topology of the fleet aggregation
+// plane, which a SOC should see. In receiveBaseline the call sits after restoreBaseline,
+// which ATTACHes the snapshot and copies only the REPLICATED tables, so this connection
+// is still the same live handle; audit_log is excluded from replication, so the passive
+// appends to its OWN chain, while config is replicated, so the SIEM endpoint it streams
+// to is the pair's. Never lets logging change a pairing outcome: failures are swallowed
+// inside the funnel.
 function safeAudit(db, eventType, detail) {
-  try {
-    appendGdAuditEntry(db, { userId: null, eventType: eventType, detail: detail, ip: null });
-  } catch (err) {
-    try { console.error('gd-ha-pairing audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
-  }
+  auditHaEvent(db, eventType, detail, null);
 }
 
 function sha256Hex(s) {

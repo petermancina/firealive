@@ -30,7 +30,7 @@ const haKeys = require('./gd-ha-keys');
 const haModes = require('./gd-ha-modes');
 const tier1 = require('./gd-tier1-kek');
 const { installRuntimeJwtSecret } = require('./gd-jwt-secret');
-const { appendGdAuditEntry } = require('./gd-audit-chain');
+const { auditHaEvent } = require('./gd-ha-audit');
 
 const DEFAULTS = {
   leaseTtlSec: 30,
@@ -100,12 +100,14 @@ function auditRefusalThrottled(db, cfg, detail) {
 // to the temp database while the audit row went to the live chain, writing spurious
 // HA_SELF_FENCED / HA_DEMOTED events into a tamper-evident log an auditor reads as
 // real. Audit must never break a promotion / demotion, so failures are swallowed.
+// Record an HA lifecycle event: append the audit row through the connection this
+// module is mutating, then stream it to the operator's SIEM when that connection IS
+// the durable chain. Both halves, the severity table, and the drill gate live in
+// gd-ha-audit, so promote/demote/self-fence share one implementation with pairing, the
+// peer gate, and the HA control plane rather than each carrying a copy. Never breaks a
+// promotion or demotion: every failure is swallowed there.
 function safeAudit(db, eventType, detail) {
-  try {
-    appendGdAuditEntry(db, { userId: null, eventType: eventType, detail: detail, ip: null });
-  } catch (err) {
-    try { console.error('gd-ha-failover audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
-  }
+  auditHaEvent(db, eventType, detail, null);
 }
 
 function activeIsDown(db, cfg) {

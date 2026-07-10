@@ -15,6 +15,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
+const path = require('path');
+const { DB_PATH } = require('../db-init');
 const { encryptConfig, decryptConfig } = require('./gd-encryption');
 
 const PAYLOAD_VERSION = 1;
@@ -183,6 +185,33 @@ function _appendCore(db, fields) {
  * appendGdAuditEntry(db, { userId, eventType, detail, ip, severity })
  * The single chained-write path for the GD audit log. severity defaults to 'info'.
  */
+// Is this handle the real, durable audit chain -- the configured live database?
+//
+// A ':memory:' clone (the regression's hermetic copies) or any other file is not.
+// The question is deliberately NOT "was a connection supplied": in production every
+// caller supplies a live handle, so keying off injection would be a proxy that
+// happens to correlate with tests, and would suppress real events.
+//
+// This exists so that outbound delivery of an audit event -- SIEM, SOAR, a paged
+// operator -- can be gated on the event actually landing on the chain. A promotion
+// or a self-fence exercised against a scratch database records where the change
+// happened and emits nothing, so a drill can neither forge a row into the
+// tamper-evident log an auditor reads nor page a SOC with a fence that never
+// occurred. The Regional Server's middleware/audit.js carries the same predicate.
+//
+// db-init's require of this module is lazy (inside a migration function), so the
+// top-level require of DB_PATH here does not create a cycle in either load order.
+function isLiveChain(db) {
+  try {
+    if (!db || typeof db.name !== 'string' || !db.name || db.name === ':memory:') {
+      return false;
+    }
+    return path.resolve(db.name) === path.resolve(DB_PATH);
+  } catch (pathErr) {
+    return false;
+  }
+}
+
 function appendGdAuditEntry(db, fields) {
   if (!fields || typeof fields !== 'object' || !fields.eventType) {
     throw new Error('appendGdAuditEntry: { eventType } required');
@@ -373,6 +402,7 @@ function migrateGdAuditChain(db) {
 }
 
 module.exports = {
+  isLiveChain,
   appendGdAuditEntry,
   verifyFull,
   verifyIncremental,

@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.81 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 74 (anti-rollback) | **Build:** 20260706.1
+**Version:** v1.0.82 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 75 (anti-rollback) | **Build:** 20260709.1
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.81) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.82) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -75,7 +75,11 @@ SDN and SASE are network overlays, not container deployments: in every mode the 
 
 ### High Availability
 
-The Regional Server can run as an **active/passive** pair for automated failover: one node serves the SOC while a warm, sealed standby is kept current over a mutually authenticated peer link and promotes itself if the active stops responding. Write authority is settled internally by a cryptographic lease at a monotonically increasing epoch — enforced at the data layer, the scheduler, and the request layer — so the organization’s own load balancer only routes traffic and a flapping or compromised balancer can never cause split-brain. Replication is near-synchronous (a bounded, seconds-scale recovery point) and failover is honest about its window rather than promising zero downtime; a built-in self-test measures the real failover-and-failback time. Single-node deployments are unaffected. See [`docs/high-availability.md`](docs/high-availability.md).
+Both servers can run as an **active/passive** pair for automated failover. In each case write authority is settled internally by a cryptographic lease at a monotonically increasing epoch — enforced at the data layer, the scheduler, and the request layer — so the organization’s own load balancer only routes traffic and a flapping or compromised balancer can never cause split-brain. Active/active and multi-node clustering are ruled out rather than offered: promotion unseals a pre-wrapped key only by proving the standby is the genuine anchored node, and last-write-wins over audit chains and key material is not a trade a CISO can accept.
+
+**Regional Server.** One node serves the SOC while a warm, sealed standby is kept current over a mutually authenticated peer link and promotes itself if the active stops responding. Replication is near-synchronous (a bounded, seconds-scale recovery point) and failover is honest about its window rather than promising zero downtime; a built-in self-test measures the real failover-and-failback time. Single-node deployments are unaffected. See [`docs/high-availability.md`](docs/high-availability.md).
+
+**Global Dashboard Server.** Opt-in, and inert until two nodes are paired. Replication is asynchronous, so the recovery point is bounded rather than seconds-scale, and the tab surfaces live replication lag as the number that quantifies it. A passive is fenced on every write path — mutating requests are refused with HTTP 503 `ha_passive_read_only`, background jobs are write-gated, and the replicated alert notification is withheld — while reads and the HA control plane stay reachable, or a standby could never be paired, promoted, drilled, or recovered. The GD’s Tier-1 KEK is hardware-sealed per node, so the standby holds the shared material wrapped to its own root and unseals it only at promotion; the shared session secret rides along, so a failover does not force a re-authentication mid-incident. In Cloud Mode a node that cannot re-attest as a genuine confidential VM **refuses to promote** — integrity over availability, and the Regional Servers keep serving analysts throughout. The self-test is a real, measured failover rather than a simulation; there is no automatic fail-back; and HA lifecycle events reach the SIEM as CEF but not SOAR, email, or webhooks. See [`docs/gd-high-availability.md`](docs/gd-high-availability.md).
 
 ### Backend Services
 

@@ -32,7 +32,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DB_PATH } = require('../db-init');
-const { appendGdAuditEntry } = require('./gd-audit-chain');
+const { auditHaEvent } = require('./gd-ha-audit');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
@@ -54,18 +54,25 @@ function getClientCertThumbprint(req) {
   }
 }
 
-// Append the audit entry through the connection the gate is already holding, rather
-// than opening a second one. The gate is handed a db GETTER (getDbFn), so a caller --
-// including a test or a drill -- decides which database it operates on; auditing via
-// getDb() ignored that and always wrote to the live hash-chained log, so a gate run
-// against any other database would forge an HA_PEER_REJECTED row an auditor reads as
-// real. Never lets logging change a gate decision, so failures are swallowed.
+// Record a peer-gate event: append the audit row through the connection the gate is
+// already holding -- never a second one -- and stream it to the operator's SIEM when
+// that connection IS the durable chain. The gate is handed a db GETTER (getDbFn), so a
+// caller, including a test or a drill, decides which database it operates on; both the
+// append and the stream follow that choice. Both halves and the severity table live in
+// gd-ha-audit, shared with failover, pairing, and the HA control plane.
+//
+// HA_PEER_REJECTED streams at warning rather than high: a single rejection is usually a
+// certificate rotation on the peer, while a burst of them -- something repeatedly
+// presenting an unrecognised client certificate to the peer control plane -- is what the
+// SIEM should correlate and alert on. The client IP is carried on the audit row.
+//
+// Both call sites hold an open connection: the rejection path audits before the close,
+// and the error path asks the injected getter for one and closes only what it opened.
+// The funnel reads the SIEM configuration synchronously and dispatches database-free, so
+// neither can reach for a handle that has since been closed. Never lets logging change a
+// gate decision: failures are swallowed inside the funnel.
 function safeAudit(db, eventType, detail, ip) {
-  try {
-    appendGdAuditEntry(db, { userId: null, eventType: eventType, detail: detail, ip: ip });
-  } catch (err) {
-    try { console.error('gd-ha-peer-link audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
-  }
+  auditHaEvent(db, eventType, detail, ip);
 }
 
 // The local node's TLS server certificate + key, reused as the mTLS client

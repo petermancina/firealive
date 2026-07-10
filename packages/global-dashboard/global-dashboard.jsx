@@ -1556,6 +1556,37 @@ export default function GlobalDashboard() {
   const [updStatus, setUpdStatus] = useState(null); // {currentVersion,enabled,updateAvailable,latestVersion,releaseUrl,lastCheckedAt,lastResult}
   const [updCheck, setUpdCheck] = useState(null); // check-now result: null | "checking" | {result,...} | {error}
   const [updSaving, setUpdSaving] = useState(false);
+  // HA status. null = loading; {error,status} = failed (403 when the session is not a CISO);
+  // otherwise the GET /api/ha/status body. Polled only while the tab is open.
+  const [haStatus, setHaStatus] = useState(null);
+  const [haBusy, setHaBusy] = useState("");        // "" | "token" | "pair" | "failover" | "selftest"
+  const [haMsg, setHaMsg] = useState(null);        // {kind:"ok"|"err", text}
+  const [haToken, setHaToken] = useState(null);    // {bootstrap, expiresAt} -- shown once, never re-fetched
+  const [haPeerEndpoint, setHaPeerEndpoint] = useState("");
+  const [haPairToken, setHaPairToken] = useState("");
+  const [haConfirm, setHaConfirm] = useState(null);// null | "failover" | "selftest"
+  const [haTest, setHaTest] = useState(null);      // self-test result
+  const loadHaStatus = () => api.get("/api/ha/status").then(r => setHaStatus(r || {error:"no response"}));
+  // api._send never throws: a failure arrives as {error, status}. 423 is the config lock.
+  const haErrText = (r) => r.status===423 ? "Configuration is locked. Unlock with MFA to make HA changes."
+    : r.status===409 ? (r.error||"not allowed in this state")
+    : (r.error||"request failed") + (r.detail?" -- "+r.detail:"");
+  const haRun = async (key, fn) => {
+    setHaBusy(key); setHaMsg(null);
+    const r = await fn();
+    setHaBusy("");
+    if (r && r.error) { setHaMsg({kind:"err", text:haErrText(r)}); return null; }
+    await loadHaStatus();
+    return r;
+  };
+  useEffect(() => {
+    if (tab !== "ha") return undefined;
+    let alive = true;
+    const load = () => api.get("/api/ha/status").then(r => { if (alive) setHaStatus(r || {error:"no response"}); });
+    load();
+    const t = setInterval(load, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, [tab]);
   const [updBannerDismissed, setUpdBannerDismissed] = useState(()=>{ try { return localStorage.getItem("fa_gd_upd_dismissed")||""; } catch(_e){ return ""; } });
   // R3k C40 — GD Cloud & IaC + CI/CD server-side wiring
   const [gdIacProvider, setGdIacProvider] = useState("");
@@ -2537,7 +2568,7 @@ export default function GlobalDashboard() {
     {id:"query",label:"Query Tool"},{id:"sys_health",label:"System Health"},{id:"monitoring",label:"Monitoring Integrations"},
     {id:"iam",label:"IAM & Access"},{id:"mfa",label:"MFA"},{id:"posture",label:"Posture Assessment"},{id:"wifi",label:"WiFi Policy"},
     {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"vuln_scan",label:"Cloud Vuln Scan"},
-    {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha_cluster",label:"HA & Clustering"},
+    {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha",label:"High Availability"},
     {id:"backup",label:"Backup & Restore"},{id:"restore",label:"Restore"},{id:"restore_approvals",label:"Restore Approvals"},{id:"backup_schedules",label:"Backup Schedules"},{id:"migration",label:"Deployment Migration"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
     {id:"helper_recognition",label:"Helper Recognition"},
@@ -3486,34 +3517,93 @@ export default function GlobalDashboard() {
             </Card>
           </div>)}
 
-          {/* ══════════ HA & CLUSTERING ══════════ */}
-          {tab==="ha_cluster"&&(<div>
-            <L>High Availability & Clustering</L>
-            <M style={{color:C.tm,display:"block",marginBottom:16}}>Ensure the CISO dashboard remains available if the primary server fails. Critical for maintaining visibility during incidents affecting multiple regions simultaneously.</M>
-            {configLocked&&<Card style={{borderColor:C.d+"40",marginBottom:12,padding:10}}><M style={{color:C.d}}>LOCK Configurations locked. Unlock with MFA to make changes.</M></Card>}
-            <Card style={{marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Failover Configuration</div>
-              <Sel label="HA mode"><option value="none">None (single instance)</option><option value="active_passive">Active-Passive (manual failover)</option><option value="active_active">Active-Active (load balanced)</option></Sel>
-              <Input label="Secondary server endpoint" placeholder="https://gd-secondary.corp.com:4001"/>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" disabled={configLocked}/><M style={{color:C.t}}>Auto-failover on primary health check failure</M></label>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" disabled={configLocked}/><M style={{color:C.t}}>Synchronous config replication (zero data loss on failover)</M></label>
-              <Btn primary disabled={configLocked}>Save HA Config</Btn>
-            </Card>
-            <Card style={{marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Multi-Node Clustering</div>
-              <M style={{color:C.tm,display:"block",marginBottom:10}}>For organizations with multiple CISOs or VPs needing simultaneous dashboard access, deploy as a multi-node cluster with shared session state and horizontal scaling.</M>
-              <Input label="Number of cluster nodes" placeholder="1" type="number"/>
-              <Input label="Load balancer endpoint" placeholder="https://gd-lb.corp.com"/>
-              <Input label="Cluster node 1" placeholder="https://gd-node1.corp.com:4001"/>
-              <Input label="Cluster node 2" placeholder="https://gd-node2.corp.com:4001"/>
-              <Input label="Cluster node 3" placeholder="https://gd-node3.corp.com:4001"/>
-              <Sel label="Session state sharing"><option value="redis">Redis (recommended)</option><option value="db">Database replication</option><option value="none">None (sticky sessions)</option></Sel>
-              <Btn primary disabled={configLocked}>Save Cluster Config</Btn>
-            </Card>
-            <Card>
-              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Cluster Status</div>
-              <M style={{color:C.tm}}>Primary: healthy (this instance) · Secondary: not configured · Cluster: single node</M>
-            </Card>
+          {/* ══════════ HIGH AVAILABILITY ══════════ */}
+          {tab==="ha"&&(<div>
+            <L>High Availability</L>
+            <M style={{color:C.tm,display:"block",marginBottom:6,lineHeight:1.6}}>Two GD nodes pair over mutually-authenticated mTLS. One is active and holds a lease; the other is a warm standby that continuously replicates and refuses every write. If the active is lost, the standby promotes itself.</M>
+            <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Replication is asynchronous, so failover has a bounded RPO -- not zero data loss. High Availability is opt-in: a standalone node behaves exactly as it did before pairing.</M>
+            {haStatus===null&&<Card><M style={{color:C.td}}>Loading status...</M></Card>}
+            {haStatus&&haStatus.error&&(<Card style={{borderColor:C.d+"40"}}>
+              <M style={{color:C.d}}>{haStatus.status===403?"High Availability status requires the CISO role.":"Status unavailable: "+haStatus.error}</M>
+            </Card>)}
+            {haStatus&&!haStatus.error&&(<div>
+              <Card style={{marginBottom:12}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                  <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>This node</div>
+                  <Badge color={haStatus.role==="active"?C.a:haStatus.role==="passive"?C.i:C.td}>{String(haStatus.role||"standalone").toUpperCase()}</Badge>
+                </div>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>High Availability: {haStatus.enabled?"enabled":"not enabled"}{haStatus.mode?" · deployment mode: "+haStatus.mode:""}</M>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Lease epoch: {haStatus.epoch} · holder: {haStatus.leaseHolder||"none"}</M>
+                <M style={{color:C.td,display:"block"}}>Lease expires: {haStatus.leaseExpiresAt||"--"}</M>
+              </Card>
+              <Card style={{marginBottom:12}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                  <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Peer</div>
+                  {haStatus.peer&&haStatus.peer.paired
+                    ?<Badge color={haStatus.peer.reachable?C.a:C.w}>{haStatus.peer.reachable?"REACHABLE":"UNREACHABLE"}</Badge>
+                    :<Badge color={C.td}>NOT PAIRED</Badge>}
+                </div>
+                {haStatus.peer&&haStatus.peer.paired?(<div>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Endpoint: {haStatus.peer.endpoint}</M>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Paired at: {haStatus.peer.pairedAt||"--"} · last heartbeat: {haStatus.peer.lastHeartbeatAt||"never"}</M>
+                  <M style={{color:C.td,display:"block",marginBottom:4}}>Anchor fingerprint: {String(haStatus.peer.anchorFingerprint||"").slice(0,32)}...</M>
+                  <M style={{color:C.td,display:"block"}}>Certificate fingerprint: {String(haStatus.peer.certFingerprint||"").slice(0,32)}...</M>
+                </div>):(<M style={{color:C.tm}}>No peer paired. This node is standalone and unaffected by High Availability.</M>)}
+              </Card>
+              <Card>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Replication</div>
+                <M style={{color:haStatus.replication&&haStatus.replication.lagSeconds>30?C.w:C.tm,display:"block",marginBottom:4}}>Lag: {haStatus.replication?haStatus.replication.lagSeconds:0}s</M>
+                <M style={{color:C.tm,display:"block",marginBottom:4}}>Shipped LSN {haStatus.replication?haStatus.replication.lastShippedLsn:0} · acked {haStatus.replication?haStatus.replication.lastAckedLsn:0} · applied {haStatus.replication?haStatus.replication.lastAppliedLsn:0}</M>
+                <M style={{color:C.td,display:"block"}}>Baseline: {(haStatus.replication&&haStatus.replication.baselineAt)||"--"} · last apply: {(haStatus.replication&&haStatus.replication.lastApplyAt)||"--"}</M>
+              </Card>
+              {haMsg&&<Card style={{borderColor:(haMsg.kind==="ok"?C.a:C.d)+"40"}}><M style={{color:haMsg.kind==="ok"?C.a:C.d}}>{haMsg.text}</M></Card>}
+
+              {!(haStatus.peer&&haStatus.peer.paired)&&(<Card>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Pair with a second node</div>
+                <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>Pairing is a two-step exchange. On the node that will be the STANDBY, generate a one-time token. Carry it to the node that will be the ACTIVE and pair from there. The token is shown once and expires.</M>
+                <M style={{color:C.tm,display:"block",marginBottom:6}}>Standby side</M>
+                <Btn disabled={haBusy!==""} onClick={async()=>{const r=await haRun("token",()=>api.post("/api/ha/pairing-token",{}));if(r)setHaToken(r);}}>{haBusy==="token"?"Generating...":"Generate one-time pairing token"}</Btn>
+                {haToken&&(<Card style={{marginTop:10,borderColor:C.w+"40"}}>
+                  <M style={{color:C.w,display:"block",marginBottom:6}}>Shown once. Copy it now.</M>
+                  <M style={{color:C.t,display:"block",wordBreak:"break-all",marginBottom:6}}>{haToken.bootstrap}</M>
+                  <M style={{color:C.td}}>Expires: {haToken.expiresAt||"--"}</M>
+                </Card>)}
+                <div style={{height:14}}/>
+                <M style={{color:C.tm,display:"block",marginBottom:6}}>Active side</M>
+                <Input label="Standby endpoint" placeholder="https://gd-standby.corp.com:4001" value={haPeerEndpoint} onChange={e=>setHaPeerEndpoint(e.target.value)}/>
+                <Input label="One-time token from the standby" value={haPairToken} onChange={e=>setHaPairToken(e.target.value)}/>
+                <Btn primary disabled={haBusy!==""||!haPeerEndpoint||!haPairToken} onClick={async()=>{const r=await haRun("pair",()=>api.post("/api/ha/pair",{peerEndpoint:haPeerEndpoint,token:haPairToken}));if(r){setHaMsg({kind:"ok",text:"Paired. This node is "+r.role+". Peer anchor "+String(r.peerFingerprint||"").slice(0,16)+"..."});setHaPairToken("");}}}>{haBusy==="pair"?"Pairing...":"Pair with standby"}</Btn>
+              </Card>)}
+
+              {haStatus.peer&&haStatus.peer.paired&&haStatus.role==="active"&&(<Card style={{borderColor:C.w+"30"}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Failover drill</div>
+                <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>The self-test is a REAL failover, not a simulation. This node steps down, the peer promotes and is checked that it serves and that its data matches, and then this node takes the lease back. Writes are refused for the few seconds in between, and the events are recorded and sent to your SIEM.</M>
+                {haConfirm==="selftest"?(<div>
+                  <M style={{color:C.w,display:"block",marginBottom:10}}>This will fail over to the peer and back. Continue?</M>
+                  <Btn primary disabled={haBusy!==""} onClick={async()=>{setHaConfirm(null);const r=await haRun("selftest",()=>api.post("/api/ha/self-test",{}));if(r)setHaTest(r);}}>{haBusy==="selftest"?"Running...":"Yes, run a real failover"}</Btn>
+                  <Btn style={{marginLeft:8}} onClick={()=>setHaConfirm(null)}>Cancel</Btn>
+                </div>):(<Btn disabled={haBusy!==""} onClick={()=>{setHaTest(null);setHaConfirm("selftest");}}>Run failover self-test</Btn>)}
+                {haTest&&(<Card style={{marginTop:10,borderColor:(haTest.served&&haTest.integrityOk&&haTest.restored?C.a:C.w)+"40"}}>
+                  <M style={{color:C.tm,display:"block",marginBottom:4}}>Failover {haTest.failoverTimeMs}ms &middot; fail-back {haTest.failbackTimeMs}ms &middot; epoch now {haTest.epoch}</M>
+                  <M style={{color:haTest.served?C.a:C.d,display:"block",marginBottom:4}}>Peer served the fleet: {haTest.served?"yes":"no"}</M>
+                  <M style={{color:haTest.integrityOk?C.a:C.d,display:"block",marginBottom:4}}>Data matched across the pair: {haTest.integrityOk?"yes":"no"}</M>
+                  <M style={{color:haTest.restored?C.a:C.d,display:"block"}}>This node took the lease back: {haTest.restored?"yes":"no"}</M>
+                  {!haTest.restored&&<M style={{color:C.d,display:"block",marginTop:6}}>The peer may still be active. Check the roles above before relying on this node.</M>}
+                </Card>)}
+              </Card>)}
+
+              {haStatus.peer&&haStatus.peer.paired&&haStatus.role==="active"&&(<Card style={{borderColor:C.d+"30"}}>
+                <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Manual failover</div>
+                <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Hand the lease to the peer. This node steps down FIRST and stays a standby; the peer then promotes. If it cannot be reached, it promotes on its own once it notices this node is gone. There is no undo from here -- to come back, run a manual failover from the node that is then active.</M>
+                {haConfirm==="failover"?(<div>
+                  <M style={{color:C.d,display:"block",marginBottom:10}}>This node will stop serving writes. Continue?</M>
+                  <Btn primary disabled={haBusy!==""} onClick={async()=>{setHaConfirm(null);const r=await haRun("failover",()=>api.post("/api/ha/manual-failover",{}));if(r)setHaMsg({kind:"ok",text:"Stepped down. "+(r.peerPromoted?("Peer promoted at epoch "+(r.peerEpoch||"?")+"."):(r.note||"Peer will promote on its own."))});}}>{haBusy==="failover"?"Handing over...":"Yes, step down"}</Btn>
+                  <Btn style={{marginLeft:8}} onClick={()=>setHaConfirm(null)}>Cancel</Btn>
+                </div>):(<Btn disabled={haBusy!==""} onClick={()=>setHaConfirm("failover")}>Step down and hand over</Btn>)}
+              </Card>)}
+
+              <M style={{color:C.td,display:"block",marginTop:10}}>Status refreshes every 5 seconds while this tab is open.</M>
+            </div>)}
           </div>)}
 
           {/* ══════════ BACKUP & RESTORE ══════════ */}

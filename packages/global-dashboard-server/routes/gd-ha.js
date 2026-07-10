@@ -1,20 +1,32 @@
 // packages/global-dashboard-server/routes/gd-ha.js
 //
-// The GD's /api/ha route -- the GD twin of server/routes/ha.js. Three routers:
-//   configRouter   -- /api/ha/config, /status, /pair (operator control plane).
-//                     Mounted behind authMiddleware(['ciso']) + the config-lock.
-//                     Filled in the next commit; declared empty here.
-//   peerRouter     -- /api/ha/peer/* (replicate, pair-secret, pair-baseline,
-//                     heartbeat). Behind requirePeerCert (pinned mTLS), NOT JWT.
-//                     index.js mounts it behind gd-ha-peer-link.requirePeerCert.
-//   pairInitRouter -- /api/ha/pair-init. Token-authenticated (the body carries a
-//                     single-use pairing token); NOT cert-pinned, since the pin
-//                     does not exist yet at first contact.
+// The GD's /api/ha route -- the GD twin of server/routes/ha.js. Three routers,
+// each with its OWN authentication, because they answer to different callers:
 //
-// This commit delivers the peer data plane + pair-init. The /peer/lease endpoint
-// (graceful-handover promotion) and the heartbeat's role-reconcile reaction are
-// failover behavior and land with gd-ha-failover (PR-3). ASCII-only; no template
-// literals.
+//   configRouter   -- the operator control plane. GET/PUT /config, GET /status,
+//                     POST /pairing-token, /pair, /manual-failover, /self-test.
+//                     index.js mounts it behind authMiddleware(['ciso']) + the
+//                     config-lock chokepoint. Every event it emits has an
+//                     operator behind it, so it audits through auditHaEventBy
+//                     and the actor reaches the SIEM: an unattributed
+//                     HA_MANUAL_FAILOVER at high severity is a worse signal than
+//                     none, because the analyst cannot tell a takeover from a
+//                     drill.
+//   peerRouter     -- the peer data plane. POST /peer/replicate, /pair-secret,
+//                     /pair-baseline, /heartbeat, /lease. index.js mounts it
+//                     behind gd-ha-peer-link.requirePeerCert (pinned mTLS), NOT
+//                     JWT -- the caller is the paired node, not a person.
+//                     /heartbeat carries the epoch reaction (adopt a higher
+//                     epoch, then reconcile role); /lease is the graceful
+//                     handover a manual failover uses, make-before-break.
+//   pairInitRouter -- POST /pair-init. Token-authenticated: the body carries a
+//                     single-use pairing token. NOT cert-pinned, because the pin
+//                     does not exist until pairing completes.
+//
+// The write guard exempts /api/ha so a passive can still be inspected, promoted,
+// drilled, and recovered while it refuses every other mutating request.
+//
+// ASCII-only; no template literals.
 
 const peerRouter = require('express').Router();
 const pairInitRouter = require('express').Router();
@@ -26,7 +38,7 @@ const gdHaLease = require('../services/gd-ha-lease');
 const gdHaFailover = require('../services/gd-ha-failover');
 const gdHaPeerLink = require('../services/gd-ha-peer-link');
 const deploymentMode = require('../services/gd-deployment-mode');
-const { appendGdAuditEntry } = require('../services/gd-audit-chain');
+const { auditHaEventBy } = require('../services/gd-ha-audit');
 
 const DEFAULT_HA_CONFIG = {
   enabled: false,
@@ -75,20 +87,26 @@ function dataChecksum(db) {
   }
 }
 
-// Append the audit entry on the SAME connection the handler is already using, rather
-// than opening a second one via getDb(). Every handler here holds an open db for the
-// life of the request and closes it in a finally, so a second connection bought
-// nothing and split the operation from its audit record across two handles. On a live
-// node both point at one file, so nothing was visibly wrong -- but it is the pattern
-// that let gd-ha-failover and gd-ha-pairing forge audit rows into the live chain when
-// handed any other database, and the HA control plane should not model it. Never lets
-// logging change an operation outcome, so failures are swallowed.
+// Record an operator-initiated HA event: append the audit row on the SAME connection the
+// handler is already using -- never a second one, which would split the operation from
+// its audit record across two handles -- and stream it to the operator's SIEM when that
+// connection IS the durable chain. Both halves and the severity table live in
+// gd-ha-audit, shared with failover, pairing, and the peer gate.
+//
+// auditHaEventBy rather than auditHaEvent: every event this route emits has an operator
+// behind it, and the actor is carried into the CEF message. A HA_MANUAL_FAILOVER
+// streamed at high severity that does not say who triggered it is a worse SOC signal
+// than none -- an analyst sees what looks like an unplanned takeover of the fleet
+// aggregation plane and cannot tell it from a drill.
+//
+// All eight call sites sit between their handler's getDb() and its finally-block close,
+// including the two inside catch blocks (HA_PAIR_FAILED, and the manual-failover
+// handover-failed path) and the two in the self-test. The funnel reads the SIEM
+// configuration synchronously and dispatches database-free, so nothing reaches for a
+// handle the handler has since closed. Never lets logging change an operation outcome:
+// failures are swallowed inside the funnel.
 function safeAudit(db, userId, eventType, detail, ip) {
-  try {
-    appendGdAuditEntry(db, { userId: userId, eventType: eventType, detail: detail, ip: ip });
-  } catch (err) {
-    try { console.error('gd-ha route audit append failed:', err && err.message ? err.message : err); } catch (logErr) { /* ignore */ }
-  }
+  auditHaEventBy(db, userId, eventType, detail, ip);
 }
 
 // Local body-validation middleware (the GD has no shared middleware/ dir): the

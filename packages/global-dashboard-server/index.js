@@ -4390,6 +4390,92 @@ function runGdRegression(db) {
     if (liveRows() !== liveBefore) throw new Error('the regression probe wrote a notification row into the LIVE database');
     return 'standalone + active write; passive withholds only the replicated row; audit fires in every role';
   });
+  record('gd_high_availability', 'A drill against a scratch database never reaches the SIEM', () => {
+    // The property that makes a failover drill safe to run: an HA event exercised against
+    // any database other than the durable chain is recorded where the change happened and
+    // delivered nowhere. Without it, every regression run would page the SOC with a
+    // promotion that never occurred, and the self-test would emit a fake HA_MANUAL_FAILOVER
+    // at high severity into the operator's SIEM.
+    //
+    // This check must never call streamHaEvent with the LIVE handle: on a node with a SIEM
+    // configured that would dispatch a fabricated event. The positive control is the reason
+    // code instead. A clone must be refused with 'not_live_chain', which is only reachable
+    // if the gate runs BEFORE the configuration is read. Remove the gate and the clone falls
+    // through to the config load, the reason becomes 'not_configured', and this check fails.
+    const ha = require('./services/gd-ha-audit');
+    const chain = require('./services/gd-audit-chain');
+    if (typeof ha.streamHaEvent !== 'function' || typeof ha.auditHaEvent !== 'function' || typeof ha.auditHaEventBy !== 'function') {
+      throw new Error('gd-ha-audit did not export the funnel');
+    }
+    if (chain.isLiveChain(db) !== true) throw new Error('the live database is not recognised as the durable chain');
+
+    const liveRows = () => db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type LIKE 'HA_REGRESSION_%'").get().n;
+    const liveBefore = liveRows();
+    // No siem_config row: if the gate were removed, the clone would fall through to the
+    // config load and be refused there, changing the reason -- and never dispatching.
+    const mem = haCloneSchema(db, ['config', 'audit_log']);
+    try {
+      if (chain.isLiveChain(mem) !== false) throw new Error('a scratch database was mistaken for the durable chain');
+
+      const r = ha.streamHaEvent(mem, 'HA_REGRESSION_PROBE', 'sole-delivery probe');
+      if (!r || r.streamed !== false) throw new Error('a scratch database must never stream');
+      if (r.reason !== 'not_live_chain') {
+        throw new Error("the live-chain gate did not run before the SIEM config was read (reason '" + r.reason + "')");
+      }
+
+      // The event is still recorded, and in the database the caller handed over.
+      ha.auditHaEvent(mem, 'HA_REGRESSION_PROBE', 'system event', null);
+      const sysRow = mem.prepare("SELECT user_id, event_type FROM audit_log WHERE event_type = 'HA_REGRESSION_PROBE' LIMIT 1").get();
+      if (!sysRow) throw new Error('a system HA event must still be audited into the given connection');
+      if (sysRow.user_id !== null) throw new Error('a system HA event must record no actor');
+
+      ha.auditHaEventBy(mem, 'ha-regression-actor', 'HA_REGRESSION_ACTOR_PROBE', 'operator action', '10.0.0.5');
+      const opRow = mem.prepare("SELECT user_id, ip FROM audit_log WHERE event_type = 'HA_REGRESSION_ACTOR_PROBE' LIMIT 1").get();
+      if (!opRow || opRow.user_id !== 'ha-regression-actor') throw new Error('an operator HA event must record its actor');
+      if (opRow.ip !== '10.0.0.5') throw new Error('an operator HA event must record the client IP');
+    } finally {
+      mem.close();
+    }
+    if (liveRows() !== liveBefore) throw new Error('the drill probe wrote an HA row into the LIVE audit chain');
+    return 'scratch databases are refused before the SIEM config is read; events still audited, actor preserved';
+  });
+  record('gd_high_availability', 'Every emitted HA event has an explicit SIEM severity', () => {
+    // An unmapped event still streams, at the warning default, so this is not a safety
+    // check -- it is a review check. Adding an HA event without deciding what a SOC should
+    // do about it is a decision made by omission. The severity table is the one place that
+    // decision is recorded, and it is shared by four modules.
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    const { HA_EVENT_SEVERITY } = require('./services/gd-ha-audit');
+    const sources = [
+      'services/gd-ha-failover.js',
+      'services/gd-ha-pairing.js',
+      'services/gd-ha-peer-link.js',
+      'routes/gd-ha.js',
+    ];
+    const emitted = new Set();
+    for (const rel of sources) {
+      const abs = pathMod.join(__dirname, rel);
+      if (!fsMod.existsSync(abs)) continue;
+      const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
+      // The tokenizer blanks strings, so read the raw source for the literals and use the
+      // blanked source only to confirm the file still parses as expected.
+      const raw = fsMod.readFileSync(abs, 'utf8');
+      const re = /'(HA_[A-Z_]+)'/g;
+      let m;
+      while ((m = re.exec(raw)) !== null) emitted.add(m[1]);
+      if (code.length === 0) throw new Error('tokenizer produced no code for ' + rel);
+    }
+    const unmapped = [];
+    for (const evt of emitted) {
+      if (!Object.prototype.hasOwnProperty.call(HA_EVENT_SEVERITY, evt)) unmapped.push(evt);
+    }
+    if (unmapped.length) throw new Error('HA events emitted with no explicit severity: ' + unmapped.join(', '));
+    if (HA_EVENT_SEVERITY.HA_PROMOTION_REFUSED !== 'critical') throw new Error('HA_PROMOTION_REFUSED must be critical');
+    if (HA_EVENT_SEVERITY.HA_MANUAL_FAILOVER !== 'high') throw new Error('HA_MANUAL_FAILOVER must be high');
+    if (HA_EVENT_SEVERITY.HA_PEER_REJECTED !== 'warning') throw new Error('HA_PEER_REJECTED must be warning');
+    return emitted.size + ' emitted HA events, all with an explicit severity';
+  });
   record('gd_high_availability', 'HA modules audit through the connection they are handed', () => {
     // Seven modules across both servers took a database handle, mutated it, and then
     // audited through a SECOND connection opened with getDb(). On a live node both
@@ -4405,7 +4491,10 @@ function runGdRegression(db) {
     // audited peer-gate rejections through a second connection. Files that open a
     // connection but never audit (gd-ha-write-guard, gd-backup-scheduler) are included
     // deliberately: rule 1 requires BOTH, so they pass, and adding them means a future
-    // audit call in either one is caught on the day it is written.
+    // audit call in either one is caught on the day it is written. gd-ha-audit.js is
+    // included for the same reason and with more force: it is now the ONLY place an HA
+    // event is appended and streamed, so a getDb() reaching in there would forge rows
+    // for every HA module at once.
     const targets = [
       'routes/gd-ha.js',
       'services/gd-ha-cdc.js',
@@ -4420,6 +4509,7 @@ function runGdRegression(db) {
       'services/gd-ha-write-guard.js',
       'services/gd-alert-router.js',
       'services/gd-backup-scheduler.js',
+      'services/gd-ha-audit.js',
     ];
     const offenders = [];
     let scanned = 0;
@@ -4460,6 +4550,7 @@ function runGdRegression(db) {
       'services/gd-ha-write-guard.js',
       'services/gd-alert-router.js',
       'services/gd-backup-scheduler.js',
+      'services/gd-ha-audit.js',
     ];
     // haStripNonCode blanks comments, strings, and regex literals, so the scan never
     // flags the prose that names the wrong idiom on purpose. res.json(...) is the

@@ -40,14 +40,29 @@ function cefSeverity(sev) {
 }
 
 // ── SIEM CEF push ──────────────────────────────────────────────────────────────
-async function pushAlert(db, alert) {
+// Read the operator's SIEM configuration. SYNCHRONOUS and the only place this module
+// touches the database, so a caller can load the config while its connection is
+// certainly open and then dispatch without one. Returns null when unconfigured or
+// malformed; never throws.
+function loadSiemConfig(db) {
   try {
     const row = db.prepare("SELECT value FROM config WHERE key = 'siem_config'").get();
-    if (!row || !row.value) return { status: 'not_configured' };
+    if (!row || !row.value) return null;
     let cfg;
-    try { cfg = JSON.parse(row.value); } catch { return { status: 'invalid_config' }; }
-    if (!cfg || !cfg.endpoint) return { status: 'not_configured' };
+    try { cfg = JSON.parse(row.value); } catch (parseErr) { return null; }
+    if (!cfg || !cfg.endpoint) return null;
+    return cfg;
+  } catch (readErr) {
+    return null;
+  }
+}
 
+// Dispatch a single CEF event with an already-loaded config. ASYNCHRONOUS and
+// DATABASE-FREE, so it is safe to leave un-awaited: it cannot touch a connection the
+// caller has since closed. Never throws.
+async function pushAlertWithConfig(cfg, alert) {
+  try {
+    if (!cfg || !cfg.endpoint) return { status: 'not_configured' };
     const { GdSiemAdapter } = require('./gd-siem-adapter');
     const siem = new GdSiemAdapter(cfg.endpoint, cfg.protocol || 'tls');
     const res = await siem.sendEvent(
@@ -59,6 +74,19 @@ async function pushAlert(db, alert) {
   } catch (e) {
     return { status: 'error', detail: e.message };
   }
+}
+
+// The alert-router's `siem` channel seam. Unchanged behavior: load, then dispatch.
+// The split above exists because the database read and the network send have different
+// lifetimes. A caller that holds a short-lived connection -- gd-ha-failover, which
+// audits and streams inside promote/demote while its caller closes the handle in a
+// finally -- must read the config while the connection is open and dispatch after.
+// Relying on "the db read happens before the first await" would be an implicit
+// ordering invariant that a later refactor could silently break.
+async function pushAlert(db, alert) {
+  const cfg = loadSiemConfig(db);
+  if (!cfg) return { status: 'not_configured' };
+  return pushAlertWithConfig(cfg, alert);
 }
 
 // ── Ops email ────────────────────────────────────────────────────────────────
@@ -110,4 +138,4 @@ async function emailAlert(db, alert) {
   }
 }
 
-module.exports = { pushAlert, emailAlert, cefSeverity };
+module.exports = { pushAlert, pushAlertWithConfig, loadSiemConfig, emailAlert, cefSeverity };
