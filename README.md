@@ -7,7 +7,7 @@
 
 ## What Is FireAlive?
 
-FireAlive is an open-source, privacy-first platform that prevents burnout in Security Operations Center (SOC) analysts. It uses AI-driven burnout signal detection, capacity-aware ticket routing, peer support, upskilling scheduling, and skills assessment to keep SOC teams healthy, productive, and retained.
+FireAlive is an open-source, privacy-first platform that prevents burnout in Security Operations Center (SOC) analysts. It uses AI-driven burnout signal detection, capacity-aware ticket routing, peer support, upskilling scheduling, and skills assessment to keep SOC teams healthy, productive, and retained. It is designed for use in tandem with your alert fatigue prevention automation tools.
 
 FireAlive is grounded in peer-reviewed research on burnout — both SOC-analyst-specific findings and the broader cross-industry literature on burnout prevention. AI-generated suggestions for Team Lead interventions are drawn from a knowledge base of that peer-reviewed research, so the recommendations a lead sees are traceable to evidence rather than ungrounded model output.
 
