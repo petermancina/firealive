@@ -19,6 +19,9 @@ jobs:
         run: node scripts/check-config-lock-coverage.js
       - name: Verify request-body validation coverage
         run: node scripts/check-body-validation-coverage.js
+      - name: Verify Tier-1 column registry coverage and sync
+        run: node scripts/check-tier1-registry-coverage.js
+
 
   build-mac:
     needs: coverage
