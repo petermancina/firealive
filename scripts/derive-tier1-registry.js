@@ -51,13 +51,18 @@
  *   reader that inferred encoding from a column NAME would stamp one table's
  *   encoding onto every table that shares the name, and would conflate the two
  *   servers' envelope architectures. So shape/storage are recorded per column in
- *   ENCODING as reviewed facts, each carrying a source file and a distinctive
- *   PROOF substring; the script re-reads the cited file every run and fails if
- *   the proof is gone (the encoding changed) -- exactly correction #3's intent
- *   (read the encoding from the crypto site, never a distant window) and #4's
- *   (file evidence, drift-checked). shape and storage still come from the actual
- *   crypto site; the citation records WHICH site is authoritative, because
- *   automatic attribution across shared names and helpers is not reliable.
+ *   ENCODING as reviewed facts. They are NOT re-derived from the call sites,
+ *   because A3 routes every column through the domain-aware chokepoint
+ *   (sealTier1/openTier1), which reads the encoding FROM this registry -- so the
+ *   call site no longer independently encodes and a code-substring proof would be
+ *   circular. The encoding VALUES are instead verified by golden vectors: a
+ *   committed known-correct ciphertext per column, sealed under fixed test keys
+ *   with the correct encoding, that check-tier1-seal-roundtrip.js opens through
+ *   the chokepoint and asserts the recovered plaintext. A wrong storage decodes
+ *   the golden wrong and the GCM tag fails; a wrong shape recovers the wrong
+ *   value -- either way the regression catches it. That verifies the encoding by
+ *   demonstration on real ciphertext, not by a static match, and is robust to the
+ *   call-site conversion.
  *
  *     shape   : json    plaintext is JSON-serialized before sealing
  *               utf8    plaintext is a UTF-8 string
@@ -71,7 +76,7 @@
  * The derivation FAILS (non-zero exit) on: an unclassified candidate; a stale
  * MANUAL entry (its column is no longer a candidate, or its evidence file no
  * longer mentions the column); a tier1/tier1-derived/tier3 column with no
- * ENCODING entry; an ENCODING entry whose evidence file or proof is missing; or
+ * ENCODING entry; an ENCODING entry with an invalid shape or storage; or
  * a per-class count that does not match the expected derivation on the shipped
  * tree. That is the coverage guarantee: a new *_encrypted column cannot land
  * without either a live Tier-1 crypto site the script finds, or an explicit
@@ -245,9 +250,11 @@ function reColUse(col) {
   return new RegExp('(?:\\.' + col + '\\b|["\'`]' + col + '["\'`])');
 }
 function tierMarkerOnLine(line) {
-  // Named Tier-1 helper, the encryptTier1/decryptTier1 phantom, or a TIER1-keyed
+  // A Tier-1 crypto marker: the chokepoint calls sealTier1/openTier1 (a column the
+  // chokepoint handles IS Tier-1, and the call names the exact colRef), the named
+  // Tier-1 helpers, the encryptTier1/decryptTier1 phantom, or a TIER1-keyed
   // encrypt/decrypt -> tier1. The Tier-3 equivalents -> tier3.
-  if (/\b(?:decryptConfig|encryptConfig|decryptTier1|encryptTier1)\s*\(/.test(line)) return 'tier1';
+  if (/\b(?:decryptConfig|encryptConfig|decryptTier1|encryptTier1|sealTier1|openTier1)\s*\(/.test(line)) return 'tier1';
   if (/\b(?:decryptTier3|encryptTier3)\s*\(/.test(line)) return 'tier3';
   if (/\b(?:en|de)crypt\s*\([^\n]*['"]TIER1_ENCRYPTION_KEY['"]/.test(line)) return 'tier1';
   if (/\b(?:en|de)crypt\s*\([^\n]*['"]TIER3_ENCRYPTION_KEY['"]/.test(line)) return 'tier3';
@@ -274,59 +281,54 @@ const ENCODING = {
   mc: {
     // node-local signing keys: encryptConfig returns a raw iv|tag|ct Buffer,
     // read back via decryptConfig(row.<col>) with no base64/hex codec -> buffer.
-    'abuse_vault_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'archive_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'audit_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'backup_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'forensic_export_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'gd_push_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'report_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/chain-signing-keys.js', proof: 'decryptConfig(row.private_key_encrypted)' },
-    'cloud_iac_signing_keys.private_key_wrapped': { shape: 'json', storage: 'buffer', ev: 'server/services/cloud-iac-signing-keys.js', proof: 'decryptConfig(row.private_key_wrapped)' },
-
+    'abuse_vault_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'archive_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'audit_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'backup_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'forensic_export_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'gd_push_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'report_signing_keys.private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'cloud_iac_signing_keys.private_key_wrapped': { shape: 'json', storage: 'buffer' },
     // tier1-derived: hardware seals. sealToHardware returns base64(JSON{iv,ct,tag}).
-    'ha_node.wrap_private_sealed': { shape: 'utf8', storage: 'base64', ev: 'server/services/ha/ha-keys.js', proof: 'unsealFromHardware(row.wrap_private_sealed)' },
-    'ha_node.sealed_promotion_kek': { shape: 'raw', storage: 'base64', ev: 'server/services/ha/ha-pairing.js', proof: 'sealed_promotion_kek = ?' },
-
+    'ha_node.wrap_private_sealed': { shape: 'utf8', storage: 'base64' },
+    'ha_node.sealed_promotion_kek': { shape: 'raw', storage: 'base64' },
     // replicated tier1
-    'ca_authority.ca_private_key_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/ca.js', proof: 'encryptConfig({ pem: caKeyPem })' },
-    'integration_config.config_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/services/account-review.js', proof: 'decryptConfig(row.config_encrypted)' },
-    'sdn_integrations.api_credentials_encrypted': { shape: 'json', storage: 'buffer', ev: 'server/routes/sdn.js', proof: 'encryptConfig(credentials)' },
-    'storage_destinations.credentials_encrypted': { shape: 'json', storage: 'base64', ev: 'server/services/storage-destinations.js', proof: "Buffer.from(stored, 'base64')" },
-    'malware_scanner_integrations.credentials_encrypted': { shape: 'json', storage: 'base64', ev: 'server/services/integration-manager.js', proof: "Buffer.from(row.credentials_encrypted, 'base64')" },
-    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'base64', ev: 'server/services/external-restore.js', proof: "Buffer.from(sourceRow.credentials_encrypted, 'base64')" },
-    'scheduling_platform_config.credentials_encrypted': { shape: 'json', storage: 'base64', ev: 'server/services/scheduling-sync.js', proof: 'base64 blob' },
-    'kms_providers.credentials_encrypted': { shape: 'json', storage: 'hex', ev: 'server/services/kms-providers.js', proof: "Buffer.from(hexOrNull, 'hex')" },
-    'gd_push_config.api_key_encrypted': { shape: 'utf8', storage: 'base64', ev: 'server/services/gd-push.js', proof: 'base64-encoded' },
-    'notification_config.sms_auth_token_encrypted': { shape: 'utf8', storage: 'buffer', ev: 'server/routes/notifications.js', proof: "encrypt(smsAuthToken, 'TIER1_ENCRYPTION_KEY')" },
-
+    'ca_authority.ca_private_key_encrypted': { shape: 'json', storage: 'buffer' },
+    'integration_config.config_encrypted': { shape: 'json', storage: 'buffer' },
+    'sdn_integrations.api_credentials_encrypted': { shape: 'json', storage: 'buffer' },
+    'storage_destinations.credentials_encrypted': { shape: 'json', storage: 'base64' },
+    'malware_scanner_integrations.credentials_encrypted': { shape: 'json', storage: 'base64' },
+    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'base64' },
+    'scheduling_platform_config.credentials_encrypted': { shape: 'json', storage: 'base64' },
+    'kms_providers.credentials_encrypted': { shape: 'json', storage: 'hex' },
+    'gd_push_config.api_key_encrypted': { shape: 'utf8', storage: 'base64' },
+    'notification_config.sms_auth_token_encrypted': { shape: 'utf8', storage: 'buffer' },
     // tier3 (excluded from the operational registry; encoding recorded for coverage)
-    'peer_board_messages.content_encrypted': { shape: 'utf8', storage: 'buffer', ev: 'server/routes/peer-board.js', proof: 'encryptTier3(content)' },
+    'peer_board_messages.content_encrypted': { shape: 'utf8', storage: 'buffer' },
   },
 
   gd: {
     // GD signing keys + ca + integration credentials go through gd-encryption,
     // whose encryptConfig returns a self-describing JSON envelope STRING.
-    'archive_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-    'audit_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-    'backup_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-    'report_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-    'forensic_export_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-    'cloud_iac_signing_keys.private_key_wrapped': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-backup-signing-keys.js', proof: "require('./gd-encryption')" },
-
-    'gd_ha_node.wrap_private_sealed': { shape: 'utf8', storage: 'base64', ev: 'packages/global-dashboard-server/services/gd-ha-keys.js', proof: 'unsealFromHardware(row.wrap_private_sealed)' },
-    'gd_ha_node.sealed_promotion_kek': { shape: 'raw', storage: 'base64', ev: 'packages/global-dashboard-server/services/gd-ha-pairing.js', proof: 'sealed_promotion_kek = ?' },
-
-    'ca_authority.ca_private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-ca.js', proof: 'decryptConfig(row.ca_private_key_encrypted)' },
-    'storage_destinations.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-storage-destinations.js', proof: 'self-describing' },
-    'malware_scanner_integrations.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-integration-manager.js', proof: 'decryptConfig(row.credentials_encrypted)' },
+    'archive_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'audit_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'backup_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'report_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'forensic_export_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'cloud_iac_signing_keys.private_key_wrapped': { shape: 'json', storage: 'envelope' },
+    'gd_ha_node.wrap_private_sealed': { shape: 'utf8', storage: 'base64' },
+    'gd_ha_node.sealed_promotion_kek': { shape: 'raw', storage: 'base64' },
+    'ca_authority.ca_private_key_encrypted': { shape: 'json', storage: 'envelope' },
+    'storage_destinations.credentials_encrypted': { shape: 'json', storage: 'envelope' },
+    'malware_scanner_integrations.credentials_encrypted': { shape: 'json', storage: 'envelope' },
     // external_restore stores the gd-encryption self-describing envelope string, like
     // every other GD Tier-1 column: encryptCredentials calls encryptConfig(...) (which
     // returns that string) and its .toString('base64') is a no-op on a string, not a
     // Buffer. (The read side's Buffer.from(...,'base64') is a live defect, unexercised
     // because no source with credentials is configured; A3 routes it through the
     // chokepoint and the format stays this envelope.)
-    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-external-restore.js', proof: "require('./gd-encryption')" },
+    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'envelope' },
   },
 };
 
@@ -391,22 +393,6 @@ function fileContains(relFile, needle) {
   catch (e) { return false; }
 }
 
-// Codecs the source directly co-locates with the column (a sanity cross-check on
-// the declared storage; shared column names can widen this, so it only fails on
-// a positively wrong buffer/envelope claim, never on a plausible one).
-function observedCodecs(index, col) {
-  const set = { base64: false, hex: false };
-  const reB64 = new RegExp('Buffer\\.from\\([^,]*\\b' + col + '\\b[^,]*,\\s*[\'"]base64[\'"]');
-  const reHex = new RegExp('Buffer\\.from\\([^,]*\\b' + col + '\\b[^,]*,\\s*[\'"]hex[\'"]');
-  for (const f of index) {
-    for (const line of f.lines) {
-      if (reB64.test(line)) set.base64 = true;
-      if (reHex.test(line)) set.hex = true;
-    }
-  }
-  return set;
-}
-
 // ---------------------------------------------------------------------------
 // Derive one server.
 // ---------------------------------------------------------------------------
@@ -447,16 +433,9 @@ function derive(server) {
     if (ENCODED_CLASSES.indexOf(cls) !== -1) {
       if (Object.prototype.hasOwnProperty.call(enc, key)) {
         const e = enc[key];
-        shape = e.shape; storage = e.storage; encEvidence = { file: e.ev, proof: e.proof };
+        shape = e.shape; storage = e.storage; encEvidence = null;
         if (SHAPES.indexOf(shape) === -1) encodingDrift.push({ key: key, reason: 'invalid shape: ' + shape });
         if (STORAGES.indexOf(storage) === -1) encodingDrift.push({ key: key, reason: 'invalid storage: ' + storage });
-        if (!fileContains(e.ev, e.proof)) {
-          encodingDrift.push({ key: key, reason: 'ENCODING proof not found in ' + e.ev + ': ' + e.proof });
-        }
-        const obs = observedCodecs(index, c.column);
-        if (storage === 'buffer' && (obs.base64 || obs.hex)) {
-          encodingDrift.push({ key: key, reason: 'declared buffer but source co-locates a base64/hex codec for the column' });
-        }
       } else {
         missingEncoding.push(key);
       }

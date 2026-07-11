@@ -16,6 +16,9 @@
  *     replicated column with sharedKek() -- the routing this phase exists for;
  *   - null passthrough: sealTier1/openTier1 of null return null;
  *   - fail-closed: an unregistered column and a tier1-derived column both throw.
+ *   - golden vectors: a committed known-correct ciphertext per column opens through
+ *     the chokepoint to its known plaintext, verifying the declared encoding by
+ *     demonstration (and catching a frozen-wrong encoding a fresh round trip cannot).
  *
  * The chokepoint's crypto core (encryption.encryptWithKey) needs tweetnacl at
  * module load and its KEK resolvers need real hardware -- neither is present in
@@ -92,6 +95,8 @@ function valueForShape(shape) {
   return null;
 }
 
+const GOLDENS = require('./tier1-golden-vectors.json');
+
 function runServer(s) {
   const problems = [];
   const seal = require(path.resolve(__dirname, s.sealModule));
@@ -147,6 +152,34 @@ function runServer(s) {
   threw = false;
   try { seal.sealTier1(s.derivedExample, 'x'); } catch (e) { threw = true; }
   if (!threw) problems.push(s.name + ': sealTier1 accepted a tier1-derived column (' + s.derivedExample + ')');
+
+  // golden vectors: open each frozen ciphertext through the chokepoint and assert
+  // the plaintext. This verifies the column's declared encoding by demonstration --
+  // a wrong storage decodes the vector wrong (the GCM tag fails), a wrong shape
+  // recovers the wrong value. Because the vectors are frozen, this also catches a
+  // self-consistent wrong encoding change that a fresh round trip cannot.
+  const goldens = GOLDENS[s.name] || [];
+  const goldenRefs = {};
+  for (let i = 0; i < goldens.length; i++) {
+    const gv = goldens[i];
+    goldenRefs[gv.colRef] = true;
+    const stored = gv.storage === 'buffer' ? Buffer.from(gv.ciphertext, 'base64') : gv.ciphertext;
+    let recovered;
+    try {
+      recovered = seal.openTier1(gv.colRef, stored);
+    } catch (e) {
+      problems.push(s.name + ': golden ' + gv.colRef + ' failed to open under storage ' + gv.storage + ': ' + e.message);
+      continue;
+    }
+    if (JSON.stringify(recovered) !== JSON.stringify(gv.plaintext)) {
+      problems.push(s.name + ': golden ' + gv.colRef + ' recovered the wrong plaintext (encoding mismatch)');
+    }
+  }
+  // every tier1 column must have a golden vector (regenerate the fixture if this fires)
+  for (let i = 0; i < tier1.length; i++) {
+    const ref = tier1[i].table + '.' + tier1[i].column;
+    if (!goldenRefs[ref]) problems.push(s.name + ': no golden vector for ' + ref + ' (run node scripts/gen-tier1-golden-vectors.js)');
+  }
 
   return { count: tier1.length, problems: problems };
 }
