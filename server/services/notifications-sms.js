@@ -64,7 +64,7 @@ const crypto = require('crypto');
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
-const { decrypt } = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 
 const BATCH_SIZE = 50;
 const SEND_TIMEOUT_MS = 10000;
@@ -92,7 +92,7 @@ function loadSmsConfig(db) {
 
   let authToken;
   try {
-    authToken = decrypt(row.sms_auth_token_encrypted, 'TIER1_ENCRYPTION_KEY');
+    authToken = openTier1('notification_config.sms_auth_token_encrypted', row.sms_auth_token_encrypted);
   } catch (err) {
     logger.error('SMS pipeline: failed to decrypt sms_auth_token_encrypted', { error: err.message });
     return null;

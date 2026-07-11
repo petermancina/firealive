@@ -80,7 +80,7 @@ require('./destination-adapter-s3');
 require('./destination-adapter-gcs');
 require('./destination-adapter-azure-blob');
 
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const deploymentMode = require('./deployment-mode');
 const dataResidency = require('./data-residency');
 
@@ -220,7 +220,7 @@ function validateAgainstAdapter(adapter, config, credentials, immutabilityMode) 
 function encryptCredentials(credentials) {
   if (credentials === null || credentials === undefined) return null;
   if (typeof credentials === 'object' && Object.keys(credentials).length === 0) return null;
-  return encryptConfig(credentials).toString('base64');
+  return sealTier1('storage_destinations.credentials_encrypted', credentials);
 }
 
 /**
@@ -229,7 +229,7 @@ function encryptCredentials(credentials) {
  */
 function decryptCredentials(stored) {
   if (stored === null || stored === undefined) return null;
-  return decryptConfig(Buffer.from(stored, 'base64'));
+  return openTier1('storage_destinations.credentials_encrypted', stored);
 }
 
 // ── DB helpers ───────────────────────────────────────────────────────────

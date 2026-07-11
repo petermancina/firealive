@@ -97,7 +97,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { encryptConfig, decryptConfig } = require('./gd-encryption');
+const { sealTier1, openTier1 } = require('./gd-tier1-seal');
 const approvalsSvc = require('./gd-restore-approvals');
 const keyWrapSvc = require('./gd-backup-key-wrapping');
 const archiveSvc = require('./gd-backup-archive');
@@ -216,17 +216,15 @@ function buildAdapterCtx(sourceRow, log) {
 }
 
 function encryptCredentials(plaintext) {
-  // encryptConfig returns a Buffer; we store as base64 in the DB so
-  // the column can be TEXT (matches existing source rows).
-  const buf = encryptConfig(plaintext);
-  return buf.toString('base64');
+  // Sealed via the GD Tier-1 chokepoint; external_restore_sources.credentials_encrypted
+  // is the gd-encryption envelope string (storage envelope), stored in the TEXT column.
+  return sealTier1('external_restore_sources.credentials_encrypted', plaintext);
 }
 
 function decryptCredentials(sourceRow) {
   if (!sourceRow.credentials_encrypted) return null;
   try {
-    const buf = Buffer.from(sourceRow.credentials_encrypted, 'base64');
-    return decryptConfig(buf);
+    return openTier1('external_restore_sources.credentials_encrypted', sourceRow.credentials_encrypted);
   } catch (err) {
     throw new ExternalRestoreError(CODES.INVALID_INPUT,
       `credentials decrypt failed for source ${sourceRow.id}: ${err.message}`);

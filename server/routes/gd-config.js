@@ -23,7 +23,7 @@ const net = require('net');
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
-const { encrypt, decrypt } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { validateAllowedHost } = require('../services/gd-allow-list');
 // R3g PR3 Phase 5 (C27): the PUT handler auto-fires an initial handshake
 // when api_key + mc_id + endpoint_url first land together, staging a
@@ -342,7 +342,7 @@ async function fireInitialHandshakeIfReady(db, updatedRow, req) {
   // ── Decrypt api_key ──
   let apiKey;
   try {
-    apiKey = decrypt(Buffer.from(updatedRow.api_key_encrypted, 'base64'), 'TIER1_ENCRYPTION_KEY');
+    apiKey = openTier1('gd_push_config.api_key_encrypted', updatedRow.api_key_encrypted);
   } catch (err) {
     logger.error('GD config handshake: api_key decrypt failed', { error: err.message });
     auditLog(req.user?.id, 'GD_CONFIG_HANDSHAKE_FAILED', 'stage=decrypt reason=api_key_decrypt_failed', req.ip);
@@ -560,7 +560,7 @@ router.put('/', async (req, res) => {
       if (!v.ok) { db.close(); return res.status(400).json({ error: v.error }); }
       let encrypted;
       try {
-        encrypted = encrypt(v.value, 'TIER1_ENCRYPTION_KEY').toString('base64');
+        encrypted = sealTier1('gd_push_config.api_key_encrypted', v.value);
       } catch (err) {
         logger.error('GD config api_key encryption error', { error: err.message });
         db.close();
@@ -741,8 +741,7 @@ router.post('/test', async (req, res) => {
   }
   let apiKey;
   try {
-    const buffer = Buffer.from(row.api_key_encrypted, 'base64');
-    apiKey = decrypt(buffer, 'TIER1_ENCRYPTION_KEY');
+    apiKey = openTier1('gd_push_config.api_key_encrypted', row.api_key_encrypted);
   } catch (err) {
     logger.error('GD config test decryption error', { error: err.message });
     return res.status(500).json({ error: 'Failed to decrypt stored api_key — check TIER1_ENCRYPTION_KEY env var' });

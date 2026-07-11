@@ -18,7 +18,7 @@ const crypto = require('crypto');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const ca = require('../services/ca');
-const { encryptConfig, decryptConfig } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { cryptoEraseAnalyst } = require('../services/crypto-erase');
 const { runOffboardingDetection } = require('../services/account-review');
 
@@ -240,7 +240,7 @@ router.get('/ldap-config', (req, res) => {
     const row = db.prepare("SELECT config_encrypted, status FROM integration_config WHERE integration_type = 'iam_ldap'").get();
     if (!row || !row.config_encrypted) return res.json({ configured: false });
     let cfg = {};
-    try { cfg = decryptConfig(row.config_encrypted) || {}; } catch (_) { cfg = {}; }
+    try { cfg = openTier1('integration_config.config_encrypted', row.config_encrypted) || {}; } catch (_) { cfg = {}; }
     return res.json({
       configured: true,
       status: row.status,
@@ -275,7 +275,7 @@ router.post('/ldap-config', (req, res) => {
     if (!bindPassword) {
       const ex = db.prepare("SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap'").get();
       if (ex && ex.config_encrypted) {
-        try { bindPassword = (decryptConfig(ex.config_encrypted) || {}).bindPassword; } catch (_) { /* none */ }
+        try { bindPassword = (openTier1('integration_config.config_encrypted', ex.config_encrypted) || {}).bindPassword; } catch (_) { /* none */ }
       }
     }
     const cfg = {
@@ -289,7 +289,7 @@ router.post('/ldap-config', (req, res) => {
       groupFilter: b.groupFilter || undefined,
       groupMapping: b.groupMapping || undefined,
     };
-    const enc = encryptConfig(cfg);
+    const enc = sealTier1('integration_config.config_encrypted', cfg);
     const existing = db.prepare("SELECT id FROM integration_config WHERE integration_type = 'iam_ldap'").get();
     if (existing) {
       db.prepare("UPDATE integration_config SET config_encrypted = ?, status = 'configured', updated_at = datetime('now') WHERE id = ?").run(enc, existing.id);
@@ -319,14 +319,14 @@ router.post('/ldap-config/test', async (req, res) => {
       if (!bindPassword) {
         const ex = db.prepare("SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap'").get();
         if (ex && ex.config_encrypted) {
-          try { bindPassword = (decryptConfig(ex.config_encrypted) || {}).bindPassword; } catch (_) { /* none */ }
+          try { bindPassword = (openTier1('integration_config.config_encrypted', ex.config_encrypted) || {}).bindPassword; } catch (_) { /* none */ }
         }
       }
       cfg = { server: b.server, port: b.port || 636, baseDn: b.baseDn, bindDn: b.bindDn, bindPassword, useTLS: b.useTLS !== false };
     } else {
       const ex = db.prepare("SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap'").get();
       if (!ex || !ex.config_encrypted) return res.status(400).json({ error: 'no LDAP config to test' });
-      cfg = decryptConfig(ex.config_encrypted);
+      cfg = openTier1('integration_config.config_encrypted', ex.config_encrypted);
     }
     const { LdapClient } = require('../integrations/ldap');
     const result = await new LdapClient(cfg).testConnection();

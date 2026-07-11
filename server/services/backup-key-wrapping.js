@@ -77,7 +77,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const base = require('./key-wrapping-providers/base');
-const encryptionSvc = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -229,9 +229,9 @@ function loadKmsProviderRow(db, rowId, expectedScheme) {
   let credentials = null;
   if (row.credentials_encrypted) {
     try {
-      // credentials_encrypted is Tier-1-encrypted JSON, hex-encoded for
-      // SQLite TEXT compatibility. decryptTier1 handles JSON.parse.
-      credentials = encryptionSvc.decryptTier1(Buffer.from(row.credentials_encrypted, 'hex'));
+      // credentials_encrypted is the kms_providers Tier-1 column (hex storage);
+      // openTier1 hex-decodes, decrypts, and JSON.parses per the registry.
+      credentials = openTier1('kms_providers.credentials_encrypted', row.credentials_encrypted);
     } catch (err) {
       throw new Error(
         `backup-key-wrapping: kms_providers row '${rowId}' credentials ` +

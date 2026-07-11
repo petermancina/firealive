@@ -48,7 +48,7 @@
 
 const crypto = require('crypto');
 const base = require('./key-wrapping-providers/base');
-const encryptionSvc = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
 
@@ -183,7 +183,7 @@ function validateConfigAndCredentials(impl, config, credentials) {
 function encryptCredentials(credentials) {
   if (credentials === null || credentials === undefined) return null;
   try {
-    return encryptionSvc.encryptTier1(credentials).toString('hex');
+    return sealTier1('kms_providers.credentials_encrypted', credentials);
   } catch (err) {
     throw new KmsProviderError(
       CODES.ENCRYPTION_NOT_CONFIGURED,
@@ -195,7 +195,7 @@ function encryptCredentials(credentials) {
 function decryptCredentials(hexOrNull) {
   if (!hexOrNull) return null;
   try {
-    return encryptionSvc.decryptTier1(Buffer.from(hexOrNull, 'hex'));
+    return openTier1('kms_providers.credentials_encrypted', hexOrNull);
   } catch (err) {
     throw new KmsProviderError(
       CODES.ENCRYPTION_NOT_CONFIGURED,

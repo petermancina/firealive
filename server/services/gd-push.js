@@ -124,7 +124,7 @@
 
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
-const { decrypt } = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 const { MetricsCollector } = require('./metrics-collector');
 const { auditLog } = require('../middleware/audit');
 const { validateAllowedHost } = require('./gd-allow-list');
@@ -512,8 +512,7 @@ class GdPushService {
   }
 
   _decryptKey(encryptedBase64) {
-    const buffer = Buffer.from(encryptedBase64, 'base64');
-    return decrypt(buffer, 'TIER1_ENCRYPTION_KEY');
+    return openTier1('gd_push_config.api_key_encrypted', encryptedBase64);
   }
 
   // Map MetricsCollector output to the GD-Server /api/ingest/metrics body shape.

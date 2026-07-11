@@ -42,7 +42,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
-const { encrypt, decrypt } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 
 // N1a C22: in-memory rate limiter for /sms/test. Sliding 60s window, 3 attempts
 // per user. Cleared on server restart; production deployments behind a load
@@ -217,7 +217,7 @@ router.put('/config', (req, res) => {
       if (existing && existing.sms_auth_token_encrypted) smsAuthTokenAction = 'cleared';
     } else {
       try {
-        resolvedSmsAuthTokenEncrypted = encrypt(smsAuthToken, 'TIER1_ENCRYPTION_KEY');
+        resolvedSmsAuthTokenEncrypted = sealTier1('notification_config.sms_auth_token_encrypted', smsAuthToken);
         smsAuthTokenAction = 'changed';
       } catch (encErr) {
         db.close();
@@ -400,7 +400,7 @@ router.post('/sms/test', async (req, res) => {
       // Decrypt auth token
       let authToken;
       try {
-        authToken = decrypt(cfgRow.sms_auth_token_encrypted, 'TIER1_ENCRYPTION_KEY');
+        authToken = openTier1('notification_config.sms_auth_token_encrypted', cfgRow.sms_auth_token_encrypted);
       } catch (decErr) {
         db.close();
         logger.error('SMS test: decrypt error', { error: decErr.message });

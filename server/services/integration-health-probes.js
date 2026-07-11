@@ -99,8 +99,8 @@ function _loadIamConfig(db) {
   try {
     const row = db.prepare("SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap'").get();
     if (!row || !row.config_encrypted) return null;
-    const { decryptConfig } = require('./encryption');
-    return decryptConfig(row.config_encrypted) || null;
+    const { openTier1 } = require('./tier1-seal');
+    return openTier1('integration_config.config_encrypted', row.config_encrypted) || null;
   } catch { return null; }
 }
 

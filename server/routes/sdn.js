@@ -36,7 +36,7 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
-const { encryptConfig, decryptConfig } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 const registry = require('../services/sdn');
@@ -78,7 +78,7 @@ function rowToPublic(row) {
 function loadAdapterConfig(row) {
   let credentials = {};
   if (row.api_credentials_encrypted) {
-    credentials = decryptConfig(row.api_credentials_encrypted);
+    credentials = openTier1('sdn_integrations.api_credentials_encrypted', row.api_credentials_encrypted);
   }
   return {
     apiEndpoint: row.api_endpoint,
@@ -137,7 +137,7 @@ router.post('/integrations', function (req, res) {
     if (!apiEndpoint) return res.status(400).json({ error: 'apiEndpoint is required' });
 
     const credentials = isPlainObject(body.credentials) ? body.credentials : {};
-    const encrypted = encryptConfig(credentials);
+    const encrypted = sealTier1('sdn_integrations.api_credentials_encrypted', credentials);
     const id = crypto.randomBytes(16).toString('hex');
 
     db.prepare(
@@ -183,10 +183,10 @@ router.put('/integrations/:id', function (req, res) {
     let credentialsChanged = false;
     if (body.credentials !== undefined) {
       if (body.credentials === null || (isPlainObject(body.credentials) && Object.keys(body.credentials).length === 0)) {
-        encrypted = encryptConfig({});
+        encrypted = sealTier1('sdn_integrations.api_credentials_encrypted', {});
         credentialsChanged = true;
       } else if (isPlainObject(body.credentials)) {
-        encrypted = encryptConfig(body.credentials);
+        encrypted = sealTier1('sdn_integrations.api_credentials_encrypted', body.credentials);
         credentialsChanged = true;
       }
     }

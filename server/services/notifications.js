@@ -788,8 +788,8 @@ async function probeSmsChannel(db) {
   if (row.sms_provider === 'twilio') {
     let token;
     try {
-      const { decrypt } = require('./encryption');
-      token = decrypt(row.sms_auth_token_encrypted, 'TIER1_ENCRYPTION_KEY');
+      const { openTier1 } = require('./tier1-seal');
+      token = openTier1('notification_config.sms_auth_token_encrypted', row.sms_auth_token_encrypted);
     } catch (_e) {
       return { ok: false, status: 'error', detail: 'failed to decrypt SMS auth token' };
     }

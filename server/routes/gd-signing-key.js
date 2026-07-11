@@ -61,7 +61,7 @@ const signingKeysSvc = require('../services/gd-push-signing-keys');
 // R3g PR3 Phase 5 (C26): outbound HTTP to the GD for submitting the
 // staged signing key. Mirrors gd-push.js's outbound-call patterns:
 // allow-list re-validation, AbortController timeout, redirect: 'error'.
-const { decrypt } = require('../services/encryption');
+const { openTier1 } = require('../services/tier1-seal');
 const { validateAllowedHost } = require('../services/gd-allow-list');
 
 const REQUEST_TIMEOUT_MS = 30000;
@@ -220,7 +220,7 @@ router.post('/rotate', async (req, res) => {
   // included in response bodies; never persisted outside the encrypted
   // column it was read from.
   try {
-    apiKey = decrypt(Buffer.from(config.api_key_encrypted, 'base64'), 'TIER1_ENCRYPTION_KEY');
+    apiKey = openTier1('gd_push_config.api_key_encrypted', config.api_key_encrypted);
   } catch (err) {
     logger.error('gd-signing-key rotate: api_key decrypt failed', { error: err.message });
     auditLog(req.user.id, 'GD_PUSH_SIGNING_KEY_STAGE_FAILED', 'stage=prereq reason=api_key_decrypt_failed', req.ip);

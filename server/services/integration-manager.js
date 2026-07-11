@@ -71,7 +71,7 @@ const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
 
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 
 const INSPECTOR_VERSION = '2.0.0'; // bumped from v1.0.17's '1.0.0' for the
                                     // multi-provider refactor. Audit logs
@@ -229,7 +229,7 @@ class IntegrationManager {
     const enabledInt = (enabled === false || enabled === 0) ? 0 : 1;
 
     const id = crypto.randomBytes(16).toString('hex');
-    const credEncrypted = encryptConfig(credentials).toString('base64');
+    const credEncrypted = sealTier1('malware_scanner_integrations.credentials_encrypted', credentials);
 
     this.db.prepare(`INSERT INTO malware_scanner_integrations
       (id, provider_type, display_name, credentials_encrypted,
@@ -276,7 +276,7 @@ class IntegrationManager {
         throw new Error('credentials must be an object when provided');
       }
       sets.push('credentials_encrypted = ?');
-      params.push(encryptConfig(args.credentials).toString('base64'));
+      params.push(sealTier1('malware_scanner_integrations.credentials_encrypted', args.credentials));
       // Reset last_test fields since credentials changed — old test result
       // no longer reflects the current credentials.
       sets.push('last_test_at = NULL');
@@ -338,7 +338,7 @@ class IntegrationManager {
 
     let credentials;
     try {
-      credentials = decryptConfig(Buffer.from(row.credentials_encrypted, 'base64'));
+      credentials = openTier1('malware_scanner_integrations.credentials_encrypted', row.credentials_encrypted);
     } catch (err) {
       this._recordTestResult(id, 'failed', `credential decryption failed: ${err.message}`);
       return { ok: false, error: `credential decryption failed: ${err.message}` };
@@ -660,7 +660,7 @@ class IntegrationManager {
 
     let credentials;
     try {
-      credentials = decryptConfig(Buffer.from(row.credentials_encrypted, 'base64'));
+      credentials = openTier1('malware_scanner_integrations.credentials_encrypted', row.credentials_encrypted);
     } catch (err) {
       return { ...baseDetail, latencyMs: Date.now() - scannerStarted,
                error: `credential decryption failed: ${err.message}` };

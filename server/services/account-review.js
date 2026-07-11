@@ -12,7 +12,7 @@ const { getDb } = require('../db/init');
 const { logger } = require('./logger');
 const { auditLog } = require('../middleware/audit');
 const { LdapClient } = require('../integrations/ldap');
-const { decryptConfig } = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 
 const STALE_THRESHOLD_DAYS = 90;
 const SUSPICIOUS_API_CALLS_PER_HOUR = 500;
@@ -243,7 +243,7 @@ async function runOffboardingDetection() {
         "SELECT config_encrypted FROM integration_config WHERE integration_type = 'iam_ldap' AND status IN ('configured','operational')"
       ).get();
       if (row && row.config_encrypted) {
-        const cfg = decryptConfig(row.config_encrypted);
+        const cfg = openTier1('integration_config.config_encrypted', row.config_encrypted);
         if (cfg && cfg.server) ldap = new LdapClient(cfg);
       }
     } catch (e) {

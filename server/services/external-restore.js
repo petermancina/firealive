@@ -97,7 +97,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const { logger } = require('./logger');
 const approvalsSvc = require('./restore-approvals');
 const keyWrapSvc = require('./backup-key-wrapping');
@@ -218,17 +218,15 @@ function buildAdapterCtx(sourceRow, log) {
 }
 
 function encryptCredentials(plaintext) {
-  // encryptConfig returns a Buffer; we store as base64 in the DB so
-  // the column can be TEXT (matches existing source rows).
-  const buf = encryptConfig(plaintext);
-  return buf.toString('base64');
+  // Sealed via the Tier-1 chokepoint; external_restore_sources.credentials_encrypted
+  // is base64 storage per the registry, stored in the TEXT column.
+  return sealTier1('external_restore_sources.credentials_encrypted', plaintext);
 }
 
 function decryptCredentials(sourceRow) {
   if (!sourceRow.credentials_encrypted) return null;
   try {
-    const buf = Buffer.from(sourceRow.credentials_encrypted, 'base64');
-    return decryptConfig(buf);
+    return openTier1('external_restore_sources.credentials_encrypted', sourceRow.credentials_encrypted);
   } catch (err) {
     throw new ExternalRestoreError(CODES.INVALID_INPUT,
       `credentials decrypt failed for source ${sourceRow.id}: ${err.message}`);

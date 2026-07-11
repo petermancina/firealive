@@ -77,7 +77,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const { requireIdentityEstablished } = require('./entropy');
 
 // ── Tunables ────────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ function getCaCertPem(db) {
 function loadCaKeyPem(db) {
   const row = getActiveCaRow(db);
   if (!row) throw new Error('no active CA; call initCa(db) first');
-  const { pem } = decryptConfig(row.ca_private_key_encrypted);
+  const { pem } = openTier1('ca_authority.ca_private_key_encrypted', row.ca_private_key_encrypted);
   return pem;
 }
 
@@ -198,7 +198,7 @@ function initCa(db) {
 
     const caKeyPem = fs.readFileSync(keyPath, 'utf8');
     const caCertPem = fs.readFileSync(certPath, 'utf8');
-    const encrypted = encryptConfig({ pem: caKeyPem });
+    const encrypted = sealTier1('ca_authority.ca_private_key_encrypted', { pem: caKeyPem });
 
     db.prepare(`
       INSERT INTO ca_authority

@@ -32,7 +32,7 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
-const { encryptConfig, decryptConfig } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
 
@@ -78,7 +78,7 @@ router.get('/:type', (req, res) => {
     if (!row) return res.json({ type: req.params.type, status: 'not_configured', config: null });
 
     // Decrypt the config
-    const config = decryptConfig(row.config_encrypted);
+    const config = openTier1('integration_config.config_encrypted', row.config_encrypted);
 
     // SOC-grade: never expose sensitive field values, not even partially-
     // redacted (the earlier slice(0,4)+'••••••••' pattern still leaked the
@@ -196,7 +196,7 @@ router.put('/:type', (req, res) => {
     // apply since there's nothing to preserve.
     const db = getDb();
     const existingRow = db.prepare('SELECT id, config_encrypted FROM integration_config WHERE integration_type = ?').get(req.params.type);
-    const existingConfig = existingRow ? decryptConfig(existingRow.config_encrypted) : null;
+    const existingConfig = existingRow ? openTier1('integration_config.config_encrypted', existingRow.config_encrypted) : null;
 
     const mergedConfig = { ...incomingConfig };
     const preservedFields = [];
@@ -243,7 +243,7 @@ router.put('/:type', (req, res) => {
     // audit-log marker strings for any invariants enforced.
     const { normalized, auditMarkers } = normalizeConfigForType(req.params.type, mergedConfig);
 
-    const encrypted = encryptConfig(normalized);
+    const encrypted = sealTier1('integration_config.config_encrypted', normalized);
 
     if (existingRow) {
       db.prepare(`
@@ -304,7 +304,7 @@ router.post('/:type/test', (req, res) => {
     const row = db.prepare('SELECT * FROM integration_config WHERE integration_type = ?').get(req.params.type);
     if (!row) { db.close(); return res.status(404).json({ error: 'Integration not configured' }); }
 
-    const config = decryptConfig(row.config_encrypted);
+    const config = openTier1('integration_config.config_encrypted', row.config_encrypted);
 
     // Simulated connectivity test — in production, this would make actual
     // HTTP/LDAP/SAML calls to the configured endpoints
