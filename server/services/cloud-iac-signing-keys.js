@@ -86,7 +86,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const { logger } = require('./logger');
 
 const DEFAULT_ALGORITHM = 'cosign-ecdsa-p256';
@@ -139,7 +139,7 @@ function rowToListView(row) {
 
 function insertActiveKey(db, algorithm = DEFAULT_ALGORITHM) {
   const { publicKey, privateKey } = generateEcdsaP256Pair();
-  const wrapped = encryptConfig({ pem: privateKey });
+  const wrapped = sealTier1('cloud_iac_signing_keys.private_key_wrapped', { pem: privateKey });
   const result = db
     .prepare(
       `INSERT INTO cloud_iac_signing_keys
@@ -190,7 +190,7 @@ function getActiveSigningKey(db) {
       `active signing key id=${row.id} has no private_key_wrapped (database inconsistency)`,
     );
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_wrapped);
+  const { pem: privateKeyPem } = openTier1('cloud_iac_signing_keys.private_key_wrapped', row.private_key_wrapped);
   return {
     id: row.id,
     publicKeyPem: row.public_key,

@@ -38,7 +38,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./gd-encryption');
+const { sealTier1, openTier1 } = require('./gd-tier1-seal');
 
 // -- Typed errors (used by the external-registration trust API) --------------
 
@@ -163,7 +163,7 @@ function ensureActiveReportKeypair(db) {
   }
 
   const { publicKeyPem, privateKeyPem, publicKeyFingerprint } = generateKeypair();
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('report_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
   const result = db.prepare(`
     INSERT INTO report_signing_keys
@@ -200,7 +200,7 @@ function getActiveReportKey(db) {
   if (row.key_origin && row.key_origin !== 'local-generated') {
     throw new Error(`active report signing key is not local-generated (origin=${row.key_origin}); refusing to sign`);
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
+  const { pem: privateKeyPem } = openTier1('report_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),
@@ -268,7 +268,7 @@ function rotateReportKeypair(db, options = {}) {
     `).run();
 
     const { publicKeyPem, privateKeyPem, publicKeyFingerprint } = generateKeypair();
-    const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+    const privateKeyEncrypted = sealTier1('report_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
     const result = db.prepare(`
       INSERT INTO report_signing_keys

@@ -34,7 +34,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const { canonicalSerialize } = require('./audit-export-shared');
 
 const VALID_EVENTS = [
@@ -64,7 +64,7 @@ function ensureActiveKey(db) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
   const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' });
   const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('abuse_vault_chain_signing_keys.private_key_encrypted', { pem: privateKeyPem });
   const fingerprint = computeFingerprint(publicKey);
   const id = 'avsk-' + crypto.randomUUID();
   db.prepare(
@@ -84,7 +84,7 @@ function loadActiveKey(db) {
   if (!row) {
     throw new Error('no active abuse_vault_chain signing key; call ensureActiveKey(db) at server boot');
   }
-  const { pem } = decryptConfig(row.private_key_encrypted);
+  const { pem } = openTier1('abuse_vault_chain_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     fingerprint: row.fingerprint,

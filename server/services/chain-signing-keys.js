@@ -30,7 +30,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 
 // ── Keypair generation ────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ function ensureActiveChainKeypair(db) {
   }
 
   const { publicKeyPem, privateKeyPem } = generateKeypair();
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('chain_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
   const result = db.prepare(`
     INSERT INTO chain_signing_keys
@@ -127,7 +127,7 @@ function getActiveChainKey(db) {
   if (!row) {
     throw new Error('no active chain signing key exists; call ensureActiveChainKeypair(db) at server boot');
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
+  const { pem: privateKeyPem } = openTier1('chain_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),
@@ -191,7 +191,7 @@ function rotateChainKeypair(db, options = {}) {
     `).run();
 
     const { publicKeyPem, privateKeyPem } = generateKeypair();
-    const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+    const privateKeyEncrypted = sealTier1('chain_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
     const result = db.prepare(`
       INSERT INTO chain_signing_keys

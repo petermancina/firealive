@@ -34,7 +34,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 
 // ── Typed errors ──────────────────────────────────────────────────────────
 
@@ -218,7 +218,7 @@ function ensureActiveKeypair(db) {
   }
 
   const { publicKeyPem, privateKeyPem, publicKeyFingerprint } = generateKeypair();
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('backup_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
   const result = db.prepare(`
     INSERT INTO backup_signing_keys
@@ -262,7 +262,7 @@ function getActiveSigningKey(db) {
   if (!row.private_key_encrypted) {
     throw new Error('active local-generated signing key has no private_key_encrypted (database inconsistency)');
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
+  const { pem: privateKeyPem } = openTier1('backup_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),
@@ -385,7 +385,7 @@ function rotateKeypair(db, options = {}) {
     `).run();
 
     const { publicKeyPem, privateKeyPem, publicKeyFingerprint } = generateKeypair();
-    const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+    const privateKeyEncrypted = sealTier1('backup_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
     const result = db.prepare(`
       INSERT INTO backup_signing_keys

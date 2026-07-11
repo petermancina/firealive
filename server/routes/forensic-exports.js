@@ -104,7 +104,7 @@ const { auditLog } = require('../middleware/audit');
 const forensicExport = require('../services/forensic-export');
 const exportEncryption = require('../services/export-encryption');
 const { canonicalSerialize, sliceSha256 } = require('../services/audit-export-shared');
-const { decryptConfig } = require('../services/encryption');
+const { openTier1 } = require('../services/tier1-seal');
 
 // ── Per-handler auth gates ──────────────────────────────────────────────
 
@@ -156,7 +156,7 @@ function appendChainEntryFromRoute(db, opts) {
   if (!keyRow) {
     throw new Error('No active forensic export signing key found');
   }
-  const { pem } = decryptConfig(keyRow.private_key_encrypted);
+  const { pem } = openTier1('forensic_export_chain_signing_keys.private_key_encrypted', keyRow.private_key_encrypted);
   const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
 
   const prevRow = db

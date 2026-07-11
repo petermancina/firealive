@@ -17,7 +17,7 @@
 const crypto = require('crypto');
 const path = require('path');
 const { DB_PATH } = require('../db-init');
-const { encryptConfig, decryptConfig } = require('./gd-encryption');
+const { sealTier1, openTier1 } = require('./gd-tier1-seal');
 
 const PAYLOAD_VERSION = 1;
 const MIGRATION_MARKER = 'gd_audit_chain_backfilled';
@@ -105,7 +105,7 @@ function ensureActiveAuditChainKey(db) {
     return { id: existing.id, publicKeyPem: existing.public_key, isNewlyCreated: false };
   }
   const { publicKeyPem, privateKeyPem } = generateKeypair();
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('audit_chain_signing_keys.private_key_encrypted', { pem: privateKeyPem });
   const result = db.prepare(`
     INSERT INTO audit_chain_signing_keys
       (public_key, private_key_encrypted, is_active, notes)
@@ -119,7 +119,7 @@ function getActiveAuditChainKey(db) {
   if (!row) {
     throw new Error('no active GD audit-chain signing key; call ensureActiveAuditChainKey(db) first');
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
+  const { pem: privateKeyPem } = openTier1('audit_chain_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),

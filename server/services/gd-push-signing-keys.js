@@ -87,7 +87,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 
 // ── Keypair generation + fingerprint ──────────────────────────────────────
 
@@ -228,7 +228,7 @@ function getActivePushKey(db) {
   if (!row) {
     throw new Error('no active GD-push signing key exists; call ensureActivePushKeypair(db) before signing');
   }
-  const { pem: privateKeyPem } = decryptConfig(row.private_key_encrypted);
+  const { pem: privateKeyPem } = openTier1('gd_push_signing_keys.private_key_encrypted', row.private_key_encrypted);
   return {
     id: row.id,
     publicKey: crypto.createPublicKey(row.public_key),
@@ -319,7 +319,7 @@ function stageNewPushKeypair(db, options = {}) {
   const { notes = 'staged for handshake' } = options;
 
   const { publicKeyPem, privateKeyPem, publicKeyFingerprint } = generateKeypair();
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('gd_push_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
   const result = db.prepare(`
     INSERT INTO gd_push_signing_keys

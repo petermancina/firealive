@@ -67,7 +67,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 
-const { encryptConfig, decryptConfig } = require('./encryption');
+const { sealTier1, openTier1 } = require('./tier1-seal');
 const exportEncryption = require('./export-encryption');
 const {
   canonicalSerialize,
@@ -175,7 +175,7 @@ function ensureActiveSigningKey(db) {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
   const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' });
   const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
-  const privateKeyEncrypted = encryptConfig({ pem: privateKeyPem });
+  const privateKeyEncrypted = sealTier1('forensic_export_chain_signing_keys.private_key_encrypted', { pem: privateKeyPem });
 
   // Fingerprint = SHA-256 of the raw SPKI bytes, hex
   const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
@@ -198,7 +198,7 @@ function loadActivePrivateKey(db) {
   if (!row) {
     throw new Error('No active forensic export signing key found');
   }
-  const { pem } = decryptConfig(row.private_key_encrypted);
+  const { pem } = openTier1('forensic_export_chain_signing_keys.private_key_encrypted', row.private_key_encrypted);
   const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
   return {
     id: row.id,
