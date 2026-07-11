@@ -29,6 +29,8 @@ jobs:
         run: node scripts/check-tier1-single-writer.js
       - name: Verify shared-KEK boot reload
         run: node scripts/check-shared-kek-boot-reload.js
+      - name: Verify fuse high-water anti-rollback
+        run: node scripts/check-fuse-high-water.js
 
 
   build-mac:

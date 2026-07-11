@@ -2134,8 +2134,8 @@ class RegressionRunner {
       return 'checkClockIntegrity / status present; MAX_DRIFT_MS = ' + ci.MAX_DRIFT_MS;
     });
     await check('virtualization_mode', 'Anti-rollback fuse high-water seeded', () => {
-      const row = this.db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_high_water'").get();
-      if (!row) throw new Error('no fuse_high_water row in system_meta (B5e seed missing)');
+      const row = this.db.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get();
+      if (!row) throw new Error('no fuse_high_water row in node_state (B6h A-8 seed/migration missing)');
       return 'fuse_high_water = ' + row.value;
     });
     await check('virtualization_mode', 'Migration export / import service surface (FA-MIG1)', () => {

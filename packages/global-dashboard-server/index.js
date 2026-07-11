@@ -6891,6 +6891,42 @@ try {
   process.exit(1);
 }
 
+// B6h A-8: anti-rollback high-water gate (decision D7/D17) -- the GD's first
+// boot-time fuse check, the twin of the Regional Server's. A running GD build whose
+// fuse counter is below the highest this deployment has recorded means the binary was
+// downgraded or an older snapshot was restored. Mark the GD instance quarantined and,
+// in production, halt (fail-closed); otherwise log. The high-water lives in node_state
+// (node-local, excluded from replication, so a promoted-from-standby GD never inherits
+// another node's mark).
+try {
+  const gdFuseHighWater = require('./services/gd-fuse-high-water');
+  const hwDb = getDb();
+  try {
+    const rollbackVerdict = gdFuseHighWater.checkAndAdvance(hwDb);
+    if (rollbackVerdict.rollback) {
+      console.error('GD ANTI-ROLLBACK VIOLATION: running fuse ' + rollbackVerdict.currentFuse + ' is below the recorded high-water ' + rollbackVerdict.highWater);
+      try {
+        hwDb.prepare(
+          "UPDATE gd_instance_identity SET status = 'quarantined' " +
+          "WHERE id = (SELECT id FROM gd_instance_identity ORDER BY established_at DESC LIMIT 1)"
+        ).run();
+      } catch (markErr) {
+        console.error('Marking GD instance quarantined after rollback failed: ' + markErr.message);
+      }
+      if (process.env.NODE_ENV === 'production') {
+        console.error('HALTING: GD anti-rollback high-water check failed. Deploy the current or a newer build.');
+        process.exit(1);
+      }
+    } else {
+      console.log('GD anti-rollback high-water ok (fuse ' + rollbackVerdict.currentFuse + ', high-water ' + rollbackVerdict.highWater + ')');
+    }
+  } finally {
+    hwDb.close();
+  }
+} catch (gdHighWaterErr) {
+  console.error('GD anti-rollback high-water check failed to run: ' + gdHighWaterErr.message);
+}
+
 // B6c: resolve and hardware-seal the GD deployment mode (bare-metal /
 // virtualized / cloud / sdn / sase), the GD twin of the Regional Server's
 // deployment mode. Provisioning-only: FIREALIVE_GD_DEPLOYMENT_MODE seals the

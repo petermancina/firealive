@@ -41,7 +41,7 @@ function loadSelf(db) {
   }
   let fuseHighWater = null;
   try {
-    const m = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_high_water'").get();
+    const m = db.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get();
     if (m && m.value !== null && m.value !== undefined) {
       fuseHighWater = Number(m.value);
     }

@@ -1,29 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// FIREALIVE ── Fuse High-Water (Anti-Rollback)
+// FIREALIVE ── GD Fuse High-Water (Anti-Rollback)
 // Copyright (C) 2026 Peter Mancina
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Boot-time anti-rollback gate (B5e, decision D7). The version module is the
-// single source of truth for the running build's fuse counter. This module
-// tracks the highest fuse this deployment has ever recorded in
-// node_state.fuse_high_water (node-local, excluded from replication so a standby
-// never inherits the active's mark; relocated from system_meta in B6h A-8) and refuses to let
-// the running build sit BELOW that high-water: a lower fuse means the binary was
-// downgraded or an older snapshot or image was restored -- a rollback.
+// Boot-time anti-rollback gate for the GD Server (B6h A-8, decision D7/D17) -- the
+// GD twin of the Regional Server's fuse-high-water. The GD had no boot-time anti-
+// rollback until now; this is its first fuse check. The running build's fuse
+// counter is the GD package.json fuseCounter (the same source the GD backup suite
+// reads); there is no GD version module. This module tracks the highest fuse this
+// GD deployment has ever recorded in node_state.fuse_high_water -- node-local and
+// excluded from replication, so a promoted-from-standby GD never inherits another
+// node's mark -- and refuses to let the running build sit BELOW that high-water: a
+// lower fuse means the binary was downgraded or an older snapshot or image was
+// restored -- a rollback.
 //
-// The local check catches a binary downgrade against a preserved database. A
-// full VM snapshot restore (binary and database rolled back together) is caught
-// by the AC-fleet and GD attestation layers and, where present, the vTPM NV
-// monotonic counter (D7) -- both build on this high-water.
-//
-// checkAndAdvance() returns the verdict; the startup caller decides to refuse
-// boot, quarantine, and raise the loud alert.
-
-const version = require('../lib/version');
+// checkAndAdvance() returns the verdict; the startup caller (fail-closed) decides
+// to refuse boot, quarantine, and raise the loud alert.
 
 function currentFuse() {
-  return version.fuseCounter;
+  const pkg = require('../package.json');
+  return typeof pkg.fuseCounter === 'number' ? pkg.fuseCounter : 0;
 }
 
 function readHighWater(db) {

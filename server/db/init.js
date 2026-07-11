@@ -8483,13 +8483,29 @@ function initDb() {
     }
     const setMetaB5e = db.prepare("INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)");
     setMetaB5e.run('deployment_mode', 'bare-metal');
-    const fuseHwRow = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_counter'").get();
-    const fuseHwSeed = fuseHwRow && fuseHwRow.value !== null && fuseHwRow.value !== undefined
-      ? String(fuseHwRow.value)
-      : '0';
-    setMetaB5e.run('fuse_high_water', fuseHwSeed);
+    // B6h A-8: relocate fuse_high_water from the replicating system_meta to the
+    // excluded node_state. fuse_high_water is node-local anti-rollback state -- a
+    // standby must not inherit the active's mark (P3). PRESERVE the recorded high-
+    // water: if node_state does not yet have it, copy the existing system_meta value
+    // (NEVER the current fuse -- resetting to a lower current fuse would silently
+    // re-open the rollback window); only a genuinely fresh DB with no prior value
+    // seeds the current fuse. Then DELETE the stale system_meta row so it stops
+    // replicating and cannot be re-read. Idempotent.
+    const nsFuseHw = db.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get();
+    if (!nsFuseHw) {
+      const smFuseHw = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_high_water'").get();
+      let relocatedHw;
+      if (smFuseHw && smFuseHw.value !== null && smFuseHw.value !== undefined) {
+        relocatedHw = String(smFuseHw.value); // preserve the recorded anti-rollback high-water
+      } else {
+        const fcRow = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_counter'").get();
+        relocatedHw = (fcRow && fcRow.value !== null && fcRow.value !== undefined) ? String(fcRow.value) : '0';
+      }
+      db.prepare("INSERT INTO node_state (key, value) VALUES ('fuse_high_water', ?)").run(relocatedHw);
+    }
+    db.prepare("DELETE FROM system_meta WHERE key = 'fuse_high_water'").run();
     const instanceIdentityCount = db.prepare("SELECT COUNT(*) AS c FROM instance_identity").get().c;
-    console.log(`B5e migration: instance_identity + instance_observations + migration_bundles ready; ac_device_signing_keys ratchet columns ensured; deployment_mode + fuse_high_water seeded (${instanceIdentityCount} identity row(s) present)`);
+    console.log(`B5e migration: instance_identity + instance_observations + migration_bundles ready; ac_device_signing_keys ratchet columns ensured; deployment_mode seeded; fuse_high_water relocated to node_state (${instanceIdentityCount} identity row(s) present)`);
   } catch (b5eInstanceIdentityMigrationErr) {
     console.error('B5e instance-identity migration FAILED:', b5eInstanceIdentityMigrationErr.message);
     console.error('The server will start, but anti-cloning hardening cannot persist state: instance identity establishment, duplicate/fork detection, and the anti-rollback high-water mark are inactive. No other feature is affected. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB, then restart.');

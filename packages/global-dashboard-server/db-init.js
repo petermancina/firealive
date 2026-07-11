@@ -1422,6 +1422,19 @@ function initDb() {
   const db = getDb();
   db.exec(SCHEMA);
 
+  // B6h A-8: seed the GD anti-rollback high-water in node_state (node-local, excluded
+  // from replication) if absent. INSERT OR IGNORE preserves any existing (higher) mark,
+  // so it never resets the anti-rollback state; a fresh GD DB gets the running build's
+  // fuse. The boot-time gd-fuse-high-water gate then advances it and refuses a
+  // downgraded build.
+  try {
+    const gdPkg = require('./package.json');
+    const gdFuse = typeof gdPkg.fuseCounter === 'number' ? String(gdPkg.fuseCounter) : '0';
+    db.prepare("INSERT OR IGNORE INTO node_state (key, value) VALUES ('fuse_high_water', ?)").run(gdFuse);
+  } catch (gdFuseSeedErr) {
+    console.error('B6h A-8 GD fuse_high_water seed FAILED:', gdFuseSeedErr.message);
+  }
+
   // B6b: add backup-run status columns to backup_schedules.
   // The canonical CREATE TABLE above includes last_status / last_run /
   // last_error for fresh installs. Deploys that ran an earlier GD build have
