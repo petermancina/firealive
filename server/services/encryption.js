@@ -30,8 +30,11 @@ function getKey(envVar) {
 
 // ── AES-256-GCM Symmetric Encryption ─────────────────────────────────────────
 
-function encrypt(plaintext, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
-  const key = getKey(keyEnvVar);
+// Core AES-256-GCM seal/open on a raw 32-byte key. The v1 envelope is
+// iv (12) || tag (16) || ciphertext. Both the env-var-keyed encrypt/decrypt
+// below and the domain-aware Tier-1 chokepoint (tier1-seal) build on these, so
+// there is exactly one envelope implementation and no risk of the two drifting.
+function encryptWithKey(plaintext, key) {
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()]);
@@ -40,14 +43,21 @@ function encrypt(plaintext, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
   return Buffer.concat([iv, tag, encrypted]);
 }
 
-function decrypt(buffer, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
-  const key = getKey(keyEnvVar);
+function decryptWithKey(buffer, key) {
   const iv = buffer.subarray(0, IV_LENGTH);
   const tag = buffer.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
   const ciphertext = buffer.subarray(IV_LENGTH + TAG_LENGTH);
   const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
   decipher.setAuthTag(tag);
   return decipher.update(ciphertext, null, 'utf-8') + decipher.final('utf-8');
+}
+
+function encrypt(plaintext, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
+  return encryptWithKey(plaintext, getKey(keyEnvVar));
+}
+
+function decrypt(buffer, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
+  return decryptWithKey(buffer, getKey(keyEnvVar));
 }
 
 // Tier-3 analyst signals
@@ -103,6 +113,7 @@ function decryptMessage(ciphertext, nonce, senderPublicKey, recipientSecretKey) 
 
 module.exports = {
   encrypt, decrypt,
+  encryptWithKey, decryptWithKey,
   encryptTier3, decryptTier3,
   encryptConfig, decryptConfig,
   generateKeyPair, encryptMessage, decryptMessage,

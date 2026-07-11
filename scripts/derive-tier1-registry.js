@@ -320,7 +320,13 @@ const ENCODING = {
     'ca_authority.ca_private_key_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-ca.js', proof: 'decryptConfig(row.ca_private_key_encrypted)' },
     'storage_destinations.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-storage-destinations.js', proof: 'self-describing' },
     'malware_scanner_integrations.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-integration-manager.js', proof: 'decryptConfig(row.credentials_encrypted)' },
-    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'base64', ev: 'packages/global-dashboard-server/services/gd-external-restore.js', proof: "Buffer.from(sourceRow.credentials_encrypted, 'base64')" },
+    // external_restore stores the gd-encryption self-describing envelope string, like
+    // every other GD Tier-1 column: encryptCredentials calls encryptConfig(...) (which
+    // returns that string) and its .toString('base64') is a no-op on a string, not a
+    // Buffer. (The read side's Buffer.from(...,'base64') is a live defect, unexercised
+    // because no source with credentials is configured; A3 routes it through the
+    // chokepoint and the format stays this envelope.)
+    'external_restore_sources.credentials_encrypted': { shape: 'json', storage: 'envelope', ev: 'packages/global-dashboard-server/services/gd-external-restore.js', proof: "require('./gd-encryption')" },
   },
 };
 

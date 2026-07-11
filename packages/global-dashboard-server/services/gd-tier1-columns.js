@@ -21,7 +21,7 @@ const GD_TIER1_COLUMNS = [
   { table: 'gd_ha_node', column: 'wrap_private_sealed', domain: 'node-local', class: 'tier1-derived', shape: 'utf8', storage: 'base64' },
   { table: 'report_signing_keys', column: 'private_key_encrypted', domain: 'node-local', class: 'tier1', shape: 'json', storage: 'envelope' },
   { table: 'ca_authority', column: 'ca_private_key_encrypted', domain: 'replicated', class: 'tier1', shape: 'json', storage: 'envelope' },
-  { table: 'external_restore_sources', column: 'credentials_encrypted', domain: 'replicated', class: 'tier1', shape: 'json', storage: 'base64' },
+  { table: 'external_restore_sources', column: 'credentials_encrypted', domain: 'replicated', class: 'tier1', shape: 'json', storage: 'envelope' },
   { table: 'malware_scanner_integrations', column: 'credentials_encrypted', domain: 'replicated', class: 'tier1', shape: 'json', storage: 'envelope' },
   { table: 'storage_destinations', column: 'credentials_encrypted', domain: 'replicated', class: 'tier1', shape: 'json', storage: 'envelope' },
 ];

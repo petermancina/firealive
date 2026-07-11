@@ -54,9 +54,12 @@ function deriveKek() {
   return gdTier1Kek.resolveTier1Kek();
 }
 
-function encryptConfig(obj) {
-  if (obj === undefined) throw new Error('encryptConfig: obj is undefined');
-  const kek = deriveKek();
+// Core: seal a config object into the GD self-describing envelope string under a
+// given raw 32-byte key. encryptConfig() below is this with the resolved KEK; the
+// domain-aware Tier-1 chokepoint (gd-tier1-seal) calls this with ownKek() or
+// sharedKek() by column, so there is exactly one envelope implementation.
+function encryptConfigWithKey(obj, kek) {
+  if (obj === undefined) throw new Error('encryptConfigWithKey: obj is undefined');
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);
   const plaintext = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -70,23 +73,26 @@ function encryptConfig(obj) {
   });
 }
 
-function decryptConfig(envelope) {
+function encryptConfig(obj) {
+  return encryptConfigWithKey(obj, deriveKek());
+}
+
+function decryptConfigWithKey(envelope, kek) {
   if (typeof envelope !== 'string' || envelope.length === 0) {
-    throw new Error('decryptConfig: envelope must be a non-empty string');
+    throw new Error('decryptConfigWithKey: envelope must be a non-empty string');
   }
   let parsed;
   try {
     parsed = JSON.parse(envelope);
   } catch (e) {
-    throw new Error(`decryptConfig: envelope is not valid JSON: ${e.message}`);
+    throw new Error(`decryptConfigWithKey: envelope is not valid JSON: ${e.message}`);
   }
   if (parsed.v !== 1) {
-    throw new Error(`decryptConfig: unsupported envelope version v=${parsed.v}`);
+    throw new Error(`decryptConfigWithKey: unsupported envelope version v=${parsed.v}`);
   }
   if (!parsed.iv || !parsed.tag || !parsed.ciphertext) {
-    throw new Error('decryptConfig: envelope missing iv / tag / ciphertext');
+    throw new Error('decryptConfigWithKey: envelope missing iv / tag / ciphertext');
   }
-  const kek = deriveKek();
   const iv = Buffer.from(parsed.iv, 'base64');
   const tag = Buffer.from(parsed.tag, 'base64');
   const ciphertext = Buffer.from(parsed.ciphertext, 'base64');
@@ -94,6 +100,10 @@ function decryptConfig(envelope) {
   decipher.setAuthTag(tag);
   const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(plaintext.toString('utf8'));
+}
+
+function decryptConfig(envelope) {
+  return decryptConfigWithKey(envelope, deriveKek());
 }
 
 // Retained for the Cloud Mode boot caller. Under B6d the Tier-1 KEK is hardware-
@@ -114,6 +124,8 @@ function _resetKekCache() {
 module.exports = {
   encryptConfig,
   decryptConfig,
+  encryptConfigWithKey,
+  decryptConfigWithKey,
   _resetKekCache,
   requireCloudKek,
 };
