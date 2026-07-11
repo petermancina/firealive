@@ -48,7 +48,7 @@ const TRIGGER_PREFIX = 'fa_ha_cdc_';
 // vs-local boundary for chain tables is finalized with the replication engine.
 const DEFAULT_EXCLUDE_TABLES = [
   'ha_node', 'ha_peer', 'ha_lease', 'ha_replication_journal', 'ha_replication_state',
-  'instance_identity', 'instance_observations',
+  'instance_identity', 'instance_observations', 'node_state',
   'audit_log', 'auth_log', 'audit_chain_checkpoint', 'audit_chain_signing_keys',
 ];
 const DEFAULT_EXCLUDE_PREFIXES = ['ha_', 'sqlite_'];
