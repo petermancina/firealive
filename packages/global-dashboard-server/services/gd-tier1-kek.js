@@ -196,6 +196,61 @@ function installSharedKek(rawKek) {
   cachedSharedKek = Buffer.from(rawKek);
 }
 
+// node_state key holding the shared KEK sealed to THIS node's hardware.
+const NODE_STATE_SHARED_KEK = 'shared_kek_sealed';
+
+// Adopt the shared KEK received at promotion: seal it to THIS node's hardware, persist
+// the wrapper to node_state (excluded from replication, so it never leaves this node),
+// and install it for immediate use. Called from gd-ha-failover.promote() before any
+// epoch or role change, so a hardware or persistence failure aborts the promotion.
+function adoptSharedKek(db, rawKek) {
+  assertKek(rawKek);
+  const wrapper = sealKekToWrapper(rawKek); // fail-closed: throws without a hardware root
+  db.prepare(
+    'INSERT INTO node_state (key, value) VALUES (?, ?) ' +
+    'ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).run(NODE_STATE_SHARED_KEK, wrapper);
+  installSharedKek(rawKek);
+}
+
+// Boot reload: if this GD node adopted a shared KEK (it was promoted), unseal it on this
+// hardware and install it so the promoted node can read the replicated columns after a
+// restart. FAIL-CLOSED: if the wrapper is present but cannot be unsealed on this
+// hardware, THROW rather than fall back to ownKek() -- reading the former active's
+// replicated data with this node's own key would silently corrupt. A node that never
+// adopted a shared KEK (original active / standalone / un-promoted passive) has no row,
+// so this is a no-op and sharedKek() keeps returning ownKek().
+function loadSharedKekOnBoot(db) {
+  const row = db
+    .prepare('SELECT value FROM node_state WHERE key = ?')
+    .get(NODE_STATE_SHARED_KEK);
+  if (!row || !row.value) {
+    return false;
+  }
+  const wrapper = row.value;
+  if (wrapper.indexOf(SEAL_PREFIX) !== 0) {
+    throw new Error(
+      'node_state.shared_kek_sealed is not a hardware-sealed wrapper (expected prefix ' +
+        SEAL_PREFIX + '); refusing to serve replicated columns'
+    );
+  }
+  const sealedBlob = Buffer.from(wrapper.slice(SEAL_PREFIX.length), 'base64');
+  let kek;
+  try {
+    kek = keystore().unsealKey(sealedBlob);
+  } catch (e) {
+    const detail = e && e.message ? e.message : String(e);
+    throw new Error(
+      'shared KEK sealed to this hardware could not be unsealed: ' + detail +
+        '. This node was promoted and holds replicated data under the former active KEK; ' +
+        'refusing to boot rather than read it with the wrong key. Recover the hardware, or ' +
+        're-pair from a healthy active.'
+    );
+  }
+  installSharedKek(kek);
+  return true;
+}
+
 function _resetCacheForTests() {
   cachedOwnKek = null;
   cachedSharedKek = null;
@@ -210,6 +265,8 @@ module.exports = {
   ownKek,
   sharedKek,
   installSharedKek,
+  adoptSharedKek,
+  loadSharedKekOnBoot,
   resolveTier1Kek,   // back-compat alias for ownKek()
   makeRecoveryCode,
   recoverKekFromCode,

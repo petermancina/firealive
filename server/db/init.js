@@ -1515,6 +1515,15 @@ CREATE TABLE IF NOT EXISTS system_meta (
   value TEXT NOT NULL
 );
 
+-- B6h A-7: node-local state that must NOT replicate to standbys (excluded in
+-- ha-cdc DEFAULT_EXCLUDE_TABLES). Holds shared_kek_sealed -- the replicated-domain
+-- KEK sealed to THIS node's hardware, reloaded fail-closed on boot. fuse_high_water
+-- and deployment_mode relocate here in later B6h phases.
+CREATE TABLE IF NOT EXISTS node_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 -- v0.0.24 tables
 CREATE TABLE IF NOT EXISTS auth_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

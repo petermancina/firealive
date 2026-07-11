@@ -4,14 +4,14 @@
 // automated takeover when the active is lost, and the active's own step-down when
 // it is superseded or isolated. Built on gd-ha-lease (epoch/lease authority) and
 // gd-ha-keys (the sealed shared-material unwrap), plus the two runtime install
-// hooks (gd-tier1-kek.installSharedKek, gd-jwt-secret.installRuntimeJwtSecret) so
+// hooks (gd-tier1-kek.adoptSharedKek, gd-jwt-secret.installRuntimeJwtSecret) so
 // a promoted node can read Tier-1 columns and validate the same sessions the
 // former active issued.
 //
 //   evaluatePromotion -- passive scheduler tick: if the active's heartbeat has
 //                        gone stale past missCount intervals, and not within the
 //                        post-promotion cooldown, promote.
-//   promote           -- install shared KEK + JWT (fail before any state change),
+//   promote           -- adopt+persist shared KEK + JWT (fail before any state change),
 //                        claim epoch + 1 and the lease, flip role to active, audit
 //                        HA_PROMOTED with the measured elapsed.
 //   reconcileRole     -- an active that has lost the current-epoch lease (a higher
@@ -175,7 +175,11 @@ function promote(db, opts) {
     throw new Error('gd-ha-failover.promote: sealed promotion material is corrupt');
   }
   if (material.kek) {
-    tier1.installSharedKek(Buffer.from(material.kek, 'hex'));
+    // adoptSharedKek seals the shared KEK to THIS node's hardware and persists it to
+    // node_state (excluded from replication), so a reboot of this now-active node
+    // reloads it fail-closed rather than losing it (closes R1/R4). Runs before any
+    // epoch/role change, so a hardware or persistence failure aborts the promotion.
+    tier1.adoptSharedKek(db, Buffer.from(material.kek, 'hex'));
   }
   if (material.jwtSecret) {
     installRuntimeJwtSecret(material.jwtSecret);

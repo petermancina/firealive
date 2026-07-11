@@ -58,7 +58,7 @@ const TRIGGER_PREFIX = 'fa_gd_ha_cdc_';
 
 const DEFAULT_EXCLUDE_TABLES = [
   'gd_ha_node', 'gd_ha_peer', 'gd_ha_lease', 'gd_ha_replication_journal', 'gd_ha_replication_state',
-  'gd_instance_identity', 'system_health',
+  'gd_instance_identity', 'system_health', 'node_state',
   'audit_log', 'auth_log', 'audit_chain_checkpoint',
   'signing_keys',
 ];

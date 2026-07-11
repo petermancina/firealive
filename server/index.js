@@ -597,6 +597,30 @@ async function start() {
       process.exit(1);
     }
 
+    // B6h A-7: reload this node's shared KEK (the replicated-domain KEK) if it was
+    // adopted at a prior promotion. A promoted node that reboots must re-install the
+    // former active's KEK to read the replicated Tier-1 columns; otherwise sharedKek()
+    // would fall back to this node's own KEK and mis-read them. FAIL-CLOSED (D16/D26):
+    // if the sealed blob is present but cannot be unsealed on this hardware, halt rather
+    // than serve replicated data with the wrong key. A node that never adopted a shared
+    // KEK has no node_state row, so this is a no-op. Runs after the instance anchor is
+    // established (the hardware keystore is ready) and before the server serves.
+    try {
+      const tier1Kek = require('./services/tier1-kek');
+      const kekDb = getDb();
+      try {
+        const reloaded = tier1Kek.loadSharedKekOnBoot(kekDb);
+        if (reloaded) {
+          logger.info('Shared Tier-1 KEK reloaded from node_state (this node was promoted); replicated columns are readable');
+        }
+      } finally {
+        kekDb.close();
+      }
+    } catch (sharedKekReloadErr) {
+      logger.error('Shared Tier-1 KEK reload failed; refusing to start (fail-closed, D16)', { error: sharedKekReloadErr.message });
+      process.exit(1);
+    }
+
     // B5e: resolve and seal the deployment mode (D9) now that the instance
     // anchor exists. On first run FIREALIVE_DEPLOYMENT_MODE provisions and
     // hardware-seals the mode; thereafter the sealed value is authoritative and

@@ -6867,6 +6867,30 @@ try {
   process.exit(1);
 }
 
+// B6h A-7: reload this GD node's shared KEK (the replicated-domain KEK) if it was
+// adopted at a prior promotion. A promoted GD node that reboots must re-install the
+// former active's KEK to read the replicated Tier-1 columns; otherwise sharedKek()
+// would fall back to this node's own KEK and mis-read them. FAIL-CLOSED (D16/D26): if
+// the sealed blob is present but cannot be unsealed on this hardware, halt rather than
+// serve replicated data with the wrong key. A node that never adopted a shared KEK has
+// no node_state row, so this is a no-op. Runs after the instance anchor is established
+// (the hardware keystore is ready) and before the GD Server serves.
+try {
+  const gdTier1Kek = require('./services/gd-tier1-kek');
+  const kekDb = getDb();
+  try {
+    const reloaded = gdTier1Kek.loadSharedKekOnBoot(kekDb);
+    if (reloaded) {
+      console.log('Shared GD Tier-1 KEK reloaded from node_state (this node was promoted); replicated columns are readable');
+    }
+  } finally {
+    kekDb.close();
+  }
+} catch (gdSharedKekReloadErr) {
+  console.error('Shared GD Tier-1 KEK reload failed; refusing to start (fail-closed, D16): ' + gdSharedKekReloadErr.message);
+  process.exit(1);
+}
+
 // B6c: resolve and hardware-seal the GD deployment mode (bare-metal /
 // virtualized / cloud / sdn / sase), the GD twin of the Regional Server's
 // deployment mode. Provisioning-only: FIREALIVE_GD_DEPLOYMENT_MODE seals the

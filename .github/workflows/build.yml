@@ -27,6 +27,8 @@ jobs:
         run: node scripts/check-tier1-single-writer.js --self-test
       - name: Verify Tier-1 single-writer guard
         run: node scripts/check-tier1-single-writer.js
+      - name: Verify shared-KEK boot reload
+        run: node scripts/check-shared-kek-boot-reload.js
 
 
   build-mac:
