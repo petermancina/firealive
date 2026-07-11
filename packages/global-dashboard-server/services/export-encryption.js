@@ -214,7 +214,7 @@ async function sealArtifact(plaintext, opts) {
   // gd-encryption (the GD has no key-wrapping-providers registry). The wrapped
   // form is the gd-encryption envelope string, carried in the FA-ENC1 header.
   const dataKey = crypto.randomBytes(KEY_LENGTH_BYTES);
-  const wrapped = gdEncryption.encryptConfig({ k: dataKey.toString('base64') });
+  const wrapped = gdEncryption.encryptConfigWithKey({ k: dataKey.toString('base64') }, gdEncryption.deriveKek());
   const kek = { v: 1, scheme: SCHEME_GD_TIER1, wrapped: wrapped };
   const framed = buildFrame(plaintext, dataKey, { role: role, exportId: exportId, kek: kek });
   dataKey.fill(0);
@@ -230,7 +230,7 @@ async function openArtifact(framed, opts) {
   if (kek.scheme !== SCHEME_GD_TIER1) {
     throw new Error('export-encryption: unexpected GD wrap scheme ' + String(kek.scheme));
   }
-  const unwrapped = gdEncryption.decryptConfig(kek.wrapped);
+  const unwrapped = gdEncryption.decryptConfigWithKey(kek.wrapped, gdEncryption.deriveKek());
   const dataKey = Buffer.from(unwrapped.k, 'base64');
   try {
     return decryptFrame(parsed, dataKey);

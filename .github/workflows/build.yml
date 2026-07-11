@@ -23,6 +23,10 @@ jobs:
         run: node scripts/check-tier1-registry-coverage.js
       - name: Verify Tier-1 seal round-trip
         run: node scripts/check-tier1-seal-roundtrip.js
+      - name: Verify Tier-1 single-writer guard (self-test)
+        run: node scripts/check-tier1-single-writer.js --self-test
+      - name: Verify Tier-1 single-writer guard
+        run: node scripts/check-tier1-single-writer.js
 
 
   build-mac:

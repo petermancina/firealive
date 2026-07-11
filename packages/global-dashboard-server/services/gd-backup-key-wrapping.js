@@ -32,7 +32,7 @@
 // seam for it.
 // =============================================================================
 
-const { encryptConfig, decryptConfig } = require('./gd-encryption');
+const { encryptConfigWithKey, decryptConfigWithKey, deriveKek } = require('./gd-encryption');
 
 const ENVELOPE_VERSION = 1;
 const KEY_LENGTH_BYTES = 32;                 // AES-256 data key
@@ -104,7 +104,7 @@ async function wrapKey(ephemeralKey, options = {}) {
   // object, AES-256-GCM-encrypts it under the KEK, and returns a self-describing
   // envelope string. We carry that string, base64-encoded, in the outer
   // envelope's `wrapped` field.
-  const gdEnvelope = encryptConfig({ k: ephemeralKey.toString('base64') });
+  const gdEnvelope = encryptConfigWithKey({ k: ephemeralKey.toString('base64') }, deriveKek());
 
   const envelope = {
     v: ENVELOPE_VERSION,
@@ -159,7 +159,7 @@ async function unwrapKey(envelopeBytes, expectedScheme, expectedRef, options = {
   const gdEnvelope = Buffer.from(envelope.wrapped, 'base64').toString('utf-8');
   let obj;
   try {
-    obj = decryptConfig(gdEnvelope);
+    obj = decryptConfigWithKey(gdEnvelope, deriveKek());
   } catch (err) {
     // Unwrap failures (wrong KEK, tampered wrapped bytes) are permanent; no
     // retry helps.

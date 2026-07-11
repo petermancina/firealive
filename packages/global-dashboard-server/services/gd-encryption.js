@@ -73,10 +73,6 @@ function encryptConfigWithKey(obj, kek) {
   });
 }
 
-function encryptConfig(obj) {
-  return encryptConfigWithKey(obj, deriveKek());
-}
-
 function decryptConfigWithKey(envelope, kek) {
   if (typeof envelope !== 'string' || envelope.length === 0) {
     throw new Error('decryptConfigWithKey: envelope must be a non-empty string');
@@ -102,10 +98,6 @@ function decryptConfigWithKey(envelope, kek) {
   return JSON.parse(plaintext.toString('utf8'));
 }
 
-function decryptConfig(envelope) {
-  return decryptConfigWithKey(envelope, deriveKek());
-}
-
 // Retained for the Cloud Mode boot caller. Under B6d the Tier-1 KEK is hardware-
 // sealed and fail-closed for EVERY mode (gd-tier1-kek refuses a raw key and the
 // GD_JWT_SECRET fallback), so Cloud Mode no longer needs a separate KEK rule --
@@ -122,10 +114,9 @@ function _resetKekCache() {
 }
 
 module.exports = {
-  encryptConfig,
-  decryptConfig,
   encryptConfigWithKey,
   decryptConfigWithKey,
+  deriveKek,
   _resetKekCache,
   requireCloudKek,
 };

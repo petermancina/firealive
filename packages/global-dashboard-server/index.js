@@ -40,7 +40,6 @@ const gdBackupFullSuite = require('./services/gd-backup-full-suite');
 const storageRouting = require('./services/gd-storage-routing');
 const storagePush = require('./services/gd-storage-push');
 const { gdBackupScheduler } = require('./services/gd-backup-scheduler');
-const { decryptConfig: decryptForensicConfig } = require('./services/gd-encryption');
 const exportEncryption = require('./services/export-encryption');
 const { migrateExportsAtRest } = require('./services/export-encryption-migration');
 const {
@@ -5172,7 +5171,7 @@ function runGdRegression(db) {
       freshEnc.requireCloudKek();
       freshEnc._resetKekCache();
       let threw = false;
-      try { freshEnc.encryptConfig({ probe: 1 }); } catch (e) { threw = true; }
+      try { freshEnc.encryptConfigWithKey({ probe: 1 }, freshEnc.deriveKek()); } catch (e) { threw = true; }
       if (!threw) throw new Error('cloud-mode KEK did not fail closed without GD_ENCRYPTION_KEY');
       return 'Tier-1 KEK fails closed in cloud mode without a hardware-sealed GD_ENCRYPTION_KEY (raw/JWT refused, universal under D26)';
     } finally {
@@ -6338,7 +6337,7 @@ function appendForensicChainEntry(db, opts) {
     )
     .get();
   if (!keyRow) throw new Error('No active forensic export signing key found');
-  const { pem } = decryptForensicConfig(keyRow.private_key_encrypted);
+  const { pem } = openTier1('forensic_export_chain_signing_keys.private_key_encrypted', keyRow.private_key_encrypted);
   const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
 
   const prevRow = db

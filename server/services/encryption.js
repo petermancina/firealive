@@ -53,10 +53,16 @@ function decryptWithKey(buffer, key) {
 }
 
 function encrypt(plaintext, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
+  if (keyEnvVar === 'TIER1_ENCRYPTION_KEY') {
+    throw new Error('encrypt: Tier-1 columns must be sealed via the chokepoint (sealTier1), not the raw encrypt path');
+  }
   return encryptWithKey(plaintext, getKey(keyEnvVar));
 }
 
 function decrypt(buffer, keyEnvVar = 'TIER3_ENCRYPTION_KEY') {
+  if (keyEnvVar === 'TIER1_ENCRYPTION_KEY') {
+    throw new Error('decrypt: Tier-1 columns must be opened via the chokepoint (openTier1), not the raw decrypt path');
+  }
   return decryptWithKey(buffer, getKey(keyEnvVar));
 }
 
@@ -70,14 +76,6 @@ function decryptTier3(buffer) {
 }
 
 // Tier-1 integration configs
-function encryptConfig(data) {
-  return encrypt(typeof data === 'string' ? data : JSON.stringify(data), 'TIER1_ENCRYPTION_KEY');
-}
-
-function decryptConfig(buffer) {
-  return JSON.parse(decrypt(buffer, 'TIER1_ENCRYPTION_KEY'));
-}
-
 // ── NaCl Box Encryption (E2EE Peer Messages) ────────────────────────────────
 
 function generateKeyPair() {
@@ -115,6 +113,5 @@ module.exports = {
   encrypt, decrypt,
   encryptWithKey, decryptWithKey,
   encryptTier3, decryptTier3,
-  encryptConfig, decryptConfig,
   generateKeyPair, encryptMessage, decryptMessage,
 };
