@@ -24,10 +24,19 @@
 // anti-clone property. Backing up the server AND keeping the recovery code
 // offline are both essential; neither alone can recover a failed deployment.
 //
-// This module is the single resolver both consumers call: encryption.js (the
-// just-in-time encryptConfig / decryptConfig chokepoint) and the env-var KMS key-
-// wrapping provider used by the backup engine. The unsealed KEK is cached in
-// process memory so the hardware is touched once per process, not per operation.
+// This module resolves the KEK for two distinct domains. ownKek() is THIS node's
+// hardware-sealed key (the TIER1_ENCRYPTION_KEY wrapper); it protects the node-
+// local domain -- the CDC-excluded columns (every signing-key private key, the CA
+// key) each node writes under its own KEK. sharedKek() is the deployment ACTIVE's
+// key, under which the replicated domain (integration credentials and the other
+// CDC-replicated columns) is sealed; on the active or a standalone node it IS this
+// node's own KEK, and on a promoted node it is the former active's KEK installed at
+// promotion. Splitting the two is what lets a promoted node read its own node-local
+// columns with ownKek() AND the replicated columns with sharedKek(), instead of a
+// single process-wide key that could only ever be one of them. Each domain's key is
+// cached separately so the hardware is touched once per process. Callers: the env-
+// var KMS key-wrapping provider and the HA seal/pairing helpers take ownKek(); the
+// domain-aware encryption chokepoint takes ownKek() or sharedKek() by column.
 //
 // The unseal leaf operation needs real hardware (none in CI), so that path ships
 // platform-validation-pending. The recovery-code make/recover round-trip and the
@@ -44,7 +53,8 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 
-let cachedKek = null;
+let cachedOwnKek = null;     // this node's own env-sealed KEK (node-local domain)
+let cachedSharedKek = null;  // the active's KEK, installed at promotion (replicated domain)
 
 function assertKek(buf) {
   if (!Buffer.isBuffer(buf) || buf.length !== KEK_BYTES) {
@@ -78,13 +88,13 @@ function sealKekToWrapper(rawKek) {
   return SEAL_PREFIX + sealed.toString('base64');
 }
 
-// Resolve the raw Tier-1 KEK for use by the encryption chokepoint and the backup
-// KMS provider. Reads TIER1_ENCRYPTION_KEY, which MUST be a hardware-sealed
-// wrapper; unseals it on this hardware and caches the result. Fail-closed on a
-// missing value, a raw (non-sealed) value, or an unseal failure.
-function resolveTier1Kek() {
-  if (cachedKek) {
-    return cachedKek;
+// Resolve this node's OWN Tier-1 KEK -- the key for the node-local domain. Reads
+// TIER1_ENCRYPTION_KEY, which MUST be a hardware-sealed wrapper; unseals it on this
+// hardware and caches the result. Fail-closed on a missing value, a raw (non-
+// sealed) value, or an unseal failure.
+function ownKek() {
+  if (cachedOwnKek) {
+    return cachedOwnKek;
   }
   const raw = process.env.TIER1_ENCRYPTION_KEY;
   if (!raw || raw === 'CHANGE_ME' || raw.indexOf('CHANGE_ME') === 0) {
@@ -102,8 +112,28 @@ function resolveTier1Kek() {
     throw new Error('Tier-1 KEK could not be unsealed on this hardware: ' + detail + '. If the TPM or Secure Enclave changed, recover with: node scripts/recover-tier1-kek.js');
   }
   assertKek(kek);
-  cachedKek = kek;
-  return cachedKek;
+  cachedOwnKek = kek;
+  return cachedOwnKek;
+}
+
+// Resolve the SHARED Tier-1 KEK -- the deployment active's key, under which the
+// replicated domain is sealed. On the active or a standalone node no shared KEK is
+// installed, so the shared key IS this node's own KEK. On a node promoted from
+// passive, installSharedKek() has stored the former active's KEK (unsealed from the
+// promotion material wrapped to this node at pairing); that value is returned so the
+// promoted node can read the replicated columns the former active wrote.
+function sharedKek() {
+  if (cachedSharedKek) {
+    return cachedSharedKek;
+  }
+  return ownKek();
+}
+
+// Back-compat alias for ownKek(). The HA seal/pairing helpers and the env-var KMS
+// provider call this name for this node's own KEK; the encryption chokepoint moves
+// to the domain-aware ownKek()/sharedKek() split in a later phase.
+function resolveTier1Kek() {
+  return ownKek();
 }
 
 // Wrap a raw KEK under an operator passphrase, producing the one-time recovery
@@ -149,18 +179,21 @@ function recoverKekFromCode(recoveryCode, passphrase) {
   return kek;
 }
 
-// Install a raw KEK into the process cache at runtime. Used at HA promotion: the
-// promoted passive unseals the shared Tier-1 KEK (wrapped to its hardware at
-// pairing) and installs it here so the encryption chokepoint resolves the SHARED
-// key from now on -- the only way the promoted node can read the Tier-1 columns
-// the former active wrote. assertKek enforces the 32-byte length (fail-closed).
-function installRuntimeKek(rawKek) {
+// Install the SHARED Tier-1 KEK into the process cache at HA promotion. The
+// promoted passive unseals the shared KEK (wrapped to its hardware at pairing) and
+// installs it here so sharedKek() resolves the former active's key from now on --
+// the only way the promoted node can read the REPLICATED Tier-1 columns the former
+// active wrote. Sets ONLY the shared cache: this node's own KEK (ownKek) is
+// untouched, so the promoted node still reads its own node-local columns with its
+// own key. assertKek enforces the 32-byte length (fail-closed).
+function installSharedKek(rawKek) {
   assertKek(rawKek);
-  cachedKek = Buffer.from(rawKek);
+  cachedSharedKek = Buffer.from(rawKek);
 }
 
 function _resetCacheForTests() {
-  cachedKek = null;
+  cachedOwnKek = null;
+  cachedSharedKek = null;
 }
 
 module.exports = {
@@ -169,8 +202,10 @@ module.exports = {
   RECOVERY_PREFIX,
   generateKek,
   sealKekToWrapper,
-  resolveTier1Kek,
-  installRuntimeKek,
+  ownKek,
+  sharedKek,
+  installSharedKek,
+  resolveTier1Kek,   // back-compat alias for ownKek()
   makeRecoveryCode,
   recoverKekFromCode,
   _resetCacheForTests,

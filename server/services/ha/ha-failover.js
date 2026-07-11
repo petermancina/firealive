@@ -3,7 +3,7 @@
 // Drives the passive's automated takeover when the active is lost, and the
 // active's own step-down when it is superseded or isolated. Built on ha-lease
 // (epoch/lease authority) and ha-keys (the sealed shared-material unwrap), plus
-// the two runtime install hooks (tier1-kek.installRuntimeKek,
+// the two runtime install hooks (tier1-kek.installSharedKek,
 // auth.installRuntimeJwtSecret) so a promoted node can read Tier-1 columns and
 // validate the same sessions the former active issued.
 //
@@ -145,7 +145,7 @@ function promote(db, opts) {
     throw new Error('ha-failover.promote: sealed promotion material is corrupt');
   }
   if (material.kek) {
-    tier1.installRuntimeKek(Buffer.from(material.kek, 'hex'));
+    tier1.installSharedKek(Buffer.from(material.kek, 'hex'));
   }
   if (material.jwtSecret) {
     installRuntimeJwtSecret(material.jwtSecret);

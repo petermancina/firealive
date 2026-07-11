@@ -5220,14 +5220,14 @@ function runGdRegression(db) {
       if (savedKek === undefined) delete process.env.GD_ENCRYPTION_KEY; else process.env.GD_ENCRYPTION_KEY = savedKek;
     }
   });
-  record('gd_tier1_kek', 'installRuntimeKek installs the HA-promotion KEK', () => {
+  record('gd_tier1_kek', 'installSharedKek installs the HA-promotion shared KEK', () => {
     const kek = require('./services/gd-tier1-kek');
     try {
       kek._resetCacheForTests();
       const shared = Buffer.alloc(32, 9);
-      kek.installRuntimeKek(shared);
-      if (Buffer.compare(kek.resolveTier1Kek(), shared) !== 0) throw new Error('resolveTier1Kek did not return the installed KEK');
-      return 'installRuntimeKek caches the shared KEK for the promoted node (fail-closed on non-32-byte)';
+      kek.installSharedKek(shared);
+      if (Buffer.compare(kek.sharedKek(), shared) !== 0) throw new Error('sharedKek did not return the installed shared KEK');
+      return 'installSharedKek caches the shared KEK; sharedKek returns it while ownKek stays independent';
     } finally {
       kek._resetCacheForTests();
     }

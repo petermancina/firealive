@@ -4,7 +4,7 @@
 // automated takeover when the active is lost, and the active's own step-down when
 // it is superseded or isolated. Built on gd-ha-lease (epoch/lease authority) and
 // gd-ha-keys (the sealed shared-material unwrap), plus the two runtime install
-// hooks (gd-tier1-kek.installRuntimeKek, gd-jwt-secret.installRuntimeJwtSecret) so
+// hooks (gd-tier1-kek.installSharedKek, gd-jwt-secret.installRuntimeJwtSecret) so
 // a promoted node can read Tier-1 columns and validate the same sessions the
 // former active issued.
 //
@@ -175,7 +175,7 @@ function promote(db, opts) {
     throw new Error('gd-ha-failover.promote: sealed promotion material is corrupt');
   }
   if (material.kek) {
-    tier1.installRuntimeKek(Buffer.from(material.kek, 'hex'));
+    tier1.installSharedKek(Buffer.from(material.kek, 'hex'));
   }
   if (material.jwtSecret) {
     installRuntimeJwtSecret(material.jwtSecret);

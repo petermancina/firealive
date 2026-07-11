@@ -29,12 +29,19 @@
 // property. Backing up the GD Server AND keeping the recovery code offline are
 // both essential; neither alone can recover a failed deployment.
 //
-// This module is the single resolver gd-encryption.js (the just-in-time
-// encryptConfig / decryptConfig chokepoint) calls. The unsealed KEK is cached in
-// process memory so the hardware is touched once per process, not per operation.
-// installRuntimeKek installs a shared KEK at GD HA promotion (the promoted GD
-// passive unseals the Tier-1 KEK wrapped to its hardware at pairing) so the GD
-// encryption chokepoint resolves the shared key from that point on.
+// This module resolves the GD KEK for two distinct domains. ownKek() is the GD
+// Server's OWN hardware-sealed key (the GD_ENCRYPTION_KEY wrapper); it protects the
+// node-local domain -- the CDC-excluded columns (every GD signing-key private key,
+// the GD CA key) each GD node writes under its own KEK. sharedKek() is the GD
+// deployment ACTIVE's key, under which the replicated domain (integration
+// credentials and the other CDC-replicated columns) is sealed; on the active or a
+// standalone GD node it IS this node's own KEK, and on a promoted GD node it is the
+// former active's KEK installed at promotion. Splitting the two lets a promoted GD
+// node read its own node-local columns with ownKek() AND the replicated columns
+// with sharedKek(), instead of a single process-wide key that could only ever be
+// one of them. Each domain's key is cached separately so the hardware is touched
+// once per process. The GD encryption chokepoint takes ownKek() or sharedKek() by
+// column; the GD HA seal/pairing helpers take ownKek().
 //
 // The unseal leaf operation needs real hardware (none in CI), so that path ships
 // platform-validation-pending. The recovery-code make/recover round-trip and the
@@ -51,7 +58,8 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 
-let cachedKek = null;
+let cachedOwnKek = null;     // this GD node's own env-sealed KEK (node-local domain)
+let cachedSharedKek = null;  // the active GD's KEK, installed at promotion (replicated domain)
 
 function assertKek(buf) {
   if (!Buffer.isBuffer(buf) || buf.length !== KEK_BYTES) {
@@ -85,13 +93,13 @@ function sealKekToWrapper(rawKek) {
   return SEAL_PREFIX + sealed.toString('base64');
 }
 
-// Resolve the raw GD Tier-1 KEK for the GD encryption chokepoint. Reads
-// GD_ENCRYPTION_KEY, which MUST be a hardware-sealed wrapper; unseals it on this
-// GD hardware and caches the result. Fail-closed on a missing value, a raw (non-
+// Resolve this GD node's OWN Tier-1 KEK -- the key for the node-local domain. Reads
+// GD_ENCRYPTION_KEY, which MUST be a hardware-sealed wrapper; unseals it on this GD
+// hardware and caches the result. Fail-closed on a missing value, a raw (non-
 // sealed) value, or an unseal failure. There is no GD_JWT_SECRET fallback.
-function resolveTier1Kek() {
-  if (cachedKek) {
-    return cachedKek;
+function ownKek() {
+  if (cachedOwnKek) {
+    return cachedOwnKek;
   }
   const raw = process.env.GD_ENCRYPTION_KEY;
   if (!raw || raw === 'CHANGE_ME' || raw.indexOf('CHANGE_ME') === 0) {
@@ -109,8 +117,28 @@ function resolveTier1Kek() {
     throw new Error('GD Tier-1 KEK could not be unsealed on this hardware: ' + detail + '. If the TPM or Secure Enclave changed, recover with: node scripts/gd-recover-tier1-kek.js');
   }
   assertKek(kek);
-  cachedKek = kek;
-  return cachedKek;
+  cachedOwnKek = kek;
+  return cachedOwnKek;
+}
+
+// Resolve the SHARED GD Tier-1 KEK -- the deployment active's key, under which the
+// replicated domain is sealed. On the active or a standalone GD node no shared KEK
+// is installed, so the shared key IS this node's own KEK. On a GD node promoted from
+// passive, installSharedKek() has stored the former active's KEK (unsealed from the
+// promotion material wrapped to this node at pairing); that value is returned so the
+// promoted GD node can read the replicated columns the former active wrote.
+function sharedKek() {
+  if (cachedSharedKek) {
+    return cachedSharedKek;
+  }
+  return ownKek();
+}
+
+// Back-compat alias for ownKek(). The GD HA seal/pairing helpers call this name for
+// this node's own key; the GD encryption chokepoint moves to the domain-aware
+// ownKek()/sharedKek() split in a later phase.
+function resolveTier1Kek() {
+  return ownKek();
 }
 
 // Wrap a raw KEK under an operator passphrase, producing the one-time recovery
@@ -156,19 +184,21 @@ function recoverKekFromCode(recoveryCode, passphrase) {
   return kek;
 }
 
-// Install a raw KEK into the process cache at runtime. Used at GD HA promotion:
-// the promoted GD passive unseals the shared GD Tier-1 KEK (wrapped to its
-// hardware at pairing) and installs it here so the GD encryption chokepoint
-// resolves the SHARED key from now on -- the only way the promoted node can read
-// the Tier-1 columns the former active wrote. assertKek enforces the 32-byte
-// length (fail-closed).
-function installRuntimeKek(rawKek) {
+// Install the SHARED GD Tier-1 KEK into the process cache at GD HA promotion. The
+// promoted GD passive unseals the shared KEK (wrapped to its hardware at pairing)
+// and installs it here so sharedKek() resolves the former active's key from now on
+// -- the only way the promoted node can read the REPLICATED Tier-1 columns the
+// former active wrote. Sets ONLY the shared cache: this node's own KEK (ownKek) is
+// untouched, so the promoted GD node still reads its own node-local columns with its
+// own key. assertKek enforces the 32-byte length (fail-closed).
+function installSharedKek(rawKek) {
   assertKek(rawKek);
-  cachedKek = Buffer.from(rawKek);
+  cachedSharedKek = Buffer.from(rawKek);
 }
 
 function _resetCacheForTests() {
-  cachedKek = null;
+  cachedOwnKek = null;
+  cachedSharedKek = null;
 }
 
 module.exports = {
@@ -177,8 +207,10 @@ module.exports = {
   RECOVERY_PREFIX,
   generateKek,
   sealKekToWrapper,
-  resolveTier1Kek,
-  installRuntimeKek,
+  ownKek,
+  sharedKek,
+  installSharedKek,
+  resolveTier1Kek,   // back-compat alias for ownKek()
   makeRecoveryCode,
   recoverKekFromCode,
   _resetCacheForTests,
