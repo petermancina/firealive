@@ -21,6 +21,8 @@ jobs:
         run: node scripts/check-body-validation-coverage.js
       - name: Verify Tier-1 column registry coverage and sync
         run: node scripts/check-tier1-registry-coverage.js
+      - name: Verify Tier-1 seal round-trip
+        run: node scripts/check-tier1-seal-roundtrip.js
 
 
   build-mac:
