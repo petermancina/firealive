@@ -18,7 +18,7 @@
 // ASCII only; no template literals.
 
 const { logger } = require('./logger');
-const { decrypt } = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 const deploymentMode = require('./deployment-mode');
 const sdnRegistry = require('./sdn');
 const sdnPosture = require('./sdn-posture');
@@ -31,9 +31,7 @@ const DEFAULT_INITIAL_DELAY_MS = 45 * 1000;        // first cycle ~45s after boo
 // Decrypt + parse a Tier-1 credential blob (a BLOB column or a base64 string).
 function decryptCredentials(blob) {
   if (!blob) return {};
-  const buffer = Buffer.isBuffer(blob) ? blob : Buffer.from(String(blob), 'base64');
-  const plaintext = decrypt(buffer, 'TIER1_ENCRYPTION_KEY');
-  return JSON.parse(plaintext);
+  return openTier1('sdn_integrations.api_credentials_encrypted', blob);
 }
 
 // Probe one integration row and fold the result into the posture machine. Never

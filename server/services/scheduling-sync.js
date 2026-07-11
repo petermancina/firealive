@@ -46,7 +46,7 @@
 
 const { getDb } = require('../db/init');
 const { logger } = require('./logger');
-const { decrypt } = require('./encryption');
+const { openTier1 } = require('./tier1-seal');
 const { auditLog } = require('../middleware/audit');
 
 const CIRCUIT_BREAKER_THRESHOLD = 20;
@@ -225,13 +225,7 @@ class SchedulingSyncService {
     if (!encryptedBase64) {
       throw new Error('credentials_encrypted is empty; configure platform credentials first');
     }
-    const buffer = Buffer.from(encryptedBase64, 'base64');
-    const plaintext = decrypt(buffer, 'TIER1_ENCRYPTION_KEY');
-    try {
-      return JSON.parse(plaintext);
-    } catch (err) {
-      throw new Error(`credentials_encrypted decrypted but is not valid JSON: ${err.message}`);
-    }
+    return openTier1('scheduling_platform_config.credentials_encrypted', encryptedBase64);
   }
 
   /**

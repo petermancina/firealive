@@ -49,7 +49,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const { auditLog } = require('../middleware/audit');
-const { encrypt, decrypt } = require('../services/encryption');
+const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { validateAllowedHost } = require('../services/hr-allow-list');
 const { schedulingSyncService } = require('../services/scheduling-sync');
 
@@ -325,7 +325,7 @@ router.put('/config', (req, res) => {
       } else {
         let encrypted;
         try {
-          encrypted = encrypt(JSON.stringify(v.value), 'TIER1_ENCRYPTION_KEY').toString('base64');
+          encrypted = sealTier1('scheduling_platform_config.credentials_encrypted', v.value);
         } catch (err) {
           logger.error('Scheduling config credentials encryption error', { error: err.message });
           db.close();
@@ -462,8 +462,7 @@ router.post('/test', async (req, res) => {
   // Decrypt credentials.
   let credentials;
   try {
-    const buffer = Buffer.from(row.credentials_encrypted, 'base64');
-    credentials = JSON.parse(decrypt(buffer, 'TIER1_ENCRYPTION_KEY'));
+    credentials = openTier1('scheduling_platform_config.credentials_encrypted', row.credentials_encrypted);
   } catch (err) {
     logger.error('Scheduling test credentials decryption error', { error: err.message });
     return res.status(500).json({ error: 'Failed to decrypt stored credentials — check TIER1_ENCRYPTION_KEY env var' });
