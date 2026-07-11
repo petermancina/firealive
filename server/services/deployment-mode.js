@@ -16,6 +16,11 @@
 // path with no VM allowances — so a forged 'virtualized' value never weakens
 // the anti-cloning enforcement. Bare-metal deployments simply never set a
 // mode and run strict by default.
+//
+// The sealed record lives in node_state (node-local, excluded from replication),
+// so each node holds its OWN mode. Storing it in a replicated table let the
+// active's record clobber a standby's and fail verification against the standby's
+// anchor -- the paired-standby bare-metal defect. Relocated from config in B6h A-9.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const crypto = require('crypto');
@@ -40,7 +45,7 @@ function fail(code, message) {
 }
 
 function readRecord(db) {
-  const row = db.prepare("SELECT value FROM config WHERE key = ?").get(MODE_KEY);
+  const row = db.prepare("SELECT value FROM node_state WHERE key = ?").get(MODE_KEY);
   if (!row || !row.value) return null;
   try { return JSON.parse(row.value); } catch (_e) { return null; }
 }
@@ -95,6 +100,15 @@ function isConfigured(db) {
   return !!(rec && verifyRecord(db, rec));
 }
 
+// True if a mode record is stored but does NOT verify against this node's anchor --
+// tamper evidence: a corrupted seal, or a record bound to a different anchor (e.g. an
+// active's record that reached a standby). A node with no record (bare-metal) or a
+// valid record is NOT tampered. Promotion refuses on this signal (fail-closed).
+function sealTampered(db) {
+  const rec = readRecord(db);
+  return !!(rec && !verifyRecord(db, rec));
+}
+
 function isVirtualized(db) {
   return getMode(db) === VIRTUALIZED;
 }
@@ -140,7 +154,7 @@ function setMode(db, mode, opts) {
   const signature = anchor.sign({ db: db, identity: identity, data: signedPayload(rec) });
   rec.alg = SIG_ALG;
   rec.signature = Buffer.from(signature).toString('base64');
-  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(MODE_KEY, JSON.stringify(rec));
+  db.prepare("INSERT OR REPLACE INTO node_state (key, value) VALUES (?, ?)").run(MODE_KEY, JSON.stringify(rec));
   return { mode: mode, substrate: substrate, sealed: true };
 }
 
@@ -237,6 +251,7 @@ module.exports = {
   isSdn,
   isSase,
   isConfigured,
+  sealTampered,
   detectHypervisor,
   detectSubstrate,
   summary,

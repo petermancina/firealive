@@ -1435,6 +1435,26 @@ function initDb() {
     console.error('B6h A-8 GD fuse_high_water seed FAILED:', gdFuseSeedErr.message);
   }
 
+  // B6h A-9: relocate the sealed GD deployment-mode record from the replicating config to
+  // the excluded node_state. The record is node-local (anchor-bound); a replicated table
+  // let the active's record clobber a standby's and fail verification against the standby's
+  // anchor. Copy the existing config record into node_state if absent (preserve the
+  // active's own sealed mode), then DELETE the config row. Idempotent. A standby whose
+  // config record was clobbered pre-A-9 relocates a non-verifying record and fails safe to
+  // bare-metal until re-provisioned.
+  try {
+    const nsMode = db.prepare("SELECT value FROM node_state WHERE key = 'deployment_mode'").get();
+    if (!nsMode) {
+      const cfgMode = db.prepare("SELECT value FROM config WHERE key = 'deployment_mode'").get();
+      if (cfgMode && cfgMode.value !== null && cfgMode.value !== undefined) {
+        db.prepare("INSERT INTO node_state (key, value) VALUES ('deployment_mode', ?)").run(String(cfgMode.value));
+      }
+    }
+    db.prepare("DELETE FROM config WHERE key = 'deployment_mode'").run();
+  } catch (gdModeMigErr) {
+    console.error('B6h A-9 GD deployment_mode relocation FAILED:', gdModeMigErr.message);
+  }
+
   // B6b: add backup-run status columns to backup_schedules.
   // The canonical CREATE TABLE above includes last_status / last_run /
   // last_error for fresh installs. Deploys that ran an earlier GD build have

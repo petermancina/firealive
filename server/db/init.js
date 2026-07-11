@@ -8481,8 +8481,6 @@ function initDb() {
     if (!acDeviceCols.includes('ratchet_updated_at')) {
       db.exec("ALTER TABLE ac_device_signing_keys ADD COLUMN ratchet_updated_at TEXT");
     }
-    const setMetaB5e = db.prepare("INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)");
-    setMetaB5e.run('deployment_mode', 'bare-metal');
     // B6h A-8: relocate fuse_high_water from the replicating system_meta to the
     // excluded node_state. fuse_high_water is node-local anti-rollback state -- a
     // standby must not inherit the active's mark (P3). PRESERVE the recorded high-
@@ -8504,8 +8502,25 @@ function initDb() {
       db.prepare("INSERT INTO node_state (key, value) VALUES ('fuse_high_water', ?)").run(relocatedHw);
     }
     db.prepare("DELETE FROM system_meta WHERE key = 'fuse_high_water'").run();
+    // B6h A-9: relocate the sealed deployment-mode record from the replicating config
+    // to the excluded node_state. The record is node-local (anchor-bound); a replicated
+    // table let the active's record clobber a standby's and fail verification against the
+    // standby's anchor (the paired-standby bare-metal defect). Copy the existing config
+    // record into node_state if absent (preserve the active's own sealed mode), then
+    // DELETE the config row. Also drop the dead system_meta.deployment_mode seed (no
+    // readers). Idempotent. A standby whose config record was clobbered pre-A-9 relocates
+    // a non-verifying record and fails safe to bare-metal until re-provisioned.
+    const nsMode = db.prepare("SELECT value FROM node_state WHERE key = 'deployment_mode'").get();
+    if (!nsMode) {
+      const cfgMode = db.prepare("SELECT value FROM config WHERE key = 'deployment_mode'").get();
+      if (cfgMode && cfgMode.value !== null && cfgMode.value !== undefined) {
+        db.prepare("INSERT INTO node_state (key, value) VALUES ('deployment_mode', ?)").run(String(cfgMode.value));
+      }
+    }
+    db.prepare("DELETE FROM config WHERE key = 'deployment_mode'").run();
+    db.prepare("DELETE FROM system_meta WHERE key = 'deployment_mode'").run();
     const instanceIdentityCount = db.prepare("SELECT COUNT(*) AS c FROM instance_identity").get().c;
-    console.log(`B5e migration: instance_identity + instance_observations + migration_bundles ready; ac_device_signing_keys ratchet columns ensured; deployment_mode seeded; fuse_high_water relocated to node_state (${instanceIdentityCount} identity row(s) present)`);
+    console.log(`B5e migration: instance_identity + instance_observations + migration_bundles ready; ac_device_signing_keys ratchet columns ensured; fuse_high_water + deployment_mode relocated to node_state (${instanceIdentityCount} identity row(s) present)`);
   } catch (b5eInstanceIdentityMigrationErr) {
     console.error('B5e instance-identity migration FAILED:', b5eInstanceIdentityMigrationErr.message);
     console.error('The server will start, but anti-cloning hardening cannot persist state: instance identity establishment, duplicate/fork detection, and the anti-rollback high-water mark are inactive. No other feature is affected. Recovery: run the CREATE TABLE / ALTER TABLE statements above in a SQLite shell against the production DB, then restart.');

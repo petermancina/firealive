@@ -185,6 +185,16 @@ function promote(db, opts) {
     installRuntimeJwtSecret(material.jwtSecret);
   }
 
+  // A promoted GD node must not carry a tampered deployment-mode seal. If a mode record is
+  // present but does not verify against this node's anchor, that is tamper evidence (or an
+  // active's record that reached this standby); refuse to promote rather than serve as
+  // active in an inconsistent, possibly-compromised posture. A bare-metal node (no record)
+  // or a valid mode promotes normally. Runs before the epoch/role change (fail-closed).
+  const deploymentMode = require('./gd-deployment-mode');
+  if (deploymentMode.sealTampered(db)) {
+    throw new Error('gd-ha-failover.promote: the GD deployment-mode seal on this node is present but does not verify against its anchor (tamper evidence, or a record bound to another node); refusing to promote. Re-provision the mode with the GD deployment-mode ceremony.');
+  }
+
   // 2. Take the next epoch + the lease (the monotonic trigger guards the bump).
   const epoch = haLease.claimNextEpoch(db, cfg.leaseTtlSec);
 
