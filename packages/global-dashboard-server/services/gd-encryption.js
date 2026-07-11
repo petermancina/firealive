@@ -126,6 +126,7 @@ module.exports = {
   decryptConfig,
   encryptConfigWithKey,
   decryptConfigWithKey,
+  deriveKek,
   _resetKekCache,
   requireCloudKek,
 };
