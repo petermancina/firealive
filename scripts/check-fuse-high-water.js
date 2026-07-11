@@ -90,12 +90,42 @@ function runServer(label, modulePath) {
   return problems;
 }
 
+// Tree-wide guard: no file may read fuse_high_water from system_meta except the
+// init.js migration (which copies the legacy value out and deletes the row). This
+// catches a missed descriptor/reader that the per-module source checks above cannot
+// see -- exactly the gd-instance-anchor reader VERIFY-MERGE found after A-8 merged.
+function treeWideSystemMetaCheck() {
+  const REPO = path.resolve(__dirname, '..');
+  const MIGRATION_FILE = path.join('server', 'db', 'init.js');
+  const NEEDLE = "system_meta WHERE key = 'fuse_high_water'";
+  const violations = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      if (!e.isFile() || !e.name.endsWith('.js')) continue;
+      const rel = path.relative(REPO, full);
+      if (rel === MIGRATION_FILE) continue; // the migration is the sole allowed toucher
+      let src;
+      try { src = fs.readFileSync(full, 'utf8'); } catch { continue; }
+      if (src.indexOf(NEEDLE) !== -1) {
+        violations.push(rel + " reads fuse_high_water from system_meta -- it must read node_state (node-local, excluded from replication)");
+      }
+    }
+  };
+  for (const d of ['server', 'packages']) walk(path.join(REPO, d));
+  return violations;
+}
+
 function main() {
   const servers = [
     ['MC fuse-high-water', path.resolve(__dirname, '..', 'server', 'services', 'fuse-high-water.js')],
     ['GD gd-fuse-high-water', path.resolve(__dirname, '..', 'packages', 'global-dashboard-server', 'services', 'gd-fuse-high-water.js')],
   ];
-  let problems = [];
+  let problems = treeWideSystemMetaCheck();
   for (const [label, p] of servers) {
     try {
       problems = problems.concat(runServer(label, p));

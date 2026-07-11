@@ -58,13 +58,13 @@ function derToPem(der) {
 }
 
 // Shape the in-memory identity descriptor from a stored row, reading
-// fuse_high_water from system_meta when present (null before the high-water
-// commit seeds it).
+// fuse_high_water from node_state (node-local, excluded from replication;
+// relocated from system_meta in B6h A-8, so a standby reports its own mark).
 function descriptorFromRow(row, db) {
   let fuseHighWater = null;
   if (db) {
     try {
-      const m = db.prepare("SELECT value FROM system_meta WHERE key = 'fuse_high_water'").get();
+      const m = db.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get();
       if (m && m.value !== null && m.value !== undefined) {
         fuseHighWater = Number(m.value);
       }
