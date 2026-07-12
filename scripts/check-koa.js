@@ -53,7 +53,7 @@ function tokenTests(label, rel, anchorReq, approvalsReq, identityTable) {
 
   let store = {};
   const db = { prepare(sql) {
-    if (new RegExp('anchor_public FROM ' + identityTable).test(sql)) return { get: () => ({ anchor_public: PEM }) };
+    if (sql.indexOf('anchor_public FROM ' + identityTable) !== -1) return { get: () => ({ anchor_public: PEM }) };
     if (/INSERT INTO key_op_authorizations/.test(sql)) return { run: (...a) => { store[a[0]] = { id: a[0], op: a[1], key_op_ref: a[2], approval_id: a[3], requested_by_user_id: a[4], created_at: a[5], expires_at: a[6], anchor_public_fingerprint: a[7], signature: a[8], consumed_at: null }; } };
     if (/SELECT \* FROM key_op_authorizations WHERE id/.test(sql)) return { get: (id) => store[id] };
     if (/UPDATE key_op_authorizations SET consumed_at/.test(sql)) return { run: (ts, ctx, id) => { if (store[id] && store[id].consumed_at === null) { store[id].consumed_at = ts; return { changes: 1 }; } return { changes: 0 }; } };
