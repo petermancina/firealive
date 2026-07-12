@@ -235,6 +235,11 @@ killing the process and waiting for detection. It promotes the standby
 deliberately and records the action in the audit log. Drain or redirect
 client traffic at your load balancer as part of the same maintenance step.
 
+Manual failover is a deliberate, high-consequence action, so beyond the
+lead/admin role it requires a fresh hardware MFA step-up and the configuration
+lock to be open. Detection-driven automatic failover is unaffected -- it is not
+a gated action, so an unattended failure still promotes the standby on its own.
+
 ### "Why didn't it promote?"
 
 If an active failed and the standby did not take over, work through the
@@ -246,8 +251,12 @@ detection wait is simply longer than you expected. Check the promotion
 cooldown — a promotion that fired recently will suppress another for the
 cooldown window, and a throttled attempt is audited. And confirm the standby
 is genuinely healthy and anchored, since promotion requires unsealing its
-promotion material. The HA status view and the `HA_*` audit events together
-will show which of these applies.
+promotion material. Promotion also refuses if the standby's sealed
+deployment-mode record is present but does not verify against its own anchor --
+tamper evidence, or a record left behind by another node; if a standby is stuck
+this way after an upgrade, see *Re-provision a standby's deployment mode* below.
+The HA status view and the `HA_*` audit events together will show which of these
+applies.
 
 ### Watch replication lag
 
@@ -269,6 +278,39 @@ fail back on your own schedule (for instance with a manual failover during a
 maintenance window) if you want the original node active again. No manual
 de-conflicting is required, and there is never a moment when both nodes
 consider themselves the writer.
+
+### Un-pair a node
+
+Un-pairing dissolves the pair and returns both nodes to standalone. Initiate it
+with the un-pair action; it clears the peer, releases the lease, stops
+replication, resets the node to a clean standalone state, and signals the peer
+to do the same. Like manual failover it requires a hardware MFA step-up, the
+configuration lock open, and the lead/admin role, and it is audited
+(`HA_UNPAIR`). The peer's inbound un-pair endpoint is mutual-TLS-pinned and, in
+addition, rate-limited, so a malfunctioning or compromised peer cannot drive
+repeated teardowns; a breach is audited (`HA_PEER_UNPAIR_RATE_LIMITED`) and
+rejected with a 429.
+
+Un-pair is **fail-closed against data loss**. A node that was promoted at any
+point holds its replicated operational data under the key it adopted from the
+former active. Un-pairing would strand that data under a key the standalone node
+no longer uses, so such a node **refuses to un-pair** and directs you to rekey it
+first. Re-binding the replicated data to the node's own key is an offline rekey
+-- a separate maintenance action, and a later capability. A node that was never
+promoted -- a standby you are decommissioning, or the original active -- un-pairs
+cleanly.
+
+### Re-provision a standby's deployment mode
+
+A node's deployment mode (bare-metal, virtualized, cloud, and so on) is sealed to
+that node's own hardware anchor and is node-local. If a standby was paired under
+an earlier release that replicated the mode record, the active's record may have
+overwritten the standby's; the standby then reads its mode as bare-metal -- the
+strict, fail-safe default -- and, because that record does not verify against the
+standby's own anchor, it will refuse to promote. Re-seal the mode on the standby
+by re-running the deployment-mode ceremony there. New pairings are unaffected:
+the mode now stays node-local and survives pairing, failover, and restart
+untouched.
 
 ### Mind the cooldown
 
@@ -310,6 +352,6 @@ behavior you were trying to observe.
 | Promotion cooldown | Suppresses a second promotion for a configured window; throttled attempts audited |
 | Configurable knobs | enabled, self/peer endpoint, sync interval, heartbeat interval, miss count, lease TTL, promotion cooldown, self-fence timeout — all live, no restart |
 | Self-test | Real measured failover-and-failback drill; reports timing, served, integrity, restored |
-| Audit events | `HA_CONFIG_UPDATED`, `HA_PAIR_INITIATED`, `HA_PAIRED`, `HA_PAIR_FAILED`, `HA_PEER_REJECTED`, `HA_PROMOTED`, `HA_DEMOTED`, `HA_SELF_FENCED`, `HA_PROMOTION_THROTTLED`, `HA_MANUAL_FAILOVER`, `HA_TEST_STARTED`, `HA_TEST_COMPLETE` |
+| Audit events | `HA_CONFIG_UPDATED`, `HA_PAIR_INITIATED`, `HA_PAIRED`, `HA_PAIR_FAILED`, `HA_PEER_REJECTED`, `HA_PROMOTED`, `HA_DEMOTED`, `HA_SELF_FENCED`, `HA_PROMOTION_THROTTLED`, `HA_MANUAL_FAILOVER`, `HA_UNPAIR`, `HA_PEER_UNPAIR_RATE_LIMITED`, `HA_TEST_STARTED`, `HA_TEST_COMPLETE` |
 | Per-mode pairing | Bare-metal/virtualized as described; cloud adds mutual confidential-compute attestation; SDN exposes the peer as a system segment |
 | Global Dashboard HA | Out of scope (separate, later capability) |

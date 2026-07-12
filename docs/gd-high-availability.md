@@ -172,7 +172,7 @@ CEF, at these severities:
 |---|---|
 | `critical` | `HA_PROMOTION_REFUSED` |
 | `high` | `HA_PROMOTED`, `HA_SELF_FENCED`, `HA_MANUAL_FAILOVER` |
-| `warning` | `HA_DEMOTED`, `HA_PAIRED`, `HA_PEER_REJECTED`, `HA_PAIR_FAILED`, `HA_SEGMENT_REREGISTER_FAILED` |
+| `warning` | `HA_DEMOTED`, `HA_PAIRED`, `HA_UNPAIR`, `HA_PEER_UNPAIR_RATE_LIMITED`, `HA_PEER_REJECTED`, `HA_PAIR_FAILED`, `HA_SEGMENT_REREGISTER_FAILED` |
 | `info` | `HA_SEGMENT_REREGISTERED`, `HA_PROMOTION_THROTTLED`, `HA_PAIR_INITIATED`, `HA_PAIRING_TOKEN_ISSUED`, `HA_CONFIG_UPDATED`, `HA_TEST_STARTED`, `HA_TEST_COMPLETE` |
 
 `HA_PROMOTION_REFUSED` is critical because in Cloud Mode it means the node could not re-attest at the moment it
@@ -222,6 +222,10 @@ peer promotes on its own once it notices the active is gone, and this node stays
 
 There is no undo from that node. To come back, run a manual failover from whichever node is then active.
 
+Because it is a deliberate, high-consequence action, manual failover requires a fresh hardware MFA step-up in
+addition to the CISO role and the configuration lock being open. Detection-driven automatic failover is
+unaffected -- it is not a gated action.
+
 ### "Why didn't it promote?"
 
 In order, check:
@@ -234,6 +238,9 @@ In order, check:
 4. Look for `HA_PROMOTION_REFUSED`. In Cloud Mode this means attestation failed. Fix the platform; the node will
    not promote onto an unverified one.
 5. Does the node have sealed promotion material? A node paired before the KEK was provisioned will refuse.
+6. Does the node's sealed deployment-mode record verify against its own anchor? A record present but not
+   verifying -- tamper evidence, or one left by another node -- blocks promotion. If a standby is stuck this way
+   after an upgrade, see *Re-provision a standby's deployment mode*.
 
 ### Recover a demoted former active
 
@@ -247,6 +254,30 @@ node, then `POST /api/ha/pair` from the current active.
 
 `replication.lagSeconds` is your recovery point. Alert on it. A lag of *n* seconds means a failover right now
 loses roughly *n* seconds of fleet updates.
+
+### Un-pair a node
+
+`POST /api/ha/unpair`. It clears the peer, releases the lease, stops replication, resets the node to a clean
+standalone state, and signals the peer to do the same -- audited `HA_UNPAIR`. Like manual failover it requires a
+hardware MFA step-up, the configuration lock open, and the CISO role. The peer's inbound un-pair endpoint
+(`/api/ha/peer/unpair`) is mutual-TLS-pinned and, in addition, rate-limited: a malfunctioning or compromised peer
+cannot drive repeated teardowns, and a breach is audited (`HA_PEER_UNPAIR_RATE_LIMITED`) and rejected with a
+`429`.
+
+Un-pair is **fail-closed against data loss**. A node that was promoted at any point holds its replicated fleet
+data under the key it adopted from the former active; un-pairing would strand that data under a key the
+standalone node no longer uses, so such a node **refuses to un-pair** and directs you to rekey it first.
+Re-binding the data to the node's own key is an offline rekey -- a separate maintenance action, and a later
+capability. A node that was never promoted -- a standby you are decommissioning, or the original active --
+un-pairs cleanly.
+
+### Re-provision a standby's deployment mode
+
+A node's deployment mode is sealed to its own hardware anchor and is node-local. If a standby was paired under an
+earlier release that replicated the mode record, the active's record may have overwritten the standby's; the
+standby then reads bare-metal -- the strict, fail-safe default -- and, because that record does not verify
+against its own anchor, refuses to promote. Re-seal the mode on the standby by re-running the deployment-mode
+ceremony there. New pairings keep the mode node-local through pairing, failover, and restart.
 
 ### Mind the cooldown
 
