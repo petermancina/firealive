@@ -416,7 +416,7 @@ configRouter.post('/unpair', gdMfaStepUp(), requireObjectBody, async (req, res) 
   }
 });
 
-configRouter.post('/manual-failover', requireObjectBody, async (req, res) => {
+configRouter.post('/manual-failover', gdMfaStepUp(), requireObjectBody, async (req, res) => {
   const db = getDb();
   try {
     if (nodeRole(db) !== 'active') {
