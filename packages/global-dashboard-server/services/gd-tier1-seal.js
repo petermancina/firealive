@@ -110,6 +110,20 @@ function openTier1(colRef, stored) {
   return gdTier1Envelope.open(stored, keyForDomain(m.domain), aadForColumn(colRef), kekFpForDomain(m.domain));
 }
 
+// Re-seal an already-stored GD Tier-1 value from one KEK to another. Opens the stored
+// envelope under fromKek (verifying fromKekFp for v2) and re-seals the same plaintext as a
+// v2 envelope under toKek/toKekFp -- upgrading any legacy v1 value to v2. Used ONLY by the
+// offline node rekey (B-4) to rebind a promoted GD node's replicated columns from the adopted
+// shared KEK to its own KEK. Fails closed: throws if the value will not open under fromKek, so
+// the rekey caller aborts the whole transaction rather than persist a half-rekeyed row.
+function resealValue(colRef, stored, fromKek, fromKekFp, toKek, toKekFp) {
+  if (stored === null || stored === undefined) return null;
+  const m = meta(colRef);
+  assertEnvelope(colRef, m);
+  const plaintext = gdTier1Envelope.open(stored, fromKek, aadForColumn(colRef), fromKekFp);
+  return gdTier1Envelope.sealV2(plaintext, toKek, toKekFp, aadForColumn(colRef));
+}
+
 // True if colRef is a GD Tier-1 (chokepoint-sealed) column.
 function isRegistered(colRef) {
   const m = REGISTRY.get(colRef);
@@ -119,5 +133,6 @@ function isRegistered(colRef) {
 module.exports = {
   sealTier1,
   openTier1,
+  resealValue,
   isRegistered,
 };

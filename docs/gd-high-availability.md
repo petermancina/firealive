@@ -255,6 +255,33 @@ node, then `POST /api/ha/pair` from the current active.
 `replication.lagSeconds` is your recovery point. Alert on it. A lag of *n* seconds means a failover right now
 loses roughly *n* seconds of fleet updates.
 
+### Rekey a promoted node (shed the shared key)
+
+A promoted GD node holds its replicated fleet data (the CA private key, external-restore credentials, malware-scanner
+and storage-destination secrets) sealed under the key it adopted from the former active -- the shared KEK. Before that
+node can be un-paired and run standalone, that data must be re-bound to the node's own key. That is the offline rekey.
+
+The rekey is a **destructive key operation**, gated by a two-person, anchor-signed, single-use authorization (a KOA),
+with the two people held to **distinct roles**:
+
+1. A CISO requests it: `POST /api/key-ops/request` with `{ op: "rekey", key_op_ref: "<a label>" }` (configuration lock
+   open, hardware step-up). This opens a pending approval.
+2. A **signing-key approver** (not the CISO) approves it: `POST /api/key-ops/<approval-id>/approve` (hardware step-up).
+3. The CISO mints the authorization: `POST /api/key-ops/authorize` with
+   `{ op: "rekey", key_op_ref: "<same label>", approval_id: "<approval-id>" }`. The response contains the KOA `id`.
+4. On the node itself (a hardware root of trust is required), run:
+   `node packages/global-dashboard-server/tools/gd-rekey-node.js --koa <koa-id>`
+
+The tool verifies the KOA offline against the node's anchor public key, consumes it single-use, and -- in one atomic
+transaction -- re-seals every replicated column from the shared KEK to the node's own KEK and then sheds the shared KEK.
+Any failure rolls the whole thing back: the authorization stays usable and nothing is left half-rekeyed. If a value will
+not open under the shared KEK it aborts before writing anything. When it completes, the node is standalone and un-pairs
+cleanly.
+
+**Forward-only.** The rekey re-binds only the node's live fleet data. Existing backups and forensic exports stay sealed
+under the OLD key -- chained, at-rest artifacts, never rewritten. **Retain the old recovery code**; it is what reads
+those older artifacts.
+
 ### Un-pair a node
 
 `POST /api/ha/unpair`. It clears the peer, releases the lease, stops replication, resets the node to a clean
@@ -267,8 +294,8 @@ cannot drive repeated teardowns, and a breach is audited (`HA_PEER_UNPAIR_RATE_L
 Un-pair is **fail-closed against data loss**. A node that was promoted at any point holds its replicated fleet
 data under the key it adopted from the former active; un-pairing would strand that data under a key the
 standalone node no longer uses, so such a node **refuses to un-pair** and directs you to rekey it first.
-Re-binding the data to the node's own key is an offline rekey -- a separate maintenance action, and a later
-capability. A node that was never promoted -- a standby you are decommissioning, or the original active --
+Re-binding the data to the node's own key is an offline rekey -- a separate maintenance action; see "Rekey a
+promoted node" above. A node that was never promoted -- a standby you are decommissioning, or the original active --
 un-pairs cleanly.
 
 ### Re-provision a standby's deployment mode

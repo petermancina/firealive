@@ -279,6 +279,42 @@ maintenance window) if you want the original node active again. No manual
 de-conflicting is required, and there is never a moment when both nodes
 consider themselves the writer.
 
+### Rekey a promoted node (shed the shared key)
+
+A node that was promoted holds its replicated operational data (integration
+credentials, storage and backup destinations, the CA private key, and the like)
+sealed under the key it adopted from the former active -- the shared KEK. Before
+that node can be un-paired and run standalone, that data must be re-bound to the
+node's own key. That is the offline rekey.
+
+The rekey is a **destructive key operation**, gated by a two-person,
+anchor-signed, single-use authorization (a KOA):
+
+1. On the node, request it: `POST /api/key-ops/request` with
+   `{ op: "rekey", key_op_ref: "<a label for this rekey>" }` (admin, configuration
+   lock open, hardware step-up). This opens a pending two-person approval.
+2. A **different** admin approves: `POST /api/key-ops/<approval-id>/approve`
+   (admin, hardware step-up). The approver cannot be the requester.
+3. Mint the authorization: `POST /api/key-ops/authorize` with
+   `{ op: "rekey", key_op_ref: "<same label>", approval_id: "<approval-id>" }`.
+   The response contains the KOA `id`.
+4. On the node itself (a hardware root of trust is required), run:
+   `node server/tools/rekey-node.js --koa <koa-id>`
+
+The tool verifies the KOA offline against the node's anchor public key, consumes
+it single-use, and -- in one atomic transaction -- re-seals every replicated
+column from the shared KEK to the node's own KEK and then sheds the shared KEK.
+It is all-or-nothing: any failure rolls the whole thing back, the authorization
+stays usable, and nothing is left half-rekeyed. If a value will not open under
+the shared KEK it aborts before writing anything. When it completes, the node is
+standalone and un-pairs cleanly.
+
+**Forward-only.** The rekey re-binds only the node's live operational data.
+Existing backups and forensic exports stay sealed under the OLD key -- they are
+chained, at-rest artifacts and are never rewritten. **Retain the old recovery
+code**; it is what reads those older artifacts. Backups taken after the rekey are
+under the node's own key.
+
 ### Un-pair a node
 
 Un-pairing dissolves the pair and returns both nodes to standalone. Initiate it
@@ -296,7 +332,7 @@ point holds its replicated operational data under the key it adopted from the
 former active. Un-pairing would strand that data under a key the standalone node
 no longer uses, so such a node **refuses to un-pair** and directs you to rekey it
 first. Re-binding the replicated data to the node's own key is an offline rekey
--- a separate maintenance action, and a later capability. A node that was never
+-- a separate maintenance action; see "Rekey a promoted node" above. A node that was never
 promoted -- a standby you are decommissioning, or the original active -- un-pairs
 cleanly.
 

@@ -132,6 +132,23 @@ function openTier1(colRef, stored) {
   return deserialize(tier1Envelope.open(envelope, key, aadForColumn(colRef), kekFpForDomain(m.domain)), m.shape);
 }
 
+// Re-seal an already-stored Tier-1 value from one KEK to another WITHOUT deserializing
+// the plaintext. Opens the stored ciphertext under fromKek (verifying fromKekFp when the
+// value is v2) and re-seals the exact same plaintext bytes as a v2 envelope under toKek /
+// toKekFp -- also upgrading any legacy v1 value to v2 in passing. Used ONLY by the offline
+// node rekey (B-4) to rebind a promoted node's replicated columns from the adopted shared
+// KEK to this node's own KEK. Fails closed: if the value will not open under fromKek (wrong
+// key or tamper) this throws, and the rekey caller aborts the whole transaction rather than
+// persist a half-rekeyed row. Deserialize/serialize are intentionally skipped -- the value's
+// meaning never changes, only the key wrapping it.
+function resealValue(colRef, stored, fromKek, fromKekFp, toKek, toKekFp) {
+  if (stored === null || stored === undefined) return null;
+  const m = meta(colRef);
+  const aad = aadForColumn(colRef);
+  const plaintext = tier1Envelope.open(decodeStorage(stored, m.storage), fromKek, aad, fromKekFp);
+  return encodeStorage(tier1Envelope.sealV2(plaintext, toKek, toKekFp, aad), m.storage);
+}
+
 // True if colRef is a Tier-1 (chokepoint-sealed) column.
 function isRegistered(colRef) {
   const m = REGISTRY.get(colRef);
@@ -141,5 +158,6 @@ function isRegistered(colRef) {
 module.exports = {
   sealTier1,
   openTier1,
+  resealValue,
   isRegistered,
 };
