@@ -221,7 +221,7 @@ router.post('/pair', requireObjectBody, async (req, res) => {
   }
 });
 
-router.post('/manual-failover', requireObjectBody, async (req, res) => {
+router.post('/manual-failover', mfaStepUp(), requireObjectBody, async (req, res) => {
   if (!requireRole(req, res, ['lead', 'admin'])) {
     return;
   }
