@@ -55,6 +55,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/geo-fence',  // B5n: login geo-fence config/exceptions/per-user country (all writes + the resolve dry-run gated under the mount)
   '/api/data-residency',  // B5n2: data-residency policy/declarations/transfer-mechanism (all writes + the evaluate re-check gated under the mount)
   '/api/vuln-scan',  // B5p: on-prem vulnerability-scanner authorization registry + config + access-log (all writes gated under the mount)
+  '/api/key-ops',  // B6h B-3: KOA request/approve/authorize (all writes gated; a rekey needs config unlocked)
 ];
 
 // Exact config-write endpoints inside the mixed feature routers (v021-v030).
