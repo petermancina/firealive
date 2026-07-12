@@ -37,6 +37,8 @@ jobs:
         run: node scripts/check-ha-unpair.js
       - name: Verify Tier-1 boot integrity gate
         run: node scripts/check-tier1-boot-gate.js
+      - name: Verify Key-Operation Authorization (KOA)
+        run: node scripts/check-koa.js
 
 
   build-mac:

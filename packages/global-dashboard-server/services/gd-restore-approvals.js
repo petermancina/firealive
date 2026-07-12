@@ -24,14 +24,14 @@
 //
 //   strict
 //     approver_user_id MUST differ from requested_by_user_id.
-//     TOTP must be verified before this method is called (route's
-//     responsibility -- this service trusts the totp_verified flag).
-//     approval_method = 'second-person-totp'.
+//     a passkey (WebAuthn) assertion must be verified before this method is called (route's
+//     responsibility -- this service trusts the stepup_verified flag).
+//     approval_method = 'second-person-webauthn'.
 //
 //   delayed-self-approval
 //     Either a different admin approves any time within the window
-//     (method='second-person-totp'), OR the original requester
-//     self-approves AFTER expires_at (method='delayed-self-totp').
+//     (method='second-person-webauthn'), OR the original requester
+//     self-approves AFTER expires_at (method='delayed-self-webauthn').
 //     Self-approval before the window has elapsed is rejected with
 //     code WINDOW_NOT_ELAPSED -- the window IS the security property.
 //
@@ -103,13 +103,14 @@
 
 const crypto = require('crypto');
 const policy = require('./gd-restore-approval-policy');
+const keyOpPolicy = require('./gd-key-op-approval-policy');
 
 const VALID_STATUSES = ['pending', 'approved', 'denied', 'expired', 'consumed'];
 const TERMINAL_STATUSES = ['denied', 'expired', 'consumed'];
 
 const VALID_APPROVAL_METHODS = [
-  'second-person-totp',
-  'delayed-self-totp',
+  'second-person-webauthn',   // mfa-stepup verifies a user-verified WebAuthn assertion
+  'delayed-self-webauthn',
   'disabled-mode-bypass',
 ];
 
@@ -161,7 +162,7 @@ const CODES = {
   APPROVER_SAME_AS_REQUESTER: 'APPROVER_SAME_AS_REQUESTER',
   WINDOW_NOT_ELAPSED: 'WINDOW_NOT_ELAPSED',
   DISABLED_MODE_NO_MANUAL_APPROVE: 'DISABLED_MODE_NO_MANUAL_APPROVE',
-  TOTP_NOT_VERIFIED: 'TOTP_NOT_VERIFIED',
+  STEPUP_NOT_VERIFIED: 'STEPUP_NOT_VERIFIED',
 };
 
 // -- Helpers --------------------------------------------------------------
@@ -457,6 +458,28 @@ function findUsableForExternal(db, args) {
   `).get(args.source_id, args.external_backup_id, args.requested_by_user_id, nowSqlite());
 }
 
+/**
+ * B6h B-3: find the most-recent usable approved row targeting a KEY OPERATION
+ * (the two-person gate for a KOA). Mirror of findUsableForBackup -- approved,
+ * not consumed, still within the consumption window, most recent first.
+ */
+function findUsableForKeyOp(db, args) {
+  if (!args || typeof args !== 'object') return null;
+  if (typeof args.key_op_ref !== 'string' || args.key_op_ref === '') return null;
+  if (typeof args.requested_by_user_id !== 'string' || args.requested_by_user_id === '') return null;
+
+  return db.prepare(`
+    SELECT * FROM restore_approvals
+    WHERE key_op_ref = ?
+      AND requested_by_user_id = ?
+      AND status = 'approved'
+      AND consumed_at IS NULL
+      AND datetime(approved_at, '+' || approval_window_hours || ' hours') > ?
+    ORDER BY approved_at DESC
+    LIMIT 1
+  `).get(args.key_op_ref, args.requested_by_user_id, nowSqlite());
+}
+
 // -- Create ---------------------------------------------------------------
 
 /**
@@ -494,24 +517,32 @@ function createApprovalRequest(db, args) {
   const hasBackupId = typeof args.backup_id === 'string' && args.backup_id !== '';
   const hasSource = typeof args.source_id === 'string' && args.source_id !== '';
   const hasExternalBackupId = typeof args.external_backup_id === 'string' && args.external_backup_id !== '';
-  const isLocal = hasBackupId && !hasSource && !hasExternalBackupId;
-  const isExternal = !hasBackupId && hasSource && hasExternalBackupId;
-  if (!isLocal && !isExternal) {
+  const hasKeyOpRef = typeof args.key_op_ref === 'string' && args.key_op_ref !== '';
+  const isLocal = hasBackupId && !hasSource && !hasExternalBackupId && !hasKeyOpRef;
+  const isExternal = !hasBackupId && hasSource && hasExternalBackupId && !hasKeyOpRef;
+  const isKeyOp = !hasBackupId && !hasSource && !hasExternalBackupId && hasKeyOpRef;
+  if (!isLocal && !isExternal && !isKeyOp) {
     throw new ApprovalError(
       CODES.INVALID_INPUT,
       'must provide exactly one of: backup_id (local restore) ' +
-      'OR (source_id AND external_backup_id) (external restore)',
+      'OR (source_id AND external_backup_id) (external restore) ' +
+      'OR key_op_ref (key operation)',
       { validation: true },
     );
   }
   const backupId = isLocal ? args.backup_id : null;
   const sourceId = isExternal ? args.source_id : null;
   const externalBackupId = isExternal ? args.external_backup_id : null;
+  const keyOpRef = isKeyOp ? args.key_op_ref : null;
 
   const requestReason = optionalString(args.request_reason, 'request_reason', REASON_MAX_LENGTH);
   const clientIp = optionalString(args.client_ip, 'client_ip', CLIENT_IP_MAX_LENGTH);
 
-  const cfg = policy.getConfig(db);
+  // Key operations use their own approval policy (strict / delayed-self-approval
+  // only -- there is no 'disabled' mode for a destructive key operation).
+  const cfg = isKeyOp
+    ? { mode: keyOpPolicy.getMode(db), window_hours: keyOpPolicy.getWindowHours(db) }
+    : policy.getConfig(db);
   const id = generateApprovalId();
   const requestedAt = nowSqlite();
   const expiresAt = computeExpiresAt(cfg.window_hours);
@@ -519,17 +550,18 @@ function createApprovalRequest(db, args) {
   if (cfg.mode === 'disabled') {
     db.prepare(`
       INSERT INTO restore_approvals (
-        id, backup_id, source_id, external_backup_id,
+        id, backup_id, source_id, external_backup_id, key_op_ref,
         requested_by_user_id, requested_at, request_reason,
         status, approval_mode_at_creation, approval_window_hours,
         approved_by_user_id, approved_at, approval_method,
         expires_at, client_ip_at_request, client_ip_at_approval
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', 'disabled', ?, ?, ?, 'disabled-mode-bypass', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', 'disabled', ?, ?, ?, 'disabled-mode-bypass', ?, ?, ?)
     `).run(
       id,
       backupId,
       sourceId,
       externalBackupId,
+      keyOpRef,
       args.requested_by_user_id,
       requestedAt,
       requestReason,
@@ -544,16 +576,17 @@ function createApprovalRequest(db, args) {
     // strict or delayed-self-approval -- create pending row.
     db.prepare(`
       INSERT INTO restore_approvals (
-        id, backup_id, source_id, external_backup_id,
+        id, backup_id, source_id, external_backup_id, key_op_ref,
         requested_by_user_id, requested_at, request_reason,
         status, approval_mode_at_creation, approval_window_hours,
         expires_at, client_ip_at_request
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
     `).run(
       id,
       backupId,
       sourceId,
       externalBackupId,
+      keyOpRef,
       args.requested_by_user_id,
       requestedAt,
       requestReason,
@@ -574,13 +607,13 @@ function createApprovalRequest(db, args) {
  *
  *   strict:
  *     - approver MUST differ from requester
- *     - totp_verified MUST be true (route's job to actually verify)
+ *     - stepup_verified MUST be true (route's job to actually verify)
  *
  *   delayed-self-approval:
  *     - if approver == requester, expires_at MUST already be in the past
  *       (window elapsed). Otherwise WINDOW_NOT_ELAPSED.
  *     - approver may be a different admin at any time within the window
- *     - totp_verified MUST be true
+ *     - stepup_verified MUST be true
  *
  *   disabled:
  *     - this method is REJECTED with DISABLED_MODE_NO_MANUAL_APPROVE.
@@ -593,7 +626,7 @@ function createApprovalRequest(db, args) {
  * Args:
  *   id                     string (required)
  *   approver_user_id       string (required)
- *   totp_verified          bool   (required, must be true)
+ *   stepup_verified          bool   (required, must be true)
  *   client_ip              string (optional)
  *
  * Returns: { id, previous_status, new_status, approval_method,
@@ -613,11 +646,11 @@ function approve(db, args) {
   }
   requireNonEmptyString(args.id, 'id');
   requireNonEmptyString(args.approver_user_id, 'approver_user_id');
-  if (args.totp_verified !== true) {
+  if (args.stepup_verified !== true) {
     throw new ApprovalError(
-      CODES.TOTP_NOT_VERIFIED,
-      'TOTP must be verified before approval can be recorded',
-      { field: 'totp_verified', forbidden: true },
+      CODES.STEPUP_NOT_VERIFIED,
+      'a passkey (WebAuthn) assertion must be verified before approval can be recorded',
+      { field: 'stepup_verified', forbidden: true },
     );
   }
   const clientIp = optionalString(args.client_ip, 'client_ip', CLIENT_IP_MAX_LENGTH);
@@ -672,7 +705,7 @@ function approve(db, args) {
           { forbidden: true, detail: { mode: 'strict' } },
         );
       }
-      approvalMethod = 'second-person-totp';
+      approvalMethod = 'second-person-webauthn';
       break;
 
     case 'delayed-self-approval':
@@ -684,9 +717,9 @@ function approve(db, args) {
             { forbidden: true, detail: { expires_at: row.expires_at, current_time: now } },
           );
         }
-        approvalMethod = 'delayed-self-totp';
+        approvalMethod = 'delayed-self-webauthn';
       } else {
-        approvalMethod = 'second-person-totp';
+        approvalMethod = 'second-person-webauthn';
       }
       break;
 
@@ -1048,6 +1081,7 @@ module.exports = {
   listAll,
   findUsableForBackup,
   findUsableForExternal,
+  findUsableForKeyOp,
 
   // Write API
   createApprovalRequest,

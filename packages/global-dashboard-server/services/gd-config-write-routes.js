@@ -42,6 +42,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/backup-schedules',
   '/api/malware-scanners',
   '/api/config-baseline',
+  '/api/key-ops',  // B6h B-3: KOA request/approve/authorize (all writes gated; a rekey needs config unlocked)
 ];
 
 // Exact config-write endpoints inside mixed routers (operational siblings such

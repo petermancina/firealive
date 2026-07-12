@@ -28,7 +28,7 @@
 //   delayed-self-approval default.
 //
 // Step-up gate (approve only):
-//   approvalsSvc.approve() requires totp_verified=true. This route satisfies
+//   approvalsSvc.approve() requires stepup_verified=true. This route satisfies
 //   it with a fresh, user-verified WebAuthn assertion via the gdMfaStepUp
 //   middleware (body.stepup = { challengeToken, response }) BEFORE delegating
 //   to the service. A step-up failure short-circuits in the middleware and
@@ -87,7 +87,7 @@ function approvalCodeToHttpStatus(code) {
       return 409;
     case approvalsSvc.CODES.APPROVER_SAME_AS_REQUESTER:
     case approvalsSvc.CODES.WINDOW_NOT_ELAPSED:
-    case approvalsSvc.CODES.TOTP_NOT_VERIFIED:
+    case approvalsSvc.CODES.STEPUP_NOT_VERIFIED:
       return 403;
     default:
       return 500;
@@ -211,7 +211,7 @@ router.get('/:id', (req, res) => {
 // -- POST /api/restore-approvals/:id/approve -- step-up required -------------
 //
 // A fresh user-verified WebAuthn step-up (gdMfaStepUp) satisfies the
-// service's totp_verified=true guard. The service enforces the per-mode
+// service's stepup_verified=true guard. The service enforces the per-mode
 // rules: strict requires approver != requester; delayed-self-approval permits
 // requester self-approval only after the window elapses; disabled always
 // rejects (rows are auto-approved at creation).
@@ -222,7 +222,7 @@ router.post('/:id/approve', gdMfaStepUp(), (req, res) => {
     const result = approvalsSvc.approve(db, {
       id: req.params.id,
       approver_user_id: req.user.id,
-      totp_verified: true,
+      stepup_verified: true,
       client_ip: ip,
     });
     auditLog(req.user.id, 'RESTORE_APPROVAL_APPROVED',

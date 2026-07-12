@@ -356,6 +356,7 @@ app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
 app.use('/api/restore-approvals', authMiddleware(['ciso']), require('./routes/gd-restore-approvals'));
+app.use('/api/key-ops', authMiddleware(['ciso', 'signing_key_approver']), require('./routes/gd-key-ops'));  // B6h B-3: KOA (ciso request/authorize, signing_key_approver approve; global /api config-lock + step-up)
 app.use('/api/migration', authMiddleware(['ciso']), require('./routes/gd-migration'));
 app.use('/api/sdn', authMiddleware(['ciso']), require('./routes/gd-sdn'));
 app.use('/api/sase', authMiddleware(['ciso']), require('./routes/gd-sase'));

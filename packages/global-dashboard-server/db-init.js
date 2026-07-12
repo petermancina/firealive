@@ -1354,6 +1354,7 @@ CREATE TABLE IF NOT EXISTS restore_approvals (
   backup_id TEXT,
   source_id TEXT,
   external_backup_id TEXT,
+  key_op_ref TEXT,                 -- B6h B-3: KOA target (a key operation), a third target kind
   requested_by_user_id TEXT NOT NULL,
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   request_reason TEXT,
@@ -1366,7 +1367,7 @@ CREATE TABLE IF NOT EXISTS restore_approvals (
   approved_at TEXT,
   approval_method TEXT
     CHECK (approval_method IS NULL OR approval_method IN
-      ('second-person-totp', 'delayed-self-totp', 'disabled-mode-bypass')),
+      ('second-person-webauthn', 'delayed-self-webauthn', 'disabled-mode-bypass')),
   denied_by_user_id TEXT,
   denied_at TEXT,
   denial_reason TEXT,
@@ -1376,9 +1377,11 @@ CREATE TABLE IF NOT EXISTS restore_approvals (
   client_ip_at_request TEXT,
   client_ip_at_approval TEXT,
   CHECK (
-    (backup_id IS NOT NULL AND source_id IS NULL AND external_backup_id IS NULL)
+    (backup_id IS NOT NULL AND source_id IS NULL AND external_backup_id IS NULL AND key_op_ref IS NULL)
     OR
-    (backup_id IS NULL AND source_id IS NOT NULL AND external_backup_id IS NOT NULL)
+    (backup_id IS NULL AND source_id IS NOT NULL AND external_backup_id IS NOT NULL AND key_op_ref IS NULL)
+    OR
+    (backup_id IS NULL AND source_id IS NULL AND external_backup_id IS NULL AND key_op_ref IS NOT NULL)
   )
 );
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_backup
@@ -1391,6 +1394,37 @@ CREATE INDEX IF NOT EXISTS idx_restore_approvals_expiry_scan
   ON restore_approvals(expires_at) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
   ON restore_approvals(requested_by_user_id);
+
+-- B6h B-3: Key-Operation Authorizations (KOA). An anchor-signed, single-use token
+-- authorizing ONE destructive key operation (a rekey, a migration-import re-seal, or
+-- a deployment reset). The running server mints it behind role + config-lock + a
+-- hardware step-up, and the restore-approvals two-person gate (approval_id) must be
+-- approved first. The offline rekey tool verifies the signature against
+-- gd_instance_identity.anchor_public alone -- no hardware, no running server -- then
+-- consumes it in the same transaction as the operation (consumed_at is single-use).
+-- The signature covers the canonical payload
+-- id|op|key_op_ref|approval_id|requested_by_user_id|created_at|expires_at, so none of
+-- those fields can be altered without invalidating it.
+CREATE TABLE IF NOT EXISTS key_op_authorizations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  op TEXT NOT NULL
+    CHECK (op IN ('rekey', 'migration-import', 'deployment-reset')),
+  key_op_ref TEXT NOT NULL,
+  approval_id TEXT NOT NULL,
+  requested_by_user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  anchor_public_fingerprint TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  consumed_at TEXT,
+  consumed_context TEXT,
+  CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_approval
+  ON key_op_authorizations(approval_id);
+CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_unconsumed
+  ON key_op_authorizations(op, key_op_ref) WHERE consumed_at IS NULL;
 
 -- External restore sources: registered off-box locations (network share, NAS,
 -- S3, Azure blob, SFTP) a backup can be pulled from for a restore. Credentials

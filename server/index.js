@@ -301,6 +301,7 @@ app.use('/api/features', authMiddleware(['lead', 'admin', 'analyst']), require('
 app.use('/api/query', authMiddleware(['lead', 'admin']), require('./routes/query'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/restore-approvals', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/restore-approvals'));
+app.use('/api/key-ops', authMiddleware(['admin']), configLockChokepoint(), require('./routes/key-ops'));  // B6h B-3: KOA request/approve/authorize (admin + config-lock + step-up)
 app.use('/api/data-subject', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/data-subject'));
 app.use('/api/backup-signing-keys', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-signing-keys'));
 app.use('/api/config-baseline', authMiddleware(['admin']), configLockChokepoint(), require('./routes/config-baseline'));

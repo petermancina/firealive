@@ -24,7 +24,7 @@
 //
 // Step-up gate (approve only):
 //   The service contract for approvalsSvc.approve() requires
-//   totp_verified=true. This route satisfies it with a fresh,
+//   stepup_verified=true. This route satisfies it with a fresh,
 //   user-verified WebAuthn step-up assertion (the mfaStepUp middleware)
 //   supplied in body.stepup BEFORE delegating to the service. A step-up
 //   failure short-circuits in the middleware (401/400) and never touches
@@ -95,7 +95,7 @@ function approvalCodeToHttpStatus(code) {
       return 409;
     case approvalsSvc.CODES.APPROVER_SAME_AS_REQUESTER:
     case approvalsSvc.CODES.WINDOW_NOT_ELAPSED:
-    case approvalsSvc.CODES.TOTP_NOT_VERIFIED:
+    case approvalsSvc.CODES.STEPUP_NOT_VERIFIED:
       return 403;
     default:
       return 500;
@@ -303,7 +303,7 @@ router.get('/:id', (req, res) => {
 //   2. mfaStepUp() -- require a fresh user-verified WebAuthn assertion; a
 //      failure short-circuits in the middleware (401/400) and never
 //      touches the approval row
-//   3. Delegate to approvalsSvc.approve() with totp_verified=true -- the
+//   3. Delegate to approvalsSvc.approve() with stepup_verified=true -- the
 //      service's "a second factor was verified" guard, now satisfied by
 //      the step-up middleware
 //   4. Audit log RESTORE_APPROVAL_APPROVED on success
@@ -330,7 +330,7 @@ router.post('/:id/approve', approveAdminGate, quarantineGuard(), mfaStepUp(), (r
     const result = approvalsSvc.approve(db, {
       id: req.params.id,
       approver_user_id: req.user.id,
-      totp_verified: true,
+      stepup_verified: true,
       client_ip: ip,
     });
 
