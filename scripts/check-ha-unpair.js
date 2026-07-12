@@ -66,6 +66,8 @@ const gd = read(path.join('packages', 'global-dashboard-server', 'routes', 'gd-h
 check('GD: /unpair requires gdMfaStepUp', /post\('\/unpair', gdMfaStepUp\(\)/.test(gd));
 check('GD: /manual-failover requires gdMfaStepUp', /post\('\/manual-failover', gdMfaStepUp\(\)/.test(gd));
 check('GD: peer /unpair route exists', /peerRouter\.post\('\/unpair'/.test(gd));
+check('MC: peer /unpair is rate-limited', /peerRouter\.post\('\/unpair', peerUnpairLimiter/.test(mc));
+check('GD: peer /unpair is rate-limited', /peerRouter\.post\('\/unpair', peerUnpairLimiter/.test(gd));
 
 // --- 3. fail-closed un-pair guard + teardown (source) ---
 for (const [label, rel, peerTbl] of [
