@@ -35,6 +35,8 @@ jobs:
         run: node scripts/check-deployment-mode-seal.js
       - name: Verify HA un-pair flow
         run: node scripts/check-ha-unpair.js
+      - name: Verify Tier-1 boot integrity gate
+        run: node scripts/check-tier1-boot-gate.js
 
 
   build-mac:

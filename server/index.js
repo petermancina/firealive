@@ -621,6 +621,33 @@ async function start() {
       process.exit(1);
     }
 
+    // B6h B-2: Tier-1 boot integrity gate. Now that the shared KEK is loaded, verify every
+    // chokepoint-sealed Tier-1 column opens under the KEK this node holds -- a wrong env-sealed
+    // key, a partially-completed rekey, a relocated value, or corruption is caught here
+    // (fail-closed) rather than at first read. A never-promoted passive skips its (un-adopted)
+    // replicated columns.
+    try {
+      const tier1BootGate = require('./services/tier1-boot-gate');
+      const gateDb = getDb();
+      let tier1Failures;
+      try {
+        tier1Failures = tier1BootGate.verifyTier1Integrity(gateDb);
+      } finally {
+        gateDb.close();
+      }
+      if (tier1Failures.length) {
+        logger.error('Tier-1 boot integrity gate FAILED; refusing to start (fail-closed). '
+          + tier1Failures.length + ' column value(s) do not open under this node KEK -- a wrong KEK, '
+          + 'a partially-completed rekey, or corruption. First failures: '
+          + tier1Failures.slice(0, 5).map(function (f) { return f.column + '#' + f.rowid + ' (' + f.error + ')'; }).join('; '));
+        process.exit(1);
+      }
+      logger.info('Tier-1 boot integrity gate passed; all readable Tier-1 columns open under this node KEK');
+    } catch (bootGateErr) {
+      logger.error('Tier-1 boot integrity gate errored; refusing to start (fail-closed)', { error: bootGateErr.message });
+      process.exit(1);
+    }
+
     // B5e: resolve and seal the deployment mode (D9) now that the instance
     // anchor exists. On first run FIREALIVE_DEPLOYMENT_MODE provisions and
     // hardware-seals the mode; thereafter the sealed value is authoritative and

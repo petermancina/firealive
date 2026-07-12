@@ -6891,6 +6891,32 @@ try {
   process.exit(1);
 }
 
+// B6h B-2: GD Tier-1 boot integrity gate. Verify every chokepoint-sealed Tier-1 column opens
+// under the KEK this node holds -- a wrong KEK, a partially-completed rekey, a relocated value,
+// or corruption is caught here (fail-closed) rather than at first read. A never-promoted passive
+// skips its (un-adopted) replicated columns.
+try {
+  const gdTier1BootGate = require('./services/gd-tier1-boot-gate');
+  const gateDb = getDb();
+  let tier1Failures;
+  try {
+    tier1Failures = gdTier1BootGate.verifyTier1Integrity(gateDb);
+  } finally {
+    gateDb.close();
+  }
+  if (tier1Failures.length) {
+    console.error('GD Tier-1 boot integrity gate FAILED; refusing to start (fail-closed). '
+      + tier1Failures.length + ' column value(s) do not open under this node KEK -- a wrong KEK, '
+      + 'a partially-completed rekey, or corruption. First failures: '
+      + tier1Failures.slice(0, 5).map(function (f) { return f.column + '#' + f.rowid + ' (' + f.error + ')'; }).join('; '));
+    process.exit(1);
+  }
+  console.log('GD Tier-1 boot integrity gate passed; all readable Tier-1 columns open under this node KEK');
+} catch (gdBootGateErr) {
+  console.error('GD Tier-1 boot integrity gate errored; refusing to start (fail-closed): ' + gdBootGateErr.message);
+  process.exit(1);
+}
+
 // B6h A-8: anti-rollback high-water gate (decision D7/D17) -- the GD's first
 // boot-time fuse check, the twin of the Regional Server's. A running GD build whose
 // fuse counter is below the highest this deployment has recorded means the binary was
