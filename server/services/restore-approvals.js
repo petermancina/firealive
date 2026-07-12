@@ -108,8 +108,10 @@ const VALID_STATUSES = ['pending', 'approved', 'denied', 'expired', 'consumed'];
 const TERMINAL_STATUSES = ['denied', 'expired', 'consumed'];
 
 const VALID_APPROVAL_METHODS = [
-  'second-person-totp',
-  'delayed-self-totp',
+  'second-person-totp',      // legacy: recorded before the mfa-stepup (WebAuthn) cutover
+  'delayed-self-totp',       // legacy
+  'second-person-passkey',   // B6h B-3: mfa-stepup verifies a WebAuthn assertion, not TOTP
+  'delayed-self-passkey',
   'disabled-mode-bypass',
 ];
 
