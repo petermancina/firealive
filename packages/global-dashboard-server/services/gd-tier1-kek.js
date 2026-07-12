@@ -251,6 +251,16 @@ function loadSharedKekOnBoot(db) {
   return true;
 }
 
+// Shed the shared KEK on un-pair: delete the persisted wrapper and reset the in-memory
+// cache, so sharedKek() falls back to ownKek() (this GD node is standalone again). The
+// caller (gd-ha-pairing.unpair) MUST first confirm no replicated data still depends on the
+// shared KEK -- shedding it while data is under it would strand that data (that case is
+// refused at the unpair guard, pending Part B's offline rekey). Safe no-op when none adopted.
+function clearSharedKek(db) {
+  db.prepare('DELETE FROM node_state WHERE key = ?').run(NODE_STATE_SHARED_KEK);
+  cachedSharedKek = null;
+}
+
 function _resetCacheForTests() {
   cachedOwnKek = null;
   cachedSharedKek = null;
@@ -267,6 +277,7 @@ module.exports = {
   installSharedKek,
   adoptSharedKek,
   loadSharedKekOnBoot,
+  clearSharedKek,
   resolveTier1Kek,   // back-compat alias for ownKek()
   makeRecoveryCode,
   recoverKekFromCode,

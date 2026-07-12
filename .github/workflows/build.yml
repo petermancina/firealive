@@ -33,6 +33,8 @@ jobs:
         run: node scripts/check-fuse-high-water.js
       - name: Verify deployment-mode seal
         run: node scripts/check-deployment-mode-seal.js
+      - name: Verify HA un-pair flow
+        run: node scripts/check-ha-unpair.js
 
 
   build-mac:

@@ -29,7 +29,9 @@ const { getDb } = require('../db/init');
 // and the alert router's audit channel forge rows into the live chain when handed any
 // other database; the HA control plane should not model it.
 const { auditLogOn } = require('../middleware/audit');
+const rateLimit = require('express-rate-limit');
 const { requireObjectBody } = require('../middleware/body-validation');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 const { getClientCertThumbprint } = require('../middleware/auth');
 const haPairing = require('../services/ha/ha-pairing');
 const haReplication = require('../services/ha/ha-replication');
@@ -75,6 +77,7 @@ function requireRole(req, res, roles) {
 
 const PEER_HEARTBEAT_PATH = '/api/ha/peer/heartbeat';
 const PEER_LEASE_PATH = '/api/ha/peer/lease';
+const PEER_UNPAIR_PATH = '/api/ha/peer/unpair';
 
 function nodeRole(db) {
   const row = db.prepare("SELECT role FROM ha_node WHERE id = 'self'").get();
@@ -219,7 +222,7 @@ router.post('/pair', requireObjectBody, async (req, res) => {
   }
 });
 
-router.post('/manual-failover', requireObjectBody, async (req, res) => {
+router.post('/manual-failover', mfaStepUp(), requireObjectBody, async (req, res) => {
   if (!requireRole(req, res, ['lead', 'admin'])) {
     return;
   }
@@ -249,6 +252,44 @@ router.post('/manual-failover', requireObjectBody, async (req, res) => {
     }
   } catch (failErr) {
     res.status(500).json({ error: 'manual failover error', detail: (failErr && failErr.message) ? failErr.message.slice(0, 160) : 'error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+router.post('/unpair', mfaStepUp(), requireObjectBody, async (req, res) => {
+  if (!requireRole(req, res, ['lead', 'admin'])) {
+    return;
+  }
+  const db = getDb();
+  try {
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'not paired with a peer' });
+    }
+    // Fail-closed peek: if this node holds replicated data under an adopted shared KEK,
+    // refuse before signaling the peer or tearing down -- unpair would strand that data.
+    const adopted = db.prepare("SELECT 1 FROM node_state WHERE key = 'shared_kek_sealed'").get();
+    if (adopted) {
+      return res.status(409).json({ error: 'unpair refused: this node holds replicated data under an adopted shared KEK; complete an offline rekey before un-pairing', code: 'UNPAIR_REKEY_REQUIRED' });
+    }
+    // Tell the peer to unpair too (best-effort), while we still hold its pin and endpoint.
+    let peerUnpaired = false;
+    let peerNote = null;
+    try {
+      const resp = await haPeerLink.sendToPeer(db, PEER_UNPAIR_PATH, { unpair: true }, {}) || {};
+      peerUnpaired = resp.ok === true;
+      if (!peerUnpaired) peerNote = resp.error ? String(resp.error).slice(0, 120) : 'peer did not confirm';
+    } catch (sendErr) {
+      peerNote = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'peer signal failed';
+    }
+    // Tear down our side (the fail-closed guard is re-checked inside unpair).
+    haPairing.unpair(db, {});
+    auditLogOn(db, actor(req), 'HA_UNPAIR', 'Un-paired to standalone; peer ' + (peerUnpaired ? 'also un-paired' : 'not confirmed (' + peerNote + ')'), req.ip);
+    res.json({ ok: true, role: 'standalone', peerUnpaired: peerUnpaired, peerNote: peerNote });
+  } catch (unpairErr) {
+    const detail = (unpairErr && unpairErr.message) ? unpairErr.message : 'error';
+    try { auditLogOn(db, actor(req), 'HA_UNPAIR_FAILED', 'Un-pair failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
+    res.status(500).json({ error: 'unpair failed', detail: detail.slice(0, 160) });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }
@@ -411,6 +452,47 @@ peerRouter.post('/lease', requireObjectBody, (req, res) => {
     res.json(applyPeerLeaseSignal(db, body));
   } catch (leaseErr) {
     res.status(500).json({ error: 'lease error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+// A tight, per-route limiter for the destructive peer un-pair. The global /api limiter
+// (1000/15min) prevents gross DoS, but a cluster teardown warrants a far lower ceiling.
+// This also gives CodeQL a route-level limiter it recognizes (it does not trace the global
+// limiter into this later-mounted sub-router). mTLS already pins the caller to the peer, so
+// a burst here means a compromised or malfunctioning peer: audit it (the D24 destructive-op
+// philosophy -- trip a 429 and leave a SOC-visible record) and reject.
+const peerUnpairLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+  message: { ok: false, error: 'too many un-pair requests' },
+  handler: (req, res) => {
+    const db = getDb();
+    try { auditLogOn(db, 'ha-peer', 'HA_PEER_UNPAIR_RATE_LIMITED', 'Peer un-pair rate limit exceeded from ' + (req.ip || 'unknown'), req.ip); }
+    catch (auditErr) { /* ignore */ }
+    finally { try { db.close(); } catch (closeErr) { /* ignore */ } }
+    res.status(429).json({ ok: false, error: 'too many un-pair requests' });
+  },
+});
+
+peerRouter.post('/unpair', peerUnpairLimiter, requireObjectBody, (req, res) => {
+  const db = getDb();
+  try {
+    // The peer is dissolving the pair; tear down our side too. Fail-closed: if we hold
+    // replicated data under an adopted shared KEK, refuse -- the operator must rekey us
+    // first -- and report it so the initiating peer surfaces it.
+    const adopted = db.prepare("SELECT 1 FROM node_state WHERE key = 'shared_kek_sealed'").get();
+    if (adopted) {
+      return res.status(409).json({ ok: false, error: 'peer holds data under an adopted shared KEK; rekey required before un-pair' });
+    }
+    haPairing.unpair(db, {});
+    res.json({ ok: true });
+  } catch (unpairErr) {
+    res.status(500).json({ ok: false, error: 'peer unpair failed' });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }

@@ -76,6 +76,8 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/auth-logs/notification-config' },
   { method: 'PUT',  path: '/api/posture/config' },
   { method: 'PUT',  path: '/api/ha/config' },
+  { method: 'POST', path: '/api/ha/manual-failover' },
+  { method: 'POST', path: '/api/ha/unpair' },
   { method: 'PUT',  path: '/api/fail-open/config' },
   { method: 'PUT',  path: '/api/pseudonyms/config' },
   { method: 'PUT',  path: '/api/global-dashboard/config' },

@@ -37,6 +37,8 @@ const gdHaReplication = require('../services/gd-ha-replication');
 const gdHaLease = require('../services/gd-ha-lease');
 const gdHaFailover = require('../services/gd-ha-failover');
 const gdHaPeerLink = require('../services/gd-ha-peer-link');
+const { gdMfaStepUp } = require('../services/gd-mfa-stepup');
+const rateLimit = require('express-rate-limit');
 const deploymentMode = require('../services/gd-deployment-mode');
 const { auditHaEventBy } = require('../services/gd-ha-audit');
 
@@ -67,6 +69,7 @@ function actor(req) {
 }
 
 const PEER_LEASE_PATH = '/api/ha/peer/lease';
+const PEER_UNPAIR_PATH = '/api/ha/peer/unpair';
 
 function nodeRole(db) {
   const row = db.prepare("SELECT role FROM gd_ha_node WHERE id = 'self'").get();
@@ -379,7 +382,42 @@ configRouter.post('/pair', requireObjectBody, async (req, res) => {
 // stops writing before the peer promotes -- the make-before-break order that
 // guarantees no split-brain. If the handover signal cannot be delivered, the peer
 // still promotes via failure detection; this node stays passive either way.
-configRouter.post('/manual-failover', requireObjectBody, async (req, res) => {
+configRouter.post('/unpair', gdMfaStepUp(), requireObjectBody, async (req, res) => {
+  const db = getDb();
+  try {
+    if (!peerPaired(db)) {
+      return res.status(409).json({ error: 'not paired with a peer' });
+    }
+    // Fail-closed peek: if this GD node holds replicated data under an adopted shared KEK,
+    // refuse before signaling the peer or tearing down -- unpair would strand that data.
+    const adopted = db.prepare("SELECT 1 FROM node_state WHERE key = 'shared_kek_sealed'").get();
+    if (adopted) {
+      return res.status(409).json({ error: 'unpair refused: this GD node holds replicated data under an adopted shared KEK; complete an offline rekey before un-pairing', code: 'UNPAIR_REKEY_REQUIRED' });
+    }
+    // Tell the peer to unpair too (best-effort), while we still hold its pin and endpoint.
+    let peerUnpaired = false;
+    let peerNote = null;
+    try {
+      const resp = await gdHaPeerLink.sendToPeer(db, PEER_UNPAIR_PATH, { unpair: true }, {}) || {};
+      peerUnpaired = resp.ok === true;
+      if (!peerUnpaired) peerNote = resp.error ? String(resp.error).slice(0, 120) : 'peer did not confirm';
+    } catch (sendErr) {
+      peerNote = (sendErr && sendErr.message) ? sendErr.message.slice(0, 120) : 'peer signal failed';
+    }
+    // Tear down our side (the fail-closed guard is re-checked inside unpair).
+    gdHaPairing.unpair(db, {});
+    safeAudit(db, actor(req), 'HA_UNPAIR', 'Un-paired to standalone; peer ' + (peerUnpaired ? 'also un-paired' : 'not confirmed (' + peerNote + ')'), req.ip);
+    res.json({ ok: true, role: 'standalone', peerUnpaired: peerUnpaired, peerNote: peerNote });
+  } catch (unpairErr) {
+    const detail = (unpairErr && unpairErr.message) ? unpairErr.message : 'error';
+    try { safeAudit(db, actor(req), 'HA_UNPAIR_FAILED', 'Un-pair failed: ' + detail.slice(0, 160), req.ip); } catch (auditErr) { /* ignore */ }
+    res.status(500).json({ error: 'unpair failed', detail: detail.slice(0, 160) });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+configRouter.post('/manual-failover', gdMfaStepUp(), requireObjectBody, async (req, res) => {
   const db = getDb();
   try {
     if (nodeRole(db) !== 'active') {
@@ -464,6 +502,47 @@ configRouter.post('/self-test', requireObjectBody, async (req, res) => {
     res.json(result);
   } catch (testErr) {
     res.status(500).json({ error: 'self-test error', detail: (testErr && testErr.message) ? testErr.message.slice(0, 160) : 'error' });
+  } finally {
+    try { db.close(); } catch (closeErr) { /* ignore */ }
+  }
+});
+
+// A tight, per-route limiter for the destructive peer un-pair. The global /api limiter
+// prevents gross DoS, but a cluster teardown warrants a far lower ceiling. This also gives
+// CodeQL a route-level limiter it recognizes (it does not trace the global limiter into this
+// later-mounted sub-router). mTLS already pins the caller to the peer, so a burst here means
+// a compromised or malfunctioning peer: audit it (the D24 destructive-op philosophy -- trip a
+// 429 and leave a SOC-visible record) and reject.
+const peerUnpairLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+  message: { ok: false, error: 'too many un-pair requests' },
+  handler: (req, res) => {
+    const db = getDb();
+    try { safeAudit(db, 'ha-peer', 'HA_PEER_UNPAIR_RATE_LIMITED', 'Peer un-pair rate limit exceeded from ' + (req.ip || 'unknown'), req.ip); }
+    catch (auditErr) { /* ignore */ }
+    finally { try { db.close(); } catch (closeErr) { /* ignore */ } }
+    res.status(429).json({ ok: false, error: 'too many un-pair requests' });
+  },
+});
+
+peerRouter.post('/unpair', peerUnpairLimiter, requireObjectBody, (req, res) => {
+  const db = getDb();
+  try {
+    // The peer is dissolving the pair; tear down our side too. Fail-closed: refuse if we
+    // hold replicated data under an adopted shared KEK, and report it so the initiator
+    // surfaces it.
+    const adopted = db.prepare("SELECT 1 FROM node_state WHERE key = 'shared_kek_sealed'").get();
+    if (adopted) {
+      return res.status(409).json({ ok: false, error: 'peer holds data under an adopted shared KEK; rekey required before un-pair' });
+    }
+    gdHaPairing.unpair(db, {});
+    res.json({ ok: true });
+  } catch (unpairErr) {
+    res.status(500).json({ ok: false, error: 'peer unpair failed' });
   } finally {
     try { db.close(); } catch (closeErr) { /* ignore */ }
   }

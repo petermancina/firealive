@@ -459,6 +459,36 @@ function receiveBaseline(db, snapshotB64, opts) {
   return { ok: true, role: 'passive' };
 }
 
+// ---------------------------------------------------------------------------
+// Un-pair: this node leaves the HA cluster and returns to standalone.
+// ---------------------------------------------------------------------------
+
+// FAIL-CLOSED against data loss: a promoted node adopted the former active's KEK, and its
+// live replicated data (burnout, tickets, training) is encrypted under it. Shedding that
+// KEK here would strand the data (sharedKek() would fall back to ownKek(), the wrong key),
+// so REFUSE and direct the operator to an offline rekey first (Part B). A never-promoted
+// standby or the original active has no adopted shared KEK and unpairs cleanly. On success
+// the pairing is reversed completely: CDC capture stops, the peer/lease/replication state
+// are cleared, any pending pairing token is dropped, ha_node is reset to a clean standalone
+// row, and the (absent) shared KEK is shed.
+function unpair(db, opts) {
+  const adopted = db.prepare("SELECT 1 FROM node_state WHERE key = 'shared_kek_sealed'").get();
+  if (adopted) {
+    throw new Error('unpair refused: this node holds replicated data under an adopted shared KEK. Complete an offline rekey (rebind the replicated columns to this node own KEK) before un-pairing, or that data would be stranded.');
+  }
+  haCdc.dropTriggers(db);
+  db.prepare("DELETE FROM ha_peer").run();
+  db.prepare("DELETE FROM ha_lease").run();
+  db.prepare("DELETE FROM ha_replication_journal").run();
+  db.prepare("DELETE FROM ha_replication_state").run();
+  db.prepare("DELETE FROM config WHERE key = ?").run(TOKEN_CONFIG_KEY);
+  db.prepare(
+    "UPDATE ha_node SET role = 'standalone', wrap_public_pem = NULL, wrap_private_sealed = NULL, "
+    + "wrap_pubkey_anchor_sig = NULL, sealed_promotion_kek = NULL, updated_at = datetime('now') WHERE id = 'self'"
+  ).run();
+  tier1.clearSharedKek(db);
+}
+
 module.exports = {
   generatePairingToken,
   consumePairingToken,
@@ -473,6 +503,7 @@ module.exports = {
   respondToPairInit,
   receiveSharedMaterial,
   receiveBaseline,
+  unpair,
   PAIR_INIT_PATH,
   PAIR_SECRET_PATH,
   PAIR_BASELINE_PATH,

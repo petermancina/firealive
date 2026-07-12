@@ -50,6 +50,8 @@ const CONFIG_WRITE_MOUNTS = [
 const CONFIG_WRITE_PATHS = [
   { method: 'PUT', path: '/api/notifications/config' },
   { method: 'PUT', path: '/api/auto-update/config' },
+  { method: 'POST', path: '/api/ha/manual-failover' },
+  { method: 'POST', path: '/api/ha/unpair' },
 ];
 
 // Parameterized trust-posture mutations (the MC signing-key trust decisions and
