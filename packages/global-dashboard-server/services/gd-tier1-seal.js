@@ -36,7 +36,7 @@
 
 'use strict';
 
-const gdEnc = require('./gd-encryption');
+const gdTier1Envelope = require('./gd-tier1-envelope');
 const gdTier1Kek = require('./gd-tier1-kek');
 const { GD_TIER1_COLUMNS } = require('./gd-tier1-columns');
 
@@ -66,6 +66,22 @@ function keyForDomain(domain) {
   throw new Error('gd-tier1-seal: unknown domain ' + domain);
 }
 
+// The KEK fingerprint stamped into (and checked against) the v2 envelope for a
+// column's domain -- lets a read fail fast and clearly when it holds the wrong KEK.
+function kekFpForDomain(domain) {
+  if (domain === 'node-local') return gdTier1Kek.ownKekFingerprint();
+  if (domain === 'replicated') return gdTier1Kek.sharedKekFingerprint();
+  throw new Error('gd-tier1-seal: unknown domain ' + domain);
+}
+
+// The per-column AAD binding: table and column names, NUL-separated. Combined with
+// the version tag + kek_fp inside the v2 envelope, this pins a ciphertext to its
+// exact column so it cannot be relocated (R6).
+function aadForColumn(colRef) {
+  const dot = colRef.indexOf('.');
+  return Buffer.from(colRef.slice(0, dot) + '\u0000' + colRef.slice(dot + 1), 'utf8');
+}
+
 function assertEnvelope(colRef, m) {
   if (m.storage !== 'envelope') {
     throw new Error('gd-tier1-seal: ' + colRef + ' has storage ' + m.storage +
@@ -83,7 +99,7 @@ function sealTier1(colRef, value) {
   if (value === null || value === undefined) return null;
   const m = meta(colRef);
   assertEnvelope(colRef, m);
-  return gdEnc.encryptConfigWithKey(value, keyForDomain(m.domain));
+  return gdTier1Envelope.sealV2(value, keyForDomain(m.domain), kekFpForDomain(m.domain), aadForColumn(colRef));
 }
 
 // Open a GD Tier-1 column's stored envelope. Returns null for a NULL column.
@@ -91,7 +107,7 @@ function openTier1(colRef, stored) {
   if (stored === null || stored === undefined) return null;
   const m = meta(colRef);
   assertEnvelope(colRef, m);
-  return gdEnc.decryptConfigWithKey(stored, keyForDomain(m.domain));
+  return gdTier1Envelope.open(stored, keyForDomain(m.domain), aadForColumn(colRef), kekFpForDomain(m.domain));
 }
 
 // True if colRef is a GD Tier-1 (chokepoint-sealed) column.

@@ -261,8 +261,26 @@ function _resetCacheForTests() {
   cachedSharedKek = null;
 }
 
+// -- KEK fingerprint (for the v2 Tier-1 envelope) ----------------------------
+// A stable 8-byte fingerprint that names WHICH KEK sealed a Tier-1 value. It is
+// stored in the clear in the v2 envelope so a reader holding the wrong KEK -- a
+// node-local column opened under the shared KEK, a replicated column opened under
+// own KEK before a shared KEK was adopted, or a relocated/corrupt value -- fails
+// fast and clearly instead of hitting a cryptic GCM authentication error. Domain-
+// separated, and 8 bytes of SHA-256 over a fixed tag leaks nothing about the key.
+const KEK_FP_TAG = 'fa-tier1-kekfp:v1';
+const KEK_FP_BYTES = 8;
+function kekFingerprint(key) {
+  return crypto.createHash('sha256').update(KEK_FP_TAG).update(key).digest().subarray(0, KEK_FP_BYTES);
+}
+function ownKekFingerprint() { return kekFingerprint(ownKek()); }
+function sharedKekFingerprint() { return kekFingerprint(sharedKek()); }
+
 module.exports = {
   KEK_BYTES,
+  kekFingerprint,
+  ownKekFingerprint,
+  sharedKekFingerprint,
   SEAL_PREFIX,
   RECOVERY_PREFIX,
   generateKek,

@@ -35,16 +35,21 @@
 
 const path = require('path');
 const Module = require('module');
+const crypto = require('crypto');
 
 // Distinct fixed keys per domain; the mock records every resolve so the test can
 // assert which key a column used.
 const OWN_KEK = Buffer.alloc(32, 0x11);
 const SHARED_KEK = Buffer.alloc(32, 0x22);
+function kekFp(key) { return crypto.createHash('sha256').update('fa-tier1-kekfp:v1').update(key).digest().subarray(0, 8); }
 const kekUsed = [];
 function mockKek(sealModuleBasename) {
   return {
     ownKek: function () { kekUsed.push('own'); return OWN_KEK; },
     sharedKek: function () { kekUsed.push('shared'); return SHARED_KEK; },
+    // v2 envelope KEK fingerprints -- same domain-separated SHA-256 as tier1-kek.kekFingerprint
+    ownKekFingerprint: function () { return kekFp(OWN_KEK); },
+    sharedKekFingerprint: function () { return kekFp(SHARED_KEK); },
   };
 }
 
@@ -152,6 +157,27 @@ function runServer(s) {
   threw = false;
   try { seal.sealTier1(s.derivedExample, 'x'); } catch (e) { threw = true; }
   if (!threw) problems.push(s.name + ': sealTier1 accepted a tier1-derived column (' + s.derivedExample + ')');
+
+  // relocation resistance (R6): a v2 value is bound to its exact column via the AAD.
+  // Pick two columns sharing domain AND storage (so the key and the decode are identical
+  // and only the table||column binding differs), seal a value for one, and assert it will
+  // not open as the other -- the GCM tag must fail.
+  let relocTested = false;
+  for (let i = 0; i < tier1.length && !relocTested; i++) {
+    for (let j = 0; j < tier1.length; j++) {
+      if (i === j) continue;
+      if (tier1[i].domain !== tier1[j].domain || tier1[i].storage !== tier1[j].storage) continue;
+      const a = tier1[i].table + '.' + tier1[i].column;
+      const b = tier1[j].table + '.' + tier1[j].column;
+      const sealed = seal.sealTier1(a, valueForShape(tier1[i].shape));
+      let rThrew = false;
+      try { seal.openTier1(b, sealed); } catch (e) { rThrew = true; }
+      if (!rThrew) problems.push(s.name + ': a value sealed for ' + a + ' opened as ' + b + ' -- relocation not rejected (R6)');
+      relocTested = true;
+      break;
+    }
+  }
+  if (!relocTested) problems.push(s.name + ': could not find two columns sharing domain+storage to test relocation (R6)');
 
   // golden vectors: open each frozen ciphertext through the chokepoint and assert
   // the plaintext. This verifies the column's declared encoding by demonstration --

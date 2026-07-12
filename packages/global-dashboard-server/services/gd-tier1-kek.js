@@ -266,8 +266,23 @@ function _resetCacheForTests() {
   cachedSharedKek = null;
 }
 
+// -- KEK fingerprint (for the v2 GD Tier-1 envelope) -------------------------
+// 8-byte domain-separated fingerprint naming WHICH KEK sealed a value, so a reader
+// holding the wrong KEK fails fast and clearly instead of a cryptic GCM error. Same
+// tag as the MC (the GD and MC KEKs differ, so their fingerprints differ regardless).
+const KEK_FP_TAG = 'fa-tier1-kekfp:v1';
+const KEK_FP_BYTES = 8;
+function kekFingerprint(key) {
+  return crypto.createHash('sha256').update(KEK_FP_TAG).update(key).digest().subarray(0, KEK_FP_BYTES);
+}
+function ownKekFingerprint() { return kekFingerprint(ownKek()); }
+function sharedKekFingerprint() { return kekFingerprint(sharedKek()); }
+
 module.exports = {
   KEK_BYTES,
+  kekFingerprint,
+  ownKekFingerprint,
+  sharedKekFingerprint,
   SEAL_PREFIX,
   RECOVERY_PREFIX,
   generateKek,

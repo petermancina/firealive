@@ -33,7 +33,7 @@
 
 'use strict';
 
-const enc = require('./encryption');
+const tier1Envelope = require('./tier1-envelope');
 const tier1Kek = require('./tier1-kek');
 const { TIER1_COLUMNS } = require('./tier1-columns');
 
@@ -61,6 +61,22 @@ function keyForDomain(domain) {
   if (domain === 'node-local') return tier1Kek.ownKek();
   if (domain === 'replicated') return tier1Kek.sharedKek();
   throw new Error('tier1-seal: unknown domain ' + domain);
+}
+
+// The KEK fingerprint stamped into (and checked against) the v2 envelope for a
+// column's domain -- lets a read fail fast and clearly when it holds the wrong KEK.
+function kekFpForDomain(domain) {
+  if (domain === 'node-local') return tier1Kek.ownKekFingerprint();
+  if (domain === 'replicated') return tier1Kek.sharedKekFingerprint();
+  throw new Error('tier1-seal: unknown domain ' + domain);
+}
+
+// The per-column AAD binding: table and column names, NUL-separated. Combined with
+// the envelope header (magic||version||kek_fp) inside the v2 envelope, this pins a
+// ciphertext to its exact column so it cannot be relocated (R6).
+function aadForColumn(colRef) {
+  const dot = colRef.indexOf('.');
+  return Buffer.from(colRef.slice(0, dot) + '\u0000' + colRef.slice(dot + 1), 'utf8');
 }
 
 function serialize(value, shape) {
@@ -103,7 +119,7 @@ function sealTier1(colRef, value) {
   if (value === null || value === undefined) return null;
   const m = meta(colRef);
   const key = keyForDomain(m.domain);
-  const envelope = enc.encryptWithKey(serialize(value, m.shape), key);
+  const envelope = tier1Envelope.sealV2(serialize(value, m.shape), key, kekFpForDomain(m.domain), aadForColumn(colRef));
   return encodeStorage(envelope, m.storage);
 }
 
@@ -113,7 +129,7 @@ function openTier1(colRef, stored) {
   const m = meta(colRef);
   const key = keyForDomain(m.domain);
   const envelope = decodeStorage(stored, m.storage);
-  return deserialize(enc.decryptWithKey(envelope, key), m.shape);
+  return deserialize(tier1Envelope.open(envelope, key, aadForColumn(colRef), kekFpForDomain(m.domain)), m.shape);
 }
 
 // True if colRef is a Tier-1 (chokepoint-sealed) column.
