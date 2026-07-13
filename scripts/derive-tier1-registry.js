@@ -350,9 +350,6 @@ const MANUAL_CLASSIFICATION = {
 
     'peer_board_messages.content_encrypted': { class: 'tier3', evidence: 'server/routes/peer-board.js', reason: 'Tier-3 encryptTier3 of the post body (analyst-tier key), not a KEK column; shares the content_encrypted name with the client-sealed peer_abuse_flags column' },
 
-    'ai_provider_config.config_encrypted': { class: 'unused', evidence: 'server/db/init.js', reason: 'no writer in tree; superseded config path; dropped in B-4' },
-    'automation_systems.api_key_encrypted': { class: 'unused', evidence: 'server/db/init.js', reason: 'no writer in tree; dropped in B-4' },
-    'external_restore_sources.backup_decryption_key_encrypted': { class: 'unused', evidence: 'server/db/init.js', reason: 'no writer in tree; dropped in B-4' },
 
     'auth_recovery.credential_hash': { class: 'not-ciphertext', evidence: 'server/db/init.js', reason: 'a hash, not a KEK-sealed secret' },
     'backup_schedules.encrypted': { class: 'not-ciphertext', evidence: 'server/db/init.js', reason: 'INTEGER boolean flag (whether the destination is encrypted), not ciphertext' },
@@ -365,7 +362,6 @@ const MANUAL_CLASSIFICATION = {
     'gd_ha_node.wrap_private_sealed': { class: 'tier1-derived', evidence: 'packages/global-dashboard-server/services/gd-ha-keys.js', reason: 'HKDF-derived local seal of the pairing wrap private key' },
     'gd_ha_node.sealed_promotion_kek': { class: 'tier1-derived', evidence: 'packages/global-dashboard-server/services/gd-ha-pairing.js', reason: 'promotion-time transport seal of the shared KEK' },
 
-    'external_restore_sources.backup_decryption_key_encrypted': { class: 'unused', evidence: 'packages/global-dashboard-server/db-init.js', reason: 'no writer in tree; dropped in B-4' },
 
     'management_consoles.api_key': { class: 'not-ciphertext', evidence: 'packages/global-dashboard-server/index.js', reason: 'MC-trust shared-secret bearer token, matched by equality (WHERE api_key = ?); not KEK ciphertext' },
     'auth_recovery.credential_hash': { class: 'not-ciphertext', evidence: 'packages/global-dashboard-server/db-init.js', reason: 'a hash, not a KEK-sealed secret' },
@@ -380,8 +376,8 @@ const MANUAL_CLASSIFICATION = {
 // the meaningful classes; not-ciphertext is reported but not pinned.
 // ---------------------------------------------------------------------------
 const EXPECTED = {
-  mc: { tier1: 19, 'tier1-derived': 2, tier3: 1, 'client-sealed': 4, unused: 3 },
-  gd: { tier1: 10, 'tier1-derived': 2, tier3: 0, 'client-sealed': 0, unused: 1 },
+  mc: { tier1: 19, 'tier1-derived': 2, tier3: 1, 'client-sealed': 4, unused: 0 },
+  gd: { tier1: 10, 'tier1-derived': 2, tier3: 0, 'client-sealed': 0, unused: 0 },
 };
 const NODE_LOCAL_EXPECTED = { mc: 9, gd: 6 };
 

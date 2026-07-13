@@ -365,7 +365,6 @@ CREATE TABLE IF NOT EXISTS automation_systems (
   max_capacity INTEGER NOT NULL,
   capacity_unit TEXT DEFAULT 'alerts/hr',
   api_endpoint TEXT,
-  api_key_encrypted BLOB,
   status TEXT DEFAULT 'configuring' CHECK (status IN ('operational', 'degraded', 'offline', 'configuring')),
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -2283,7 +2282,6 @@ CREATE TABLE IF NOT EXISTS ai_provider_config (
     'internal'
   )),
   model_name TEXT,
-  config_encrypted BLOB,
   max_tokens INTEGER NOT NULL DEFAULT 1024,
   temperature REAL NOT NULL DEFAULT 0.7,
   updated_by TEXT REFERENCES users(id),
@@ -3047,7 +3045,6 @@ CREATE TABLE IF NOT EXISTS external_restore_sources (
     CHECK (source_type IN ('network_share', 'nas', 's3', 'azure_blob', 'sftp')),
   path TEXT NOT NULL,
   credentials_encrypted TEXT NOT NULL,
-  backup_decryption_key_encrypted TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   last_used_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -3257,6 +3254,28 @@ function initDb() {
     }
   } catch (e) {
     console.error('B5d1 retired-table drop migration failed:', e.message);
+  }
+
+  // ── B6h B-8: drop declared-but-never-written encrypted columns ───────────
+  // automation_systems.api_key_encrypted and
+  // external_restore_sources.backup_decryption_key_encrypted were declared but
+  // no feature ever wrote them. They are removed from the SCHEMA above (fresh
+  // installs lack them) and dropped from upgraded databases here. PRAGMA-guarded
+  // so re-running initDb no-ops. (DROP COLUMN is DDL, permitted by the
+  // append-only triggers.)
+  try {
+    const asCols = db.prepare("PRAGMA table_info(automation_systems)").all().map((c) => c.name);
+    if (asCols.includes('api_key_encrypted')) {
+      db.exec('ALTER TABLE automation_systems DROP COLUMN api_key_encrypted');
+      console.log('automation_systems migration (B6h B-8): dropped unused api_key_encrypted column');
+    }
+    const ersCols = db.prepare("PRAGMA table_info(external_restore_sources)").all().map((c) => c.name);
+    if (ersCols.includes('backup_decryption_key_encrypted')) {
+      db.exec('ALTER TABLE external_restore_sources DROP COLUMN backup_decryption_key_encrypted');
+      console.log('external_restore_sources migration (B6h B-8): dropped unused backup_decryption_key_encrypted column');
+    }
+  } catch (e) {
+    console.error('B6h B-8 unused-column drop migration failed:', e.message);
   }
 
   // ── Migration: peer board KV → peer_board_messages (U2) ──────────────────
@@ -3491,7 +3510,6 @@ function initDb() {
             )),
             provider TEXT NOT NULL DEFAULT 'internal' CHECK (provider IN ('internal')),
             model_name TEXT,
-            config_encrypted BLOB,
             max_tokens INTEGER NOT NULL DEFAULT 1024,
             temperature REAL NOT NULL DEFAULT 0.7,
             updated_by TEXT REFERENCES users(id),
@@ -3501,9 +3519,9 @@ function initDb() {
         const copied = db.prepare('SELECT COUNT(*) AS n FROM ai_provider_config').get().n;
         db.exec(`
           INSERT INTO ai_provider_config_new
-            (feature_id, provider, model_name, config_encrypted, max_tokens, temperature, updated_by, updated_at)
+            (feature_id, provider, model_name, max_tokens, temperature, updated_by, updated_at)
           SELECT
-            feature_id, 'internal', model_name, NULL, max_tokens, temperature, updated_by, updated_at
+            feature_id, 'internal', model_name, max_tokens, temperature, updated_by, updated_at
           FROM ai_provider_config
         `);
         db.exec('DROP TABLE ai_provider_config');
@@ -3519,6 +3537,21 @@ function initDb() {
     }
   } catch (apMigErr) {
     console.error('ai_provider_config migration (B5c2) failed (non-fatal):', apMigErr.message);
+  }
+
+  // ── B6h B-8: drop ai_provider_config.config_encrypted ────────────────────
+  // Declared but never written (the AI provider is 'internal'-only and stores no
+  // provider config); the recreation above no longer includes it, and this
+  // idempotent, PRAGMA-guarded DROP COLUMN removes it from databases that already
+  // ran the B5c2 rebuild (which recreated the column). No-op on fresh installs.
+  try {
+    const apCols = db.prepare("PRAGMA table_info(ai_provider_config)").all().map((c) => c.name);
+    if (apCols.includes('config_encrypted')) {
+      db.exec('ALTER TABLE ai_provider_config DROP COLUMN config_encrypted');
+      console.log('ai_provider_config migration (B6h B-8): dropped unused config_encrypted column');
+    }
+  } catch (e) {
+    console.error('B6h B-8 ai_provider_config.config_encrypted drop migration failed:', e.message);
   }
 
   // ── Migration: peer_abuse_flags.determination column (U4 PR 5) ──────

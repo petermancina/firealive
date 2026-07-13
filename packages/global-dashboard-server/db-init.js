@@ -1436,7 +1436,6 @@ CREATE TABLE IF NOT EXISTS external_restore_sources (
     CHECK (source_type IN ('network_share', 'nas', 's3', 'azure_blob', 'sftp')),
   path TEXT NOT NULL,
   credentials_encrypted TEXT NOT NULL,
-  backup_decryption_key_encrypted TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   last_used_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1902,6 +1901,20 @@ function initDb() {
   } catch (dropOrphanSdnErr) {
     console.error('B6c PR-4 migration (drop orphan SDN/SASE tables) failed (non-fatal):', dropOrphanSdnErr.message);
   }
+  // ── B6h B-8: drop the unused external_restore_sources.backup_decryption_key_encrypted ──
+  // Declared but never written on the GD (mirrors the MC drop). Removed from the
+  // SCHEMA above; this idempotent, PRAGMA-guarded DROP COLUMN sheds it from
+  // upgraded GD databases. No-op on fresh installs.
+  try {
+    const ersCols = db.prepare("PRAGMA table_info(external_restore_sources)").all().map((c) => c.name);
+    if (ersCols.includes('backup_decryption_key_encrypted')) {
+      db.exec('ALTER TABLE external_restore_sources DROP COLUMN backup_decryption_key_encrypted');
+      console.log('external_restore_sources migration (B6h B-8): dropped unused backup_decryption_key_encrypted column (GD)');
+    }
+  } catch (e) {
+    console.error('B6h B-8 GD external_restore_sources.backup_decryption_key_encrypted drop migration failed:', e.message);
+  }
+
   // ── R3g PR3 Phase 5 migration: add approval workflow columns to signing_keys ──
   //
   // The canonical CREATE TABLE above includes approval_status, approved_at,

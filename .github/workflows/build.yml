@@ -47,6 +47,8 @@ jobs:
         run: node scripts/check-import-rekey.js
       - name: Verify macOS preflight
         run: node scripts/check-macos-preflight.js
+      - name: Verify no recovery-substitute claims in docs
+        run: node scripts/check-no-recovery-substitute-claims.js
 
 
   build-mac:

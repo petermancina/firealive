@@ -242,7 +242,7 @@ const TABLE_SECTIONS = [
   {
     table: 'external_restore_sources', mode: 'manifest', orderBy: 'name',
     manifestCols: ['name', 'source_type', 'path', 'enabled'],
-    secretCols: ['credentials_encrypted', 'backup_decryption_key_encrypted'],
+    secretCols: ['credentials_encrypted'],
   },
   {
     table: 'scheduling_platform_config', mode: 'singleton', idCol: 'id', singletonId: 1,
