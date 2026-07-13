@@ -26,6 +26,10 @@ const gdEnc = require('./gd-encryption');
 
 const ALGORITHM = 'aes-256-gcm';
 const VERSION = 2;
+// New writes use VERSION; open() refuses anything below MIN_SEAL_VERSION. MIN_SEAL_VERSION = 1
+// keeps legacy v1 values readable until rekeyed; raise to 2 to permanently retire v1.
+const CURRENT_SEAL_VERSION = VERSION;
+const MIN_SEAL_VERSION = 1;
 const KEK_FP_LEN = 8;
 const V2_AAD_TAG = Buffer.from('fa-gd-tier1-v2', 'ascii');
 
@@ -33,6 +37,13 @@ const V2_AAD_TAG = Buffer.from('fa-gd-tier1-v2', 'ascii');
 function isV2(envelope) {
   if (typeof envelope !== 'string' || envelope.length === 0) return false;
   try { return JSON.parse(envelope).v === VERSION; } catch (e) { return false; }
+}
+
+// The seal version of a stored value: the JSON `v` field (2 for v2, 1 for a legacy v1 value),
+// or 1 for anything that will not parse. Read-only -- never decrypts. Used by the boot straggler
+// scan and the anti-rollback seal-version high-water.
+function sealVersionOf(envelope) {
+  try { const v = JSON.parse(envelope).v; return (typeof v === 'number') ? v : 1; } catch (e) { return 1; }
 }
 
 // Seal an object into a v2 envelope string under `kek`, stamping `kekFp` (8 bytes)
@@ -61,6 +72,12 @@ function sealV2(obj, kek, kekFp, aad) {
 // expectedKekFp when supplied, AAD) and decrypted here; legacy v1 values are
 // delegated to gd-encryption.decryptConfigWithKey. Returns the decrypted object.
 function open(envelope, kek, aad, expectedKekFp) {
+  // Floor: refuse any value sealed below MIN_SEAL_VERSION (downgrade / retired-format defense).
+  const version = sealVersionOf(envelope);
+  if (version < MIN_SEAL_VERSION) {
+    throw new Error('gd-tier1-envelope: seal version ' + version + ' is below the MIN_SEAL_VERSION floor '
+      + MIN_SEAL_VERSION + ' -- this value must be rekeyed to a current envelope');
+  }
   if (!isV2(envelope)) {
     return gdEnc.decryptConfigWithKey(envelope, kek);
   }
@@ -86,8 +103,11 @@ function open(envelope, kek, aad, expectedKekFp) {
 
 module.exports = {
   VERSION,
+  CURRENT_SEAL_VERSION,
+  MIN_SEAL_VERSION,
   KEK_FP_LEN,
   isV2,
+  sealVersionOf,
   sealV2,
   open,
 };

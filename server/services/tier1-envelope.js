@@ -36,11 +36,25 @@ const IV_LEN = 12;
 const TAG_LEN = 16;
 const HEADER_LEN = MAGIC.length + 1 + KEK_FP_LEN; // magic || version || kek_fp = 13
 
+// The version new writes use, and the floor below which open() refuses. MIN_SEAL_VERSION = 1
+// keeps legacy v1 values readable until they are rekeyed; raise it to 2 to permanently retire
+// v1 (reject any value not on the AAD-bound, KEK-fingerprinted v2 envelope) once every
+// deployment has been rekeyed.
+const CURRENT_SEAL_VERSION = VERSION;
+const MIN_SEAL_VERSION = 1;
+
 // True if a stored value is a v2 Tier-1 envelope (as opposed to a legacy v1 one).
 function isV2(buffer) {
   return Buffer.isBuffer(buffer)
     && buffer.length >= HEADER_LEN + IV_LEN + TAG_LEN
     && buffer.subarray(0, MAGIC.length).equals(MAGIC);
+}
+
+// The seal version of a stored value: the version byte of a magic'd envelope (2 for v2), or 1
+// for a legacy v1 value (no magic). Read-only -- never decrypts. Used by the boot straggler
+// scan and the anti-rollback seal-version high-water.
+function sealVersionOf(buffer) {
+  return isV2(buffer) ? buffer[MAGIC.length] : 1;
 }
 
 // Seal plaintext into a v2 envelope under `key`, stamping `kekFp` (8 bytes) and
@@ -63,11 +77,17 @@ function sealV2(plaintext, key, kekFp, aad) {
 // expectedKekFp when supplied, AAD) and decrypted here; legacy v1 values are
 // delegated to encryption.decryptWithKey (no AAD). Returns the utf-8 plaintext.
 function open(buffer, key, aad, expectedKekFp) {
+  // Floor: refuse any value sealed below MIN_SEAL_VERSION (downgrade / retired-format defense),
+  // before any decrypt path.
+  const version = sealVersionOf(buffer);
+  if (version < MIN_SEAL_VERSION) {
+    throw new Error('tier1-envelope: seal version ' + version + ' is below the MIN_SEAL_VERSION floor '
+      + MIN_SEAL_VERSION + ' -- this value must be rekeyed to a current envelope');
+  }
   if (!isV2(buffer)) {
     // Legacy v1: bare iv||tag||ct, no AAD, no fingerprint.
     return enc.decryptWithKey(buffer, key);
   }
-  const version = buffer[MAGIC.length];
   if (version !== VERSION) {
     throw new Error('tier1-envelope: unsupported envelope version ' + version);
   }
@@ -90,9 +110,12 @@ function open(buffer, key, aad, expectedKekFp) {
 module.exports = {
   MAGIC,
   VERSION,
+  CURRENT_SEAL_VERSION,
+  MIN_SEAL_VERSION,
   KEK_FP_LEN,
   HEADER_LEN,
   isV2,
+  sealVersionOf,
   sealV2,
   open,
 };

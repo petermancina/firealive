@@ -896,6 +896,54 @@ async function start() {
       logger.error('Anti-rollback high-water check failed to run', { error: highWaterErr.message });
     }
 
+    // B6h B-5: seal-format anti-rollback high-water. A running build whose seal
+    // version is below the highest this deployment has recorded means the binary
+    // was downgraded to one that writes an older, weaker envelope -- refuse it the
+    // same way as the fuse. On success, report (never rewrite) any at-rest values
+    // still on an older seal version.
+    try {
+      const sealVersion = require('./services/seal-version');
+      const svDb = getDb();
+      try {
+        const sealVerdict = sealVersion.checkAndAdvance(svDb);
+        if (sealVerdict.rollback) {
+          logger.error('SEAL-VERSION ROLLBACK: running seal version is below the recorded high-water', {
+            currentSealVersion: sealVerdict.currentSealVersion,
+            highWater: sealVerdict.highWater,
+          });
+          try {
+            svDb.prepare(
+              "UPDATE instance_identity SET status = 'quarantined', last_attested_at = datetime('now') " +
+              "WHERE id = (SELECT id FROM instance_identity ORDER BY id LIMIT 1)"
+            ).run();
+          } catch (markErr) {
+            logger.error('Marking instance quarantined after seal-version rollback failed', { error: markErr.message });
+          }
+          if (process.env.NODE_ENV === 'production') {
+            logger.error('HALTING: seal-version anti-rollback check failed. Deploy the current or a newer build.');
+            process.exit(1);
+          }
+        } else {
+          logger.info('Seal-version high-water ok', {
+            sealVersion: sealVerdict.currentSealVersion,
+            highWater: sealVerdict.highWater,
+          });
+          const stragglers = sealVersion.reportStragglers(svDb);
+          if (stragglers.below > 0) {
+            logger.warn('Tier-1 values below the current seal version (rekey to upgrade)', {
+              below: stragglers.below,
+              total: stragglers.total,
+              current: stragglers.current,
+            });
+          }
+        }
+      } finally {
+        svDb.close();
+      }
+    } catch (sealVersionErr) {
+      logger.error('Seal-version high-water check failed to run', { error: sealVersionErr.message });
+    }
+
     // B5e (Block C, decision D4): start the signed subnet peer-beacon. A clone
     // or fork seen on the local subnet quarantines this instance, which raises
     // the loud alert. Best-effort; a beacon failure must never stop startup. A

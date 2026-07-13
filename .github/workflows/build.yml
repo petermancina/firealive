@@ -41,6 +41,8 @@ jobs:
         run: node scripts/check-koa.js
       - name: Verify offline node rekey
         run: node scripts/check-rekey.js
+      - name: Verify seal-format versioning
+        run: node scripts/check-seal-version.js
 
 
   build-mac:

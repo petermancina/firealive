@@ -6954,6 +6954,44 @@ try {
   console.error('GD anti-rollback high-water check failed to run: ' + gdHighWaterErr.message);
 }
 
+// B6h B-5: seal-format anti-rollback high-water, the GD twin of the Regional
+// Server's. A running GD build whose seal version is below the recorded
+// high-water was downgraded to one that writes an older, weaker envelope --
+// refuse it as the fuse is. On success, report (never rewrite) any at-rest
+// values still on an older seal version.
+try {
+  const gdSealVersion = require('./services/gd-seal-version');
+  const svDb = getDb();
+  try {
+    const sealVerdict = gdSealVersion.checkAndAdvance(svDb);
+    if (sealVerdict.rollback) {
+      console.error('GD SEAL-VERSION ROLLBACK: running seal version ' + sealVerdict.currentSealVersion + ' is below the recorded high-water ' + sealVerdict.highWater);
+      try {
+        svDb.prepare(
+          "UPDATE gd_instance_identity SET status = 'quarantined' " +
+          "WHERE id = (SELECT id FROM gd_instance_identity ORDER BY established_at DESC LIMIT 1)"
+        ).run();
+      } catch (markErr) {
+        console.error('Marking GD instance quarantined after seal-version rollback failed: ' + markErr.message);
+      }
+      if (process.env.NODE_ENV === 'production') {
+        console.error('HALTING: GD seal-version anti-rollback check failed. Deploy the current or a newer build.');
+        process.exit(1);
+      }
+    } else {
+      console.log('GD seal-version high-water ok (version ' + sealVerdict.currentSealVersion + ', high-water ' + sealVerdict.highWater + ')');
+      const stragglers = gdSealVersion.reportStragglers(svDb);
+      if (stragglers.below > 0) {
+        console.warn('GD: ' + stragglers.below + ' of ' + stragglers.total + ' Tier-1 values are below the current seal version ' + stragglers.current + ' (rekey to upgrade)');
+      }
+    }
+  } finally {
+    svDb.close();
+  }
+} catch (gdSealVersionErr) {
+  console.error('GD seal-version high-water check failed to run: ' + gdSealVersionErr.message);
+}
+
 // B6c: resolve and hardware-seal the GD deployment mode (bare-metal /
 // virtualized / cloud / sdn / sase), the GD twin of the Regional Server's
 // deployment mode. Provisioning-only: FIREALIVE_GD_DEPLOYMENT_MODE seals the
