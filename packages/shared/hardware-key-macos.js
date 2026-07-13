@@ -148,16 +148,59 @@ function safeLabel(label) {
   return String(label).replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
+const MACOS_SWIFT_PREFLIGHT = 'MACOS_SWIFT_PREFLIGHT';
+
+// A hardware-backed keystore that fails cryptically could mask that the Secure Enclave root of
+// trust is not actually present -- which an operator must know. So an unavailable macOS helper is
+// surfaced as a clear, NAMED error (code MACOS_SWIFT_PREFLIGHT) rather than a raw spawn ENOENT.
+function preflightError(detail) {
+  const e = new Error('macOS Secure Enclave helper unavailable: ' + detail);
+  e.code = MACOS_SWIFT_PREFLIGHT;
+  return e;
+}
+
+// Verify the Secure Enclave helper can run before relying on it. Throws a named
+// MACOS_SWIFT_PREFLIGHT error if the bundled helper is not executable or the Swift toolchain
+// cannot run. Safe to call at startup for an early, actionable failure.
+function preflight() {
+  const custom = process.env.FIREALIVE_CLIENT_SE_HELPER;
+  if (custom) {
+    try {
+      fs.accessSync(custom, fs.constants.X_OK);
+    } catch (err) {
+      throw preflightError('FIREALIVE_CLIENT_SE_HELPER="' + custom + '" is not an executable file (' + (err.code || err.message) + '); point it at the bundled, signed helper binary.');
+    }
+    return;
+  }
+  try {
+    execFileSync(swiftExe(), ['--version'], { stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch (err) {
+    throw preflightError('the Swift toolchain (' + swiftExe() + ') could not run (' + (err.code || err.message) + '); install the Xcode command-line tools, or set FIREALIVE_CLIENT_SE_HELPER to the bundled, signed helper binary.');
+  }
+}
+
 function realRunHelper(args) {
   const custom = process.env.FIREALIVE_CLIENT_SE_HELPER;
   if (custom) {
-    return execFileSync(custom, args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    try {
+      return execFileSync(custom, args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        throw preflightError('FIREALIVE_CLIENT_SE_HELPER="' + custom + '" could not be executed (ENOENT); point it at the bundled, signed helper binary.');
+      }
+      throw err;
+    }
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fa-cl-se-'));
   const file = path.join(dir, 'helper.swift');
   try {
     fs.writeFileSync(file, SWIFT_HELPER);
     return execFileSync(swiftExe(), [file].concat(args), { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      throw preflightError('the Swift toolchain (' + swiftExe() + ') could not run (ENOENT); install the Xcode command-line tools, or set FIREALIVE_CLIENT_SE_HELPER to the bundled, signed helper binary.');
+    }
+    throw err;
   } finally {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -248,6 +291,8 @@ function sign(label, data) {
 module.exports = {
   kind: KIND,
   isAvailable,
+  preflight,
+  MACOS_SWIFT_PREFLIGHT,
   createSigningKey,
   getSigningPublicKey,
   hasSigningKey,

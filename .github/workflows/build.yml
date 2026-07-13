@@ -45,6 +45,8 @@ jobs:
         run: node scripts/check-seal-version.js
       - name: Verify import rekey
         run: node scripts/check-import-rekey.js
+      - name: Verify macOS preflight
+        run: node scripts/check-macos-preflight.js
 
 
   build-mac:
