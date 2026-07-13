@@ -373,6 +373,24 @@ class RegressionRunner {
       if (present.length) throw new Error('forbidden login route(s) present: ' + present.join(', '));
       return 'passkey login present; no password / LDAP / TOTP / certificate login route';
     });
+    await check('auth', 'No TOTP / MFA-config endpoints (B6i removed them)', () => {
+      // B6i removed the vestigial /mfa/config (GET/PUT) and /mfa/totp/setup
+      // endpoints from the v024-features router. Inspect its registered paths.
+      let router;
+      try { router = require('../routes/v024-features'); } catch (e) { throw new Error('cannot load v024-features router: ' + e.message); }
+      const paths = (router && router.stack ? router.stack : [])
+        .filter(l => l && l.route && l.route.path)
+        .map(l => l.route.path);
+      const forbidden = paths.filter(p => p === '/mfa/config' || p.indexOf('/mfa/totp') === 0);
+      if (forbidden.length) throw new Error('forbidden MFA/TOTP endpoint(s) present: ' + forbidden.join(', '));
+      return 'no /mfa/config or /mfa/totp endpoint';
+    });
+    await check('auth', 'users has no dead totp_* columns (B6i)', () => {
+      const cols = this.db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+      const leftover = cols.filter(c => c.indexOf('totp_') === 0);
+      if (leftover.length) throw new Error('dead totp_* column(s) present: ' + leftover.join(', '));
+      return 'no totp_* columns (' + cols.length + ' columns total)';
+    });
     await check('auth', 'CA issue / verify / revoke / CRL round-trip', () => {
       // Real openssl-backed CA round-trip against a throwaway in-memory clone:
       // the CA key lives in the DB, so a fresh clone gets its own CA, and

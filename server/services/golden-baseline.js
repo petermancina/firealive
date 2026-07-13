@@ -175,7 +175,6 @@ const CONFIG_TABLE_KEYS = [
   'integration_health_settings',
   'key_erase_grace_days',
   'malware_scan_mode',
-  'mfa_config',
   'notification_config',
   'overtime_full_time_hours',
   'posture_config',

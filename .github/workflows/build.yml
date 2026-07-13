@@ -49,6 +49,8 @@ jobs:
         run: node scripts/check-macos-preflight.js
       - name: Verify no recovery-substitute claims in docs
         run: node scripts/check-no-recovery-substitute-claims.js
+      - name: Verify legacy TOTP/2FA stays removed
+        run: node scripts/check-no-legacy-2fa.js
 
 
   build-mac:

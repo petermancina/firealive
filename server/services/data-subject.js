@@ -28,11 +28,10 @@ const EXPORT_SCHEMA = 'firealive.data-subject-export';
 const EXPORT_VERSION = 1;
 
 // Allow-list of users columns included in an access export: profile, status, and
-// non-secret auth metadata. Credential and second-factor secrets are never
-// exported (totp_secret, totp_last_used_step,
-// totp_recovery_codes_hashed are intentionally absent). Allow-list, not a
-// blocklist: a column is exported only by being named here, so a column added to
-// users in the future is excluded until it is deliberately added to this list.
+// non-secret auth metadata. Credential secrets are never exported. Allow-list,
+// not a blocklist: a column is exported only by being named here, so a column
+// added to users in the future is excluded until it is deliberately added to
+// this list.
 const USER_EXPORT_COLUMNS = [
   'id',
   'username',
@@ -52,9 +51,7 @@ const USER_EXPORT_COLUMNS = [
   'auth_method',
   'external_id',
   'geo_country',
-  'totp_enrolled_at',
   'mfa_enrollment_required',
-  'totp_recovery_codes_remaining',
   'leaderboard_opt_in',
   'created_at',
   'updated_at',

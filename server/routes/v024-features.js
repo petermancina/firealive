@@ -13,40 +13,6 @@ const { requireObjectBody } = require('../middleware/body-validation');
 const { logger } = require('../services/logger');
 const notifications = require('../services/notifications');
 
-// ── MFA Configuration ───────────────────────────────────────────────────────
-router.get('/mfa/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = db.prepare("SELECT value FROM config WHERE key = 'mfa_config'").get();
-    db.close();
-    res.json(cfg ? JSON.parse(cfg.value) : { enabled: false, method: 'totp', enforceForAll: true, graceLogins: 3, rememberDeviceDays: 30, backupCodes: true, status: 'not_configured' });
-  } catch (e) { logger.error('MFA config fetch failed', e); res.status(500).json({ error: 'Failed to load MFA config' }); }
-});
-
-router.put('/mfa/config', (req, res) => {
-  try {
-    const db = getDb();
-    const cfg = req.body;
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('mfa_config', ?)").run(JSON.stringify(cfg));
-    auditLog(req.user?.id || 'system', 'MFA_CONFIG_UPDATED', `Method: ${cfg.method}, enforce: ${cfg.enforceForAll}`);
-    db.close();
-    res.json({ success: true, config: cfg });
-  } catch (e) { logger.error('MFA config save failed', e); res.status(500).json({ error: 'Failed to save MFA config' }); }
-});
-
-// TOTP setup — generates shared secret for authenticator app
-router.post('/mfa/totp/setup', (req, res) => {
-  try {
-    const secret = crypto.randomBytes(20).toString('base32') || crypto.randomBytes(20).toString('hex');
-    // In production, store encrypted secret per-user and return QR code URI
-    res.json({
-      secret,
-      uri: `otpauth://totp/FireAlive:${req.user?.email || 'user'}?secret=${secret}&issuer=FireAlive&algorithm=SHA1&digits=6&period=30`,
-      backupCodes: Array.from({ length: 10 }, () => crypto.randomBytes(4).toString('hex'))
-    });
-  } catch (e) { logger.error('TOTP setup failed', e); res.status(500).json({ error: 'TOTP setup failed' }); }
-});
-
 // ── Threat Hunting Integrations ─────────────────────────────────────────────
 router.get('/threat-hunting/config', (req, res) => {
   try {

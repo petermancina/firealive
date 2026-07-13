@@ -52,25 +52,13 @@ CREATE TABLE IF NOT EXISTS users (
   auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
   external_id TEXT,  -- SSO subject identifier
   geo_country TEXT,  -- v0.0.25: assigned country for geo-fencing
-  totp_secret TEXT,  -- v1.0.30: TOTP shared secret (Tier-3 encrypted base32). NULL = not enrolled.
-  totp_enrolled_at TEXT,  -- v1.0.30: timestamp of TOTP enrollment confirmation
-  totp_last_used_step INTEGER,  -- v1.0.30: replay protection -- last accepted TOTP time-step counter
-  -- ── R3f (v1.0.31): MFA enforcement + recovery codes ─────────────────────
+  -- ── R3f (v1.0.31): MFA enforcement ────────────────────────────────────────
   mfa_enrollment_required INTEGER NOT NULL DEFAULT 1
-    CHECK (mfa_enrollment_required IN (0, 1)),  -- 1 = login refuses to issue JWT
-                                                -- when totp_enrolled_at IS NULL.
+    CHECK (mfa_enrollment_required IN (0, 1)),  -- 1 = login refuses to issue a
+                                                -- session until a hardware
+                                                -- passkey is enrolled (FIDO2).
                                                 -- DEFAULT 1: SOC-grade policy
                                                 -- requires MFA for all roles.
-  totp_recovery_codes_hashed TEXT,              -- JSON array of bcrypt hashes of
-                                                -- single-use 14-char alphanumeric
-                                                -- recovery codes. Generated at
-                                                -- enrollment, displayed once,
-                                                -- never stored plaintext.
-                                                -- Consumption removes the matched
-                                                -- hash from the array.
-  totp_recovery_codes_remaining INTEGER,        -- cached count for UI display so
-                                                -- the JSON array doesn't have to
-                                                -- be parsed for status reads.
   -- ── R3h (v1.0.34): Helper Recognition Leaderboard opt-in ─────────────────
   leaderboard_opt_in INTEGER NOT NULL DEFAULT 0
     CHECK (leaderboard_opt_in IN (0, 1)),       -- 1 = analyst's name + points
@@ -4239,9 +4227,6 @@ function initDb() {
     addCol('last_iam_check', 'last_iam_check TEXT');
     addCol('offboarded_at', 'offboarded_at TEXT');
     addCol('pseudonym_rotated_at', 'pseudonym_rotated_at TEXT');
-    addCol('totp_secret', 'totp_secret TEXT');
-    addCol('totp_enrolled_at', 'totp_enrolled_at TEXT');
-    addCol('totp_last_used_step', 'totp_last_used_step INTEGER');
 
     // ─────────────────────────────────────────────────────────────────────
     // R3c — ANONYMITY MODEL note for the email column added below
@@ -5247,17 +5232,89 @@ function initDb() {
     if (r3fPt2Backfill.changes > 0) {
       console.log(`R3f-pt2 backfill: ${r3fPt2Backfill.changes} previously-carved-out row(s) now require MFA`);
     }
-    if (!usersCols.includes('totp_recovery_codes_hashed')) {
-      db.exec(`ALTER TABLE users ADD COLUMN totp_recovery_codes_hashed TEXT;`);
-      console.log('R3f migration: added users.totp_recovery_codes_hashed');
-    }
-    if (!usersCols.includes('totp_recovery_codes_remaining')) {
-      db.exec(`ALTER TABLE users ADD COLUMN totp_recovery_codes_remaining INTEGER;`);
-      console.log('R3f migration: added users.totp_recovery_codes_remaining');
-    }
   } catch (r3fUsersErr) {
     console.error('R3f users migration FAILED:', r3fUsersErr.message);
     console.error('The server will start, but MFA enforcement at login may not work until investigated.');
+  }
+
+  // ── Migration: Phase B6i ── drop the dead TOTP-2FA columns ──────────────────────
+  //
+  // The TOTP two-factor feature (R3f, v1.0.30-31) is removed platform-wide.
+  // Login is FIDO2 hardware-key + PIN only (B5n3); the five totp_* columns
+  // have no live reader. SQLite cannot cleanly DROP a column with a dependent
+  // default/CHECK on every engine version, so users is rebuilt without them,
+  // mirroring the peer_abuse_flags rebuild idiom above: FK OFF, create
+  // users_b6i_new with the surviving column set (exact defaults/CHECKs
+  // preserved), copy rows, drop, rename, FK ON. Gated on totp_secret being
+  // present, so it runs once and is a no-op on a fresh install (whose CREATE
+  // TABLE already omits the columns) and on any re-run. mfa_enrollment_required
+  // and every non-totp column are preserved. users has no secondary indexes.
+  try {
+    const b6iUsersCols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+    if (b6iUsersCols.includes('totp_secret')) {
+      console.log('B6i migration: rebuilding users to drop dead totp_* columns');
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE users_b6i_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            username TEXT UNIQUE NOT NULL,
+            email TEXT,
+            role TEXT NOT NULL CHECK (role IN ('analyst', 'lead', 'admin', 'anon_author')),
+            name TEXT NOT NULL,
+            pseudonym TEXT,
+            pseudonym_rotated_at TEXT,
+            tier INTEGER CHECK (tier IN (1, 2, 3)),
+            shift TEXT CHECK (shift IN ('day', 'swing', 'night')),
+            available INTEGER DEFAULT 1,
+            active INTEGER DEFAULT 1,
+            capacity_score INTEGER DEFAULT 50,
+            last_heartbeat TEXT,
+            last_iam_check TEXT,
+            offboarded_at TEXT,
+            auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
+            external_id TEXT,
+            geo_country TEXT,
+            mfa_enrollment_required INTEGER NOT NULL DEFAULT 1
+              CHECK (mfa_enrollment_required IN (0, 1)),
+            leaderboard_opt_in INTEGER NOT NULL DEFAULT 0
+              CHECK (leaderboard_opt_in IN (0, 1)),
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            last_login TEXT
+          )
+        `);
+        const b6iCopied = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+        db.exec(`
+          INSERT INTO users_b6i_new
+            (id, username, email, role, name, pseudonym, pseudonym_rotated_at,
+             tier, shift, available, active, capacity_score, last_heartbeat,
+             last_iam_check, offboarded_at, auth_method, external_id, geo_country,
+             mfa_enrollment_required, leaderboard_opt_in, created_at, updated_at,
+             last_login)
+          SELECT
+            id, username, email, role, name, pseudonym, pseudonym_rotated_at,
+            tier, shift, available, active, capacity_score, last_heartbeat,
+            last_iam_check, offboarded_at, auth_method, external_id, geo_country,
+            mfa_enrollment_required, leaderboard_opt_in, created_at, updated_at,
+            last_login
+          FROM users
+        `);
+        db.exec('DROP TABLE users');
+        db.exec('ALTER TABLE users_b6i_new RENAME TO users');
+        db.exec('COMMIT');
+        console.log(`B6i migration: users rebuilt, preserved ${b6iCopied} user(s); totp_* columns dropped`);
+      } catch (b6iRebuildErr) {
+        db.exec('ROLLBACK');
+        throw b6iRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (b6iUsersErr) {
+    console.error('B6i users totp-column drop FAILED:', b6iUsersErr.message);
+    console.error('The server will start, but the dead totp_* columns remain until investigated.');
   }
 
   // ── Migration: Phase R3h — leaderboard opt-in flag ─────────────────────────

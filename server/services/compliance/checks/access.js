@@ -30,9 +30,9 @@
 //   - Planned auth_hardening table → does not exist; rate limiting is
 //     in-memory via express-rate-limit (apiLimiter, 1000 req/15min);
 //     failed logins are tracked in auth_log with action LIKE '%FAIL%'
-//   - Planned users.mfa_enrolled column → actual columns are
-//     totp_enrolled_at (NULL = not enrolled) and mfa_enrollment_required
-//     (1 = login blocks JWT until enrolled) per R3f
+//   - Planned users.mfa_enrolled column → MFA enrollment is a hardware
+//     passkey in webauthn_credentials (is_passwordless=1); the gate is
+//     mfa_enrollment_required (1 = login blocks a session until enrolled)
 //   - Planned "lead-only badge attributes" for privilege separation →
 //     no such concept; the users.role CHECK constraint makes roles
 //     mutually exclusive (analyst | lead | admin)
@@ -117,9 +117,11 @@ function checkAccountLockout(db) {
 }
 
 // ── checkMfaEnforcement ──────────────────────────────────────────────────────
-// Verifies all active users either have TOTP enrolled or have
-// mfa_enrollment_required=1 (which blocks JWT issuance until enrollment).
-// R3f introduced this enforcement column; SOC-grade default is 1.
+// Verifies all active users either have a hardware passkey enrolled or have
+// mfa_enrollment_required=1 (login refuses to issue a session until a passkey
+// is enrolled). MFA is a FIDO2 hardware passkey (AAL3, phishing-resistant),
+// recorded in webauthn_credentials; the legacy totp_* columns were removed in
+// B6i. SOC-grade default for mfa_enrollment_required is 1.
 //
 // Maps to controls including: HIPAA 164.312(d), SOC 2 CC6.1,
 // NIST CSF PR.AA-02, ISO 27001 A.8.5, NIST 800-53 IA-2(1)/(2)
@@ -129,10 +131,16 @@ function checkMfaEnforcement(db) {
   const stats = db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN totp_enrolled_at IS NOT NULL THEN 1 ELSE 0 END) AS enrolled,
-      SUM(CASE WHEN mfa_enrollment_required = 1 THEN 1 ELSE 0 END) AS required,
-      SUM(CASE WHEN totp_enrolled_at IS NULL AND mfa_enrollment_required = 0 THEN 1 ELSE 0 END) AS unenforced
-    FROM users WHERE active = 1
+      SUM(CASE WHEN EXISTS (
+        SELECT 1 FROM webauthn_credentials wc
+        WHERE wc.user_id = u.id AND wc.is_passwordless = 1
+      ) THEN 1 ELSE 0 END) AS enrolled,
+      SUM(CASE WHEN u.mfa_enrollment_required = 1 THEN 1 ELSE 0 END) AS required,
+      SUM(CASE WHEN NOT EXISTS (
+        SELECT 1 FROM webauthn_credentials wc
+        WHERE wc.user_id = u.id AND wc.is_passwordless = 1
+      ) AND u.mfa_enrollment_required = 0 THEN 1 ELSE 0 END) AS unenforced
+    FROM users u WHERE u.active = 1
   `).get();
   if (stats.total === 0) {
     return { status: 'pass', detail: 'No active users; MFA enforcement vacuously holds.' };
@@ -140,12 +148,12 @@ function checkMfaEnforcement(db) {
   if (stats.unenforced > 0) {
     return {
       status: 'warning',
-      detail: `${stats.unenforced} of ${stats.total} active user(s) have MFA neither enrolled nor required (totp_enrolled_at IS NULL AND mfa_enrollment_required = 0). SOC-grade policy requires mfa_enrollment_required = 1 for all roles.`,
+      detail: `${stats.unenforced} of ${stats.total} active user(s) have MFA neither enrolled nor required (no passwordless hardware passkey AND mfa_enrollment_required = 0). SOC-grade policy requires mfa_enrollment_required = 1 for all roles.`,
     };
   }
   return {
     status: 'pass',
-    detail: `MFA: ${stats.enrolled} of ${stats.total} active users TOTP-enrolled; ${stats.required} have enrollment required. Login refuses JWT issuance when required and not enrolled.`,
+    detail: `MFA: ${stats.enrolled} of ${stats.total} active users have a hardware passkey enrolled; ${stats.required} have enrollment required. Login refuses a session when required and not enrolled.`,
   };
 }
 
