@@ -42,6 +42,7 @@ const path = require('path');
 const APP_VERSION = require('../package.json').version;
 const bundleSvc = require('./gd-migration-bundle');
 const backupManifestSvc = require('./gd-backup-manifest');
+const keyWrapSvc = require('./gd-backup-key-wrapping');
 
 const SUPPORTED_BUNDLE_SCHEMA_VERSION = bundleSvc.BUNDLE_SCHEMA_VERSION;
 
@@ -200,9 +201,33 @@ function planReconciliation(bundleDir, options) {
       + 'backup signing public key before authorizing an apply.');
   }
 
+  // D-R2-3: can this GD resolve/match the bundle's source KEK? Read the embedded backup manifest's
+  // salted fingerprint and compare to what this host resolves, so a foreign-KEK bundle is flagged
+  // at Preview -- the operator should use the offline import-rekey tool rather than a doomed online
+  // apply. The GD wraps under one KEK, so no db handle is needed. The apply-time gate is the hard
+  // enforcement in every case.
+  let kekResolvable = null;
+  try {
+    const backupManifest = JSON.parse(fs.readFileSync(
+      path.join(bundleDir, bundleSvc.BACKUP_SUBDIR, backupManifestSvc.MANIFEST_FILENAME), 'utf8'));
+    const wrapping = backupManifest.key_wrapping || {};
+    if (wrapping.scheme) {
+      const targetKekFp = keyWrapSvc.resolveKekFingerprint(wrapping.scheme);
+      const verdict = backupManifestSvc.verifyKekFingerprint(backupManifest, targetKekFp);
+      kekResolvable = (verdict !== false);
+    }
+  } catch (err) {
+    kekResolvable = null;
+  }
+  if (kekResolvable === false) {
+    warnings.push('this bundle was wrapped under a different KEK than this host resolves; '
+      + 'a cross-KEK import must go through the offline import-rekey tool.');
+  }
+
   return {
     verification,
-    proceedable: verification.ok && verification.signatureChecked === true,
+    proceedable: verification.ok && verification.signatureChecked === true && kekResolvable !== false,
+    kekResolvable,
     source: {
       appVersion: manifest.appVersion || null,
       anchorFingerprint: (manifest.source && manifest.source.anchorFingerprint) || null,

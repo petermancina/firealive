@@ -440,6 +440,19 @@ async function probe(config, credentials, options) {
 
 // ── Provider object + registration ────────────────────────────────────────
 
+// D-R2-4: the Vault transit KEK material never leaves Vault; fingerprint the stable transit key
+// reference (vault_addr [/namespace] /transit_path/keys/key_name).
+function kekFingerprint(config) {
+  const c = config || {};
+  if (!c.vault_addr || !c.key_name) {
+    throw new Error('hashicorp-vault kekFingerprint: config.vault_addr and config.key_name required');
+  }
+  const transitPath = c.transit_path || 'transit';
+  const ns = c.namespace ? String(c.namespace) + '/' : '';
+  const ref = String(c.vault_addr) + '/' + ns + String(transitPath) + '/keys/' + String(c.key_name);
+  return base.kekFpFromReference(ref);
+}
+
 const provider = {
   name: PROVIDER_NAME,
   description: 'HashiCorp Vault transit engine via raw HTTPS API (no SDK dependency). Tier 2 -- KEK in Vault HSM (Enterprise) or software-encrypted storage (OSS). Recommended for on-prem and EU privacy-first deployments.',
@@ -449,6 +462,7 @@ const provider = {
   probe,
   wrap,
   unwrap,
+  kekFingerprint,
   // Test-only exports
   _setHttpsForTest,
 };

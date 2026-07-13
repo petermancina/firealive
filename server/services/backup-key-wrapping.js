@@ -306,6 +306,18 @@ function isCloudDeployment(db) {
  * works without source changes in backup.js. db/logger/signal/timeoutMs
  * are all optional for env-var scheme.
  */
+// Resolve a scheme's config + credentials from its kekReference. Single source of truth shared
+// by wrapKey and resolveKekFingerprint, so the fingerprint always matches the KEK the DEK was
+// wrapped under. env-var: kekReference IS the env var name (no DB lookup); cloud: kekReference =
+// kms_providers.id, look up the row.
+function resolveSchemeConfig(scheme, kekReference, db) {
+  if (scheme === 'env-var') {
+    return { config: { env_var_name: kekReference }, credentials: null };
+  }
+  const loaded = loadKmsProviderRow(db, kekReference, scheme);
+  return { config: loaded.config, credentials: loaded.credentials };
+}
+
 async function wrapKey(ephemeralKey, options) {
   if (!Buffer.isBuffer(ephemeralKey) || ephemeralKey.length !== KEY_LENGTH_BYTES) {
     throw new Error(`backup-key-wrapping: ephemeralKey must be a ${KEY_LENGTH_BYTES}-byte Buffer`);
@@ -340,18 +352,8 @@ async function wrapKey(ephemeralKey, options) {
     );
   }
 
-  // Resolve config + credentials per scheme.
-  let config, credentials;
-  if (scheme === 'env-var') {
-    // Backward-compatible: kekReference IS the env var name. No DB lookup.
-    config = { env_var_name: kekReference };
-    credentials = null;
-  } else {
-    // Cloud schemes: kekReference = kms_providers.id; look up the row.
-    const loaded = loadKmsProviderRow(db, kekReference, scheme);
-    config = loaded.config;
-    credentials = loaded.credentials;
-  }
+  // Resolve config + credentials per scheme (shared with resolveKekFingerprint).
+  const { config, credentials } = resolveSchemeConfig(scheme, kekReference, db);
 
   const providerOpts = { logger, signal, timeoutMs };
   let wrapped;
@@ -474,11 +476,63 @@ async function unwrapKey(envelopeBytes, expectedScheme, expectedRef, options) {
 
 // ── Module exports ───────────────────────────────────────────────────────────
 
+// Compute the KEK fingerprint for a wrapping scheme (D-R2-4). Dispatches to the provider's
+// kekFingerprint; the caller supplies the same config/credentials it passes to wrapKey. Used at
+// backup creation to stamp the manifest, and at restore to recompute against the target's KEK.
+function computeKekFingerprint(scheme, config, credentials) {
+  if (typeof scheme !== 'string' || !SUPPORTED_SCHEMES.includes(scheme)) {
+    throw new Error(`backup-key-wrapping: unknown scheme '${scheme}' for KEK fingerprint`);
+  }
+  ensureProvidersLoaded();
+  const provider = base.getProvider(scheme);
+  if (!provider || typeof provider.kekFingerprint !== 'function') {
+    throw new Error(`backup-key-wrapping: provider '${scheme}' has no kekFingerprint`);
+  }
+  return provider.kekFingerprint(config, credentials);
+}
+
+// D-R2-2: raw-KEK DEK unwrap for the offline import-rekey tool. A cross-KEK bundle's DEK is
+// wrapped under the SOURCE KEK; the tool recovers that KEK from the source recovery code and
+// unwraps with it here (bypassing reference resolution). ONLY env-var (local-material) supports
+// this -- a cloud KEK never leaves the HSM, so a cloud cross-KEK import is not a raw-KEK operation.
+function unwrapKeyWithRawKek(wrappedDek, scheme, rawKek) {
+  if (typeof scheme !== 'string' || !SUPPORTED_SCHEMES.includes(scheme)) {
+    throw new Error(`backup-key-wrapping: unknown scheme '${scheme}' for raw-KEK unwrap`);
+  }
+  if (scheme !== 'env-var') {
+    throw new Error(`backup-key-wrapping: raw-KEK unwrap is only supported for the env-var scheme (cloud KEKs stay in the HSM); scheme='${scheme}'`);
+  }
+  ensureProvidersLoaded();
+  const provider = base.getProvider('env-var');
+  if (!provider || typeof provider.unwrapWithRawKek !== 'function') {
+    throw new Error('backup-key-wrapping: env-var provider has no unwrapWithRawKek');
+  }
+  return provider.unwrapWithRawKek(wrappedDek, rawKek);
+}
+
+// Resolve a scheme's config from its kekReference (the same resolution wrapKey uses), then
+// compute the KEK fingerprint. The backup path uses this at creation to stamp the manifest and at
+// restore to recompute against the target's KEK.
+function resolveKekFingerprint(scheme, kekReference, db) {
+  if (typeof scheme !== 'string' || !SUPPORTED_SCHEMES.includes(scheme)) {
+    throw new Error(`backup-key-wrapping: unknown scheme '${scheme}' for KEK fingerprint`);
+  }
+  if (typeof kekReference !== 'string' || !kekReference) {
+    throw new Error('backup-key-wrapping: kekReference required for KEK fingerprint');
+  }
+  ensureProvidersLoaded();
+  const { config, credentials } = resolveSchemeConfig(scheme, kekReference, db);
+  return computeKekFingerprint(scheme, config, credentials);
+}
+
 module.exports = {
   // Public API (signatures unchanged from pre-refactor for env-var
   // backward compatibility; cloud schemes accept additional options.db)
   wrapKey,
   unwrapKey,
+  computeKekFingerprint,
+  resolveKekFingerprint,
+  unwrapKeyWithRawKek,
   assertCloudBackupKekPosture,
 
   // Exported for tests and for diagnostic tools that may want to

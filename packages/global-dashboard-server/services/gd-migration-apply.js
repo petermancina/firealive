@@ -120,6 +120,10 @@ async function applyReconciliation(db, options) {
     wrappedKeyBytes,
     scheme: wrapping.scheme,
     kekReference: wrapping.kek_reference,
+    // D-R2-3/4: the embedded backup manifest carries the source KEK fingerprint; the restore gate
+    // refuses a cross-KEK import here (online /import/apply is same-KEK only) and points to the
+    // offline import-rekey tool.
+    manifest: backupManifest,
     label: 'migration-restore',
   });
 

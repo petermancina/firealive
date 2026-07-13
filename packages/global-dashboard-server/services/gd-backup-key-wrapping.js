@@ -33,6 +33,7 @@
 // =============================================================================
 
 const { encryptConfigWithKey, decryptConfigWithKey, deriveKek } = require('./gd-encryption');
+const gdTier1Kek = require('./gd-tier1-kek');
 
 const ENVELOPE_VERSION = 1;
 const KEY_LENGTH_BYTES = 32;                 // AES-256 data key
@@ -175,9 +176,46 @@ async function unwrapKey(envelopeBytes, expectedScheme, expectedRef, options = {
   return key;
 }
 
+// Fingerprint of the KEK this backup was wrapped under (D-R2-4). The GD wraps every backup DEK
+// under the single GD Tier-1 KEK (scheme 'gd-tier1': wrapKey -> deriveKek() -> resolveTier1Kek(),
+// which is ownKek), so the backup's KEK fingerprint is ownKek's -- the same ownKekFingerprint the
+// boot gate and envelope use. The manifest salts it per backup_id. No provider registry here.
+function resolveKekFingerprint(scheme) {
+  const s = scheme || DEFAULT_SCHEME;
+  if (!SUPPORTED_SCHEMES.includes(s)) {
+    throw new Error(`gd-backup-key-wrapping: unknown scheme '${s}' for KEK fingerprint`);
+  }
+  return gdTier1Kek.ownKekFingerprint().toString('hex');
+}
+
+// D-R2-2: unwrap a wrapped DEK with a PROVIDED raw KEK instead of the GD Tier-1 KEK. Used ONLY by
+// the offline import-rekey tool, where the source KEK is recovered transiently from the source
+// recovery code and the DEK was wrapped under it. Same inner envelope as unwrapKey
+// (encryptConfigWithKey under the KEK, base64 in the outer envelope); the raw KEK is the caller's
+// to scrub. Does not check scheme/ref -- the offline tool supplies the KEK deliberately.
+function unwrapKeyWithRawKek(envelopeBytes, rawKek) {
+  if (!Buffer.isBuffer(rawKek) || rawKek.length !== KEY_LENGTH_BYTES) {
+    throw new Error(`gd-backup-key-wrapping: rawKek must be a ${KEY_LENGTH_BYTES}-byte Buffer`);
+  }
+  const envelope = parseEnvelope(envelopeBytes);
+  const gdEnvelope = Buffer.from(envelope.wrapped, 'base64').toString('utf-8');
+  let obj;
+  try {
+    obj = decryptConfigWithKey(gdEnvelope, rawKek);
+  } catch (err) {
+    throw new Error(`gd-backup-key-wrapping: raw-KEK unwrap failed (wrong KEK or tampered wrapped key): ${err.message}`);
+  }
+  if (!obj || typeof obj.k !== 'string') {
+    throw new Error('gd-backup-key-wrapping: unwrapped envelope missing key material');
+  }
+  return Buffer.from(obj.k, 'base64');
+}
+
 module.exports = {
   wrapKey,
   unwrapKey,
+  unwrapKeyWithRawKek,
+  resolveKekFingerprint,
   parseEnvelope,
   serializeEnvelope,
   ENVELOPE_VERSION,

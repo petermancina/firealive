@@ -385,6 +385,18 @@ async function probe(config, credentials, options) {
 
 // ── Provider object + registration ────────────────────────────────────────
 
+// D-R2-4: the Azure Key Vault KEK material stays in the HSM; fingerprint the stable key
+// identifier URL (vault_url/keys/key_name[/key_version]), matching the wrapped-envelope ref.
+function kekFingerprint(config) {
+  const c = config || {};
+  if (!c.vault_url || !c.key_name) {
+    throw new Error('azure-keyvault kekFingerprint: config.vault_url and config.key_name required');
+  }
+  const ref = String(c.vault_url) + '/keys/' + String(c.key_name)
+    + (c.key_version ? '/' + String(c.key_version) : '');
+  return base.kekFpFromReference(ref);
+}
+
 const provider = {
   name: PROVIDER_NAME,
   description: 'Azure Key Vault envelope encryption via @azure/keyvault-keys + @azure/identity. Tier 2 -- KEK in Azure HSM (FIPS 140-2 Level 2 in Standard SKU; Level 3 in Premium / Managed HSM).',
@@ -394,6 +406,7 @@ const provider = {
   probe,
   wrap,
   unwrap,
+  kekFingerprint,
   // Test-only export
   _setSdkForTest,
   // Exposed for documentation / admin UI

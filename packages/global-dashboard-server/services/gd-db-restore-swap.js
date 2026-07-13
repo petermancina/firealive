@@ -39,6 +39,7 @@ const path = require('path');
 
 const keyWrapSvc = require('./gd-backup-key-wrapping');
 const archiveSvc = require('./gd-backup-archive');
+const manifestSvc = require('./gd-backup-manifest');
 const { IntegrationManager } = require('./gd-integration-manager');
 const { DB_PATH, getDb } = require('../db-init');
 
@@ -54,6 +55,8 @@ const CODES = {
   SCAN_FAILED: 'SCAN_FAILED',
   PRE_RESTORE_SNAPSHOT_FAILED: 'PRE_RESTORE_SNAPSHOT_FAILED',
   ATOMIC_APPLY_FAILED: 'ATOMIC_APPLY_FAILED',
+  KEK_MISMATCH: 'KEK_MISMATCH',
+  KEK_FINGERPRINT_FAILED: 'KEK_FINGERPRINT_FAILED',
 };
 
 class DbRestoreError extends Error {
@@ -130,12 +133,17 @@ async function restoreDatabaseFromArchive(options) {
   const wrappedKeyBytes = options.wrappedKeyBytes;
   const scheme = options.scheme;
   const kekReference = options.kekReference;
+  // D-R2-2: when supplied (the offline import-rekey tool), the DEK is unwrapped with this raw
+  // source KEK instead of the GD Tier-1 KEK, and the same-KEK gate below is skipped.
+  const rawKek = options.rawKek || null;
   const label = options.label || 'restore';
 
   // 1. Unwrap the data encryption key under the KEK.
   let ephemeralKey;
   try {
-    ephemeralKey = await keyWrapSvc.unwrapKey(wrappedKeyBytes, scheme, kekReference);
+    ephemeralKey = rawKek
+      ? keyWrapSvc.unwrapKeyWithRawKek(wrappedKeyBytes, rawKek)
+      : await keyWrapSvc.unwrapKey(wrappedKeyBytes, scheme, kekReference);
   } catch (err) {
     throw new DbRestoreError(CODES.KEY_UNWRAP_FAILED,
       'DEK unwrap failed (scheme=' + scheme + ', kek=' + kekReference + '): ' + err.message,
@@ -159,6 +167,28 @@ async function restoreDatabaseFromArchive(options) {
 
   // 4. Mandatory EDR scan (fail-closed).
   const scan = await scanExtractedBytes(extracted.payload);
+
+  // 4b. KEK-match gate (D-R2-4). Confirm this GD's KEK matches the one the backup was wrapped
+  // under, via the salted fingerprint the manifest carries -- so a foreign-KEK backup is refused
+  // BEFORE the swap, with the live handle untouched. A cross-KEK restore must go through the
+  // offline import-rekey tool. A legacy manifest with no fingerprint (verdict null) is not blocked.
+  // rawKek supplied => authorized offline cross-KEK path (KOA-gated): the target KEK deliberately
+  // differs from the source, so the same-KEK gate does not apply; importRekey re-seals afterward.
+  if (options.manifest && !rawKek) {
+    let verdict;
+    try {
+      const targetKekFp = keyWrapSvc.resolveKekFingerprint(scheme);
+      verdict = manifestSvc.verifyKekFingerprint(options.manifest, targetKekFp);
+    } catch (err) {
+      throw new DbRestoreError(CODES.KEK_FINGERPRINT_FAILED,
+        'KEK fingerprint check failed: ' + err.message);
+    }
+    if (verdict === false) {
+      throw new DbRestoreError(CODES.KEK_MISMATCH,
+        'this backup was wrapped under a different KEK than this host resolves; '
+        + 'a cross-KEK restore must go through the offline import-rekey tool');
+    }
+  }
 
   // 5. Pre-restore snapshot of the current live database (rollback path).
   const dbDir = path.dirname(DB_PATH);

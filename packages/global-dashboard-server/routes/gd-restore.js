@@ -1039,6 +1039,7 @@ router.post('/execute/:id', gdMfaStepUp(), async (req, res) => {
           wrappedKeyBytes,
           scheme: manifest.key_wrapping.scheme,
           kekReference: manifest.key_wrapping.kek_reference,
+          manifest,
           label: 'restore-' + backup.id,
         });
       } catch (swapErr) {

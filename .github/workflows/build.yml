@@ -43,6 +43,8 @@ jobs:
         run: node scripts/check-rekey.js
       - name: Verify seal-format versioning
         run: node scripts/check-seal-version.js
+      - name: Verify import rekey
+        run: node scripts/check-import-rekey.js
 
 
   build-mac:

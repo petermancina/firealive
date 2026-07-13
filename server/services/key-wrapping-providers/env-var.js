@@ -264,6 +264,33 @@ async function probe(config, credentials, options) {
 
 // ── Provider object + registration ───────────────────────────────────────
 
+// D-R2-4: a one-way fingerprint of the KEK this provider wraps under. The env-var KEK is local
+// 32-byte material (readEnvVarKek resolves the same key wrap/unwrap use, including the tier1Kek
+// default), so fingerprint the material -- it never appears in the manifest.
+function kekFingerprint(config) {
+  const kek = readEnvVarKek((config || {}).env_var_name, 'kek-fingerprint');
+  return base.kekFpFromMaterial(kek);
+}
+
+// D-R2-2: unwrap a wrapped DEK with a PROVIDED raw KEK instead of the env var. Used ONLY by the
+// offline import-rekey tool, where the source KEK is recovered transiently from the source
+// recovery code and the DEK was wrapped under it. Same envelope format as unwrap
+// (iv || tag || ciphertext, AES-256-GCM); the raw KEK is the caller's to scrub.
+function unwrapWithRawKek(wrappedDek, rawKek) {
+  if (!Buffer.isBuffer(wrappedDek)) {
+    throw new Error('env-var unwrapWithRawKek: wrappedDek must be a Buffer');
+  }
+  if (!Buffer.isBuffer(rawKek) || rawKek.length !== KEY_LENGTH_BYTES) {
+    throw new Error('env-var unwrapWithRawKek: rawKek must be a ' + KEY_LENGTH_BYTES + '-byte Buffer');
+  }
+  const iv = wrappedDek.subarray(0, IV_LENGTH_BYTES);
+  const authTag = wrappedDek.subarray(IV_LENGTH_BYTES, IV_LENGTH_BYTES + TAG_LENGTH_BYTES);
+  const ciphertext = wrappedDek.subarray(IV_LENGTH_BYTES + TAG_LENGTH_BYTES);
+  const decipher = crypto.createDecipheriv(ENC_ALGORITHM, rawKek, iv);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
 const provider = {
   name: PROVIDER_NAME,
   description: 'KEK from process env var (TIER1_ENCRYPTION_KEY by default). Tier 3 -- KEK lives in process memory.',
@@ -273,6 +300,8 @@ const provider = {
   probe,
   wrap,
   unwrap,
+  unwrapWithRawKek,
+  kekFingerprint,
 };
 
 base.registerProvider(provider);

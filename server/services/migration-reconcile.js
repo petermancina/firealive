@@ -43,6 +43,7 @@ const { logger } = require('./logger');
 const { version: APP_VERSION } = require('../lib/version');
 const bundleSvc = require('./migration-bundle');
 const backupManifestSvc = require('./backup-manifest');
+const keyWrapSvc = require('./backup-key-wrapping');
 
 const SUPPORTED_BUNDLE_SCHEMA_VERSION = bundleSvc.BUNDLE_SCHEMA_VERSION;
 
@@ -201,9 +202,34 @@ function planReconciliation(bundleDir, options) {
       + 'backup signing public key before authorizing an apply.');
   }
 
+  // D-R2-3: can this target resolve/match the bundle's source KEK? Read the embedded backup
+  // manifest's salted fingerprint and compare to what this host resolves, so a foreign-KEK bundle
+  // is flagged at Preview -- the operator should use the offline import-rekey tool rather than a
+  // doomed online apply. null = undetermined (e.g. a cloud KEK when no db handle was supplied);
+  // the apply-time gate is the hard enforcement in every case.
+  let kekResolvable = null;
+  try {
+    const backupManifest = JSON.parse(fs.readFileSync(
+      path.join(bundleDir, bundleSvc.BACKUP_SUBDIR, backupManifestSvc.MANIFEST_FILENAME), 'utf8'));
+    const wrapping = backupManifest.key_wrapping || {};
+    if (wrapping.scheme && wrapping.kek_reference) {
+      const targetKekFp = keyWrapSvc.resolveKekFingerprint(
+        wrapping.scheme, wrapping.kek_reference, options.db || null);
+      const verdict = backupManifestSvc.verifyKekFingerprint(backupManifest, targetKekFp);
+      kekResolvable = (verdict !== false);
+    }
+  } catch (err) {
+    kekResolvable = null;
+  }
+  if (kekResolvable === false) {
+    warnings.push('this bundle was wrapped under a different KEK than this host resolves; '
+      + 'a cross-KEK import must go through the offline import-rekey tool.');
+  }
+
   return {
     verification,
-    proceedable: verification.ok && verification.signatureChecked === true,
+    proceedable: verification.ok && verification.signatureChecked === true && kekResolvable !== false,
+    kekResolvable,
     source: {
       appVersion: manifest.appVersion || null,
       anchorFingerprint: (manifest.source && manifest.source.anchorFingerprint) || null,

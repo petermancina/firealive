@@ -156,6 +156,9 @@ async function performFullSuiteBackup(db, options = {}) {
       compressionLevel,
       keyWrappingScheme,
       kekReference,
+      // D-R2-4: stamp the salted fingerprint of the GD Tier-1 KEK this backup was wrapped under,
+      // so a restore can refuse a foreign-KEK backup before the swap.
+      kekFingerprint: keyWrapSvc.resolveKekFingerprint(keyWrappingScheme),
       signingKeyId: signingKey.id,
       signingKeyFingerprint: signingKey.publicKeyFingerprint,
       sourceFuseCounter,

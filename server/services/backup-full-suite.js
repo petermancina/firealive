@@ -439,6 +439,9 @@ async function performFullSuiteBackup(options = {}) {
       compressionLevel,
       keyWrappingScheme,
       kekReference,
+      // D-R2-4: stamp the salted, non-correlatable fingerprint of the KEK that wrapped this
+      // backup, so a restore can refuse a foreign-KEK backup before the swap.
+      kekFingerprint: keyWrapSvc.resolveKekFingerprint(keyWrappingScheme, kekReference, db),
       signingKeyId: signingKey.id,
       signingKeyFingerprint: signingKey.publicKeyFingerprint,
       sourceFuseCounter,

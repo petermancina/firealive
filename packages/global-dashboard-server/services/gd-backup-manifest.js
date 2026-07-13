@@ -53,6 +53,10 @@ const BACKUP_TYPES = ['scheduled', 'on-demand', 'snapshot'];
 // the signature file IS the signature of this manifest.
 const TRACKED_FILENAMES = [ARCHIVE_FILENAME, WRAPPED_KEY_FILENAME];
 
+const crypto = require('crypto');
+// Domain separation for the salted per-backup KEK fingerprint (D-R2-4).
+const KEK_FP_DOMAIN = 'fa-backup-kekfp:v1';
+
 // -- Canonical serialization --------------------------------------------------
 
 /**
@@ -134,6 +138,34 @@ function parse(manifestBytes) {
  * Returns the constructed manifest object (call serialize() to get bytes for
  * signing).
  */
+// A per-backup, non-correlatable fingerprint of the KEK that wrapped this backup's key.
+// Salted by backup_id so the same KEK yields a DIFFERENT value in every backup (no stable
+// cross-backup identifier), and domain-separated. Written into the manifest at creation, so it
+// is covered by manifest.sig (tamper-evident) and never rewritten. It lets a restore confirm
+// the target's KEK matches the one this backup was wrapped under -- WITHOUT unwrapping anything
+// -- and refuse a foreign-KEK backup before the swap.
+function saltedKekFingerprint(kekFingerprintHex, backupId) {
+  if (typeof kekFingerprintHex !== 'string' || !/^[0-9a-f]+$/.test(kekFingerprintHex)) {
+    throw new Error('saltedKekFingerprint: kekFingerprintHex must be lowercase hex');
+  }
+  return crypto.createHash('sha256')
+    .update(KEK_FP_DOMAIN + '|' + kekFingerprintHex + '|' + String(backupId), 'utf-8')
+    .digest('hex');
+}
+
+// Does the manifest's kek_fingerprint match the target's KEK fingerprint (recomputed with the
+// manifest's OWN backup_id)? Returns true / false, or null for a legacy manifest that has no
+// kek_fingerprint (a pre-D-R2-4 backup -- the caller decides how to treat that). Constant-time.
+function verifyKekFingerprint(manifest, targetKekFingerprintHex) {
+  if (!manifest || typeof manifest !== 'object' || typeof manifest.kek_fingerprint !== 'string') {
+    return null;
+  }
+  const expected = saltedKekFingerprint(targetKekFingerprintHex, manifest.backup_id);
+  const a = Buffer.from(manifest.kek_fingerprint, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 function buildManifest(opts) {
   if (!opts || typeof opts !== 'object') {
     throw new Error('buildManifest: opts object required');
@@ -207,6 +239,11 @@ function buildManifest(opts) {
     },
     signing_key_id: opts.signingKeyId,
     signing_key_fingerprint: opts.signingKeyFingerprint,
+    // D-R2-4: the salted, non-correlatable KEK fingerprint (dropped by serialize when the
+    // caller supplies no kekFingerprint, so legacy manifests are unchanged).
+    kek_fingerprint: (opts.kekFingerprint !== undefined && opts.kekFingerprint !== null)
+      ? saltedKekFingerprint(opts.kekFingerprint, opts.backupId)
+      : undefined,
   };
 }
 
@@ -305,6 +342,10 @@ module.exports = {
 
   // construction
   buildManifest,
+
+  // KEK fingerprint (D-R2-4)
+  saltedKekFingerprint,
+  verifyKekFingerprint,
 
   // validation
   validateStructure,

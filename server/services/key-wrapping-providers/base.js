@@ -137,6 +137,41 @@ class KeyWrappingError extends Error {
 
 const providerRegistry = new Map();
 
+// Domain separation for backup KEK fingerprints (D-R2-4). A provider's kekFingerprint()
+// returns one of these two forms; backup-manifest then salts it per backup_id, so the value
+// in the manifest is non-correlatable across backups.
+//
+//   kekFingerprint(config, credentials) -> lowercase-hex string   (NEW provider method)
+//     A stable, one-way fingerprint of the KEK this provider wraps under. env-var fingerprints
+//     the raw material; cloud KMS fingerprints the stable key reference (the material never
+//     leaves the HSM). It lets a restore confirm the target's KEK matches the backup's WITHOUT
+//     unwrapping anything. (Enforced in registerProvider only once every provider implements it.)
+const cryptoMod = require('crypto');
+const FA_BACKUP_KEK_DOMAIN = 'fa-backup-kek:v1';
+
+// Fingerprint of raw KEK MATERIAL (env-var scheme: the 32-byte KEK itself). The material never
+// appears in the manifest -- only this domain-separated SHA-256, hex.
+function kekFpFromMaterial(materialBuffer) {
+  if (!Buffer.isBuffer(materialBuffer) || materialBuffer.length === 0) {
+    throw new Error('kekFpFromMaterial: materialBuffer must be a non-empty Buffer');
+  }
+  return cryptoMod.createHash('sha256')
+    .update(Buffer.concat([Buffer.from(FA_BACKUP_KEK_DOMAIN + '|material|'), materialBuffer]))
+    .digest('hex');
+}
+
+// Fingerprint of a stable KEK REFERENCE (cloud KMS: the key ARN / URL / resource name). The
+// KEK material stays in the HSM; the reference is the stable identifier. Domain-separated
+// SHA-256, hex.
+function kekFpFromReference(reference) {
+  if (typeof reference !== 'string' || reference === '') {
+    throw new Error('kekFpFromReference: reference must be a non-empty string');
+  }
+  return cryptoMod.createHash('sha256')
+    .update(FA_BACKUP_KEK_DOMAIN + '|reference|' + reference, 'utf-8')
+    .digest('hex');
+}
+
 function registerProvider(provider) {
   if (!provider || typeof provider !== 'object') {
     throw new Error('registerProvider: provider must be an object');
@@ -144,7 +179,7 @@ function registerProvider(provider) {
   if (!VALID_PROVIDER_NAMES.has(provider.name)) {
     throw new Error(`registerProvider: invalid provider name '${provider.name}' (must be one of: ${[...VALID_PROVIDER_NAMES].join(', ')})`);
   }
-  for (const required of ['validateConfig', 'validateCredentials', 'probe', 'wrap', 'unwrap']) {
+  for (const required of ['validateConfig', 'validateCredentials', 'probe', 'wrap', 'unwrap', 'kekFingerprint']) {
     if (typeof provider[required] !== 'function') {
       throw new Error(`registerProvider: provider '${provider.name}' missing required method '${required}'`);
     }
@@ -281,6 +316,9 @@ async function probeRoundTrip(provider, config, credentials, options = {}) {
 // ── Module exports ───────────────────────────────────────────────────────
 
 module.exports = {
+  FA_BACKUP_KEK_DOMAIN,
+  kekFpFromMaterial,
+  kekFpFromReference,
   // Error class
   KeyWrappingError,
 

@@ -793,6 +793,7 @@ async function executeRestore(db, args) {
       wrappedKeyBytes,
       scheme: manifest.key_wrapping.scheme,
       kekReference: manifest.key_wrapping.kek_reference,
+      manifest,
       label: 'external-restore',
     });
   } catch (err) {

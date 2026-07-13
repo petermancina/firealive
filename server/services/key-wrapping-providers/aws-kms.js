@@ -369,6 +369,11 @@ async function probe(config, credentials, options) {
 
 // ── Provider object + registration ────────────────────────────────────────
 
+// D-R2-4: the AWS KMS KEK material stays in the HSM; fingerprint the stable key reference (ARN).
+function kekFingerprint(config) {
+  return base.kekFpFromReference((config || {}).key_id);
+}
+
 const provider = {
   name: PROVIDER_NAME,
   description: 'AWS KMS envelope encryption via @aws-sdk/client-kms. Tier 2 -- KEK in AWS HSM (FIPS 140-2 Level 3 in eligible regions).',
@@ -378,6 +383,7 @@ const provider = {
   probe,
   wrap,
   unwrap,
+  kekFingerprint,
   // Test-only export; not used in production paths
   _setSdkForTest,
 };

@@ -411,6 +411,18 @@ async function probe(config, credentials, options) {
 
 // ── Provider object + registration ────────────────────────────────────────
 
+// D-R2-4: the Cloud KMS KEK material stays in the HSM; fingerprint the stable cryptoKey resource
+// name (the bare key Decrypt uses -- version excluded, matching the wrapped-envelope ref).
+function kekFingerprint(config) {
+  const c = config || {};
+  if (!c.project_id || !c.location_id || !c.key_ring_id || !c.key_id) {
+    throw new Error('gcp-kms kekFingerprint: project_id, location_id, key_ring_id, key_id required');
+  }
+  const ref = 'projects/' + String(c.project_id) + '/locations/' + String(c.location_id)
+    + '/keyRings/' + String(c.key_ring_id) + '/cryptoKeys/' + String(c.key_id);
+  return base.kekFpFromReference(ref);
+}
+
 const provider = {
   name: PROVIDER_NAME,
   description: 'Google Cloud KMS envelope encryption via @google-cloud/kms. Tier 2 -- KEK in Cloud HSM (FIPS 140-2 Level 3 in Cloud HSM regions).',
@@ -420,6 +432,7 @@ const provider = {
   probe,
   wrap,
   unwrap,
+  kekFingerprint,
   // Test-only export
   _setSdkForTest,
 };
