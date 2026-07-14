@@ -184,11 +184,11 @@ const REMEDIATIONS = {
   // ── checks/access.js ───────────────────────────────────────────────────────
 
   checkPasswordPolicy: {
-    summary: 'Password policy is hardcoded at 12-character minimum',
+    summary: 'FireAlive is passwordless: login is a FIDO2 hardware passkey, so no password policy applies',
     steps: [
-      'No action required -- MIN_PASSWORD_LENGTH = 12 is enforced in server/routes/password.js',
-      'If your organization requires a higher minimum, update MIN_PASSWORD_LENGTH and rebuild',
-      'bcrypt hashing is automatic on user creation and password change',
+      'No action required -- login is a user-verified FIDO2 hardware passkey; there is no password to set or gate',
+      'The credential-strength control is the phishing-resistant hardware key, stronger than any password policy',
+      'No password hash is stored; the login credential is a hardware-backed public key in webauthn_credentials',
     ],
     uiPath: null,
   },
@@ -257,7 +257,7 @@ const REMEDIATIONS = {
       'For each integration in error status, click "Test Connection" to diagnose',
       'Common failures: expired client secret, certificate chain mismatch, IdP-side config drift',
       'Affected users may be unable to authenticate via SSO until remediated',
-      'Local bcrypt auth remains available as fallback for the duration of the outage',
+      'FIDO2 hardware-passkey login remains available for the duration of the outage (SSO is not the login path)',
     ],
     uiPath: 'mc:admin/iam-integrations',
   },

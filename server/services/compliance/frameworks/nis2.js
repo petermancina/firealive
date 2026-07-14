@@ -151,7 +151,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(g)',
       name: 'Cyber Hygiene -- Password Policy',
       check: checks.checkPasswordPolicy,
-      mapping: '12-character minimum password length enforced; bcrypt hashing. Cyber hygiene technical foundation; awareness training delivery is operator-side under Art.21(2)(g).',
+      mapping: 'Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant); no password is stored, so no password-length policy applies. Cyber hygiene technical foundation; awareness training delivery is operator-side under Art.21(2)(g).',
     },
     {
       id: 'Art.21(2)(h) [Crypto]',

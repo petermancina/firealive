@@ -23,8 +23,8 @@
 // platform structures that don't match the v1.0.32 codebase. The
 // functions below query the actual structures:
 //
-//   - Planned PASSWORD_MIN_LENGTH env var → actual hardcoded
-//     MIN_PASSWORD_LENGTH = 12 in server/routes/password.js
+//   - Planned PASSWORD_MIN_LENGTH env var → not applicable; the platform
+//     is passwordless (FIDO2 hardware-passkey login; no password to gate)
 //   - Planned JWT_EXPIRES_IN env var → actual JWT_EXPIRY env var
 //     in server/middleware/auth.js (default '15m')
 //   - Planned auth_hardening table → does not exist; rate limiting is
@@ -44,10 +44,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── checkPasswordPolicy ──────────────────────────────────────────────────────
-// Verifies the platform's password policy meets SOC-grade minimums.
-// FireAlive enforces a 12-character minimum hardcoded in the password
-// validation endpoint (server/routes/password.js MIN_PASSWORD_LENGTH).
-// bcrypt hashing on storage; complexity validation at change-password.
+// FireAlive is passwordless: login is a user-verified FIDO2 hardware passkey
+// (B5n3), so there is no password to set, store, or gate. The password /
+// credential-management controls are satisfied by the phishing-resistant
+// hardware credential, which is stronger than any password policy.
 //
 // Maps to controls including: HIPAA 164.308(a)(5)(ii)(D), SOC 2 CC6.1,
 // NIST CSF PR.AA-03, ISO 27001 A.8.5, NIST 800-53 IA-5, NIS2 Art.21(2)(g),
@@ -55,7 +55,7 @@
 function checkPasswordPolicy() {
   return {
     status: 'pass',
-    detail: 'Password policy: 12-character minimum (server/routes/password.js MIN_PASSWORD_LENGTH); bcrypt hashing on storage; complexity validation at change-password endpoint; rotation enforcement via mfa_enrollment_required gate.',
+    detail: 'FireAlive is passwordless: no passwords are stored (login is a user-verified FIDO2 hardware passkey, AAL3, phishing-resistant). The credential-strength control is the hardware key, stronger than any password-complexity policy.',
   };
 }
 
@@ -220,7 +220,7 @@ function checkApiKeyRotation(db) {
 // state. The platform supports SAML, OIDC, LDAP, and Cloud IAM via
 // integration_config rows with integration_type in {iam_saml, iam_oidc,
 // iam_ldap, iam_cloud}. If no IAM integrations are configured, local
-// bcrypt auth is the fallback and the check passes vacuously.
+// FIDO2 hardware-passkey auth is the login path and the check passes vacuously.
 //
 // Maps to controls including: SOC 2 CC6.1/CC6.2, NIST CSF PR.AA-01,
 // ISO 27001 A.5.16/A.8.5, NIST 800-53 IA-2/IA-8, NIS2 Art.21(2)(j),
@@ -235,7 +235,7 @@ function checkIamIntegrationHealth(db) {
   if (integrations.length === 0) {
     return {
       status: 'pass',
-      detail: 'No IAM integrations configured. Platform supports SAML/OIDC/LDAP/Cloud IAM via integration_config; local bcrypt auth is the active method.',
+      detail: 'No IAM integrations configured. Platform supports SAML/OIDC/LDAP/Cloud IAM via integration_config; local FIDO2 hardware-passkey auth is the active method.',
     };
   }
   const errored = integrations.filter(r => r.status === 'error');

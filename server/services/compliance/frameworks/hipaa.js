@@ -158,7 +158,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(5)(ii)(D)',
       name: 'Password Management (Addressable)',
       check: checks.checkPasswordPolicy,
-      mapping: '12-character minimum password length enforced at registration and change endpoints; bcrypt hashing with platform-configured cost factor. Addressable specification, implemented as Required.',
+      mapping: 'Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant); no password is stored, so no password-length policy applies. Addressable specification, implemented as Required.',
     },
     {
       id: '164.308(a)(7)(ii)(A)',

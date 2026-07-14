@@ -198,7 +198,7 @@ module.exports = (checks) => ({
       id: 'IA-5',
       name: 'Authenticator Management',
       check: checks.checkPasswordPolicy,
-      mapping: '12-character minimum password length hardcoded in server/routes/password.js; bcrypt hashing with platform-configured cost factor. IA-5(1) password-based authentication minimum length requirement satisfied.',
+      mapping: 'Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant); no password is stored, so no password-length policy applies. IA-5 authenticator management is satisfied by the phishing-resistant hardware credential.',
     },
     // ── IR Incident Response ────────────────────────────────────────────────
     {
