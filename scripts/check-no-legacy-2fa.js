@@ -11,8 +11,9 @@
 // bare strings) so it does not false-positive on comments or forbidden-route
 // lists.
 //
-// B6i-1 asserts the Regional server. B6i-2 extends this with the GD server
-// (mfa_secret / mfa_enabled / password_hash columns; /api/auth/mfa-* routes).
+// Covers both servers: the Regional (totp_* columns; /mfa/totp + /mfa/config
+// routes) and the GD (mfa_secret / mfa_enabled / password_hash columns;
+// /api/auth/mfa-setup|confirm|verify routes).
 
 const fs = require('fs');
 const path = require('path');
@@ -55,11 +56,36 @@ check('webauthn_credentials table present', createBody(init, 'webauthn_credentia
 check('mfa-stepup middleware present', read('server/middleware/mfa-stepup.js').length > 0);
 check('mfa passkey/cert self-service route present', read('server/routes/mfa.js').length > 0);
 
+// ---- GD server: no dead legacy-auth columns ----
+const gdInit = read('packages/global-dashboard-server/db-init.js');
+const gdUsers = createBody(gdInit, 'users');
+check('GD users CREATE TABLE found', gdUsers !== null);
+check('GD users has no mfa_secret / mfa_enabled / password_hash', gdUsers !== null && !/\b(mfa_secret|mfa_enabled|password_hash)\b/.test(gdUsers));
+
+// ---- GD server: no legacy /api/auth/mfa-* (TOTP) route definitions ----
+// (The /api/mfa/* passkey + cert routes are the canonical stack -- keep them.
+//  Only the dash-form /api/auth/mfa-setup|confirm|verify are the dead TOTP
+//  endpoints.) The GD defines its auth routes in index.js via app.METHOD.
+let gdMfaRoute = '';
+const gdSources = [['index.js', read('packages/global-dashboard-server/index.js')]];
+try {
+  for (const f of fs.readdirSync(path.join(REPO, 'packages/global-dashboard-server/routes')).filter((n) => n.endsWith('.js'))) {
+    gdSources.push([f, read('packages/global-dashboard-server/routes/' + f)]);
+  }
+} catch (e) { /* routes dir optional */ }
+for (const pair of gdSources) {
+  if (/(app|router)\.(get|post|put|delete)\(\s*['"][^'"]*\/auth\/mfa-(setup|confirm|verify)/.test(pair[1])) gdMfaRoute = pair[0];
+}
+check('GD defines no /api/auth/mfa-setup|confirm|verify route', gdMfaRoute === '');
+
+// ---- Positive: the GD passkey store is present ----
+check('GD webauthn_credentials table present', createBody(gdInit, 'webauthn_credentials') !== null);
+
 // ---- Report ----
 if (problems.length) {
   console.error('check-no-legacy-2fa: FAILED (' + problems.length + ')');
   for (const p of problems) console.error('  - ' + p);
   process.exit(1);
 }
-console.log('check-no-legacy-2fa passed: legacy TOTP/2FA stays removed on the Regional server; the FIDO2 passkey stack (webauthn_credentials + mfa-stepup + routes/mfa.js) is present.');
+console.log('check-no-legacy-2fa passed: legacy TOTP/2FA stays removed on both the Regional and GD servers; the FIDO2 passkey stack is present on each.');
 process.exit(0);

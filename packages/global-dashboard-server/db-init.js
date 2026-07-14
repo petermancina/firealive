@@ -27,11 +27,8 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   username TEXT UNIQUE NOT NULL,
-  password_hash TEXT,
   role TEXT NOT NULL CHECK (role IN ('ciso', 'vp', 'readonly', 'signing_key_approver')),
   name TEXT NOT NULL,
-  mfa_secret TEXT,
-  mfa_enabled INTEGER DEFAULT 0,
   auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
   created_at TEXT DEFAULT (datetime('now')),
   last_login TEXT
@@ -2023,10 +2020,11 @@ function initDb() {
 
       db.exec('BEGIN TRANSACTION');
       try {
-        // Create users_new with the extended CHECK constraint. Schema
-        // mirrors the canonical CREATE TABLE above EXACTLY (column order,
-        // defaults, secondary constraints) so the rebuild preserves all
-        // pre-existing column semantics.
+        // Create users_new with the extended CHECK constraint. This rebuild
+        // predates B6i and still carries password_hash / mfa_secret /
+        // mfa_enabled so it can copy them from a pre-B6i database; the B6i
+        // migration below then drops those three dead columns. All non-legacy
+        // columns and their defaults/constraints are preserved.
         db.exec(`
           CREATE TABLE users_new (
             id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -2080,6 +2078,65 @@ function initDb() {
     }
   } catch (e) {
     console.error('users role migration failed:', e.message);
+  }
+
+  // -- B6i migration: drop the dead legacy-auth columns from users ------------
+  //
+  // B6i removes the vestigial TOTP/2FA feature platform-wide. The GD is FIDO2
+  // hardware-key + PIN only (B5n3), so users.mfa_secret and users.mfa_enabled
+  // have no live reader, and users.password_hash is dead bcrypt from the
+  // password era (also unread). SQLite cannot cleanly DROP a column on every
+  // engine version, so users is rebuilt without them, mirroring the role-CHECK
+  // rebuild above. Gated on mfa_enabled appearing in the stored CREATE sql, so
+  // it runs once and is a no-op on a fresh install (whose canonical CREATE
+  // TABLE already omits the three columns) and on any re-run.
+  try {
+    const b6iUsersSql = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+    ).get();
+    const needsLegacyAuthDrop = b6iUsersSql && b6iUsersSql.sql.includes('mfa_enabled');
+
+    if (needsLegacyAuthDrop) {
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE users_b6i_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            username TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('ciso', 'vp', 'readonly', 'signing_key_approver')),
+            name TEXT NOT NULL,
+            auth_method TEXT DEFAULT 'local' CHECK (auth_method IN ('local', 'saml', 'oidc', 'ldap')),
+            created_at TEXT DEFAULT (datetime('now')),
+            last_login TEXT
+          );
+        `);
+        const b6iMoved = db.prepare(`
+          INSERT INTO users_b6i_new
+            (id, username, role, name, auth_method, created_at, last_login)
+          SELECT id, username, role, name, auth_method, created_at, last_login
+          FROM users
+        `).run();
+        db.exec('DROP TABLE users');
+        db.exec('ALTER TABLE users_b6i_new RENAME TO users');
+        db.exec('COMMIT');
+        const b6iFk = db.prepare('PRAGMA foreign_key_check').all();
+        if (b6iFk.length > 0) {
+          console.error('B6i users legacy-auth drop left FK issues:', b6iFk);
+        } else {
+          console.log(
+            `B6i migration: dropped password_hash / mfa_secret / mfa_enabled from users; ${b6iMoved.changes} user row(s) preserved`
+          );
+        }
+      } catch (b6iRebuildErr) {
+        db.exec('ROLLBACK');
+        throw b6iRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (b6iLegacyErr) {
+    console.error('B6i users legacy-auth drop failed:', b6iLegacyErr.message);
   }
 
   const setMeta = db.prepare('INSERT OR IGNORE INTO system_meta (key, value) VALUES (?, ?)');

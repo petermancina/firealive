@@ -3594,7 +3594,7 @@ app.post('/api/compromise-scan', authMiddleware(['ciso']), (req, res) => {
 
 // ── Regression Test (R3k C26) ────────────────────────────────────────────────
 //
-// Replaces the v1.0.36 8-pass mock with a real 22-check regression
+// Replaces the v1.0.36 8-pass mock with a real 23-check regression
 // runner covering GD-side schema integrity, MC trust, auth, cross-
 // region rollup, compliance pipeline, backup machinery, and system
 // health. Symmetric to the MC-side /api/regression/run rewrite in
@@ -3711,6 +3711,13 @@ function runGdRegression(db) {
     const missing = required.filter(c => !names.includes(c));
     if (missing.length > 0) throw new Error(`signing_keys missing columns: ${missing.join(', ')}`);
     return `${cols.length} columns, all required present`;
+  });
+
+  record('schema', 'users has no legacy-auth columns (B6i)', () => {
+    const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+    const leftover = cols.filter(c => c === 'mfa_secret' || c === 'mfa_enabled' || c === 'password_hash');
+    if (leftover.length > 0) throw new Error(`dead legacy-auth column(s) present: ${leftover.join(', ')}`);
+    return `no mfa_secret / mfa_enabled / password_hash (${cols.length} columns)`;
   });
 
   // ── Crypto (3) ─────────────────────────────────────────────────────────

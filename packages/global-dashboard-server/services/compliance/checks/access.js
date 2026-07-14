@@ -14,11 +14,10 @@
 //
 // PLATFORM STATE NOTES (GD-specific gaps relative to MC)
 //
-//   - GD has no password policy enforcement endpoint. The users table
-//     stores bcrypt hashes; the strength of the hash is verified at
-//     login but there is no enforced minimum length or complexity
-//     gate at password-set time. checkPasswordPolicy surfaces this
-//     honestly as a warning rather than a pass.
+//   - GD is passwordless: login is a user-verified FIDO2 hardware
+//     passkey (B5n3), so there is no password to set, store, or gate.
+//     users.password_hash was removed in B6i. checkPasswordPolicy
+//     reports the phishing-resistant posture as a pass.
 //   - GD's session timeout is HARDCODED at 8h in the login route's
 //     jwt.sign() call. CISO operations are infrequent and multi-step,
 //     so the longer timeout is a deliberate UX choice — but it exceeds
@@ -35,9 +34,9 @@
 //     Lock button (firealive-gd jsx line 800) but the server has no
 //     route handler. checkRoleSeparation warns that Config Lock SoD
 //     enforcement is deferred until server-side persistence lands.
-//   - GD users table has a single mfa_enabled column (INTEGER 0/1);
-//     no separate mfa_enrollment_required gate. checkMfaEnforcement
-//     adapts accordingly.
+//   - GD MFA is a FIDO2 hardware passkey (webauthn_credentials); the
+//     legacy mfa_secret / mfa_enabled columns were removed in B6i.
+//     checkMfaEnforcement counts passkey enrollment.
 //
 // FORWARD-COMPATIBLE PATTERN
 //
@@ -67,18 +66,18 @@ function tableExists(db, name) {
 }
 
 // ── checkPasswordPolicy ──────────────────────────────────────────────────────
-// Verifies the platform's password policy meets SOC-grade minimums.
-// GD has no explicit password-policy enforcement at password-set time;
-// bcrypt hashing is enforced at storage (see login route's bcrypt.compare)
-// but no minimum-length or complexity gate exists. Honest gap.
+// GD is passwordless: login is a user-verified FIDO2 hardware passkey
+// (B5n3), so there is no password to set, store, or gate. The password /
+// credential-management controls are satisfied by the phishing-resistant
+// hardware credential, which is stronger than any password policy.
 //
 // Maps to controls including: HIPAA 164.308(a)(5)(ii)(D), SOC 2 CC6.1,
 // NIST CSF PR.AA-03, ISO 27001 A.8.5, NIST 800-53 IA-5, NIS2 Art.21(2)(g),
 // Cyber Essentials "User access control".
 function checkPasswordPolicy() {
   return {
-    status: 'warning',
-    detail: 'Password storage: bcrypt hashing on users.password_hash. No enforced minimum length or complexity at password-set time on the GD server (no equivalent of MC\'s 12-char MIN_PASSWORD_LENGTH gate). Operator-side discipline required: set strong passwords for CISO/VP/readonly accounts at provisioning and rotate per organizational policy.',
+    status: 'pass',
+    detail: 'GD is passwordless: no passwords are stored (users.password_hash removed in B6i). Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant) whose attestation chains to bundled trusted-vendor roots -- stronger than any password-complexity policy.',
   };
 }
 
@@ -124,18 +123,12 @@ function checkAccountLockout(db) {
 }
 
 // ── checkMfaEnforcement ──────────────────────────────────────────────────────
-// Verifies the MFA enrollment posture across GD users. GD's schema has
-// a single mfa_enabled column (INTEGER 0/1) without a separate
-// mfa_enrollment_required gate. Login flow branches on mfa_enabled =
-// 1 to require an MFA code before issuing JWT; otherwise password is
-// sufficient.
-//
-// Note: the /api/auth/mfa-verify route is currently stubbed and
-// accepts any 6-digit code without verifying against users.mfa_secret.
-// That bug is tracked separately; for the compliance posture, the
-// honest description is that MFA-enabled users go through a verify
-// step but the verify is non-functional in v0.0.31. This check
-// inspects enrollment posture, not the verify-step quality.
+// Verifies the MFA enrollment posture across GD users. MFA is a FIDO2
+// hardware passkey (AAL3, phishing-resistant), recorded in
+// webauthn_credentials; the legacy mfa_secret / mfa_enabled columns and
+// the /api/auth/mfa-* routes were removed in B6i. Login is passkey-only
+// (B5n3): the server refuses a session without a user-verified hardware
+// passkey, so MFA is structurally enforced rather than optional.
 //
 // Maps to controls including: HIPAA 164.312(d), SOC 2 CC6.1,
 // NIST CSF PR.AA-02, ISO 27001 A.8.5, NIST 800-53 IA-2(1)/(2),
@@ -144,8 +137,11 @@ function checkMfaEnforcement(db) {
   const stats = db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN mfa_enabled = 1 THEN 1 ELSE 0 END) AS enrolled
-    FROM users
+      SUM(CASE WHEN EXISTS (
+        SELECT 1 FROM webauthn_credentials wc
+        WHERE wc.user_id = u.id AND wc.is_passwordless = 1
+      ) THEN 1 ELSE 0 END) AS enrolled
+    FROM users u
   `).get();
   if (stats.total === 0) {
     return { status: 'pass', detail: 'No users; MFA enforcement vacuously holds.' };
@@ -153,12 +149,12 @@ function checkMfaEnforcement(db) {
   if (stats.enrolled < stats.total) {
     return {
       status: 'warning',
-      detail: `${stats.enrolled} of ${stats.total} user(s) have MFA enabled. SOC-grade policy requires mfa_enabled = 1 for all CISO/VP/readonly accounts; provision unenrolled users with TOTP before granting production access.`,
+      detail: `${stats.enrolled} of ${stats.total} user(s) have a hardware passkey enrolled. SOC-grade policy requires a FIDO2 hardware passkey for every CISO/VP/readonly account before granting production access.`,
     };
   }
   return {
     status: 'pass',
-    detail: `MFA: ${stats.enrolled} of ${stats.total} users enrolled (mfa_enabled = 1). Login refuses JWT issuance for enrolled users until MFA verify completes.`,
+    detail: `MFA: ${stats.enrolled} of ${stats.total} users have a hardware passkey enrolled. Login is passkey-only; the server refuses to issue a session without a user-verified hardware passkey.`,
   };
 }
 
@@ -273,7 +269,7 @@ function checkIamIntegrationHealth(db) {
     if (idpIntegrations.length === 0) {
       return {
         status: 'pass',
-        detail: `All users use local bcrypt auth (${methods[0].c} users). No IdP integrations configured in integration_config — acceptable for deployments not using external IdPs.`,
+        detail: `All users use local FIDO2 passkey auth (${methods[0].c} users). No IdP integrations configured in integration_config — acceptable for deployments not using external IdPs.`,
       };
     }
     const dayMs = 24 * 60 * 60 * 1000;
@@ -314,7 +310,7 @@ function checkIamIntegrationHealth(db) {
   if (nonLocal.length === 0) {
     return {
       status: 'pass',
-      detail: `All users use local bcrypt auth (${methods[0].c} users). Per-user auth_method distribution: ${summary}.${recentSummary} Real SAML/OIDC/LDAP IdP integration planned for B5b (v1.0.51); integration_config table not yet present. Until then, auth_method is set per-user without per-integration health tracking.`,
+      detail: `All users use local FIDO2 passkey auth (${methods[0].c} users). Per-user auth_method distribution: ${summary}.${recentSummary} Real SAML/OIDC/LDAP IdP integration planned for B5b (v1.0.51); integration_config table not yet present. Until then, auth_method is set per-user without per-integration health tracking.`,
     };
   }
   return {

@@ -162,11 +162,11 @@ function checkAuditControls(db) {
 
 function checkAuthentication(db) {
   const ssoMethods = db.prepare("SELECT auth_method, COUNT(*) AS c FROM users GROUP BY auth_method").all();
-  const mfaEnrolled = db.prepare("SELECT COUNT(*) AS c FROM users WHERE mfa_enabled = 1").get();
+  const mfaEnrolled = db.prepare("SELECT COUNT(*) AS c FROM users u WHERE EXISTS (SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = u.id AND wc.is_passwordless = 1)").get();
   const totalUsers = db.prepare("SELECT COUNT(*) AS c FROM users").get();
   return {
     status: 'pass',
-    detail: `JWT (HS256, 8h expiry) + bcrypt password verification. MFA: ${mfaEnrolled.c}/${totalUsers.c} users enrolled. Auth methods: ${ssoMethods.map(m => `${m.auth_method}(${m.c})`).join(', ')}. SAML/OIDC/LDAP supported per users.auth_method column.`,
+    detail: `Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant); sessions are signed JWTs (HS256). Hardware passkey enrolled: ${mfaEnrolled.c}/${totalUsers.c} users. Auth methods: ${ssoMethods.map(m => `${m.auth_method}(${m.c})`).join(', ')}. SAML/OIDC/LDAP supported per users.auth_method column.`,
   };
 }
 
