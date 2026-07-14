@@ -101,7 +101,7 @@ module.exports = (checks) => ({
       id: 'PR.AA-03 [MFA]',
       name: 'Multi-Factor Authentication for Privileged Roles',
       check: checks.checkMfaEnforcement,
-      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts; real TOTP verification + WebAuthn/FIDO2 are future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts, satisfied by the phishing-resistant hardware passkey (present today).',
     },
     {
       id: 'PR.AA-05',
@@ -143,7 +143,7 @@ module.exports = (checks) => ({
       id: 'PR.PS-01',
       name: 'Configuration Management Practices are Established',
       check: checks.checkConfigLockState,
-      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock.',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and, like the MC config-lock, a phishing-resistant hardware-passkey step-up.',
     },
     {
       id: 'PR.PS-02',

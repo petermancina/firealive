@@ -57,13 +57,13 @@ function checkConfigLockState(db) {
   if (isProduction && lockState.lock_active === 0) {
     return {
       status: 'warning',
-      detail: 'NODE_ENV=production but Config Lock is not active (lock_active = 0). Production deployments should enable Config Lock to prevent unauthorized platform-configuration changes. Toggle via admin Config Lock UI with TOTP MFA.',
+      detail: 'NODE_ENV=production but Config Lock is not active (lock_active = 0). Production deployments should enable Config Lock to prevent unauthorized platform-configuration changes. Toggle via admin Config Lock UI with a hardware-passkey step-up.',
     };
   }
   if (lockState.lock_active === 1) {
     return {
       status: 'pass',
-      detail: `Config Lock active (locked_at=${lockState.locked_at}, locked_by_user_id=${lockState.locked_by_user_id || 'NULL'}). Platform-configuration routes gated; modifications require unlock + admin role + TOTP MFA.`,
+      detail: `Config Lock active (locked_at=${lockState.locked_at}, locked_by_user_id=${lockState.locked_by_user_id || 'NULL'}). Platform-configuration routes gated; modifications require unlock + admin role + a hardware-passkey step-up.`,
     };
   }
   return {

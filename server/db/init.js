@@ -5164,16 +5164,19 @@ function initDb() {
 
   // ── R3f migration: MFA enforcement + recovery codes ──────────────────
   //
-  // Adds three columns to users for SOC-grade MFA enforcement at login,
-  // and a new mfa_consumed_jtis table for the two-step login flow:
+  // Adds the mfa_enrollment_required column to users for SOC-grade MFA
+  // enforcement at login, and a new mfa_consumed_jtis table:
   //
   //   mfa_enrollment_required        Set to 1 for all roles. Login
-  //                                  refuses to issue a JWT when this
-  //                                  is set and totp_enrolled_at IS
-  //                                  NULL.
-  //   totp_recovery_codes_hashed     JSON array of bcrypt hashes of
-  //                                  single-use recovery codes.
-  //   totp_recovery_codes_remaining  Cached count for UI display.
+  //                                  refuses to issue a session when this
+  //                                  is set and the user has no
+  //                                  login-capable passkey in
+  //                                  webauthn_credentials.
+  //
+  // (The original R3f also added totp_recovery_codes_hashed and
+  //  totp_recovery_codes_remaining; those columns were dropped in B6i when
+  //  login became passwordless FIDO2. This migration now adds only
+  //  mfa_enrollment_required.)
   //
   // The two-step login flow uses a short-lived signed JWT (5-minute
   // TTL, mfa_pending claim) as the bridge token between password
@@ -5428,8 +5431,8 @@ function initDb() {
   // routes (KMS provider switch, GD push config, HR integration creds,
   // IAM role changes, audit log purges, integration onboarding). When
   // lock_active=1, those routes refuse with 423 Locked until an admin
-  // unlocks via POST /api/config/lock with a fresh MFA proof (TOTP or
-  // single-use recovery code, per the R3f mfa-stepup middleware factory).
+  // unlocks via POST /api/config/lock with a fresh WebAuthn hardware-passkey
+  // step-up (via the mfa-stepup middleware factory).
   //
   // Design properties:
   //
@@ -5447,7 +5450,7 @@ function initDb() {
   //      ready" action.
   //
   //   3. MFA REQUIRED IN BOTH DIRECTIONS. Lock and unlock both require
-  //      a fresh TOTP / recovery code via the mfa-stepup middleware.
+  //      a fresh WebAuthn hardware-passkey step-up via the mfa-stepup middleware.
   //      Symmetric -- no escape hatch where an attacker with a stolen
   //      session could lock the legitimate admin out without proving
   //      possession of the second factor.

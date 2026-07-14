@@ -139,7 +139,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(e) [Acquisition]',
       name: 'Security in Acquisition, Development, Maintenance -- Config Lock',
       check: checks.checkConfigLockState,
-      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and, like the MC config-lock, a phishing-resistant hardware-passkey step-up. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     {
       id: 'Art.21(2)(e) [Patch]',

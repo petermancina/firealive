@@ -25,7 +25,7 @@
 //   • users.email (the SSO join key)
 //   • users.username, external_id, geo_country
 //   • last_heartbeat, capacity_score, available, last_iam_check
-//   • mfa state, role, totp_*, anything else
+//   • mfa state, role, anything else
 //
 // Pool intelligence (count by tier/shift) IS inferable from this response,
 // but is already inferable from GET /api/team/overview (lead/admin) and

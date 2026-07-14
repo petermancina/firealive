@@ -24,12 +24,12 @@
 //   manage the keys that protect every backup. No per-handler
 //   role tightening; the auth gate is at the mount.
 //
-// No TOTP step-up:
+// No hardware-passkey step-up:
 //   Unlike POST /api/restore-approvals/:id/approve, these endpoints
-//   do NOT require TOTP step-up. The destructive surface is bounded
+//   do NOT require a hardware-passkey step-up. The destructive surface is bounded
 //   by the service-level guards (seed-row protection, default-row
 //   protection, last-enabled-row protection) and every mutation is
-//   audit-logged. A future commit may add TOTP step-up on
+//   audit-logged. A future commit may add a hardware-passkey step-up on
 //   set-default and delete if SOC-audit experience suggests it's
 //   warranted.
 //

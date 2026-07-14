@@ -163,7 +163,7 @@ module.exports = (checks) => ({
       id: 'A.8.9',
       name: 'Configuration Management',
       check: checks.checkConfigLockState,
-      mapping: 'Configurations, including security configurations, of hardware, software, services and networks established, documented, implemented, monitored and reviewed. GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock.',
+      mapping: 'Configurations, including security configurations, of hardware, software, services and networks established, documented, implemented, monitored and reviewed. GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and, like the MC config-lock, a phishing-resistant hardware-passkey step-up.',
     },
     {
       id: 'A.8.13',

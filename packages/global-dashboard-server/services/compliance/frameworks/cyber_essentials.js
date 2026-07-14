@@ -108,7 +108,7 @@ module.exports = (checks) => ({
       id: 'CE-2.2',
       name: 'Secure Configuration -- Change Control',
       check: checks.checkConfigLockState,
-      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and hardened beyond the MC TOTP-MFA unlock. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
+      mapping: 'GD Config Lock server-side persistence is live (the config_lock_state singleton; the config-write chokepoint refuses writes while the GD is locked). Unlock requires a fresh hardware-passkey assertion (a UV step-up), the GD twin of the MC R3e v1.0.32 config-lock and, like the MC config-lock, a phishing-resistant hardware-passkey step-up. Configuration-change discipline is additionally backed by route-middleware role gating (CISO-only writes).',
     },
     {
       id: 'CE-2.3',
@@ -139,7 +139,7 @@ module.exports = (checks) => ({
       id: 'CE-3.4',
       name: 'User Access Control -- Multi-Factor Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts; real TOTP verification lands in a future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts, satisfied by the hardware passkey.',
     },
     {
       id: 'CE-3.5',
