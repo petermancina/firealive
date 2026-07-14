@@ -31,28 +31,23 @@ function signToken(user, cnf) {
 /**
  * Verify and decode an auth JWT.
  *
- * MFA BRIDGE JWT ASSERTION
+ * MFA BRIDGE JWT ASSERTION (defense-in-depth)
  *
- * Rejects any token carrying mfa_pending=true. The MFA-bridge JWT
- * issued by routes/auth.js POST /login (and consumed by /login-mfa
- * + /login-enroll-confirm) carries this claim to mark itself as a
- * partial-login token, valid ONLY at the MFA-step endpoints. A
- * bridge JWT presented to a protected route -- whether by accident,
- * misuse, or attack -- is refused here regardless of whether the
- * signature, exp, and other structural checks pass.
+ * Rejects any token carrying mfa_pending=true. The original R3f two-step
+ * login flow used such an mfa_pending bridge JWT between password
+ * verification and a second factor; that flow was removed when login became
+ * passwordless single-step WebAuthn, so no route issues a bridge JWT today
+ * (the /login-mfa and /login-enroll-confirm endpoints, and the
+ * mfa_consumed_jtis denylist, are gone). This assertion is kept deliberately:
+ * if an mfa_pending token ever appears -- via a future refactor that
+ * reintroduces bridge tokens, by accident, or by attack -- it is refused for
+ * authentication regardless of whether the signature, exp, and other
+ * structural checks pass.
  *
  * The error is shaped as a JsonWebTokenError so existing consumers
- * (authMiddleware below, websocket-server.js, password.js, the /me
- * + /refresh endpoints in routes/auth.js) handle it via their
- * existing invalid-token branches without code changes.
- *
- * Defense-in-depth: today the auth-JWT payload uses the `id` claim
- * and the bridge-JWT payload uses `sub`, so a bridge JWT presented
- * here would fail downstream when consumers read decoded.id and
- * find undefined. That asymmetry is real but implicit -- if
- * signToken is ever refactored to use `sub` (the more conventional
- * JWT field), the implicit protection silently disappears. The
- * explicit assertion below survives that refactor.
+ * (authMiddleware below, websocket-server.js, the /me + /refresh endpoints in
+ * routes/auth.js) handle it via their existing invalid-token branches without
+ * code changes.
  */
 function verifyToken(token) {
   const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });

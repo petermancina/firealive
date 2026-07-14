@@ -5162,47 +5162,23 @@ function initDb() {
     console.error('The server will start, but legacy config snapshots may remain in team_config until the migration is investigated. New snapshots are unaffected.');
   }
 
-  // ── R3f migration: MFA enforcement + recovery codes ──────────────────
+  // -- R3f migration: MFA enrollment flag --------------------------------------
   //
-  // Adds the mfa_enrollment_required column to users for SOC-grade MFA
-  // enforcement at login, and a new mfa_consumed_jtis table:
+  // Adds users.mfa_enrollment_required (1 for all roles). Login refuses to
+  // issue a session for a user with this flag set who has not enrolled a
+  // login-capable FIDO2 hardware passkey in webauthn_credentials (B5n3).
   //
-  //   mfa_enrollment_required        Set to 1 for all roles. Login
-  //                                  refuses to issue a session when this
-  //                                  is set and the user has no
-  //                                  login-capable passkey in
-  //                                  webauthn_credentials.
+  // Historical note: the original R3f (v1.0.30-31) also added a TOTP two-step
+  // login flow -- an mfa_pending bridge JWT between password verification and a
+  // second factor, verified at /api/auth/login-mfa and
+  // /api/auth/login-enroll-confirm, plus the totp_recovery_codes_* columns and
+  // an mfa_consumed_jtis replay denylist. That entire flow was removed when
+  // login became passwordless single-step WebAuthn: the routes and the bridge
+  // token are gone, the totp_* columns were dropped in B6i, and the
+  // mfa_consumed_jtis table in B6i-3e. This migration now adds only
+  // mfa_enrollment_required.
   //
-  // (The original R3f also added totp_recovery_codes_hashed and
-  //  totp_recovery_codes_remaining; those columns were dropped in B6i when
-  //  login became passwordless FIDO2. This migration now adds only
-  //  mfa_enrollment_required.)
-  //
-  // The two-step login flow uses a short-lived signed JWT (5-minute
-  // TTL, mfa_pending claim) as the bridge token between password
-  // verification and the second factor. The JWT is HMAC-SHA256 signed
-  // with the existing JWT_SECRET; verification at /api/auth/login-mfa
-  // and /api/auth/login-enroll-confirm is by signature check (not by
-  // hash-then-DB-lookup). The mfa_consumed_jtis table is a denylist
-  // of JTIs that have been spent, ensuring single-use semantics: once
-  // a JWT's JTI is in the denylist, that token cannot be replayed
-  // even if the signature still verifies and the exp has not passed.
-  // Rows are pruned by expires_at on a periodic basis.
-  //
-  // This design eliminates the "plaintext credential token hashed for
-  // DB lookup" pattern entirely. There is no plaintext-token sink
-  // flowing into a hash function in the verification path: the bridge
-  // token IS its signature, and verification is signature-validation.
-  // No keyed HMAC of user-supplied input, no indexed-lookup-by-hash,
-  // no input that a static analyzer could mistake for a password
-  // hash. Single-use enforcement happens at INSERT-time on the JTI
-  // denylist with ON CONFLICT DO NOTHING + changes() check; this is
-  // race-safe and replay-safe.
-  //
-  // Idempotent: column-presence checks for each ALTER TABLE; CREATE
-  // TABLE IF NOT EXISTS for the new table; DROP TABLE IF EXISTS for
-  // the legacy mfa_login_sessions table that R3f preview installs
-  // may have created.
+  // Idempotent: column-presence check for the ALTER TABLE.
   try {
     const usersCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
     if (!usersCols.includes('mfa_enrollment_required')) {
@@ -5396,33 +5372,15 @@ function initDb() {
     console.error('The server will start, but sock-puppet detection (C8) cannot operate until investigated.');
   }
 
-  // mfa_consumed_jtis: denylist of MFA-bridge JWT IDs (jti claim) that
-  // have already been spent. Single-use enforcement: when /api/auth/
-  // login-mfa or /api/auth/login-enroll-confirm successfully verifies
-  // an MFA-bridge JWT and is ready to issue the real auth JWT, it
-  // INSERTs the JTI here under ON CONFLICT DO NOTHING; if the row
-  // already existed, that's a replay attempt and the request fails.
-  //
-  // expires_at mirrors the JWT's exp claim (Unix-ms epoch). Once
-  // expires_at < now(), the JWT itself would no longer verify (jwt
-  // library throws TokenExpiredError), so the denylist row no longer
-  // adds value; periodic pruning removes expired rows to keep the
-  // table small.
-  //
-  // The legacy mfa_login_sessions table from R3f preview installs is
-  // dropped here. Production never saw v1.0.31 with that table; only
-  // dev / test environments that ran the preview migrations have it.
-  // DROP IF EXISTS is a no-op on installs that never had it.
+  // Legacy two-step-login tables from the removed R3f TOTP flow. Both are
+  // dropped here (idempotent): mfa_login_sessions was an R3f-preview artifact
+  // production never saw, and mfa_consumed_jtis was the mfa_pending-bridge
+  // replay denylist -- with login now single-step WebAuthn, no bridge JWTs are
+  // issued or consumed, so the denylist had no writer or reader (removed in
+  // B6i-3e). DROP IF EXISTS is a no-op on installs that never had them.
   db.exec(`
     DROP TABLE IF EXISTS mfa_login_sessions;
-
-    CREATE TABLE IF NOT EXISTS mfa_consumed_jtis (
-      jti TEXT PRIMARY KEY,                    -- JWT ID claim, hex-encoded random bytes
-      consumed_at INTEGER NOT NULL,            -- ms-epoch when single-use was spent
-      expires_at INTEGER NOT NULL              -- ms-epoch == JWT's exp claim * 1000; row prunable after this
-    );
-    CREATE INDEX IF NOT EXISTS idx_mfa_consumed_jtis_expires_at
-      ON mfa_consumed_jtis(expires_at);
+    DROP TABLE IF EXISTS mfa_consumed_jtis;
   `);
 
   // R3e schema additions (v1.0.32) -- Config Lock with MFA.

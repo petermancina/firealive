@@ -13,7 +13,7 @@
 // The pre-R3k implementation (68 lines, 32 checks) was authored against
 // a schema snapshot that has since drifted: it queried tables that no
 // longer exist canonically (config -> team_config; backup_history ->
-// backups; mfa_tokens -> mfa_consumed_jtis; feature_toggles and
+// backups; feature_toggles and
 // integration_status -> not canonical at all), with most checks
 // silent-failing inside try/catch so the response was almost entirely
 // noise. R3k absorbs what BUILD-PLAN-v22 had described as the deferred
@@ -28,8 +28,8 @@
 //   2. Crypto                — AES-256-GCM, SHA-256, Ed25519, NaCl
 //                               box round-trips; CSPRNG presence
 //                               implied by the round-trips
-//   3. Auth                  — JWT_SECRET configured, api_keys and
-//                               mfa_consumed_jtis present; passwordless
+//   3. Auth                  — JWT_SECRET configured, api_keys present;
+//                               passwordless
 //                               PKI + WebAuthn: a CA issue/verify/revoke/
 //                               CRL round-trip, WebAuthn + step-up wiring,
 //                               break-glass recovery, LDAP directory
@@ -335,8 +335,8 @@ class RegressionRunner {
       if (!s || s.length < 16) throw new Error('JWT_SECRET not set or too short (<16 chars)');
       return 'configured (' + s.length + ' chars)';
     });
-    await check('auth', 'api_keys + mfa_consumed_jtis tables', () => {
-      return requireAll(['api_keys', 'mfa_consumed_jtis']);
+    await check('auth', 'api_keys table', () => {
+      return requireAll(['api_keys']);
     });
     await check('auth', 'JWT session round-trip (HS256 sign / verify / tamper-reject)', () => {
       // Passwordless system: the only login-time secret exercised here is the
