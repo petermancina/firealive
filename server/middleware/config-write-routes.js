@@ -71,7 +71,6 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/edr/config' },
   { method: 'PUT',  path: '/api/kms/config' },
   { method: 'PUT',  path: '/api/network/wifi-policy' },
-  { method: 'PUT',  path: '/api/mfa/config' },
   { method: 'PUT',  path: '/api/threat-hunting/config' },
   { method: 'PUT',  path: '/api/tripwire/config' },
   { method: 'PUT',  path: '/api/auth-logs/notification-config' },
