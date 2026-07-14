@@ -1112,21 +1112,6 @@ export default function AnalystClientApp() {
   const [selfUserId, setSelfUserId] = useState(null);
   const [burnoutReady, setBurnoutReady] = useState(false); // login → welcome → app
   const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [mfaCode, setMfaCode] = useState("");
-  // R3g login flow state. loginStage replaces the previous mfaStep boolean
-  // and adds enroll-start / enroll-confirm / recovery-display stages so
-  // analysts subject to mfa_enrollment_required (per R3f-pt2) can enroll
-  // their first authenticator at login time.
-  const [loginStage, setLoginStage] = useState("creds");
-    // creds | mfa | enroll-start | enroll-confirm | recovery-display
-  const [mfaSessionToken, setMfaSessionToken] = useState(null);
-  const [recoveryCodeInput, setRecoveryCodeInput] = useState("");
-  const [useRecoveryLogin, setUseRecoveryLogin] = useState(false);
-  const [enrollData, setEnrollData] = useState(null);
-  const [enrollConfirmCode, setEnrollConfirmCode] = useState("");
-  const [recoveryCodesDisplay, setRecoveryCodesDisplay] = useState(null);
-  const [pendingLoginResponse, setPendingLoginResponse] = useState(null);
   const [loginInFlight, setLoginInFlight] = useState(false);
   const [apiMode, setApiMode] = useState(null); // null=probing, true=backend, false=demo
   const [loginError, setLoginError] = useState("");
@@ -2771,7 +2756,7 @@ export default function AnalystClientApp() {
         </div>
         <div style={{display:"flex",gap:8}}>
           <Btn small onClick={()=>setShowHelp(!showHelp)}>Help</Btn>
-          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setBurnoutReady(false);try{window.firealive&&window.firealive.invoke&&window.firealive.invoke("burnout:lock");}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
+          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_ac_refresh_token');}catch(_e){}setBurnoutReady(false);try{window.firealive&&window.firealive.invoke&&window.firealive.invoke("burnout:lock");}catch(_e){}setStage("login");setUsername("");setLoginError("");logC("SIGN_OUT","Signed out");}}>Sign Out</Btn>
         </div>
       </div>
       {breakPrompt&&featureToggles.proactive_interventions!==false&&(<div style={{padding:"12px 24px",background:"rgba(167,139,250,0.08)",borderBottom:`1px solid ${C.p}30`}}>

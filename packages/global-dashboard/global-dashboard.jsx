@@ -1528,20 +1528,6 @@ export default function GlobalDashboard() {
   },[]);
   const [gdServerUrl, setGdServerUrl] = useState("https://localhost:4001");
   const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [mfaCode, setMfaCode] = useState("");
-  // R3f login flow state. loginStage replaces the previous mfaStep boolean
-  // and adds enroll-start / enroll-confirm / recovery-display stages for
-  // the enrollment-required and post-enroll recovery-codes flows.
-  const [loginStage, setLoginStage] = useState("creds");
-    // creds | mfa | enroll-start | enroll-confirm | recovery-display
-  const [mfaSessionToken, setMfaSessionToken] = useState(null);
-  const [recoveryCodeInput, setRecoveryCodeInput] = useState("");
-  const [useRecoveryLogin, setUseRecoveryLogin] = useState(false);
-  const [enrollData, setEnrollData] = useState(null);
-  const [enrollConfirmCode, setEnrollConfirmCode] = useState("");
-  const [recoveryCodesDisplay, setRecoveryCodesDisplay] = useState(null);
-  const [pendingLoginResponse, setPendingLoginResponse] = useState(null);
   const [loginError, setLoginError] = useState("");
   const [loginInFlight, setLoginInFlight] = useState(false);
   const [firstLaunch, setFirstLaunch] = useState(true);
@@ -2638,7 +2624,7 @@ export default function GlobalDashboard() {
         </div>
         <div style={{display:"flex",gap:8}}>
           <Btn small onClick={()=>setShowHelp(!showHelp)}>Help</Btn>
-          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_gd_refresh_token');}catch(_e){}setStage("login");setUsername("");setPassword("");setMfaCode("");setLoginStage("creds");setMfaSessionToken(null);setRecoveryCodeInput("");setUseRecoveryLogin(false);setEnrollData(null);setEnrollConfirmCode("");setRecoveryCodesDisplay(null);setPendingLoginResponse(null);setLoginError("");setRegions([]);}}>Sign Out</Btn>
+          <Btn small onClick={()=>{api.setToken(null);try{localStorage.removeItem('fa_gd_refresh_token');}catch(_e){}setStage("login");setUsername("");setLoginError("");setRegions([]);}}>Sign Out</Btn>
         </div>
       </div>
 
@@ -3220,16 +3206,11 @@ export default function GlobalDashboard() {
             <GdFidoTrustSection/>
           </div>)}
 
-          {/* ══════════ R3f — MFA SELF-SERVICE + ADMIN POLICY ══════════ */}
+          {/* ══════════ MFA SELF-SERVICE (hardware passkey) ══════════ */}
           {tab==="mfa"&&(<div>
             <L>Multi-Factor Authentication</L>
             <MyMfaSecuritySection/>
-            <Card>
-              <Sel label="MFA method"><option value="totp">TOTP (Authenticator app)</option><option value="webauthn">WebAuthn / FIDO2 (hardware key)</option><option value="push">Push notification</option></Sel>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Require MFA for all users</M></label>
-              <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}><input type="checkbox" defaultChecked/><M style={{color:C.t}}>Require MFA for report generation</M></label>
-              <M style={{color:C.td,display:"block",marginTop:8}}>NIST 800-63B compliant. TOTP with SHA-1, 6-digit, 30-second window.</M>
-            </Card>
+            <M style={{color:C.tm,display:"block",marginTop:16,lineHeight:1.6}}>MFA is enforced: operators sign in with a user-verified FIDO2 hardware passkey (WebAuthn, AAL3, phishing-resistant). There is no password and no TOTP. Manage your registered keys above.</M>
           </div>)}
 
           {/* ══════════ POSTURE ASSESSMENT ══════════ */}
@@ -3597,7 +3578,7 @@ export default function GlobalDashboard() {
                 <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>Hand the lease to the peer. This node steps down FIRST and stays a standby; the peer then promotes. If it cannot be reached, it promotes on its own once it notices this node is gone. There is no undo from here -- to come back, run a manual failover from the node that is then active.</M>
                 {haConfirm==="failover"?(<div>
                   <M style={{color:C.d,display:"block",marginBottom:10}}>This node will stop serving writes. Continue?</M>
-                  <Btn primary disabled={haBusy!==""} onClick={async()=>{setHaConfirm(null);const r=await haRun("failover",()=>api.post("/api/ha/manual-failover",{}));if(r)setHaMsg({kind:"ok",text:"Stepped down. "+(r.peerPromoted?("Peer promoted at epoch "+(r.peerEpoch||"?")+"."):(r.note||"Peer will promote on its own."))});}}>{haBusy==="failover"?"Handing over...":"Yes, step down"}</Btn>
+                  <Btn primary disabled={haBusy!==""} onClick={async()=>{setHaConfirm(null);const r=await haRun("failover",()=>stepUp("/api/ha/manual-failover",{}));if(r)setHaMsg({kind:"ok",text:"Stepped down. "+(r.peerPromoted?("Peer promoted at epoch "+(r.peerEpoch||"?")+"."):(r.note||"Peer will promote on its own."))});}}>{haBusy==="failover"?"Handing over...":"Yes, step down"}</Btn>
                   <Btn style={{marginLeft:8}} onClick={()=>setHaConfirm(null)}>Cancel</Btn>
                 </div>):(<Btn disabled={haBusy!==""} onClick={()=>setHaConfirm("failover")}>Step down and hand over</Btn>)}
               </Card>)}

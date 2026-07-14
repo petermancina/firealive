@@ -3182,7 +3182,6 @@ function ManagementConsole() {
   const [wifiPolicy, setWifiPolicy] = useState({minimumProtocol:"wpa2_enterprise",wpa3Preferred:true,blockWpa2Personal:true,requireDot1x:true,warnOnInsecure:true,disconnectOnInsecure:false});
   // ── v1.0.0 NEW STATE ──────────────────────────────────────────────────
   // MFA wizard
-  const [mfaCfg, setMfaCfg] = useState({enabled:false,method:"totp",enforceForAll:true,graceLogins:3,rememberDeviceDays:30,backupCodes:true,status:"not_configured"});
   // Threat hunting integrations (expanded beyond EDR)
   const [threatHuntCfg, setThreatHuntCfg] = useState({xdr:{enabled:false,provider:null,behaviorMonitoring:true,consumptionMetrics:true},atp:{enabled:false,provider:null},ngav:{enabled:false,provider:null,realTimeScan:true},mspScanner:{enabled:false,provider:null,agentId:""}});
   // Tripwire (B4 — server-backed)
@@ -4845,7 +4844,7 @@ function ManagementConsole() {
             <button onClick={()=>setShowSetupWizard(true)} style={{width:"100%",padding:"8px 12px",background:"rgba(110,231,183,0.08)",border:`1px solid ${C.a}30`,borderRadius:8,color:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Setup Wizard</button>
             <button onClick={()=>{setShowWelcome(true);setWelcomeStep(0);}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(96,165,250,0.08)",border:`1px solid ${C.i}30`,borderRadius:8,color:C.i,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Welcome Guide</button>
             <button onClick={()=>setTab("help_mc")} style={{width:"100%",marginTop:6,padding:"8px 12px",background:"rgba(167,139,250,0.08)",border:`1px solid ${C.p}30`,borderRadius:8,color:C.p,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>Help</button>
-            <button onClick={async()=>{const code=window.prompt("Enter your 6-digit MFA code to "+(configLocked?"unlock":"lock")+" all configurations:");if(!code||code.length<6){if(code!==null)window.alert("Invalid MFA code. Configurations remain "+(configLocked?"locked":"unlocked")+".");return;}const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",totp_code:code});if(r&&!r.error){setConfigLocked(!!r.lock_active);setLockInfo({auto_relock_at:r.auto_relock_at,idle_minutes:r.idle_minutes});addA(r.lock_active?"MASTER_LOCK":"MASTER_UNLOCK","All configurations "+(r.lock_active?"locked":"unlocked (MFA verified)"));}else{window.alert("Lock toggle failed: "+(r?.error||"unknown error"));addA("MASTER_LOCK_FAIL",r?.error||"unknown");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":("🔓 Configs Unlocked (MFA to lock)"+(lockInfo&&lockInfo.auto_relock_at?(" - auto-relocks in ~"+Math.max(0,Math.ceil((lockInfo.auto_relock_at-Date.now())/60000))+"m"):""))}</button>
+            <button onClick={async()=>{const stepup=await getStepUp();if(!stepup){return;}const r=await api.post("/api/config/lock",{action:configLocked?"unlock":"lock",stepup});if(r&&!r.error){setConfigLocked(!!r.lock_active);setLockInfo({auto_relock_at:r.auto_relock_at,idle_minutes:r.idle_minutes});addA(r.lock_active?"MASTER_LOCK":"MASTER_UNLOCK","All configurations "+(r.lock_active?"locked":"unlocked (MFA verified)"));}else{window.alert("Lock toggle failed: "+(r?.error||"unknown error"));addA("MASTER_LOCK_FAIL",r?.error||"unknown");}}} style={{width:"100%",marginTop:6,padding:"8px 12px",background:configLocked?"rgba(239,68,68,0.06)":"rgba(110,231,183,0.06)",border:`1px solid ${configLocked?C.d+"30":C.a+"30"}`,borderRadius:8,color:configLocked?C.d:C.a,fontSize:10,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer"}}>{configLocked?"🔒 Configs Locked (MFA to unlock)":("🔓 Configs Unlocked (MFA to lock)"+(lockInfo&&lockInfo.auto_relock_at?(" - auto-relocks in ~"+Math.max(0,Math.ceil((lockInfo.auto_relock_at-Date.now())/60000))+"m"):""))}</button>
           </div>
         </div>
         <div style={{flex:1,overflowY:"auto"}}>
@@ -4873,7 +4872,7 @@ function ManagementConsole() {
           {setupStep===1&&(<div>
             <L>Step 2: Core Security</L>
             <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>We'll now configure MFA, pseudonyms, and basic security. These are the highest-priority settings.</M>
-            <Card style={{marginBottom:12,padding:12,borderColor:C.a+"30"}}><M style={{color:C.a,fontWeight:500}}>MFA → </M><M style={{color:C.tm}}>Go to Security → MFA to configure TOTP or WebAuthn</M></Card>
+            <Card style={{marginBottom:12,padding:12,borderColor:C.a+"30"}}><M style={{color:C.a,fontWeight:500}}>MFA → </M><M style={{color:C.tm}}>Go to Security → MFA to enroll your FIDO2 hardware passkey</M></Card>
             <Card style={{marginBottom:12,padding:12,borderColor:C.p+"30"}}><M style={{color:C.p,fontWeight:500}}>Pseudonyms → </M><M style={{color:C.tm}}>Go to Analysts → Pseudonyms to enable analyst identity protection</M></Card>
             <Card style={{marginBottom:12,padding:12,borderColor:C.i+"30"}}><M style={{color:C.i,fontWeight:500}}>Posture Assessment → </M><M style={{color:C.tm}}>Go to Security → Posture Assessment to set client requirements</M></Card>
             <div style={{display:"flex",gap:8,marginTop:16}}><Btn onClick={()=>setSetupStep(0)}>← Back</Btn><Btn primary onClick={()=>setSetupStep(2)}>Continue →</Btn></div>
@@ -7611,7 +7610,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             {[
               {n:"Tripwire",s:tripwireCfg.enabled?(tripwireTriggered?"TRIGGERED":"armed"):"disabled",d:tripwireCfg.enabled?"Threshold: "+tripwireCfg.threshold_pct+"% analysts in reduced routing":"Not enabled \u2014 see Tripwire tab"},
               {n:"Posture Assessment",s:postureCfg.enabled?"enabled":"disabled",d:postureCfg.enabled?Object.values(postureCfg.checks).filter(v=>v===true).length+" checks active \u00b7 "+(postureCfg.blockOnFail?"strict":"warn")+" mode":"Not enabled \u2014 see Posture tab"},
-              {n:"MFA",s:mfaCfg.status==="configured"?"configured":"pending",d:mfaCfg.status==="configured"?"Method: "+mfaCfg.method+" \u00b7 Enforce all: "+(mfaCfg.enforceForAll?"yes":"no"):"Not configured \u2014 see MFA tab"},
+              {n:"MFA",s:"enforced",d:"FIDO2 hardware passkey (WebAuthn) required at login"},
               {n:"Pseudonym System",s:pseudonymCfg.enabled?"active":"disabled",d:pseudonymCfg.enabled?analystPseudonyms.length+" analysts pseudonymized":"Not enabled \u2014 see Pseudonyms tab"},
               {n:"Fail-Open Routing",s:failOpenCfg.enabled?"enabled":"disabled",d:failOpenCfg.enabled?"Auto-detect failure \u00b7 Restore auto: "+(failOpenCfg.restoreAuto?"yes":"no"):"Not enabled \u2014 see Fail-Open tab"},
               {n:"WiFi Security Policy",s:"configured",d:"Min: "+wifiPolicy.minimumProtocol.replace(/_/g," ")+" \u00b7 WPA3 preferred: "+(wifiPolicy.wpa3Preferred?"yes":"no")+" \u00b7 Block PSK: "+(wifiPolicy.blockWpa2Personal?"yes":"no")},
@@ -8377,31 +8376,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Btn primary onClick={()=>api.put("/api/network/wifi-policy",wifiPolicy).then(r=>saved(r,"WIFI_POLICY_SAVED","WiFi security policy saved"))}>Save WiFi Policy</Btn>
         </div>)}
 
-        {/* ══════════ R3f — MFA SELF-SERVICE + ADMIN POLICY ══════════ */}
+        {/* ══════════ MFA SELF-SERVICE (hardware passkey) ══════════ */}
         {tab==="mfa"&&(<div>
           <L>Multi-Factor Authentication</L>
             <MyMfaSecuritySection/>
-          <M style={{color:C.tm,display:"block",marginTop:16,marginBottom:16,lineHeight:1.6}}>Configure MFA policy for FireAlive's built-in authentication. If you use enterprise IAM (SAML/OIDC) with MFA already enforced at the IdP, this is redundant — your IdP handles MFA. The policy below is for deployments without IAM integration.</M>
-          <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={mfaCfg.enabled} onChange={e=>setMfaCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable built-in MFA</label>
-            <Sel label="MFA Method" value={mfaCfg.method} onChange={e=>setMfaCfg(prev=>({...prev,method:e.target.value}))}>
-              <option value="totp">TOTP (Google Authenticator, Authy, etc.)</option>
-              <option value="webauthn">WebAuthn / FIDO2 (hardware key — YubiKey, etc.)</option>
-              <option value="totp_or_webauthn">TOTP or WebAuthn (user choice)</option>
-            </Sel>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",cursor:"pointer"}}><input type="checkbox" checked={mfaCfg.enforceForAll} onChange={e=>setMfaCfg(prev=>({...prev,enforceForAll:e.target.checked}))}/><M style={{color:C.t}}>Enforce MFA for all users (team lead + analysts)</M></label>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Grace logins before enforcement" value={mfaCfg.graceLogins} onChange={e=>setMfaCfg(prev=>({...prev,graceLogins:parseInt(e.target.value)||0}))} type="number"/>
-              <Input label="Remember device (days)" value={mfaCfg.rememberDeviceDays} onChange={e=>setMfaCfg(prev=>({...prev,rememberDeviceDays:parseInt(e.target.value)||0}))} type="number"/>
-            </div>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",cursor:"pointer"}}><input type="checkbox" checked={mfaCfg.backupCodes} onChange={e=>setMfaCfg(prev=>({...prev,backupCodes:e.target.checked}))}/><M style={{color:C.t}}>Generate one-time backup codes (10 codes, SHA-256 hashed at rest)</M></label>
-          </Card>
-          <Card style={{marginBottom:16,padding:12,borderColor:C.i+"30"}}>
-            <M style={{color:C.i,fontWeight:500,display:"block",marginBottom:4}}>Password Policy (NIST 800-63B compliant)</M>
-            <M style={{color:C.tm,lineHeight:1.8}}>Minimum 12 characters · No composition rules (no forced symbols/uppercase/numbers) · No mandatory rotation — password changes only on evidence of compromise · Passwords checked against breached password databases (HaveIBeenPwned k-anonymity API) · bcrypt with cost factor 12 (not plain SHA/MD5) · Account lockout after 10 failed attempts (15-min progressive backoff) · All passwords salted with per-user cryptographically random salt</M>
-          </Card>
-          <M style={{color:C.td,display:"block",marginBottom:12,fontStyle:"italic"}}>This follows current NIST SP 800-63B guidance: no complexity rules, no forced rotation, breach-checking, and strong hashing. The old 90-day rotation + complexity rules are deprecated because they cause password reuse and sticky notes.</M>
-          <Btn primary onClick={()=>{ setMfaCfg(prev=>({...prev,status:"configured"})); addA("MFA_CONFIG_SAVED","MFA configuration saved — method: "+mfaCfg.method); }}>Save MFA Config</Btn>
+          <M style={{color:C.tm,display:"block",marginTop:16,lineHeight:1.6}}>MFA is enforced: operators sign in with a user-verified FIDO2 hardware passkey (WebAuthn, AAL3, phishing-resistant). There is no password and no TOTP. Manage your registered keys above.</M>
         </div>)}
 
         {/* ══════════ v1.0.0 — THREAT HUNTING INTEGRATIONS ══════════ */}
@@ -8804,14 +8783,15 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginBottom:16}}>
             <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Failover Operations</div>
             <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
-              <Btn disabled={haManualFailover} style={{borderColor:C.d+"60",color:C.d}} onClick={()=>{
+              <Btn disabled={haManualFailover} style={{borderColor:C.d+"60",color:C.d}} onClick={async()=>{
                 if(!window.confirm("MANUAL FAILOVER: step this active node down and promote the standby? This node becomes passive."))return;
+                const stepup=await getStepUp();
+                if(!stepup){return;}
                 setHaManualFailover(true);
-                api.post("/api/ha/manual-failover",{}).then(r=>{
-                  if(r&&r.error){window.alert("Manual failover: "+r.error);addA("HA_MANUAL_FAILOVER","Manual failover failed: "+r.error);}
-                  else addA("HA_MANUAL_FAILOVER","Stepped down to "+(r.role||"passive")+(r.peerPromoted?"; peer promoted to epoch "+(r.peerEpoch||"?"):"; peer will promote via detection"));
-                  setHaManualFailover(false);
-                });
+                const r=await api.post("/api/ha/manual-failover",{stepup});
+                if(r&&r.error){window.alert("Manual failover: "+r.error);addA("HA_MANUAL_FAILOVER","Manual failover failed: "+r.error);}
+                else addA("HA_MANUAL_FAILOVER","Stepped down to "+(r.role||"passive")+(r.peerPromoted?"; peer promoted to epoch "+(r.peerEpoch||"?"):"; peer will promote via detection"));
+                setHaManualFailover(false);
               }}>{haManualFailover?"Failing over...":"Manual Failover"}</Btn>
               <Btn disabled={haTestRunning} onClick={()=>{
                 setHaTestRunning(true);setHaTestResults(null);
