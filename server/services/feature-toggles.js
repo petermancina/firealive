@@ -20,7 +20,6 @@ const FEATURES = {
   compliance_reports: { name: 'Compliance Reports', default: true, category: 'compliance' },
   threat_hunting_transparency: { name: 'Threat Hunting Transparency', default: true, category: 'security' },
   edr_integration: { name: 'EDR Integration', default: true, category: 'security' },
-  mfa_totp: { name: 'MFA TOTP Enrollment', default: true, category: 'security' },
   post_incident_wellness: { name: 'Post-Incident Wellness', default: true, category: 'wellness' },
   board: { name: 'Anonymous Board', default: true, category: 'wellness' },
   delegate_to_automation: { name: 'Delegate to Automation', default: true, category: 'core' },
