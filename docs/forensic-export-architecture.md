@@ -98,7 +98,7 @@ Both pairings satisfy ISO 27001 A.9.4.5 separation-of-duties and NIST 800-53 AC-
         (forensic_export_chain_signing_keys; private PEM at-rest
         encrypted with Tier-1 KEK per server).
      b. Reads each enabled slice via column-omitted SELECT (private
-        fields like password hashes and session refresh-token hashes
+        fields like session refresh-token and API-key hashes
         are excluded by construction at the SELECT level — they cannot
         appear in any export).
      c. Lazy-loads each requested format serializer; if a format isn't

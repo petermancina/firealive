@@ -8,12 +8,12 @@
    - Windows: `FireAlive-Management-Console-<version>-Setup.exe`
    - Linux: `FireAlive-Management-Console-<version>.AppImage`
 2. Run the installer. The MC includes the embedded Regional Server.
-3. On first launch, the MC starts in **unlocked** mode (no MFA configured yet).
+3. On first launch, the MC starts in **unlocked** mode (config lock off).
 
 ### Step 2: Configure the Management Console
-1. **Set up MFA:** Go to MFA tab → scan TOTP QR code with your authenticator app (Authy, Google Authenticator, or Microsoft Authenticator) → enter the 6-digit code → Verify.
+1. **Enroll your passkey:** Go to the MFA tab → register your FIDO2 hardware security key (e.g. YubiKey, Feitian, or Titan) with a PIN. This hardware passkey is your sign-in credential; there is no password and no authenticator-app code.
 2. **Configure IAM:** Go to IAM tab → select your identity provider (Okta, Azure AD, or Duo) → enter your IAM endpoint URL and API credentials → Save.
-3. **Lock configs:** Once MFA is working, use the sidebar lock button to lock all configurations. Any future config changes will require MFA unlock.
+3. **Lock configs:** Once your passkey is enrolled, use the sidebar lock button to lock all configurations. Any future config changes will require a hardware-passkey step-up to unlock.
 
 ### Step 3: Configure Integrations
 1. **SOAR:** Go to Routing & SOAR tab → select your SOAR platform (Splunk SOAR, XSOAR, QRadar SOAR, Tines, Torq, or Swimlane) → enter API endpoint and key → Save. SOAR gives FireAlive WRITE access to distribute tickets based on burnout-aware routing.
@@ -41,7 +41,7 @@ Cases identify everyone by **pseudonym** — FireAlive stores no real names, so 
 
 ### Step 6: Analysts Install and Connect
 1. Analyst downloads and installs the Analyst Client for their OS.
-2. On first launch: enter the server address provided by the Team Lead, then log in with their IAM credentials + MFA code.
+2. On first launch: enter the server address provided by the Team Lead, then sign in with your FIDO2 hardware passkey.
 3. The first full shift establishes the analyst's burnout signal baseline. After one shift, the AI begins generating personalized recommendations.
 
 ### Step 7: Ongoing Configuration
@@ -64,7 +64,7 @@ Cases identify everyone by **pseudonym** — FireAlive stores no real names, so 
 3. Repeat for each regional SOC.
 
 ### Step 3: Configure
-1. **MFA:** Set up your TOTP authenticator in the MFA tab.
+1. **MFA:** Enroll your FIDO2 hardware passkey in the MFA tab.
 2. **Notifications:** Configure email and/or SMS alerts with thresholds in the Notifications tab.
 3. **Data Sovereignty:** Set data residency requirements per region in the Data Sovereignty tab.
 4. **Backup Schedules:** Configure GD backup schedules in Backup & Restore tab.
@@ -195,5 +195,5 @@ lsof -i :3000
 ### Analyst Client can't connect
 Verify the server address is correct and that the firewall allows connections on port 3000. The AC and server must be on the same network or VPN.
 
-### MFA code rejected
-Ensure your device clock is synchronized. TOTP codes are time-based and will fail if your clock is off by more than 30 seconds.
+### Passkey sign-in rejected
+Make sure you are using a hardware security key already registered to your account, that it is inserted or tapped, and that you complete the PIN or biometric prompt. If you have lost your key, use the break-glass recovery path to register a new one.

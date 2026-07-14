@@ -12,7 +12,7 @@ A successful database restore overwrites the live `users`, `audit_log`, `backup_
 
 Requiring a second human's explicit approval before the destructive operation runs converts a one-person attack or accident into a two-person collusion or accident. This is the same pattern used in nuclear-launch authorization, large-value bank transfers, and HSM key generation.
 
-The implementation gates the restore endpoint at the route layer (`server/routes/restore.js`) by requiring the request body to reference a successfully-approved row in the `restore_approvals` table. The approval row is created by the requesting admin, marked approved by a second admin (after verifying TOTP), and consumed by the restore endpoint. Each transition is captured in the audit log and the immutable backup chain.
+The implementation gates the restore endpoint at the route layer (`server/routes/restore.js`) by requiring the request body to reference a successfully-approved row in the `restore_approvals` table. The approval row is created by the requesting admin, marked approved by a second admin (after a fresh hardware-passkey step-up), and consumed by the restore endpoint. Each transition is captured in the audit log and the immutable backup chain.
 
 ## Three operating modes
 
@@ -20,12 +20,12 @@ The mode is configured via `system_meta.restore_approval_mode` and read by `serv
 
 ### Mode: `strict` (recommended default)
 
-Two distinct admins are required: one to request, one to approve. The approver must verify a TOTP code at approval time. The original requester then has a configurable window (default 24 hours) to consume the approval and run the restore.
+Two distinct admins are required: one to request, one to approve. The approver must complete a fresh user-verified WebAuthn hardware-passkey step-up at approval time. The original requester then has a configurable window (default 24 hours) to consume the approval and run the restore.
 
 Use this mode when:
 
 - You have at least two on-call admins available within the approval window.
-- Your threat model includes account compromise (single admin password/JWT theft).
+- Your threat model includes account compromise (single admin session/JWT theft — note there is no password to steal; login is a hardware passkey).
 - You operate under SOC 2 / ISO 27001 / regulated-industry expectations of separation of duties.
 
 This is the only mode that fully delivers two-person assurance.
@@ -40,7 +40,7 @@ Use this mode when:
 - The 24-hour cooling-off period is acceptable in your incident-response posture.
 - You want a fallback path if the second admin is unreachable.
 
-The mode trades two-person assurance for time-based assurance. An attacker who steals an admin account can still self-approve, but only after waiting 24 hours during which the legitimate admin is likely to notice the unusual `RESTORE_APPROVAL_CREATED` audit event and revoke the session.
+The mode trades two-person assurance for time-based assurance. An attacker who compromises an admin session can still self-approve, but only after waiting 24 hours during which the legitimate admin is likely to notice the unusual `RESTORE_APPROVAL_CREATED` audit event and revoke the session.
 
 ### Mode: `disabled`
 
@@ -67,73 +67,20 @@ Valid mode values are `'strict'`, `'delayed-self-approval'`, `'disabled'`. The w
 
 A change to the mode takes effect for **newly created** approval requests. In-flight requests retain the mode they were created under (recorded as `restore_approvals.approval_mode_at_creation`). This prevents a malicious mode-swap from retroactively widening or narrowing approval semantics.
 
-## TOTP enrollment (one-time per admin)
+## The second-approver step-up
 
-Before an admin can approve a restore in `strict` or `delayed-self-approval` mode, they must enroll a TOTP authenticator (Google Authenticator, 1Password, Authy, etc.). Enrollment is per-user; each admin enrolls their own.
+There is no separate enrollment for restore approval. The approving admin re-uses the same FIDO2 hardware passkey they sign in with — approval simply requires a **fresh** user-verified WebAuthn assertion, proving the human at the keyboard is present right now (not merely holding a live session).
 
-The endpoints are under `/api/mfa/*` and require an authenticated session.
-
-### Step 1 — start enrollment
+The approve route is gated by the shared `mfaStepUp()` middleware (`server/middleware/mfa-stepup.js`), the same step-up used for config-lock, migration, key operations, and data-subject erasure. The client obtains a one-time challenge and signs it before calling approve:
 
 ```http
-POST /api/mfa/enroll-start
+POST /api/mfa/stepup/options
 Authorization: Bearer <jwt>
 ```
 
-Response:
+Response: a WebAuthn `PublicKeyCredentialRequestOptions` plus a short-lived `challengeToken` (a signed JWT binding the challenge to this user). The client runs `navigator.credentials.get()` with the options, then sends the serialized assertion and the `challengeToken` back inside the approve request's `body.stepup` (see Step 3). The assertion is single-use and bound to the challenge; the middleware rejects an unknown or foreign credential, a wrong or replayed challenge, or a non-user-verified assertion.
 
-```json
-{
-  "secret_base32": "JBSWY3DPEHPK3PXP",
-  "otpauth_url": "otpauth://totp/FireAlive%20%28alice%29?secret=JBSWY3DPEHPK3PXP&issuer=FireAlive&..."
-}
-```
-
-The frontend should render `otpauth_url` as a QR code (e.g., via `qrcode-svg` client-side) for the user to scan with their authenticator app. The `secret_base32` value is shown as a fallback for users whose authenticator app does not support QR-code import.
-
-The secret is stored encrypted-at-rest in `users.totp_secret` (Tier-3 AES-256-GCM, hex-encoded into the SQLite TEXT column). Compromise of the column ciphertext alone does not bypass MFA; the attacker also needs `TIER3_ENCRYPTION_KEY`.
-
-The user's enrollment status at this stage: `in_enrollment = true, enrolled = false`. The user has a secret but has not yet proven their authenticator app generates valid codes for it.
-
-### Step 2 — confirm enrollment
-
-The user opens their authenticator app, enters the 6-digit code shown for the FireAlive entry, and submits:
-
-```http
-POST /api/mfa/enroll-confirm
-Authorization: Bearer <jwt>
-Content-Type: application/json
-
-{ "totp_code": "123456" }
-```
-
-Response on success:
-
-```json
-{ "enrolled_at": "2026-04-18T14:23:11.000Z" }
-```
-
-After this, `users.totp_enrolled_at` is set, `users.totp_last_used_step` is seeded with the just-verified step (so the same code cannot be replayed for verify), and the user is fully enrolled.
-
-If the code is wrong, the response is `401 CODE_INVALID`. The user can simply enter the next code from their authenticator. **Failed enrollment confirmations do not count toward the verify lockout** — enrollment is one-shot, locking would just frustrate users typing slightly slowly.
-
-### Step 3 — verify TOTP works (optional sanity check)
-
-```http
-POST /api/mfa/verify
-Authorization: Bearer <jwt>
-Content-Type: application/json
-
-{ "totp_code": "654321" }
-```
-
-Response on success:
-
-```json
-{ "verified": true, "step": 56908543 }
-```
-
-This is the same endpoint admins implicitly hit during the approve flow. Calling it directly is a useful pre-flight before navigating to a sensitive screen.
+Because the step-up credential is the admin's login passkey, there is no shared secret at rest and no per-admin enrollment ceremony to manage. An admin who can sign in can approve; an admin who has lost their hardware key uses the break-glass path (see Troubleshooting).
 
 ## The end-to-end restore flow
 
@@ -178,22 +125,29 @@ Authorization: Bearer <jwt-of-admin-B>
 
 Returns the FIFO queue of pending requests, oldest first. Admin B opens the request, reviews `request_reason`, the `backup_id`, the requester identity, and decides.
 
-### Step 3 — admin B approves with TOTP
+### Step 3 — admin B approves with a passkey step-up
+
+Admin B first fetches step-up options and signs the challenge (see "The second-approver step-up" above), then submits the assertion with the approve call:
 
 ```http
 POST /api/restore-approvals/f7a3b8c2d1e9.../approve
 Authorization: Bearer <jwt-of-admin-B>
 Content-Type: application/json
 
-{ "totp_code": "789012" }
+{
+  "stepup": {
+    "challengeToken": "<jwt from POST /api/mfa/stepup/options>",
+    "response": { /* serialized WebAuthn assertion */ }
+  }
+}
 ```
 
-The route handler:
+The route handler (`routes/restore-approvals.js`):
 
-1. Checks admin B's role (must be `admin`).
-2. Calls `totp.verify(db, admin-B's-id, code)`. On any TOTP failure, responds with `TOTP_*` error code mapped to HTTP and writes audit `RESTORE_APPROVAL_APPROVE_TOTP_FAIL`. The approval row is **not** touched.
-3. On TOTP success, calls `approvalsSvc.approve()` with `totp_verified: true`. The service enforces the per-mode rules (in `strict`, approver must differ from requester).
-4. Writes audit `RESTORE_APPROVAL_APPROVED` with the consumption deadline.
+1. `approveAdminGate` — refuses non-admins with `403 FORBIDDEN` before any step-up work.
+2. `mfaStepUp()` — verifies a fresh user-verified WebAuthn assertion from `body.stepup`. On failure it responds with the step-up error (`401 MFA_STEPUP_REQUIRED` if none supplied, `400 INVALID_INPUT` if malformed, `401 STEPUP_FAILED` if the credential is unknown/foreign or the assertion fails verification) and the approval row is **not** touched. On success it sets `req.mfaStepUp.method = 'webauthn'`.
+3. Delegates to `approvalsSvc.approve()` with `stepup_verified: true`. The service enforces the per-mode rules (in `strict`, the approver must differ from the requester) and rejects a call without a verified step-up via `STEPUP_NOT_VERIFIED`.
+4. Writes audit `RESTORE_APPROVAL_APPROVED` with the consumption deadline. If the service rejects the transition (mode mismatch, race, etc.), it writes `RESTORE_APPROVAL_APPROVE_REJECTED` instead.
 
 Response on success:
 
@@ -202,7 +156,7 @@ Response on success:
   "id": "f7a3b8c2d1e9...",
   "previous_status": "pending",
   "new_status": "approved",
-  "approval_method": "second-person-totp",
+  "approval_method": "second-person-webauthn",
   "approver_user_id": "bob-uuid",
   "approved_at": "2026-04-18 14:35:00",
   "approval_mode_at_creation": "strict",
@@ -211,6 +165,8 @@ Response on success:
   "consumption_deadline": "2026-04-19 14:35:00"
 }
 ```
+
+The `approval_method` is `second-person-webauthn` when a second admin approves. In `delayed-self-approval` mode, a requester who self-approves after the window records `delayed-self-webauthn`; in `disabled` mode the auto-created row records `disabled-mode-bypass`.
 
 After approval, the original requester (admin A) has until `consumption_deadline` to consume the approval. The deadline is `approved_at + window_hours` — independent of the request's original `expires_at` to give the requester a full window from the moment of approval.
 
@@ -305,17 +261,12 @@ Every state transition writes a row to `audit_log` (CEF format, SIEM-streamable)
 | Event type                              | Written when                                          | Who    |
 |------------------------------------------|-------------------------------------------------------|--------|
 | `RESTORE_APPROVAL_CREATED`               | Pending row inserted                                  | requester |
-| `RESTORE_APPROVAL_APPROVED`              | Pending → approved                                    | approver  |
-| `RESTORE_APPROVAL_DENIED`                | Pending → denied                                      | denier    |
-| `RESTORE_APPROVAL_APPROVE_TOTP_FAIL`     | TOTP verification failed at approve-time              | approver  |
+| `RESTORE_APPROVAL_APPROVED`              | Pending → approved (after a verified step-up)         | approver  |
 | `RESTORE_APPROVAL_APPROVE_REJECTED`      | Service rejected approve (mode mismatch, race, etc.)  | approver  |
-| `TOTP_ENROLL_START`                      | Secret generated and stored                           | self      |
-| `TOTP_ENROLL_CONFIRM_OK` / `_FAIL`       | Enrollment confirmation outcome                       | self      |
-| `TOTP_VERIFY_OK` / `_FAIL`               | Step-up verification outcome                          | self      |
-| `TOTP_VERIFY_REPLAY` / `_REPLAY_RACE`    | Replay attempt detected                               | self      |
-| `TOTP_VERIFY_BLOCKED`                    | Lockout active, request rejected                      | self      |
-| `TOTP_DISABLED`                          | User-initiated MFA disable (with valid OTP)           | self      |
+| `RESTORE_APPROVAL_DENIED`                | Pending → denied                                      | denier    |
 | `DATABASE_RESTORED`                      | Destructive restore completed                         | requester |
+
+A failed step-up at approve time is refused by the `mfaStepUp()` middleware before the service is reached; the WebAuthn step-up ceremony (challenge issue, assertion verify, and any failure) is itself audited by the shared step-up middleware, so a failed approval attempt is still forensically visible without a restore-specific event.
 
 Plus `RESTORE_REQUEST` and `RESTORE_COMPLETE` entries in `backup_chain` (separate from `audit_log` — the chain is the immutable provenance record for the database itself).
 
@@ -327,7 +278,6 @@ A typical SOC investigation might use the query tool (`POST /api/query`) to reco
 SELECT created_at, user_id, event_type, detail, ip_address
 FROM audit_log
 WHERE event_type LIKE 'RESTORE_APPROVAL_%'
-   OR event_type LIKE 'TOTP_%'
    OR event_type = 'DATABASE_RESTORED'
 ORDER BY created_at DESC
 LIMIT 100;
@@ -337,13 +287,21 @@ The CEF column (`audit_log.cef_message`) is what gets streamed to your external 
 
 ## Troubleshooting
 
-### Approve returns `TOTP_NOT_ENROLLED` (403)
+### Approve returns `MFA_STEPUP_REQUIRED` (401)
 
-The admin attempting to approve has not yet enrolled their authenticator. Walk them through `POST /api/mfa/enroll-start` → scan QR → `POST /api/mfa/enroll-confirm`. After enrollment they can retry the approve.
+No step-up assertion was supplied in `body.stepup`. The client must first call `POST /api/mfa/stepup/options`, run `navigator.credentials.get()`, and resend the approve request with the serialized assertion and `challengeToken`. In the Management Console this is automatic — the approve button drives the ceremony for you.
 
-### Approve returns `TOTP_LOCKED_OUT` (429)
+### Approve returns `STEPUP_FAILED` (401)
 
-The admin has failed TOTP verification 5 times in 15 minutes. The lockout is in-memory and namespaced as `totp:${userId}`, so it does not affect login. The lockout clears automatically after 30 minutes, or earlier if the server restarts (acceptable for SOC-grade because the audit log retains every failure for forensics — short-term restart resets do not erase the evidence).
+The assertion did not verify: the credential is unknown or belongs to a different user, the challenge was wrong or already used, or user-verification (PIN/biometric) was not satisfied. Retry the step-up; if it persists, confirm the admin is using a hardware key already registered to their own account.
+
+### Approve returns `INVALID_INPUT` (400)
+
+The `body.stepup` payload was malformed (missing `challengeToken` or `response`, or an unparseable assertion). This is a client-integration error, not a credential problem.
+
+### Approve returns `STEPUP_NOT_VERIFIED` (403)
+
+The service was asked to record an approval without a verified step-up. In normal operation the route guarantees this cannot happen (the `mfaStepUp()` middleware runs first); seeing it indicates a route wired to call `approve()` without the middleware — a bug to fix, not an operational condition.
 
 ### Approve returns `APPROVER_SAME_AS_REQUESTER` (403) in `strict` mode
 
@@ -361,19 +319,9 @@ The approval was approved more than `window_hours` ago. Create a fresh approval 
 
 The currently-logged-in admin is not the original requester named on the approval. Each approval is bound to its requester at creation time and cannot be consumed by anyone else, even if they're another admin. This is intentional — it forces the audit trail to reflect a clear chain of custody.
 
-### Code returns `CODE_REPLAY` (401)
+### Lost hardware key
 
-The admin entered a TOTP code that was already used (either for verify or for enrollment) within its 30-second window. They must wait for the next code from their authenticator.
-
-### Lost authenticator device
-
-There is no self-service recovery path in this release. The admin must:
-
-1. Contact a fellow admin.
-2. The fellow admin manually clears `users.totp_secret` and `users.totp_enrolled_at` via a database administration tool.
-3. The original admin re-enrolls via `POST /api/mfa/enroll-start`.
-
-A future commit should add a recovery-codes column and a recovery flow that itself requires two-person approval (so an attacker who claims to have lost their device cannot trivially bypass MFA).
+There is no self-service reset for a lost passkey (a self-service reset would be a bypass an attacker could claim). The admin recovers login — and therefore approval capability — through the break-glass enrollment path (`POST /api/auth/break-glass`, which authorizes registering a new hardware key), then approves as normal. Because approval re-uses the login passkey, once the admin can sign in again they can approve again; there is nothing restore-specific to re-enroll.
 
 ## Mode tradeoff matrix
 
@@ -386,36 +334,35 @@ A future commit should add a recovery-codes column and a recovery flow that itse
 | Audit trail uniform across approvals      | Yes                   | Yes                     | Yes (bypass row)|
 | Time-to-restore in routine ops            | Minutes (admin avail) | Minutes (admin avail)   | Seconds         |
 | Time-to-restore worst-case                | Window hours          | 2× window hours         | Seconds         |
-| TOTP enrollment required                  | All admins            | All admins              | None            |
+| Approver step-up required                 | Hardware passkey      | Hardware passkey        | None            |
 | SOC 2 / ISO 27001 compatible default      | Yes                   | Acceptable              | No              |
 
 ## See also
 
-- `services/restore-approvals.js` — service implementation with hard-expiry rules.
+- `services/restore-approvals.js` — service implementation with hard-expiry rules and the `stepup_verified` contract.
 - `services/restore-approval-policy.js` — mode/window configuration accessor.
-- `services/totp.js` — TOTP service used by the approve gate.
+- `middleware/mfa-stepup.js` — the shared WebAuthn step-up middleware used by the approve gate.
 - `routes/restore-approvals.js` — admin endpoints (queue, approve, deny).
 - `routes/restore.js` — destructive restore endpoint that consumes approvals.
-- `routes/mfa.js` — TOTP self-service endpoints (enroll, verify, disable).
-- `db/init.js` — `restore_approvals`, `users.totp_*` schema.
+- `docs/iam-and-authentication.md` — the hardware-passkey login and step-up model.
+- `db/init.js` — `restore_approvals` schema.
 
 ## Threat model summary
 
 This control mitigates these threats:
 
-1. **Single-admin account compromise.** Attacker with one admin's credentials cannot restore alone in `strict` mode; cannot restore quickly in `delayed-self-approval` mode.
-2. **Compelled-action / coercion.** A second admin's verification creates a witness; coerced restore requires two compromised admins or two coerced admins.
+1. **Single-admin account compromise.** An attacker with one admin's session cannot restore alone in `strict` mode; cannot restore quickly in `delayed-self-approval` mode. Login is a hardware passkey, so there is no password to phish or replay in the first place.
+2. **Compelled-action / coercion.** A second admin's step-up creates a witness; a coerced restore requires two compromised admins or two coerced admins, each physically present with their hardware key.
 3. **Operator misclick.** The cooling-off window in `delayed-self-approval` and the second-admin gate in `strict` give a chance to catch and abort.
 4. **Latent approved-but-unused approval as attack target.** Three-class hard expiry caps total lifetime; consumption deadline forces use-it-or-lose-it.
 5. **Cross-backup approval reuse.** `backup_id` is bound at approval creation; consume rejects mismatch.
-6. **TOTP replay within validity window.** `totp_last_used_step` advances on every accept; same code cannot be reused even within its 30-second window.
-7. **TOTP brute force.** Lockout after 5 failures in 15 minutes; 30-minute cooldown.
+6. **Session-replay approval.** Approval requires a *fresh* user-verified assertion, so a stolen JWT alone cannot approve — the attacker would also need the admin's hardware key, present and unlocked at approve time.
+7. **Stolen-session restore without presence.** The step-up is phishing-resistant and device-bound; there is no shared secret to exfiltrate that would let an attacker approve remotely.
 8. **Audit log tampering by restore.** `RESTORE_REQUEST`/`RESTORE_COMPLETE` chain entries are recorded on the destination database; `audit_log` is append-only and recovered with the backup it came from. The pair-or-orphan signature in the chain is explicit forensic evidence of any aborted restore.
 
 This control does **not** mitigate:
 
-- Compromise of `TIER3_ENCRYPTION_KEY` (would expose TOTP secrets).
-- Compromise of two distinct admin accounts simultaneously.
+- Compromise of two distinct admin accounts *and* their hardware keys simultaneously.
 - Out-of-band access to the database file (bypasses all application controls).
 - A malicious operator with shell access to the server (bypasses all application controls).
 
