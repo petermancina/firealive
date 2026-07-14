@@ -146,7 +146,7 @@ module.exports = (checks) => ({
       id: 'A.8.5',
       name: 'Secure Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'Secure authentication technologies and procedures implemented based on information access restrictions and the topic-specific policy on access control. TOTP MFA via users.mfa_enrollment_required + totp_enrolled_at.',
+      mapping: 'Secure authentication technologies and procedures implemented based on information access restrictions and the topic-specific policy on access control. FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials.',
     },
     {
       id: 'A.8.7',

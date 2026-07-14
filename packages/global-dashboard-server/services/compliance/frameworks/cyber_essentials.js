@@ -114,7 +114,7 @@ module.exports = (checks) => ({
       id: 'CE-2.3',
       name: 'Secure Configuration -- Default Password Replacement',
       check: checks.checkPasswordPolicy,
-      mapping: 'GD has no application-layer password-policy gate (no MIN_PASSWORD_LENGTH equivalent of MC\'s /api/auth/password route) as of v0.0.31. bcrypt hashing is automatic at storage time. No default accounts ship with the platform; CISO / VP / readonly accounts are operator-created at deployment with operator-chosen credentials.',
+      mapping: 'GD is passwordless -- login is a FIDO2 hardware passkey (B5n3), so there is no password to gate and no MIN_PASSWORD_LENGTH policy applies; the credential-strength control is the phishing-resistant hardware key. No default accounts ship with the platform; CISO / VP / readonly accounts are operator-created at deployment with operator-chosen credentials.',
     },
     // ── Control 3: User Access Control ──────────────────────────────────────
     {
@@ -139,7 +139,7 @@ module.exports = (checks) => ({
       id: 'CE-3.4',
       name: 'User Access Control -- Multi-Factor Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts; real TOTP verification lands in a future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts; real TOTP verification lands in a future MFA-hardening pass.',
     },
     {
       id: 'CE-3.5',

@@ -279,7 +279,7 @@ class ApprovalConsumeError extends Error {
  *   APPROVER_SAME_AS_REQUESTER             -> 403
  *   WINDOW_NOT_ELAPSED                     -> 403
  *   DISABLED_MODE_NO_MANUAL_APPROVE        -> 409
- *   TOTP_NOT_VERIFIED                      -> 403
+ *   STEPUP_NOT_VERIFIED                    -> 403
  */
 function approvalCodeToHttpStatus(code) {
   switch (code) {
@@ -296,7 +296,7 @@ function approvalCodeToHttpStatus(code) {
       return 409;
     case approvalsSvc.CODES.APPROVER_SAME_AS_REQUESTER:
     case approvalsSvc.CODES.WINDOW_NOT_ELAPSED:
-    case approvalsSvc.CODES.TOTP_NOT_VERIFIED:
+    case approvalsSvc.CODES.STEPUP_NOT_VERIFIED:
       return 403;
     default:
       return 500;

@@ -101,13 +101,13 @@ module.exports = (checks) => ({
       id: 'CPS 234 [23a]',
       name: 'Information Security Controls -- Encryption',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); bcrypt at user-record storage. TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). CPS 234 para 23 requires controls including encryption for sensitive data.',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). CPS 234 para 23 requires controls including encryption for sensitive data.',
     },
     {
       id: 'CPS 234 [23b]',
       name: 'Information Security Controls -- Authentication',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET; bcrypt password hashing at user storage. SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is local bcrypt. TOTP MFA enrollment via users.mfa_enabled (note: /api/auth/mfa-verify currently a stub — real verification lands in a future MFA-hardening pass).',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); login is a FIDO2 hardware passkey. The hardware-passkey MFA is enrolled in webauthn_credentials and enforced at login.',
     },
     {
       id: 'CPS 234 [25]',

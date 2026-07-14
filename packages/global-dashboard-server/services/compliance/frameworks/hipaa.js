@@ -99,7 +99,7 @@ module.exports = (checks) => ({
       id: '164.312(a)(2)(ii)',
       name: 'Emergency Access Procedure (Required)',
       check: checks.checkPrivilegedSeparation,
-      mapping: 'SoD model for the GD: 1-2 CISO-role users supports emergency-access continuity without standing emergency privileges. Required implementation specification. Note: GD Config Lock server-side persistence is live (config_lock_state + the config-write chokepoint), gating config changes behind a fresh hardware-passkey assertion (hardened beyond TOTP MFA).',
+      mapping: 'SoD model for the GD: 1-2 CISO-role users supports emergency-access continuity without standing emergency privileges. Required implementation specification. Note: GD Config Lock server-side persistence is live (config_lock_state + the config-write chokepoint), gating config changes behind a fresh hardware-passkey assertion (phishing-resistant, hardware-backed).',
     },
     {
       id: '164.312(a)(2)(iii)',
@@ -129,19 +129,19 @@ module.exports = (checks) => ({
       id: '164.312(c)(2)',
       name: 'Mechanism to Authenticate ePHI (Addressable)',
       check: checks.checkAlgorithmStrength,
-      mapping: 'GD does not directly encrypt analyst-level ePHI (architectural boundary — ePHI lives at the MC layer). The GD-layer cryptographic surface comprises GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) for JWT signing and bcrypt at user-record storage. Addressable specification, implemented for the GD-layer authentication surface.',
+      mapping: 'GD does not directly encrypt analyst-level ePHI (architectural boundary — ePHI lives at the MC layer). The GD-layer cryptographic surface comprises GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) for JWT signing and no passwords stored (passwordless FIDO2 hardware-passkey login). Addressable specification, implemented for the GD-layer authentication surface.',
     },
     {
       id: '164.312(d)',
       name: 'Person or Entity Authentication (Standard)',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP is planned for B5b (v1.0.51) with integration_config-based IdP wiring; until then, users.auth_method is informational only and authentication is local bcrypt. Required Standard.',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP is planned for B5b (v1.0.51) with integration_config-based IdP wiring; until then, users.auth_method is informational only and authentication is a FIDO2 hardware passkey. Required Standard.',
     },
     {
       id: '164.312(d) [MFA]',
       name: 'Multi-Factor Authentication (Industry Standard)',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup / /api/auth/mfa-confirm endpoints. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. Real verification lands in a future MFA-hardening pass. Multi-factor is the SOC-grade industry-standard interpretation of "verify person" required by modern OCR guidance for ePHI-access systems.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. Real verification lands in a future MFA-hardening pass. Multi-factor is the SOC-grade industry-standard interpretation of "verify person" required by modern OCR guidance for ePHI-access systems.',
     },
     {
       id: '164.312(e)(1)',
@@ -178,7 +178,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(5)(ii)(D)',
       name: 'Password Management (Addressable)',
       check: checks.checkPasswordPolicy,
-      mapping: 'GD has no application-layer password-policy gate (no MIN_PASSWORD_LENGTH equivalent of MC\'s /api/auth/password route) as of v0.0.31. bcrypt hashing is automatic at storage time. Operator-managed discipline: provision strong passwords at account creation; a future GD enhancement may add a password-policy endpoint.',
+      mapping: 'GD is passwordless -- login is a FIDO2 hardware passkey (B5n3), so there is no password to gate and no MIN_PASSWORD_LENGTH policy applies; the credential-strength control is the phishing-resistant hardware key. Operator-managed discipline: provision strong passwords at account creation; a future GD enhancement may add a password-policy endpoint.',
     },
     {
       id: '164.308(a)(7)(ii)(A)',

@@ -104,7 +104,7 @@ module.exports = (checks) => ({
       id: 'CE-2.2',
       name: 'Secure Configuration -- Change Control',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + TOTP MFA. Default-configuration changes blocked unless explicitly authorized.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up. Default-configuration changes blocked unless explicitly authorized.',
     },
     {
       id: 'CE-2.3',
@@ -135,7 +135,7 @@ module.exports = (checks) => ({
       id: 'CE-3.4',
       name: 'User Access Control -- Multi-Factor Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA via users.mfa_enrollment_required + totp_enrolled_at. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts; FireAlive supports MFA for all roles.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials. Cyber Essentials v3.2 requires MFA for cloud-service admin accounts; FireAlive enforces a hardware passkey for all roles.',
     },
     {
       id: 'CE-3.5',

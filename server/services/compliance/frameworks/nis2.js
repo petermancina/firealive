@@ -133,7 +133,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(e) [Acquisition]',
       name: 'Security in Acquisition, Development, Maintenance -- Config Lock',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + TOTP MFA. Acquisition / development / maintenance security at the platform configuration level.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up. Acquisition / development / maintenance security at the platform configuration level.',
     },
     {
       id: 'Art.21(2)(e) [Patch]',
@@ -175,7 +175,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(j) [MFA]',
       name: 'Multi-Factor Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA via users.mfa_enrollment_required + totp_enrolled_at. NIS2 Art.21(2)(j) explicitly requires MFA or continuous authentication; FireAlive supports MFA enforcement for all roles.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials. NIS2 Art.21(2)(j) explicitly requires MFA or continuous authentication; FireAlive enforces a hardware passkey for all roles.',
     },
     {
       id: 'Art.21(2)(j) [Comms]',

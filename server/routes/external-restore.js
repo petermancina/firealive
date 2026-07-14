@@ -42,13 +42,13 @@
 //   1. Admin A POSTs to /sources/:id/restore-request/:backupId,
 //      which creates an approval row (via approvalsSvc).
 //   2. Admin B POSTs to /api/restore-approvals/:approvalId/approve
-//      with a TOTP code (existing route from R3d-4 part 2).
+//      with a hardware-passkey step-up (existing route from R3d-4 part 2).
 //   3. Admin A POSTs to /restore-execute/:approvalId. The service
 //      verifies the approval is approved + usable + targets the
 //      external (source_id, external_backup_id) shape + the
 //      executing user matches the requester.
 //
-// This route file does NOT duplicate the TOTP gate -- the existing
+// This route file does NOT duplicate the step-up gate -- the existing
 // approve flow handles it. The execute endpoint just consumes the
 // already-approved row.
 //
@@ -378,7 +378,7 @@ router.post('/sources/:id/preview/:backupId', async (req, res) => {
 //   }
 //
 // After creation, route the user to the approve flow:
-//   POST /api/restore-approvals/:approvalId/approve  (TOTP-gated)
+//   POST /api/restore-approvals/:approvalId/approve  (step-up-gated)
 router.post('/sources/:id/restore-request/:backupId', (req, res) => {
   let db;
   try {
@@ -405,7 +405,7 @@ router.post('/sources/:id/restore-request/:backupId', (req, res) => {
       expires_at: approval.expires_at,
       next_step: approval.status === 'approved'
         ? `POST /api/external-restore/restore-execute/${approval.id}`
-        : `POST /api/restore-approvals/${approval.id}/approve (TOTP required)`,
+        : `POST /api/restore-approvals/${approval.id}/approve (hardware-passkey step-up required)`,
     });
   } catch (err) {
     return sendError(res, err);

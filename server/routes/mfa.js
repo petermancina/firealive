@@ -6,8 +6,8 @@
 // never accept a user_id parameter, so a user cannot enroll, remove, or
 // step-up as anyone else.
 //
-// TOTP self-service has been removed: TOTP is deprecated platform-wide in
-// favor of passkeys and client certificates (both AAL3, phishing-resistant).
+// There is no TOTP self-service: TOTP was removed platform-wide in favor of
+// passkeys and client certificates (both AAL3, phishing-resistant).
 //
 // Endpoints:
 //   POST   /api/mfa/passkey/register-options  { passwordless? } -> { options, challengeToken }

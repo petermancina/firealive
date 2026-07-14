@@ -95,7 +95,7 @@ module.exports = (checks) => ({
       id: 'A.5.17',
       name: 'Authentication Information',
       check: checks.checkAuthentication,
-      mapping: 'Allocation and management of authentication information controlled. JWT-based authentication with operator-configured GD_JWT_SECRET; bcrypt password hashing at user storage. SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is local bcrypt.',
+      mapping: 'Allocation and management of authentication information controlled. JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is a FIDO2 hardware passkey.',
     },
     {
       id: 'A.5.18',
@@ -145,7 +145,7 @@ module.exports = (checks) => ({
       id: 'A.8.5',
       name: 'Secure Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'Secure authentication technologies and procedures implemented based on information access restrictions and the topic-specific policy on access control. TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. Real verification lands in a future MFA-hardening pass.',
+      mapping: 'Secure authentication technologies and procedures implemented based on information access restrictions and the topic-specific policy on access control. FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. Real verification lands in a future MFA-hardening pass.',
     },
     {
       id: 'A.8.7',

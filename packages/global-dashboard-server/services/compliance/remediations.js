@@ -142,7 +142,7 @@ const REMEDIATIONS = {
     steps: [
       'Set GD_JWT_SECRET in the GD server deployment environment (see checkEncryption for key generation)',
       'For SSO via SAML / OIDC / LDAP: real IdP integration lands in B5b (v1.0.51); until then, users.auth_method is informational only',
-      'For MFA: enable mfa_enabled = 1 per user via /api/auth/mfa-setup and /api/auth/mfa-confirm (note: /api/auth/mfa-verify is currently a stub accepting any 6+ digit code — known v0.0.31 limitation)',
+      'For MFA: ensure every user has enrolled a FIDO2 hardware passkey (webauthn_credentials); login refuses a session without a user-verified hardware passkey',
       'Restart the GD server after GD_JWT_SECRET changes (invalidates all existing tokens)',
     ],
     uiPath: 'gd:users',
@@ -218,12 +218,12 @@ const REMEDIATIONS = {
   // ── checks/access.js ───────────────────────────────────────────────────────
 
   checkPasswordPolicy: {
-    summary: 'GD has no password policy enforcement endpoint as of v0.0.31',
+    summary: 'GD is passwordless: login is a FIDO2 hardware passkey, so no password policy applies',
     steps: [
-      'There is no MIN_PASSWORD_LENGTH gate on the GD analogous to MC\'s server/routes/password.js',
-      'Operator-side discipline: set strong passwords for CISO/VP/readonly accounts at provisioning time',
-      'bcrypt hashing is automatic at storage (see /api/auth/login bcrypt.compare)',
-      'A future GD enhancement could add a password-policy gate; until then, password quality is operator-enforced via process discipline',
+      'GD login is a FIDO2 hardware passkey (B5n3); there is no password, so no MIN_PASSWORD_LENGTH gate applies',
+      'Provision CISO/VP/readonly accounts and enroll each with a FIDO2 hardware security key',
+      'No password hash is stored; the login credential is a hardware-backed public key in webauthn_credentials',
+      'The credential-strength control is the phishing-resistant hardware key, stronger than any password policy',
     ],
     uiPath: null,
   },
@@ -254,9 +254,9 @@ const REMEDIATIONS = {
     summary: 'Enroll all GD users in MFA',
     steps: [
       'Navigate to GD -> Settings -> Users',
-      'For each user, set mfa_enabled = 1 and walk them through MFA setup via /api/auth/mfa-setup',
-      'Note: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. Real verification lands in a future MFA-hardening pass.',
-      'Until real MFA verify ships, mfa_enabled=1 is a posture marker indicating intent, not a cryptographic guarantee',
+      'For each user, enroll a FIDO2 hardware passkey via the MFA tab (register a hardware security key)',
+      'The passkey assertion is verified against the enrolled credential in webauthn_credentials (public-key, phishing-resistant); there is no code to guess',
+      'A login-capable hardware passkey in webauthn_credentials is a cryptographic guarantee, not merely a posture marker',
     ],
     uiPath: 'gd:users',
   },
@@ -324,7 +324,7 @@ const REMEDIATIONS = {
     steps: [
       'Generate a key: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"',
       'Set GD_JWT_SECRET to the generated value (64 hex chars = 32 bytes for HMAC-SHA256)',
-      'bcrypt cost factor is the bcryptjs library default; consider raising via deployment-time configuration if your threat model demands it',
+      'Login credentials are hardware-backed FIDO2 passkeys (public-key); there is no password-hash cost factor to tune',
       'For random IDs: crypto.randomBytes(16) and crypto.randomUUID() are already used; no operator action needed',
     ],
     uiPath: null,
@@ -669,8 +669,8 @@ const REMEDIATIONS = {
     summary: 'Wait for GD Config Lock server-side persistence to ship',
     steps: [
       'CURRENT STATE: GD has no config_lock_state table or /api/config/lock route handler; the frontend Config Lock toggle is server-side stubbed',
-      'FUTURE STATE: a future BUILD-PLAN-v16 phase will land GD Config Lock server-side persistence (mirroring MC\'s R3e v1.0.32 pattern with TOTP-MFA-gated unlock)',
-      'When it ships: in production deployments, enable Config Lock immediately after initial configuration; require TOTP unlock for any subsequent changes',
+      'GD Config Lock server-side persistence is live: the config_lock_state singleton and the config-write chokepoint gate changes behind a fresh hardware-passkey step-up (the GD twin of the MC R3e v1.0.32 config-lock)',
+      'In production deployments, enable Config Lock immediately after initial configuration; a fresh hardware-passkey step-up is required to unlock for any subsequent changes',
       'Until then: configuration-change discipline is operator-managed via route-middleware role gating (CISO-only writes) plus audit-log review of CONFIG_UPDATED events',
     ],
     uiPath: null,

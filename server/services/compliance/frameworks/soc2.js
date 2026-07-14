@@ -136,7 +136,7 @@ module.exports = (checks) => ({
       id: 'CC8.1 [Config Lock]',
       name: 'Configuration Change Restriction',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + TOTP MFA to modify. Lock state tracked in config_lock_state singleton.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up to modify. Lock state tracked in config_lock_state singleton.',
     },
     // ── CC9 Risk Mitigation ──────────────────────────────────────────────────
     {

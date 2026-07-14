@@ -188,19 +188,19 @@ module.exports = (checks) => ({
       id: 'IA-2',
       name: 'Identification and Authentication (Organizational Users)',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is local bcrypt. IA-2(1) MFA for privileged accounts requires checkMfaEnforcement (see below).',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is a FIDO2 hardware passkey. IA-2(1) MFA for privileged accounts requires checkMfaEnforcement (see below).',
     },
     {
       id: 'IA-2(1)',
       name: 'MFA for Privileged Accounts',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. IA-2(1) explicitly requires MFA for privileged accounts; real verification lands in a future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. IA-2(1) explicitly requires MFA for privileged accounts; real verification lands in a future MFA-hardening pass.',
     },
     {
       id: 'IA-5',
       name: 'Authenticator Management',
       check: checks.checkPasswordPolicy,
-      mapping: 'GD has no application-layer password-policy gate (no MIN_PASSWORD_LENGTH equivalent of MC\'s /api/auth/password route) as of v0.0.31. bcrypt hashing is automatic at storage time. Operator-managed discipline: provision strong passwords at account creation; a future GD enhancement may add a password-policy endpoint.',
+      mapping: 'GD is passwordless -- login is a FIDO2 hardware passkey (B5n3), so there is no password to gate and no MIN_PASSWORD_LENGTH policy applies; the credential-strength control is the phishing-resistant hardware key. Operator-managed discipline: provision strong passwords at account creation; a future GD enhancement may add a password-policy endpoint.',
     },
     // ── IR Incident Response ────────────────────────────────────────────────
     {
@@ -238,7 +238,7 @@ module.exports = (checks) => ({
       id: 'SC-13',
       name: 'Cryptographic Protection',
       check: checks.checkAlgorithmStrength,
-      mapping: 'HMAC-SHA256 for JWT signing (GD_JWT_SECRET, 32 bytes minimum); bcrypt at user-record storage. The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). FIPS 140-3 compatible algorithms are used; FIPS-validated cryptographic modules at the deployment layer are operator-managed.',
+      mapping: 'HMAC-SHA256 for JWT signing (GD_JWT_SECRET, 32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). FIPS 140-3 compatible algorithms are used; FIPS-validated cryptographic modules at the deployment layer are operator-managed.',
     },
     {
       id: 'SC-28',

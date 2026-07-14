@@ -160,7 +160,7 @@ module.exports = (checks) => ({
       id: 'CM-5',
       name: 'Access Restrictions for Change',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + TOTP MFA. Lock state and lock attribution tracked in config_lock_state singleton.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up. Lock state and lock attribution tracked in config_lock_state singleton.',
     },
     {
       id: 'CM-7',
@@ -192,7 +192,7 @@ module.exports = (checks) => ({
       id: 'IA-2(1)',
       name: 'MFA for Privileged Accounts',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA via users.mfa_enrollment_required + totp_enrolled_at. IA-2(1) explicitly requires MFA for privileged accounts; FireAlive supports MFA for all roles including admins.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials. IA-2(1) explicitly requires MFA for privileged accounts; FireAlive enforces a hardware passkey for all roles including admins.',
     },
     {
       id: 'IA-5',

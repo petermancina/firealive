@@ -93,7 +93,7 @@ module.exports = (checks) => ({
       id: '§1798.100(e) [Encryption]',
       name: 'Reasonable Security -- Encryption',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); bcrypt at user-record storage. TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). §1798.100(e) requires reasonable security procedures and practices appropriate to the nature of the information.',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). §1798.100(e) requires reasonable security procedures and practices appropriate to the nature of the information.',
     },
     {
       id: '§1798.100(e) [Access Control]',
@@ -135,7 +135,7 @@ module.exports = (checks) => ({
       id: '§1798.130(a)(5)',
       name: 'Verification Methods',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with GD_JWT_SECRET; TOTP MFA enrollment via users.mfa_enabled (note: /api/auth/mfa-verify is currently a stub accepting any 6+ digit code). §1798.130(a)(5) requires reasonable methods to verify the requester for sensitive rights (delete, know, limit SPI). The verification workflow itself is operator-defined.',
+      mapping: 'JWT-based authentication with GD_JWT_SECRET; FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. §1798.130(a)(5) requires reasonable methods to verify the requester for sensitive rights (delete, know, limit SPI). The verification workflow itself is operator-defined.',
     },
     {
       id: '§1798.150 [Encryption Defense]',

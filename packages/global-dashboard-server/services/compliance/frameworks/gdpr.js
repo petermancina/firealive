@@ -119,7 +119,7 @@ module.exports = (checks) => ({
       id: 'Art.32(1)(a) [Encryption]',
       name: 'Encryption of Personal Data',
       check: checks.checkAlgorithmStrength,
-      mapping: 'GD_JWT_SECRET HMAC-SHA256 for JWT signing (32 bytes minimum); bcrypt at user record storage. TLS 1.2+ at reverse proxy for in-transit protection (operator-managed). Backup destinations support encrypted=true via backup_schedules. State-of-the-art expectation for Art.32 "appropriate technical measures" met at GD layer for the cryptographic surface the GD owns; deployment-layer cryptography (disk encryption, TLS termination) is operator-managed.',
+      mapping: 'GD_JWT_SECRET HMAC-SHA256 for JWT signing (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at reverse proxy for in-transit protection (operator-managed). Backup destinations support encrypted=true via backup_schedules. State-of-the-art expectation for Art.32 "appropriate technical measures" met at GD layer for the cryptographic surface the GD owns; deployment-layer cryptography (disk encryption, TLS termination) is operator-managed.',
     },
     {
       id: 'Art.32(1)(b)',

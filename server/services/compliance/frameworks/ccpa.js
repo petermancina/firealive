@@ -122,7 +122,7 @@ module.exports = (checks) => ({
       id: '§1798.130(a)(5)',
       name: 'Verification Methods',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication; multi-factor via TOTP. §1798.130(a)(5) requires reasonable methods to verify the requester for sensitive rights (delete, know, limit SPI). The verification workflow itself is operator-defined.',
+      mapping: 'JWT-based authentication; multi-factor via a FIDO2 hardware passkey (AAL3, phishing-resistant). §1798.130(a)(5) requires reasonable methods to verify the requester for sensitive rights (delete, know, limit SPI). The verification workflow itself is operator-defined.',
     },
     {
       id: '§1798.150 [Encryption Defense]',

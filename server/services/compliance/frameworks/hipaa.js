@@ -79,7 +79,7 @@ module.exports = (checks) => ({
       id: '164.312(a)(2)(ii)',
       name: 'Emergency Access Procedure (Required)',
       check: checks.checkPrivilegedSeparation,
-      mapping: 'Admin role separation supports emergency access via SoD: admins <= 25% of active users prevents standing emergency privileges; emergency access via Config Lock unlock + admin role + TOTP. Required implementation specification.',
+      mapping: 'Admin role separation supports emergency access via SoD: admins <= 25% of active users prevents standing emergency privileges; emergency access via Config Lock unlock + admin role + a WebAuthn hardware-passkey step-up. Required implementation specification.',
     },
     {
       id: '164.312(a)(2)(iii)',
@@ -121,7 +121,7 @@ module.exports = (checks) => ({
       id: '164.312(d) [MFA]',
       name: 'Multi-Factor Authentication (Industry Standard)',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enforcement via users.mfa_enrollment_required + totp_enrolled_at. Multi-factor is the SOC-grade industry-standard interpretation of "verify person" required by modern OCR guidance for ePHI access.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials. A user-verified hardware credential is the SOC-grade interpretation of "verify person" required by modern OCR guidance for ePHI access.',
     },
     {
       id: '164.312(e)(1)',

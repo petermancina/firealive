@@ -157,13 +157,13 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(g)',
       name: 'Cyber Hygiene -- Password Policy',
       check: checks.checkPasswordPolicy,
-      mapping: 'GD has no application-layer password-policy gate (no MIN_PASSWORD_LENGTH equivalent of MC\'s /api/auth/password route) as of v0.0.31. bcrypt hashing is automatic at storage time. Operator-managed discipline: provision strong passwords at account creation; awareness training delivery and policy documentation are operator-side under Art.21(2)(g).',
+      mapping: 'GD is passwordless -- login is a FIDO2 hardware passkey (B5n3), so there is no password to gate and no MIN_PASSWORD_LENGTH policy applies; the credential-strength control is the phishing-resistant hardware key. Operator-managed discipline: provision strong passwords at account creation; awareness training delivery and policy documentation are operator-side under Art.21(2)(g).',
     },
     {
       id: 'Art.21(2)(h) [Crypto]',
       name: 'Cryptography -- Algorithm Strength',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); bcrypt at user-record storage. The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption).',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption).',
     },
     {
       id: 'Art.21(2)(h) [Keys]',
@@ -181,7 +181,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(j) [MFA]',
       name: 'Multi-Factor Authentication',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. NIS2 Art.21(2)(j) explicitly requires MFA or continuous authentication; real verification lands in a future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. NIS2 Art.21(2)(j) explicitly requires MFA or continuous authentication; real verification lands in a future MFA-hardening pass.',
     },
     {
       id: 'Art.21(2)(j) [Comms]',

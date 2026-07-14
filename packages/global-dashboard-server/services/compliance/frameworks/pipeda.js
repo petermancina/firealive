@@ -116,7 +116,7 @@ module.exports = (checks) => ({
       id: 'Principle 7 [Encryption]',
       name: 'Safeguards -- Encryption',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); bcrypt at user-record storage. TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). Schedule 1, Principle 7 requires personal information to be protected by security safeguards appropriate to the sensitivity of the information.',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). Schedule 1, Principle 7 requires personal information to be protected by security safeguards appropriate to the sensitivity of the information.',
     },
     {
       id: 'Principle 7 [Access]',

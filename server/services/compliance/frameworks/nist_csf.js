@@ -88,7 +88,7 @@ module.exports = (checks) => ({
       id: 'PR.AA-03 [MFA]',
       name: 'Multi-Factor Authentication for Privileged Roles',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA via users.mfa_enrollment_required + totp_enrolled_at. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts; TOTP is industry-standard sufficient for most threat models.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant) enforced at login via users.mfa_enrollment_required + webauthn_credentials. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts; a hardware passkey is phishing-resistant by construction (unlike a shared TOTP secret).',
     },
     {
       id: 'PR.AA-05',
@@ -130,7 +130,7 @@ module.exports = (checks) => ({
       id: 'PR.PS-01',
       name: 'Configuration Management Practices are Established',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes; requires unlock + admin role + TOTP MFA; lock state tracked in config_lock_state singleton with audit-trail attribution.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up; lock state tracked in config_lock_state singleton with audit-trail attribution.',
     },
     {
       id: 'PR.PS-02',

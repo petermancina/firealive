@@ -78,7 +78,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [19]',
       name: 'Implementation of Controls',
       check: checks.checkConfigLockState,
-      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + TOTP MFA. CPS 234 para 19 requires controls to be implemented in a manner commensurate with vulnerabilities and threats.',
+      mapping: 'Config Lock (R3e v1.0.32) gates platform-configuration changes in production; requires unlock + admin role + a fresh user-verified WebAuthn hardware-passkey step-up. CPS 234 para 19 requires controls to be implemented in a manner commensurate with vulnerabilities and threats.',
     },
     {
       id: 'CPS 234 [21]',
@@ -102,7 +102,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [23b]',
       name: 'Information Security Controls -- Authentication',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with JWT_SECRET signing; SSO via SAML/OIDC/LDAP integration_config types; TOTP MFA enforcement. Multi-layered authentication satisfies CPS 234 para 23 expectations.',
+      mapping: 'JWT-based authentication with JWT_SECRET signing; SSO via SAML/OIDC/LDAP integration_config types; FIDO2 hardware-passkey MFA enforcement (AAL3, phishing-resistant). Multi-layered authentication satisfies CPS 234 para 23 expectations.',
     },
     {
       id: 'CPS 234 [25]',

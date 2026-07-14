@@ -95,13 +95,13 @@ module.exports = (checks) => ({
       id: 'PR.AA-03',
       name: 'Users, Services, Hardware are Authenticated',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET (HMAC-SHA256). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, users.auth_method is informational and authentication is local bcrypt. MC-to-GD service authentication via management_consoles.api_key shared secret.',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET (HMAC-SHA256). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, users.auth_method is informational and authentication is a FIDO2 hardware passkey. MC-to-GD service authentication via management_consoles.api_key shared secret.',
     },
     {
       id: 'PR.AA-03 [MFA]',
       name: 'Multi-Factor Authentication for Privileged Roles',
       check: checks.checkMfaEnforcement,
-      mapping: 'TOTP MFA enrollment via users.mfa_enabled + /api/auth/mfa-setup. NOTE: /api/auth/mfa-verify currently accepts any 6+ digit code without real TOTP verification — known v0.0.31 stub. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts; real TOTP verification + WebAuthn/FIDO2 are future MFA-hardening pass.',
+      mapping: 'FIDO2 hardware-passkey MFA (AAL3, phishing-resistant): login refuses a session without a user-verified hardware passkey in webauthn_credentials. CSF 2.0 implementation examples emphasize phishing-resistant MFA for privileged accounts; real TOTP verification + WebAuthn/FIDO2 are future MFA-hardening pass.',
     },
     {
       id: 'PR.AA-05',
