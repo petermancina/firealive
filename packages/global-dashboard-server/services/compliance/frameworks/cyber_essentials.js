@@ -189,9 +189,9 @@ module.exports = (checks) => ({
     },
     {
       id: 'CE-Policy-1',
-      name: 'Password Policy Documentation',
+      name: 'Credential Policy Documentation',
       category: 'documentation',
-      detail: 'Document the organizational password policy. Cyber Essentials v3.2 requires at least 12 characters OR 8 characters with MFA OR password less than 8 characters only with technical controls preventing brute-force attacks (rate limiting, lockout). Communicate to staff; require acknowledgment.',
+      detail: 'The platform is passwordless: login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant), which satisfies the Cyber Essentials v3.2 MFA expectation without a password. No password policy to document; communicate the hardware-key requirement to staff.',
     },
     {
       id: 'CE-Policy-2',

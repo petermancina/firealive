@@ -96,7 +96,7 @@ module.exports = (checks) => ({
       id: 'A.5.17',
       name: 'Authentication Information',
       check: checks.checkAuthentication,
-      mapping: 'Allocation and management of authentication information controlled. JWT_SECRET-based signing; SSO via SAML/OIDC/LDAP integration_config types; bcrypt password hashing.',
+      mapping: 'Allocation and management of authentication information controlled. JWT_SECRET-based signing; SSO via SAML/OIDC/LDAP integration_config types; no passwords stored (passwordless FIDO2 hardware-passkey login).',
     },
     {
       id: 'A.5.18',

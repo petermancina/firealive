@@ -37,8 +37,8 @@
 //     aggregate metrics (regional_metrics) and account data (users).
 //     checkAlgorithmStrength adapts to inspect GD_JWT_SECRET strength
 //     (the closest analog: the HMAC key used to sign JWTs) and
-//     describes the platform's actual cryptographic posture (bcrypt
-//     password hashing, HS256 JWTs, crypto.randomBytes for IDs).
+//     describes the platform's actual cryptographic posture (HS256 JWTs,
+//     crypto.randomBytes for IDs; login is a public-key FIDO2 passkey).
 //   - GD has no enforceMinTls middleware. TLS enforcement is entirely
 //     reverse-proxy-layer on the GD. checkTlsMinVersion documents
 //     this honestly.
@@ -135,7 +135,7 @@ function checkKeyRotation() {
 // Verifies cryptographic algorithm and key-strength posture for the GD.
 // The GD uses:
 //
-//   - bcrypt for password hashing (bcryptjs library, default cost factor)
+//   - no password hashing (passwordless FIDO2 hardware-passkey login)
 //   - JWT with HS256 (HMAC-SHA256) signed via GD_JWT_SECRET
 //   - crypto.randomBytes(16) for backup hashes and IDs
 //   - crypto.randomUUID() for scan IDs
@@ -171,7 +171,7 @@ function checkAlgorithmStrength() {
   }
   return {
     status: 'pass',
-    detail: `Password storage: bcrypt (bcryptjs). JWT: HS256 with ${byteLen}-byte GD_JWT_SECRET. Random IDs: crypto.randomBytes(16) for backup IDs and similar; crypto.randomUUID() for scan IDs. Application-layer at-rest encryption protects the most sensitive columns (signing-key private keys, the GD CA key, backup destination credentials) with AES-256-GCM under a hardware-sealed Tier-1 KEK (TPM 2.0 / Secure Enclave-sealed, decision D26 — a copied disk cannot unseal it; recovery-coded for disaster recovery). Bulk database data-at-rest is filesystem-level on the SQLite database file (operator-managed disk encryption).`,
+    detail: `No password storage (passwordless FIDO2 hardware-passkey login). JWT: HS256 with ${byteLen}-byte GD_JWT_SECRET. Random IDs: crypto.randomBytes(16) for backup IDs and similar; crypto.randomUUID() for scan IDs. Application-layer at-rest encryption protects the most sensitive columns (signing-key private keys, the GD CA key, backup destination credentials) with AES-256-GCM under a hardware-sealed Tier-1 KEK (TPM 2.0 / Secure Enclave-sealed, decision D26 — a copied disk cannot unseal it; recovery-coded for disaster recovery). Bulk database data-at-rest is filesystem-level on the SQLite database file (operator-managed disk encryption).`,
   };
 }
 

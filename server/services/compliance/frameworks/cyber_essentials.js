@@ -185,7 +185,7 @@ module.exports = (checks) => ({
     },
     {
       id: 'CE-Policy-1',
-      name: 'Password Policy Documentation',
+      name: 'Credential Policy Documentation',
       category: 'documentation',
       detail: 'The platform is passwordless: login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant), which satisfies the Cyber Essentials v3.2 MFA expectation without a password. No password policy to document; communicate the hardware-key requirement to staff.',
     },

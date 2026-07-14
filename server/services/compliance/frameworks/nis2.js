@@ -149,7 +149,7 @@ module.exports = (checks) => ({
     },
     {
       id: 'Art.21(2)(g)',
-      name: 'Cyber Hygiene -- Password Policy',
+      name: 'Cyber Hygiene -- Credential Policy',
       check: checks.checkPasswordPolicy,
       mapping: 'Login is a user-verified FIDO2 hardware passkey (AAL3, phishing-resistant); no password is stored, so no password-length policy applies. Cyber hygiene technical foundation; awareness training delivery is operator-side under Art.21(2)(g).',
     },

@@ -155,7 +155,7 @@ module.exports = (checks) => ({
     },
     {
       id: 'Art.21(2)(g)',
-      name: 'Cyber Hygiene -- Password Policy',
+      name: 'Cyber Hygiene -- Credential Policy',
       check: checks.checkPasswordPolicy,
       mapping: 'GD is passwordless -- login is a FIDO2 hardware passkey (B5n3), so there is no password to gate and no MIN_PASSWORD_LENGTH policy applies; the credential-strength control is the phishing-resistant hardware key. Operator-managed discipline: provision strong passwords at account creation; awareness training delivery and policy documentation are operator-side under Art.21(2)(g).',
     },

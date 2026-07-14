@@ -139,7 +139,7 @@ function checkEncryption(db) {
   const jwtKeyConfigured = !!process.env.GD_JWT_SECRET && !process.env.GD_JWT_SECRET.startsWith('CHANGE_ME');
   return {
     status: jwtKeyConfigured ? 'pass' : 'warning',
-    detail: `Password storage: bcrypt (cost factor default 10). Session tokens: JWT signed with ${jwtKeyConfigured ? 'persistent GD_JWT_SECRET' : 'ephemeral key (set GD_JWT_SECRET env var for persistence across restarts)'}. Data-at-rest encryption is filesystem-level on the SQLite database file; customer-managed disk encryption (LUKS, FileVault, BitLocker) advised for SOC-grade posture.`,
+    detail: `No password storage (passwordless FIDO2 hardware-passkey login). Session tokens: JWT signed with ${jwtKeyConfigured ? 'persistent GD_JWT_SECRET' : 'ephemeral key (set GD_JWT_SECRET env var for persistence across restarts)'}. Data-at-rest encryption is filesystem-level on the SQLite database file; customer-managed disk encryption (LUKS, FileVault, BitLocker) advised for SOC-grade posture.`,
   };
 }
 
