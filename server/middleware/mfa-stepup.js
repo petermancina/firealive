@@ -10,7 +10,7 @@
 // hardware credential at the moment of the action.
 //
 // This replaces the former TOTP / recovery-code step-up. TOTP is
-// deprecated platform-wide; a phishable one-time code guarding the most
+// removed platform-wide; a phishable one-time code guarding the most
 // sensitive operations was exactly backwards (the login path is already
 // phishing-resistant). A fresh user-verified passkey assertion keeps the
 // whole stack at AAL3.
