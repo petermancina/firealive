@@ -12,7 +12,7 @@
     "build:linux": "electron-builder --linux"
   },
   "dependencies": {
-    "@signalapp/libsignal-client": "^0.96.1",
+    "@signalapp/libsignal-client": "^0.97.2",
     "pdfkit": "^0.19.0"
   },
   "devDependencies": {
