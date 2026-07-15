@@ -1,0 +1,33 @@
+{
+  "name": "firealive-global-dashboard-server",
+  "version": "1.0.84",
+  "fuseCounter": 77,
+  "buildId": "20260714.1",
+  "description": "FireAlive Global Dashboard — Independent Backend Server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "init-db": "node db-init.js"
+  },
+  "license": "AGPL-3.0",
+  "dependencies": {
+    "express": "^5.2.1",
+    "better-sqlite3": "^12.11.1",
+    "jsonwebtoken": "^9.0.3",
+    "@simplewebauthn/server": "^13.3.2",
+    "helmet": "^8.2.0",
+    "cors": "^2.8.6",
+    "compression": "^1.8.1",
+    "node-cron": "^4.6.0",
+    "dotenv": "^17.4.2",
+    "express-rate-limit": "^8.5.2",
+    "docx": "^9.7.1",
+    "pdfkit": "^0.19.1",
+    "@aws-sdk/client-s3": "^3.1087.0",
+    "@aws-sdk/lib-storage": "^3.1087.0",
+    "@azure/identity": "^4.0.0",
+    "@azure/storage-blob": "^12.33.0",
+    "@google-cloud/storage": "^7.21.0",
+    "ssh2": "^1.15.0"
+  }
+}
