@@ -29,6 +29,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const HEALTH_CONFIG_KEY = 'integration_health_config';
 const FRESHNESS_DAYS = 365; // an approved active MC signing key older than this is "rotation due"
@@ -72,7 +73,9 @@ async function kmsProbe(db) {
 
 // ── storage: GD backup destination reachability (built-in local until B6b) ────
 async function storageProbe() {
-  const backupsDir = process.env.GD_BACKUPS_DIR || path.join(__dirname, '..', 'data', 'backups');
+  // P1-1: the same resolver the backup engine uses, so the probe cannot report
+  // on a directory the backups do not go to.
+  const backupsDir = gdDataRoot.backupsDir();
   try {
     // Check the dir itself; if absent, walk up to the nearest existing ancestor
     // (the backup path is created on demand by the backup job). Read-only: an

@@ -33,13 +33,15 @@ const path = require('path');
 
 const archiveSegment = require('./gd-archive-segment');
 const { canonicalSerialize } = require('./audit-export-shared');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const CEF_CATEGORY = 'cef_archive';
 const SPOOL_FILE = 'cef-current.log';   // active spool; appended by the SIEM tee
 const PENDING_FILE = 'cef-pending.log'; // rotated, awaiting seal (single slot)
 
 function resolveSpoolDir() {
-  return process.env.GD_CEF_SPOOL_DIR || path.join(__dirname, '..', 'data', 'cef-spool');
+  // P1-1: GD_CEF_SPOOL_DIR, else the canonical GD data root.
+  return gdDataRoot.cefSpoolDir();
 }
 function currentPath() {
   return path.join(resolveSpoolDir(), SPOOL_FILE);

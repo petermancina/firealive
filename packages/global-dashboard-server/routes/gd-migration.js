@@ -29,6 +29,7 @@ const migrationReconcile = require('../services/gd-migration-reconcile');
 const migrationApply = require('../services/gd-migration-apply');
 const signingKeysSvc = require('../services/gd-backup-signing-keys');
 const backupManifestSvc = require('../services/gd-backup-manifest');
+const gdDataRoot = require('../lib/gd-data-root');
 
 // Self-contained audit helper mapping the Regional auditLog(userId, eventType,
 // detail, ip) signature onto the GD audit chain, so the call sites stay verbatim.
@@ -55,13 +56,24 @@ const CODE_STATUS = {
   ATOMIC_APPLY_FAILED: 500,
 };
 
-// The server-controlled root that migration bundles live under. Mirrors the
-// directory the bundle composer (services/migration-bundle.js) writes exports
-// to -- same MIGRATION_BUNDLE_DIR env var and same default -- so a bundle this
-// deployment exported is importable, and the importer can only be pointed at a
-// path inside that root.
-const BUNDLE_ROOT = path.resolve(
-  process.env.MIGRATION_BUNDLE_DIR || path.join(__dirname, '../../data/migration-bundles'));
+// The server-controlled root that GD migration bundles live under, and the
+// confinement root for the path-traversal defense below. It MUST resolve to
+// exactly what the bundle composer (services/gd-migration-bundle.js) writes
+// exports to.
+//
+// Before P1 it did not, and the mismatch was a live bug. This file was copied
+// from the Regional Server's routes/migration.js and its paths were never
+// adapted: it read MIGRATION_BUNDLE_DIR -- the REGIONAL server's variable, not
+// the GD's GD_MIGRATION_BUNDLE_DIR -- and defaulted one directory higher, to
+// <install>/resources/data/migration-bundles, under a different name, while the
+// composer wrote to <gd-server>/data/gd-migration-bundles. Different variable,
+// different root, different name. A bundle the GD exported was not importable
+// by the GD, and this confinement root guarded a directory nothing ever wrote
+// to. The stale comment naming "services/migration-bundle.js" and
+// "MIGRATION_BUNDLE_DIR" is what a copy leaves behind.
+//
+// Composer and importer now call one function, so they cannot disagree again.
+const BUNDLE_ROOT = path.resolve(gdDataRoot.migrationBundlesDir());
 
 // Validate the bundle directory supplied in the request body and confine it to
 // BUNDLE_ROOT. The operator-supplied value is resolved against the root and

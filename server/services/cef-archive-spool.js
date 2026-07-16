@@ -32,13 +32,15 @@ const path = require('path');
 
 const archiveSegment = require('./archive-segment');
 const { canonicalSerialize } = require('./audit-export-shared');
+const dataRoot = require('../lib/data-root');
 
 const CEF_CATEGORY = 'cef_archive';
 const SPOOL_FILE = 'cef-current.log';   // active spool; appended by the SIEM tee
 const PENDING_FILE = 'cef-pending.log'; // rotated, awaiting seal (single slot)
 
 function resolveSpoolDir() {
-  return process.env.CEF_SPOOL_DIR || path.join(__dirname, '../../data/cef-spool');
+  // P1-1: CEF_SPOOL_DIR, else the canonical data root.
+  return dataRoot.cefSpoolDir();
 }
 function currentPath() {
   return path.join(resolveSpoolDir(), SPOOL_FILE);

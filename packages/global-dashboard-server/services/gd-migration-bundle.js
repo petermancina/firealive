@@ -44,6 +44,7 @@ const { performFullSuiteBackup } = require('./gd-backup-full-suite');
 const signingKeysSvc = require('./gd-backup-signing-keys');
 const manifestSvc = require('./gd-backup-manifest');
 const anchor = require('./gd-instance-anchor');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const logger = {
   info: (m, meta) => console.log('[gd-migration-bundle] ' + m, meta !== undefined ? meta : ''),
@@ -72,15 +73,17 @@ const BACKUP_FILES = [
 // -----------------------------------------------------------------------------
 
 function resolveBundleDir(override) {
-  return (
-    override
-    || process.env.GD_MIGRATION_BUNDLE_DIR
-    || path.join(__dirname, '../data/gd-migration-bundles')
-  );
+  // P1-1: GD_MIGRATION_BUNDLE_DIR, else the canonical GD data root.
+  // routes/gd-migration.js confines operator-supplied paths to this same root,
+  // and before P1 it did NOT: it used the Regional Server's
+  // MIGRATION_BUNDLE_DIR and a different default, so a bundle the GD exported
+  // was not importable by the GD. Both now call this one function.
+  return override || gdDataRoot.migrationBundlesDir();
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return gdDataRoot.ensureDir(dir);
 }
 
 // Recursive byte total (the bundle contains a backup/ subdirectory, so a

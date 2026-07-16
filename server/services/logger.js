@@ -4,11 +4,14 @@
 
 const winston = require('winston');
 const path = require('path');
-const fs = require('fs');
 const pkgVersion = require(path.join(__dirname, '..', '..', 'package.json')).version;
+const dataRoot = require('../lib/data-root');
 
-const logDir = process.env.LOG_PATH || path.join(__dirname, '../../data/logs');
-if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+// P1-1: logs live under the canonical data root, not beside the code.
+// ensureDir creates 0700 and refuses a group- or world-readable directory --
+// operational logs are not public.
+const logDir = dataRoot.logsDir();
+dataRoot.ensureDir(logDir);
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',

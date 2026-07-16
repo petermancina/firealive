@@ -63,6 +63,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { logger } = require('./logger');
 const { DB_PATH } = require('../db/init');
+const dataRoot = require('../lib/data-root');
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -77,15 +78,13 @@ const PLATFORM_FILENAME = {
 };
 
 function resolveCicdConfigsDir(override) {
-  return (
-    override
-    || process.env.CICD_CONFIGS_DIR
-    || path.join(__dirname, '../../data/cicd-configs')
-  );
+  // P1-1: CICD_CONFIGS_DIR, else the canonical data root.
+  return override || dataRoot.cicdConfigsDir();
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return dataRoot.ensureDir(dir);
 }
 
 // ── Install snapshot (lighter than cloud-iac's) ────────────────────────

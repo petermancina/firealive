@@ -50,6 +50,7 @@ const storageRouting = require('./storage-routing');
 const storageDestinations = require('./storage-destinations');
 const dataResidency = require('./data-residency');
 const base = require('./destination-adapter-base');
+const dataRoot = require('../lib/data-root');
 
 // Categories that flow through the sealed-segment chain. (backup / snapshot /
 // forensic_export have their own push paths; these two are net-new archives.)
@@ -64,8 +65,8 @@ const DEFAULT_PUSH_TIMEOUT_MS = 5 * 60 * 1000;
 // held; the steady state, where the secondary lands promptly, retains nothing.
 // Mirrors the backups data-dir convention.
 function resolvePendingDir() {
-  return process.env.ARCHIVE_PENDING_DIR
-    || path.join(__dirname, '../../data/archive-pending');
+  // P1-1: ARCHIVE_PENDING_DIR, else the canonical data root.
+  return dataRoot.archivePendingDir();
 }
 
 // Secondary re-push retry policy. Mirrors backup-push.js exactly: five attempts

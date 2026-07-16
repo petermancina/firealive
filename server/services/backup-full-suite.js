@@ -171,20 +171,18 @@ const BUNDLE_FILENAME = 'full-suite-bundle.json';
 const BUNDLE_FORMAT_VERSION = 'firealive-full-suite-v1';
 
 const Database = require('better-sqlite3');
+const dataRoot = require('../lib/data-root');
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function resolveBackupDir(override) {
-  return (
-    override
-    || process.env.BACKUP_DIR
-    || process.env.BACKUP_PATH
-    || path.join(__dirname, '../../data/backups')
-  );
+  // P1-1: same chain and same root as services/backup.js -- one answer.
+  return dataRoot.backupsDir(override);
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return dataRoot.ensureDir(dir);
 }
 
 function backupDirName(date = new Date()) {

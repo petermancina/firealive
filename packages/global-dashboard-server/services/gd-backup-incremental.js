@@ -53,6 +53,7 @@ const walExtractor = require('./gd-wal-extractor');
 const walCheckpoint = require('./gd-wal-checkpoint');
 const storagePush = require('./gd-storage-push');
 const backupV2 = require('./gd-backup-v2');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const INCR_MAGIC = Buffer.from('INCR', 'ascii');
 const INCR_FORMAT_VERSION = 1;
@@ -74,10 +75,10 @@ function ensureDir(dir) {
 }
 
 function resolveWalPath(options) {
-  const dbPath = (options && options.dbPath)
-    || process.env.GD_DB_PATH
-    || path.join(__dirname, '..', 'data', 'global-dashboard.db');
-  return dbPath + '-wal';
+  // P1-1: one function answers for the database path across db-init.js,
+  // gd-backup-v2.js, and both WAL resolvers -- they previously agreed only by
+  // coincidence of maintenance.
+  return gdDataRoot.dbPath(options && options.dbPath) + '-wal';
 }
 
 /**

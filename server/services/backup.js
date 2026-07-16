@@ -89,6 +89,7 @@ const signingKeysSvc = require('./backup-signing-keys');
 const chainSvc = require('./backup-chain');
 const backupPushSvc = require('./backup-push');
 const storageRouting = require('./storage-routing');
+const dataRoot = require('../lib/data-root');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -96,14 +97,15 @@ const DEFAULT_RETENTION_DAYS = 35;
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 function resolveBackupDir(override) {
-  return override
-    || process.env.BACKUP_DIR
-    || process.env.BACKUP_PATH
-    || path.join(__dirname, '../../data/backups');
+  // P1-1: BACKUP_DIR then BACKUP_PATH, else the canonical data root. Backups
+  // used to land inside the application bundle -- an installer replaced the
+  // very artifacts meant to survive it.
+  return dataRoot.backupsDir(override);
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return dataRoot.ensureDir(dir);
 }
 
 /**

@@ -54,6 +54,7 @@ const archiveChainKeys = require('./gd-archive-chain-keys');
 const storageRouting = require('./gd-storage-routing');
 const storageDestinations = require('./gd-storage-destinations');
 const base = require('./gd-destination-adapter-base');
+const gdDataRoot = require('../lib/gd-data-root');
 
 // Categories that flow through the sealed-segment chain. (backup / snapshot /
 // forensic_export have their own push paths; these two are net-new archives.)
@@ -68,8 +69,8 @@ const DEFAULT_PUSH_TIMEOUT_MS = 5 * 60 * 1000;
 // steady state, where the secondary lands promptly, retains nothing. Lives
 // under the GD server's data dir, mirroring the GD backups convention.
 function resolvePendingDir() {
-  return process.env.GD_ARCHIVE_PENDING_DIR
-    || path.join(__dirname, '..', 'data', 'archive-pending');
+  // P1-1: GD_ARCHIVE_PENDING_DIR, else the canonical GD data root.
+  return gdDataRoot.archivePendingDir();
 }
 
 // Secondary re-push retry policy. Mirrors the push engine exactly: five attempts

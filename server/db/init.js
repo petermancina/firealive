@@ -6,14 +6,22 @@
 
 const Database = require('better-sqlite3');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
+const dataRoot = require('../lib/data-root');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../../data/firealive.db');
+// P1-1: runtime state lives under the canonical data root (lib/data-root.js),
+// never inside the application bundle. This path was previously resolved
+// relative to this file's directory, which in a packaged build put the
+// database under <install>/resources/data -- the directory an installer
+// replaces, and on a Linux AppImage a read-only mount it could not be created
+// in at all. dbPath() still honours DB_PATH. There is deliberately no
+// module-directory fallback: a fallback that writes into the application
+// directory is the defect P1 removes.
+const DB_PATH = dataRoot.dbPath();
 
 function ensureDataDir() {
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // Creates 0700 and refuses an already group- or world-accessible directory.
+  dataRoot.ensureDir(path.dirname(DB_PATH));
 }
 
 function getDb() {

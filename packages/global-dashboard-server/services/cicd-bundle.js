@@ -75,6 +75,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const gdDataRoot = require('../lib/gd-data-root');
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -96,15 +97,13 @@ const GD_CICD_SHAPE = {
 };
 
 function resolveCicdConfigsDir(override) {
-  return (
-    override
-    || process.env.GD_CICD_CONFIGS_DIR
-    || path.join(__dirname, '../data/cicd-configs')
-  );
+  // P1-1: GD_CICD_CONFIGS_DIR, else the canonical GD data root.
+  return override || gdDataRoot.cicdConfigsDir();
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return gdDataRoot.ensureDir(dir);
 }
 
 // ── Snapshot (GD-shape, CI/CD-tailored) ────────────────────────────────

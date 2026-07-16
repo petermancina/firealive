@@ -1559,7 +1559,87 @@ class RegressionRunner {
       return 'TAXII discovery/collections/objects present with taxii+stix media types and auth guard';
     });
 
-    // ── Category: Vulnerability scan (B5p) ─────────────────
+    // -- Category: Data root (P1-1) -------------------------------------
+    // Before P1 every runtime path resolved relative to the module directory,
+    // which in a packaged build put the database, the logs, the audit archive
+    // and THE BACKUPS inside the application bundle an installer replaces.
+    // These assertions are the guard against that returning.
+    await check('data_root', 'no accessor resolves inside the application directory', () => {
+      const dr = require('../lib/data-root');
+      const appDir = path.resolve(__dirname, '..');
+      const names = ['dbPath', 'logsDir', 'backupsDir', 'archivePendingDir', 'cefSpoolDir',
+        'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir'];
+      const bad = [];
+      for (const n of names) {
+        const p = path.resolve(dr[n]());
+        if (p === appDir || p.startsWith(appDir + path.sep)) bad.push(n + ' -> ' + p);
+      }
+      if (bad.length) throw new Error('accessor(s) resolve inside the app dir: ' + bad.join(', '));
+      return names.length + ' accessors all resolve outside ' + appDir;
+    });
+
+    await check('data_root', 'every documented env override is honoured', () => {
+      const dr = require('../lib/data-root');
+      const cases = [
+        ['DB_PATH', '/tmp/fa-rr/x.db', () => dr.dbPath()],
+        ['LOG_PATH', '/tmp/fa-rr/logs', () => dr.logsDir()],
+        ['BACKUP_DIR', '/tmp/fa-rr/bk1', () => dr.backupsDir()],
+        ['BACKUP_PATH', '/tmp/fa-rr/bk2', () => dr.backupsDir()],
+        ['ARCHIVE_PENDING_DIR', '/tmp/fa-rr/ap', () => dr.archivePendingDir()],
+        ['CEF_SPOOL_DIR', '/tmp/fa-rr/cef', () => dr.cefSpoolDir()],
+        ['CICD_CONFIGS_DIR', '/tmp/fa-rr/cicd', () => dr.cicdConfigsDir()],
+        ['CLOUD_PACKAGES_DIR', '/tmp/fa-rr/cp', () => dr.cloudPackagesDir()],
+        ['MIGRATION_BUNDLE_DIR', '/tmp/fa-rr/mb', () => dr.migrationBundlesDir()],
+      ];
+      for (const [envName, value, fn] of cases) {
+        const prev = process.env[envName];
+        process.env[envName] = value;
+        let got;
+        try { got = fn(); } finally {
+          if (prev === undefined) delete process.env[envName]; else process.env[envName] = prev;
+        }
+        if (got !== value) throw new Error(envName + ' ignored: expected ' + value + ', got ' + got);
+      }
+      return cases.length + ' env overrides honoured';
+    });
+
+    await check('data_root', 'ensureDir creates 0700 and refuses a permissive directory', () => {
+      if (process.platform === 'win32') return SKIP('POSIX mode bits; Windows ACLs are covered by the boot posture check');
+      const dr = require('../lib/data-root');
+      const fsMod = require('fs');
+      const dir = path.join('/tmp', 'fa-rr-mode-' + crypto.randomBytes(4).toString('hex'));
+      try {
+        dr.ensureDir(dir);
+        const mode = fsMod.statSync(dir).mode & 0o777;
+        if (mode !== 0o700) throw new Error('ensureDir created mode ' + mode.toString(8) + ', expected 700');
+        fsMod.chmodSync(dir, 0o777);
+        let refused = false;
+        try { dr.ensureDir(dir); } catch (_e) { refused = true; }
+        if (!refused) throw new Error('ensureDir accepted a 0777 directory');
+        return 'creates 0700 and refuses 0777';
+      } finally {
+        try { fsMod.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    await check('data_root', 'a pre-P1 database refuses the boot', () => {
+      const dr = require('../lib/data-root');
+      const fsMod = require('fs');
+      const legacy = dr.legacyDbPath();
+      if (fsMod.existsSync(legacy)) {
+        throw new Error('a pre-P1 database is present at ' + legacy + '; the boot gate should have refused');
+      }
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      const a = src.indexOf('assertNoLegacyDatabase()');
+      const b = src.indexOf('initDb();');
+      if (a === -1) throw new Error('index.js does not call assertNoLegacyDatabase()');
+      if (b === -1 || a > b) {
+        throw new Error('assertNoLegacyDatabase() must precede initDb(): initDb creates a database at the new root, which would turn "your data is at the old path" into a misleading "both are present"');
+      }
+      return 'gate present and ordered before initDb()';
+    });
+
+    // -- Category: Vulnerability scan (B5p) -----------------────
     await check('vuln_scan', 'B5p schema present (tables + indexes + append-only triggers)', () => {
       requireAll(['vuln_scan_scanner_authorizations', 'vuln_scan_access_log']);
       const missing = ['idx_vuln_scan_auth_enabled', 'idx_vuln_scan_access_accessed_at', 'idx_vuln_scan_access_outcome', 'idx_vuln_scan_access_auth'].filter((n) => !indexExists(n));

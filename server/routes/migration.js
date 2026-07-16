@@ -30,6 +30,7 @@ const migrationReconcile = require('../services/migration-reconcile');
 const migrationApply = require('../services/migration-apply');
 const signingKeysSvc = require('../services/backup-signing-keys');
 const backupManifestSvc = require('../services/backup-manifest');
+const dataRoot = require('../lib/data-root');
 
 // Failure code -> HTTP status for the apply path (MigrationApplyError and the
 // DbRestoreError codes that propagate from the shared swap primitive).
@@ -47,13 +48,14 @@ const CODE_STATUS = {
   ATOMIC_APPLY_FAILED: 500,
 };
 
-// The server-controlled root that migration bundles live under. Mirrors the
-// directory the bundle composer (services/migration-bundle.js) writes exports
-// to -- same MIGRATION_BUNDLE_DIR env var and same default -- so a bundle this
-// deployment exported is importable, and the importer can only be pointed at a
-// path inside that root.
-const BUNDLE_ROOT = path.resolve(
-  process.env.MIGRATION_BUNDLE_DIR || path.join(__dirname, '../../data/migration-bundles'));
+// The server-controlled root that migration bundles live under, and the
+// confinement root for the path-traversal defense below. It MUST resolve to
+// exactly what the bundle composer (services/migration-bundle.js) writes
+// exports to, or a bundle this deployment exported is not importable and the
+// confinement check guards the wrong directory. P1-1: both now call one
+// function -- lib/data-root.js migrationBundlesDir() -- rather than each
+// duplicating the MIGRATION_BUNDLE_DIR chain, so the two cannot drift.
+const BUNDLE_ROOT = path.resolve(dataRoot.migrationBundlesDir());
 
 // Validate the bundle directory supplied in the request body and confine it to
 // BUNDLE_ROOT. The operator-supplied value is resolved against the root and

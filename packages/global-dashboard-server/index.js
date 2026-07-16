@@ -174,6 +174,20 @@ app.use('/api/', apiLimiter);
 // peer-to-peer, not a client) and the health endpoint (load-balancer probes).
 // Bookkeeping only; never blocks a request.
 const gdHaLiveness = require('./services/gd-ha-liveness');
+
+// ── P1-1: pre-P1 database detection, fail-closed ───────────────────────────
+// Placed immediately after the requires and before ANY other module-scope work,
+// because getDb() creates a database at the new root: if this ran later, an
+// empty database would already exist and the operator would be told "both are
+// present" when the truth is "your data is at the old path and starting now
+// would have looked like total data loss". The GD has ~20 module-scope getDb()
+// sites; rather than depend on which executes first, this runs before all of
+// them.
+//
+// It tests for the database FILE, not <gd-server>/data/ -- that directory still
+// holds the bundled attestation trust anchors and exists on every clean install.
+const gdDataRoot = require('./lib/gd-data-root');
+gdDataRoot.assertNoLegacyDatabase();
 app.use('/api/', (req, res, next) => {
   // The exclusion rule lives in gd-ha-liveness.shouldStampClientRequest, exported so
   // the regression can assert it. Pass originalUrl: this middleware is mounted at
@@ -3677,6 +3691,102 @@ function runGdRegression(db) {
       tests.push({ category, name, status: 'fail', detail: String(err.message || err).slice(0, 500) });
     }
   };
+
+  // -- Data root (P1-1) (5) ---------------------------------------------
+  record('data_root', 'no accessor resolves inside the application directory', () => {
+    const dr = require('./lib/gd-data-root');
+    const p = require('path');
+    const appDir = p.resolve(__dirname);
+    const names = ['dbPath', 'backupsDir', 'archivePendingDir', 'cefSpoolDir',
+      'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir'];
+    const bad = [];
+    for (const n of names) {
+      const got = p.resolve(dr[n]());
+      if (got === appDir || got.startsWith(appDir + p.sep)) bad.push(n + ' -> ' + got);
+    }
+    if (bad.length) throw new Error('accessor(s) resolve inside the app dir: ' + bad.join(', '));
+    return `${names.length} accessors all resolve outside ${appDir}`;
+  });
+  record('data_root', 'every documented GD env override is honoured', () => {
+    const dr = require('./lib/gd-data-root');
+    const cases = [
+      ['GD_DB_PATH', '/tmp/gd-rr/x.db', () => dr.dbPath()],
+      ['GD_BACKUPS_DIR', '/tmp/gd-rr/bk', () => dr.backupsDir()],
+      ['GD_ARCHIVE_PENDING_DIR', '/tmp/gd-rr/ap', () => dr.archivePendingDir()],
+      ['GD_CEF_SPOOL_DIR', '/tmp/gd-rr/cef', () => dr.cefSpoolDir()],
+      ['GD_CICD_CONFIGS_DIR', '/tmp/gd-rr/cicd', () => dr.cicdConfigsDir()],
+      ['GD_CLOUD_PACKAGES_DIR', '/tmp/gd-rr/cp', () => dr.cloudPackagesDir()],
+      ['GD_MIGRATION_BUNDLE_DIR', '/tmp/gd-rr/mb', () => dr.migrationBundlesDir()],
+    ];
+    for (const [envName, value, fn] of cases) {
+      const prev = process.env[envName];
+      process.env[envName] = value;
+      let got;
+      try { got = fn(); } finally {
+        if (prev === undefined) delete process.env[envName]; else process.env[envName] = prev;
+      }
+      if (got !== value) throw new Error(`${envName} ignored: expected ${value}, got ${got}`);
+    }
+    return `${cases.length} env overrides honoured`;
+  });
+  // The assertion that would have caught the bug P1-1 fixed: routes/gd-migration.js
+  // confines operator-supplied bundle paths to BUNDLE_ROOT, and that root must equal
+  // what services/gd-migration-bundle.js writes exports to. Before P1 it did not --
+  // the route was a copy of the Regional Server's and still read MIGRATION_BUNDLE_DIR
+  // with a different default, so a GD-exported bundle was not importable by the GD and
+  // the confinement check guarded a directory nothing wrote to. Both must call one
+  // resolver; assert on the source so a future copy-paste cannot reintroduce it.
+  record('data_root', 'migration composer and importer share one root', () => {
+    const fsMod = require('fs');
+    const p = require('path');
+    const route = fsMod.readFileSync(p.join(__dirname, 'routes', 'gd-migration.js'), 'utf8');
+    const svc = fsMod.readFileSync(p.join(__dirname, 'services', 'gd-migration-bundle.js'), 'utf8');
+    if (/process\.env\.MIGRATION_BUNDLE_DIR/.test(route)) {
+      throw new Error("routes/gd-migration.js reads MIGRATION_BUNDLE_DIR -- that is the Regional Server's variable; the GD's is GD_MIGRATION_BUNDLE_DIR");
+    }
+    if (!/gdDataRoot\.migrationBundlesDir\(\)/.test(route)) {
+      throw new Error('routes/gd-migration.js does not resolve BUNDLE_ROOT via gdDataRoot.migrationBundlesDir()');
+    }
+    if (!/gdDataRoot\.migrationBundlesDir\(\)/.test(svc)) {
+      throw new Error('services/gd-migration-bundle.js does not resolve its bundle dir via gdDataRoot.migrationBundlesDir()');
+    }
+    return 'composer and importer both resolve via gdDataRoot.migrationBundlesDir()';
+  });
+  record('data_root', 'ensureDir creates 0700 and refuses a permissive directory', () => {
+    if (process.platform === 'win32') return SKIP('POSIX mode bits; Windows ACLs are covered by the boot posture check');
+    const dr = require('./lib/gd-data-root');
+    const fsMod = require('fs');
+    const p = require('path');
+    const dir = p.join('/tmp', 'gd-rr-mode-' + require('crypto').randomBytes(4).toString('hex'));
+    try {
+      dr.ensureDir(dir);
+      const mode = fsMod.statSync(dir).mode & 0o777;
+      if (mode !== 0o700) throw new Error(`ensureDir created mode ${mode.toString(8)}, expected 700`);
+      fsMod.chmodSync(dir, 0o777);
+      let refused = false;
+      try { dr.ensureDir(dir); } catch (_e) { refused = true; }
+      if (!refused) throw new Error('ensureDir accepted a 0777 directory');
+      return 'creates 0700 and refuses 0777';
+    } finally {
+      try { fsMod.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+    }
+  });
+  // The GD's data/ still holds the bundled attestation trust anchors, so the legacy
+  // gate must test for the database FILE -- testing the directory would refuse every
+  // clean install.
+  record('data_root', 'a pre-P1 GD database refuses the boot', () => {
+    const dr = require('./lib/gd-data-root');
+    const fsMod = require('fs');
+    const legacy = dr.legacyDbPath();
+    if (fsMod.existsSync(legacy)) {
+      throw new Error(`a pre-P1 database is present at ${legacy}; the boot gate should have refused`);
+    }
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    if (!/gdDataRoot\.assertNoLegacyDatabase\(\);/.test(src)) {
+      throw new Error('index.js does not call gdDataRoot.assertNoLegacyDatabase()');
+    }
+    return 'gate present; trust anchors in the same directory do not trigger it';
+  });
 
   // ── Schema (4) ─────────────────────────────────────────────────────────
   record('schema', 'sqlite integrity_check', () => {

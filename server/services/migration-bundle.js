@@ -45,6 +45,7 @@ const { performFullSuiteBackup } = require('./backup-full-suite');
 const signingKeysSvc = require('./backup-signing-keys');
 const manifestSvc = require('./backup-manifest');
 const anchor = require('./instance-anchor');
+const dataRoot = require('../lib/data-root');
 
 // FA-MIG1 envelope constants.
 const FORMAT = 'FA-MIG1';
@@ -69,15 +70,15 @@ const BACKUP_FILES = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveBundleDir(override) {
-  return (
-    override
-    || process.env.MIGRATION_BUNDLE_DIR
-    || path.join(__dirname, '../../data/migration-bundles')
-  );
+  // P1-1: MIGRATION_BUNDLE_DIR, else the canonical data root. routes/
+  // migration.js confines operator-supplied paths to this same root, so both
+  // must resolve identically -- they now call one function.
+  return override || dataRoot.migrationBundlesDir();
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return dataRoot.ensureDir(dir);
 }
 
 // Recursive byte total (the bundle contains a backup/ subdirectory, so a

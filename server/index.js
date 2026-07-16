@@ -32,6 +32,7 @@ const { schedulerService } = require('./services/scheduler');
 const { networkHardening, antiEnumerationErrors, validatePortBinding } = require('./middleware/network-hardening');
 const { bandwidthMonitor } = require('./services/bandwidth-monitor');
 const { verifyIntegrity } = require('./services/integrity');
+const dataRoot = require('./lib/data-root');
 const { runtimeMonitor } = require('./services/runtime-monitor');
 const oodaJobs = require('./services/ooda-generation-jobs');
 const { gdPushService } = require('./services/gd-push');
@@ -499,6 +500,14 @@ function bootstrapTlsMaterial() {
 
 async function start() {
   try {
+    // P1-1: refuse to start if a pre-P1 database is still present at the old
+    // bundle-relative location. This MUST run before initDb(): initDb() creates
+    // a database at the new root, which would turn a clear "your data is at the
+    // old path, move it" into a misleading "both are present" and hide the very
+    // condition this check exists to surface. Fail-closed by design -- starting
+    // against an empty new root would look like total data loss.
+    dataRoot.assertNoLegacyDatabase();
+
     // Initialize database
     initDb();
     logger.info('Database initialized');

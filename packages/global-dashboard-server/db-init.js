@@ -9,8 +9,23 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
 const { ensureActiveReportKeypair } = require('./services/report-signing-keys');
+const gdDataRoot = require('./lib/gd-data-root');
 
-const DB_PATH = process.env.GD_DB_PATH || path.join(__dirname, 'data', 'global-dashboard.db');
+// P1-1: runtime state lives under the canonical GD data root, never inside the
+// application bundle. This path was previously resolved relative to this file's
+// directory, which in a packaged build put the database under
+// <install>/resources/gd-server/data -- the directory an installer replaces,
+// and on a Linux AppImage a read-only mount it could not be created in at all.
+// dbPath() still honours GD_DB_PATH. There is deliberately no module-directory
+// fallback: a fallback that writes into the application directory is the defect
+// P1 removes.
+//
+// Three other files resolved this same path independently before P1
+// (gd-backup-v2, gd-backup-incremental, gd-backup-differential). They agreed
+// only by coincidence of maintenance -- one edit to any of them would have
+// split the database from the WAL paths its backup engines read. One function
+// now answers for all four.
+const DB_PATH = gdDataRoot.dbPath();
 
 const SCHEMA = `
 -- Users (CISOs, VPs, signing-key approvers, read-only analysts)
@@ -1442,9 +1457,8 @@ CREATE TABLE IF NOT EXISTS external_restore_sources (
 `;
 
 function getDb() {
-  const fs = require('fs');
-  const dir = path.dirname(DB_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // Creates 0700 and refuses an already group- or world-accessible directory.
+  gdDataRoot.ensureDir(path.dirname(DB_PATH));
   return new Database(DB_PATH);
 }
 

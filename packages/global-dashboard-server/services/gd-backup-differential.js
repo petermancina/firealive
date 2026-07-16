@@ -46,6 +46,7 @@ const backupV2 = require('./gd-backup-v2');
 // Reuse the INCR-v1 binary bundle format from the incremental writer -- a
 // differential archive uses the same bundle format byte-for-byte.
 const incrementalSvc = require('./gd-backup-incremental');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const ARCHIVE_FILENAME     = manifestSvc.ARCHIVE_FILENAME;
 const WRAPPED_KEY_FILENAME = manifestSvc.WRAPPED_KEY_FILENAME;
@@ -59,10 +60,10 @@ function ensureDir(dir) {
 }
 
 function resolveWalPath(options) {
-  const dbPath = (options && options.dbPath)
-    || process.env.GD_DB_PATH
-    || path.join(__dirname, '..', 'data', 'global-dashboard.db');
-  return dbPath + '-wal';
+  // P1-1: one function answers for the database path across db-init.js,
+  // gd-backup-v2.js, and both WAL resolvers -- they previously agreed only by
+  // coincidence of maintenance.
+  return gdDataRoot.dbPath(options && options.dbPath) + '-wal';
 }
 
 /**

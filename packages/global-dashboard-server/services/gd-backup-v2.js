@@ -60,6 +60,7 @@ const storageRouting = require('./gd-storage-routing');
 const storagePush = require('./gd-storage-push');
 const walExtractor = require('./gd-wal-extractor');
 const walCheckpoint = require('./gd-wal-checkpoint');
+const gdDataRoot = require('../lib/gd-data-root');
 
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;        // 1 hour
 const DEFAULT_RETENTION_DAYS = 35;
@@ -67,15 +68,15 @@ const DEFAULT_RETENTION_DAYS = 35;
 // -- Path resolution ----------------------------------------------------------
 
 function resolveBackupsDir(options) {
-  return (options && options.backupsDir)
-    || process.env.GD_BACKUPS_DIR
-    || path.join(__dirname, '..', 'data', 'backups');
+  // P1-1: GD_BACKUPS_DIR, else the canonical GD data root. Backups previously
+  // landed inside the application bundle -- an installer would have replaced
+  // the very artifacts meant to survive it.
+  return gdDataRoot.backupsDir(options && options.backupsDir);
 }
 
 function resolveDbPath(options) {
-  return (options && options.dbPath)
-    || process.env.GD_DB_PATH
-    || path.join(__dirname, '..', 'data', 'global-dashboard.db');
+  // P1-1: one function, shared with db-init.js and both WAL resolvers.
+  return gdDataRoot.dbPath(options && options.dbPath);
 }
 
 function resolveWalPath(options) {
@@ -83,7 +84,8 @@ function resolveWalPath(options) {
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return gdDataRoot.ensureDir(dir);
 }
 
 // -- Source metadata ----------------------------------------------------------

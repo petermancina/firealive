@@ -82,6 +82,7 @@ const { DB_PATH } = require('../db-init');
 const sbomGenerator = require('./gd-sbom-generator');
 const cosignSigner = require('./gd-cosign-signer');
 const signingKeys = require('./gd-cloud-iac-signing-keys');
+const gdDataRoot = require('../lib/gd-data-root');
 
 // -- Constants ----------------------------------------------------------
 
@@ -98,15 +99,13 @@ const SECRETS_MAPPING_BY_PROVIDER = {
 };
 
 function resolveCloudPackagesDir(override) {
-  return (
-    override
-    || process.env.GD_CLOUD_PACKAGES_DIR
-    || path.join(__dirname, '../data/cloud-packages')
-  );
+  // P1-1: GD_CLOUD_PACKAGES_DIR, else the canonical GD data root.
+  return override || gdDataRoot.cloudPackagesDir();
 }
 
 function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // 0700, and refuses an already group- or world-accessible directory.
+  return gdDataRoot.ensureDir(dir);
 }
 
 function sha256OfFile(filePath) {
