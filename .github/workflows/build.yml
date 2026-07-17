@@ -1,0 +1,288 @@
+name: Build & Release FireAlive
+
+# Triggers. Until P1-3 this workflow fired ONLY on a tag push, which meant every
+# gate below ran after the merge, at release time -- so no gate had ever blocked
+# a pull request in this repository's history. CodeQL (GitHub default setup, no
+# workflow file) was the only PR-time check.
+#
+# The builds stay tag-only: a pull request pays for `coverage` on one ubuntu
+# runner, not nine electron-builder invocations across three operating systems.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Least privilege. This was `contents: write` at the top level, applying to every
+# job including ones that only read source. Only `release` writes. With a
+# pull_request trigger now present, that distinction stops being cosmetic.
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Verify config-lock registry coverage
+        run: node scripts/check-config-lock-coverage.js
+      - name: Verify request-body validation coverage
+        run: node scripts/check-body-validation-coverage.js
+      - name: Verify Tier-1 column registry coverage and sync
+        run: node scripts/check-tier1-registry-coverage.js
+      - name: Verify Tier-1 seal round-trip
+        run: node scripts/check-tier1-seal-roundtrip.js
+      - name: Verify Tier-1 single-writer guard (self-test)
+        run: node scripts/check-tier1-single-writer.js --self-test
+      - name: Verify Tier-1 single-writer guard
+        run: node scripts/check-tier1-single-writer.js
+      - name: Verify shared-KEK boot reload
+        run: node scripts/check-shared-kek-boot-reload.js
+      - name: Verify fuse high-water anti-rollback
+        run: node scripts/check-fuse-high-water.js
+      - name: Verify deployment-mode seal
+        run: node scripts/check-deployment-mode-seal.js
+      - name: Verify HA un-pair flow
+        run: node scripts/check-ha-unpair.js
+      - name: Verify Tier-1 boot integrity gate
+        run: node scripts/check-tier1-boot-gate.js
+      - name: Verify Key-Operation Authorization (KOA)
+        run: node scripts/check-koa.js
+      - name: Verify offline node rekey
+        run: node scripts/check-rekey.js
+      - name: Verify seal-format versioning
+        run: node scripts/check-seal-version.js
+      - name: Verify import rekey
+        run: node scripts/check-import-rekey.js
+      - name: Verify macOS preflight
+        run: node scripts/check-macos-preflight.js
+      - name: Verify no recovery-substitute claims in docs
+        run: node scripts/check-no-recovery-substitute-claims.js
+      - name: Verify legacy TOTP/2FA stays removed
+        run: node scripts/check-no-legacy-2fa.js
+      # The 18th gate. Two steps, matching the single-writer guard above: the
+      # self-test proves the detector goes red on a planted defect on EVERY run,
+      # rather than once in a pull request that then closes.
+      - name: Verify no bundle-relative data paths (self-test)
+        run: node scripts/check-no-bundle-relative-data-paths.js --self-test
+      - name: Verify no bundle-relative data paths
+        run: node scripts/check-no-bundle-relative-data-paths.js
+
+
+  # The first thing in this repository that launches the product. Runs on every
+  # pull request and every tag -- NOT tag-only like the builds, because a
+  # packaging defect must be caught before the merge, which is the whole reason
+  # six of them shipped.
+  #
+  # It builds Linux only. That is not a gap: FATAL 1, 2, 4, 6 and 7 are
+  # platform-independent (a spawn target, a require specifier, a data path, a
+  # missing schema), and FATAL 3 is Linux-specific by nature -- the AppImage IS
+  # the read-only mount. macOS and Windows are covered at tag time by build-mac
+  # and build-windows, whose electron-builder invocations are identical.
+  smoke:
+    needs: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      # Electron needs a display. xvfb-run supplies one; --no-sandbox is set by
+      # the harness because a runner has no user namespaces for Chromium's
+      # sandbox. Neither weakens the product: all three apps set sandbox: true
+      # in webPreferences regardless, and that is what ships.
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - run: npm install
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+
+      - name: Build the three Linux apps
+        run: |
+          set -euo pipefail
+          cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never && cd ../..
+          cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never && cd ../..
+          cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never && cd ..
+
+      # --appimage-extract rather than executing the AppImage directly: Ubuntu
+      # 22.04+ ships FUSE 3 and an AppImage needs FUSE 2, so a direct run needs
+      # a privileged `apt-get install libfuse2`. Extraction needs nothing.
+      # The Analyst Client targets arch: [x64, arm64] where the MC and GD target
+      # x64 only, so its dist/ holds TWO AppImages. An earlier version of this
+      # step used `find ... | head -1`, which deterministically picked the arm64
+      # one (`-arm64.AppImage` sorts before `.AppImage`) and died with
+      # "cannot execute binary file: Exec format error" on an x64 runner.
+      #
+      # The fix is not to pick the right one. `head -1` silently selects one of
+      # N and reports success -- the same shape as every defect this phase
+      # exists to kill. This asserts there is EXACTLY ONE runner-arch AppImage
+      # and fails loud otherwise, so a future arch change is a red build rather
+      # than a coin flip.
+      - name: Extract the AppImages
+        run: |
+          set -euo pipefail
+          for d in frontend packages/global-dashboard packages/analyst-client; do
+            imgs=$(find "$d/dist" -maxdepth 1 -name '*.AppImage' ! -name '*arm64*' ! -name '*armv7l*' ! -name '*i386*')
+            n=$(printf '%s' "$imgs" | grep -c . || true)
+            if [ "$n" -ne 1 ]; then
+              echo "expected exactly 1 x64 AppImage in $d/dist, found $n:"
+              find "$d/dist" -maxdepth 1 -name '*.AppImage' || true
+              exit 1
+            fi
+            echo "extracting $imgs"
+            ( cd "$d/dist" && chmod +x "$(basename "$imgs")" && "./$(basename "$imgs")" --appimage-extract >/dev/null )
+            test -x "$d/dist/squashfs-root/AppRun" || { echo "no AppRun after extracting $imgs"; exit 1; }
+          done
+
+      # Each asserts the boot ladder reaches the hardware refusal and nothing
+      # earlier. The MC and GD are asserted differently because their servers
+      # report differently -- see the harness header.
+      - name: Smoke the Management Console
+        run: xvfb-run -a node scripts/smoke-packaged-app.js mc frontend/dist/squashfs-root
+      - name: Smoke the Global Dashboard
+        run: xvfb-run -a node scripts/smoke-packaged-app.js gd packages/global-dashboard/dist/squashfs-root
+      # NOTE: the AC's arm64 AppImage is built but NOT smoked -- a hosted x64
+      # runner cannot execute it. That is a named gap, not an oversight: the
+      # arch-independent fatals (1, 2, 4, 6, 7) are covered by the x64 run, and
+      # closing it properly needs an arm64 runner.
+      - name: Smoke the Analyst Client
+        run: xvfb-run -a node scripts/smoke-packaged-app.js ac packages/analyst-client/dist/squashfs-root
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: smoke-logs
+          path: |
+            ~/.firealive/regional-server/logs/*.log
+            /home/runner/.firealive/regional-server/logs/*.log
+          if-no-files-found: ignore
+
+
+  build-mac:
+    needs: coverage
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+      - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
+      - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
+      - run: cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mac-installers
+          path: |
+            packages/*/dist/*.dmg
+            packages/*/dist/*.zip
+            frontend/dist/*.dmg
+            frontend/dist/*.zip
+          if-no-files-found: warn
+
+  build-windows:
+    needs: coverage
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+        shell: bash
+      - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --win --publish never
+        shell: bash
+      - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --win --publish never
+        shell: bash
+      - run: cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --win --publish never
+        shell: bash
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: win-installers
+          path: |
+            packages/*/dist/*.exe
+            frontend/dist/*.exe
+          if-no-files-found: warn
+
+  build-linux:
+    needs: coverage
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: cp packages/shared/signal-e2ee.js packages/analyst-client/signal-e2ee.js && cp packages/shared/signal-e2ee.js frontend/signal-e2ee.js && cp packages/shared/abuse-seal.js packages/analyst-client/abuse-seal.js && cp packages/shared/abuse-seal.js frontend/abuse-seal.js
+      - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
+      - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
+      - run: cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-installers
+          path: |
+            packages/*/dist/*.AppImage
+            frontend/dist/*.AppImage
+
+  release:
+    # `smoke` joins this list only NOW, in the commit that creates the job. A
+    # needs on an undefined job fails the WHOLE workflow to load -- an earlier
+    # draft of this plan declared it in the commit that added the trigger,
+    # which would have taken CI down with the first commit of the PR that
+    # exists to make CI trustworthy.
+    #
+    # `coverage` was NOT in this list. With `if: always()` beside it, a red gate
+    # did not stop a release: the builds skipped, this job ran anyway, the
+    # artifact download could not fail, and action-gh-release published --
+    # `fail_on_unmatched_files` defaults to false, so zero installers was not an
+    # error. Pushing v1.0.85 with a red gate produced a published, empty
+    # v1.0.85. The seventeen gates gated the installers; they never gated a
+    # release.
+    #
+    # The trade, stated rather than buried: without `if: always()`, one flaky
+    # runner now withholds the release until it is re-run. That has happened
+    # once (the v1.0.75 mac ECONNRESET). Re-run the job. Do not publish a
+    # release the gates never cleared. O4 owns the npm fetch-retry hardening
+    # that reduces the flake.
+    needs: [coverage, smoke, build-mac, build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+      - uses: softprops/action-gh-release@v3
+        with:
+          # A release that publishes with no installers while calling itself a
+          # release is the same lie as a green check that cannot go red.
+          fail_on_unmatched_files: true
+          files: |
+            **/*.dmg
+            **/*.zip
+            **/*.exe
+            **/*.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
