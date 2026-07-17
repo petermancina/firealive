@@ -7,6 +7,34 @@
 // NEVER writes back to Regional Servers.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── P1-2a: owner-only by default ───────────────────────────────────────────
+// Set before ANY require, and therefore before the P1-1 legacy-database gate
+// below, so nothing this process or its children create can land group- or
+// world-readable -- not for an instant.
+//
+// Node inherits the login shell's umask, typically 0022, which makes every
+// mkdirSync 0755 and every writeFileSync 0644. That is how the GD database, its
+// backups, its audit archive, and its persistent TPM keystore directory all
+// came to be readable by any other local account on the CISO's host. 0o077
+// makes the defaults 0700 and 0600.
+//
+// This is the control; per-site modes are defense in depth on top of it, for
+// three reasons a per-site approach cannot cover:
+//
+//   1. fs.copyFileSync CANNOT take a mode. The persistent keystore key files
+//      arrive by copy out of the mkdtemp workdir
+//      (gd-hardware-keystore-linux.js:166-167), as does a restored database
+//      (gd-restore.js:734). Chmod-after leaves a window in which the file
+//      exists at 0644; a umask leaves none.
+//   2. Child processes inherit it. tpm2_create writes key.pub / key.priv
+//      itself -- no Node-side mode argument reaches that.
+//   3. It fails safe. A writer nobody classified still lands 0600.
+//
+// No-op on Windows, where process.umask does nothing: the boot posture check's
+// ACL branch is the only control there, which is why it must never silently
+// skip that platform.
+if (typeof process.umask === 'function') process.umask(0o077);
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -3691,6 +3719,62 @@ function runGdRegression(db) {
       tests.push({ category, name, status: 'fail', detail: String(err.message || err).slice(0, 500) });
     }
   };
+
+  // -- Permissions (P1-2a) (3) ------------------------------------------
+  // Assert the EFFECT, not the call: grepping for process.umask(0o077) would
+  // still pass if a refactor moved it below a require, at which point everything
+  // created while those requires run lands 0644 again.
+  record('permissions', 'owner-only is the process default', () => {
+    if (process.platform === 'win32') {
+      return SKIP('process.umask is a no-op on Windows; the boot posture check covers ACLs there');
+    }
+    const fsMod = require('fs');
+    const osMod = require('os');
+    const p = require('path');
+    const tmp = fsMod.mkdtempSync(p.join(osMod.tmpdir(), 'gd-umask-'));
+    try {
+      const sub = p.join(tmp, 'sub');
+      const file = p.join(tmp, 'f');
+      const copy = p.join(tmp, 'c');
+      fsMod.mkdirSync(sub);
+      fsMod.writeFileSync(file, 'x');
+      // copyFileSync cannot take a mode: the umask is the ONLY control, and it
+      // is how the persistent keystore key files and a restored database land.
+      fsMod.copyFileSync(file, copy);
+      const dm = fsMod.statSync(sub).mode & 0o777;
+      const fm = fsMod.statSync(file).mode & 0o777;
+      const cm = fsMod.statSync(copy).mode & 0o777;
+      if (dm !== 0o700 || fm !== 0o600 || cm !== 0o600) {
+        throw new Error(`default modes are dir ${dm.toString(8)}, file ${fm.toString(8)}, copy ${cm.toString(8)}; expected 700/600/600. process.umask(0o077) is not in effect.`);
+      }
+      return 'dir 700, file 600, copy 600 with no explicit mode';
+    } finally {
+      try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+    }
+  });
+  record('permissions', 'the umask precedes every require', () => {
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    const u = code.indexOf('process.umask(0o077)');
+    const r = code.indexOf('require(');
+    if (u === -1) throw new Error('index.js does not set process.umask(0o077)');
+    if (r !== -1 && u > r) throw new Error('process.umask(0o077) appears after the first require');
+    return 'umask precedes every require';
+  });
+  // GD-specific: the P1-1 legacy gate calls existsSync and its sibling getDb()
+  // CREATES the database. If the umask were set after it, the first artifacts of
+  // a fresh GD -- including that database -- would land 0644.
+  record('permissions', 'the umask precedes the legacy-database gate', () => {
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    const u = code.indexOf('process.umask(0o077)');
+    const g = code.indexOf('assertNoLegacyDatabase();');
+    if (g === -1) throw new Error('index.js does not call gdDataRoot.assertNoLegacyDatabase()');
+    if (u === -1 || u > g) throw new Error('process.umask(0o077) must precede the legacy-database gate');
+    return 'umask precedes the legacy gate';
+  });
 
   // -- Data root (P1-1) (5) ---------------------------------------------
   record('data_root', 'no accessor resolves inside the application directory', () => {

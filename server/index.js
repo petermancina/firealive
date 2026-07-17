@@ -4,6 +4,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── P1-2a: owner-only by default ───────────────────────────────────────────
+// Set before ANY require, so nothing this process or its children create can
+// land group- or world-readable -- not for an instant.
+//
+// Node inherits the login shell's umask, typically 0022, which makes every
+// mkdirSync 0755 and every writeFileSync 0644. That is how the database, the
+// logs, the audit archive, the backups, and the persistent TPM keystore all
+// came to be world-readable. 0o077 makes the defaults 0700 and 0600.
+//
+// This is the control, not a convenience. Per-site modes are defense in depth
+// on top of it, for three reasons a per-site approach alone cannot cover:
+//
+//   1. fs.copyFileSync CANNOT take a mode. The persistent keystore key files
+//      arrive by copy (hardware-keystore-linux.js:160-161), as does a restored
+//      database (restore.js:721). Chmod-after leaves a window in which the file
+//      exists at 0644; a umask leaves none.
+//   2. Child processes inherit it. tpm2_create writes key.pub / key.priv
+//      itself -- no Node-side mode argument reaches that.
+//   3. It fails safe. A writer nobody classified still lands 0600, instead of
+//      staying 0644 forever because a review missed it.
+//
+// No-op on Windows, where process.umask does nothing: the boot posture check's
+// ACL branch is the only control there, which is why it must never silently
+// skip that platform.
+if (typeof process.umask === 'function') process.umask(0o077);
+
 require('dotenv').config();
 
 const express = require('express');

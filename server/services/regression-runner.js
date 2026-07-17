@@ -1559,6 +1559,59 @@ class RegressionRunner {
       return 'TAXII discovery/collections/objects present with taxii+stix media types and auth guard';
     });
 
+    // -- Category: Permissions (P1-2a) ----------------------------------
+    // Asserts the EFFECT, not the call. Grepping index.js for
+    // process.umask(0o077) would still pass if a refactor moved it below a
+    // require -- at which point everything created during those requires lands
+    // 0644 again. This creates a directory and a file with NO explicit mode and
+    // checks what the operating system actually produced.
+    await check('permissions', 'owner-only is the process default', () => {
+      if (process.platform === 'win32') {
+        return SKIP('process.umask is a no-op on Windows; the boot posture check covers ACLs there');
+      }
+      const fsMod = require('fs');
+      const osMod = require('os');
+      const tmp = fsMod.mkdtempSync(path.join(osMod.tmpdir(), 'fa-umask-'));
+      try {
+        const sub = path.join(tmp, 'sub');
+        const file = path.join(tmp, 'f');
+        const copy = path.join(tmp, 'c');
+        fsMod.mkdirSync(sub);
+        fsMod.writeFileSync(file, 'x');
+        // copyFileSync cannot take a mode: the umask is the ONLY control here,
+        // and this is how the persistent keystore key files and a restored
+        // database are created.
+        fsMod.copyFileSync(file, copy);
+        const dm = fsMod.statSync(sub).mode & 0o777;
+        const fm = fsMod.statSync(file).mode & 0o777;
+        const cm = fsMod.statSync(copy).mode & 0o777;
+        if (dm !== 0o700 || fm !== 0o600 || cm !== 0o600) {
+          throw new Error(
+            'default modes are dir ' + dm.toString(8) + ', file ' + fm.toString(8)
+            + ', copy ' + cm.toString(8) + '; expected 700/600/600. process.umask(0o077) '
+            + 'is not in effect -- it must be set in index.js before any require, or '
+            + 'everything created while those requires run lands group- and world-readable.'
+          );
+        }
+        return 'dir 700, file 600, copy 600 with no explicit mode';
+      } finally {
+        try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    await check('permissions', 'the umask is set before the first require', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      const u = code.indexOf('process.umask(0o077)');
+      const r = code.indexOf("require(");
+      if (u === -1) throw new Error('index.js does not set process.umask(0o077)');
+      if (r !== -1 && u > r) {
+        throw new Error('process.umask(0o077) appears after the first require; anything created while those requires run would land 0644');
+      }
+      return 'umask precedes every require';
+    });
+
     // -- Category: Data root (P1-1) -------------------------------------
     // Before P1 every runtime path resolved relative to the module directory,
     // which in a packaged build put the database, the logs, the audit archive
