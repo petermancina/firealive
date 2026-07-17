@@ -667,7 +667,16 @@ ipcMain.handle('abuse:finalize-export', async (_e, { descriptor } = {}) => {
   });
   if (canceled || !filePath) return { saved: false, reason: 'dialog_canceled' };
   try {
-    fs.writeFileSync(filePath, pdf);
+    // P1-2b: owner-only. This is an abuse-flag submission record -- analyst
+    // evidence naming a reporter and a subject -- written to an operator-chosen
+    // path that may be a shared drive or a synced folder. Every sibling write in
+    // this file sets a mode (:76 the public CA pin at 0o644 deliberately, :513
+    // the same dialog-to-filePath shape at 0o600); this one did not, so it
+    // landed at the inherited default, typically 0644.
+    //
+    // Note the limit of the mode argument: it applies only when the file is
+    // CREATED. Overwriting an existing file leaves that file's mode as it was.
+    fs.writeFileSync(filePath, pdf, { mode: 0o600 });
   } catch (e) {
     return { saved: false, reason: 'write_failed' };
   }

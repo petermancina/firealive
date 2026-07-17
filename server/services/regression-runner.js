@@ -1559,6 +1559,83 @@ class RegressionRunner {
       return 'TAXII discovery/collections/objects present with taxii+stix media types and auth guard';
     });
 
+    // -- Category: Data posture (P1-2c) ---------------------------------
+    // The umask is the control; this is the verification. It must assert the
+    // REFUSAL, not just that a good directory passes -- a check that cannot fail
+    // proves nothing, which is the defect this whole phase keeps finding.
+    await check('data_posture', 'a group- or world-accessible directory refuses the boot', () => {
+      if (process.platform === 'win32') {
+        return SKIP('POSIX mode bits; the Windows ACL branch is built in P1-3 on CI windows-latest');
+      }
+      const dp = require('../lib/data-posture');
+      const fsMod = require('fs');
+      const dir = path.join('/tmp', 'fa-posture-' + crypto.randomBytes(4).toString('hex'));
+      try {
+        fsMod.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        if (dp.offendingMode(dir) !== null) throw new Error('0700 was reported as offending');
+        // 0750 -- group-readable. The likelier real mistake, and it must fail too.
+        fsMod.chmodSync(dir, 0o750);
+        if (dp.offendingMode(dir) === null) throw new Error('0750 (group-readable) was accepted');
+        fsMod.chmodSync(dir, 0o777);
+        if (dp.offendingMode(dir) === null) throw new Error('0777 was accepted');
+        return '0700 allowed; 0750 and 0777 both refused';
+      } finally {
+        try { fsMod.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ }
+      }
+    });
+
+    await check('data_posture', 'an absent directory does not brick a fresh install', () => {
+      if (process.platform === 'win32') return SKIP('POSIX mode bits; Windows ACL branch is P1-3');
+      const dp = require('../lib/data-posture');
+      const missing = path.join('/tmp', 'fa-absent-' + crypto.randomBytes(4).toString('hex'));
+      // statSync throws ENOENT on a missing path. A posture check that crashes a
+      // fresh install is worse than no check; absent must mean nothing to protect.
+      if (dp.offendingMode(missing) !== null) throw new Error('an absent directory was reported as offending');
+      return 'absent is skipped, not refused';
+    });
+
+    await check('data_posture', 'the check covers the keystore and asks rather than reconstructs', () => {
+      const dp = require('../lib/data-posture');
+      const owned = dp.ownedDirectories();
+      const labels = owned.map((o) => o.label);
+      for (const want of ['data root', 'logs', 'backups']) {
+        if (labels.indexOf(want) === -1) throw new Error('posture check does not cover: ' + want);
+      }
+      if (process.platform === 'linux' && labels.indexOf('hardware keystore') === -1) {
+        throw new Error('posture check does not cover the hardware keystore -- the Tier-1 KEK seal');
+      }
+      for (const o of owned) {
+        if (o.resolveError) throw new Error(o.label + ' could not resolve: ' + o.resolveError);
+      }
+      return labels.length + ' directories: ' + labels.join(', ');
+    });
+
+    await check('data_posture', 'the boot gate is wired and ordered before initDb', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      const p = code.indexOf('dataPosture.assertPosture()');
+      const i = code.indexOf('initDb();');
+      if (p === -1) throw new Error('index.js does not call dataPosture.assertPosture()');
+      if (i !== -1 && p > i) {
+        throw new Error('assertPosture() must precede initDb(): initDb creates these directories, so a check after it inspects directories this boot just made at 0700 -- correct by construction and proof of nothing');
+      }
+      return 'wired and ordered before initDb()';
+    });
+
+    await check('data_posture', 'Windows reports not-covered honestly, never a silent pass', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'lib', 'data-posture.js'), 'utf8');
+      if (!/covered:\s*false/.test(src)) {
+        throw new Error('data-posture.js has no covered:false branch -- on Windows it would silently pass, and Windows is the one platform where this check is the ONLY file-permission control (process.umask is a no-op, Node mode is ignored, no ACL code exists)');
+      }
+      const idx = require('fs').readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      if (!/posture\.covered/.test(idx)) {
+        throw new Error('index.js ignores the covered flag -- a not-covered verdict must be surfaced, not dropped');
+      }
+      return 'covered:false is reported and the boot surfaces it';
+    });
+
     // -- Category: Permissions (P1-2a) ----------------------------------
     // Asserts the EFFECT, not the call. Grepping index.js for
     // process.umask(0o077) would still pass if a refactor moved it below a

@@ -216,6 +216,39 @@ const gdHaLiveness = require('./services/gd-ha-liveness');
 // holds the bundled attestation trust anchors and exists on every clean install.
 const gdDataRoot = require('./lib/gd-data-root');
 gdDataRoot.assertNoLegacyDatabase();
+
+// ── P1-2c: refuse a group-readable data directory ──────────────────────────
+// Placed immediately after the legacy check and before ANY other module-scope
+// work, for the same reason the umask is: getDb() CREATES these directories, the
+// GD has ~20 module-scope getDb() sites, and rather than depend on proving which
+// executes first, this runs before all of them. A check that ran after one would
+// inspect directories this very boot had just made at 0700 -- correct by
+// construction, and proof of nothing about the ones already there.
+//
+// The GD cannot copy the Regional wiring: it has NO logger (verified -- no
+// gd-logger.js, no logger require; this file uses console throughout), and its
+// boot gates run at module scope rather than inside a start(), so there is no
+// "before initDb()" anchor -- index.js never calls initDb at all.
+//
+// Halts unconditionally. The integrity and anti-rollback gates halt only when
+// NODE_ENV=production, and that pattern is deliberately NOT copied: `npm start`
+// is `node index.js` and sets no NODE_ENV, so those gates are off unless an
+// operator remembered an env var. A security control conditioned on config is
+// not fail-closed. A group-readable directory is also something a developer has
+// by accident (a pre-P1 run left one at 0755) -- exactly the case worth
+// catching, and the remedy is one chmod that the error names.
+const gdDataPosture = require('./lib/gd-data-posture');
+const gdPosture = gdDataPosture.assertPosture();
+if (!gdPosture.covered) {
+  // Windows: NOT a pass. process.umask is a no-op, Node's mode is ignored, and
+  // no ACL code exists anywhere in this codebase -- so Windows has no
+  // file-permission control at all today. Say so loudly rather than skip
+  // silently: this is the one platform where the posture check is the only
+  // control there is. The ACL branch lands in P1-3 on CI's windows-latest runner.
+  console.warn('[gd] Data posture NOT VERIFIED on this platform:', gdPosture.reason);
+} else {
+  console.log('[gd] Data posture ok:', gdPosture.checked.length, 'directories');
+}
 app.use('/api/', (req, res, next) => {
   // The exclusion rule lives in gd-ha-liveness.shouldStampClientRequest, exported so
   // the regression can assert it. Pass originalUrl: this middleware is mounted at

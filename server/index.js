@@ -59,6 +59,7 @@ const { networkHardening, antiEnumerationErrors, validatePortBinding } = require
 const { bandwidthMonitor } = require('./services/bandwidth-monitor');
 const { verifyIntegrity } = require('./services/integrity');
 const dataRoot = require('./lib/data-root');
+const dataPosture = require('./lib/data-posture');
 const { runtimeMonitor } = require('./services/runtime-monitor');
 const oodaJobs = require('./services/ooda-generation-jobs');
 const { gdPushService } = require('./services/gd-push');
@@ -533,6 +534,31 @@ async function start() {
     // condition this check exists to surface. Fail-closed by design -- starting
     // against an empty new root would look like total data loss.
     dataRoot.assertNoLegacyDatabase();
+
+    // P1-2c: refuse to start if any FireAlive directory is reachable by another
+    // local account. Ordered AFTER the legacy check and BEFORE initDb(): initDb()
+    // CREATES these directories, and a check that ran after it would inspect
+    // directories this very boot had just made at 0700 -- correct by
+    // construction, and proof of nothing about the ones that were already there.
+    //
+    // Unconditional, unlike the integrity and anti-rollback gates, which halt
+    // only when NODE_ENV=production (:88, :917). Those guard against a tampered
+    // or downgraded build, which is not a thing a developer does by accident. A
+    // group-readable data directory IS something a developer has by accident --
+    // a pre-P1 run left one at 0755 -- and that is exactly the case worth
+    // catching. NODE_ENV-gating it would mean no developer ever sees it and it
+    // fires first on a customer's machine. The remedy is one chmod and the error
+    // names it.
+    const posture = dataPosture.assertPosture();
+    if (!posture.covered) {
+      // Windows: NOT a pass. process.umask is a no-op there, Node's mode is
+      // ignored, and no ACL check exists yet (P1-3, on CI windows-latest). Say so
+      // loudly rather than skip silently -- this is the one platform where the
+      // posture check is the only file-permission control there is.
+      logger.warn('Data posture NOT VERIFIED on this platform', { reason: posture.reason });
+    } else {
+      logger.info('Data posture ok', { directories: posture.checked.length });
+    }
 
     // Initialize database
     initDb();

@@ -5,6 +5,22 @@
 // notifications, compliance data, system health metrics.
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── P1-2b: owner-only by default ───────────────────────────────────────────
+// This file is BOTH a module and an entry point. `npm run init-db` runs it as a
+// script (see the require.main branch at the foot of the file), and that is the
+// ONLY thing that creates the GD database: index.js imports initDb and never
+// calls it. So P1-2a's umask -- set in index.js -- does not cover the path that
+// actually creates the database. Without this line a fresh GD's database, and
+// every table in it, lands 0644.
+//
+// Set unconditionally rather than inside the require.main branch: when index.js
+// requires this module the umask is already 0o077 and this is a no-op, and a
+// process-wide default must not depend on which branch a future edit takes.
+//
+// No-op on Windows, where process.umask does nothing; the boot posture check's
+// ACL branch is the only control there.
+if (typeof process.umask === 'function') process.umask(0o077);
+
 const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');

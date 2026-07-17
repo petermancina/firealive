@@ -4,6 +4,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ── P1-2b: owner-only by default ───────────────────────────────────────────
+// This file is BOTH a module and an entry point: the require.main branch at the
+// foot of the file runs initDb() when it is invoked directly, which creates the
+// database and every file under the data root.
+//
+// Unlike the GD -- whose index.js never calls initDb, making `npm run init-db`
+// the only path that creates its database -- server/index.js DOES call initDb()
+// (:512), so the primary path is already covered by P1-2a's umask. What this
+// line covers is the standalone invocation: `node server/db/init.js`, which
+// would otherwise run at the inherited 0022 and lay down a 0644 database and a
+// 0755 data root.
+//
+// Set unconditionally at the top rather than inside the require.main branch:
+// when index.js requires this module the umask is already 0o077 and this is a
+// no-op, and a process-wide default must not depend on which branch a future
+// edit happens to take.
+//
+// No-op on Windows, where process.umask does nothing; the boot posture check's
+// ACL branch is the only control there.
+if (typeof process.umask === 'function') process.umask(0o077);
+
 const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');

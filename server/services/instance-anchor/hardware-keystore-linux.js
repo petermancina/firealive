@@ -291,6 +291,12 @@ function nvIncrementCounter(index) {
 module.exports = {
   kind: KIND,
   isAvailable,
+  // P1-2c: the boot posture check verifies this directory is owner-only. It must
+  // ask rather than reconstruct the FIREALIVE_HW_KEYSTORE_DIR chain -- duplicated
+  // path logic is what let the GD's migration composer and importer point at
+  // different directories, and let the storage health probe report on a directory
+  // the backup engine never wrote to. One resolver, one answer.
+  storeDir,
   createSigningKey,
   getSigningPublicKey,
   sign,
