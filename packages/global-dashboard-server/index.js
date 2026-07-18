@@ -249,6 +249,34 @@ if (!gdPosture.covered) {
 } else {
   console.log('[gd] Data posture ok:', gdPosture.checked.length, 'directories');
 }
+// -- P1-3b: create the schema before anything reads it (FATAL 7) -------------
+//
+// index.js imported initDb and never called it, so the GD schema was created
+// only by `npm run init-db`. A packaged GD spawns index.js directly
+// (packages/global-dashboard/main.js) and nothing runs that script -- so
+// getDb() (db-init.js) handed back a connection to an EMPTY database: it
+// creates the file and never execs SCHEMA. The instance-anchor's
+// SELECT * FROM gd_instance_identity then threw `no such table`, and the catch
+// around it halted the GD Server on EVERY host, with or without a hardware
+// root of trust. The packaged GD had never started anywhere.
+//
+// It went unseen because that catch prints the hardware-root message for ANY
+// establishment failure, so the symptom blamed a TPM that was present and
+// working. The halt was honest; its stated reason was not.
+//
+// Placement. After the posture check, because the data root must be verified
+// before a directory is created inside it. Before the first module-scope
+// database read, which is the instance-anchor's getDb(). Every other getDb()
+// in this file sits inside an app.* handler or a function body and does not
+// execute at require time -- established by reading all 17 call sites, because
+// a brace counter desynchronises on the regex literal at :4359 and cannot be
+// trusted here.
+//
+// Idempotent. The canonical schema is CREATE TABLE IF NOT EXISTS throughout,
+// and server/index.js calls initDb() on every boot -- the Regional Server is
+// the in-repo proof that a repeated call is safe.
+initDb();
+console.log('[gd] Database initialized');
 app.use('/api/', (req, res, next) => {
   // The exclusion rule lives in gd-ha-liveness.shouldStampClientRequest, exported so
   // the regression can assert it. Pass originalUrl: this middleware is mounted at
@@ -3809,6 +3837,43 @@ function runGdRegression(db) {
     return 'umask precedes the legacy gate';
   });
 
+  // -- Boot schema (P1-3b) (2) -------------------------------------------
+  // FATAL 7. index.js imported initDb and never called it, so a packaged GD --
+  // which spawns index.js directly and never runs `npm run init-db` -- reached
+  // the instance anchor with a zero-table database and halted on EVERY host.
+  // Nothing caught it because nothing had ever booted a GD, and because the
+  // anchor's catch prints the hardware-root message for ANY failure, so the
+  // symptom blamed a TPM that was present and working.
+  //
+  // Both halves are needed. The table's presence cannot prove the boot call --
+  // `npm run init-db` would satisfy it too -- and the source order cannot prove
+  // the table exists. Same reason the umask carries an effect check AND an
+  // order check: an effect cannot establish an ordering.
+  record('boot_schema', 'the instance-anchor identity table exists', () => {
+    const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='gd_instance_identity'").get();
+    if (!row) {
+      throw new Error('gd_instance_identity is absent: initDb() never ran against this database. The instance anchor would throw `no such table` and the GD would halt claiming no hardware root of trust.');
+    }
+    return 'gd_instance_identity present';
+  });
+  record('boot_schema', 'initDb precedes the instance-anchor identity read', () => {
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    const i = code.indexOf('\ninitDb();');
+    const a = code.indexOf('const identityDb = getDb();');
+    if (i === -1) {
+      throw new Error('index.js does not call initDb() at module scope; a packaged GD never runs `npm run init-db`, so its schema would not exist');
+    }
+    if (a === -1) {
+      throw new Error('the instance-anchor identity read moved; this check needs rewiring rather than deleting');
+    }
+    if (i > a) {
+      throw new Error('initDb() appears after the instance anchor reads identity: the anchor would see a zero-table database and halt with `no such table: gd_instance_identity`');
+    }
+    return 'initDb precedes the identity read';
+  });
+
   // -- Data root (P1-1) (5) ---------------------------------------------
   record('data_root', 'no accessor resolves inside the application directory', () => {
     const dr = require('./lib/gd-data-root');
@@ -4680,6 +4745,7 @@ function runGdRegression(db) {
     // decision is recorded, and it is shared by four modules.
     const fsMod = require('fs');
     const pathMod = require('path');
+    const { sourceFile } = require('./lib/gd-source-file');
     const { HA_EVENT_SEVERITY } = require('./services/gd-ha-audit');
     const sources = [
       'services/gd-ha-failover.js',
@@ -4689,7 +4755,10 @@ function runGdRegression(db) {
     ];
     const emitted = new Set();
     for (const rel of sources) {
-      const abs = pathMod.join(__dirname, rel);
+      // GD __dirname IS the server root, so rootDir and fromDir are both
+      // __dirname. sourceFile refuses any rel escaping the root or not a .js
+      // file, so SOURCE_SCANNERS no longer needs to permit this path.
+      const abs = sourceFile(__dirname, __dirname, rel);
       if (!fsMod.existsSync(abs)) continue;
       const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
       // The tokenizer blanks strings, so read the raw source for the literals and use the
@@ -4720,6 +4789,7 @@ function runGdRegression(db) {
     // indirection below the function that received the db.
     const fsMod = require('fs');
     const pathMod = require('path');
+    const { sourceFile } = require('./lib/gd-source-file');
     // The full HA surface, not a hand-picked subset. The first version of this list
     // omitted gd-ha-peer-link.js and the scheduler, and passed while gd-ha-peer-link
     // audited peer-gate rejections through a second connection. Files that open a
@@ -4748,7 +4818,10 @@ function runGdRegression(db) {
     const offenders = [];
     let scanned = 0;
     for (const rel of targets) {
-      const abs = pathMod.join(__dirname, rel);
+      // GD __dirname IS the server root, so rootDir and fromDir are both
+      // __dirname. sourceFile refuses any rel escaping the root or not a .js
+      // file, so SOURCE_SCANNERS no longer needs to permit this path.
+      const abs = sourceFile(__dirname, __dirname, rel);
       if (!fsMod.existsSync(abs)) continue;
       scanned += 1;
       const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
@@ -4767,6 +4840,7 @@ function runGdRegression(db) {
   record('gd_high_availability', 'No HA source reads .json off a peer-link result', () => {
     const fsMod = require('fs');
     const pathMod = require('path');
+    const { sourceFile } = require('./lib/gd-source-file');
     // The full HA surface. A guard that is not looking somewhere reports clean: the
     // audit-connection guard's first target list omitted the peer links, and three real
     // sites sat outside it until VERIFY-MERGE swept independently.
@@ -4792,7 +4866,10 @@ function runGdRegression(db) {
     const offenders = [];
     let scanned = 0;
     for (const rel of targets) {
-      const abs = pathMod.join(__dirname, rel);
+      // GD __dirname IS the server root, so rootDir and fromDir are both
+      // __dirname. sourceFile refuses any rel escaping the root or not a .js
+      // file, so SOURCE_SCANNERS no longer needs to permit this path.
+      const abs = sourceFile(__dirname, __dirname, rel);
       if (!fsMod.existsSync(abs)) continue;
       scanned += 1;
       const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));

@@ -18,6 +18,10 @@
 //     the forensic-key reader -- so the guard tokenizes the identifier itself,
 //     which the alias cannot disguise).
 //
+// P1-3a moved that tokenizer to scripts/lib/js-tokenizer.js so the 18th gate
+// (check-no-bundle-relative-data-paths.js) uses the same one rather than a copy.
+// The token stream is unchanged; this guard's --self-test is what proves it.
+//
 // Two violation classes:
 //   1. retired-config-api : any use of the exact identifiers `encryptConfig` or
 //      `decryptConfig` (the `...WithKey` cores are different identifiers and are
@@ -41,71 +45,12 @@ const RETIRED = new Set(['encryptConfig', 'decryptConfig']);
 const RAW = new Set(['encrypt', 'decrypt']);
 const TIER1 = 'TIER1_ENCRYPTION_KEY';
 
+
 // --- tokenizer -------------------------------------------------------------
-// Emits { type, value, line }. type is one of 'id' | 'str' | 'punct'. Line and
-// block comments are skipped. String bodies are captured (with escapes folded)
-// so the TIER1 literal can be matched, but string tokens never match an
-// identifier, so a quoted "encryptConfig" is not a violation.
-function tokenize(src) {
-  const toks = [];
-  let i = 0;
-  let line = 1;
-  const n = src.length;
-  const isIdStart = (c) => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '_' || c === '$';
-  const isId = (c) => isIdStart(c) || (c >= '0' && c <= '9');
-  while (i < n) {
-    const c = src[i];
-    if (c === '\n') { line++; i++; continue; }
-    // line comment
-    if (c === '/' && src[i + 1] === '/') {
-      i += 2;
-      while (i < n && src[i] !== '\n') i++;
-      continue;
-    }
-    // block comment
-    if (c === '/' && src[i + 1] === '*') {
-      i += 2;
-      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
-        if (src[i] === '\n') line++;
-        i++;
-      }
-      i += 2;
-      continue;
-    }
-    // string (single, double, or template -- we only read the raw body)
-    if (c === "'" || c === '"' || c === '`') {
-      const q = c;
-      const startLine = line;
-      i++;
-      let val = '';
-      while (i < n) {
-        if (src[i] === '\\') { val += src[i + 1] || ''; i += 2; continue; }
-        if (src[i] === q) { i++; break; }
-        if (src[i] === '\n') line++;
-        val += src[i];
-        i++;
-      }
-      toks.push({ type: 'str', value: val, line: startLine });
-      continue;
-    }
-    // identifier
-    if (isIdStart(c)) {
-      let j = i + 1;
-      while (j < n && isId(src[j])) j++;
-      toks.push({ type: 'id', value: src.slice(i, j), line });
-      i = j;
-      continue;
-    }
-    // parentheses matter for call-argument scanning
-    if (c === '(' || c === ')') {
-      toks.push({ type: 'punct', value: c, line });
-      i++;
-      continue;
-    }
-    i++;
-  }
-  return toks;
-}
+// Shared with check-no-bundle-relative-data-paths.js. Emits
+// { type, value, line } with type 'id' | 'str' | 'punct'; comments are skipped
+// and string bodies never match an identifier. See that module's header.
+const { tokenize } = require('./lib/js-tokenizer');
 
 // --- detector --------------------------------------------------------------
 function scan(src) {

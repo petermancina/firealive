@@ -3402,6 +3402,7 @@ class RegressionRunner {
     await check('high_availability', 'No HA source reads .json off a peer-link result', () => {
       const fsMod = require('fs');
       const pathMod = require('path');
+      const { sourceFile } = require('../lib/source-file');
       // The full HA surface. A guard that is not looking somewhere reports clean: the
       // audit-connection guard's first target list omitted the peer links and this
       // scheduler, and three real sites sat outside it until VERIFY-MERGE swept
@@ -3427,7 +3428,10 @@ class RegressionRunner {
       const offenders = [];
       let scanned = 0;
       for (const rel of targets) {
-        const abs = pathMod.join(__dirname, rel);
+        // sourceFile refuses any rel that escapes the server root (path.join(
+        // __dirname, '..')) or is not a .js file, so the 18th gate's SOURCE_SCANNERS
+        // suppression is no longer needed to permit this variable path.
+        const abs = sourceFile(pathMod.join(__dirname, '..'), __dirname, rel);
         if (!fsMod.existsSync(abs)) continue;
         scanned += 1;
         const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
@@ -3450,6 +3454,7 @@ class RegressionRunner {
       // indirection below the function that received the db.
       const fsMod = require('fs');
       const pathMod = require('path');
+      const { sourceFile } = require('../lib/source-file');
       // The full HA surface, not a hand-picked subset. The first version of this list
       // omitted ha-peer-link.js and this scheduler, and passed while both audited
       // through a second connection. Files that open a connection but never audit
@@ -3474,7 +3479,10 @@ class RegressionRunner {
       const offenders = [];
       let scanned = 0;
       for (const rel of targets) {
-        const abs = pathMod.join(__dirname, rel);
+        // sourceFile refuses any rel that escapes the server root (path.join(
+        // __dirname, '..')) or is not a .js file, so the 18th gate's SOURCE_SCANNERS
+        // suppression is no longer needed to permit this variable path.
+        const abs = sourceFile(pathMod.join(__dirname, '..'), __dirname, rel);
         if (!fsMod.existsSync(abs)) continue;
         scanned += 1;
         const code = haStripNonCode(fsMod.readFileSync(abs, 'utf8'));
