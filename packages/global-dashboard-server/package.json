@@ -28,6 +28,7 @@
     "@azure/identity": "^4.0.0",
     "@azure/storage-blob": "^12.33.0",
     "@google-cloud/storage": "^7.21.0",
-    "ssh2": "^1.15.0"
+    "ssh2": "^1.15.0",
+    "nodemailer": "^9.0.1"
   }
 }
