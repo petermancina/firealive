@@ -12,6 +12,7 @@
     "build:linux": "electron-builder --linux"
   },
   "dependencies": {
+    "@firealive/shared": "file:../packages/shared",
     "@signalapp/libsignal-client": "^0.97.2",
     "pdfkit": "^0.19.1"
   },
@@ -31,8 +32,6 @@
     },
     "files": [
       "main.js",
-      "signal-e2ee.js",
-      "abuse-seal.js",
       "preload.js",
       "index.html",
       "app.js",

@@ -5,6 +5,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 let gdServerProcess = null;
+let isQuitting = false;
 
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (e) => e.preventDefault());
@@ -40,7 +41,7 @@ const caPinPath = () => path.join(app.getPath('userData'), 'firealive-gd-ca.pem'
 // D9: per-installation deployment-mode selection (advisory; the server's
 // anchor-sealed mode is authoritative). Stored as a plain JSON file under
 // userData, like the CA pin. Created lazily so app paths are ready.
-const { makeLocalMode } = require('../shared/deployment-mode-local');
+const { makeLocalMode } = require('@firealive/shared/deployment-mode-local');
 let _localMode = null;
 function localMode() {
   if (!_localMode) {
@@ -160,7 +161,7 @@ function gdPopMessage(method, path, iat, jti, jkt) {
 // Mint or load the device key. Fails closed when no hardware root is present.
 async function getGdDeviceKey() {
   if (_gdDeviceKey) return _gdDeviceKey;
-  const hwkey = require('../shared/hardware-key');
+  const hwkey = require('@firealive/shared/hardware-key');
   if (!hwkey.isAvailable()) {
     throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the GD operator device signing key; this app fails closed and will not run without it');
   }
@@ -355,12 +356,29 @@ ipcMain.handle('anticlone:anchorState', async () => {
 
 function startGdServer() {
   const serverPath = path.join(__dirname, '..', 'global-dashboard-server', 'index.js');
-  gdServerProcess = spawn('node', [serverPath], {
-    env: { ...process.env, NODE_ENV: 'production', GD_PORT: '4001' },
-    stdio: 'pipe'
-  });
+  // FATAL 2: a packaged Electron app ships no standalone node on PATH, so a bare
+  // spawn('node', ...) fails with ENOENT. Spawn the Electron binary itself as a Node
+  // runtime via ELECTRON_RUN_AS_NODE, and pass an explicit minimal environment
+  // allow-list rather than the whole parent environment.
+  const childEnv = { ELECTRON_RUN_AS_NODE: '1', NODE_ENV: 'production', GD_PORT: '4001' };
+  for (const k of ['PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'LANG', 'LC_ALL', 'LC_CTYPE']) {
+    if (process.env[k] !== undefined) childEnv[k] = process.env[k];
+  }
+  gdServerProcess = spawn(process.execPath, [serverPath], { env: childEnv, stdio: 'pipe' });
   gdServerProcess.stdout.on('data', (d) => console.log('[GD-Server]', d.toString()));
   gdServerProcess.stderr.on('data', (d) => console.error('[GD-Server]', d.toString()));
+  // FATAL 2: the GD had no exit handler at all. Fail loud and fail closed -- the Global
+  // Dashboard cannot function without its embedded server; an unexpected exit is fatal.
+  gdServerProcess.on('exit', (code, signal) => {
+    if (isQuitting) {
+      console.log('[GD-Server] exited during shutdown (code ' + code + ')');
+      return;
+    }
+    console.error('[GD-Server] FATAL: the embedded GD Server exited unexpectedly (code '
+      + code + ', signal ' + signal + '). The Global Dashboard cannot operate without it '
+      + 'and will now close.');
+    app.quit();
+  });
 }
 
 function createWindow() {
@@ -398,12 +416,7 @@ function createWindow() {
 let beaconListener = null;
 
 function startBeaconListener() {
-  let beaconLib;
-  try {
-    beaconLib = require('./beacon-listener');
-  } catch {
-    beaconLib = require('../shared/beacon-listener');
-  }
+  const beaconLib = require('@firealive/shared/beacon-listener');
   try {
     beaconListener = beaconLib.start({
       expectedRole: 'gd-server',
@@ -449,5 +462,5 @@ function startBeaconListener() {
 }
 
 app.whenReady().then(() => { startGdServer(); setTimeout(createWindow, 2000); startBeaconListener(); });
-app.on('window-all-closed', () => { if (gdServerProcess) gdServerProcess.kill(); if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => { isQuitting = true; if (gdServerProcess) gdServerProcess.kill(); if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => { try { if (beaconListener) beaconListener.stop(); } catch (_e) { /* ignore */ } });

@@ -39,7 +39,7 @@ const caPinPath = () => path.join(app.getPath('userData'), 'firealive-ca.pem');
 // D9: per-installation deployment-mode selection (advisory; the server's
 // anchor-sealed mode is authoritative). Stored as a plain JSON file under
 // userData, like the CA pin. Created lazily so app paths are ready.
-const { makeLocalMode } = require('../shared/deployment-mode-local');
+const { makeLocalMode } = require('@firealive/shared/deployment-mode-local');
 let _localMode = null;
 function localMode() {
   if (!_localMode) {
@@ -291,12 +291,7 @@ ipcMain.handle('anticlone:anchorState', async () => {
 let beaconListener = null;
 
 function startBeaconListener() {
-  let beaconLib;
-  try {
-    beaconLib = require('./beacon-listener');
-  } catch {
-    beaconLib = require('../shared/beacon-listener');
-  }
+  const beaconLib = require('@firealive/shared/beacon-listener');
   try {
     beaconListener = beaconLib.start({
       expectedRole: 'regional-server',
@@ -451,42 +446,22 @@ ipcMain.on('notify:desktop', (event, payload) => {
 // The shared wrapper (packages/shared/signal-e2ee.js) is bundled into this app
 // by the CI copy step (build.yml); it lives alongside main.js in a packaged
 // build and under ../shared when run from source — try both.
-let createSignalE2EE;
-try {
-  ({ createSignalE2EE } = require('./signal-e2ee'));
-} catch {
-  ({ createSignalE2EE } = require('../shared/signal-e2ee'));
-}
+const { createSignalE2EE } = require('@firealive/shared/signal-e2ee');
 
 // The reviewer-only seal helper (packages/shared/abuse-seal.js) is bundled the
 // same way; load it with the same packaged/source fallback. It needs no native
 // dependency (Node crypto only), so a plain require is enough.
-let sealToReviewers;
-try {
-  ({ sealToReviewers } = require('./abuse-seal'));
-} catch {
-  ({ sealToReviewers } = require('../shared/abuse-seal'));
-}
+const { sealToReviewers } = require('@firealive/shared/abuse-seal');
 
 // The reporter-note sanitizer (packages/shared/note-sanitizer.js) is loaded the
 // same packaged/source way. It hardens the reporter's free-text note before it
 // is sealed; the flagged CONTENT is never passed through it.
-let sanitizeNote;
-try {
-  ({ sanitizeNote } = require('./note-sanitizer'));
-} catch {
-  ({ sanitizeNote } = require('../shared/note-sanitizer'));
-}
+const { sanitizeNote } = require('@firealive/shared/note-sanitizer');
 
 // The abuse-flag export PDF builder (packages/shared/abuse-export-pdf.js) is
 // loaded the same packaged/source way. It renders the flagger's one-shot
 // submission record locally; no content leaves the device to build it.
-let buildAbuseExportPdf;
-try {
-  ({ buildAbuseExportPdf } = require('./abuse-export-pdf'));
-} catch {
-  ({ buildAbuseExportPdf } = require('../shared/abuse-export-pdf'));
-}
+const { buildAbuseExportPdf } = require('@firealive/shared/abuse-export-pdf');
 
 // libsignal is a native ESM module; load it dynamically and normalize the
 // shape across the ESM-namespace and CJS-default interop cases.
@@ -881,12 +856,12 @@ function burnoutStore() {
 // secret on-chip via agree(), so the blob is useless on other hardware. The factor is
 // optional -- with no hardware root the PRF/scrypt factors remain the recovery path, so
 // recoverability is unchanged. The hardware-wrap key is per-user.
-let hwwrap = null;
-try {
-  hwwrap = require('../shared/hardware-wrap');
-} catch (err) {
-  hwwrap = null;
-}
+// FATAL 6 / security: resolve the hardware-wrap seam from @firealive/shared. A MISSING
+// module is a packaging defect and must throw here, loudly -- it must never be silently
+// swallowed to null and then reported to the analyst as an absent TPM. A genuinely absent
+// hardware root is a separate, runtime fact, reported by hwwrap.isAvailable() === false
+// (which never throws at require time); the hardware factor stays optional in that case.
+const hwwrap = require('@firealive/shared/hardware-wrap');
 
 const BURNOUT_HW_WRAP_VERSION = 1;
 const BURNOUT_MODE_HW = 3;
@@ -1354,7 +1329,7 @@ let _deviceScanKey = null;
 // signing happens on-chip through the seam.
 async function getDeviceScanKey() {
   if (_deviceScanKey) return _deviceScanKey;
-  const hwkey = require('../shared/hardware-key');
+  const hwkey = require('@firealive/shared/hardware-key');
   if (!hwkey.isAvailable()) {
     throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the device signing key; this client fails closed and will not run without it');
   }
@@ -1784,7 +1759,7 @@ ipcMain.handle('recovery:wipeLocal', async () => {
   // B5e: also retire the hardware-bound device key so a clone of this machine
   // cannot use it (the private key lives in the TPM / Secure Enclave, not on disk).
   try {
-    const removed = require('../shared/hardware-key').deleteSigningKey(DEVICE_KEY_LABEL);
+    const removed = require('@firealive/shared/hardware-key').deleteSigningKey(DEVICE_KEY_LABEL);
     wiped['device_hw_key'] = removed ? 'removed' : 'absent';
   } catch (e) { wiped['device_hw_key'] = 'error'; }
   // Drop in-memory caches so the session holds no unlocked key material.

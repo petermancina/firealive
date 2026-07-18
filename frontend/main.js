@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 let serverProcess = null;
+let isQuitting = false;
 
 app.on('web-contents-created', (event, contents) => {
   contents.on('will-navigate', (e) => e.preventDefault());
@@ -39,7 +40,7 @@ const caPinPath = () => path.join(app.getPath('userData'), 'firealive-ca.pem');
 // D9: per-installation deployment-mode selection (advisory; the server's
 // anchor-sealed mode is authoritative). Stored as a plain JSON file under
 // userData, like the CA pin. Created lazily so app paths are ready.
-const { makeLocalMode } = require('../packages/shared/deployment-mode-local');
+const { makeLocalMode } = require('@firealive/shared/deployment-mode-local');
 let _localMode = null;
 function localMode() {
   if (!_localMode) {
@@ -114,7 +115,7 @@ let _mcDeviceKey = null;
 
 async function getMcDeviceKey() {
   if (_mcDeviceKey) return _mcDeviceKey;
-  const hwkey = require('../packages/shared/hardware-key');
+  const hwkey = require('@firealive/shared/hardware-key');
   if (!hwkey.isAvailable()) {
     throw new Error('A hardware root of trust (TPM 2.0 / Secure Enclave) is required for the MC device signing key; this app fails closed and will not run without it');
   }
@@ -243,13 +244,30 @@ ipcMain.handle('deployment:setLocalMode', async (_e, { mode, substrate } = {}) =
 
 function startServer() {
   const serverPath = path.join(__dirname, '..', 'server', 'index.js');
-  serverProcess = spawn('node', [serverPath], {
-    env: { ...process.env, NODE_ENV: 'production', PORT: '3000' },
-    stdio: 'pipe'
-  });
+  // FATAL 2: a packaged Electron app ships no standalone node on PATH, so a bare
+  // spawn('node', ...) fails with ENOENT. Spawn the Electron binary itself as a Node
+  // runtime via ELECTRON_RUN_AS_NODE, and pass an explicit minimal environment
+  // allow-list (only what the embedded server needs) rather than the whole parent env.
+  const childEnv = { ELECTRON_RUN_AS_NODE: '1', NODE_ENV: 'production', PORT: '3000' };
+  for (const k of ['PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'LANG', 'LC_ALL', 'LC_CTYPE']) {
+    if (process.env[k] !== undefined) childEnv[k] = process.env[k];
+  }
+  serverProcess = spawn(process.execPath, [serverPath], { env: childEnv, stdio: 'pipe' });
   serverProcess.stdout.on('data', (d) => console.log('[Server]', d.toString()));
   serverProcess.stderr.on('data', (d) => console.error('[Server]', d.toString()));
-  serverProcess.on('exit', (code) => console.log('[Server] Exited with code', code));
+  // FATAL 2: fail loud and fail closed. The Management Console cannot function without
+  // its embedded Regional Server; an unexpected exit is fatal, so surface it and quit
+  // rather than leave a hollow window with no backend.
+  serverProcess.on('exit', (code, signal) => {
+    if (isQuitting) {
+      console.log('[Server] exited during shutdown (code ' + code + ')');
+      return;
+    }
+    console.error('[Server] FATAL: the embedded Regional Server exited unexpectedly (code '
+      + code + ', signal ' + signal + '). The Management Console cannot operate without it '
+      + 'and will now close.');
+    app.quit();
+  });
 }
 
 function createWindow() {
@@ -346,27 +364,15 @@ ipcMain.on('notify:desktop', (event, payload) => {
 // The shared wrapper (packages/shared/signal-e2ee.js) is bundled into this app by
 // the CI copy step (build.yml) as ./signal-e2ee in a packaged build, and lives
 // under ../packages/shared when run from source -- try both.
-let createSignalE2EE;
-try {
-  ({ createSignalE2EE } = require('./signal-e2ee'));
-} catch {
-  ({ createSignalE2EE } = require('../packages/shared/signal-e2ee'));
-}
+const { createSignalE2EE } = require('@firealive/shared/signal-e2ee');
 
 // The abuse-seal helper (packages/shared/abuse-seal.js) is bundled the same way;
 // load it with the same packaged/source fallback. It needs no native dependency
 // (Node crypto only), so a plain require is enough. The Team-Lead review side
 // uses the keypair/open/wrap helpers (the lead holds the private key and opens
 // sealed cases in this main process).
-let generateReviewerKeypair, openForReviewer, wrapPrivateKey,
-  unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate;
-try {
-  ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey,
-    unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('./abuse-seal'));
-} catch {
-  ({ generateReviewerKeypair, openForReviewer, wrapPrivateKey,
-    unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('../packages/shared/abuse-seal'));
-}
+const { generateReviewerKeypair, openForReviewer, wrapPrivateKey,
+  unwrapPrivateKey, fingerprintForPubB64, publicKeyB64FromPrivate } = require('@firealive/shared/abuse-seal');
 
 // B5e: subnet beacon listener (anti-cloning, client side). Listen-only. Verifies
 // the signed beacons FireAlive regional servers broadcast and warns the operator
@@ -377,12 +383,7 @@ try {
 let beaconListener = null;
 
 function startBeaconListener() {
-  let beaconLib;
-  try {
-    beaconLib = require('./beacon-listener');
-  } catch {
-    beaconLib = require('../packages/shared/beacon-listener');
-  }
+  const beaconLib = require('@firealive/shared/beacon-listener');
   try {
     beaconListener = beaconLib.start({
       expectedRole: 'regional-server',
@@ -628,6 +629,7 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  isQuitting = true;
   if (serverProcess) serverProcess.kill();
   if (process.platform !== 'darwin') app.quit();
 });
