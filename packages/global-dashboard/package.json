@@ -1,0 +1,84 @@
+{
+  "name": "firealive-global-dashboard",
+  "version": "1.0.84",
+  "description": "FireAlive \u2014 Global CISO Dashboard",
+  "main": "main.js",
+  "author": "Peter Mancina",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "dependencies": {
+    "@firealive/shared": "file:../shared"
+  },
+  "devDependencies": {
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "esbuild": "0.28.1",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.firealive.global-dashboard",
+    "productName": "FireAlive Global Dashboard",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "app.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../global-dashboard-server",
+        "to": "global-dashboard-server"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "icon": "assets/icon.png"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true
+    },
+    "icon": "assets/icon.png"
+  }
+}
