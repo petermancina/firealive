@@ -41,6 +41,14 @@
       {
         "from": "../server",
         "to": "server"
+      },
+      {
+        "from": "../server/node_modules",
+        "to": "server/node_modules"
+      },
+      {
+        "from": "../package.json",
+        "to": "package.json"
       }
     ],
     "mac": {

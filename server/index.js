@@ -49,6 +49,31 @@ const fs = require('fs');
 const { initDb, getDb, DB_PATH } = require('./db/init');
 const ca = require('./services/ca');
 const { logger } = require('./services/logger');
+
+// Fail-closed halt with a durable record. Winston's File transport writes
+// asynchronously, so a bare process.exit() can terminate before a refusal reaches
+// error.log -- the one durable record that this deployment refused. Write the record
+// synchronously to both log files, in the JSON shape Winston uses, then exit
+// immediately so nothing is ever served past a refusal. Safe at module scope and
+// inside start() alike, because the exit is immediate (no fall-through).
+function logHaltAndExit(message, meta) {
+  const record = Object.assign(
+    { level: 'error', service: 'firealive', message: message },
+    meta || {},
+    { timestamp: new Date().toISOString() }
+  );
+  const line = JSON.stringify(record) + '\n';
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const logsDir = require('./lib/data-root').logsDir();
+    fs.appendFileSync(path.join(logsDir, 'error.log'), line);
+    fs.appendFileSync(path.join(logsDir, 'combined.log'), line);
+  } catch (writeErr) {
+    try { process.stderr.write('logHaltAndExit: halt record not written: ' + (writeErr && writeErr.message) + '\n'); } catch (_e) {}
+  }
+  process.exit(1);
+}
 const { auditMiddleware } = require('./middleware/audit');
 const { authMiddleware } = require('./middleware/auth');
 const { configLockChokepoint } = require('./middleware/config-lock');
@@ -87,8 +112,7 @@ if (process.env.SKIP_INTEGRITY_CHECK !== 'true') {
         violations: integrityResult.violations.map(v => `${v.type}: ${v.file}`),
       });
       if (process.env.NODE_ENV === 'production') {
-        logger.error('HALTING: Source files have been modified. Run integrity --generate after verified deploy.');
-        process.exit(1);
+        logHaltAndExit('HALTING: Source files have been modified. Run integrity --generate after verified deploy.');
       }
     }
   } else if (integrityResult.valid) {
@@ -187,7 +211,7 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => req.path === '/api/system/health' || isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip) || isAuthorizedVulnScannerSource(req.ip),
   keyGenerator: rateLimitKeyGenerator,
-  validate: true,
+  validate: { keyGeneratorIpFallback: false },
 });
 app.use('/api/', apiLimiter);
 
@@ -408,7 +432,7 @@ const threatHuntingLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   keyGenerator: rateLimitKeyGenerator,
-  validate: true,
+  validate: { keyGeneratorIpFallback: false },
 });
 
 app.use('/api/threat-hunting', threatHuntingLimiter, authMiddleware(['admin']), configLockChokepoint(), require('./routes/threat-hunting-admin'));
@@ -432,9 +456,9 @@ const staticLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => isAuthorizedScannerIp(req.ip) || isAuthorizedConsumerIp(req.ip),
   keyGenerator: rateLimitKeyGenerator,
-  validate: true,
+  validate: { keyGeneratorIpFallback: false },
 });
-app.get('*', staticLimiter, (req, res) => {
+app.get('/*splat', staticLimiter, (req, res) => {
   if (!req.path.startsWith('/api/')) {
     res.sendFile(path.join(__dirname, '../frontend/index.html'));
   }
@@ -654,9 +678,7 @@ async function start() {
         identityDb.close();
       }
     } catch (instanceIdentityErr) {
-      logger.error('Instance identity establishment failed; refusing to start (fail-closed, D26)', { error: instanceIdentityErr.message });
-      logger.error('FireAlive requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.');
-      process.exit(1);
+      logHaltAndExit('Instance identity establishment failed; refusing to start (fail-closed, D26). FireAlive requires a hardware root of trust: TPM 2.0 on Linux/Windows, or the Secure Enclave on macOS. Provision one and restart; there is no software fallback.', { error: instanceIdentityErr.message });
     }
 
     // B6h A-7: reload this node's shared KEK (the replicated-domain KEK) if it was
@@ -679,8 +701,7 @@ async function start() {
         kekDb.close();
       }
     } catch (sharedKekReloadErr) {
-      logger.error('Shared Tier-1 KEK reload failed; refusing to start (fail-closed, D16)', { error: sharedKekReloadErr.message });
-      process.exit(1);
+      logHaltAndExit('Shared Tier-1 KEK reload failed; refusing to start (fail-closed, D16)', { error: sharedKekReloadErr.message });
     }
 
     // B6h B-2: Tier-1 boot integrity gate. Now that the shared KEK is loaded, verify every
@@ -698,16 +719,14 @@ async function start() {
         gateDb.close();
       }
       if (tier1Failures.length) {
-        logger.error('Tier-1 boot integrity gate FAILED; refusing to start (fail-closed). '
+        logHaltAndExit('Tier-1 boot integrity gate FAILED; refusing to start (fail-closed). '
           + tier1Failures.length + ' column value(s) do not open under this node KEK -- a wrong KEK, '
           + 'a partially-completed rekey, or corruption. First failures: '
           + tier1Failures.slice(0, 5).map(function (f) { return f.column + '#' + f.rowid + ' (' + f.error + ')'; }).join('; '));
-        process.exit(1);
       }
       logger.info('Tier-1 boot integrity gate passed; all readable Tier-1 columns open under this node KEK');
     } catch (bootGateErr) {
-      logger.error('Tier-1 boot integrity gate errored; refusing to start (fail-closed)', { error: bootGateErr.message });
-      process.exit(1);
+      logHaltAndExit('Tier-1 boot integrity gate errored; refusing to start (fail-closed)', { error: bootGateErr.message });
     }
 
     // B5e: resolve and seal the deployment mode (D9) now that the instance
@@ -732,14 +751,12 @@ async function start() {
             const substrateEnv = envMode === deploymentMode.SASE ? 'FIREALIVE_SASE_SUBSTRATE' : 'FIREALIVE_SDN_SUBSTRATE';
             const declared = process.env[substrateEnv];
             if (deploymentMode.SUBSTRATES.indexOf(declared) === -1) {
-              logger.error(envMode + ' mode requires ' + substrateEnv + ' to be one of ' + deploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed)', { value: declared || null });
-              process.exit(1);
+              logHaltAndExit(envMode + ' mode requires ' + substrateEnv + ' to be one of ' + deploymentMode.SUBSTRATES.join(', ') + '; refusing to start (fail-closed)', { value: declared || null });
             }
             const detected = await deploymentMode.detectSubstrate(modeDb);
             const substrateRank = { 'bare-metal': 0, 'virtualized': 1, 'cloud': 2 };
             if (substrateRank[detected] > substrateRank[declared]) {
-              logger.error(substrateEnv + ' declares a weaker host substrate than detection proves; refusing to start (anti-downgrade, fail-closed)', { declared: declared, detected: detected });
-              process.exit(1);
+              logHaltAndExit(substrateEnv + ' declares a weaker host substrate than detection proves; refusing to start (anti-downgrade, fail-closed)', { declared: declared, detected: detected });
             }
             deploymentMode.setMode(modeDb, envMode, { substrate: declared });
             logger.info('Deployment mode provisioned and sealed', { mode: envMode, substrate: declared, detected: detected });
@@ -799,26 +816,22 @@ async function start() {
 
         const att = cloudAttestation.verifyAttestation({ tcbFloor: cloudConfig ? cloudConfig.tcbFloor : undefined });
         if (!att.verified) {
-          logger.error('A confidential-VM substrate (cloud, or cloud-resident sdn) requires confidential computing, but the attestation report did not verify; refusing to start (fail-closed, D-B5h-3 / D-B5i-2)', { reason: att.reason });
-          process.exit(1);
+          logHaltAndExit('A confidential-VM substrate (cloud, or cloud-resident sdn) requires confidential computing, but the attestation report did not verify; refusing to start (fail-closed, D-B5h-3 / D-B5i-2)', { reason: att.reason });
         }
         logger.info('Confidential computing attested', { tech: att.tech, platformValidationPending: att.platformValidationPending });
 
         const mit = guestMitigations.evaluateMitigations();
         if (!mit.ok) {
-          logger.error('Guest CPU cross-tenant side-channel mitigations are not satisfied; refusing to start (fail-closed)', { detail: guestMitigations.summarize(mit) });
-          process.exit(1);
+          logHaltAndExit('Guest CPU cross-tenant side-channel mitigations are not satisfied; refusing to start (fail-closed)', { detail: guestMitigations.summarize(mit) });
         }
         logger.info('Guest CPU side-channel mitigations verified', { detail: guestMitigations.summarize(mit) });
 
         const meta = await cloudMetadata.readCloudMetadata();
         if (meta && (meta.spot === true || meta.autoscaled === true)) {
-          logger.error('A confidential-VM substrate refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
-          process.exit(1);
+          logHaltAndExit('A confidential-VM substrate refuses spot / autoscaled / ephemeral-fleet instances; run on a dedicated on-demand confidential VM (fail-closed, D-B5h-4)', { spot: meta.spot, autoscaled: meta.autoscaled, provider: meta.provider });
         }
         if (cloudConfig && cloudConfig.requireDedicatedTenancy === true && !cloudMetadata.isDedicatedTenancy(meta)) {
-          logger.error('requireDedicatedTenancy is set but the instance is not on single-tenant hardware; refusing to start (fail-closed)', { tenancy: meta ? meta.tenancy : null, provider: meta ? meta.provider : null });
-          process.exit(1);
+          logHaltAndExit('requireDedicatedTenancy is set but the instance is not on single-tenant hardware; refusing to start (fail-closed)', { tenancy: meta ? meta.tenancy : null, provider: meta ? meta.provider : null });
         }
 
         const recDb = getDb();
@@ -826,8 +839,7 @@ async function start() {
           if (att.measurement) {
             const pin = cloudMode.pinMeasurement(recDb, att.measurement);
             if (!pin.matched) {
-              logger.error('The confidential-VM launch measurement does not match the pinned value; refusing to start (fail-closed, measurement TOFU)', { tech: att.tech });
-              process.exit(1);
+              logHaltAndExit('The confidential-VM launch measurement does not match the pinned value; refusing to start (fail-closed, measurement TOFU)', { tech: att.tech });
             }
             if (pin.firstPin) logger.info('Confidential-VM launch measurement pinned (trust-on-first-use)', { tech: att.tech });
           }
@@ -878,8 +890,7 @@ async function start() {
         }, REATTEST_INTERVAL_MS);
         if (reattestTimer && typeof reattestTimer.unref === 'function') reattestTimer.unref();
       } catch (cloudBootErr) {
-        logger.error('Confidential-VM boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
-        process.exit(1);
+        logHaltAndExit('Confidential-VM boot gate failed; refusing to start (fail-closed, no downgrade)', { error: cloudBootErr.message });
       }
     }
 
@@ -941,8 +952,7 @@ async function start() {
             logger.error('Marking instance quarantined after rollback failed', { error: markErr.message });
           }
           if (process.env.NODE_ENV === 'production') {
-            logger.error('HALTING: anti-rollback high-water check failed. Deploy the current or a newer build.');
-            process.exit(1);
+            logHaltAndExit('HALTING: anti-rollback high-water check failed. Deploy the current or a newer build.');
           }
         } else {
           logger.info('Anti-rollback high-water ok', {
@@ -981,8 +991,7 @@ async function start() {
             logger.error('Marking instance quarantined after seal-version rollback failed', { error: markErr.message });
           }
           if (process.env.NODE_ENV === 'production') {
-            logger.error('HALTING: seal-version anti-rollback check failed. Deploy the current or a newer build.');
-            process.exit(1);
+            logHaltAndExit('HALTING: seal-version anti-rollback check failed. Deploy the current or a newer build.');
           }
         } else {
           logger.info('Seal-version high-water ok', {
@@ -1292,8 +1301,7 @@ async function start() {
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   } catch (err) {
-    logger.error('Failed to start:', err);
-    process.exit(1);
+    logHaltAndExit('Failed to start', { error: err && err.message, stack: err && err.stack });
   }
 }
 

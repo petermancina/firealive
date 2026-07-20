@@ -30,6 +30,7 @@ const { getDb } = require('../db/init');
 // other database; the HA control plane should not model it.
 const { auditLogOn } = require('../middleware/audit');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { requireObjectBody } = require('../middleware/body-validation');
 const { mfaStepUp } = require('../middleware/mfa-stepup');
 const { getClientCertThumbprint } = require('../middleware/auth');
@@ -468,7 +469,7 @@ const peerUnpairLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => ipKeyGenerator(req.ip),
   message: { ok: false, error: 'too many un-pair requests' },
   handler: (req, res) => {
     const db = getDb();

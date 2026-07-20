@@ -98,7 +98,7 @@ function runModule(label, rel) {
 function sourceChecks() {
   const mc = read(path.join('server', 'index.js'));
   check('MC index.js calls the boot gate', /verifyTier1Integrity/.test(mc));
-  check('MC index.js boot gate fails closed', /Tier-1 boot integrity gate FAILED[\s\S]{0,400}process\.exit\(1\)/.test(mc));
+  check('MC index.js boot gate fails closed', /logHaltAndExit\('Tier-1 boot integrity gate FAILED/.test(mc) && /function logHaltAndExit[\s\S]*?process\.exit\(1\)/.test(mc));
   const gd = read(path.join('packages', 'global-dashboard-server', 'index.js'));
   check('GD index.js calls the boot gate', /verifyTier1Integrity/.test(gd));
   check('GD index.js boot gate fails closed', /GD Tier-1 boot integrity gate FAILED[\s\S]{0,400}process\.exit\(1\)/.test(gd));

@@ -37,6 +37,10 @@
       {
         "from": "../global-dashboard-server",
         "to": "global-dashboard-server"
+      },
+      {
+        "from": "../global-dashboard-server/node_modules",
+        "to": "global-dashboard-server/node_modules"
       }
     ],
     "mac": {

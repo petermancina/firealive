@@ -106,7 +106,7 @@ const PACKAGING_FAILURES = [
   ['EACCES', 'a permission failure below the hardware boundary'],
 ];
 
-const HARDWARE_CAUSE = /Hardware root of trust \(.*\) not detected on this .* host/;
+const HARDWARE_CAUSE = /Hardware root of trust \(.*\) not detected on this .* host|no hardware root of trust \(.*\) available/;
 
 const problems = [];
 const fail = (m) => problems.push(m);

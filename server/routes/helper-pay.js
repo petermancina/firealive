@@ -48,6 +48,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const router = express.Router();
 
 const helperPay = require('../services/helper-pay');
@@ -880,7 +881,7 @@ const visibilityToggleLimiter = rateLimit({
   max: 50,
   message: { error: 'RATE_LIMIT_EXCEEDED',
     message: 'Too many visibility toggle requests. Please try again later.' },
-  keyGenerator: (req) => (req.user && req.user.id) || req.ip,
+  keyGenerator: (req) => (req.user && req.user.id) || ipKeyGenerator(req.ip),
   standardHeaders: true,
   legacyHeaders: false,
 });

@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS training_modules (
   title TEXT NOT NULL,
   url TEXT NOT NULL,
   difficulty TEXT CHECK (difficulty IN ('beginner', 'intermediate', 'advanced', 'expert')),
-  free_or_paid TEXT CHECK (free_or_paid IN ('free', 'paid', 'subscription', 'enterprise')),
+  free_or_paid TEXT CHECK (free_or_paid IN ('free', 'paid', 'subscription', 'enterprise', 'free_with_premium')),
   estimated_hours INTEGER,
   description TEXT,
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),

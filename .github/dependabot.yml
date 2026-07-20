@@ -20,6 +20,14 @@ updates:
     directory: "/packages/global-dashboard-server"
     schedule:
       interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/server"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/packages/shared"
+    schedule:
+      interval: "weekly"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

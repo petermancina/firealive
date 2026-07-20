@@ -101,6 +101,22 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
       - run: npm install
+      # P1-5: install each embedded server's production dependencies and rebuild its ONE
+      # boot-critical native module -- better-sqlite3 -- for THIS runner's Electron ABI, so the
+      # packaged server (spawned under ELECTRON_RUN_AS_NODE, i.e. Electron's Node, not system
+      # Node) can load it at boot in initDb. The rebuild runs from INSIDE each server directory
+      # so it targets that directory's node_modules -- the copy that ships via extraResources --
+      # and is scoped with --only better-sqlite3: node-llama-cpp and @mongodb-js/zstd are N-API
+      # and load under Electron without a node-gyp rebuild, while cpu-features (an OPTIONAL ssh2
+      # acceleration native whose bundled nan cannot compile against Electron 43's V8) is left
+      # alone -- ssh2 falls back to pure-JS crypto, so it is skipped, not degraded.
+      - name: Install and Electron-ABI-rebuild the embedded servers
+        shell: bash
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./node_modules/electron/package.json').version")
+          echo "Rebuilding embedded-server native modules for Electron $ELECTRON_VERSION"
+          ( cd server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
+          ( cd packages/global-dashboard-server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
 
       - name: Build the three Linux apps
         run: |
@@ -138,6 +154,33 @@ jobs:
             ( cd "$d/dist" && chmod +x "$(basename "$imgs")" && "./$(basename "$imgs")" --appimage-extract >/dev/null )
             test -x "$d/dist/squashfs-root/AppRun" || { echo "no AppRun after extracting $imgs"; exit 1; }
           done
+
+      # P1-5: the boot smoke below proves better-sqlite3 LOADS (initDb's new Database
+      # succeeds), but a failed ship or a wrong-ABI rebuild would surface there as a cryptic
+      # MODULE_NOT_FOUND or a native-load error. This asserts the earlier, legible fact
+      # directly -- each embedded server shipped a node_modules carrying its boot-critical
+      # native module -- so a packaging regression is named at the point it happened.
+      - name: Assert the embedded servers shipped their dependencies
+        run: |
+          set -euo pipefail
+          check() {
+            local dir="$1" name="$2"
+            if [ ! -d "$dir/node_modules" ]; then
+              echo "$name: node_modules NOT shipped at $dir/node_modules"
+              root="${dir%/resources/*}"
+              echo "--- ls $root ---"; ls -la "$root" 2>&1 | head -40
+              echo "--- ls $root/resources ---"; ls -la "$root/resources" 2>&1 | head -60
+              echo "--- ls $dir ---"; ls -la "$dir" 2>&1 | head -60
+              echo "--- node_modules dirs under $root ---"; find "$root" -maxdepth 6 -type d -name node_modules 2>/dev/null | head -40
+              echo "--- better-sqlite3 dirs under $root ---"; find "$root" -maxdepth 7 -type d -name better-sqlite3 2>/dev/null | head -40
+              exit 1
+            fi
+            test -d "$dir/node_modules/better-sqlite3" || { echo "$name: better-sqlite3 not shipped"; exit 1; }
+            test -n "$(find "$dir/node_modules/better-sqlite3" -name '*.node' -print -quit)" || { echo "$name: better-sqlite3 native .node missing -- Electron-ABI rebuild did not run"; exit 1; }
+            echo "$name: node_modules + better-sqlite3 native module present"
+          }
+          check frontend/dist/squashfs-root/resources/server "Regional Server"
+          check packages/global-dashboard/dist/squashfs-root/resources/global-dashboard-server "GD server"
 
       # FATAL 3's PREMISE, verified on the real artifact rather than reasoned.
       #
@@ -191,6 +234,17 @@ jobs:
       # closing it properly needs an arm64 runner.
       - name: Smoke the Analyst Client
         run: xvfb-run -a node scripts/smoke-packaged-app.js ac packages/analyst-client/dist/squashfs-root
+
+      # Diagnostic: on ANY smoke failure, run the Regional Server the exact way the MC
+      # spawns it (ELECTRON_RUN_AS_NODE) so its own stdout/stderr -- the crash the harness
+      # only counts as bytes -- prints directly, with no Electron or xvfb noise. Never runs
+      # on success; head-capped and timed out so it cannot hang the job.
+      - name: Diagnostic - run the Regional Server directly on failure
+        if: failure()
+        run: |
+          echo "=== resources/server/index.js via ELECTRON_RUN_AS_NODE (server output only) ==="
+          ( cd frontend/dist/squashfs-root && ELECTRON_RUN_AS_NODE=1 NODE_ENV=production PORT=3000 timeout 30 ./firealive-management-console resources/server/index.js ) 2>&1 | head -200 || true
+          echo "=== end direct run ==="
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -246,6 +300,22 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
+      # P1-5: install each embedded server's production dependencies and rebuild its ONE
+      # boot-critical native module -- better-sqlite3 -- for THIS runner's Electron ABI, so the
+      # packaged server (spawned under ELECTRON_RUN_AS_NODE, i.e. Electron's Node, not system
+      # Node) can load it at boot in initDb. The rebuild runs from INSIDE each server directory
+      # so it targets that directory's node_modules -- the copy that ships via extraResources --
+      # and is scoped with --only better-sqlite3: node-llama-cpp and @mongodb-js/zstd are N-API
+      # and load under Electron without a node-gyp rebuild, while cpu-features (an OPTIONAL ssh2
+      # acceleration native whose bundled nan cannot compile against Electron 43's V8) is left
+      # alone -- ssh2 falls back to pure-JS crypto, so it is skipped, not degraded.
+      - name: Install and Electron-ABI-rebuild the embedded servers
+        shell: bash
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./node_modules/electron/package.json').version")
+          echo "Rebuilding embedded-server native modules for Electron $ELECTRON_VERSION"
+          ( cd server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
+          ( cd packages/global-dashboard-server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
       - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
       - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
       - run: cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --mac --publish never
@@ -275,6 +345,22 @@ jobs:
           node-version: '22'
       - run: npm install
         shell: bash
+      # P1-5: install each embedded server's production dependencies and rebuild its ONE
+      # boot-critical native module -- better-sqlite3 -- for THIS runner's Electron ABI, so the
+      # packaged server (spawned under ELECTRON_RUN_AS_NODE, i.e. Electron's Node, not system
+      # Node) can load it at boot in initDb. The rebuild runs from INSIDE each server directory
+      # so it targets that directory's node_modules -- the copy that ships via extraResources --
+      # and is scoped with --only better-sqlite3: node-llama-cpp and @mongodb-js/zstd are N-API
+      # and load under Electron without a node-gyp rebuild, while cpu-features (an OPTIONAL ssh2
+      # acceleration native whose bundled nan cannot compile against Electron 43's V8) is left
+      # alone -- ssh2 falls back to pure-JS crypto, so it is skipped, not degraded.
+      - name: Install and Electron-ABI-rebuild the embedded servers
+        shell: bash
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./node_modules/electron/package.json').version")
+          echo "Rebuilding embedded-server native modules for Electron $ELECTRON_VERSION"
+          ( cd server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
+          ( cd packages/global-dashboard-server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
       - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --win --publish never
         shell: bash
       - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --win --publish never
@@ -302,6 +388,22 @@ jobs:
         with:
           node-version: '22'
       - run: npm install
+      # P1-5: install each embedded server's production dependencies and rebuild its ONE
+      # boot-critical native module -- better-sqlite3 -- for THIS runner's Electron ABI, so the
+      # packaged server (spawned under ELECTRON_RUN_AS_NODE, i.e. Electron's Node, not system
+      # Node) can load it at boot in initDb. The rebuild runs from INSIDE each server directory
+      # so it targets that directory's node_modules -- the copy that ships via extraResources --
+      # and is scoped with --only better-sqlite3: node-llama-cpp and @mongodb-js/zstd are N-API
+      # and load under Electron without a node-gyp rebuild, while cpu-features (an OPTIONAL ssh2
+      # acceleration native whose bundled nan cannot compile against Electron 43's V8) is left
+      # alone -- ssh2 falls back to pure-JS crypto, so it is skipped, not degraded.
+      - name: Install and Electron-ABI-rebuild the embedded servers
+        shell: bash
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./node_modules/electron/package.json').version")
+          echo "Rebuilding embedded-server native modules for Electron $ELECTRON_VERSION"
+          ( cd server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
+          ( cd packages/global-dashboard-server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
       - run: cd packages/analyst-client && npm install && npx esbuild analyst-client.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
       - run: cd packages/global-dashboard && npm install && npx esbuild global-dashboard.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
       - run: cd frontend && npm install && npx esbuild firealive-mc.jsx --bundle --format=iife --jsx=automatic --minify --outfile=app.js && npx electron-builder --linux --publish never
