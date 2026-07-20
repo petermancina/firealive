@@ -70,7 +70,7 @@ The MC-side pipeline embeds an inline regression-runner invocation (stage 3) tha
 5.  Snyk                       --severity-threshold=high (fail on any HIGH+)
 6.  SBOM                       Syft -> SPDX-JSON artifact uploaded
 7.  Dep-pin verify             confirm package-lock.json present, deterministic install
-8.  Build (SLSA L3)            docker buildx --provenance=mode=max --sbom=true
+8.  Build (SLSA L3)            electron-builder installer; SLSA L3 build provenance
 9.  Sign                       Cosign keyless OIDC default; key-based via
                                COSIGN_KEY_MODE=key-based + COSIGN_PRIVATE_KEY
 10. CVE scan                   Trivy with HIGH,CRITICAL exit 1

@@ -8,7 +8,7 @@ Operators deploying FireAlive into a new cloud environment historically faced th
 
 - **Template drift.** Hand-written Terraform, Pulumi, or CloudFormation files in random GitHub gists rarely match the version of FireAlive being deployed. Operators paste a config from a year ago and silently lose a security control that the current server expects.
 - **No supply-chain attestation.** Downloading an IaC bundle from a vendor's website is a download without provenance. There is no way to verify that the bundle was produced by the operator's own FireAlive instance versus altered in transit by a CDN compromise or man-in-the-middle.
-- **No software bill of materials.** Operators applying a bundle have no machine-readable inventory of what's inside — which container images, which package versions, which transitive dependencies — and therefore cannot answer the question "is my deployment vulnerable to CVE-XXXX-YYYY?".
+- **No software bill of materials.** Operators applying a bundle have no machine-readable inventory of what's inside — which package versions, which transitive dependencies — and therefore cannot answer the question "is my deployment vulnerable to CVE-XXXX-YYYY?".
 
 The cloud-iac-bundle generator resolves all three by rendering bundles server-side, attaching a Syft-generated SPDX-JSON SBOM, signing the archive with a server-managed Sigstore Cosign key, and persisting the manifest hash to an audited database row. The bundle a CISO downloads on Monday is the same bytes the auditor verifies on Tuesday, and the signing key fingerprint matches the one published on the FireAlive instance.
 
@@ -31,7 +31,7 @@ GET  /api/cloud/packages/:id/public-key    verifier PEM
 POST /api/cloud/signing-keys/rotate        operator-triggered rotation
 ```
 
-The two surfaces differ only in deployment target: MC bundles target the FireAlive MC-server image (`ghcr.io/petermancina/firealive`, port 4000, env vars `JWT_SECRET` + `TIER1_ENCRYPTION_KEY`); GD bundles target the GD-server image (`ghcr.io/petermancina/firealive-gd`, port 4001, env vars `GD_JWT_SECRET` + `GD_ENCRYPTION_KEY`). The shape difference is documented inline in each side's bundle module and is centralized in a single `DEPLOY_SHAPE` constant per side.
+The two surfaces differ only in deployment target: MC bundles provision a confidential VM running the Regional Server (port 4000, env vars `JWT_SECRET` + `TIER1_ENCRYPTION_KEY`); GD bundles provision one running the GD Server (port 4001, env vars `GD_JWT_SECRET` + `GD_ENCRYPTION_KEY`). The shape difference is documented inline in each side's bundle module and is centralized in a single `DEPLOY_SHAPE` constant per side.
 
 ## The provider × IaC-tool matrix
 
@@ -138,7 +138,7 @@ The Cloud & IaC tab (under the Infrastructure section) presents a two-card workf
 
 ### From the GD frontend
 
-The Cloud & IaC tab in the global dashboard exposes the same workflow against the GD-server (rather than the MC-server). Bundles generated here target the GD deployment shape (image `ghcr.io/petermancina/firealive-gd`, port 4001, env vars `GD_JWT_SECRET` + `GD_ENCRYPTION_KEY`). The CISO uses this tab when deploying or relocating the global dashboard itself.
+The Cloud & IaC tab in the global dashboard exposes the same workflow against the GD-server (rather than the MC-server). Bundles generated here target the GD deployment shape (the GD Server, port 4001, env vars `GD_JWT_SECRET` + `GD_ENCRYPTION_KEY`). The CISO uses this tab when deploying or relocating the global dashboard itself.
 
 Note that GD's `api.post` helper drops the response JSON body on non-OK HTTP status, so the failure card surfaces only `r.statusText` rather than the structured `code` + `message`. This is a known limitation of the GD frontend's helper, documented in the C40 commit.
 

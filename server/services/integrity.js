@@ -15,10 +15,24 @@ const path = require('path');
 const { version } = require('../lib/version');
 
 const SERVER_ROOT = path.join(__dirname, '..');
-const MANIFEST_PATH = path.join(SERVER_ROOT, '..', 'config', 'integrity-manifest.json');
+// P1-6 (FATAL 5a): the manifest ships INSIDE server/ so the MC's extraResources
+// rule (../server -> server) carries it into resources/server/. The path is
+// computed from __dirname, never read from a config row, so the packaged app
+// resolves resources/server/integrity-manifest.json with no build-config change.
+const MANIFEST_PATH = path.join(SERVER_ROOT, 'integrity-manifest.json');
 
 // Files to check — all JS in server/, middleware/, services/, routes/, integrations/, db/
 const SCAN_DIRS = ['routes', 'middleware', 'services', 'integrations', 'db'];
+
+// P1-6: pinned, security-critical DATA trust anchors that ship in the bundle and
+// must not be swapped -- the FIDO2 attestation root CAs that gate hardware-passkey
+// enrollment (an attacker who swaps this file could add a rogue attestation root
+// and forge a passkey). These are static seeds: admin-added roots go to the
+// database, not this file, and runtime data lives in ~/.firealive/, so the hash
+// is stable across a release. Non-.js, so the SCAN_DIRS loop below never reaches
+// them -- they are listed explicitly rather than by scanning data/, so a
+// runtime-mutable file dropped in data/ can never silently join the manifest.
+const DATA_FILES = ['fido-attestation-roots.json'];
 
 function hashFile(filePath) {
   const content = fs.readFileSync(filePath);
@@ -42,6 +56,14 @@ function collectFiles() {
       files[rel] = hashFile(path.join(dirPath, f));
     }
   }
+
+  // Pinned data trust anchors (see DATA_FILES).
+  for (const f of DATA_FILES) {
+    const p = path.join(SERVER_ROOT, 'data', f);
+    if (fs.existsSync(p)) {
+      files[`server/data/${f}`] = hashFile(p);
+    }
+  }
   return files;
 }
 
@@ -60,8 +82,7 @@ function generateManifest() {
   const content = JSON.stringify({ ...manifest, manifestHash: undefined }, null, 2);
   manifest.manifestHash = crypto.createHash('sha256').update(content).digest('hex');
 
-  const configDir = path.dirname(MANIFEST_PATH);
-  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+  // MANIFEST_PATH's parent is SERVER_ROOT, which always exists; no mkdir needed.
   fs.writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
   console.log(`Integrity manifest generated: ${manifest.fileCount} files`);
   return manifest;

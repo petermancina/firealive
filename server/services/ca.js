@@ -36,8 +36,8 @@
 //   injection surface). Rationale: openssl is the most-audited PKI engine in
 //   existence (FIPS-validated builds exist), and this adds ZERO npm dependencies
 //   to the most security-critical code in the platform. The trade-off is a
-//   runtime requirement on the openssl binary, which the container image
-//   provides (see the Dockerfile note added alongside the HTTPS listener).
+//   runtime requirement on the openssl binary, which the host OS provides
+//   (FireAlive runs directly on a TPM-backed host, never in a container).
 //
 //   Certificate VERIFICATION (the per-login hot path) uses Node's NATIVE
 //   crypto.X509Certificate — it parses the presented PEM, checks the signature

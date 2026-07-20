@@ -462,8 +462,8 @@ jobs:
     needs: [test, security]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t firealive:\${{ github.sha }} .
-      - run: docker run --rm firealive:\${{ github.sha }} node -e "require('./server/services/integrity').verifyStartup()"
+      - run: npx electron-builder --linux --publish never
+      - run: node server/services/integrity.js --verify
   regression:
     runs-on: ubuntu-latest
     needs: build
@@ -485,9 +485,8 @@ security:
   allow_failure: true
 build:
   stage: build
-  image: docker:latest
-  services: [docker:dind]
-  script: [docker build -t firealive:$CI_COMMIT_SHA .]
+  image: node:22
+  script: [npx electron-builder --linux --publish never]
 regression:
   stage: regression
   image: node:20
@@ -500,7 +499,7 @@ regression:
   stages {
     stage('Test') { steps { sh 'npm ci && npm test && npm run lint' } }
     stage('Security') { steps { sh 'npm audit --production' } }
-    stage('Build') { steps { sh 'docker build -t firealive:\${BUILD_NUMBER} .' } }
+    stage('Build') { steps { sh 'npx electron-builder --linux --publish never' } }
     stage('Regression') { steps { sh 'npm ci && npm run regression-test' } }
   }
   post { failure { emailext subject: 'FireAlive CI Failed', body: 'Build \${BUILD_NUMBER} failed.' } }

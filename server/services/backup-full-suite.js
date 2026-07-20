@@ -53,16 +53,12 @@
 //                                          kms_providers, and every
 //                                          other canonical table
 //
-//   config/integrity-manifest.json     file-integrity baseline used
+//   server/integrity-manifest.json     file-integrity baseline used
 //                                      by services/integrity.js at
 //                                      boot to detect binary
 //                                      tampering. Needed after
 //                                      restore so the restored
 //                                      install can verify itself.
-//
-//   config/electron-security.js        electron security config
-//                                      script, captured if present
-//                                      (skipped silently otherwise).
 //
 //   version-manifest.json              backup-time {version,
 //                                      fuse_counter, build_id,
@@ -264,8 +260,7 @@ function fileEntry(relativePath, contentBuffer, encoding) {
 /**
  * Build the full-suite bundle envelope:
  *   - firealive.db          (binary, base64)
- *   - config/integrity-manifest.json   (if present, utf8)
- *   - config/electron-security.js      (if present, utf8)
+ *   - server/integrity-manifest.json   (if present, utf8)
  *   - version-manifest.json            (utf8, generated here)
  *
  * Returns a Buffer (UTF-8 JSON bytes) ready to feed the v2 pipeline.
@@ -282,22 +277,18 @@ async function buildBundle(workDir) {
   }
 
   const serverRoot = path.join(__dirname, '..');
-  const projectRoot = path.join(serverRoot, '..');
 
-  const integrityManifestPath = path.join(projectRoot, 'config', 'integrity-manifest.json');
-  const electronSecurityPath = path.join(projectRoot, 'config', 'electron-security.js');
+  // P1-6: the code-integrity manifest now ships inside server/ (FATAL 5a
+  // relocation). The dead config/electron-security.js baseline entry is dropped
+  // with the file (S4); config/ no longer exists.
+  const integrityManifestPath = path.join(serverRoot, 'integrity-manifest.json');
 
   const files = [];
   files.push(fileEntry('firealive.db', dbBytes, 'base64'));
 
   const integrityManifest = readOptionalFile(integrityManifestPath);
   if (integrityManifest) {
-    files.push(fileEntry('config/integrity-manifest.json', integrityManifest, 'utf8'));
-  }
-
-  const electronSecurity = readOptionalFile(electronSecurityPath);
-  if (electronSecurity) {
-    files.push(fileEntry('config/electron-security.js', electronSecurity, 'utf8'));
+    files.push(fileEntry('server/integrity-manifest.json', integrityManifest, 'utf8'));
   }
 
   // Version manifest is always present — generated here from current

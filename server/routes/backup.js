@@ -182,8 +182,8 @@ router.post('/', async (req, res) => {
 // ── Trigger Full-Suite Comprehensive Backup (R3k) ─────────────────────────────
 //
 // Operator-initiated comprehensive backup capturing the regional DB
-// snapshot, on-disk config files (integrity-manifest.json, electron-
-// security.js if present), and a backup-time version manifest.
+// snapshot, the server/integrity-manifest.json file-integrity baseline,
+// and a backup-time version manifest.
 // Returns the same shape as POST / with an additional kind:
 // 'full-suite' field. Same audit event-type pattern as single-DB
 // backup, namespaced FULL_SUITE_* for distinct lifecycle tracking.

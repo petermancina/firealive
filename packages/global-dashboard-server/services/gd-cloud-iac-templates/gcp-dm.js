@@ -103,7 +103,7 @@ function render(snapshot, provider) {
     '              echo "GD_ENCRYPTION_KEY=$TIER1" > /etc/firealive-gd/.env',
     '              echo "GD_JWT_SECRET=$JWT" >> /etc/firealive-gd/.env',
     '              echo "FIREALIVE_GD_DEPLOYMENT_MODE=cloud" >> /etc/firealive-gd/.env',
-    '              docker run -d --name firealive-gd --restart=always -p 4001:4001 --env-file /etc/firealive-gd/.env -v firealive-gd-data:/data ghcr.io/petermancina/firealive-gd:latest',
+    '              systemctl enable --now firealive-gd',
     '',
     'outputs:',
     '  - name: instanceIp',

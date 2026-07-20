@@ -101,22 +101,40 @@ const { FireAliveWebSocket } = require('./services/websocket-server');
 const HOST = process.env.HOST || '0.0.0.0';
 
 // ── Startup Integrity Check ─────────────────────────────────────────────────
-if (process.env.SKIP_INTEGRITY_CHECK !== 'true') {
+// P1-6 (FATAL 5a): fail closed in production. verifyIntegrity() returns
+// {valid:false, violations:[]} for a MISSING manifest and {valid:false,
+// violations:[...]} for a MODIFIED/ADDED/MISSING file -- BOTH must stop a
+// production boot. The prior guard keyed on violations.length > 0, so a missing
+// manifest (violations empty) fell through and the server booted with no
+// integrity protection. SKIP_INTEGRITY_CHECK is honoured only outside
+// production, so no env var can disable the gate on a shipped install -- both
+// packaged mains spawn the server with NODE_ENV=production.
+const inProduction = process.env.NODE_ENV === 'production';
+const skipIntegrity = process.env.SKIP_INTEGRITY_CHECK === 'true' && !inProduction;
+if (!skipIntegrity) {
   const integrityResult = verifyIntegrity();
-  if (!integrityResult.valid && integrityResult.violations.length > 0) {
-    // Log violations but don't halt in dev (no manifest yet)
-    if (integrityResult.error) {
-      logger.warn('Integrity check skipped', { reason: integrityResult.error });
-    } else {
+  if (integrityResult.valid) {
+    logger.info('Integrity check passed', { files: integrityResult.expectedFiles });
+  } else if (inProduction) {
+    // Fail closed: a missing manifest OR any file violation stops the boot.
+    if (integrityResult.violations.length > 0) {
       logger.error('INTEGRITY VIOLATIONS DETECTED', {
         violations: integrityResult.violations.map(v => `${v.type}: ${v.file}`),
       });
-      if (process.env.NODE_ENV === 'production') {
-        logHaltAndExit('HALTING: Source files have been modified. Run integrity --generate after verified deploy.');
-      }
+      logHaltAndExit('HALTING: Source files have been modified. Run integrity --generate after a verified deploy.');
+    } else {
+      logHaltAndExit(`HALTING: ${integrityResult.error || 'integrity manifest missing or unreadable'}`);
     }
-  } else if (integrityResult.valid) {
-    logger.info('Integrity check passed', { files: integrityResult.expectedFiles });
+  } else {
+    // Non-production (npm start / dev): warn but continue -- a dev tree may have
+    // no manifest yet or carry local edits.
+    if (integrityResult.violations.length > 0) {
+      logger.warn('Integrity violations (non-production, not halting)', {
+        violations: integrityResult.violations.map(v => `${v.type}: ${v.file}`),
+      });
+    } else {
+      logger.warn('Integrity check skipped (non-production)', { reason: integrityResult.error });
+    }
   }
 }
 

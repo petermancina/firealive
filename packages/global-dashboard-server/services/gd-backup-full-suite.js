@@ -82,7 +82,19 @@ function buildBundleBytes(db, backupsDir, backupId, options) {
     const vmanifest = buildVersionManifest(db, backupId);
     fs.writeFileSync(path.join(workDir, 'version-manifest.json'), JSON.stringify(vmanifest, null, 2), 'utf8');
 
-    // 4. Plain tar the workdir to a Buffer; compression + encryption are the v2
+    // 4. server/integrity-manifest.json -- the GD code-integrity baseline.
+    // P1-6: twin of the Regional full-suite backup, which carries its own
+    // integrity manifest. The manifest ships inside the GD server dir
+    // (gd-integrity.js); capturing it means a restored install carries the
+    // code-integrity baseline current at backup time. Skipped if absent (a dev
+    // tree with no generated manifest). The dead config/electron-security.js
+    // entry the Regional backup used to carry is deliberately NOT copied (S4).
+    const gdIntegrityManifestPath = path.join(__dirname, '..', 'integrity-manifest.json');
+    if (fs.existsSync(gdIntegrityManifestPath)) {
+      fs.writeFileSync(path.join(workDir, 'integrity-manifest.json'), fs.readFileSync(gdIntegrityManifestPath));
+    }
+
+    // 5. Plain tar the workdir to a Buffer; compression + encryption are the v2
     // archive layer's job (this bundle rides through as the single archive payload).
     const bundleBytes = execFileSync('tar', ['-cf', '-', '-C', workDir, '.'], {
       maxBuffer: MAX_BUNDLE_BYTES,

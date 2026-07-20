@@ -249,6 +249,43 @@ if (!gdPosture.covered) {
 } else {
   console.log('[gd] Data posture ok:', gdPosture.checked.length, 'directories');
 }
+// -- P1-6 (FATAL 5b): GD code-integrity gate --------------------------------
+//
+// Twin of the Regional Server's boot integrity check (server/index.js), adapted
+// to the GD: module scope (this file has no start() wrapper), console (this
+// file has no logger), and a hard process.exit(1) in production. Placement:
+// after the posture check and before initDb() -- verify the shipped code has
+// not been modified on disk before this boot touches the database or the
+// instance anchor. Fail closed in production on BOTH a missing manifest and any
+// file violation; SKIP_INTEGRITY_CHECK is honoured only outside production, so
+// no env var can disable the gate on a shipped install -- the GD app spawns
+// this server with NODE_ENV=production. Inline require mirrors the posture gate
+// just above.
+const gdIntegrity = require('./services/gd-integrity');
+const gdInProduction = process.env.NODE_ENV === 'production';
+const gdSkipIntegrity = process.env.SKIP_INTEGRITY_CHECK === 'true' && !gdInProduction;
+if (!gdSkipIntegrity) {
+  const gdIntegrityResult = gdIntegrity.verifyIntegrity();
+  if (gdIntegrityResult.valid) {
+    console.log('[gd] Integrity check passed:', gdIntegrityResult.expectedFiles, 'files');
+  } else if (gdInProduction) {
+    if (gdIntegrityResult.violations.length > 0) {
+      console.error('[gd] INTEGRITY VIOLATIONS DETECTED:',
+        gdIntegrityResult.violations.map(v => `${v.type}: ${v.file}`).join(', '));
+      console.error('[gd] HALTING: GD server source files have been modified. Run gd-integrity --generate after a verified deploy.');
+    } else {
+      console.error(`[gd] HALTING: ${gdIntegrityResult.error || 'GD integrity manifest missing or unreadable'}`);
+    }
+    process.exit(1);
+  } else {
+    if (gdIntegrityResult.violations.length > 0) {
+      console.warn('[gd] Integrity violations (non-production, not halting):',
+        gdIntegrityResult.violations.map(v => `${v.type}: ${v.file}`).join(', '));
+    } else {
+      console.warn('[gd] Integrity check skipped (non-production):', gdIntegrityResult.error);
+    }
+  }
+}
 // -- P1-3b: create the schema before anything reads it (FATAL 7) -------------
 //
 // index.js imported initDb and never called it, so the GD schema was created

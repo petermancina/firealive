@@ -72,6 +72,13 @@ jobs:
         run: node scripts/check-no-bundle-relative-data-paths.js --self-test
       - name: Verify no bundle-relative data paths
         run: node scripts/check-no-bundle-relative-data-paths.js
+      # The 19th gate (P1-6): both servers' code-integrity checks -- exports
+      # present (the GD's absence was FATAL 5b), the manifest covers every
+      # scanned directory, a modified file is detected, and a missing manifest is
+      # fail-closed. Exercised against isolated temp sandboxes, so the working
+      # tree is untouched.
+      - name: Verify code-integrity checks (both servers)
+        run: node scripts/check-integrity.js
 
 
   # The first thing in this repository that launches the product. Runs on every
@@ -117,6 +124,18 @@ jobs:
           echo "Rebuilding embedded-server native modules for Electron $ELECTRON_VERSION"
           ( cd server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
           ( cd packages/global-dashboard-server && npm install --omit=dev && npx @electron/rebuild --version "$ELECTRON_VERSION" --only better-sqlite3 )
+
+      # P1-6 (FATAL 5a/5b): generate BOTH servers' code-integrity manifests before
+      # electron-builder packs them. The manifest hashes the .js source and ships
+      # inside each server dir (server/, global-dashboard-server/), so it must
+      # exist before extraResources copies the dir. Generated here from the exact
+      # tree that gets packed, so the shipped manifest matches the shipped code --
+      # otherwise the smoke's boot integrity gate would go red at boot step 1.
+      - name: Generate code-integrity manifests
+        run: |
+          set -euo pipefail
+          node server/services/integrity.js --generate
+          node packages/global-dashboard-server/services/gd-integrity.js --generate
 
       - name: Build the three Linux apps
         run: |
@@ -234,6 +253,77 @@ jobs:
       # closing it properly needs an arm64 runner.
       - name: Smoke the Analyst Client
         run: xvfb-run -a node scripts/smoke-packaged-app.js ac packages/analyst-client/dist/squashfs-root
+
+      # P1-6 (FATAL 5a): prove the packaged Regional Server refuses tampering. The
+      # integrity gate runs at boot step 1, before the hardware gate at step 4, so
+      # on this TPM-less runner a CLEAN boot reaches the hardware refusal while a
+      # TAMPERED boot halts earlier -- and that integrity halt lands in error.log
+      # (logHaltAndExit writes to the log, not stderr). The shipped integrity
+      # --verify CLI gives the crisp console signal; the boot check confirms the
+      # gate is wired into startup and refuses.
+      - name: Prove the packaged Regional Server refuses tampering
+        run: |
+          set -uo pipefail
+          ROOT=frontend/dist/squashfs-root
+          SRV=resources/server
+          BIN=./firealive-management-console
+          LOGS="$HOME/.firealive/regional-server/logs"
+          VICTIM=$(cd "$ROOT/$SRV/routes" && ls *.js | head -1)
+          echo "victim: $SRV/routes/$VICTIM"
+          verify() { ( cd "$ROOT" && ELECTRON_RUN_AS_NODE=1 "$BIN" "$SRV/services/integrity.js" --verify ); }
+          boot()   { ( cd "$ROOT" && ELECTRON_RUN_AS_NODE=1 NODE_ENV=production PORT=3000 timeout 40 "$BIN" "$SRV/index.js" ) >/dev/null 2>&1; }
+          fail() { echo "FAIL: $1"; exit 1; }
+          # (a) MODIFIED file: --verify flags it (console + non-zero)
+          cp "$ROOT/$SRV/routes/$VICTIM" /tmp/rs.bak
+          printf '\n// tamper\n' >> "$ROOT/$SRV/routes/$VICTIM"
+          if verify >/tmp/rsv.out 2>&1; then cp /tmp/rs.bak "$ROOT/$SRV/routes/$VICTIM"; fail "--verify passed on a modified file"; fi
+          grep -q "INTEGRITY VIOLATION" /tmp/rsv.out || { cp /tmp/rs.bak "$ROOT/$SRV/routes/$VICTIM"; fail "--verify did not report an integrity violation"; }
+          # (b) MODIFIED file: the boot gate refuses (non-zero) with an integrity halt in error.log
+          rm -f "$LOGS/error.log" "$LOGS/combined.log" 2>/dev/null || true
+          if boot; then cp /tmp/rs.bak "$ROOT/$SRV/routes/$VICTIM"; fail "tampered Regional Server booted (exit 0)"; fi
+          cp /tmp/rs.bak "$ROOT/$SRV/routes/$VICTIM"
+          grep -qiE "Source files have been modified|INTEGRITY" "$LOGS/error.log" "$LOGS/combined.log" 2>/dev/null || { echo "--- error.log ---"; tail -20 "$LOGS/error.log" 2>/dev/null; fail "boot halt was not an integrity halt"; }
+          echo "ok  modified file: --verify flagged it AND the boot gate refused"
+          # (c) MISSING manifest: fail-closed at --verify and at boot
+          mv "$ROOT/$SRV/integrity-manifest.json" /tmp/rs-mani.bak
+          if verify >/tmp/rsv2.out 2>&1; then mv /tmp/rs-mani.bak "$ROOT/$SRV/integrity-manifest.json"; fail "--verify passed with no manifest"; fi
+          rm -f "$LOGS/error.log" "$LOGS/combined.log" 2>/dev/null || true
+          if boot; then mv /tmp/rs-mani.bak "$ROOT/$SRV/integrity-manifest.json"; fail "Regional Server booted with no manifest (exit 0)"; fi
+          mv /tmp/rs-mani.bak "$ROOT/$SRV/integrity-manifest.json"
+          grep -qiE "integrity manifest|HALTING" "$LOGS/error.log" "$LOGS/combined.log" 2>/dev/null || { echo "--- error.log ---"; tail -20 "$LOGS/error.log" 2>/dev/null; fail "missing-manifest boot halt not found"; }
+          echo "ok  missing manifest: fail-closed at --verify AND at the boot gate"
+
+      # P1-6 (FATAL 5b): prove the packaged GD Server refuses tampering. The GD
+      # gate uses console.error (the GD has no logger), so the integrity halt
+      # reaches stderr directly; same integrity-before-hardware ordering applies.
+      - name: Prove the packaged GD Server refuses tampering
+        run: |
+          set -uo pipefail
+          ROOT=packages/global-dashboard/dist/squashfs-root
+          SRV=resources/global-dashboard-server
+          BIN=./firealive-global-dashboard
+          VICTIM=$(cd "$ROOT/$SRV/routes" && ls *.js | head -1)
+          echo "victim: $SRV/routes/$VICTIM"
+          verify() { ( cd "$ROOT" && ELECTRON_RUN_AS_NODE=1 "$BIN" "$SRV/services/gd-integrity.js" --verify ); }
+          boot()   { ( cd "$ROOT" && ELECTRON_RUN_AS_NODE=1 NODE_ENV=production GD_PORT=4001 timeout 40 "$BIN" "$SRV/index.js" ); }
+          fail() { echo "FAIL: $1"; exit 1; }
+          # (a) MODIFIED file: --verify flags it
+          cp "$ROOT/$SRV/routes/$VICTIM" /tmp/gd.bak
+          printf '\n// tamper\n' >> "$ROOT/$SRV/routes/$VICTIM"
+          if verify >/tmp/gdv.out 2>&1; then cp /tmp/gd.bak "$ROOT/$SRV/routes/$VICTIM"; fail "--verify passed on a modified file"; fi
+          grep -q "INTEGRITY VIOLATION" /tmp/gdv.out || { cp /tmp/gd.bak "$ROOT/$SRV/routes/$VICTIM"; fail "--verify did not report an integrity violation"; }
+          # (b) MODIFIED file: the boot gate refuses (non-zero) with an integrity halt on stderr
+          if boot >/tmp/gdb.out 2>&1; then cp /tmp/gd.bak "$ROOT/$SRV/routes/$VICTIM"; fail "tampered GD Server booted (exit 0)"; fi
+          cp /tmp/gd.bak "$ROOT/$SRV/routes/$VICTIM"
+          grep -qiE "INTEGRITY|HALTING" /tmp/gdb.out || { echo "--- gd boot out ---"; tail -20 /tmp/gdb.out; fail "GD boot halt was not an integrity halt"; }
+          echo "ok  modified file: --verify flagged it AND the boot gate refused"
+          # (c) MISSING manifest: fail-closed at --verify and at boot
+          mv "$ROOT/$SRV/integrity-manifest.json" /tmp/gd-mani.bak
+          if verify >/tmp/gdv2.out 2>&1; then mv /tmp/gd-mani.bak "$ROOT/$SRV/integrity-manifest.json"; fail "--verify passed with no manifest"; fi
+          if boot >/tmp/gdb2.out 2>&1; then mv /tmp/gd-mani.bak "$ROOT/$SRV/integrity-manifest.json"; fail "GD Server booted with no manifest (exit 0)"; fi
+          mv /tmp/gd-mani.bak "$ROOT/$SRV/integrity-manifest.json"
+          grep -qiE "integrity manifest|HALTING" /tmp/gdb2.out || { echo "--- gd boot out ---"; tail -20 /tmp/gdb2.out; fail "missing-manifest GD boot halt not found"; }
+          echo "ok  missing manifest: fail-closed at --verify AND at the boot gate"
 
       # Diagnostic: on ANY smoke failure, run the Regional Server the exact way the MC
       # spawns it (ELECTRON_RUN_AS_NODE) so its own stdout/stderr -- the crash the harness

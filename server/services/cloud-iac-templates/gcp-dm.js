@@ -103,7 +103,7 @@ function render(snapshot, provider) {
     '              echo "TIER1_ENCRYPTION_KEY=$TIER1" > /etc/firealive/.env',
     '              echo "JWT_SECRET=$JWT" >> /etc/firealive/.env',
     '              echo "FIREALIVE_DEPLOYMENT_MODE=cloud" >> /etc/firealive/.env',
-    '              docker run -d --name firealive --restart=always -p 3000:3000 --env-file /etc/firealive/.env -v firealive-data:/data ghcr.io/petermancina/firealive:latest',
+    '              systemctl enable --now firealive',
     '',
     'outputs:',
     '  - name: instanceIp',

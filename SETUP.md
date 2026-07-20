@@ -1,5 +1,29 @@
 # FireAlive — Setup Guide
 
+## Prerequisites (read before installing)
+
+**A hardware root of trust is required. FireAlive will not start without it.**
+Every host that runs the Management Console (which embeds the Regional Server) or
+the Global Dashboard must have one of:
+- **Windows / Linux:** a **TPM 2.0** (discrete or firmware/fTPM), enabled in
+  firmware.
+- **macOS:** a **Secure Enclave** (any Apple-silicon Mac, or an Intel Mac with
+  the T2 chip).
+
+The Tier-1 key-encryption-key that protects server-side secrets at rest is sealed
+to this hardware. On a host without a TPM 2.0 / Secure Enclave the server fails
+closed at boot with a named error and does not start — this is deliberate: it is
+what makes a copied install unable to run on hardware it was not sealed to. A
+virtual machine must expose a vTPM (Azure, GCP, and AWS all offer one) or the app
+will not run.
+
+Everything else is bundled: you do not need to install Node.js, a database, or
+any other runtime separately for the packaged apps. Supported operating systems:
+Windows 10/11 (x64), macOS 12+ (Apple silicon or T2 Intel), and Linux
+distributions that can run an AppImage (glibc 2.28+).
+
+---
+
 ## For Team Leads (Management Console + Server + Analyst Clients)
 
 ### Step 1: Install the Management Console
@@ -69,6 +93,42 @@ Cases identify everyone by **pseudonym** — FireAlive stores no real names, so 
 3. **Data Sovereignty:** Set data residency requirements per region in the Data Sovereignty tab.
 4. **Backup Schedules:** Configure GD backup schedules in Backup & Restore tab.
 5. **Lock configs:** Lock the master config via sidebar when setup is complete.
+
+## Data Location, Updates, and Rollback
+
+### Where FireAlive keeps its data
+All persistent state — the database, the audit log, backups, and the KEK
+keystore — lives under a per-user data root **outside** the application bundle:
+- **macOS / Linux:** `~/.firealive/`
+- **Windows:** `%USERPROFILE%\.firealive\`
+
+The directory is created at `0700` (owner-only) on first run, and the server
+verifies that permission on every boot, so no other local user can read the audit
+log, the backups, or the keystore. Because the data root is outside the app
+bundle, **it survives both an application update and an uninstall** — the
+installer replaces only the program files, never `~/.firealive/`. To remove
+FireAlive's data completely, delete `~/.firealive/` by hand after uninstalling.
+
+### Updating
+Install the new version over the old one (the same installer flow). The data root
+persists, so your configuration, enrolled keys, and history carry forward; the
+first launch of a new version may apply forward-only schema migrations. The
+anti-rollback fuse advances with releases: once a newer build has run, an older
+build below the sealed fuse floor **refuses to start** rather than open a
+downgrade window — so keep the installer for the version you are running until
+you have confirmed the new one is healthy.
+
+### Rolling back
+Because of the anti-rollback fuse, a rollback is a **restore**, not a downgrade:
+1. Uninstall the newer version.
+2. Reinstall the previous version.
+3. Restore the most recent backup taken **on that previous version** (Backup &
+   Restore / Backup & Schedules). A backup is encrypted under the Tier-1 KEK and
+   is restored on a host whose hardware root can unwrap it.
+
+If the hardware root itself was lost or replaced, recovery requires **both** a
+server backup **and** the offline Tier-1 recovery code — see
+`docs/tier1-kek-hardware-sealing.md`. Neither alone is sufficient.
 
 ## Shared Responsibility in Compliance Reports
 
