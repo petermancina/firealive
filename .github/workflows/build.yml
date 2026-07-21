@@ -415,9 +415,7 @@ jobs:
           name: mac-installers
           path: |
             packages/*/dist/*.dmg
-            packages/*/dist/*.zip
             frontend/dist/*.dmg
-            frontend/dist/*.zip
           if-no-files-found: warn
 
   build-windows:
@@ -538,7 +536,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             **/*.dmg
-            **/*.zip
             **/*.exe
             **/*.AppImage
         env:

@@ -195,12 +195,16 @@ To enable GD push:
 
 ### First-Time Setup Flow
 
-1. Team Lead installs MC → MC starts Regional Server automatically
-1. Team Lead configures authentication (built-in CA + LDAP directory), SOAR, Ticketing, SIEM, EDR
-1. The AC is a standard application, installed on each analyst's workstation through the organization's normal software-deployment process
-1. Each installed AC is then linked to its MC: it trusts the FireAlive CA, confirms the server's hardware-anchor fingerprint out-of-band on first connection, and registers a hardware-bound device key; the analyst signs in with a hardware passkey, and the client certificate secures transport, not sign-in
-1. The AI Burnout Engine establishes a per-analyst behavioral baseline, then generates real-time drift detection and training recommendations
-1. CISO installs GD → registers regional MCs → sees cross-region health
+1. Operator installs the MC on the team lead's workstation; the MC starts its Regional Server automatically, and the leads enroll their hardware passkeys.
+1. Operator provisions the MC's local AI models: FireAlive's on-device AI never downloads weights, so the operator obtains the official GGUF files through a vetted channel — the Phi-4 Q4_K chat model (Microsoft, MIT; ~9 GB) and the Nomic Embed Text v1.5 embedder — installs them into the model directory (default `~/.firealive/models/`), and runs `node scripts/download-model.js` to verify each against a source-pinned SHA-256. A file that fails verification will not load.
+1. Operator configures the MC's authentication (built-in CA + LDAP directory) and integrations (SOAR, ticketing, SIEM, EDR).
+1. Operator installs the AC on each analyst's workstation through the organization's normal software-deployment process.
+1. Operator provisions each AC's local AI models the same way — the same Phi-4 chat model and Nomic embedder, verified against the pinned SHA-256.
+1. Each analyst enrolls their hardware passkey in their AC.
+1. Operator links each AC to its MC: the AC trusts the FireAlive CA, confirms the server's hardware-anchor fingerprint out-of-band on first connection, and registers a hardware-bound device key; the client certificate secures transport, not sign-in.
+1. The AI Burnout Engine on each AC begins establishing that analyst's behavioral baseline, then generates real-time drift detection and training recommendations.
+1. Operator installs the GD on the CISO's workstation; the GD starts its GD Server automatically, and the CISO enrolls their hardware passkey.
+1. Operator registers the regional MCs in the GD; the CISO then sees cross-region oversight — health and burnout posture aggregated across all regions.
 
 ### Hardware-Rooted Identity, Anti-Cloning & Sender-Constrained Sessions
 
