@@ -45,7 +45,8 @@
     ],
     "asarUnpack": [
       "node_modules/node-llama-cpp/**",
-      "node_modules/@node-llama-cpp/**"
+      "node_modules/@node-llama-cpp/**",
+      "model-utility.js"
     ],
     "mac": {
       "target": [
