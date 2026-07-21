@@ -264,7 +264,7 @@ const SCENARIOS = [
       ],
       recovery: [
         'Re-enroll the cleaned AC. Analyst authenticates via IAM + MFA.',
-        'New baseline calibration period begins (8 signal readings) before the AI burnout engine resumes drift detection for this analyst.',
+        'Baseline re-establishment begins on-device over the fixed ~90-day establishment window; until it completes, the analyst\'s signals read as \'establishing\' and are not scored against a personal baseline.',
         'Resume normal operations.',
       ],
       verification: [
@@ -1631,7 +1631,7 @@ const SCENARIOS = [
       ],
       recovery: [
         'After ACs are reprovisioned and analysts re-authenticate, signal collection resumes.',
-        'Burnout Engine baselines are re-established (8 signal readings to baseline).',
+        'Burnout Engine baselines re-establish on-device over the fixed ~90-day establishment window (frozen once set, not a rolling mean).',
         'After baselines are clean, re-enable burnout-aware routing.',
       ],
       verification: [
@@ -2045,7 +2045,7 @@ const SCENARIOS = [
       ],
       recovery: [
         'Each reprovisioned AC enrolls fresh, analyst re-authenticates with IAM + MFA.',
-        'New baselines must be established (8 signal readings) before burnout-aware routing resumes for that analyst.',
+        'New baselines must re-establish over the fixed ~90-day establishment window before burnout-aware routing resumes for that analyst.',
         'After all baselines are established, resume burnout-aware routing.',
       ],
       verification: [

@@ -1,8 +1,9 @@
 // FireAlive v1.0.42 — Burnout Message Generator
 //
-// Orchestrates AI generation of the two burnout-message surfaces — per-analyst
-// signal interpretations and team-level intervention prompts — for the N1b
-// precompute jobs. It owns three responsibilities:
+// Orchestrates AI generation of the team-level burnout-intervention prompts for
+// the N1b precompute jobs. Per-analyst signal interpretations are private to the
+// analyst and generated ON-DEVICE (never server-side), so this module produces
+// only the team surface. It owns three responsibilities:
 //
 //   1. Whole-KB grounding. Every prompt embeds the entire 42-entry research KB
 //      (research-kb.getAll), so the model may ground a suggestion in any entry,
@@ -26,13 +27,6 @@ const { logger } = require('./logger');
 const TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 2; // one initial attempt + one retry
 
-const SIGNAL_LABELS = {
-  investigationTime: 'Investigation time per ticket',
-  dismissRate: 'Alert dismiss rate',
-  ticketQuality: 'Ticket quality / documentation',
-  escalationRate: 'Escalation rate',
-};
-
 // Compact one-line-per-entry serialization of the KB for prompt embedding.
 function serializeKb() {
   return researchKb
@@ -42,33 +36,6 @@ function serializeKb() {
 }
 
 // ── Prompt builders ──────────────────────────────────────────────────────────
-
-function analystPrompt(label, signalKey, ctx, retry) {
-  const correction = retry
-    ? '\nIMPORTANT: your previous response was rejected for citing research not in the list, or for the wrong format. Cite ONLY R-ref ids that appear in the list below.\n'
-    : '';
-  return [
-    'You are a SOC analyst wellbeing assistant. One of an analyst\u2019s behavioral',
-    'signals has drifted from their personal baseline. Write a brief (2 to 4',
-    'sentences), supportive, practical interpretation of what this change may',
-    'indicate and one concrete, healthy step they could consider. Address the',
-    'analyst directly as "you". Do not be alarmist and do not diagnose.',
-    '',
-    `Signal: ${label} (${signalKey})`,
-    `Personal baseline: ${ctx.baseline}`,
-    `Current value: ${ctx.current}`,
-    '',
-    'Ground your interpretation ONLY in the peer-reviewed research below. Cite the',
-    'specific entries you rely on by their R-ref id in parentheses, e.g. (R008).',
-    'Do NOT mention or cite any research not in this list. Do NOT invent',
-    'citations, study names, or statistics.',
-    correction,
-    'RESEARCH KNOWLEDGE BASE:',
-    serializeKb(),
-    '',
-    'Respond with the interpretation text only \u2014 no preamble, no headings, no JSON.',
-  ].join('\n');
-}
 
 function teamPrompt(condition, th, retry) {
   const correction = retry
@@ -105,12 +72,6 @@ function teamPrompt(condition, th, retry) {
 }
 
 // ── Parsers (return { validateText, result } or null) ─────────────────────────
-
-function parseAnalyst(text) {
-  const t = String(text || '').trim();
-  if (!t) return null;
-  return { validateText: t, result: { text: t } };
-}
 
 function parseTeam(text) {
   let s = String(text || '').trim();
@@ -172,18 +133,6 @@ async function generateWithGate(kind, buildPrompt, parse, userId) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-// ctx: { baseline, current } for the analyst's own signal (Tier-3 values).
-// Returns { ok:true, text, model_name, kb_refs } or { ok:false, reason }.
-function generateAnalystInterpretation(signalKey, ctx, userId) {
-  const label = SIGNAL_LABELS[signalKey] || signalKey;
-  return generateWithGate(
-    'analyst',
-    (retry) => analystPrompt(label, signalKey, ctx || {}, retry),
-    parseAnalyst,
-    userId
-  );
-}
-
 // condition: { key, severity, label }; th: team-health aggregate.
 // Returns { ok:true, content:{full,compact,minimal}, model_name, kb_refs } or
 // { ok:false, reason }. Scheduled (no triggering user) so userId is null.
@@ -196,4 +145,4 @@ function generateTeamPrompt(condition, th) {
   );
 }
 
-module.exports = { generateAnalystInterpretation, generateTeamPrompt };
+module.exports = { generateTeamPrompt };

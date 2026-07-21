@@ -1624,18 +1624,6 @@ CREATE TABLE IF NOT EXISTS peer_sessions (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS analyst_baselines (
-  analyst_id TEXT PRIMARY KEY,
-  cognitive_load REAL,
-  task_switching REAL,
-  queue_pressure REAL,
-  response_latency REAL,
-  break_compliance REAL,
-  shift_overtime REAL,
-  established_at TEXT,
-  sample_count INTEGER DEFAULT 0
-);
-
 CREATE TABLE IF NOT EXISTS analyst_impacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   analyst_id TEXT,
@@ -3254,7 +3242,9 @@ function initDb() {
   // server-decryptable per-analyst burnout path is fully retired -- behavioral
   // detail now lives sealed on the analyst's own device (analyst_private_data)
   // and the only server-side views are the de-identified team aggregates.
-  // analyst_signals, signal_readings, and analyst_interpretations are no longer
+  // analyst_signals, signal_readings, analyst_interpretations, and
+  // analyst_baselines (the vestigial trailing-mean/sample_count table; the live
+  // per-analyst baseline is the on-device fixed-window engine) are no longer
   // written or read by any code path, so they are dropped here. DROP IF EXISTS
   // is a no-op on fresh installs (the SCHEMA above no longer creates them) and
   // removes them from upgraded databases. The write-only analyst_id_encrypted
@@ -3264,6 +3254,7 @@ function initDb() {
     db.exec('DROP TABLE IF EXISTS analyst_signals');
     db.exec('DROP TABLE IF EXISTS signal_readings');
     db.exec('DROP TABLE IF EXISTS analyst_interpretations');
+    db.exec('DROP TABLE IF EXISTS analyst_baselines');
     const lqCols = db.prepare("PRAGMA table_info(lighter_queue_requests)").all().map((c) => c.name);
     if (lqCols.includes('analyst_id_encrypted')) {
       db.exec('ALTER TABLE lighter_queue_requests DROP COLUMN analyst_id_encrypted');

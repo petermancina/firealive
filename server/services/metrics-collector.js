@@ -32,7 +32,6 @@ class MetricsCollector {
       // New v1.0.0 services
       notifications: this._getNotificationMetrics(),
       ir_policies: this._getIRPolicyMetrics(),
-      baselines: this._getBaselineMetrics(),
       // System
       system: { uptime: process.uptime(), memory: process.memoryUsage(), version: versionLabel, fuse: fuseCounter, buildId }
     };
@@ -144,9 +143,6 @@ class MetricsCollector {
   _getIRPolicyMetrics() {
     try { const p = this.db.prepare("SELECT COUNT(*) as c FROM ir_policies").get(); return { loaded: p?.c || 0 }; } catch { return { loaded: 0 }; }
   }
-  _getBaselineMetrics() {
-    try { const b = this.db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN established_at IS NOT NULL THEN 1 ELSE 0 END) as established FROM analyst_baselines").get(); return { total: b?.total || 0, established: b?.established || 0 }; } catch { return { total: 0, established: 0 }; }
-  }
   _getFeatureState() {
     try {
       const features = this.db.prepare("SELECT feature, enabled FROM feature_toggles").all();
@@ -165,7 +161,7 @@ class MetricsCollector {
       `logins24h=${m.auth.logins24h} authFailures=${m.auth.failures24h} ` +
       `auditIntact=${m.audit_integrity.intact} ` +
       `soar=${m.integrations.soar} ticketing=${m.integrations.ticketing} ` +
-      `fuse=${m.system.fuse} uptime=${Math.round(m.system.uptime)} notifications=${m.notifications.unread} irPolicies=${m.ir_policies.loaded} baselines=${m.baselines.established}/${m.baselines.total}`;
+      `fuse=${m.system.fuse} uptime=${Math.round(m.system.uptime)} notifications=${m.notifications.unread} irPolicies=${m.ir_policies.loaded}`;
   }
 }
 

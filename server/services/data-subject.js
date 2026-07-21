@@ -64,7 +64,7 @@ const USER_EXPORT_COLUMNS = [
  * Reads every personal record FireAlive holds about one subject of ANY role.
  * Shared sources (the users row, audit_log, notification_preferences) are
  * gathered for everyone. Analyst-only sources (analyst_private_data,
- * analyst_baselines, analyst_impacts, analyst_consent_log, analyst_availability,
+ * analyst_impacts, analyst_consent_log, analyst_availability,
  * analyst_keys) come back empty for a non-analyst because their analyst_id /
  * user_id matches nothing. Lead-oriented sources (lead_notification_contacts,
  * e2ee_identity_keys, abuse_review_keys registered by the subject) likewise come
@@ -99,13 +99,6 @@ function gatherSubjectData(db, subjectId) {
         ciphertext_b64: row.ciphertext == null ? null : Buffer.from(row.ciphertext).toString('base64'),
       };
     });
-
-  const baselines =
-    db
-      .prepare(
-        'SELECT analyst_id, cognitive_load, task_switching, queue_pressure, response_latency, break_compliance, shift_overtime, established_at, sample_count FROM analyst_baselines WHERE analyst_id = ?'
-      )
-      .get(subjectId) || null;
 
   const impacts = db
     .prepare('SELECT id, type, description, recorded_at FROM analyst_impacts WHERE analyst_id = ? ORDER BY id')
@@ -186,7 +179,6 @@ function gatherSubjectData(db, subjectId) {
     user: user,
     analyst_key: analystKey,
     private_data: privateData,
-    baselines: baselines,
     impacts: impacts,
     consent_log: consentLog,
     availability: availability,
@@ -230,8 +222,7 @@ function sealBundleToAnalyst(db, analystId, bundle) {
  * eraseSubject(db, subjectId) -> erasure receipt
  *
  * Delete-based right-to-erasure for a subject of ANY role, run as one
- * transaction. Deletes the subject's live personal rows -- analyst_baselines,
- * analyst_impacts, analyst_consent_log, analyst_availability,
+ * transaction. Deletes the subject's live personal rows -- analyst_impacts, analyst_consent_log, analyst_availability,
  * notification_preferences, lead_notification_contacts, and the subject's E2EE
  * key material (e2ee_identity_keys, e2ee_signed_prekeys, e2ee_one_time_prekeys)
  * -- and, for an analyst, crypto-shreds the analyst key material via
@@ -271,9 +262,6 @@ function eraseSubject(db, subjectId) {
       deleted.analyst_key_recovery_wraps = shred.wrapsDeleted;
     }
 
-    deleted.analyst_baselines = db
-      .prepare('DELETE FROM analyst_baselines WHERE analyst_id = ?')
-      .run(subjectId).changes;
     deleted.analyst_impacts = db
       .prepare('DELETE FROM analyst_impacts WHERE analyst_id = ?')
       .run(subjectId).changes;

@@ -62,7 +62,7 @@ cd packages/global-dashboard && npm run build:linux # .AppImage
 1. Operator provisions each AC's local AI models the same way — the same Phi-4 chat model and Nomic embedder, verified against the pinned SHA-256.
 1. Each analyst enrolls their hardware passkey in their AC.
 1. Operator links each AC to its MC: the AC trusts the FireAlive CA, confirms the server's hardware-anchor fingerprint out-of-band on first connection, and registers a hardware-bound device key; the client certificate secures transport, not sign-in.
-1. The AI Burnout Engine on each AC begins establishing that analyst's behavioral baseline, then generates real-time drift detection and training recommendations.
+1. The AI Burnout Engine on each AC begins establishing that analyst's behavioral baseline over a fixed ~90-day window (frozen once set, so sustained strain is never normalized into "normal"; until the window is met, signals read as "establishing" and are not scored against a personal baseline), then generates real-time drift detection and training recommendations.
 1. Operator installs the GD on the CISO's workstation; the GD starts its GD Server automatically, and the CISO enrolls their hardware passkey.
 1. Operator registers the regional MCs in the GD; the CISO then sees cross-region oversight — health and burnout posture aggregated across all regions.
 

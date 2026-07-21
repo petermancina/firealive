@@ -812,7 +812,7 @@ class RegressionRunner {
 
     // ── Category 6: Burnout signals ────────────────────────────────
     await check('burnout', 'Burnout engine tables', () => {
-      return requireAll(['analyst_baselines', 'analyst_impacts']);
+      return requireAll(['analyst_impacts']);
     });
     await check('burnout', 'AI provider config present', () => {
       if (!tableExists('ai_provider_config')) throw new Error('missing table ai_provider_config');
