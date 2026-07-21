@@ -59,7 +59,7 @@ function createHandler(deps) {
   };
 
   async function ensureLlama() {
-    if (!llamaModule) llamaModule = loadLlama();
+    if (!llamaModule) llamaModule = await loadLlama();
     if (!llama) {
       const { getLlama } = llamaModule;
       llama = await getLlama();
@@ -170,7 +170,7 @@ if (require.main === module) {
   }
   try { process.title = 'firealive-model-worker'; } catch (_e) { /* ignore */ }
   const handler = createHandler({
-    loadLlama: () => require('node-llama-cpp'),
+    loadLlama: () => import('node-llama-cpp'),
     send: sendToParent,
   });
   process.on('message', (msg) => { handler.handle(msg); });

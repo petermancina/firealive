@@ -51,6 +51,84 @@ cd packages/global-dashboard && npm run build:linux # .AppImage
 
 -----
 
+## How It Works
+
+### First-Time Setup Flow
+
+1. Operator installs the MC on the team lead's workstation; the MC starts its Regional Server automatically, and the leads enroll their hardware passkeys.
+1. Operator provisions the MC's local AI models: FireAlive's on-device AI never downloads weights, so the operator obtains the official GGUF files through a vetted channel — the Phi-4 Q4_K chat model (Microsoft, MIT; ~9 GB) and the Nomic Embed Text v1.5 embedder — installs them into the model directory (default `~/.firealive/models/`), and runs `node scripts/download-model.js` to verify each against a source-pinned SHA-256. A file that fails verification will not load.
+1. Operator configures the MC's authentication (built-in CA + LDAP directory) and integrations (SOAR, ticketing, SIEM, EDR).
+1. Operator installs the AC on each analyst's workstation through the organization's normal software-deployment process.
+1. Operator provisions each AC's local AI models the same way — the same Phi-4 chat model and Nomic embedder, verified against the pinned SHA-256.
+1. Each analyst enrolls their hardware passkey in their AC.
+1. Operator links each AC to its MC: the AC trusts the FireAlive CA, confirms the server's hardware-anchor fingerprint out-of-band on first connection, and registers a hardware-bound device key; the client certificate secures transport, not sign-in.
+1. The AI Burnout Engine on each AC begins establishing that analyst's behavioral baseline, then generates real-time drift detection and training recommendations.
+1. Operator installs the GD on the CISO's workstation; the GD starts its GD Server automatically, and the CISO enrolls their hardware passkey.
+1. Operator registers the regional MCs in the GD; the CISO then sees cross-region oversight — health and burnout posture aggregated across all regions.
+
+### Hardware-Rooted Identity, Anti-Cloning & Sender-Constrained Sessions
+
+FireAlive treats a running deployment as something that must continuously prove it is the genuine, un-cloned instance — not only at install time, but on every client connection and every request.
+
+- **Hardware-rooted instance identity.** Each server derives a non-exportable identity anchor from the host hardware root of trust — TPM 2.0 on Windows and Linux, the Secure Enclave on macOS. The anchor key never leaves hardware, and identity establishment is fail-closed: no anchor, no serving.
+- **Anti-cloning.** A byte-for-byte copy of a deployment — database, keys, and disk — cannot reconstitute the anchor on different hardware, so a lifted clone is detectable rather than silently authoritative. Every Analyst Client and Global Dashboard verifies the server’s anchor fingerprint on each connect; the **first** connection requires an explicit out-of-band operator confirmation of that fingerprint (the server prints it at startup), and any later fingerprint change blocks the client instead of trusting it.
+- **Ciphertext bound to its location.** Every field sealed at rest — the CA private key, signing keys, integration credentials — is cryptographically bound to its own table and column, so an attacker with write access to the database file but no key cannot move a revoked key’s ciphertext into the active row, or a test credential into production. The seal refuses to open anywhere but where it was written.
+- **Virtualized deployments.** Bare-metal installs bind to the physical TPM; virtualized installs additionally run a VM-attestation and clock-integrity gate, so a paused, rolled-back, snapshotted, or migrated VM is caught fail-closed rather than serving forked or stale state. See [`docs/anti-cloning-and-virtualization.md`](docs/anti-cloning-and-virtualization.md).
+- **Sender-constrained sessions.** Session tokens are bound to a per-device key — the token carries that key’s thumbprint — and every authenticated request carries a short-lived, replay-protected proof-of-possession signed by the device’s private key. A stolen session token is therefore useless on its own: without the device’s hardware-held key it cannot be replayed. See [`docs/iam-and-authentication.md`](docs/iam-and-authentication.md).
+- **Verified code integrity.** The packaged server ships with a code-integrity manifest generated at build time; at boot it recomputes the hashes of its own code and pinned trust anchors (including the bundled FIDO attestation roots) and, in production, refuses to start if any shipped file was modified on disk — a tampered install is caught fail-closed rather than served.
+- **Per-client recovery.** A lost or compromised Analyst Client can be torn down and re-provisioned individually — rate-limited and fully audited — without re-keying the whole deployment. See [`docs/client-recovery.md`](docs/client-recovery.md).
+- **Key continuity across upgrades.** A normal in-place upgrade preserves every key and sealed record: the new release resolves the same hardware root of trust (or KMS/env-var KEK), and the sealed data at rest is never rewritten — so an update costs nothing, with no re-keying, no re-encryption, and no data loss. The seal format is versioned with anti-rollback, so a downgrade onto newer-format data is halted and quarantined rather than risking a mismatched read. Moving to a *different* KEK (a genuine hardware move) is the one case that re-seals the data, and the recovery code is the sole factor for it — there is no KMS escrow or back-door substitute, because that absence is the anti-clone guarantee. See [`docs/key-continuity-and-upgrades.md`](docs/key-continuity-and-upgrades.md).
+- **Two-person authorization for key operations.** Destructive key operations — re-keying a node, importing a migration bundle onto a new key, and a deployment reset — require an anchor-signed, single-use, two-person authorization with a fresh hardware-passkey step-up (a second admin approves, or delayed-self on a single-admin deployment), verified offline against the instance anchor before any key material is touched.
+
+### Locking Configuration (Required Hardening)
+
+Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before the first authenticator is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires a fresh WebAuthn step-up (a user-verified passkey assertion) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
+
+When locked, every configuration-write endpoint returns HTTP 423 Locked. A single registry-driven chokepoint covers all of them — not only the platform-config routers (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, storage destinations, storage routing, backup push, audit retention, API keys) but also the in-app feature settings (EDR, posture, geo-fencing, threat-hunting, vulnerability scan, pseudonyms, recertification, access control, and the rest). Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing, scans, alert approvals) are unaffected, so production incident response is never blocked by the lock.
+
+Unlocking starts a sliding idle window: the platform auto-relocks after a period of no configuration activity (default 15 minutes, admin-configurable), so a walked-away admin session cannot leave configuration writable. A continuous-integration coverage guard fails the build if any configuration endpoint is ever added without being placed behind the lock.
+
+In smaller SOCs where one person handles both Team Lead and Platform Admin duties, assign the `admin` role to that user; the codebase does not collapse the role boundary, which preserves SoD for orgs that do separate the roles.
+
+Audit events: `CONFIG_LOCK_ENABLED`, `CONFIG_LOCK_DISABLED`, `CONFIG_LOCK_GATE_HIT`, `CONFIG_LOCK_AUTO_RELOCK`, `CONFIG_LOCK_BYPASS_ATTEMPT`.
+
+### Burnout Prevention Routing
+
+When active (requires SOAR + Ticketing configured):
+
+- FireAlive reads queue metadata via Ticketing (READ-ONLY)
+- AI assesses each analyst’s capacity score from burnout signals
+- FireAlive writes ticket assignments via SOAR (WRITE) to the analyst with highest capacity
+- Analysts with elevated signals automatically receive lighter ticket loads
+- Anonymity is architecturally enforced — Team Lead never sees which analyst requested reduction
+
+### Privacy Architecture
+
+- **Tier-3 data** (individual burnout signals): encrypted on client, never visible to Team Lead
+- **Tier-1 data** (team aggregates): Team Lead sees averages, never individual data
+- **GD level**: CISO sees regional health only, no individual data
+- Pseudonyms protect analyst identity in all UIs. UUID stays constant across rotations.
+- **Peer chat** and **lead chat** are both genuinely end-to-end encrypted via the Signal protocol (libsignal), each on its own key domain. Lead chat is pseudonymous-to-the-lead. The server is a content-blind relay and cannot decrypt either channel.
+- **Abuse-flag content** (peer-session and board-post reports) is sealed on the flagger’s device to the active Team-Lead recipient set — a multi-recipient X25519 envelope — before it leaves the app. The server stores only opaque ciphertext and cannot decrypt it; review and disposition happen in the MC **Peer Conduct** tab, opened by a lead who has enrolled an abuse-review key. The server, the GD, and an admin (who handles only public keys) cannot read flag content — only an enrolled lead can, on their own device. See the review model below.
+
+### Abuse review (Team Lead)
+
+Abuse reports from peer skill-share sessions and the skill-share Board are reviewed by a Team Lead in the MC **Peer Conduct** tab. At least one lead must enroll an abuse-review key before abuse reporting can be used; with no enrolled key, sealed reports could not be opened by anyone.
+
+**Multi-lead, zero-access.** Each lead enrolls their own X25519 abuse-review key on their own device, behind a passphrase only they know. The public key is registered with the server from the MC Peer Conduct tab; the private key never leaves the lead’s device. Flag content is sealed on the flagger’s device to ALL enrolled leads at once (a multi-recipient envelope); any one lead opens it with their own key. No private key is ever shared, exported, or transferred between people, and the admin only ever handles public keys — true zero-access, in the sense that the server, the admin, and any DB or key insider cannot decrypt flag content. Enrolling another lead adds a public key to the set; revoking removes it.
+
+**Until at least one lead has enrolled, abuse reporting is disabled** — with no enrolled key, nothing could be decrypted, and the flagger’s app shows an explicit message saying so. Key enrollment requires a 12-character (or longer) passphrase, and the private key stays on the lead’s device — it is never sent to the server.
+
+### Signed reports & verification
+
+Every exportable report FireAlive generates — compliance reports, Report Engine output, helper-pay statements, and abuse-flag submission reports — is signed by the instance’s Ed25519 **report-signing key**, a key family distinct from the forensic, backup, chain, GD-push, and cloud-IaC signing keys (a compromise of one family taints none of the others). Each report carries a footer with the human-readable instance label, the UTC sign time, a report id, the short signing-key fingerprint, and a verification hash — so a genuine FireAlive report cannot be forged or altered and passed off as legitimate.
+
+Verification is **authenticated only — there is no public endpoint**. A public hash-verify endpoint would let an adversary grind hashes to enumerate or confirm accusations, so abuse-flag reports verify solely for an enrolled Team Lead; compliance and Report Engine reports for admin/CISO; helper-pay statements for the owning analyst or an admin. The verification ledger is permanent and append-only, so any signed report stays verifiable indefinitely.
+
+Reports can also be verified **independently, with no FireAlive tooling and no trust in the running system**, using OpenSSL against the instance’s published Ed25519 public key — see [`docs/report-verification.md`](docs/report-verification.md). Abuse-flag reports are zero-access end to end: the signature covers a canonical data record containing only a content hash, never the report text, so the server signs and records a verifiable report without ever holding the plaintext.
+
+-----
+
 ## Architecture
 
 Five components:
@@ -188,84 +266,6 @@ To enable GD push:
 1. Click Save (with Enabled left off).
 1. Click Test Connection. The MC reads the saved config and tests it against the GD-Server.
 1. If Test passes, edit the config and toggle Enabled on, then Save again. The recurring push begins on the configured cadence.
-
------
-
-## How It Works
-
-### First-Time Setup Flow
-
-1. Operator installs the MC on the team lead's workstation; the MC starts its Regional Server automatically, and the leads enroll their hardware passkeys.
-1. Operator provisions the MC's local AI models: FireAlive's on-device AI never downloads weights, so the operator obtains the official GGUF files through a vetted channel — the Phi-4 Q4_K chat model (Microsoft, MIT; ~9 GB) and the Nomic Embed Text v1.5 embedder — installs them into the model directory (default `~/.firealive/models/`), and runs `node scripts/download-model.js` to verify each against a source-pinned SHA-256. A file that fails verification will not load.
-1. Operator configures the MC's authentication (built-in CA + LDAP directory) and integrations (SOAR, ticketing, SIEM, EDR).
-1. Operator installs the AC on each analyst's workstation through the organization's normal software-deployment process.
-1. Operator provisions each AC's local AI models the same way — the same Phi-4 chat model and Nomic embedder, verified against the pinned SHA-256.
-1. Each analyst enrolls their hardware passkey in their AC.
-1. Operator links each AC to its MC: the AC trusts the FireAlive CA, confirms the server's hardware-anchor fingerprint out-of-band on first connection, and registers a hardware-bound device key; the client certificate secures transport, not sign-in.
-1. The AI Burnout Engine on each AC begins establishing that analyst's behavioral baseline, then generates real-time drift detection and training recommendations.
-1. Operator installs the GD on the CISO's workstation; the GD starts its GD Server automatically, and the CISO enrolls their hardware passkey.
-1. Operator registers the regional MCs in the GD; the CISO then sees cross-region oversight — health and burnout posture aggregated across all regions.
-
-### Hardware-Rooted Identity, Anti-Cloning & Sender-Constrained Sessions
-
-FireAlive treats a running deployment as something that must continuously prove it is the genuine, un-cloned instance — not only at install time, but on every client connection and every request.
-
-- **Hardware-rooted instance identity.** Each server derives a non-exportable identity anchor from the host hardware root of trust — TPM 2.0 on Windows and Linux, the Secure Enclave on macOS. The anchor key never leaves hardware, and identity establishment is fail-closed: no anchor, no serving.
-- **Anti-cloning.** A byte-for-byte copy of a deployment — database, keys, and disk — cannot reconstitute the anchor on different hardware, so a lifted clone is detectable rather than silently authoritative. Every Analyst Client and Global Dashboard verifies the server’s anchor fingerprint on each connect; the **first** connection requires an explicit out-of-band operator confirmation of that fingerprint (the server prints it at startup), and any later fingerprint change blocks the client instead of trusting it.
-- **Ciphertext bound to its location.** Every field sealed at rest — the CA private key, signing keys, integration credentials — is cryptographically bound to its own table and column, so an attacker with write access to the database file but no key cannot move a revoked key’s ciphertext into the active row, or a test credential into production. The seal refuses to open anywhere but where it was written.
-- **Virtualized deployments.** Bare-metal installs bind to the physical TPM; virtualized installs additionally run a VM-attestation and clock-integrity gate, so a paused, rolled-back, snapshotted, or migrated VM is caught fail-closed rather than serving forked or stale state. See [`docs/anti-cloning-and-virtualization.md`](docs/anti-cloning-and-virtualization.md).
-- **Sender-constrained sessions.** Session tokens are bound to a per-device key — the token carries that key’s thumbprint — and every authenticated request carries a short-lived, replay-protected proof-of-possession signed by the device’s private key. A stolen session token is therefore useless on its own: without the device’s hardware-held key it cannot be replayed. See [`docs/iam-and-authentication.md`](docs/iam-and-authentication.md).
-- **Verified code integrity.** The packaged server ships with a code-integrity manifest generated at build time; at boot it recomputes the hashes of its own code and pinned trust anchors (including the bundled FIDO attestation roots) and, in production, refuses to start if any shipped file was modified on disk — a tampered install is caught fail-closed rather than served.
-- **Per-client recovery.** A lost or compromised Analyst Client can be torn down and re-provisioned individually — rate-limited and fully audited — without re-keying the whole deployment. See [`docs/client-recovery.md`](docs/client-recovery.md).
-- **Key continuity across upgrades.** A normal in-place upgrade preserves every key and sealed record: the new release resolves the same hardware root of trust (or KMS/env-var KEK), and the sealed data at rest is never rewritten — so an update costs nothing, with no re-keying, no re-encryption, and no data loss. The seal format is versioned with anti-rollback, so a downgrade onto newer-format data is halted and quarantined rather than risking a mismatched read. Moving to a *different* KEK (a genuine hardware move) is the one case that re-seals the data, and the recovery code is the sole factor for it — there is no KMS escrow or back-door substitute, because that absence is the anti-clone guarantee. See [`docs/key-continuity-and-upgrades.md`](docs/key-continuity-and-upgrades.md).
-- **Two-person authorization for key operations.** Destructive key operations — re-keying a node, importing a migration bundle onto a new key, and a deployment reset — require an anchor-signed, single-use, two-person authorization with a fresh hardware-passkey step-up (a second admin approves, or delayed-self on a single-admin deployment), verified offline against the instance anchor before any key material is touched.
-
-### Locking Configuration (Required Hardening)
-
-Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before the first authenticator is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires a fresh WebAuthn step-up (a user-verified passkey assertion) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
-
-When locked, every configuration-write endpoint returns HTTP 423 Locked. A single registry-driven chokepoint covers all of them — not only the platform-config routers (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, storage destinations, storage routing, backup push, audit retention, API keys) but also the in-app feature settings (EDR, posture, geo-fencing, threat-hunting, vulnerability scan, pseudonyms, recertification, access control, and the rest). Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing, scans, alert approvals) are unaffected, so production incident response is never blocked by the lock.
-
-Unlocking starts a sliding idle window: the platform auto-relocks after a period of no configuration activity (default 15 minutes, admin-configurable), so a walked-away admin session cannot leave configuration writable. A continuous-integration coverage guard fails the build if any configuration endpoint is ever added without being placed behind the lock.
-
-In smaller SOCs where one person handles both Team Lead and Platform Admin duties, assign the `admin` role to that user; the codebase does not collapse the role boundary, which preserves SoD for orgs that do separate the roles.
-
-Audit events: `CONFIG_LOCK_ENABLED`, `CONFIG_LOCK_DISABLED`, `CONFIG_LOCK_GATE_HIT`, `CONFIG_LOCK_AUTO_RELOCK`, `CONFIG_LOCK_BYPASS_ATTEMPT`.
-
-### Burnout Prevention Routing
-
-When active (requires SOAR + Ticketing configured):
-
-- FireAlive reads queue metadata via Ticketing (READ-ONLY)
-- AI assesses each analyst’s capacity score from burnout signals
-- FireAlive writes ticket assignments via SOAR (WRITE) to the analyst with highest capacity
-- Analysts with elevated signals automatically receive lighter ticket loads
-- Anonymity is architecturally enforced — Team Lead never sees which analyst requested reduction
-
-### Privacy Architecture
-
-- **Tier-3 data** (individual burnout signals): encrypted on client, never visible to Team Lead
-- **Tier-1 data** (team aggregates): Team Lead sees averages, never individual data
-- **GD level**: CISO sees regional health only, no individual data
-- Pseudonyms protect analyst identity in all UIs. UUID stays constant across rotations.
-- **Peer chat** and **lead chat** are both genuinely end-to-end encrypted via the Signal protocol (libsignal), each on its own key domain. Lead chat is pseudonymous-to-the-lead. The server is a content-blind relay and cannot decrypt either channel.
-- **Abuse-flag content** (peer-session and board-post reports) is sealed on the flagger’s device to the active Team-Lead recipient set — a multi-recipient X25519 envelope — before it leaves the app. The server stores only opaque ciphertext and cannot decrypt it; review and disposition happen in the MC **Peer Conduct** tab, opened by a lead who has enrolled an abuse-review key. The server, the GD, and an admin (who handles only public keys) cannot read flag content — only an enrolled lead can, on their own device. See the review model below.
-
-### Abuse review (Team Lead)
-
-Abuse reports from peer skill-share sessions and the skill-share Board are reviewed by a Team Lead in the MC **Peer Conduct** tab. At least one lead must enroll an abuse-review key before abuse reporting can be used; with no enrolled key, sealed reports could not be opened by anyone.
-
-**Multi-lead, zero-access.** Each lead enrolls their own X25519 abuse-review key on their own device, behind a passphrase only they know. The public key is registered with the server from the MC Peer Conduct tab; the private key never leaves the lead’s device. Flag content is sealed on the flagger’s device to ALL enrolled leads at once (a multi-recipient envelope); any one lead opens it with their own key. No private key is ever shared, exported, or transferred between people, and the admin only ever handles public keys — true zero-access, in the sense that the server, the admin, and any DB or key insider cannot decrypt flag content. Enrolling another lead adds a public key to the set; revoking removes it.
-
-**Until at least one lead has enrolled, abuse reporting is disabled** — with no enrolled key, nothing could be decrypted, and the flagger’s app shows an explicit message saying so. Key enrollment requires a 12-character (or longer) passphrase, and the private key stays on the lead’s device — it is never sent to the server.
-
-### Signed reports & verification
-
-Every exportable report FireAlive generates — compliance reports, Report Engine output, helper-pay statements, and abuse-flag submission reports — is signed by the instance’s Ed25519 **report-signing key**, a key family distinct from the forensic, backup, chain, GD-push, and cloud-IaC signing keys (a compromise of one family taints none of the others). Each report carries a footer with the human-readable instance label, the UTC sign time, a report id, the short signing-key fingerprint, and a verification hash — so a genuine FireAlive report cannot be forged or altered and passed off as legitimate.
-
-Verification is **authenticated only — there is no public endpoint**. A public hash-verify endpoint would let an adversary grind hashes to enumerate or confirm accusations, so abuse-flag reports verify solely for an enrolled Team Lead; compliance and Report Engine reports for admin/CISO; helper-pay statements for the owning analyst or an admin. The verification ledger is permanent and append-only, so any signed report stays verifiable indefinitely.
-
-Reports can also be verified **independently, with no FireAlive tooling and no trust in the running system**, using OpenSSL against the instance’s published Ed25519 public key — see [`docs/report-verification.md`](docs/report-verification.md). Abuse-flag reports are zero-access end to end: the signature covers a canonical data record containing only a content hash, never the report text, so the server signs and records a verifiable report without ever holding the plaintext.
 
 -----
 

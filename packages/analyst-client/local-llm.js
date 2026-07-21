@@ -308,7 +308,7 @@ async function verifyBeforeLoad(which) {
 
 // ── Isolated utilityProcess host (on-device; nothing leaves the machine) ──────
 function spawnUtil() {
-  const scriptPath = path.join(__dirname, 'model-utility.js');
+  const scriptPath = path.join(__dirname, 'model-utility.js').replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep);
   let forkFn = utilForkForTest;
   if (!forkFn) {
     let up;

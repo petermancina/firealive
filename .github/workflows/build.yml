@@ -79,6 +79,25 @@ jobs:
       # tree is untouched.
       - name: Verify code-integrity checks (both servers)
         run: node scripts/check-integrity.js
+      # The 20th gate (pre-N2): the release pipeline's own correctness. The
+      # phantom `**/*.zip` in the release `files:` list -- producible by no build
+      # target -- failed the v1.0.85 publish under fail_on_unmatched_files. This
+      # proves every release glob is producible AND that the G1/G2 fixes stay in
+      # place: release needs coverage+smoke+posture-windows, and a PR triggers CI.
+      # Two steps, self-test first, matching the single-writer and 18th-gate pattern.
+      - name: Verify workflow validity (self-test)
+        run: node scripts/check-workflow-validity.js --self-test
+      - name: Verify workflow validity
+        run: node scripts/check-workflow-validity.js
+      # The 21st gate (pre-N2): the lockfile carries a node-llama-cpp prebuilt for
+      # EVERY platform the MC and AC ship to, so a Dependabot bump cannot silently
+      # drop one and leave that platform's app with no model binding; and
+      # @mongodb-js/zstd (backup compression) stays declared with its
+      # prebuild-install fetch mechanism intact.
+      - name: Verify native-module completeness (self-test)
+        run: node scripts/check-native-modules.js --self-test
+      - name: Verify native-module completeness
+        run: node scripts/check-native-modules.js
 
 
   # The first thing in this repository that launches the product. Runs on every
@@ -108,6 +127,14 @@ jobs:
       - name: Install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
       - run: npm install
+      # pre-N2: prove the two native N-API addons LOAD and function on this
+      # platform -- not merely that a prebuilt is present (check-native-modules)
+      # or that a .node shipped (asserted on the artifact below). getLlama() loads
+      # llama.cpp's CPU backend; the zstd step compresses and decompresses a
+      # buffer and checks it survived. build.yml's note that these modules "load
+      # under Electron without a rebuild" was an assertion -- this tests it.
+      - name: Probe the native N-API modules load
+        run: node scripts/probe-native-modules.js
       # P1-5: install each embedded server's production dependencies and rebuild its ONE
       # boot-critical native module -- better-sqlite3 -- for THIS runner's Electron ABI, so the
       # packaged server (spawned under ELECTRON_RUN_AS_NODE, i.e. Electron's Node, not system
@@ -183,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           check() {
-            local dir="$1" name="$2"
+            local dir="$1" name="$2" natives="$3"
             if [ ! -d "$dir/node_modules" ]; then
               echo "$name: node_modules NOT shipped at $dir/node_modules"
               root="${dir%/resources/*}"
@@ -194,12 +221,55 @@ jobs:
               echo "--- better-sqlite3 dirs under $root ---"; find "$root" -maxdepth 7 -type d -name better-sqlite3 2>/dev/null | head -40
               exit 1
             fi
-            test -d "$dir/node_modules/better-sqlite3" || { echo "$name: better-sqlite3 not shipped"; exit 1; }
-            test -n "$(find "$dir/node_modules/better-sqlite3" -name '*.node' -print -quit)" || { echo "$name: better-sqlite3 native .node missing -- Electron-ABI rebuild did not run"; exit 1; }
-            echo "$name: node_modules + better-sqlite3 native module present"
+            # $3 = space-separated "<label>:<path-substring>" specs; the shipped
+            # tree must hold a *.node whose path matches *<substring>*. llama's
+            # binding lives in @node-llama-cpp/<platform>, not in node-llama-cpp/
+            # itself, so it is matched by the path substring "llama" rather than a
+            # package dir. better-sqlite3 and @mongodb-js/zstd match their own dirs.
+            for spec in $natives; do
+              label="${spec%%:*}"; hint="${spec#*:}"
+              test -n "$(find "$dir/node_modules" -path "*$hint*" -name '*.node' -print -quit)" \
+                || { echo "$name: $label native .node missing (no *.node on a path matching *$hint*) -- it did not ship, or its ABI build did not run"; exit 1; }
+            done
+            echo "$name: shipped native modules present -- $natives"
           }
-          check frontend/dist/squashfs-root/resources/server "Regional Server"
-          check packages/global-dashboard/dist/squashfs-root/resources/global-dashboard-server "GD server"
+          # Regional Server ships all three: better-sqlite3 (DB), node-llama-cpp
+          # (inference), @mongodb-js/zstd (backup compression). GD server ships
+          # only better-sqlite3 -- it runs neither inference nor backup-archive.
+          check frontend/dist/squashfs-root/resources/server "Regional Server" "better-sqlite3:better-sqlite3 node-llama-cpp:llama zstd:@mongodb-js/zstd"
+          check packages/global-dashboard/dist/squashfs-root/resources/global-dashboard-server "GD server" "better-sqlite3:better-sqlite3"
+
+      # pre-N2: the Analyst Client loads node-llama-cpp via ESM import() from a
+      # utilityProcess. import() cannot resolve a package from inside app.asar
+      # (electron/electron#38957), so the fix runs model-utility.js from the
+      # UNPACKED tree with node-llama-cpp unpacked beside it. Reasoning is not
+      # proof: this loads it from that exact packaged layout. A bare-specifier
+      # import() run with cwd set to the AC's unpacked tree resolves node-llama-cpp
+      # from unpacked/node_modules -- exactly how model-utility.js resolves it --
+      # and getLlama() loads the CPU backend with no model file. The two presence
+      # tests name a packaging regression legibly before the load.
+      #
+      # Run under the runner's Node, not the extracted Electron binary: the app's
+      # AppRun injects --no-sandbox (a Chromium flag) which Node rejects under
+      # ELECTRON_RUN_AS_NODE, and node-llama-cpp is N-API (ABI-stable), so a Node
+      # load is equivalent for load purposes -- the substantive check here is that
+      # the AC's unpacked packaging resolves the import, which is venue-independent.
+      - name: Probe node-llama-cpp loads in the packaged Analyst Client
+        run: |
+          set -euo pipefail
+          AC="$PWD/packages/analyst-client/dist/squashfs-root"
+          UNPACK="$AC/resources/app.asar.unpacked"
+          test -e "$UNPACK/node_modules/node-llama-cpp/package.json" \
+            || { echo "AC: node-llama-cpp is NOT unpacked (asarUnpack node_modules/node-llama-cpp/** missing)"; exit 1; }
+          test -e "$UNPACK/model-utility.js" \
+            || { echo "AC: model-utility.js is NOT unpacked -- the ESM importer must be on real fs, import() cannot cross the asar boundary"; exit 1; }
+          printf '%s\n' \
+            "const { getLlama } = await import('node-llama-cpp');" \
+            "const llama = await getLlama();" \
+            "if (!llama || typeof llama !== 'object') { console.error('getLlama() returned no instance'); process.exit(3); }" \
+            "console.log('AC packaged: node-llama-cpp import() + getLlama() OK');" \
+            > "$UNPACK/ac-llama-probe.mjs"
+          ( cd "$UNPACK" && node ac-llama-probe.mjs )
 
       # FATAL 3's PREMISE, verified on the real artifact rather than reasoned.
       #

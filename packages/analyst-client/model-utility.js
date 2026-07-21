@@ -43,7 +43,7 @@ function createHandler(deps) {
   };
 
   async function ensureLlama() {
-    if (!llamaModule) llamaModule = loadLlama();
+    if (!llamaModule) llamaModule = await loadLlama();
     if (!llama) { const { getLlama } = llamaModule; llama = await getLlama(); }
     return llamaModule;
   }
@@ -134,7 +134,7 @@ function createHandler(deps) {
 // not when this file is required by a test.
 if (process.parentPort) {
   const post = (m) => { try { process.parentPort.postMessage(m); } catch (_e) { /* ignore */ } };
-  const handler = createHandler({ loadLlama: () => require('node-llama-cpp'), send: post });
+  const handler = createHandler({ loadLlama: () => import('node-llama-cpp'), send: post });
   process.parentPort.on('message', (e) => { handler.handle(e && e.data); });
   post({ t: 'ready' });
 }
