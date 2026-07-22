@@ -98,6 +98,16 @@ jobs:
         run: node scripts/check-native-modules.js --self-test
       - name: Verify native-module completeness
         run: node scripts/check-native-modules.js
+      # The 22nd gate (N2): the on-device behavioral baseliner's load-bearing
+      # invariants -- fixed 90-day window, establishing-unscored, frozen against
+      # upward drift, downward re-establish only when in-band, and drift measured
+      # vs the frozen base. baseliner.js is the exact renderer math (bundled into
+      # the AC's app.js); a refactor toward a rolling/self-refitting mean would
+      # ship green without this gate.
+      - name: Verify baseliner invariants (self-test)
+        run: node scripts/check-baseliner-invariants.js --self-test
+      - name: Verify baseliner invariants
+        run: node scripts/check-baseliner-invariants.js
 
 
   # The first thing in this repository that launches the product. Runs on every

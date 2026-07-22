@@ -1,6 +1,6 @@
 {
   "name": "firealive-regional-server",
-  "version": "1.0.85",
+  "version": "1.0.86",
   "description": "FireAlive Regional Server -- the embedded backend spawned by the Management Console, and the standalone bare-metal deployment. Its dependency set exists so the packaged app can ship a self-contained, Electron-ABI node_modules; the source-of-truth for the server is the repo root (main: server/index.js).",
   "private": true,
   "main": "index.js",
