@@ -1,6 +1,6 @@
 {
   "name": "@firealive/shared",
-  "version": "1.0.85",
+  "version": "1.0.86",
   "description": "FireAlive shared modules: the X25519 sealed-envelope (abuse-seal), Signal-protocol E2EE, note sanitizer, abuse-export PDF builder, beacon listener, and the hardware-backed key-storage families. Consumed by the regional server and the Electron apps.",
   "author": "Peter Mancina",
   "license": "AGPL-3.0-or-later",
