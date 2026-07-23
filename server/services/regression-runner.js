@@ -3544,6 +3544,50 @@ class RegressionRunner {
       return 'unset (defaults apply)';
     });
 
+    await check('config_lock', 'B6j: reconciled MC writes gate; operational siblings + reads open', () => {
+      const { isConfigWriteRequest } = require('../middleware/config-write-routes');
+      const gated = [
+        ['PUT', '/api/notifications/config'], ['PUT', '/api/retention/config'],
+        ['PUT', '/api/reports/config'], ['POST', '/api/cloud/signing-keys/rotate'],
+      ];
+      for (const [m, p] of gated) if (isConfigWriteRequest(m, p) !== true) throw new Error('must be gated: ' + m + ' ' + p);
+      const open = [
+        ['POST', '/api/reports/generate'], ['PUT', '/api/sla/config'], ['PUT', '/api/helper-pay/config'],
+        ['GET', '/api/notifications/config'], ['POST', '/api/config/lock'],
+      ];
+      for (const [m, p] of open) if (isConfigWriteRequest(m, p) !== false) throw new Error('must be operational-open: ' + m + ' ' + p);
+      return gated.length + ' reconciled writes gate; sla/helper-pay + reads open';
+    });
+
+    await check('restore_posture', 'post-restore posture ratchets fuse + force-locks + clears MFA (module)', () => {
+      const { applyPostRestorePosture } = require('./restore-posture');
+      const Database = this.db.constructor;
+      const mk = (mark, lock) => {
+        const d = new Database(':memory:');
+        d.exec('CREATE TABLE node_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+        d.exec('CREATE TABLE config_lock_state (id INTEGER PRIMARY KEY CHECK(id = 1), lock_active INTEGER NOT NULL DEFAULT 0 CHECK(lock_active IN (0,1)), locked_at INTEGER, auto_relock_at INTEGER, idle_minutes INTEGER NOT NULL DEFAULT 15, last_mfa_verified_at INTEGER, locked_by_user_id TEXT)');
+        if (mark !== null) d.prepare("INSERT INTO node_state (key, value) VALUES ('fuse_high_water', ?)").run(String(mark));
+        d.prepare('INSERT INTO config_lock_state (id, lock_active, idle_minutes, last_mfa_verified_at) VALUES (1, ?, 15, 111)').run(lock);
+        return d;
+      };
+      const markOf = (d) => { const r = d.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get(); return r ? Number(r.value) : null; };
+      const rowOf = (d) => d.prepare('SELECT lock_active, last_mfa_verified_at AS mfa FROM config_lock_state WHERE id = 1').get();
+      const a = mk(70, 0);
+      const pa = applyPostRestorePosture(a, { preFuseHighWater: 79 });
+      const ra = rowOf(a);
+      if (markOf(a) !== 79) { a.close(); throw new Error('fuse not ratcheted to max(pre, restored)'); }
+      if (pa.configForceLocked !== true || ra.lock_active !== 1) { a.close(); throw new Error('config not force-locked (D6)'); }
+      if (ra.mfa !== null) { a.close(); throw new Error('last_mfa_verified_at not cleared on force-lock'); }
+      a.close();
+      const b = mk(85, 0); applyPostRestorePosture(b, { preFuseHighWater: 79 });
+      const keptHigher = markOf(b) === 85; b.close();
+      if (!keptHigher) throw new Error('restore must never lower the fuse high-water');
+      const c = mk(null, 0); applyPostRestorePosture(c, { preFuseHighWater: 79 });
+      const seeded = markOf(c) === 79; c.close();
+      if (!seeded) throw new Error('missing mark (pre-B6h backup) not seeded from pre');
+      return 'ratchet=max(pre,restored); force-lock on; MFA cleared; pre-B6h mark seeded';
+    });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

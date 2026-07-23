@@ -58,6 +58,11 @@ const COMPLIANCE_FRAMEWORKS = [
 // behavior for a CISO console).
 const api = {
   _token: null,
+  // B6j-3: optional callback the renderer registers (in a useEffect) so a config-
+  // lock / quarantine refusal (423/403) from ANY component surfaces one clear
+  // message and flips the lock state, instead of failing silently or with a raw
+  // error. Null until the app stage mounts; see _send.
+  _onConfigRefusal: null,
   _baseUrl: 'https://localhost:4001',
   setBaseUrl(url) { this._baseUrl = url; },
   setToken(t) { this._token = t; },
@@ -91,7 +96,18 @@ const api = {
       if (r.ok) return await r.json();
       let body = {};
       try { body = await r.json(); } catch (_) { /* non-JSON error response */ }
-      return { ...(body && typeof body === 'object' ? body : {}), error: body.error || r.statusText, code: body.code, status: r.status };
+      const errObj = { ...(body && typeof body === 'object' ? body : {}), error: body.error || r.statusText, code: body.code, status: r.status };
+      // B6j-3: surface a config-lock / quarantine refusal centrally. The chokepoint
+      // returns 423 CONFIG_LOCKED / CONFIG_LOCK_STATE_MISSING or 403 INSTANCE_QUARANTINED
+      // with a human-readable `error`. Firing here (before the caller sees it) means
+      // every config write in every component gives the CISO the same clear message
+      // and re-syncs the lock, rather than one tab failing silently and another with a
+      // raw error. Callers still receive errObj and may show their own inline error.
+      if ((r.status === 423 || r.status === 403) &&
+          (errObj.code === 'CONFIG_LOCKED' || errObj.code === 'CONFIG_LOCK_STATE_MISSING' || errObj.code === 'INSTANCE_QUARANTINED')) {
+        try { if (typeof api._onConfigRefusal === 'function') api._onConfigRefusal(errObj.code, errObj.error); } catch (_) { /* ignore */ }
+      }
+      return errObj;
     } catch (e) {
       console.warn('[API]', path, e.message);
       return { error: e.message };
@@ -1943,6 +1959,19 @@ export default function GlobalDashboard() {
       if (r && !r.error) setConfigLocked(!!r.lock_active);
     });
   }, [stage]);
+
+  // B6j-3: register the central config-lock refusal handler on the api client so a
+  // 423/403 refusal from ANY component (FIDO trust, storage, HA, signing keys,
+  // migration, data residency, cloud-vuln, SASE/SDN, MC register, CI/CD secret ...)
+  // flips the lock state and shows one clear toast, instead of a silent failure or a
+  // raw error. Cleared on unmount so a stale closure never fires.
+  useEffect(() => {
+    api._onConfigRefusal = (code, msg) => {
+      if (code === 'CONFIG_LOCKED' || code === 'CONFIG_LOCK_STATE_MISSING') setConfigLocked(true);
+      showGdToast(msg || 'Configuration is locked. Unlock with hardware MFA to proceed.');
+    };
+    return () => { api._onConfigRefusal = null; };
+  }, []);
 
   // Load regions whenever the user lands in the app stage. Also re-runs on
   // tab switches into "overview" / "regions" / "connections" so a CISO who

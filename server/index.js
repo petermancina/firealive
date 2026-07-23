@@ -328,7 +328,7 @@ app.use('/api/routing', authMiddleware(['lead', 'admin']), require('./routes/rou
 app.use('/api/handoffs', authMiddleware(['lead', 'admin']), require('./routes/handoffs'));
 app.use('/api/retro', authMiddleware(['lead', 'admin']), require('./routes/retro'));
 app.use('/api/assessments', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/assessments'));
-app.use('/api/reports', authMiddleware(['lead', 'admin']), require('./routes/reports'));
+app.use('/api/reports', authMiddleware(['lead', 'admin']), configLockChokepoint(), require('./routes/reports'));
 app.use('/api/delegations', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/delegations'));
 app.use('/api/pseudonyms', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/pseudonyms'));
 app.use('/api/integrations/ticketing/activity-events', authMiddleware(['admin']), require('./routes/ticketing-activity'));
@@ -353,7 +353,7 @@ app.use('/api/alert-config', authMiddleware(['admin']), require('./routes/alert-
 app.use('/api/integration-health', authMiddleware(['admin']), require('./routes/integration-health'));
 app.use('/api/resources', authMiddleware(['lead', 'admin', 'analyst']), require('./routes/resources'));
 app.use('/api/sla', authMiddleware(['lead', 'admin']), require('./routes/sla'));
-app.use('/api/notifications', authMiddleware(['admin']), require('./routes/notifications'));
+app.use('/api/notifications', authMiddleware(['admin']), configLockChokepoint(), require('./routes/notifications'));
 app.use('/api/messages', authMiddleware(['analyst']), require('./routes/messages'));
 app.use('/api/peers', authMiddleware(['analyst']), require('./routes/peers'));
 app.use('/api/e2ee', authMiddleware(['analyst', 'lead']), require('./routes/e2ee-keys'));
@@ -413,7 +413,7 @@ app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoi
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), require('./routes/v025-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), require('./routes/v027-features'));
 app.use('/api', authMiddleware(['lead', 'admin', 'analyst']), configLockChokepoint(), require('./routes/v030-features'));
-app.use('/api', authMiddleware(['lead', 'admin']), require('./routes/compliance-monitoring'));
+app.use('/api', authMiddleware(['lead', 'admin']), configLockChokepoint(), require('./routes/compliance-monitoring'));
 app.use('/api/system/connected-clients', authMiddleware(['admin']), require('./routes/system-connected-clients'));
 app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
 // /device-key is the AC keyless bootstrap (an analyst registers the hardware
@@ -421,11 +421,11 @@ app.use('/api/system', authMiddleware(['admin']), require('./routes/system'));
 // compromise route requires a bound, proven session (B5f).
 app.use('/api/compromise', (req, res, next) => authMiddleware(['analyst', 'lead', 'admin'], { popExempt: req.path === '/device-key' })(req, res, next), require('./routes/compromise-scan-orchestration'));
 app.use('/api/client-ops', authMiddleware(['lead', 'admin']), require('./routes/client-ops'));
-app.use('/api/tripwire', authMiddleware(['lead', 'admin']), require('./routes/tripwire'));
+app.use('/api/tripwire', authMiddleware(['lead', 'admin']), configLockChokepoint(), require('./routes/tripwire'));
 app.use('/api/status', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/status'));
 app.use('/api/regression', authMiddleware(['admin']), require('./routes/regression'));
 app.use('/api/cicd', authMiddleware(['admin']), require('./routes/cicd'));
-app.use('/api/cloud', authMiddleware(['admin']), require('./routes/cloud'));
+app.use('/api/cloud', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud'));
 app.use('/api/cloud-vuln', authMiddleware(['admin']), configLockChokepoint(), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
 app.use('/api/vuln-scan', authMiddleware(['admin']), configLockChokepoint(), require('./routes/vuln-scan'));

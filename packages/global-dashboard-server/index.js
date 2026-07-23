@@ -5267,6 +5267,51 @@ function runGdRegression(db) {
     if (isGdConfigWriteRequest('POST', '/api/config/lock') !== false) throw new Error('lock control not exempt');
     return 'write paths gated; reads + lock-control exempt';
   });
+  record('config_lock', 'B6j coverage: HA control-plane + trust writes gated; peer/ops open', () => {
+    const { isGdConfigWriteRequest } = require('./services/gd-config-write-routes');
+    const gated = [
+      ['PUT', '/api/ha/config'], ['POST', '/api/ha/pairing-token'], ['POST', '/api/ha/pair'],
+      ['POST', '/api/mc/register'], ['POST', '/api/cicd/webhook-secret/rotate'],
+      ['POST', '/api/iam/fido-roots'], ['POST', '/api/backup/signing-keys/rotate'],
+      ['POST', '/api/cloud/signing-keys/rotate'], ['PUT', '/api/sase/config'],
+      ['PUT', '/api/sdn/network-map'], ['POST', '/api/data-residency/config'],
+      ['POST', '/api/storage-destinations'],
+    ];
+    for (const [m, p] of gated) if (isGdConfigWriteRequest(m, p) !== true) throw new Error('must be gated: ' + m + ' ' + p);
+    const open = [
+      ['POST', '/api/ha/peer/replicate'], ['POST', '/api/ha/pair-init'], ['POST', '/api/ha/self-test'],
+      ['POST', '/api/config/lock'], ['POST', '/api/ingest/metrics'], ['POST', '/api/reports/generate'],
+      ['POST', '/api/mc/me/pending-requests'], ['POST', '/api/backup'],
+    ];
+    for (const [m, p] of open) if (isGdConfigWriteRequest(m, p) !== false) throw new Error('must be operational-open: ' + m + ' ' + p);
+    return gated.length + ' gated, ' + open.length + ' operational-open';
+  });
+  record('restore_posture', 'post-restore posture ratchets fuse + force-locks (module)', () => {
+    const { applyPostRestorePosture } = require('./services/gd-restore-posture');
+    const Database = db.constructor;
+    const mk = (mark, lock) => {
+      const d = new Database(':memory:');
+      d.exec('CREATE TABLE node_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+      d.exec('CREATE TABLE config_lock_state (id INTEGER PRIMARY KEY CHECK(id = 1), lock_active INTEGER NOT NULL DEFAULT 0 CHECK(lock_active IN (0,1)), locked_at INTEGER, auto_relock_at INTEGER, idle_minutes INTEGER NOT NULL DEFAULT 15, locked_by_user_id TEXT)');
+      if (mark !== null) d.prepare("INSERT INTO node_state (key, value) VALUES ('fuse_high_water', ?)").run(String(mark));
+      d.prepare('INSERT INTO config_lock_state (id, lock_active, idle_minutes) VALUES (1, ?, 15)').run(lock);
+      return d;
+    };
+    const markOf = (d) => { const r = d.prepare("SELECT value FROM node_state WHERE key = 'fuse_high_water'").get(); return r ? Number(r.value) : null; };
+    const lockOf = (d) => d.prepare('SELECT lock_active FROM config_lock_state WHERE id = 1').get().lock_active;
+    const a = mk(70, 0);
+    const pa = applyPostRestorePosture(a, { preFuseHighWater: 79 });
+    if (markOf(a) !== 79) { a.close(); throw new Error('fuse not ratcheted to max(pre, restored)'); }
+    if (pa.configForceLocked !== true || lockOf(a) !== 1) { a.close(); throw new Error('config not force-locked (D6)'); }
+    a.close();
+    const b = mk(85, 0); applyPostRestorePosture(b, { preFuseHighWater: 79 });
+    const keptHigher = markOf(b) === 85; b.close();
+    if (!keptHigher) throw new Error('restore must never lower the fuse high-water');
+    const c = mk(null, 0); applyPostRestorePosture(c, { preFuseHighWater: 79 });
+    const seeded = markOf(c) === 79; c.close();
+    if (!seeded) throw new Error('missing mark (pre-B6h backup) not seeded from pre');
+    return 'ratchet=max(pre,restored); force-lock on; pre-B6h mark seeded';
+  });
 
   // ── Self-protection surface (B6a) (3) ───────────────────────
   record('self_protection', 'self-protection config defaults present', () => {

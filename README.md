@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.86 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 79 (anti-rollback) | **Build:** 20260721.1
+**Version:** v1.0.87 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 80 (anti-rollback) | **Build:** 20260722.1
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.86) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.87) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -82,11 +82,15 @@ FireAlive treats a running deployment as something that must continuously prove 
 
 ### Locking Configuration (Required Hardening)
 
-Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before the first authenticator is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires a fresh WebAuthn step-up (a user-verified passkey assertion) and is **admin-role-only**. Use the **Lock All Configs** button in the MC or GD sidebar.
+Before promoting the deployment to production, an admin **must** lock the configuration to prevent runtime changes. The platform ships unlocked because initial setup (KMS, IAM, integration onboarding, backup signing keys, etc.) needs to happen before the first authenticator is even enrolled — but unlocked is a setup-time state, not the production state. Lock/unlock requires a fresh WebAuthn step-up (a user-verified passkey assertion) and is role-gated — **admin-only** on the Management Console, **CISO-only** on the Global Dashboard, where a role mismatch is itself audited as a bypass attempt. Use the **Lock All Configs** button in the MC or GD sidebar.
 
 When locked, every configuration-write endpoint returns HTTP 423 Locked. A single registry-driven chokepoint covers all of them — not only the platform-config routers (KMS, IAM, backup signing keys, integrations, GD push config, scheduling, external restore, AI provider, malware scanners, storage destinations, storage routing, backup push, audit retention, API keys) but also the in-app feature settings (EDR, posture, geo-fencing, threat-hunting, vulnerability scan, pseudonyms, recertification, access control, and the rest). Reads pass through — admins can still inspect config state. Operational routes (backup creation, restore execution, incident routing, scans, alert approvals) are unaffected, so production incident response is never blocked by the lock.
 
-Unlocking starts a sliding idle window: the platform auto-relocks after a period of no configuration activity (default 15 minutes, admin-configurable), so a walked-away admin session cannot leave configuration writable. A continuous-integration coverage guard fails the build if any configuration endpoint is ever added without being placed behind the lock.
+The lock is enforced independently on **both** servers — the Regional Server and the Global Dashboard — and the Global Dashboard is held to a **strict** standard: every mutating endpoint is either gated or in a reasoned operational allow-list, so a config write of any shape that is neither fails the build. That covers the trust-expanding writes a naive rule would miss — the HA configuration and admin-initiated pairing, the FIDO hardware-key attestation roots, backup and cloud signing-key rotation, storage destinations and routing, migration, external restore, data residency, registering a new management console, and the CI/CD webhook secret. The allow-list is equally deliberate: lock control itself, login and step-up (you authenticate in order to unlock), credential enrollment and revocation, the mutually-authenticated HA peer data plane, and inbound console-to-dashboard ingest all keep working while locked, so a lock window never causes an outage or locks an operator out of recovery.
+
+Unlocking starts a sliding idle window: the platform auto-relocks after a period of no configuration activity (default 15 minutes, admin-configurable), so a walked-away admin session cannot leave configuration writable. A continuous-integration coverage guard fails the build if any configuration endpoint is ever added on either server without being placed behind the lock — checking not only that a route is registered, but that the mount serving it actually carries the chokepoint, so a write cannot be registered yet ship ungated.
+
+A **restore always lands locked.** Restoring overwrites the database wholesale from a backup, which would otherwise carry the backup's lock state and its anti-rollback fuse mark. So after any restore — on either server, by any path — the restored database is force-locked and its fuse high-water is ratcheted to the higher of the pre-restore and restored values, and the fixup is recorded in the restored node's audit chain. A restored node therefore comes up frozen and requires a hardware unlock before any configuration change, and a restore can never lower the anti-rollback mark. Full detail — what is gated, what deliberately stays open, and the refusal codes a client sees — is in [`docs/configuration-lock.md`](docs/configuration-lock.md).
 
 In smaller SOCs where one person handles both Team Lead and Platform Admin duties, assign the `admin` role to that user; the codebase does not collapse the role boundary, which preserves SoD for orgs that do separate the roles.
 

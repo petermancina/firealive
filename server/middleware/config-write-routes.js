@@ -88,6 +88,16 @@ const CONFIG_WRITE_PATHS = [
   { method: 'PUT',  path: '/api/global-dashboard/push-config' },
   { method: 'PUT',  path: '/api/ticketing/config' },
   { method: 'PUT',  path: '/api/auto-update/config' },  // B5r: update-detection schedule (check-now + status are operational, pass through)
+  // B6j: MC config-lock reconciliation. Four config-write-shaped writes whose
+  // mounts carry operational siblings, so gate the exact path (chokepoints are
+  // added to their mounts in index.js). Classification: notifications/config
+  // (webhook + SMS secrets), retention/config (evidence-destruction policy),
+  // reports/config (delivery recipients + SIEM feed), cloud/signing-keys/rotate
+  // (trust-root rotation).
+  { method: 'PUT',  path: '/api/notifications/config' },
+  { method: 'PUT',  path: '/api/retention/config' },
+  { method: 'PUT',  path: '/api/reports/config' },
+  { method: 'POST', path: '/api/cloud/signing-keys/rotate' },
 ];
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);

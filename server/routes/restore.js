@@ -111,6 +111,9 @@ const fs = require('fs');
 const path = require('path');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
+const { appendAuditEntry } = require('../services/audit-chain');
+const { readHighWater } = require('../services/fuse-high-water');
+const { applyPostRestorePosture } = require('../services/restore-posture');
 const { logger } = require('../services/logger');
 const archiveSvc = require('../services/backup-archive');
 const keyWrapSvc = require('../services/backup-key-wrapping');
@@ -574,6 +577,10 @@ router.post('/execute/:id', async (req, res) => {
 
   try {
     const db = getDb();
+    // B6j-4: capture the anti-rollback fuse high-water from the LIVE DB before the
+    // restore overwrites it, so the post-restore fixup can ratchet it forward.
+    let preFuseHighWater = null;
+    try { preFuseHighWater = readHighWater(db); } catch (_e) { /* live DB may predate node_state */ }
     const backup = db.prepare('SELECT * FROM backups WHERE id = ?').get(req.params.id);
 
     if (!backup) { db.close(); return res.status(404).json({ error: 'Backup not found' }); }
@@ -728,6 +735,12 @@ router.post('/execute/:id', async (req, res) => {
       try {
         const newDb = getDb();
         try {
+          // B6j-4: repair node-local posture on the RESTORED DB before the restart
+          // prompt -- ratchet the fuse high-water to max(pre,restored) so a restore
+          // can never lower it, and force-lock config (D6). db-init at restart will
+          // not override it. Audited on the same handle to avoid a second connection.
+          const posture = applyPostRestorePosture(newDb, { preFuseHighWater });
+          appendAuditEntry(newDb, { userId, eventType: 'POST_RESTORE_POSTURE_APPLIED', detail: `format=v1 fuse_high_water=${posture.fuseHighWater} pre=${posture.fusePre} restored=${posture.fuseRestored} config_force_locked=${posture.configForceLocked}`, ip: req.ip });
           const result = chainSvc.appendChainEntry(newDb, {
             eventType: 'RESTORE_COMPLETE',
             backupId: backup.id,
@@ -1184,6 +1197,9 @@ router.post('/execute/:id', async (req, res) => {
       try {
         const newDb = getDb();
         try {
+          // B6j-4: repair node-local posture on the RESTORED DB (see the v1 path).
+          const posture = applyPostRestorePosture(newDb, { preFuseHighWater });
+          appendAuditEntry(newDb, { userId, eventType: 'POST_RESTORE_POSTURE_APPLIED', detail: `format=v2 fuse_high_water=${posture.fuseHighWater} pre=${posture.fusePre} restored=${posture.fuseRestored} config_force_locked=${posture.configForceLocked}`, ip: req.ip });
           const result = chainSvc.appendChainEntry(newDb, {
             eventType: 'RESTORE_COMPLETE',
             backupId: backup.id,
@@ -1324,6 +1340,10 @@ router.post('/execute-chain/:id', async (req, res) => {
   let db;
   try {
     db = getDb();
+    // B6j-4: capture the anti-rollback fuse high-water from the LIVE DB before the
+    // chain replay overwrites it, so the post-restore fixup can ratchet it forward.
+    let preFuseHighWater = null;
+    try { preFuseHighWater = readHighWater(db); } catch (_e) { /* live DB may predate node_state */ }
     const leaf = db.prepare('SELECT * FROM backups WHERE id = ?').get(req.params.id);
     if (!leaf) { db.close(); return res.status(404).json({ error: 'Backup not found' }); }
     if (leaf.status !== 'verified') { db.close(); return res.status(400).json({ error: 'Backup not verified' }); }
@@ -1504,6 +1524,9 @@ router.post('/execute-chain/:id', async (req, res) => {
 
     // Success — re-open DB for audit log
     const auditDb = getDb();
+    // B6j-4: repair node-local posture on the RESTORED DB (see the /execute paths).
+    const posture = applyPostRestorePosture(auditDb, { preFuseHighWater });
+    appendAuditEntry(auditDb, { userId, eventType: 'POST_RESTORE_POSTURE_APPLIED', detail: `format=chain fuse_high_water=${posture.fuseHighWater} pre=${posture.fusePre} restored=${posture.fuseRestored} config_force_locked=${posture.configForceLocked}`, ip: req.ip });
     auditLog(
       userId,
       'DATABASE_RESTORED',
