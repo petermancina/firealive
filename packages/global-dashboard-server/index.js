@@ -312,6 +312,28 @@ if (!gdSkipIntegrity) {
 // Idempotent. The canonical schema is CREATE TABLE IF NOT EXISTS throughout,
 // and server/index.js calls initDb() on every boot -- the Regional Server is
 // the in-repo proof that a repeated call is safe.
+// B6k: publish this process as the live owner of the GD data root, BEFORE the
+// first database handle exists. The offline GD rollback tool atomically renames
+// a restored database over the live path and cannot close a handle held by this
+// process, so it refuses to run while this pidfile names a live pid. Ordered
+// before initDb() because initDb() is what opens that handle, and after the
+// posture check so the directory written into has already been proven 0700.
+//
+// Never fatal: the GD must not fail to boot because a pidfile could not be
+// written. The safety does not rest on this succeeding -- the tool fails closed
+// on its own side, since a pidfile it cannot read is a server it cannot prove
+// is stopped.
+const gdPidfile = require('./services/gd-pidfile');
+const gdPidHeld = gdPidfile.acquire();
+if (!gdPidHeld.ok) {
+  console.warn('[gd] Pidfile not written; the offline rollback tool will refuse until it can verify this GD is stopped:', gdPidHeld.error);
+} else if (gdPidHeld.priorHolder && gdPidHeld.priorHolder.alive) {
+  // Two GD servers on one SQLite data root is a genuine hazard. B6k reports it
+  // rather than passing over it; enforcing single-instance startup is a separate
+  // concern with its own failure modes.
+  console.warn('[gd] Another Global Dashboard process appears to be live on this data root (pid', gdPidHeld.priorHolder.pid + ')');
+}
+
 initDb();
 console.log('[gd] Database initialized');
 app.use('/api/', (req, res, next) => {
@@ -494,6 +516,13 @@ app.use('/api/storage-routing', authMiddleware(['ciso']), require('./routes/stor
 app.use('/api/data-residency', authMiddleware(['ciso']), require('./routes/data-residency'));
 app.use('/api/backup', authMiddleware(['ciso']), require('./routes/gd-backup'));
 app.use('/api/restore', authMiddleware(['ciso']), require('./routes/gd-restore'));
+// B6k: pre-upgrade restore points. Like /api/backup this changes no
+// configuration, so it stays usable while the config lock is engaged -- an
+// operator must not have to unlock the GD in order to protect it before an
+// upgrade. POST /api/restore-points is listed in GD_OPERATIONAL_ALLOWLIST in
+// the coverage gate with that reasoning, since the GD is held to the strict
+// model where every mutating endpoint is either gated or explicitly allowed.
+app.use('/api/restore-points', authMiddleware(['ciso']), require('./routes/gd-restore-points'));
 app.use('/api/external-restore', authMiddleware(['ciso']), require('./routes/gd-external-restore'));
 app.use('/api/restore-approvals', authMiddleware(['ciso']), require('./routes/gd-restore-approvals'));
 app.use('/api/key-ops', authMiddleware(['ciso', 'signing_key_approver']), require('./routes/gd-key-ops'));  // B6h B-3: KOA (ciso request/authorize, signing_key_approver approve; global /api config-lock + step-up)
@@ -3917,7 +3946,10 @@ function runGdRegression(db) {
     const p = require('path');
     const appDir = p.resolve(__dirname);
     const names = ['dbPath', 'backupsDir', 'archivePendingDir', 'cefSpoolDir',
-      'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir'];
+      'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir',
+      // B6k. Listed here rather than only in the B6k checks below: an accessor
+      // absent from this list is an accessor this guard does not cover.
+      'restorePointsDir', 'runtimePidPath'];
     const bad = [];
     for (const n of names) {
       const got = p.resolve(dr[n]());
@@ -3936,6 +3968,7 @@ function runGdRegression(db) {
       ['GD_CICD_CONFIGS_DIR', '/tmp/gd-rr/cicd', () => dr.cicdConfigsDir()],
       ['GD_CLOUD_PACKAGES_DIR', '/tmp/gd-rr/cp', () => dr.cloudPackagesDir()],
       ['GD_MIGRATION_BUNDLE_DIR', '/tmp/gd-rr/mb', () => dr.migrationBundlesDir()],
+      ['FIREALIVE_GD_RESTORE_POINTS_DIR', '/tmp/gd-rr/rp', () => dr.restorePointsDir()],
     ];
     for (const [envName, value, fn] of cases) {
       const prev = process.env[envName];
@@ -4005,6 +4038,225 @@ function runGdRegression(db) {
       throw new Error('index.js does not call gdDataRoot.assertNoLegacyDatabase()');
     }
     return 'gate present; trust anchors in the same directory do not trigger it';
+  });
+
+  // ── B6k: the restore-point store and the pidfile ───────────────────────
+  // The store exists to be used when this GD has to go back to its previous
+  // version, which means replacing the contents of the data root. If it lived
+  // inside that root it would be destroyed by the operation it exists to serve.
+  record('data_root', 'B6k: the restore-point store is OUTSIDE the GD data root', () => {
+    const dr = require('./lib/gd-data-root');
+    const p = require('path');
+    const root = p.resolve(dr.gdDataRoot());
+    const store = p.resolve(dr.restorePointsDir());
+    if (store === root || store.startsWith(root + p.sep)) {
+      throw new Error('the restore-point store resolves INSIDE the GD data root (' + store + '); a data-root reset would destroy the restore point it exists to preserve');
+    }
+    return 'store ' + store + ' is a sibling of ' + root;
+  });
+  record('data_root', 'B6k: the GD store survives a data-root relocation', () => {
+    const dr = require('./lib/gd-data-root');
+    const before = dr.restorePointsDir();
+    const prev = process.env.FIREALIVE_GD_DATA_DIR;
+    process.env.FIREALIVE_GD_DATA_DIR = '/tmp/gd-rr-moved-root';
+    let moved, after;
+    try { moved = dr.gdDataRoot(); after = dr.restorePointsDir(); }
+    finally { if (prev === undefined) delete process.env.FIREALIVE_GD_DATA_DIR; else process.env.FIREALIVE_GD_DATA_DIR = prev; }
+    if (moved !== '/tmp/gd-rr-moved-root') throw new Error('FIREALIVE_GD_DATA_DIR was ignored; this check proves nothing');
+    if (after !== before) throw new Error('the store followed the data root (' + before + ' -> ' + after + '); it must be independent');
+    return 'store unchanged when the GD data root moves';
+  });
+  record('data_root', 'B6k: the GD store does not collide with the Regional Server store', () => {
+    const dr = require('./lib/gd-data-root');
+    const p = require('path');
+    const store = p.resolve(dr.restorePointsDir());
+    // Both servers may run on one host and both stores sit under the shared
+    // ~/.firealive home. One overwriting the other's restore points would be
+    // silent and total.
+    const mcDefault = p.resolve(require('os').homedir(), '.firealive', 'restore-points');
+    if (store === mcDefault) {
+      throw new Error('the GD restore-point store resolves to the Regional Server store (' + store + '); on a single host each would overwrite the other');
+    }
+    return 'GD store distinct from ' + mcDefault;
+  });
+  record('pidfile', 'B6k: reports live, stale, foreign and absent correctly', () => {
+    const pf = require('./services/gd-pidfile');
+    const dr = require('./lib/gd-data-root');
+    const fsMod = require('fs');
+    const p = require('path');
+    const tmp = p.join('/tmp', 'gd-rr-pid-' + require('crypto').randomBytes(4).toString('hex'));
+    const prev = process.env.FIREALIVE_GD_DATA_DIR;
+    process.env.FIREALIVE_GD_DATA_DIR = tmp;
+    try {
+      fsMod.mkdirSync(tmp, { recursive: true, mode: 0o700 });
+      const file = dr.runtimePidPath();
+      if (pf.read() !== null) throw new Error('absent pidfile did not read as null');
+      if (pf.isRunning() !== false) throw new Error('absent pidfile reported a running GD');
+      const got = pf.acquire();
+      if (!got.ok) throw new Error('acquire failed: ' + got.error);
+      const held = pf.read();
+      if (!held || held.pid !== process.pid) throw new Error('pidfile does not name this process');
+      if (pf.isRunning() !== true) throw new Error('isRunning() false while we hold the pidfile');
+      fsMod.writeFileSync(file, JSON.stringify({ pid: 2147483646, dataRoot: tmp }));
+      if (pf.isRunning() !== false) throw new Error('a stale pidfile reported a running GD; a rollback would be wedged forever');
+      if (pf.release() !== false) throw new Error('release() removed a pidfile belonging to another process');
+      fsMod.writeFileSync(file, 'not json');
+      if (pf.read() !== null) throw new Error('a corrupt pidfile did not read as null');
+      pf.acquire();
+      if (pf.release() !== true) throw new Error('release() did not remove our own pidfile');
+      return 'live, stale, foreign, corrupt and absent all handled';
+    } finally {
+      if (prev === undefined) delete process.env.FIREALIVE_GD_DATA_DIR; else process.env.FIREALIVE_GD_DATA_DIR = prev;
+      try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* best effort */ }
+    }
+  });
+  record('pidfile', 'B6k: the boot acquires it before initDb opens a handle', () => {
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    const a = code.indexOf('gdPidfile.acquire()');
+    const b = code.indexOf('\ninitDb();');
+    if (a === -1) throw new Error('index.js does not acquire the pidfile at boot; the offline rollback tool could not tell a running GD from a stopped one');
+    if (b === -1) throw new Error('index.js does not call initDb() at module scope; this check needs rewiring rather than deleting');
+    if (a > b) {
+      throw new Error('the pidfile is acquired AFTER initDb(): between the two the database is open and nothing on disk says so, which is exactly the window the offline tool must never swap into');
+    }
+    return 'acquired before the first database handle';
+  });
+
+  // ── B6k: restore points ────────────────────────────────────────────────
+  record('restore_point', 'B6k: schema present (table + indexes)', () => {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='restore_points'").get();
+    if (!t) throw new Error('restore_points table is absent');
+    for (const idx of ['idx_restore_points_created', 'idx_restore_points_unconsumed']) {
+      const i = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?").get(idx);
+      if (!i) throw new Error('missing index: ' + idx);
+    }
+    const cols = db.prepare('PRAGMA table_info(restore_points)').all().map((c) => c.name);
+    for (const need of ['backup_id', 'bundle_dir', 'manifest_path', 'source_fuse_counter',
+      'source_version', 'created_by_user_id', 'koa_id', 'consumed_at']) {
+      if (cols.indexOf(need) === -1) throw new Error('restore_points is missing column: ' + need);
+    }
+    return cols.length + ' columns, 2 indexes';
+  });
+
+  record('restore_point', 'B6k: purpose is NOT locked behind a CHECK constraint', () => {
+    // key_op_authorizations.op is the in-repo lesson: a CHECK on an enumerable
+    // field cannot be widened without rebuilding the whole table.
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_points'").get();
+    if (!sql || !sql.sql) throw new Error('restore_points DDL not readable');
+    if (/purpose[^,]*CHECK/i.test(sql.sql)) {
+      throw new Error('restore_points.purpose has acquired a CHECK constraint; widening it later would require a full table rebuild (see key_op_authorizations.op)');
+    }
+    return 'purpose is unconstrained and can gain values without a rebuild';
+  });
+
+  record('restore_point', 'B6k: the underlying backup is not typed as a pre-restore snapshot', () => {
+    const svc = require('./services/gd-restore-point');
+    if (svc.BACKUP_TYPE === 'snapshot') {
+      throw new Error("restore points are being written with backups.type='snapshot', which already means pre-restore; the two operations would be indistinguishable");
+    }
+    if (svc.BACKUP_TYPE !== 'on-demand') throw new Error("unexpected restore-point backup type '" + svc.BACKUP_TYPE + "'");
+    return "backups.type='on-demand'; the pre-upgrade meaning lives on restore_points";
+  });
+
+  record('restore_point', 'B6k: the route is mounted WITHOUT a config-lock chokepoint', () => {
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+    const line = src.split('\n').filter((l) => !l.trim().startsWith('//'))
+      .find((l) => l.indexOf("app.use('/api/restore-points'") !== -1);
+    if (!line) throw new Error('/api/restore-points is not mounted');
+    if (line.indexOf('configLockChokepoint()') !== -1) {
+      throw new Error('/api/restore-points carries a config-lock chokepoint: an operator would have to UNLOCK the GD in order to protect it before an upgrade, which is backwards. The gates belong on consuming the restore point, not producing it.');
+    }
+    if (line.indexOf("authMiddleware(['ciso'])") === -1) throw new Error('/api/restore-points is not ciso-gated');
+    return 'ciso-gated, deliberately not config-lock gated';
+  });
+
+  record('restore_point', 'B6k: the GD engine is composed with ITS option names, not the MC twin\'s', () => {
+    // The GD full-suite engine takes the db as its FIRST argument and reads
+    // `backupsDir` (plural) and `triggerType`. The Regional Server twin takes
+    // no db and reads `backupDir` / `type`. Passing the MC's names here would
+    // silently write the restore point into the DEFAULT backups directory --
+    // inside the GD data root, which a rollback replaces -- and the restore
+    // point would be destroyed by the operation it exists to serve.
+    const fsMod = require('fs');
+    const src = fsMod.readFileSync(require('path').join(__dirname, 'services', 'gd-restore-point.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    if (code.indexOf('backupsDir:') === -1) throw new Error("the GD service does not pass `backupsDir:`; the GD engine ignores the MC's `backupDir` and would fall back to the default backups directory INSIDE the data root");
+    if (code.indexOf('triggerType:') === -1) throw new Error('the GD service does not pass `triggerType:`; the GD engine ignores the MC\'s `type`');
+    if (!/performFullSuiteBackup\(\s*db\s*,/.test(code)) throw new Error('the GD service does not pass db as the first argument to performFullSuiteBackup');
+    return 'db-first, backupsDir, triggerType -- GD option names honoured';
+  });
+
+  // ── B6k: the sanctioned rollback ───────────────────────────────────────
+  record('rollback', 'B6k: op=rollback is admitted by BOTH the service and the schema', () => {
+    const koa = require('./services/gd-key-op-authorization');
+    if (koa.VALID_OPS.indexOf('rollback') === -1) throw new Error("VALID_OPS does not include 'rollback'");
+    for (const legacy of ['rekey', 'migration-import', 'deployment-reset']) {
+      if (koa.VALID_OPS.indexOf(legacy) === -1) throw new Error('VALID_OPS lost the ' + legacy + ' op');
+    }
+    const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='key_op_authorizations'").get();
+    if (!ddl || !ddl.sql) throw new Error('key_op_authorizations DDL not readable');
+    if (ddl.sql.indexOf("'rollback'") === -1) {
+      throw new Error("the key_op_authorizations CHECK constraint does not admit 'rollback'; the B6k rebuild migration has not run against this database, and minting a rollback authorization would be rejected at INSERT");
+    }
+    return 'service and schema agree on 4 ops';
+  });
+
+  record('rollback', 'B6k: the rollback TTL ceiling is op-specific and fails loud', () => {
+    const koa = require('./services/gd-key-op-authorization');
+    if (koa.maxTtlFor('rollback') !== koa.ROLLBACK_MAX_TTL_MS) throw new Error('maxTtlFor(rollback) is not the rollback ceiling');
+    if (koa.maxTtlFor('rekey') !== koa.MAX_TTL_MS) throw new Error('the rollback ceiling leaked onto rekey');
+    if (koa.ROLLBACK_MAX_TTL_MS <= koa.MAX_TTL_MS) throw new Error('the rollback ceiling is not longer than the default; a contingency authorization minted before an upgrade would expire before the operator discovered they needed it');
+    return 'rollback ' + (koa.ROLLBACK_MAX_TTL_MS / 86400000) + 'd, every other op ' + (koa.MAX_TTL_MS / 3600000) + 'h';
+  });
+
+  record('rollback', 'B6k: the rollback path can NEVER ratchet the fuse', () => {
+    // Defined by ABSENCE, so it cannot be tested by calling anything. B6j-4's
+    // ratchet is exactly why the ordinary restore path cannot serve a rollback:
+    // it computes max(current, restored) and pushes the mark straight back up.
+    // Omitting it here IS the operation.
+    const fsMod = require('fs');
+    const p = require('path');
+    const src = fsMod.readFileSync(p.join(__dirname, 'services', 'gd-rollback-apply.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    for (const forbidden of ['applyPostRestorePosture', 'gd-restore-posture', 'persistHighWater']) {
+      if (code.indexOf(forbidden) !== -1) {
+        throw new Error("gd-rollback-apply.js references '" + forbidden + "'. The rollback path must not ratchet: doing so would restore the old database and then push the anti-rollback mark straight back to the new build's fuse, so the previous binary still would not start.");
+      }
+    }
+    if (code.indexOf('readHighWater') === -1) throw new Error('gd-rollback-apply.js no longer reads the high-water mark; the one-version-back gate cannot be enforced');
+    return 'reads the mark, never writes it';
+  });
+
+  record('rollback', 'B6k: the rollback path has NO HTTP surface', () => {
+    const fsMod = require('fs');
+    const p = require('path');
+    const src = fsMod.readFileSync(p.join(__dirname, 'services', 'gd-rollback-apply.js'), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    if (/require\(['"]express['"]\)/.test(code) || /\brouter\./.test(code)) {
+      throw new Error('gd-rollback-apply.js has acquired an HTTP surface. The one operation that lets a build run below the anti-rollback mark must stay offline, on the host, with the server stopped.');
+    }
+    const routesDir = p.join(__dirname, 'routes');
+    const offenders = fsMod.readdirSync(routesDir).filter((f) => f.endsWith('.js'))
+      .filter((f) => fsMod.readFileSync(p.join(routesDir, f), 'utf8').indexOf('gd-rollback-apply') !== -1);
+    if (offenders.length) {
+      throw new Error('these route files reference the rollback service: ' + offenders.join(', ') + '. It must be reachable only from the offline CLI.');
+    }
+    return 'no express, no router, no route file references it';
+  });
+
+  record('rollback', 'B6k: the offline CLI exists and is thin', () => {
+    const fsMod = require('fs');
+    const p = require('path');
+    const cli = p.join(__dirname, 'tools', 'gd-rollback-apply.js');
+    if (!fsMod.existsSync(cli)) throw new Error('packages/global-dashboard-server/tools/gd-rollback-apply.js is missing; there is no way to consume a rollback authorization');
+    const src = fsMod.readFileSync(cli, 'utf8');
+    if (src.indexOf("require('../services/gd-rollback-apply')") === -1) {
+      throw new Error('the CLI does not delegate to the rollback service; the gates live in the service and a CLI that reimplements them will drift');
+    }
+    return 'present and delegating';
   });
 
   // ── Schema (4) ─────────────────────────────────────────────────────────

@@ -175,6 +175,14 @@ const GD_OPERATIONAL_ALLOWLIST = new Map([
   ['POST /api/restore-approvals/:id/deny', 'restore approval workflow'],
   ['POST /api/restore/execute-chain/:id', 'internal restore: gated by approval + passkey step-up'],
   ['POST /api/restore/execute/:id', 'internal restore: gated by approval + passkey step-up'],
+  // B6k. Taking a pre-upgrade restore point writes a backup and changes no
+  // configuration, so it must stay usable while the lock is engaged: requiring
+  // an unlock in order to protect the deployment before an upgrade would be
+  // backwards, and the moment before an upgrade is when a GD should be at its
+  // most locked down. The gates live on CONSUMING the artifact -- an
+  // anchor-signed, single-use, one-version-deep authorization checked by an
+  // offline tool with the server stopped -- not on producing it.
+  ['POST /api/restore-points', 'operational: takes a pre-upgrade restore point (a backup; no config change)'],
   ['POST /api/self-protection/integration-health/run', 'operational: runs an integration health probe'],
   // HA peer data plane (pinned mTLS, mounted OUTSIDE the config-lock): runtime
   // replication/heartbeat/lease + inbound pairing handshake steps. Must keep

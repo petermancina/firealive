@@ -47,6 +47,8 @@ jobs:
         run: node scripts/check-fuse-high-water.js
       - name: Verify rollback containment
         run: node scripts/check-rollback-containment.js
+      - name: Verify manifest consistency
+        run: node scripts/check-manifest-consistency.js
       - name: Verify deployment-mode seal
         run: node scripts/check-deployment-mode-seal.js
       - name: Verify HA un-pair flow

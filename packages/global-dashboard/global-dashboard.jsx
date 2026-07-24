@@ -1556,6 +1556,11 @@ export default function GlobalDashboard() {
   const showGdToast = (msg) => { setGdToast(msg); setTimeout(() => setGdToast(null), 3000); };
   const [updCfg, setUpdCfg] = useState({enabled:false,frequency:"weekly",dayOfWeek:1,dayOfMonth:1,timeUtc:"03:00"});
   const [updStatus, setUpdStatus] = useState(null); // {currentVersion,enabled,updateAvailable,latestVersion,releaseUrl,lastCheckedAt,lastResult}
+  // B6k: taking a pre-upgrade restore point from the update banner. The banner is
+  // the exact moment an operator learns an update exists, which is the only moment
+  // a restore point at the OLD fuse and OLD schema can still be taken.
+  const [rpBusy, setRpBusy] = useState(false);
+  const [rpMsg, setRpMsg] = useState(null);   // {ok:boolean, text:string}
   const [updCheck, setUpdCheck] = useState(null); // check-now result: null | "checking" | {result,...} | {error}
   const [updSaving, setUpdSaving] = useState(false);
   // HA status. null = loading; {error,status} = failed (403 when the session is not a CISO);
@@ -2641,8 +2646,30 @@ export default function GlobalDashboard() {
       </div>}
       {updStatus&&updStatus.updateAvailable&&updStatus.latestVersion&&updStatus.latestVersion!==updBannerDismissed&&(
         <div style={{padding:"10px 24px",background:C.i+"18",color:C.i,fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.i}40`,fontFamily:"'IBM Plex Mono',monospace"}}>
-          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test before applying.</span>
-          <button onClick={()=>{const v=updStatus.latestVersion;setUpdBannerDismissed(v);try{localStorage.setItem("fa_gd_upd_dismissed",v);}catch(_e){}}} style={{marginLeft:12,background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11,whiteSpace:"nowrap"}}>dismiss</button>
+          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test before applying. Take a restore point first: it is the only way back to this version, and it can only be taken from this build.</span>
+          <span style={{display:"flex",alignItems:"center",gap:12,whiteSpace:"nowrap"}}>
+            {rpMsg&&<span style={{fontSize:11,color:rpMsg.ok?C.i:"#F5A0A0"}}>{rpMsg.text}</span>}
+            <button disabled={rpBusy} onClick={async()=>{
+              if (rpBusy) return;
+              setRpMsg(null);
+              setRpBusy(true);
+              try {
+                const r = await api.post("/api/restore-points", {note:"before "+updStatus.latestVersion});
+                if (r && r.error) {
+                  // Loud on failure: an operator who believes they have a way back
+                  // and does not is worse off than one who knows they do not.
+                  setRpMsg({ok:false, text:"FAILED — do not upgrade: "+r.error});
+                } else {
+                  setRpMsg({ok:true, text:"Restore point taken."});
+                }
+              } catch (e) {
+                setRpMsg({ok:false, text:"FAILED — do not upgrade: "+(e&&e.message?e.message:"unknown error")});
+              } finally {
+                setRpBusy(false);
+              }
+            }} style={{background:"transparent",border:`1px solid ${C.i}`,color:C.i,cursor:rpBusy?"default":"pointer",fontSize:11,padding:"3px 10px",borderRadius:3,opacity:rpBusy?0.6:1}}>{rpBusy?"Taking restore point…":"Take restore point"}</button>
+            <button onClick={()=>{const v=updStatus.latestVersion;setUpdBannerDismissed(v);try{localStorage.setItem("fa_gd_upd_dismissed",v);}catch(_e){}}} style={{background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11}}>dismiss</button>
+          </span>
         </div>
       )}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>

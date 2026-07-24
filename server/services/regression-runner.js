@@ -1698,7 +1698,12 @@ class RegressionRunner {
       const dr = require('../lib/data-root');
       const appDir = path.resolve(__dirname, '..');
       const names = ['dbPath', 'logsDir', 'backupsDir', 'archivePendingDir', 'cefSpoolDir',
-        'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir'];
+        'cicdConfigsDir', 'cloudPackagesDir', 'migrationBundlesDir',
+        // B6k. Listed here rather than only in the B6k checks below: an accessor
+        // absent from this list is an accessor this guard does not cover, and a
+        // restore point resolving inside the app dir is the exact defect P1-1
+        // removed -- a backup destroyed by the update it was meant to survive.
+        'restorePointsDir', 'runtimePidPath'];
       const bad = [];
       for (const n of names) {
         const p = path.resolve(dr[n]());
@@ -1720,6 +1725,7 @@ class RegressionRunner {
         ['CICD_CONFIGS_DIR', '/tmp/fa-rr/cicd', () => dr.cicdConfigsDir()],
         ['CLOUD_PACKAGES_DIR', '/tmp/fa-rr/cp', () => dr.cloudPackagesDir()],
         ['MIGRATION_BUNDLE_DIR', '/tmp/fa-rr/mb', () => dr.migrationBundlesDir()],
+        ['FIREALIVE_RESTORE_POINTS_DIR', '/tmp/fa-rr/rp', () => dr.restorePointsDir()],
       ];
       for (const [envName, value, fn] of cases) {
         const prev = process.env[envName];
@@ -1767,6 +1773,244 @@ class RegressionRunner {
         throw new Error('assertNoLegacyDatabase() must precede initDb(): initDb creates a database at the new root, which would turn "your data is at the old path" into a misleading "both are present"');
       }
       return 'gate present and ordered before initDb()';
+    });
+
+    // -- B6k: the restore-point store and the pidfile ----------------------
+    // The store exists to be used when this deployment has to go back to its
+    // previous version, which means replacing the contents of the data root.
+    // If it lived inside that root it would be destroyed by the operation it
+    // exists to serve. These assert the sibling relationship holds under both
+    // default and relocated roots, so a future edit cannot quietly move it in.
+    await check('data_root', 'B6k: the restore-point store is OUTSIDE the data root', () => {
+      const dr = require('../lib/data-root');
+      const root = path.resolve(dr.dataRoot());
+      const store = path.resolve(dr.restorePointsDir());
+      if (store === root || store.startsWith(root + path.sep)) {
+        throw new Error('the restore-point store resolves INSIDE the data root (' + store + '); a data-root reset would destroy the restore point it exists to preserve');
+      }
+      return 'store ' + store + ' is a sibling of ' + root;
+    });
+
+    await check('data_root', 'B6k: the store survives a data-root relocation', () => {
+      const dr = require('../lib/data-root');
+      const before = dr.restorePointsDir();
+      const prev = process.env.FIREALIVE_DATA_DIR;
+      process.env.FIREALIVE_DATA_DIR = '/tmp/fa-rr-moved-root';
+      let moved, after;
+      try {
+        moved = dr.dataRoot();
+        after = dr.restorePointsDir();
+      } finally {
+        if (prev === undefined) delete process.env.FIREALIVE_DATA_DIR; else process.env.FIREALIVE_DATA_DIR = prev;
+      }
+      if (moved !== '/tmp/fa-rr-moved-root') throw new Error('FIREALIVE_DATA_DIR was ignored; this check proves nothing');
+      if (after !== before) {
+        throw new Error('the restore-point store followed the data root (' + before + ' -> ' + after + '); it must be independent, or relocating the root would strand the restore points');
+      }
+      return 'store unchanged when the data root moves';
+    });
+
+    await check('data_root', 'B6k: the pidfile follows the data root it describes', () => {
+      const dr = require('../lib/data-root');
+      const root = path.resolve(dr.dataRoot());
+      const pid = path.resolve(dr.runtimePidPath());
+      if (!pid.startsWith(root + path.sep)) {
+        throw new Error('the pidfile resolves outside the data root (' + pid + '); it names the server owning THAT root and must live with it');
+      }
+      return 'pidfile ' + pid;
+    });
+
+    await check('pidfile', 'B6k: reports live, stale, foreign and absent correctly', () => {
+      const pf = require('./pidfile');
+      const dr = require('../lib/data-root');
+      const fsMod = require('fs');
+      const tmp = path.join('/tmp', 'fa-rr-pid-' + crypto.randomBytes(4).toString('hex'));
+      const prev = process.env.FIREALIVE_DATA_DIR;
+      process.env.FIREALIVE_DATA_DIR = tmp;
+      try {
+        fsMod.mkdirSync(tmp, { recursive: true, mode: 0o700 });
+        const file = dr.runtimePidPath();
+
+        if (pf.read() !== null) throw new Error('absent pidfile did not read as null');
+        if (pf.isRunning() !== false) throw new Error('absent pidfile reported a running server');
+
+        const got = pf.acquire();
+        if (!got.ok) throw new Error('acquire failed: ' + got.error);
+        const held = pf.read();
+        if (!held || held.pid !== process.pid) throw new Error('pidfile does not name this process');
+        if (held.alive !== true) throw new Error('our own live pid reported not alive');
+        if (pf.isRunning() !== true) throw new Error('isRunning() false while we hold the pidfile');
+
+        // A pid that cannot be alive: the offline tool must be allowed to proceed.
+        fsMod.writeFileSync(file, JSON.stringify({ pid: 2147483646, dataRoot: tmp }));
+        if (pf.isRunning() !== false) throw new Error('a stale pidfile reported a running server; a rollback would be wedged forever');
+
+        // A marker that is not ours must never be removed: doing so would tell
+        // the offline tool that a live server is stopped.
+        if (pf.release() !== false) throw new Error('release() removed a pidfile belonging to another process');
+        if (!fsMod.existsSync(file)) throw new Error('release() deleted a foreign pidfile');
+
+        // A corrupt marker must be inert, not fatal.
+        fsMod.writeFileSync(file, 'not json');
+        if (pf.read() !== null) throw new Error('a corrupt pidfile did not read as null');
+
+        pf.acquire();
+        if (pf.release() !== true) throw new Error('release() did not remove our own pidfile');
+        if (fsMod.existsSync(file)) throw new Error('the pidfile survived our own release()');
+        return 'live, stale, foreign, corrupt and absent all handled';
+      } finally {
+        if (prev === undefined) delete process.env.FIREALIVE_DATA_DIR; else process.env.FIREALIVE_DATA_DIR = prev;
+        try { fsMod.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* best effort */ }
+      }
+    });
+
+    await check('pidfile', 'B6k: the boot acquires it before initDb opens a handle', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      const a = code.indexOf('pidfile.acquire()');
+      const b = code.indexOf('initDb();');
+      if (a === -1) throw new Error('index.js does not acquire the pidfile at boot; the offline rollback tool could not tell a running server from a stopped one');
+      if (b === -1) throw new Error('index.js does not call initDb(); this check needs rewiring rather than deleting');
+      if (a > b) {
+        throw new Error('the pidfile is acquired AFTER initDb(): between the two the database is open and nothing on disk says so, which is exactly the window the offline tool must never swap into');
+      }
+      return 'acquired before the first database handle';
+    });
+
+    // -- B6k: restore points -----------------------------------------------
+    await check('restore_point', 'B6k: schema present (table + indexes)', () => {
+      requireAll(['restore_points']);
+      const missing = ['idx_restore_points_created', 'idx_restore_points_unconsumed']
+        .filter((n) => !indexExists(n));
+      if (missing.length) throw new Error('missing index(es): ' + missing.join(', '));
+      const cols = this.db.prepare('PRAGMA table_info(restore_points)').all().map((c) => c.name);
+      for (const need of ['backup_id', 'bundle_dir', 'manifest_path', 'source_fuse_counter',
+        'source_version', 'created_by_user_id', 'koa_id', 'consumed_at']) {
+        if (cols.indexOf(need) === -1) throw new Error('restore_points is missing column: ' + need);
+      }
+      return cols.length + ' columns, 2 indexes';
+    });
+
+    await check('restore_point', 'B6k: purpose is NOT locked behind a CHECK constraint', () => {
+      // key_op_authorizations.op is the in-repo lesson: a CHECK on an enumerable
+      // field cannot be widened without rebuilding the whole table, and B6k had
+      // to do exactly that. This asserts restore_points.purpose did not repeat
+      // the mistake, by writing a value that is not the default.
+      const sql = this.db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='restore_points'",
+      ).get();
+      if (!sql || !sql.sql) throw new Error('restore_points DDL not readable');
+      if (/purpose[^,]*CHECK/i.test(sql.sql)) {
+        throw new Error('restore_points.purpose has acquired a CHECK constraint; widening it later would require a full table rebuild (see key_op_authorizations.op)');
+      }
+      return 'purpose is unconstrained and can gain values without a rebuild';
+    });
+
+    await check('restore_point', 'B6k: the underlying backup is not typed as a pre-restore snapshot', () => {
+      const svc = require('./restore-point');
+      // backups.type CHECK allows scheduled|on-demand|snapshot, and 'snapshot'
+      // already means PRE-RESTORE. A restore point must not reuse it, or the two
+      // operations become indistinguishable in the backups table.
+      if (svc.BACKUP_TYPE === 'snapshot') {
+        throw new Error("restore points are being written with backups.type='snapshot', which already means pre-restore; the two operations would be indistinguishable");
+      }
+      if (svc.BACKUP_TYPE !== 'on-demand') {
+        throw new Error("unexpected restore-point backup type '" + svc.BACKUP_TYPE + "'");
+      }
+      return "backups.type='on-demand'; the pre-upgrade meaning lives on restore_points";
+    });
+
+    await check('restore_point', 'B6k: the route is mounted WITHOUT a config-lock chokepoint', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+      const line = src.split('\n').filter((l) => !l.trim().startsWith('//'))
+        .find((l) => l.indexOf("app.use('/api/restore-points'") !== -1);
+      if (!line) throw new Error('/api/restore-points is not mounted');
+      if (line.indexOf('configLockChokepoint()') !== -1) {
+        throw new Error('/api/restore-points carries a config-lock chokepoint: an operator would have to UNLOCK the platform in order to protect it before an upgrade, which is backwards. The gates belong on consuming the restore point, not producing it.');
+      }
+      if (line.indexOf("authMiddleware(['admin'])") === -1) {
+        throw new Error('/api/restore-points is not admin-gated');
+      }
+      return 'admin-gated, deliberately not config-lock gated';
+    });
+
+    // -- B6k: the sanctioned rollback ---------------------------------------
+    await check('rollback', 'B6k: op=rollback is admitted by BOTH the service and the schema', () => {
+      const koa = require('./key-op-authorization');
+      if (koa.VALID_OPS.indexOf('rollback') === -1) throw new Error("VALID_OPS does not include 'rollback'");
+      for (const legacy of ['rekey', 'migration-import', 'deployment-reset']) {
+        if (koa.VALID_OPS.indexOf(legacy) === -1) throw new Error('VALID_OPS lost the ' + legacy + ' op');
+      }
+      // The JS array is only half of it: the table carries its own CHECK, and a
+      // mismatch means minting succeeds in code and is rejected at INSERT.
+      const ddl = this.db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='key_op_authorizations'",
+      ).get();
+      if (!ddl || !ddl.sql) throw new Error('key_op_authorizations DDL not readable');
+      if (ddl.sql.indexOf("'rollback'") === -1) {
+        throw new Error("the key_op_authorizations CHECK constraint does not admit 'rollback'; the B6k rebuild migration has not run against this database, and minting a rollback authorization would be rejected at INSERT");
+      }
+      return 'service and schema agree on 4 ops';
+    });
+
+    await check('rollback', 'B6k: the rollback TTL ceiling is op-specific and fails loud', () => {
+      const koa = require('./key-op-authorization');
+      if (koa.maxTtlFor('rollback') !== koa.ROLLBACK_MAX_TTL_MS) throw new Error('maxTtlFor(rollback) is not the rollback ceiling');
+      if (koa.maxTtlFor('rekey') !== koa.MAX_TTL_MS) throw new Error('the rollback ceiling leaked onto rekey');
+      if (koa.maxTtlFor('migration-import') !== koa.MAX_TTL_MS) throw new Error('the rollback ceiling leaked onto migration-import');
+      if (koa.ROLLBACK_MAX_TTL_MS <= koa.MAX_TTL_MS) throw new Error('the rollback ceiling is not longer than the default; a contingency authorization minted before an upgrade would expire before the operator discovered they needed it');
+      return 'rollback ' + (koa.ROLLBACK_MAX_TTL_MS / 86400000) + 'd, every other op ' + (koa.MAX_TTL_MS / 3600000) + 'h';
+    });
+
+    await check('rollback', 'B6k: the rollback path can NEVER ratchet the fuse', () => {
+      // This is the property that makes a rollback possible at all, and it is
+      // defined by ABSENCE -- so it cannot be tested by calling anything. B6j-4's
+      // ratchet exists to stop a restore lowering the anti-rollback mark, and it
+      // is exactly why the ordinary restore path cannot serve a rollback: it would
+      // compute max(current, restored) and push the mark straight back up.
+      // Omitting it here IS the operation. If a future edit wires the posture
+      // module into this path, rollback silently stops working and the failure
+      // appears only when an operator needs it most.
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, 'rollback-apply.js'), 'utf8');
+      const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      for (const forbidden of ['applyPostRestorePosture', 'restore-posture', 'persistHighWater']) {
+        if (code.indexOf(forbidden) !== -1) {
+          throw new Error("rollback-apply.js references '" + forbidden + "'. The rollback path must not ratchet: doing so would restore the old database and then push the anti-rollback mark straight back to the new build's fuse, so the previous binary still would not start.");
+        }
+      }
+      if (code.indexOf('readHighWater') === -1) throw new Error('rollback-apply.js no longer reads the high-water mark; the one-version-back gate cannot be enforced');
+      return 'reads the mark, never writes it';
+    });
+
+    await check('rollback', 'B6k: the rollback path has NO HTTP surface', () => {
+      const fsMod = require('fs');
+      const src = fsMod.readFileSync(path.join(__dirname, 'rollback-apply.js'), 'utf8');
+      const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      if (/require\(['"]express['"]\)/.test(code) || /\brouter\./.test(code)) {
+        throw new Error('rollback-apply.js has acquired an HTTP surface. The one operation that lets a build run below the anti-rollback mark must stay offline, on the host, with the server stopped.');
+      }
+      // And nothing under routes/ may reach it.
+      const routesDir = path.join(__dirname, '..', 'routes');
+      const offenders = fsMod.readdirSync(routesDir).filter((f) => f.endsWith('.js'))
+        .filter((f) => fsMod.readFileSync(path.join(routesDir, f), 'utf8').indexOf('rollback-apply') !== -1);
+      if (offenders.length) {
+        throw new Error('these route files reference the rollback service: ' + offenders.join(', ') + '. It must be reachable only from the offline CLI.');
+      }
+      return 'no express, no router, no route file references it';
+    });
+
+    await check('rollback', 'B6k: the offline CLI exists and is thin', () => {
+      const fsMod = require('fs');
+      const cli = path.join(__dirname, '..', 'tools', 'rollback-apply.js');
+      if (!fsMod.existsSync(cli)) throw new Error('server/tools/rollback-apply.js is missing; there is no way to consume a rollback authorization');
+      const src = fsMod.readFileSync(cli, 'utf8');
+      if (src.indexOf("require('../services/rollback-apply')") === -1) {
+        throw new Error('the CLI does not delegate to the rollback service; the gates live in the service and a CLI that reimplements them will drift');
+      }
+      return 'present and delegating';
     });
 
     // -- Category: Vulnerability scan (B5p) -----------------────
