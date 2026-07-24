@@ -29,9 +29,29 @@ const crypto = require('crypto');
 const anchor = require('./gd-instance-anchor');
 const approvals = require('./gd-restore-approvals');
 
-const VALID_OPS = ['rekey', 'migration-import', 'deployment-reset'];
+const VALID_OPS = ['rekey', 'migration-import', 'deployment-reset', 'rollback'];
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 hour to carry a fresh KOA to the offline tool
 const MAX_TTL_MS = 24 * 60 * 60 * 1000; // 24h ceiling
+
+// B6k: 'rollback' carries its OWN ceiling, and only that op is affected.
+//
+// Every other op is minted and consumed in one sitting. A rollback authorization
+// may instead be minted BEFORE an upgrade, as a contingency, while the GD is
+// still healthy and can authenticate -- because if the new build fails to boot,
+// nothing can be minted afterwards, which is precisely the case the contingency
+// exists for. A 24h ceiling would expire before the operator discovered they
+// needed it.
+//
+// The longer window is bounded by the token's shape rather than by time: it
+// authorizes ONE restore point (key_op_ref), on one host (anchor signature),
+// once (consumed_at), and the offline tool refuses unless the bundle's fuse is
+// exactly one below the current mark -- so a further upgrade VOIDS any
+// outstanding rollback authorization without anyone revoking it.
+const ROLLBACK_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function maxTtlFor(op) {
+  return op === 'rollback' ? ROLLBACK_MAX_TTL_MS : MAX_TTL_MS;
+}
 
 function nowIso() { return new Date().toISOString(); }
 function requireNonEmpty(v, name) {
@@ -84,8 +104,23 @@ function mintKoa(db, args) {
   if (!gate) { const e = new Error('key-op-authorization: no usable (approved, unconsumed, in-window) two-person approval for this key operation'); e.code = 'NO_APPROVAL'; throw e; }
   if (gate.id !== args.approval_id) { const e = new Error('key-op-authorization: approval_id does not match the usable approval'); e.code = 'APPROVAL_MISMATCH'; throw e; }
 
+  const ttlCap = maxTtlFor(args.op);
   let ttl = typeof args.ttl_ms === 'number' ? args.ttl_ms : DEFAULT_TTL_MS;
-  if (!Number.isFinite(ttl) || ttl <= 0 || ttl > MAX_TTL_MS) ttl = DEFAULT_TTL_MS;
+  if (args.op === 'rollback') {
+    // B6k fails LOUD rather than silently degrading. The legacy behaviour below
+    // quietly substitutes one hour for an out-of-range request, which for a
+    // contingency rollback authorization is a footgun: the operator would upgrade
+    // believing they had a 30-day way back and actually have sixty minutes.
+    if (typeof args.ttl_ms === 'number' && (!Number.isFinite(ttl) || ttl <= 0 || ttl > ttlCap)) {
+      const e = new Error('gd-key-op-authorization: ttl_ms for a rollback must be > 0 and <= ' + ttlCap + ' ms (30 days); refusing rather than silently substituting the 1h default');
+      e.code = 'INVALID_TTL';
+      throw e;
+    }
+    if (typeof args.ttl_ms !== 'number') ttl = DEFAULT_TTL_MS;
+  } else if (!Number.isFinite(ttl) || ttl <= 0 || ttl > ttlCap) {
+    // Unchanged for every pre-B6k op.
+    ttl = DEFAULT_TTL_MS;
+  }
 
   const id = crypto.randomBytes(16).toString('hex');
   const createdAt = nowIso();
@@ -142,6 +177,8 @@ module.exports = {
   VALID_OPS,
   DEFAULT_TTL_MS,
   MAX_TTL_MS,
+  ROLLBACK_MAX_TTL_MS,
+  maxTtlFor,
   canonicalPayload,
   anchorPublicPem,
   anchorPublicFingerprint,

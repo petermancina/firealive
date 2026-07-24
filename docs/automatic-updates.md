@@ -160,11 +160,17 @@ config readability.
 When you are notified that a new version exists:
 
 1. Read the release notes on the linked GitHub release.
-2. Download the installer for your platform from that release.
-3. Validate it according to your change-management process (for example, install
+2. **Take a pre-upgrade restore point** from the banner or Backup & Restore, and
+   -- if a failure to boot would leave you unable to authenticate -- mint a
+   contingency rollback authorization at the same time. This is the step that
+   makes a rollback possible at all, and it can only be taken from the build you
+   are about to replace. See `docs/pre-upgrade-restore-point.md`.
+3. Download the installer for your platform from that release.
+4. Validate it according to your change-management process (for example, install
    and exercise it in a lab or staging deployment first).
-4. Install it on the production host. The anti-rollback fuse advances on install
-   and will refuse a later attempt to downgrade.
+5. Install it on the production host. The anti-rollback fuse advances when the new
+   build first starts, and an older build will then refuse to run against that
+   data -- so the restore point from step 2 is your only way back.
 
 FireAlive performs none of these steps for you, by design. Detection keeps you
 informed; the upgrade remains a deliberate action you own.

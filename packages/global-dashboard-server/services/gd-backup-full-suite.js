@@ -122,7 +122,13 @@ async function performFullSuiteBackup(db, options = {}) {
   // backup_strategy. A full-suite is an on-demand full unless a scheduler drives it.
   const triggerType = options.triggerType === 'scheduled' ? 'scheduled' : 'on-demand';
 
-  if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
+  // B6k: create through the engine's verifying helper, not a raw mkdirSync.
+  // gdDataRoot.ensureDir creates 0700 and REFUSES an already group- or
+  // world-accessible directory rather than writing backups into it. The v2
+  // engine has always done this (gd-backup-v2 ensureDir); the full-suite path
+  // was the one place that did not, so a directory the boot posture check
+  // already refuses could still be written into here. One path, not two.
+  backupV2.ensureDir(backupsDir);
   backupV2.cleanStaleTempDirs(backupsDir);
 
   const backupId = crypto.randomBytes(8).toString('hex');

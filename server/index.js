@@ -85,6 +85,7 @@ const { bandwidthMonitor } = require('./services/bandwidth-monitor');
 const { verifyIntegrity } = require('./services/integrity');
 const dataRoot = require('./lib/data-root');
 const dataPosture = require('./lib/data-posture');
+const pidfile = require('./services/pidfile');
 const { runtimeMonitor } = require('./services/runtime-monitor');
 const oodaJobs = require('./services/ooda-generation-jobs');
 const { gdPushService } = require('./services/gd-push');
@@ -371,6 +372,12 @@ app.use('/api/features', authMiddleware(['lead', 'admin', 'analyst']), require('
 app.use('/api/query', authMiddleware(['lead', 'admin']), require('./routes/query'));
 app.use('/api/restore', authMiddleware(['admin']), require('./routes/restore'));
 app.use('/api/restore-approvals', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/restore-approvals'));
+// B6k: pre-upgrade restore points. Deliberately NO configLockChokepoint(),
+// matching /api/backup: taking a restore point changes no configuration, and
+// requiring the lock to be OPEN would mean unlocking the platform in order to
+// protect it before an upgrade. The gates live on CONSUMING the artifact, in
+// the offline rollback tool, not on producing it.
+app.use('/api/restore-points', authMiddleware(['admin']), require('./routes/restore-points'));
 app.use('/api/key-ops', authMiddleware(['admin']), configLockChokepoint(), require('./routes/key-ops'));  // B6h B-3: KOA request/approve/authorize (admin + config-lock + step-up)
 app.use('/api/data-subject', authMiddleware(['analyst', 'lead', 'admin']), require('./routes/data-subject'));
 app.use('/api/backup-signing-keys', authMiddleware(['admin']), configLockChokepoint(), require('./routes/backup-signing-keys'));
@@ -600,6 +607,35 @@ async function start() {
       logger.warn('Data posture NOT VERIFIED on this platform', { reason: posture.reason });
     } else {
       logger.info('Data posture ok', { directories: posture.checked.length });
+    }
+
+    // B6k: publish this process as the live owner of the data root, BEFORE the
+    // first database handle exists. The offline rollback tool atomically renames
+    // a restored database over the live path, and it cannot close a handle held
+    // by this process -- so it refuses to run while this marker names a live
+    // pid. Ordered before initDb() because initDb() is what opens that handle;
+    // a marker written afterwards would leave a window in which the database is
+    // open and nothing on disk says so.
+    //
+    // Ordered after the posture check so the directory this writes into has
+    // already been proven 0700, and never fatal: a server must not fail to boot
+    // because a liveness marker could not be written. The safety does not rest
+    // on this call succeeding -- the tool fails closed on its own side, since a
+    // marker it cannot read is a server it cannot prove is stopped.
+    const liveness = pidfile.acquire();
+    if (!liveness.ok) {
+      logger.warn(
+        'Pidfile not written; the offline rollback tool will refuse to run until it can verify this server is stopped',
+        { error: liveness.error },
+      );
+    } else if (liveness.priorHolder && liveness.priorHolder.alive) {
+      // Two servers on one SQLite data root is a genuine hazard. B6k does not
+      // enforce single-instance startup (that is a separate concern with its own
+      // failure modes); it reports the condition rather than passing over it.
+      logger.warn(
+        'Another FireAlive server process appears to be live on this data root',
+        { priorPid: liveness.priorHolder.pid, dataRoot: dataRoot.dataRoot() },
+      );
     }
 
     // Initialize database

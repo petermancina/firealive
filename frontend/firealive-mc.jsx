@@ -3021,6 +3021,11 @@ function ManagementConsole() {
   const [updateCheck, setUpdateCheck] = useState(null); // check-now result: null | "checking" | {result,latestVersion,releaseUrl,...} | {error}
   const [updCfg, setUpdCfg] = useState({enabled:false,frequency:"weekly",dayOfWeek:1,dayOfMonth:1,timeUtc:"03:00",notifyLead:false});
   const [updStatus, setUpdStatus] = useState(null); // {currentVersion,enabled,updateAvailable,latestVersion,releaseUrl,lastCheckedAt,lastResult}
+  // B6k: taking a pre-upgrade restore point from the update banner. The banner is
+  // the exact moment an operator learns an update exists, which is the only moment
+  // a restore point at the OLD fuse and OLD schema can still be taken.
+  const [rpBusy, setRpBusy] = useState(false);
+  const [rpMsg, setRpMsg] = useState(null);   // {ok:boolean, text:string}
   const [updSaving, setUpdSaving] = useState(false);
   const [updBannerDismissed, setUpdBannerDismissed] = useState(()=>{ try { return localStorage.getItem("fa_upd_dismissed")||""; } catch(_e){ return ""; } });
   const [routingCaps, setRC] = useState(Object.fromEntries(ANALYSTS_INIT.filter(a=>a.shift==="day").map(a=>[a.id,a.tier===3?5:a.tier===2?3:2])));
@@ -4777,8 +4782,30 @@ function ManagementConsole() {
       {panicError&&(<div style={{padding:"8px 24px",background:C.d+"22",color:C.d,fontSize:11,textAlign:"center",borderBottom:`1px solid ${C.d}40`}}>Panic toggle error: {panicError} <button onClick={()=>setPanicError(null)} style={{marginLeft:8,background:"transparent",border:"none",color:C.d,cursor:"pointer",textDecoration:"underline"}}>dismiss</button></div>)}
       {updStatus&&updStatus.updateAvailable&&updStatus.latestVersion&&updStatus.latestVersion!==updBannerDismissed&&(
         <div style={{padding:"10px 24px",background:C.id,color:C.i,fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.i}40`}}>
-          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test in a lab before applying.</span>
-          <button onClick={()=>{ const v=updStatus.latestVersion; setUpdBannerDismissed(v); try{localStorage.setItem("fa_upd_dismissed",v);}catch(_e){} }} style={{marginLeft:12,background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11,whiteSpace:"nowrap"}}>dismiss</button>
+          <span>A new FireAlive version is available: {updStatus.latestVersion}.{updStatus.releaseUrl&&<> <a href={updStatus.releaseUrl} target="_blank" rel="noopener noreferrer" style={{color:C.i,textDecoration:"underline"}}>Release notes</a></>} — download and test in a lab before applying. Take a restore point first: it is the only way back to this version, and it can only be taken from this build.</span>
+          <span style={{display:"flex",alignItems:"center",gap:12,whiteSpace:"nowrap"}}>
+            {rpMsg&&<span style={{fontSize:11,color:rpMsg.ok?C.i:"#F5A0A0"}}>{rpMsg.text}</span>}
+            <button disabled={rpBusy} onClick={async()=>{
+              if (rpBusy) return;
+              setRpMsg(null);
+              setRpBusy(true);
+              try {
+                const r = await api.post("/api/restore-points", {note:"before "+updStatus.latestVersion});
+                if (r && r.error) {
+                  // Loud on failure: an operator who believes they have a way
+                  // back and does not is worse off than one who knows they do not.
+                  setRpMsg({ok:false, text:"FAILED — do not upgrade: "+r.error});
+                } else {
+                  setRpMsg({ok:true, text:"Restore point taken."});
+                }
+              } catch (e) {
+                setRpMsg({ok:false, text:"FAILED — do not upgrade: "+(e&&e.message?e.message:"unknown error")});
+              } finally {
+                setRpBusy(false);
+              }
+            }} style={{background:"transparent",border:`1px solid ${C.i}`,color:C.i,cursor:rpBusy?"default":"pointer",fontSize:11,padding:"3px 10px",borderRadius:3,opacity:rpBusy?0.6:1}}>{rpBusy?"Taking restore point…":"Take restore point"}</button>
+            <button onClick={()=>{ const v=updStatus.latestVersion; setUpdBannerDismissed(v); try{localStorage.setItem("fa_upd_dismissed",v);}catch(_e){} }} style={{background:"transparent",border:"none",color:C.i,cursor:"pointer",textDecoration:"underline",fontSize:11}}>dismiss</button>
+          </span>
         </div>
       )}
       <div style={{borderBottom:`1px solid ${C.b}`,background:C.s,padding:"16px 24px"}}>

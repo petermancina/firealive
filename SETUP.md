@@ -115,20 +115,87 @@ persists, so your configuration, enrolled keys, and history carry forward; the
 first launch of a new version may apply forward-only schema migrations. The
 anti-rollback fuse advances with releases: once a newer build has run, an older
 build below the sealed fuse floor **refuses to start** rather than open a
-downgrade window — so keep the installer for the version you are running until
-you have confirmed the new one is healthy.
+downgrade window.
+
+**Take a restore point before you update.** This is the step that makes a
+rollback possible at all, and it can only be taken from the build you are about
+to replace:
+
+1. When the update banner appears, click **Take restore point** (or use Backup &
+   Restore). This writes a full-suite backup at the *current* fuse and schema.
+2. It is stored in `~/.firealive/restore-points/` (`~/.firealive/gd-restore-points/`
+   for the Global Dashboard) — **outside** the data root, so it survives both an
+   uninstall and a data reset.
+3. If you want a second copy, copy that directory to removable media yourself.
+   FireAlive never transmits a restore point anywhere; an air-gapped deployment
+   stays air-gapped.
+
+**If the new build might not start, pre-authorize the rollback too.** A rollback
+needs an authorization minted by a *running* server (an approved two-person
+request under Key Operations). If the upgraded build will not boot, nothing can
+be minted afterwards — so mint the rollback authorization *before* upgrading, at
+the same time as the restore point. It is valid for 30 days, authorizes that one
+restore point only, can be used once, and is voided automatically if you upgrade
+again.
+
+Keep the installer for the version you are running until you have confirmed the
+new one is healthy.
 
 ### Rolling back
-Because of the anti-rollback fuse, a rollback is a **restore**, not a downgrade:
-1. Uninstall the newer version.
-2. Reinstall the previous version.
-3. Restore the most recent backup taken **on that previous version** (Backup &
-   Restore / Backup & Schedules). A backup is encrypted under the Tier-1 KEK and
-   is restored on a host whose hardware root can unwrap it.
+A rollback is a **restore**, not a downgrade. It replaces the database with the
+pre-upgrade one, whose recorded anti-rollback mark is the old fuse — which is why
+the previous build will then start.
+
+> **The order matters.** Run the rollback tool *before* uninstalling the newer
+> version: the tool ships inside that installation, and it reads the
+> authorization and signing keys from the database it is about to replace.
+
+1. **Quit FireAlive completely.** The tool refuses to run while the server is
+   alive — it renames a database over the live file, and a running server would
+   keep writing to an unlinked copy, silently discarding everything from that
+   point on.
+2. **Have a rollback authorization.** Either the contingency one you minted
+   before upgrading, or — if the new build still starts — a fresh one from Key
+   Operations. Note its id.
+3. **Run the offline rollback tool** from the *currently installed* version. The
+   `server` directory ships unpacked beside the application, and the application
+   binary doubles as the Node runtime:
+
+   ```
+   ELECTRON_RUN_AS_NODE=1 <app-binary> <resources>/server/tools/rollback-apply.js \
+       --koa <authorization-id> --dry-run
+   ```
+
+   `<resources>` is `FireAlive.app/Contents/Resources` on macOS, the `resources`
+   folder beside the executable on Windows, and `squashfs-root/resources` after
+   `./FireAlive-<version>.AppImage --appimage-extract` on Linux. The Global
+   Dashboard equivalent is `tools/gd-rollback-apply.js` under its own resources.
+
+   `--dry-run` runs every check and changes nothing. Re-run without it to apply.
+4. **Uninstall the newer version, then install the previous one.**
+5. **Start it.** Configuration comes back **locked** — unlock with your hardware
+   key before making changes. The database that was replaced is kept alongside as
+   a pre-restore snapshot; the tool prints its path.
+
+The tool refuses, changing nothing, if: the server is running; the authorization
+is missing, expired, already used, for a different restore point, or for a
+different operation; the restore-point bundle is incomplete or was produced by a
+different deployment; its malware scan does not come back clean; or the restore
+point is not **exactly one version back**. That last rule bounds a rollback to a
+single step — to go back further, roll back one release at a time, each with its
+own restore point.
+
+If you have no restore point, a bad upgrade cannot be rolled back in place: you
+would have to remove `~/.firealive/<data root>` and set the deployment up again
+from a backup, which starts a new instance identity. Take the restore point.
 
 If the hardware root itself was lost or replaced, recovery requires **both** a
 server backup **and** the offline Tier-1 recovery code — see
 `docs/tier1-kek-hardware-sealing.md`. Neither alone is sufficient.
+
+For the mechanism behind all of this — why a restore point is the only way back,
+how a rollback is authorized, and what the tool refuses — see
+`docs/pre-upgrade-restore-point.md`.
 
 ## Shared Responsibility in Compliance Reports
 

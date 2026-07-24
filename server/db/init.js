@@ -1455,8 +1455,15 @@ CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
 -- those fields can be altered without invalidating it.
 CREATE TABLE IF NOT EXISTS key_op_authorizations (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  -- B6k added 'rollback': a single-use authorization for the offline rollback
+  -- tool to put the PREVIOUS build in front of a database whose recorded
+  -- anti-rollback mark is the old one. It is minted the same way as every other
+  -- op -- behind an approved two-person gate, anchor-signed by the running
+  -- server, verified offline, consumed once -- and additionally bound by
+  -- key_op_ref to ONE restore point and refused unless the bundle's fuse is
+  -- exactly one below the current mark, so a further upgrade voids it.
   op TEXT NOT NULL
-    CHECK (op IN ('rekey', 'migration-import', 'deployment-reset')),
+    CHECK (op IN ('rekey', 'migration-import', 'deployment-reset', 'rollback')),
   key_op_ref TEXT NOT NULL,
   approval_id TEXT NOT NULL,
   requested_by_user_id TEXT NOT NULL,
@@ -1473,6 +1480,59 @@ CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_approval
   ON key_op_authorizations(approval_id);
 CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_unconsumed
   ON key_op_authorizations(op, key_op_ref) WHERE consumed_at IS NULL;
+
+-- B6k: Pre-upgrade restore points. A restore point is an ordinary full-suite
+-- backup written to a store OUTSIDE the data root (lib/data-root.restorePointsDir),
+-- plus this row recording WHY it was taken and what it may authorize.
+--
+-- Why a separate table rather than a column on backups: backups.type carries a
+-- CHECK constraint and its 'snapshot' value already means PRE-RESTORE, so reusing
+-- it would conflate two different operations in one column, and widening the
+-- constraint means rebuilding the most safety-critical table in the platform.
+-- backups.kind describes bundle SHAPE (single-db vs full-suite), which is
+-- orthogonal to purpose. The underlying backup therefore stays honestly typed
+-- 'on-demand' -- an operator did ask for it -- and the pre-upgrade semantics live
+-- here.
+--
+-- This row is a CONVENIENCE for the console listing, not the authority. The
+-- offline rollback tool trusts the bundle's Ed25519-signed manifest
+-- (source_db.fuse_counter_at_creation) and the hardware-sealed KEK that wraps its
+-- DEK, because the tool's whole job is to replace the database this row lives in
+-- -- and in the contingency case the deployment may not boot far enough to read
+-- it at all.
+--
+-- purpose is deliberately UNCONSTRAINED. key_op_authorizations.op is the in-repo
+-- lesson: a CHECK on an enumerable field cannot be widened without a full table
+-- rebuild, and this field is exactly the kind that gains values later.
+CREATE TABLE IF NOT EXISTS restore_points (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  backup_id TEXT NOT NULL REFERENCES backups(id) ON DELETE RESTRICT,
+  purpose TEXT NOT NULL DEFAULT 'pre-upgrade',
+  bundle_dir TEXT NOT NULL,
+  manifest_path TEXT NOT NULL,
+  -- The fuse and version the OLD binary was running when this was taken. The
+  -- rollback tool re-reads both from the signed manifest; these are here so the
+  -- console can show them without opening the bundle.
+  source_fuse_counter INTEGER NOT NULL,
+  source_version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by_user_id TEXT NOT NULL,
+  note TEXT,
+  -- An OPTIONAL contingency authorization minted at creation time, while the
+  -- deployment is still healthy and can authenticate. Null when the operator did
+  -- not pre-authorize a rollback; in that case a rollback requires minting a KOA
+  -- from the running (upgraded) deployment, which is impossible if it will not
+  -- boot -- which is precisely the case this column exists for.
+  koa_id TEXT REFERENCES key_op_authorizations(id) ON DELETE SET NULL,
+  consumed_at TEXT,
+  consumed_context TEXT,
+  CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_restore_points_created
+  ON restore_points(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_restore_points_unconsumed
+  ON restore_points(source_fuse_counter) WHERE consumed_at IS NULL;
 
 -- Data-subject erasure requests (dual control: an admin requests, a second
 -- admin approves, and on approval the erasure executes). Mirrors the
@@ -8945,6 +9005,89 @@ function initDb() {
   } catch (b5rUpdateLogMigrationErr) {
     console.error('B5r update-check log migration FAILED:', b5rUpdateLogMigrationErr.message);
     console.error('The server will start, but the automated update-detection feature cannot record check results: the auto_update_check_log table may be missing, so the Updates tab last-check display and the update-available banner have no data source. Recovery: run the CREATE TABLE / CREATE INDEX statements above in a SQLite shell against the production DB.');
+  }
+
+  // ── B6k migration: admit op='rollback' on key_op_authorizations ─────────────
+  // The canonical table above now allows a fourth op. SQLite cannot ALTER a CHECK
+  // constraint, so an existing database needs the full rebuild: CREATE _new with
+  // the canonical shape, copy every row, DROP, RENAME -- the same procedure the
+  // R3d-1 backups rebuild uses above.
+  //
+  // Why this is safe on a live security table: the copy is unconditional (no row
+  // is filtered or transformed), the whole rebuild runs in ONE transaction that
+  // rolls back on any error, and the widened constraint is strictly more
+  // permissive -- every row that satisfied the old CHECK satisfies the new one,
+  // so the copy cannot fail on a constraint. Foreign keys are toggled off for the
+  // rebuild: restore_points.koa_id references this table, and a DROP with FKs on
+  // would either fail or null those references.
+  //
+  // Idempotent: the guard reads the stored DDL and skips entirely once 'rollback'
+  // is present, so this is a no-op on every boot after the first.
+  try {
+    const koaDdl = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'key_op_authorizations'",
+    ).get();
+    if (koaDdl && koaDdl.sql && koaDdl.sql.indexOf("'rollback'") === -1) {
+      const before = db.prepare('SELECT COUNT(*) AS n FROM key_op_authorizations').get().n;
+      console.log(`B6k migration: rebuilding key_op_authorizations to admit op='rollback' (${before} row(s) to preserve)`);
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE key_op_authorizations_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            op TEXT NOT NULL
+              CHECK (op IN ('rekey', 'migration-import', 'deployment-reset', 'rollback')),
+            key_op_ref TEXT NOT NULL,
+            approval_id TEXT NOT NULL,
+            requested_by_user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            anchor_public_fingerprint TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            consumed_at TEXT,
+            consumed_context TEXT,
+            CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+          )
+        `);
+        db.exec(`
+          INSERT INTO key_op_authorizations_new
+            (id, op, key_op_ref, approval_id, requested_by_user_id, created_at,
+             expires_at, anchor_public_fingerprint, signature, consumed_at, consumed_context)
+          SELECT id, op, key_op_ref, approval_id, requested_by_user_id, created_at,
+                 expires_at, anchor_public_fingerprint, signature, consumed_at, consumed_context
+          FROM key_op_authorizations
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM key_op_authorizations_new').get().n;
+        if (copied !== before) {
+          throw new Error(`row count mismatch: ${before} before, ${copied} copied`);
+        }
+        db.exec('DROP TABLE key_op_authorizations');
+        db.exec('ALTER TABLE key_op_authorizations_new RENAME TO key_op_authorizations');
+        // The indexes belonged to the dropped table; recreate them.
+        db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_approval
+            ON key_op_authorizations(approval_id);
+          CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_unconsumed
+            ON key_op_authorizations(op, key_op_ref) WHERE consumed_at IS NULL;
+        `);
+        db.exec('COMMIT');
+        console.log(`B6k migration: key_op_authorizations rebuilt, preserved ${copied} row(s)`);
+      } catch (koaRebuildErr) {
+        db.exec('ROLLBACK');
+        throw koaRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (b6kKoaMigrationErr) {
+    // Fatal by re-throw would stop the server; this one is reported instead,
+    // because the rebuild is atomic (nothing changed on failure) and every
+    // pre-existing key operation still works. Only the NEW rollback op is
+    // unavailable, and the offline tool fails closed when it cannot find a
+    // usable authorization.
+    console.error('B6k key_op_authorizations migration FAILED:', b6kKoaMigrationErr.message);
+    console.error("The server will start and existing key operations are unaffected (the rebuild is atomic -- nothing changed). Minting a rollback authorization will be refused by the CHECK constraint until this succeeds. Recovery: re-run the rebuild above in a SQLite shell against the production DB.");
   }
 
   console.log('Database initialized at', DB_PATH);

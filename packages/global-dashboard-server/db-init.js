@@ -1435,8 +1435,15 @@ CREATE INDEX IF NOT EXISTS idx_restore_approvals_requested_by
 -- those fields can be altered without invalidating it.
 CREATE TABLE IF NOT EXISTS key_op_authorizations (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  -- B6k added 'rollback': a single-use authorization for the offline GD rollback
+  -- tool to put the PREVIOUS build in front of a database whose recorded
+  -- anti-rollback mark is the old one. Minted the same way as every other op --
+  -- approved two-person gate, anchor-signed by the running server, verified
+  -- offline, consumed once -- and additionally bound by key_op_ref to ONE restore
+  -- point and refused unless the bundle's fuse is exactly one below the current
+  -- mark, so a further upgrade voids it.
   op TEXT NOT NULL
-    CHECK (op IN ('rekey', 'migration-import', 'deployment-reset')),
+    CHECK (op IN ('rekey', 'migration-import', 'deployment-reset', 'rollback')),
   key_op_ref TEXT NOT NULL,
   approval_id TEXT NOT NULL,
   requested_by_user_id TEXT NOT NULL,
@@ -1453,6 +1460,47 @@ CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_approval
   ON key_op_authorizations(approval_id);
 CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_unconsumed
   ON key_op_authorizations(op, key_op_ref) WHERE consumed_at IS NULL;
+
+-- B6k: Pre-upgrade restore points (the GD twin). A restore point is an ordinary
+-- full-suite backup written to a store OUTSIDE the GD data root
+-- (lib/gd-data-root.restorePointsDir), plus this row recording why it was taken.
+--
+-- Why a separate table rather than a column on backups: backups.type carries a
+-- CHECK constraint whose 'snapshot' value already means PRE-RESTORE, so reusing
+-- it would conflate two operations in one column, and widening the constraint
+-- means rebuilding the most safety-critical table in the platform. The
+-- underlying backup therefore stays honestly typed 'on-demand'.
+--
+-- This row is a CONVENIENCE for the console, not the authority. The offline
+-- rollback tool trusts the bundle's signed manifest and the hardware-sealed KEK
+-- that wraps its DEK, because the tool's whole job is replacing the database
+-- this row lives in -- and in the case that matters most, an upgrade that will
+-- not boot, the GD may never read it at all.
+--
+-- purpose is deliberately UNCONSTRAINED: key_op_authorizations.op is the in-repo
+-- lesson that a CHECK on an enumerable field cannot be widened without a full
+-- table rebuild.
+CREATE TABLE IF NOT EXISTS restore_points (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  backup_id TEXT NOT NULL REFERENCES backups(id) ON DELETE RESTRICT,
+  purpose TEXT NOT NULL DEFAULT 'pre-upgrade',
+  bundle_dir TEXT NOT NULL,
+  manifest_path TEXT NOT NULL,
+  source_fuse_counter INTEGER NOT NULL,
+  source_version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by_user_id TEXT NOT NULL,
+  note TEXT,
+  koa_id TEXT REFERENCES key_op_authorizations(id) ON DELETE SET NULL,
+  consumed_at TEXT,
+  consumed_context TEXT,
+  CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_restore_points_created
+  ON restore_points(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_restore_points_unconsumed
+  ON restore_points(source_fuse_counter) WHERE consumed_at IS NULL;
 
 -- External restore sources: registered off-box locations (network share, NAS,
 -- S3, Azure blob, SFTP) a backup can be pulled from for a restore. Credentials
@@ -2639,6 +2687,73 @@ function initDb() {
   } catch (b6dGdHaSchemaMigrationErr) {
     console.error('B6d GD HA schema migration FAILED:', b6dGdHaSchemaMigrationErr.message);
     console.error('The GD will start, but opt-in active/passive High Availability cannot function: one or more gd_ha_* tables (gd_ha_node, gd_ha_lease, gd_ha_peer, gd_ha_replication_journal, gd_ha_replication_state) may be missing, so pairing, replication, and automated failover are unavailable. Recovery: run the CREATE TABLE statements above in a SQLite shell against the production DB.');
+  }
+
+  // ── B6k migration: admit op='rollback' on key_op_authorizations ─────────────
+  // SQLite cannot ALTER a CHECK constraint, so an existing database needs the
+  // full rebuild: CREATE _new with the canonical shape, copy every row, DROP,
+  // RENAME. The copy is unconditional and the widened constraint is strictly more
+  // permissive, so every row that satisfied the old CHECK satisfies the new one.
+  // Foreign keys are toggled off because restore_points.koa_id references this
+  // table. Idempotent: the guard reads the stored DDL and skips once 'rollback'
+  // is present.
+  try {
+    const koaDdl = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'key_op_authorizations'",
+    ).get();
+    if (koaDdl && koaDdl.sql && koaDdl.sql.indexOf("'rollback'") === -1) {
+      const before = db.prepare('SELECT COUNT(*) AS n FROM key_op_authorizations').get().n;
+      console.log(`[gd] B6k migration: rebuilding key_op_authorizations to admit op='rollback' (${before} row(s) to preserve)`);
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN TRANSACTION');
+      try {
+        db.exec(`
+          CREATE TABLE key_op_authorizations_new (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            op TEXT NOT NULL
+              CHECK (op IN ('rekey', 'migration-import', 'deployment-reset', 'rollback')),
+            key_op_ref TEXT NOT NULL,
+            approval_id TEXT NOT NULL,
+            requested_by_user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            anchor_public_fingerprint TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            consumed_at TEXT,
+            consumed_context TEXT,
+            CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+          )
+        `);
+        db.exec(`
+          INSERT INTO key_op_authorizations_new
+            (id, op, key_op_ref, approval_id, requested_by_user_id, created_at,
+             expires_at, anchor_public_fingerprint, signature, consumed_at, consumed_context)
+          SELECT id, op, key_op_ref, approval_id, requested_by_user_id, created_at,
+                 expires_at, anchor_public_fingerprint, signature, consumed_at, consumed_context
+          FROM key_op_authorizations
+        `);
+        const copied = db.prepare('SELECT COUNT(*) AS n FROM key_op_authorizations_new').get().n;
+        if (copied !== before) throw new Error(`row count mismatch: ${before} before, ${copied} copied`);
+        db.exec('DROP TABLE key_op_authorizations');
+        db.exec('ALTER TABLE key_op_authorizations_new RENAME TO key_op_authorizations');
+        db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_approval
+            ON key_op_authorizations(approval_id);
+          CREATE INDEX IF NOT EXISTS idx_key_op_authorizations_unconsumed
+            ON key_op_authorizations(op, key_op_ref) WHERE consumed_at IS NULL;
+        `);
+        db.exec('COMMIT');
+        console.log(`[gd] B6k migration: key_op_authorizations rebuilt, preserved ${copied} row(s)`);
+      } catch (koaRebuildErr) {
+        db.exec('ROLLBACK');
+        throw koaRebuildErr;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    }
+  } catch (b6kKoaMigrationErr) {
+    console.error('[gd] B6k key_op_authorizations migration FAILED:', b6kKoaMigrationErr.message);
+    console.error('[gd] The GD will start and existing key operations are unaffected (the rebuild is atomic -- nothing changed). Minting a rollback authorization will be refused by the CHECK constraint until this succeeds.');
   }
 
   console.log('Global Dashboard database initialized at', DB_PATH);

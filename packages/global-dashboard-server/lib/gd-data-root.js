@@ -166,6 +166,50 @@ function migrationBundlesDir(override) {
   return subDir(['GD_MIGRATION_BUNDLE_DIR'], 'migration-bundles');
 }
 
+// ── Paths that must SURVIVE a data-root reset (B6k) ────────────────────────
+//
+// Every accessor above resolves UNDER gdDataRoot(). That is correct for
+// runtime state, and wrong for exactly one thing: a pre-upgrade restore point.
+//
+// A restore point exists to be used when this Global Dashboard has to go back
+// to its previous version. Rolling back means replacing the contents of the
+// data root, so a restore point stored inside it would be destroyed by the
+// very operation it exists to serve -- the same shape of defect P1-1 removed,
+// where a backup stored inside the application bundle was destroyed by the
+// update it was meant to survive.
+//
+// So the store is a SIBLING of the data root, following the hardware keystore,
+// the one other artifact on this host that already has to outlive the database
+// it protects. Unlike the directories above it takes the gd- prefix: those sit
+// INSIDE the GD's own root where the prefix is redundant, while this one sits
+// beside the Regional Server's store under the shared ~/.firealive home and
+// must not collide with it.
+//
+// Nothing here is network-reachable and nothing here is pushed anywhere: an
+// air-gapped deployment keeps its restore points on its own disk, and a second
+// copy is an operator carrying the file to removable media.
+function restorePointsDir() {
+  return firstEnv(['FIREALIVE_GD_RESTORE_POINTS_DIR'])
+    || path.resolve(os.homedir(), '.firealive', 'gd-restore-points');
+}
+
+// The runtime liveness marker (B6k). Written at boot, removed at exit, and
+// read by the offline GD rollback tool.
+//
+// This is a CORRECTNESS control, not a convenience. The shared restore-swap
+// primitive atomically renames the restored bytes over the live database path,
+// and its contract requires the caller to close its own handle first so the
+// rename does not write to an unlinked ghost inode. An offline tool cannot
+// close a handle held by a different process, so it must refuse to run while
+// that process is alive.
+//
+// Unlike the restore-point store this DOES belong under the data root: it
+// describes the server that owns that root, and a reset which removes the root
+// is by definition a reset of a server that is not running.
+function runtimePidPath() {
+  return path.join(gdDataRoot(), 'global-dashboard.pid');
+}
+
 // ── Legacy-path detection (P1-1), fail-closed ──────────────────────────────
 //
 // Before P1 the GD database lived at <gd-server>/data/global-dashboard.db --
@@ -231,4 +275,6 @@ module.exports = {
   cicdConfigsDir,
   cloudPackagesDir,
   migrationBundlesDir,
+  restorePointsDir,
+  runtimePidPath,
 };

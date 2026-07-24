@@ -172,6 +172,50 @@ function migrationBundlesDir() {
   return subDir(['MIGRATION_BUNDLE_DIR'], 'migration-bundles');
 }
 
+// ── Paths that must SURVIVE a data-root reset (B6k) ────────────────────────
+//
+// Every accessor above resolves UNDER dataRoot(). That is correct for runtime
+// state, and wrong for exactly one thing: a pre-upgrade restore point.
+//
+// A restore point exists to be used when the deployment it protects has to go
+// back to its previous version. Rolling back means replacing the contents of
+// the data root. A restore point stored inside the data root would therefore
+// be destroyed by the very operation it exists to serve -- the same shape of
+// defect P1-1 removed, where a backup stored inside the application bundle was
+// destroyed by the update it was meant to survive.
+//
+// So the store is a SIBLING of the data root, not a child of it. It follows
+// the hardware keystore, the one other artifact on this host that already has
+// to outlive the database it protects:
+//
+//   services/instance-anchor/hardware-keystore-linux.js  ~/.firealive/hw-keystore
+//
+// Same base, same single-env override shape, same 0700 discipline via
+// ensureDir. Nothing here is network-reachable and nothing here is pushed
+// anywhere: an air-gapped deployment keeps its restore points on its own disk,
+// and a second copy is an operator carrying the file to removable media.
+function restorePointsDir() {
+  return firstEnv(['FIREALIVE_RESTORE_POINTS_DIR'])
+    || path.resolve(os.homedir(), '.firealive', 'restore-points');
+}
+
+// The runtime liveness marker (B6k). Written at boot, removed at exit, and
+// read by the offline rollback tool.
+//
+// This is a CORRECTNESS control, not a convenience. services/db-restore-swap.js
+// atomically renames the restored bytes over the live database path, and its
+// contract states the caller must close its own handle first "so the rename
+// does not write to an unlinked ghost inode." An offline tool cannot close a
+// handle held by a different process, so it must instead refuse to run while
+// that process is alive.
+//
+// Unlike the restore-point store this DOES belong under the data root: it
+// describes the server that owns that root, and a reset which removes the root
+// is by definition a reset of a server that is not running.
+function runtimePidPath() {
+  return path.join(dataRoot(), 'firealive.pid');
+}
+
 // ── Legacy-path detection (P1-1), fail-closed ──────────────────────────────
 //
 // Before P1 the database lived two directories above this module -- inside the
@@ -230,4 +274,6 @@ module.exports = {
   cicdConfigsDir,
   cloudPackagesDir,
   migrationBundlesDir,
+  restorePointsDir,
+  runtimePidPath,
 };

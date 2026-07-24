@@ -152,7 +152,7 @@ function globExtension(glob) {
 }
 
 // ── the core checker: takes the two file bodies + a package.json reader, returns problems[] ──
-function checkWorkflows(buildYml, lockfileYml, readJson) {
+function checkWorkflows(buildYml, lockfileYml, readJson, opts) {
   const problems = [];
 
   // A. tabs / non-empty
@@ -259,6 +259,39 @@ function checkWorkflows(buildYml, lockfileYml, readJson) {
     }
   }
 
+  // ── E. every gate on disk is actually INVOKED (B6k) ──────────────────────
+  //
+  // A gate that exists but is never run is the exact defect this file was built
+  // to catch, in its purest form: it looks like coverage and is not. Nothing
+  // enforced this -- every gate was wired by discipline alone, and adding one to
+  // scripts/ without adding a step to build.yml would produce a file that reads
+  // like protection, passes review, and never executes.
+  //
+  // B6k made this pressing: check-rollback-containment.js guards properties that
+  // are defined by ABSENCE (the rollback path has no HTTP surface and never
+  // ratchets the fuse). Those cannot be caught by any other test, so if that gate
+  // were silently unwired, nothing at all would notice the loss.
+  // Only meaningful against the REAL build.yml. The self-test drives this
+  // function with synthetic workflows that deliberately contain a single job, so
+  // enumerating the real scripts/ directory against them would report every gate
+  // as unwired. The caller says which it is.
+  if (opts && opts.gateWiringScriptsDir) {
+    try {
+    const scriptsDir = opts.gateWiringScriptsDir;
+    const onDisk = fs.readdirSync(scriptsDir)
+      .filter((f) => /^check-.*\.js$/.test(f));
+    const unwired = onDisk.filter((f) => buildYml.indexOf(f) === -1);
+    if (unwired.length) {
+      problems.push(
+        'build.yml: these gates exist in scripts/ but are never invoked: ' + unwired.join(', ')
+        + ' -- a gate that never runs looks like coverage and is not',
+      );
+    }
+    } catch (e) {
+      problems.push('could not enumerate scripts/ to check gate wiring: ' + e.message);
+    }
+  }
+
   return problems;
 }
 
@@ -359,7 +392,7 @@ if (process.argv.includes('--self-test')) {
 } else {
   const readFileOrNull = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } };
   const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
-  const problems = checkWorkflows(readFileOrNull(BUILD_YML), readFileOrNull(LOCKFILE_YML), readJson);
+  const problems = checkWorkflows(readFileOrNull(BUILD_YML), readFileOrNull(LOCKFILE_YML), readJson, { gateWiringScriptsDir: path.resolve(__dirname) });
   if (problems.length) {
     console.error('check-workflow-validity FAILED (' + problems.length + '):\n');
     for (const p of problems) console.error('  - ' + p);

@@ -581,6 +581,11 @@ module.exports = {
   // exposed for tests / reuse
   cleanStaleTempDirs,
   resolveBackupsDir,
+  // B6k: exported so the full-suite orchestrator creates its output directory
+  // through the SAME verifying path this engine uses, rather than a raw
+  // mkdirSync that neither sets 0700 nor refuses an already group- or
+  // world-accessible directory.
+  ensureDir,
   snapshotDbBytes,
   pushV2BackupArtifact,
   rebuildV2BackupContext,
