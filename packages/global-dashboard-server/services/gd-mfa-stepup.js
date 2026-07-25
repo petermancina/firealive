@@ -129,6 +129,7 @@ function gdMfaStepUp() {
             transports: cred.transports,
           },
           expectedUserId: req.user.id,
+          db: db,
         });
       } catch (vErr) {
         auditBestEffort(db, req, 'STEPUP_WEBAUTHN_FAILED', 'err=' + vErr.message, 'warning');
