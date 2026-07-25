@@ -109,7 +109,7 @@ function createAuthorization(db, opts) {
   const notes = normalizeNotes(o.notes);
 
   const cert = db.transaction(() => {
-    const c = ca.issueThreatHuntingConsumerCert(db, { displayName: displayName });
+    const c = ca.issueMachineConsumerCert(db, { displayName: displayName, ou: ca.THREAT_HUNTING_CONSUMER_OU });
     db.prepare(
       'INSERT INTO threat_hunting_consumer_authorizations ' +
         '(id, consumer_type, display_name, allowed_cidrs, cert_fingerprint, cert_serial, token_hash, token_salt, default_format, created_by, notes) ' +
