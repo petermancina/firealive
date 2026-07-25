@@ -158,6 +158,7 @@ function mfaStepUp() {
             transports: cred.transports,
           },
           expectedUserId: req.user.id,
+          db,
         });
       } catch (vErr) {
         auditLog(req.user.id, 'STEPUP_WEBAUTHN_FAILED', `err=${vErr.message}`, req.ip);
