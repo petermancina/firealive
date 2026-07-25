@@ -187,6 +187,7 @@ router.post('/lock', cisoOnlyWithAudit, async (req, res) => {
       let verification;
       try {
         verification = await gdWebauthn.finishAuthentication({
+          db,
           rp,
           response: assertion,
           challengeToken,
