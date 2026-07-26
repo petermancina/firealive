@@ -51,8 +51,11 @@ const router = require('express').Router();
 const accessRouter = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
+const ca = require('../services/ca');
+const { verifyMachineCert } = require('../services/machine-cert-auth');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 const VALID_SCANNERS = ['nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei'];
 const VALID_SCHEDULES = ['daily', 'weekly', 'monthly', 'manual'];
@@ -250,7 +253,7 @@ router.get('/config', (req, res) => {
   }
 });
 
-router.put('/config', (req, res) => {
+router.put('/config', mfaStepUp(), (req, res) => {
   const { enabled, allowedScanners, schedule } = req.body || {};
   if (typeof enabled !== 'boolean') {
     return res.status(400).json({ error: 'enabled must be a boolean' });
@@ -304,7 +307,7 @@ router.get('/authorizations', (req, res) => {
 });
 
 // -- Create authorization (returns the bearer token ONCE) --------------------
-router.post('/authorizations', (req, res) => {
+router.post('/authorizations', mfaStepUp(), (req, res) => {
   const { scanner_type, display_name, allowed_cidrs, notes } = req.body || {};
   if (!VALID_SCANNERS.includes(scanner_type)) {
     return res.status(400).json({ error: 'Invalid scanner_type', validScanners: VALID_SCANNERS });
@@ -336,18 +339,36 @@ router.post('/authorizations', (req, res) => {
     const token = `vss-${crypto.randomBytes(32).toString('hex')}`;
     const salt = crypto.randomBytes(16).toString('hex');
     const tokenHash = hashToken(token, salt);
-    db.prepare(
-      'INSERT INTO vuln_scan_scanner_authorizations ' +
-        '(id, scanner_type, display_name, allowed_cidrs, token_hash, token_salt, enabled, created_by, notes) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)'
-    ).run(
-      id, scanner_type, display_name.trim(), JSON.stringify(cidrs),
-      tokenHash, salt, req.user.id, notes != null ? notes : null
-    );
+    // O3 Half 2: mint the certificate that constrains this token, in the
+    // SAME transaction as the row. Either half without the other is a
+    // defect: an orphaned certificate, or a row that cannot authenticate.
+    const cert = db.transaction(() => {
+      const c = ca.issueMachineConsumerCert(db, { displayName: display_name.trim(), ou: ca.SCANNER_CONSUMER_OU });
+      db.prepare(
+        'INSERT INTO vuln_scan_scanner_authorizations ' +
+          '(id, scanner_type, display_name, allowed_cidrs, cert_fingerprint, cert_serial, token_hash, token_salt, enabled, created_by, notes) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
+      ).run(
+        id, scanner_type, display_name.trim(), JSON.stringify(cidrs),
+        c.fingerprint, c.serial, tokenHash, salt, req.user.id, notes != null ? notes : null
+      );
+      return c;
+    })();
     auditLog(req.user.id, 'VULN_SCAN_AUTH_CREATED', `scanner=${scanner_type} name="${display_name.trim()}" cidrs=${cidrs.length}`, req.ip);
     const row = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE id = ?').get(id);
     // token returned ONCE -- never retrievable again
-    res.status(201).json({ authorization: publicAuthorization(row), token });
+    res.status(201).json({
+      authorization: publicAuthorization(row),
+      // Returned exactly once and never retrievable again. The token alone
+      // authenticates nothing: the scanner must present this certificate on
+      // the TLS connection that carries it.
+      token,
+      certPem: cert.certPem,
+      keyPem: cert.keyPem,
+      caCertPem: cert.caCertPem,
+      certFingerprint: cert.fingerprint,
+      certSerial: cert.serial,
+    });
   } catch (err) {
     logger.error('vuln-scan create authorization error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to create scanner authorization' });
@@ -357,7 +378,7 @@ router.post('/authorizations', (req, res) => {
 });
 
 // -- Update authorization ----------------------------------------------------
-router.put('/authorizations/:id', (req, res) => {
+router.put('/authorizations/:id', mfaStepUp(), (req, res) => {
   const { display_name, allowed_cidrs, enabled, notes } = req.body || {};
   const db = getDb();
   try {
@@ -402,12 +423,21 @@ router.put('/authorizations/:id', (req, res) => {
 });
 
 // -- Revoke authorization ----------------------------------------------------
-router.delete('/authorizations/:id', (req, res) => {
+router.delete('/authorizations/:id', mfaStepUp(), (req, res) => {
   const db = getDb();
   try {
     const row = db.prepare('SELECT id, scanner_type, display_name FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Authorization not found' });
-    db.prepare('DELETE FROM vuln_scan_scanner_authorizations WHERE id = ?').run(req.params.id);
+    // O3 Half 2: revoke the bound certificate too. Removing the row alone
+    // leaves a certificate this CA still vouches for -- a credential the
+    // operator believes destroyed and which is not.
+    const bound = db.prepare('SELECT cert_serial FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
+    db.transaction(() => {
+      db.prepare('DELETE FROM vuln_scan_scanner_authorizations WHERE id = ?').run(req.params.id);
+      if (bound && bound.cert_serial) {
+        ca.revokeCert(db, { serial: bound.cert_serial, reason: 'scanner_authorization_revoked' });
+      }
+    })();
     auditLog(req.user.id, 'VULN_SCAN_AUTH_REVOKED', `id=${req.params.id} scanner=${row.scanner_type} name="${row.display_name}"`, req.ip);
     res.json({ ok: true });
   } catch (err) {
@@ -506,13 +536,28 @@ accessRouter.post('/', (req, res) => {
       detail: fields.detail || null,
     });
 
+    // ── Factor 1: mutual-TLS client certificate, CA-verified and scoped to
+    // this surface by OU=scanner-consumer. Checked BEFORE the token, so a
+    // caller with no certificate never reaches a token comparison and cannot
+    // probe which tokens exist. Every rejection answers the same 401; the
+    // reason goes to the hash-chained access log only.
+    const certCheck = verifyMachineCert(db, req, ca.SCANNER_CONSUMER_OU);
+    if (!certCheck.ok) {
+      log('rejected_cert', { detail: certCheck.reason });
+      return res.status(401).json({ error: 'Scan authorization token required' });
+    }
+    const certFp = certCheck.fingerprint;
+
     if (!token || !/^vss-[0-9a-f]{64}$/.test(token)) {
       log('rejected_token', { detail: 'missing or malformed token' });
       return res.status(401).json({ error: 'Scan authorization token required' });
     }
 
     // Match the authorization by constant-time token-hash comparison across rows.
-    const candidates = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations').all();
+    // Narrowed to rows BOUND to this certificate. A row with a NULL
+      // cert_fingerprint -- every row on a database upgraded across O3 --
+      // cannot match, because SQL equality never matches NULL.
+      const candidates = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE cert_fingerprint = ?').all(certFp);
     let matched = null;
     for (const row of candidates) {
       if (safeEqualHex(hashToken(token, row.token_salt), row.token_hash)) { matched = row; break; }

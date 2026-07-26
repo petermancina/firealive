@@ -39,6 +39,7 @@ const { appendGdAuditEntry } = require('../services/gd-audit-chain');
 const storageDestinations = require('../services/gd-storage-destinations');
 const dataResidency = require('../services/gd-data-residency');
 const base = require('../services/gd-destination-adapter-base');
+const { gdMfaStepUp } = require('../services/gd-mfa-stepup');
 
 function _audit(db, req, eventType, detail) {
   try {
@@ -113,7 +114,7 @@ router.get('/:id', (req, res) => {
 });
 
 // -- POST / -------------------------------------------------------------------
-router.post('/', (req, res) => {
+router.post('/', gdMfaStepUp(), (req, res) => {
   let db;
   try {
     if (!req.body || typeof req.body !== 'object') {
@@ -154,7 +155,7 @@ router.post('/', (req, res) => {
 });
 
 // -- PATCH /:id ---------------------------------------------------------------
-router.patch('/:id', (req, res) => {
+router.patch('/:id', gdMfaStepUp(), (req, res) => {
   let db;
   try {
     if (!req.body || typeof req.body !== 'object') {
@@ -198,7 +199,7 @@ router.patch('/:id', (req, res) => {
 });
 
 // -- DELETE /:id --------------------------------------------------------------
-router.delete('/:id', (req, res) => {
+router.delete('/:id', gdMfaStepUp(), (req, res) => {
   let db;
   try {
     db = getDb();

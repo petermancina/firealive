@@ -70,6 +70,7 @@ const { logger } = require('../services/logger');
 const storageDestinations = require('../services/storage-destinations');
 const dataResidency = require('../services/data-residency');
 const base = require('../services/destination-adapter-base');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 // ── GET / ────────────────────────────────────────────────────────────────
 
@@ -136,7 +137,7 @@ router.get('/:id', (req, res) => {
 
 // ── POST / ───────────────────────────────────────────────────────────────
 
-router.post('/', (req, res) => {
+router.post('/', mfaStepUp(), (req, res) => {
   let db;
   try {
     if (!req.body || typeof req.body !== 'object') {
@@ -176,7 +177,7 @@ router.post('/', (req, res) => {
 
 // ── PATCH /:id ───────────────────────────────────────────────────────────
 
-router.patch('/:id', (req, res) => {
+router.patch('/:id', mfaStepUp(), (req, res) => {
   let db;
   try {
     if (!req.body || typeof req.body !== 'object') {
@@ -220,7 +221,7 @@ router.patch('/:id', (req, res) => {
 
 // ── DELETE /:id ──────────────────────────────────────────────────────────
 
-router.delete('/:id', (req, res) => {
+router.delete('/:id', mfaStepUp(), (req, res) => {
   let db;
   try {
     db = getDb();

@@ -47,6 +47,7 @@ const router = require('express').Router();
 const { getDb } = require('../db/init');
 const { logger } = require('../services/logger');
 const kmsSvc = require('../services/kms-providers');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 // ── Error mapping ────────────────────────────────────────────────────────────
 
@@ -192,7 +193,7 @@ router.get('/:id', (req, res) => {
 //   }
 //
 // Returns 201 with the new row's publicView (no credentials_encrypted).
-router.post('/', async (req, res) => {
+router.post('/', mfaStepUp(), async (req, res) => {
   const body = req.body || {};
   if (!isPlainObject(body)) {
     return res.status(400).json({ error: 'request body must be an object', code: 'INVALID_INPUT' });
@@ -235,7 +236,7 @@ router.post('/', async (req, res) => {
 //
 // provider_type is immutable. Create a new row + delete the old to
 // switch types. is_default is changed via /set-default for clarity.
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', mfaStepUp(), async (req, res) => {
   const body = req.body || {};
   if (!isPlainObject(body)) {
     return res.status(400).json({ error: 'request body must be an object', code: 'INVALID_INPUT' });
@@ -276,7 +277,7 @@ router.patch('/:id', async (req, res) => {
 });
 
 // ── POST /api/kms-providers/:id/enable ──────────────────────────────────────
-router.post('/:id/enable', async (req, res) => {
+router.post('/:id/enable', mfaStepUp(), async (req, res) => {
   try {
     const row = await kmsSvc.enableProvider(getDb(), req.params.id, ctx(req));
     return res.json(row);
@@ -288,7 +289,7 @@ router.post('/:id/enable', async (req, res) => {
 });
 
 // ── POST /api/kms-providers/:id/disable ─────────────────────────────────────
-router.post('/:id/disable', async (req, res) => {
+router.post('/:id/disable', mfaStepUp(), async (req, res) => {
   try {
     const row = await kmsSvc.disableProvider(getDb(), req.params.id, ctx(req));
     return res.json(row);
@@ -304,7 +305,7 @@ router.post('/:id/disable', async (req, res) => {
 // Atomically swap the default-marked row. Refuses if target is disabled
 // (the default must be usable). Returns:
 //   { previous_default_id, new_default_id }
-router.post('/:id/set-default', (req, res) => {
+router.post('/:id/set-default', mfaStepUp(), (req, res) => {
   try {
     const result = kmsSvc.setDefault(getDb(), req.params.id, ctx(req));
     return res.json(result);
@@ -338,7 +339,7 @@ router.post('/:id/probe', async (req, res) => {
 // default, and the only enabled row. Operators must keep all rows
 // referenced by any backup they intend to restore -- there is no FK
 // from backups to kms_providers, so the service cannot enforce that.
-router.delete('/:id', (req, res) => {
+router.delete('/:id', mfaStepUp(), (req, res) => {
   try {
     const result = kmsSvc.deleteProvider(getDb(), req.params.id, ctx(req));
     return res.json(result);

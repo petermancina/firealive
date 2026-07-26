@@ -35,6 +35,7 @@ const { getDb } = require('../db/init');
 const { sealTier1, openTier1 } = require('../services/tier1-seal');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 const VALID_TYPES = [
   'soar', 'siem', 'ticketing',
@@ -166,7 +167,7 @@ router.get('/ticketing/queue', (req, res) => {
 });
 
 // ── Create/Update Config ─────────────────────────────────────────────────────
-router.put('/:type', (req, res) => {
+router.put('/:type', mfaStepUp(), (req, res) => {
   if (!VALID_TYPES.includes(req.params.type)) {
     return res.status(400).json({ error: 'Invalid integration type' });
   }
@@ -325,7 +326,7 @@ router.post('/:type/test', (req, res) => {
 });
 
 // ── Delete Config ────────────────────────────────────────────────────────────
-router.delete('/:type', (req, res) => {
+router.delete('/:type', mfaStepUp(), (req, res) => {
   try {
     const db = getDb();
     db.prepare('DELETE FROM integration_config WHERE integration_type = ?').run(req.params.type);

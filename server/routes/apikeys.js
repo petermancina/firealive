@@ -11,6 +11,8 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../db/init');
 const { auditLog } = require('../middleware/audit');
 const { logger } = require('../services/logger');
+const ca = require('../services/ca');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 const VALID_SCOPES = [
   'health:read', 'siem:read', 'siem:write',
@@ -39,7 +41,7 @@ router.get('/', (req, res) => {
 });
 
 // ── Generate Key ─────────────────────────────────────────────────────────────
-router.post('/', (req, res) => {
+router.post('/', mfaStepUp(), (req, res) => {
   const { name, scopes, expiresIn } = req.body;
   if (!name || typeof name !== 'string' || name.length > 128) {
     return res.status(400).json({ error: 'name required (max 128 chars)' });
@@ -65,17 +67,37 @@ router.post('/', (req, res) => {
     }
 
     const db = getDb();
-    db.prepare(`
-      INSERT INTO api_keys (id, name, key_hash, key_prefix, scopes, expires_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, name.slice(0, 128), keyHash, prefix, scopes.join(','), expiresAt, req.user.id);
+
+    // O3 Half 2: a key is sender-constrained, so minting one mints the
+    // certificate that constrains it. Both happen in ONE transaction: a
+    // certificate in issued_certs with no api_keys row bound to it is an
+    // orphaned credential, and an api_keys row with no certificate cannot
+    // authenticate at all (cert_fingerprint is NOT NULL). Neither half is
+    // allowed to land without the other.
+    const cert = db.transaction(() => {
+      const c = ca.issueMachineConsumerCert(db, { displayName: name.slice(0, 128), ou: ca.API_KEY_CONSUMER_OU });
+      db.prepare(
+        'INSERT INTO api_keys (id, name, key_hash, key_prefix, scopes, expires_at, created_by, cert_fingerprint, cert_serial) '
+        + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(id, name.slice(0, 128), keyHash, prefix, scopes.join(','), expiresAt, req.user.id, c.fingerprint, c.serial);
+      return c;
+    })();
     db.close();
 
-    auditLog(req.user.id, 'APIKEY_CREATED', `name=${name} scopes=${scopes.join(',')}`, req.ip);
+    auditLog(req.user.id, 'APIKEY_CREATED',
+      `name=${name} scopes=${scopes.join(',')} cert_fp=${cert.fingerprint} cert_serial=${cert.serial}`, req.ip);
 
     res.status(201).json({
       id, name, rawKey, prefix, scopes, expiresAt,
-      warning: 'Store this key securely. It will not be shown again.',
+      certFingerprint: cert.fingerprint,
+      certSerial: cert.serial,
+      // Returned exactly once and never retrievable again. The key alone
+      // authenticates nothing: the client must present this certificate on the
+      // TLS connection that carries it.
+      certPem: cert.certPem,
+      keyPem: cert.keyPem,
+      caCertPem: cert.caCertPem,
+      warning: 'Store the key, the client certificate and its private key securely. None will be shown again. The key will not authenticate without its certificate.',
     });
   } catch (err) {
     logger.error('Create API key error', { error: err.message });
@@ -84,13 +106,22 @@ router.post('/', (req, res) => {
 });
 
 // ── Revoke Key ───────────────────────────────────────────────────────────────
-router.delete('/:id', (req, res) => {
+router.delete('/:id', mfaStepUp(), (req, res) => {
   try {
     const db = getDb();
     const key = db.prepare('SELECT id, name FROM api_keys WHERE id = ?').get(req.params.id);
     if (!key) { db.close(); return res.status(404).json({ error: 'Key not found' }); }
 
-    db.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').run(req.params.id);
+    // O3 Half 2: revoke the bound certificate as well. Flagging the row alone
+    // leaves a certificate this deployment's CA still vouches for -- a
+    // credential the operator believes destroyed and which is not.
+    const bound = db.prepare('SELECT cert_serial FROM api_keys WHERE id = ?').get(req.params.id);
+    db.transaction(() => {
+      db.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').run(req.params.id);
+      if (bound && bound.cert_serial) {
+        ca.revokeCert(db, { serial: bound.cert_serial, reason: 'api_key_revoked' });
+      }
+    })();
     db.close();
 
     auditLog(req.user.id, 'APIKEY_REVOKED', `name=${key.name}`, req.ip);
