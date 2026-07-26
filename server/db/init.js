@@ -666,8 +666,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
   revoked INTEGER DEFAULT 0,
   created_by TEXT NOT NULL REFERENCES users(id),
   created_at TEXT DEFAULT (datetime('now')),
-  last_used_at TEXT
+  last_used_at TEXT,
+  -- O3 Half 2: the key is sender-constrained. Presenting the bearer token is not
+  -- sufficient; the request must arrive over a mutual-TLS connection whose client
+  -- certificate was issued by this deployment's CA, carries OU=api-key-consumer,
+  -- and matches this row. A stolen key alone authenticates nothing.
+  cert_fingerprint TEXT NOT NULL,
+  cert_serial TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_api_keys_cert_fingerprint
+  ON api_keys(cert_fingerprint);
 
 -- ── Reports ──────────────────────────────────────────────────────────────
 
@@ -3344,6 +3352,42 @@ function initDb() {
     }
   } catch (e) {
     console.error('B6h B-8 unused-column drop migration failed:', e.message);
+    }
+
+    // ── O3 Half 2: certificate binding on machine credentials ───────────────
+    //
+    // The CREATEs declare these NOT NULL, so a fresh install is bound
+    // structurally. SQLite cannot add a NOT NULL column to an existing table
+    // without a DEFAULT, and any default here would be a FAKE fingerprint --
+    // worse than a null, because a fake looks bound. So an upgraded database
+    // gets a nullable column and the auth path fails CLOSED on null: a
+    // credential with no bound certificate does not authenticate. There is no
+    // permissive mode and no grandfathering.
+    //
+    // PRAGMA-guarded, so re-running initDb no-ops.
+    try {
+      for (const tbl of ['api_keys', 'vuln_scan_scanner_authorizations', 'cloud_vuln_scanner_authorizations']) {
+        const info = db.prepare(`PRAGMA table_info(${tbl})`).all();
+        // This block runs long before the two scanner tables are CREATEd
+        // further down this file, so on a fresh database they do not exist
+        // yet. Everything touching a table must sit inside this guard --
+        // including the index, because CREATE INDEX IF NOT EXISTS applies the
+        // IF NOT EXISTS to the INDEX, not to the table, and throws when the
+        // table is absent. Fresh installs get these indexes from the schema
+        // alongside their CREATE TABLE instead.
+        if (info.length === 0) continue;
+        const cols = info.map((c) => c.name);
+        if (!cols.includes('cert_fingerprint')) {
+          db.exec(`ALTER TABLE ${tbl} ADD COLUMN cert_fingerprint TEXT`);
+          console.log(`${tbl} migration (O3 Half 2): added cert_fingerprint; existing rows are UNBOUND and cannot authenticate until re-issued`);
+        }
+        if (!cols.includes('cert_serial')) {
+          db.exec(`ALTER TABLE ${tbl} ADD COLUMN cert_serial TEXT`);
+        }
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_${tbl}_cert_fp ON ${tbl}(cert_fingerprint)`);
+      }
+    } catch (e) {
+      console.error('O3 Half 2 certificate-binding migration failed:', e.message);
   }
 
   // ── Migration: peer board KV → peer_board_messages (U2) ──────────────────
@@ -7751,6 +7795,9 @@ function initDb() {
         display_name TEXT NOT NULL,
         allowed_cidrs TEXT NOT NULL DEFAULT '[]',
         scope_components TEXT NOT NULL DEFAULT '[]',
+        -- O3 Half 2: cert first, then token, then source IP.
+        cert_fingerprint TEXT NOT NULL,
+        cert_serial TEXT NOT NULL,
         token_hash TEXT NOT NULL,
         token_salt TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -7764,6 +7811,9 @@ function initDb() {
 
       CREATE INDEX IF NOT EXISTS idx_cloud_vuln_auth_enabled
         ON cloud_vuln_scanner_authorizations(enabled, scanner_type);
+
+      CREATE INDEX IF NOT EXISTS idx_cloud_vuln_scanner_authorizations_cert_fp
+        ON cloud_vuln_scanner_authorizations(cert_fingerprint);
 
       CREATE TABLE IF NOT EXISTS cloud_vuln_scan_access_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7844,6 +7894,10 @@ function initDb() {
         )),
         display_name TEXT NOT NULL,
         allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+        -- O3 Half 2: cert first, then token, then source IP -- the same three
+        -- factors threat_hunting_consumer_authorizations has carried since B5m.
+        cert_fingerprint TEXT NOT NULL,
+        cert_serial TEXT NOT NULL,
         token_hash TEXT NOT NULL,
         token_salt TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -7857,6 +7911,9 @@ function initDb() {
 
       CREATE INDEX IF NOT EXISTS idx_vuln_scan_auth_enabled
         ON vuln_scan_scanner_authorizations(enabled, scanner_type);
+
+      CREATE INDEX IF NOT EXISTS idx_vuln_scan_scanner_authorizations_cert_fp
+        ON vuln_scan_scanner_authorizations(cert_fingerprint);
 
       CREATE TABLE IF NOT EXISTS vuln_scan_access_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8326,6 +8383,29 @@ function initDb() {
       CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
       CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_passwordless
         ON webauthn_credentials(is_passwordless) WHERE is_passwordless = 1;
+
+      -- O3 sub-phase 0: spent WebAuthn challenge tokens.
+      --
+      -- Without this a step-up assertion is a bearer credential valid for the
+      -- whole CHALLENGE_TTL_SEC window (300s): readChallengeToken was a bare
+      -- jwt.verify with no consumption tracking, so one captured body.stepup
+      -- payload could be replayed against every gated endpoint for five
+      -- minutes. That is the opposite of "minting is its own ceremony", and it
+      -- is the primitive every step-up gate rests on.
+      --
+      -- The PRIMARY KEY on jti makes the INSERT itself the atomic
+      -- check-and-set, so two concurrent replays cannot both succeed. Rows are
+      -- pruned an hour past expiry -- jwt.verify rejects the token
+      -- independently by then, so the row has no further value.
+      CREATE TABLE IF NOT EXISTS webauthn_challenge_consumed (
+        jti TEXT PRIMARY KEY,
+        purpose TEXT,
+        user_id TEXT,
+        consumed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_webauthn_challenge_consumed_expires
+        ON webauthn_challenge_consumed(expires_at);
 
       CREATE TABLE IF NOT EXISTS offboarding_candidates (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

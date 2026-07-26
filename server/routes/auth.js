@@ -362,6 +362,7 @@ router.post('/login-webauthn/verify', async (req, res) => {
     let verification;
     try {
       verification = await webauthn.finishAuthentication({
+          db,
         rp,
         response,
         challengeToken,

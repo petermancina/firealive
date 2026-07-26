@@ -51,6 +51,7 @@ const { logger } = require('../services/logger');
 const webauthn = require('../services/webauthn');
 const ca = require('../services/ca');
 const { auditLog } = require('../middleware/audit');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // B5b — FIDO2/WebAuthn passkey enrollment & management (self-service)
@@ -114,7 +115,7 @@ router.post('/passkey/register-options', async (req, res) => {
 // For a passwordless passkey, user verification is required at verification time
 // so the credential is genuinely MFA-complete. Persists the credential and
 // returns its public identifier.
-router.post('/passkey/register-verify', async (req, res) => {
+router.post('/passkey/register-verify', mfaStepUp(), async (req, res) => {
   try {
     const db = getDb();
     const body = req.body || {};
@@ -228,7 +229,7 @@ router.get('/passkeys', (req, res) => {
 // Remove one of the calling user's passkeys. Refuses if it would leave the user
 // with no way to authenticate (no password, no active certificate, no other
 // passwordless passkey) — lockout prevention.
-router.delete('/passkeys/:id', (req, res) => {
+router.delete('/passkeys/:id', mfaStepUp(), (req, res) => {
   try {
     const db = getDb();
     const id = req.params.id;

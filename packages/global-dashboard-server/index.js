@@ -63,6 +63,7 @@ const { routeGdAlert } = require('./services/gd-alert-router');
 const { gdRuntimeMonitor } = require('./services/gd-runtime-monitor');
 const { GdMetricsCollector } = require('./services/gd-metrics-collector');
 const { configLockChokepoint } = require('./services/gd-config-lock');
+const { gdMfaStepUp } = require('./services/gd-mfa-stepup');
 const { isGdConfigWriteRequest } = require('./services/gd-config-write-routes');
 const gdBackupFullSuite = require('./services/gd-backup-full-suite');
 const storageRouting = require('./services/gd-storage-routing');
@@ -668,6 +669,7 @@ app.post('/api/auth/login-webauthn/verify', async (req, res) => {
     let verification;
     try {
       verification = await gdWebauthn.finishAuthentication({
+        db,
         rp, response: body.response, challengeToken: body.challengeToken,
         credential: { credentialId: cred.credential_id, publicKey: cred.public_key, counter: cred.sign_count, transports: cred.transports },
         requireUserVerification: true,
@@ -883,7 +885,7 @@ app.post('/api/mfa/passkey/register-options', authMiddleware(['ciso', 'vp']), as
   finally { try { db.close(); } catch (_) { /* ignore */ } }
 });
 
-app.post('/api/mfa/passkey/register-verify', authMiddleware(['ciso', 'vp']), async (req, res) => {
+app.post('/api/mfa/passkey/register-verify', authMiddleware(['ciso', 'vp']), gdMfaStepUp(), async (req, res) => {
   const db = getDb();
   try {
     const body = req.body || {};
@@ -929,7 +931,7 @@ app.get('/api/mfa/passkeys', authMiddleware(['ciso', 'vp']), (req, res) => {
   finally { try { db.close(); } catch (_) { /* ignore */ } }
 });
 
-app.delete('/api/mfa/passkeys/:id', authMiddleware(['ciso', 'vp']), (req, res) => {
+app.delete('/api/mfa/passkeys/:id', authMiddleware(['ciso', 'vp']), gdMfaStepUp(), (req, res) => {
   const db = getDb();
   try {
     const id = req.params.id;

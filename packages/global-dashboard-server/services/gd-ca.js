@@ -90,6 +90,17 @@ const CLIENT_CERT_DAYS = 365;      // 1y analyst/operator certs.
 const KEY_ALGO_LABEL = 'rsa-3072'; // recorded in ca_authority.key_algo.
 const SIG_DIGEST = 'sha256';
 const EXTERNAL_ID_URI_PREFIX = 'firealive:external-id:'; // stamped into the SAN.
+// O3 Half 2: role OU for machine consumers. The GD's only machine-authenticated
+// surface is the cloud-vuln scanner feed, so exactly one OU is defined here --
+// the MC additionally carries api-key and threat-hunting OUs, which the GD has
+// no gate for. Defining an OU with no gate behind it would invite a certificate
+// nothing enforces.
+//
+// The GD runs its OWN CA, so this is a separate trust domain from the MC: a
+// scanner certificate issued by the MC does not verify here, and vice versa.
+// The string matches the MC's for legibility, not for interoperability.
+const SCANNER_CONSUMER_OU = 'scanner-consumer';
+const MACHINE_CONSUMER_OUS = [SCANNER_CONSUMER_OU];
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 function nowSqlite() {
@@ -308,6 +319,80 @@ function issueClientCert(db, { csrPem, userId = null, externalId = null, commonN
   });
 }
 
+// Does an X509 subject carry this exact role OU?
+// X509Certificate.subject is newline-separated RDNs; older builds use ", ".
+// Mirrors ca.subjectHasOu on the Regional Server. The two servers keep separate
+// copies because they are separate trust domains with separate CAs -- but the
+// PARSE must behave identically, so the GD twin is verified against the same
+// cases (see verify-half2-u4.js).
+function subjectHasOu(subject, ou) {
+  if (typeof subject !== 'string' || !ou) return false;
+  const parts = subject.split(/\r?\n|,\s*/);
+  for (const p of parts) {
+    const m = p.match(/^\s*OU\s*=\s*(.+?)\s*$/i);
+    if (m && m[1] === ou) return true;
+  }
+  return false;
+}
+
+function sanitizeConsumerCn(name) {
+  const cleaned = String(name || '').replace(/[^A-Za-z0-9 ._-]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 64);
+  return cleaned || 'scanner-consumer';
+}
+
+// Mint a machine-consumer certificate AND its key server-side, then hand both to
+// the operator to install in the scanner. Unlike issueClientCert (which signs a
+// client-supplied CSR), the subject -- including the role OU the access gate
+// checks -- is server-controlled and therefore trustworthy. clientAuth EKU;
+// signed by the active GD CA; recorded in issued_certs like every other leaf so
+// it is revocable through the same path.
+function issueMachineConsumerCert(db, { displayName, ou } = {}) {
+  // The OU comes from a closed set: a typo would otherwise mint a certificate
+  // no gate accepts.
+  if (!MACHINE_CONSUMER_OUS.includes(ou)) {
+    throw new Error('issueMachineConsumerCert: unknown consumer OU: ' + String(ou));
+  }
+  const cn = sanitizeConsumerCn(displayName);
+  return withTempDir((dir) => {
+    const caKeyPem = loadCaKeyPem(db);
+    const caCertPem = getCaCertPem(db);
+    const caKeyPath = path.join(dir, 'ca.key');
+    const caCrtPath = path.join(dir, 'ca.crt');
+    const keyPath = path.join(dir, 'consumer.key');
+    const csrPath = path.join(dir, 'consumer.csr');
+    const extPath = path.join(dir, 'consumer.ext');
+    const crtPath = path.join(dir, 'consumer.crt');
+    fs.writeFileSync(caKeyPath, caKeyPem, { mode: 0o600 });
+    fs.writeFileSync(caCrtPath, caCertPem);
+
+    openssl(['genpkey', '-algorithm', 'RSA',
+      '-pkeyopt', 'rsa_keygen_bits:' + SERVER_KEY_BITS, '-out', keyPath]);
+    const subject = '/OU=' + ou + '/CN=' + cn;
+    openssl(['req', '-new', '-key', keyPath, '-subj', subject, '-out', csrPath]);
+
+    fs.writeFileSync(extPath, [
+      'basicConstraints=CA:FALSE',
+      'keyUsage=critical,digitalSignature',
+      'extendedKeyUsage=clientAuth',
+    ].join('\n') + '\n');
+
+    const serial = nextSerialHex(db);
+    openssl(['x509', '-req', '-in', csrPath, '-CA', caCrtPath, '-CAkey', caKeyPath,
+      '-set_serial', '0x' + serial, '-days', String(CLIENT_CERT_DAYS),
+      '-' + SIG_DIGEST, '-extfile', extPath, '-out', crtPath]);
+
+    const certPem = fs.readFileSync(crtPath, 'utf8');
+    const keyPem = fs.readFileSync(keyPath, 'utf8');
+    const fp = fingerprint256(certPem);
+    recordIssued(db, {
+      serial, userId: null, externalId: null,
+      subject: 'OU=' + ou + ',CN=' + cn,
+      certPem, days: CLIENT_CERT_DAYS, fp,
+    });
+    return { certPem, keyPem, fingerprint: fp, serial, caCertPem };
+  });
+}
+
 function recordIssued(db, { serial, userId, externalId, subject, certPem, days, fp }) {
   const fingerprint = fp || fingerprint256(certPem);
   db.prepare(`
@@ -449,4 +534,8 @@ module.exports = {
   nowSqlite,
   KEY_ALGO_LABEL,
   EXTERNAL_ID_URI_PREFIX,
+  SCANNER_CONSUMER_OU,
+  MACHINE_CONSUMER_OUS,
+  subjectHasOu,
+  issueMachineConsumerCert,
 };

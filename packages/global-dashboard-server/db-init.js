@@ -891,6 +891,10 @@ CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
   display_name TEXT NOT NULL,
   allowed_cidrs TEXT NOT NULL DEFAULT '[]',
   scope_components TEXT NOT NULL DEFAULT '[]',
+  -- O3 Half 2: cert first, then token, then source IP -- the same three
+  -- factors the MC twin and threat_hunting_consumer_authorizations carry.
+  cert_fingerprint TEXT NOT NULL,
+  cert_serial TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   token_salt TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -901,6 +905,9 @@ CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
   last_scan_source_ip TEXT,
   notes TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_gd_cloud_vuln_auth_cert_fp
+  ON cloud_vuln_scanner_authorizations(cert_fingerprint);
 
 CREATE INDEX IF NOT EXISTS idx_cloud_vuln_auth_enabled
   ON cloud_vuln_scanner_authorizations(enabled, scanner_type);
@@ -993,6 +1000,20 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
 CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id);
 CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_passwordless
   ON webauthn_credentials(is_passwordless) WHERE is_passwordless = 1;
+
+-- O3 sub-phase 0: spent WebAuthn challenge tokens. See the MC twin in
+-- server/db/init.js for the full reasoning. Without this a step-up assertion is
+-- replayable for the whole 300s token TTL. The PRIMARY KEY on jti is the atomic
+-- check-and-set.
+CREATE TABLE IF NOT EXISTS webauthn_challenge_consumed (
+  jti TEXT PRIMARY KEY,
+  purpose TEXT,
+  user_id TEXT,
+  consumed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_challenge_consumed_expires
+  ON webauthn_challenge_consumed(expires_at);
 
 CREATE TABLE IF NOT EXISTS auth_recovery (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -1578,6 +1599,36 @@ function initDb() {
     }
   } catch (e) {
     console.error('backup_schedules status-column migration failed:', e.message);
+  }
+
+  // ── O3 Half 2: certificate binding on the GD's machine credentials ──────
+  //
+  // The CREATE declares these NOT NULL, so a fresh install is bound
+  // structurally. SQLite cannot add a NOT NULL column to an existing table
+  // without a DEFAULT, and any default here would be a FAKE fingerprint --
+  // worse than a null, because a fake LOOKS bound. So an upgraded database
+  // gets a nullable column and the access gate fails CLOSED on null: a
+  // scanner authorization with no bound certificate does not authenticate.
+  // No permissive mode, no grandfathering.
+  try {
+    const cvCols = db.prepare("PRAGMA table_info(cloud_vuln_scanner_authorizations)").all();
+    // Guard on TABLE existence, not on column absence. Anything touching the
+    // table must sit inside this check -- including the index, because
+    // CREATE INDEX IF NOT EXISTS applies the IF NOT EXISTS to the INDEX, not
+    // the table, and throws when the table is absent. The Regional Server
+    // twin had exactly this shape outside its guard and broke the smoke
+    // build. Guarding on column absence instead would skip the index on a
+    // FRESH install, where the column arrives with the CREATE.
+    if (cvCols.length) {
+      if (!cvCols.some(c => c.name === 'cert_fingerprint')) {
+        db.exec(`ALTER TABLE cloud_vuln_scanner_authorizations ADD COLUMN cert_fingerprint TEXT;`);
+        db.exec(`ALTER TABLE cloud_vuln_scanner_authorizations ADD COLUMN cert_serial TEXT;`);
+        console.log('Migrated cloud_vuln_scanner_authorizations (O3 Half 2): added cert_fingerprint / cert_serial; existing rows are UNBOUND and cannot authenticate until re-issued');
+      }
+      db.exec('CREATE INDEX IF NOT EXISTS idx_gd_cloud_vuln_auth_cert_fp ON cloud_vuln_scanner_authorizations(cert_fingerprint);');
+    }
+  } catch (e) {
+    console.error('O3 Half 2 GD certificate-binding migration failed:', e.message);
   }
 
   // v2 encrypted-backup + WAL/chain columns on `backups` (MC-grade parity).

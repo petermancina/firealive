@@ -25,6 +25,7 @@
 
 const { getDb } = require('../db/init');
 const ca = require('../services/ca');
+const { verifyMachineCert } = require('../services/machine-cert-auth');
 const registry = require('../services/threat-hunting-registry');
 const { appendAccessLog } = require('../services/threat-hunting-access-log');
 
@@ -70,17 +71,6 @@ function ipAllowed(ip, cidrs) {
   return Array.isArray(cidrs) && cidrs.some((c) => ipMatchesEntry(ip, c));
 }
 
-// ── certificate subject OU check ─────────────────────────────────────────────
-// X509Certificate.subject is newline-separated RDNs (older builds may use ", ").
-function subjectHasConsumerOu(subject) {
-  if (typeof subject !== 'string' || !CONSUMER_OU) return false;
-  const parts = subject.split(/\r?\n|,\s*/);
-  for (const p of parts) {
-    const m = p.match(/^\s*OU\s*=\s*(.+?)\s*$/i);
-    if (m && m[1] === CONSUMER_OU) return true;
-  }
-  return false;
-}
 
 // ── bearer-token extraction (Authorization: Bearer <token>) ──────────────────
 function extractBearer(req) {
@@ -117,21 +107,18 @@ function threatHuntingGate(req, res, next) {
   };
 
   try {
-    // Factor 1 -- mutual-TLS client certificate.
-    const peer = (req.socket && req.socket.getPeerCertificate)
-      ? req.socket.getPeerCertificate(true)
-      : null;
-    if (!peer || !peer.raw || !peer.raw.length) {
-      return reject(401, 'rejected_cert', null);
+    // Factor 1 -- mutual-TLS client certificate, CA-verified and scoped to this
+    // surface by its role OU. Delegates to the shared verifier so this gate and
+    // the API-key / scanner paths cannot drift apart in how they parse a subject
+    // or handle a verdict. Every failure answers the same 401 (no oracle); the
+    // reason is recorded in the hash-chained access log only.
+    const certCheck = verifyMachineCert(db, req, CONSUMER_OU);
+    if (!certCheck.ok) {
+      // certCheck.fingerprint is populated when the certificate verified but
+      // carried the wrong OU -- log it, as the pre-refactor code did.
+      return reject(401, 'rejected_cert', certCheck.fingerprint ? { fingerprint: certCheck.fingerprint } : null);
     }
-    const verdict = ca.verifyClientCert(db, peer.raw);
-    if (!verdict || !verdict.valid) {
-      return reject(401, 'rejected_cert', null);
-    }
-    if (!subjectHasConsumerOu(verdict.subject)) {
-      return reject(401, 'rejected_cert', { fingerprint: verdict.fingerprint256 });
-    }
-    const fp = verdict.fingerprint256;
+    const fp = certCheck.fingerprint;
     const row = registry.findByCertFingerprint(db, fp);
     if (!row) {
       return reject(401, 'rejected_cert', { fingerprint: fp });

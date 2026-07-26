@@ -176,37 +176,83 @@ function getClientCertThumbprint(req) {
 function handleApiKeyAuth(apiKey, req, res, next) {
   const bcrypt = require('bcryptjs');
   const { getDb } = require('../db/init');
+  const { verifyMachineCert } = require('../services/machine-cert-auth');
+  const ca = require('../services/ca');
+
+  let db = null;
+  const closeDb = () => { if (db) { try { db.close(); } catch (_) {} db = null; } };
+
+  // Single generic failure response for every auth-factor rejection: a caller
+  // must not learn WHICH factor failed, or the endpoint becomes an oracle for
+  // enumerating valid certificates and keys separately. Mirrors the
+  // threat-hunting gate's no-oracle rule.
+  const deny = (reasonForLog) => {
+    closeDb();
+    logger.warn('API key auth rejected', { reason: reasonForLog, ip: req.ip });
+    return res.status(401).json({ error: 'Invalid API key' });
+  };
 
   try {
-    const db = getDb();
-    const prefix = apiKey.slice(0, 8);
-    const keys = db.prepare(
-      'SELECT * FROM api_keys WHERE key_prefix = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > datetime("now"))'
-    ).all(prefix);
+    db = getDb();
 
+    // ── Factors 1-3: certificate present, CA-verified, correctly scoped ─────
+    // One shared implementation across every machine-authenticated path on this
+    // server; see services/machine-cert-auth.js for why four copies was the
+    // wrong answer. The reason is logged, never returned -- distinguishing
+    // "no certificate" from "certificate not registered" would let a caller
+    // enumerate valid certificates independently of valid keys.
+    const certCheck = verifyMachineCert(db, req, ca.API_KEY_CONSUMER_OU);
+    if (!certCheck.ok) {
+      return deny(certCheck.reason);
+    }
+    const fp = certCheck.fingerprint;
+
+    // ── Factor 4: an api_keys row BOUND to this exact certificate ────────────
+    // The lookup is by fingerprint, not by key prefix. A row with a NULL
+    // cert_fingerprint -- every row on a database upgraded across O3 -- cannot
+    // match, because SQL equality never matches NULL.
+    const keys = db.prepare(
+      "SELECT * FROM api_keys WHERE cert_fingerprint = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > datetime('now'))"
+    ).all(fp);
+    if (keys.length === 0) {
+      return deny('no_key_bound_to_cert');
+    }
+
+    // ── Factor 5: the bearer key itself, against rows bound to this cert ─────
     let matched = null;
     for (const k of keys) {
-      if (bcrypt.compareSync(apiKey, k.key_hash)) {
-        matched = k;
-        break;
-      }
+      // Belt and braces: the query above cannot return an unbound row, but if a
+      // future edit loosens it, an unbound row must still never authenticate.
+      if (typeof k.cert_fingerprint !== 'string' || k.cert_fingerprint.length === 0) continue;
+      if (k.cert_fingerprint !== fp) continue;
+      if (bcrypt.compareSync(apiKey, k.key_hash)) { matched = k; break; }
     }
-
     if (!matched) {
-      db.close();
-      return res.status(401).json({ error: 'Invalid API key' });
+      return deny('key_mismatch');
     }
 
-    // Update last_used_at
-    db.prepare('UPDATE api_keys SET last_used_at = datetime("now") WHERE id = ?').run(matched.id);
+    db.prepare("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?").run(matched.id);
 
-    // Set user context from key creator
     const creator = db.prepare('SELECT id, role, name FROM users WHERE id = ?').get(matched.created_by);
-    db.close();
+    if (!creator) {
+      return deny('orphaned_key');
+    }
+    closeDb();
 
-    req.user = { id: creator.id, role: creator.role, name: creator.name, apiKey: true, scopes: matched.scopes.split(',') };
+    req.user = {
+      id: creator.id,
+      role: creator.role,
+      name: creator.name,
+      apiKey: true,
+      scopes: matched.scopes.split(','),
+      // Recorded so a route can attribute an action to the exact certificate
+      // that carried it, not merely to the key.
+      certFingerprint: fp,
+      apiKeyId: matched.id,
+    };
     next();
   } catch (err) {
+    closeDb();
     logger.error('API key auth error', { error: err.message });
     return res.status(500).json({ error: 'Authentication error' });
   }

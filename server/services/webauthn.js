@@ -92,11 +92,49 @@ function parseTransports(t) {
 }
 
 function issueChallengeToken(challenge, extra) {
+  // O3 sub-phase 0: every challenge token carries a unique jti so a successful
+  // presentation can be recorded and a second one refused. Without it the token
+  // is a bearer credential valid for its whole TTL.
   return jwt.sign(
-    Object.assign({ wa_challenge: challenge }, extra || {}),
+    Object.assign({ wa_challenge: challenge, jti: crypto.randomBytes(16).toString('hex') }, extra || {}),
     JWT_SECRET,
     { algorithm: 'HS256', expiresIn: CHALLENGE_TTL_SEC }
   );
+}
+
+// Record a challenge token as spent. Atomic: the PRIMARY KEY on jti makes the
+// INSERT itself the check-and-set, so two concurrent replays cannot both win.
+// Throws on a second presentation.
+//
+// Called only AFTER the assertion verifies, so a garbage submission cannot burn
+// a legitimate operator's outstanding challenge.
+function consumeChallengeToken(db, decoded) {
+  if (!db || typeof db.prepare !== 'function') {
+    throw new Error('consumeChallengeToken requires a database handle');
+  }
+  if (!decoded || typeof decoded.jti !== 'string' || decoded.jti === '') {
+    // A token minted before this field existed, or a forged one. Refuse rather
+    // than fall back to the replayable path.
+    throw new Error('challenge token carries no jti; re-request a challenge');
+  }
+  const expIso = decoded.exp
+    ? new Date(decoded.exp * 1000).toISOString()
+    : new Date(Date.now() + CHALLENGE_TTL_SEC * 1000).toISOString();
+  try {
+    db.prepare(
+      'INSERT INTO webauthn_challenge_consumed (jti, purpose, user_id, expires_at) VALUES (?, ?, ?, ?)'
+    ).run(decoded.jti, decoded.purpose || null, decoded.sub || null, expIso);
+  } catch (err) {
+    if (/UNIQUE|constraint/i.test(err.message)) {
+      throw new Error('challenge token already used');
+    }
+    throw err;
+  }
+  // Opportunistic prune: rows are worthless once the token they guard has
+  // expired, because jwt.verify rejects it independently.
+  try {
+    db.prepare("DELETE FROM webauthn_challenge_consumed WHERE expires_at < datetime('now', '-1 hour')").run();
+  } catch (_) { /* pruning is best-effort and must never fail a verification */ }
 }
 
 function readChallengeToken(token, expectedPurpose) {
@@ -132,7 +170,13 @@ async function beginRegistration({ rp, userId, userName, existingCredentials = [
   return { options, challengeToken };
 }
 
-async function finishRegistration({ rp, response, challengeToken, requireUserVerification = false, db = null }) {
+async function finishRegistration({ rp, response, challengeToken, requireUserVerification = false, db }) {
+  // db is REQUIRED. It was already threaded here for loadTrustedRoots; the
+  // throw makes challenge consumption unbypassable too, so there is no path
+  // that verifies a registration and leaves its challenge replayable.
+  if (!db || typeof db.prepare !== 'function') {
+    throw new Error('finishRegistration requires a database handle to consume the challenge');
+  }
   const decoded = readChallengeToken(challengeToken, 'reg');
   const verification = await verifyRegistrationResponse({
     response,
@@ -151,6 +195,7 @@ async function finishRegistration({ rp, response, challengeToken, requireUserVer
   // admin-added root (rejecting 'none' and self-attestation); trustedRootId names
   // the matched root. The route layer feeds these to assertHardwareCredential.
   const chain = parseAttestationChain(info.attestationObject);
+  consumeChallengeToken(db, decoded);
   const roots = loadTrustedRoots(db);
   const chainResult = verifyAttestationChain(chain, roots);
   return {
@@ -328,7 +373,12 @@ async function beginAuthentication({ rp, allowCredentials = [], userVerification
   return { options, challengeToken };
 }
 
-async function finishAuthentication({ rp, response, challengeToken, credential, requireUserVerification = false }) {
+async function finishAuthentication({ rp, response, challengeToken, credential, requireUserVerification = false, db }) {
+  // db is REQUIRED. A replayed login assertion mints a whole SESSION, which
+  // is a larger prize than a replayed step-up minting one credential.
+  if (!db || typeof db.prepare !== 'function') {
+    throw new Error('finishAuthentication requires a database handle to consume the challenge');
+  }
   const decoded = readChallengeToken(challengeToken, 'auth');
   const verification = await verifyAuthenticationResponse({
     response,
@@ -343,6 +393,11 @@ async function finishAuthentication({ rp, response, challengeToken, credential, 
     },
     requireUserVerification,
   });
+  // Consume only a genuinely verified assertion: doing it earlier would let a
+  // garbage submission burn the operator's outstanding login challenge.
+  if (verification.verified) {
+    consumeChallengeToken(db, decoded);
+  }
   return {
     verified: !!verification.verified,
     newCounter: verification.authenticationInfo ? verification.authenticationInfo.newCounter : null,
@@ -376,7 +431,13 @@ async function beginStepUp({ rp, allowCredentials = [], userId }) {
   return { options, challengeToken };
 }
 
-async function finishStepUp({ rp, response, challengeToken, credential, expectedUserId }) {
+async function finishStepUp({ rp, response, challengeToken, credential, expectedUserId, db }) {
+  // db is REQUIRED. Refusing without it is what makes consumption
+  // unbypassable: there is no code path that verifies a step-up assertion and
+  // leaves it replayable.
+  if (!db || typeof db.prepare !== 'function') {
+    throw new Error('finishStepUp requires a database handle to consume the challenge');
+  }
   const decoded = readChallengeToken(challengeToken, 'stepup');
   // Bind the challenge to the acting user: the token must have been issued for
   // this exact user id. Rejects presenting a step-up challenge minted for a
@@ -397,6 +458,12 @@ async function finishStepUp({ rp, response, challengeToken, credential, expected
     },
     requireUserVerification: true,
   });
+  // Consume only a genuinely verified assertion. Doing it earlier would let a
+  // garbage submission burn the operator's outstanding challenge; doing it not
+  // at all leaves the assertion replayable for the rest of its TTL.
+  if (verification.verified) {
+    consumeChallengeToken(db, decoded);
+  }
   return {
     verified: !!verification.verified,
     newCounter: verification.authenticationInfo ? verification.authenticationInfo.newCounter : null,
@@ -411,6 +478,7 @@ module.exports = {
   finishAuthentication,
   beginStepUp,
   finishStepUp,
+  consumeChallengeToken,
   // Hardware-credential attestation gate (B5n3)
   assertHardwareCredential,
   HardwareCredentialError,

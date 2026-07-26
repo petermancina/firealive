@@ -91,6 +91,18 @@ const KEY_ALGO_LABEL = 'rsa-3072'; // recorded in ca_authority.key_algo.
 const SIG_DIGEST = 'sha256';
 const EXTERNAL_ID_URI_PREFIX = 'firealive:external-id:'; // stamped into the SAN.
 const THREAT_HUNTING_CONSUMER_OU = 'threat-hunting-consumer'; // role OU the feed gate checks (B5m).
+// O3 Half 2: one role OU per machine-consumer class. The OU is ENFORCED by each
+// gate, so it scopes a certificate to the surface it was issued for -- an
+// api-key certificate presented to the threat-hunting feed is rejected, and vice
+// versa. A single shared OU would make every machine certificate universal,
+// which is strictly weaker than what shipped in B5m.
+const API_KEY_CONSUMER_OU = 'api-key-consumer';
+const SCANNER_CONSUMER_OU = 'scanner-consumer';
+const MACHINE_CONSUMER_OUS = [
+  THREAT_HUNTING_CONSUMER_OU,
+  API_KEY_CONSUMER_OU,
+  SCANNER_CONSUMER_OU,
+];
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 function nowSqlite() {
@@ -398,12 +410,35 @@ function recordIssued(db, { serial, userId, externalId, subject, certPem, days, 
 // checks -- is server-controlled and trustworthy. clientAuth EKU; signed by the
 // active deployment CA; recorded in issued_certs like every other leaf so it is
 // revocable through the same path.
+// Does an X509 subject carry this exact role OU?
+//
+// X509Certificate.subject is newline-separated RDNs; older builds use ", ".
+// This lived in threat-hunting-auth.js. It moves here so the three machine-auth
+// gates share ONE parser rather than three copies that can drift apart -- a
+// subject-parsing difference between gates is precisely how one surface ends up
+// accepting a certificate another would refuse.
+function subjectHasOu(subject, ou) {
+  if (typeof subject !== 'string' || !ou) return false;
+  const parts = subject.split(/\r?\n|,\s*/);
+  for (const p of parts) {
+    const m = p.match(/^\s*OU\s*=\s*(.+?)\s*$/i);
+    if (m && m[1] === ou) return true;
+  }
+  return false;
+}
+
 function sanitizeConsumerCn(name) {
   const cleaned = String(name || '').replace(/[^A-Za-z0-9 ._-]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 64);
   return cleaned || 'threat-hunting-consumer';
 }
 
-function issueThreatHuntingConsumerCert(db, { displayName } = {}) {
+function issueMachineConsumerCert(db, { displayName, ou } = {}) {
+  // The OU comes from a closed set. A caller-supplied string would let a typo
+  // mint a certificate no gate accepts, or -- worse -- let one surface mint a
+  // certificate scoped to another.
+  if (!MACHINE_CONSUMER_OUS.includes(ou)) {
+    throw new Error('issueMachineConsumerCert: unknown consumer OU: ' + String(ou));
+  }
   const cn = sanitizeConsumerCn(displayName);
   return withTempDir((dir) => {
     const caKeyPem = loadCaKeyPem(db);
@@ -421,7 +456,7 @@ function issueThreatHuntingConsumerCert(db, { displayName } = {}) {
     openssl(['genpkey', '-algorithm', 'RSA',
       '-pkeyopt', 'rsa_keygen_bits:' + SERVER_KEY_BITS, '-out', keyPath]);
     // Server-controlled subject: we own the key, so the role OU is trustworthy.
-    const subject = '/OU=' + THREAT_HUNTING_CONSUMER_OU + '/CN=' + cn;
+    const subject = '/OU=' + ou + '/CN=' + cn;
     openssl(['req', '-new', '-key', keyPath, '-subj', subject, '-out', csrPath]);
 
     const extLines = [
@@ -441,7 +476,7 @@ function issueThreatHuntingConsumerCert(db, { displayName } = {}) {
     const fp = fingerprint256(certPem);
     recordIssued(db, {
       serial, userId: null, externalId: null,
-      subject: 'OU=' + THREAT_HUNTING_CONSUMER_OU + ',CN=' + cn,
+      subject: 'OU=' + ou + ',CN=' + cn,
       certPem, days: CLIENT_CERT_DAYS, fp,
     });
     return { certPem, keyPem, fingerprint: fp, serial, caCertPem };
@@ -571,7 +606,7 @@ module.exports = {
   reconcileServerCert,
   computeDesiredSan,
   issueClientCert,
-  issueThreatHuntingConsumerCert,
+  issueMachineConsumerCert,
   revokeCert,
   verifyClientCert,
   buildRevocationList,
@@ -583,4 +618,8 @@ module.exports = {
   KEY_ALGO_LABEL,
   EXTERNAL_ID_URI_PREFIX,
   THREAT_HUNTING_CONSUMER_OU,
+  API_KEY_CONSUMER_OU,
+  SCANNER_CONSUMER_OU,
+  MACHINE_CONSUMER_OUS,
+  subjectHasOu,
 };
