@@ -79,7 +79,7 @@ router.post('/', (req, res) => {
 
 router.put('/:id/complete', (req, res) => {
   const db = getDb();
-  db.prepare('UPDATE retro_protocols SET phase = ?, completed_at = datetime("now") WHERE id = ?').run('Complete', req.params.id);
+  db.prepare("UPDATE retro_protocols SET phase = ?, completed_at = datetime('now') WHERE id = ?").run('Complete', req.params.id);
   db.prepare('INSERT INTO retro_actions (retro_id, action_text) VALUES (?, ?)').run(req.params.id, 'Marked complete at ' + new Date().toISOString());
 
   // Restore routing caps for involved analysts
