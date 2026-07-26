@@ -626,8 +626,8 @@ function setDefault(db, id, ctx) {
     ).get();
     previousDefaultId = prev ? prev.id : null;
     if (previousDefaultId === id) return; // no-op
-    db.prepare('UPDATE kms_providers SET is_default = 0, updated_at = datetime("now") WHERE is_default = 1').run();
-    db.prepare('UPDATE kms_providers SET is_default = 1, updated_at = datetime("now") WHERE id = ?').run(id);
+    db.prepare("UPDATE kms_providers SET is_default = 0, updated_at = datetime('now') WHERE is_default = 1").run();
+    db.prepare("UPDATE kms_providers SET is_default = 1, updated_at = datetime('now') WHERE id = ?").run(id);
   });
   tx();
 

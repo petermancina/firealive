@@ -658,7 +658,7 @@ router.post('/panic', (req, res) => {
       );
 
       // Max out all caps — every analyst gets maximum complexity
-      db.prepare('UPDATE routing_caps SET max_complexity = 5, is_override = 1, override_reason = ?, override_by = ?, updated_at = datetime("now")').run(
+      db.prepare("UPDATE routing_caps SET max_complexity = 5, is_override = 1, override_reason = ?, override_by = ?, updated_at = datetime('now')").run(
         'PANIC MODE — all hands on deck', req.user.id
       );
 
@@ -713,7 +713,7 @@ router.post('/panic', (req, res) => {
       const saved = db.prepare("SELECT value FROM team_config WHERE key = 'panic_saved_caps'").get();
       if (saved) {
         const caps = JSON.parse(saved.value);
-        const restore = db.prepare('UPDATE routing_caps SET max_complexity = ?, is_override = 0, override_reason = NULL, override_by = NULL, updated_at = datetime("now") WHERE analyst_id = ?');
+        const restore = db.prepare("UPDATE routing_caps SET max_complexity = ?, is_override = 0, override_reason = NULL, override_by = NULL, updated_at = datetime('now') WHERE analyst_id = ?");
         for (const c of caps) restore.run(c.max_complexity, c.analyst_id);
       }
 

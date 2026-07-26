@@ -115,7 +115,7 @@ router.put('/routing/:analystId', (req, res) => {
 
   const db = getDb();
   db.prepare(
-    'UPDATE routing_caps SET max_complexity = ?, is_override = ?, override_reason = ?, override_by = ?, updated_at = datetime("now") WHERE analyst_id = ?'
+    "UPDATE routing_caps SET max_complexity = ?, is_override = ?, override_reason = ?, override_by = ?, updated_at = datetime('now') WHERE analyst_id = ?"
   ).run(maxComplexity, isOverride ? 1 : 0, overrideReason || null, req.user.id, analystId);
   db.close();
 

@@ -128,7 +128,7 @@ const schedulerService = {
         const { getDb } = require('../db/init');
         const db = getDb();
         const expired = db.prepare(
-          'UPDATE lighter_queue_requests SET status = ? WHERE status = ? AND expires_at < datetime("now")'
+          "UPDATE lighter_queue_requests SET status = ? WHERE status = ? AND expires_at < datetime('now')"
         ).run('expired', 'active');
         if (expired.changes > 0) {
           logger.info(`Expired ${expired.changes} lighter queue request(s)`);

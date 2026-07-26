@@ -11,6 +11,29 @@ const M=({children,...p})=><span style={{fontSize:11,fontFamily:"'IBM Plex Mono'
 const L=({children})=><div style={{fontSize:15,fontWeight:600,color:"#E8EDF5",marginBottom:16,fontFamily:"'Fraunces',serif"}}>{children}</div>;
 const Card=({children,style,...p})=><div style={{background:C.s,border:`1px solid ${C.b}`,borderRadius:10,padding:"18px 20px",marginBottom:14,...style}} {...p}>{children}</div>;
 const Btn=({children,primary,small,style,...p})=><button style={{padding:small?"5px 12px":"10px 18px",background:primary?C.ad:"transparent",border:`1px solid ${primary?C.a+"50":C.b}`,borderRadius:8,color:primary?C.a:C.tm,fontSize:small?10:12,fontWeight:500,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace",...style}} {...p}>{children}</button>;
+
+// O3 Half 2: one display for a machine credential handed out exactly once. A
+// scanner credential is no longer a single token -- it is the bearer secret PLUS
+// the client certificate that constrains it, its private key, and the CA to
+// trust. Twin of the MC component; separate because the two frontends are
+// separate bundles, not because the markup should differ. Uses the GD palette
+// (which has no C.sh) and the GD's own accent-tint idiom.
+const OneTimeCredentials=({creds,title,note,items,onDismiss})=>!creds?null:(
+  <Card style={{background:C.a+"10",border:`1px solid ${C.a}55`}}>
+    <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>{title}</M>
+    <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>{note}</M>
+    {items.map(c=>creds[c.k]?(
+      <div key={c.k} style={{marginBottom:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+          <M style={{color:C.t,fontWeight:500}}>{c.l}</M>
+          <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(String(creds[c.k]));}catch(e){}}}>Copy</Btn>
+        </div>
+        <code style={{display:"block",fontSize:10,whiteSpace:"pre-wrap",wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace",maxHeight:160,overflow:"auto"}}>{creds[c.k]}</code>
+      </div>
+    ):null)}
+    <Btn small onClick={onDismiss}>Dismiss</Btn>
+  </Card>
+);
 const Badge=({children,color})=><span style={{fontSize:9,padding:"2px 8px",borderRadius:10,background:color+"20",color,fontFamily:"'IBM Plex Mono',monospace",fontWeight:600}}>{children}</span>;
 const Input=({label,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<input style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}/></div>;
 const Sel=({label,children,...p})=><div style={{marginBottom:14}}>{label&&<M style={{color:C.tm,marginBottom:4,display:"block"}}>{label}</M>}<select style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:12}} {...p}>{children}</select></div>;
@@ -117,7 +140,7 @@ const api = {
   async get(path) { return this._send('GET', path); },
   async put(path, data) { return this._send('PUT', path, data); },
   async patch(path, data) { return this._send('PATCH', path, data); },
-  async del(path) { return this._send('DELETE', path); },
+  async del(path, data) { return this._send('DELETE', path, data); },
   async download(path, filename, opts) {
     const method = (opts && opts.method) || 'GET';
     const headers = this._headers();
@@ -187,7 +210,8 @@ function MyMfaSecuritySection() {
       try { cred = await navigator.credentials.create({ publicKey: deserializeRegOptions(opt.options) }); }
       catch (_e) { setBusy(false); setErr("Passkey enrollment was cancelled or failed."); return; }
       if (!cred) { setBusy(false); setErr("No passkey was created."); return; }
-      const r = await api.post("/api/mfa/passkey/register-verify", {
+      // O3: prove an existing credential before a new one is persisted.
+      const r = await stepUp("/api/mfa/passkey/register-verify", {
         response: serializeAttestation(cred),
         challengeToken: opt.challengeToken,
         label: label.trim() || undefined,
@@ -211,7 +235,7 @@ function MyMfaSecuritySection() {
   const removePasskey = async (id) => {
     if (!window.confirm("Remove this passkey?")) return;
     setErr(""); setMsg("");
-    const r = await api.del("/api/mfa/passkeys/" + id);
+    const r = await stepUp("/api/mfa/passkeys/" + id, {}, "del");
     if (r && r.removed) { setMsg("Passkey removed."); loadPasskeys().catch(()=>{}); }
     else { setErr(r && r.error ? String(r.error) : "Could not remove passkey."); }
   };
@@ -534,7 +558,7 @@ function serializeAssertion(cred) {
 // resend the sensitive request with body.stepup = { challengeToken, response }.
 // Reuses the login flow's deserializeAuthOptions + serializeAssertion. Returns the
 // sensitive call's result, or { error } if the step-up could not be completed.
-async function stepUp(path, body) {
+async function stepUp(path, body, method) {
   const opt = await api.post("/api/mfa/stepup/options");
   if (!opt || opt.error || !opt.options || !opt.challengeToken) {
     return { error: (opt && opt.error) || "Could not start the hardware-key step-up." };
@@ -545,7 +569,7 @@ async function stepUp(path, body) {
   } catch (e) {
     return { error: "Hardware-key step-up was cancelled or failed." };
   }
-  return await api.post(path, { ...(body || {}), stepup: { challengeToken: opt.challengeToken, response: serializeAssertion(cred) } });
+  return await api[method || "post"](path, { ...(body || {}), stepup: { challengeToken: opt.challengeToken, response: serializeAssertion(cred) } });
 }
 function deserializeRegOptions(options) {
   return {
@@ -1033,8 +1057,8 @@ const StorageDestinations = ({ addA }) => {
     setSaving(true); setFormErr(null);
     const payload = buildPayload();
     const r = modal === "add"
-      ? await api.post("/api/storage-destinations", payload)
-      : await api.patch("/api/storage-destinations/" + draft.id, payload);
+      ? await stepUp("/api/storage-destinations", payload)
+      : await stepUp("/api/storage-destinations/" + draft.id, payload, "patch");
     if (r && r.error) {
       setSaving(false);
       setFormErr(r.error + (r.field ? " (" + r.field + ")" : ""));
@@ -1047,7 +1071,7 @@ const StorageDestinations = ({ addA }) => {
 
   const remove = async () => {
     setSaving(true); setFormErr(null);
-    const r = await api.del("/api/storage-destinations/" + draft.id);
+    const r = await stepUp("/api/storage-destinations/" + draft.id, {}, "del");
     if (r && r.deleted) {
       if (addA) addA("STORAGE_DEST_REMOVED", draft.name);
       closeModal();
@@ -1061,7 +1085,7 @@ const StorageDestinations = ({ addA }) => {
   };
 
   const toggleEnabled = async (d) => {
-    const r = await api.patch("/api/storage-destinations/" + d.id, { enabled: !d.enabled });
+    const r = await stepUp("/api/storage-destinations/" + d.id, { enabled: !d.enabled }, "patch");
     if (r && r.error) { if (addA) addA("STORAGE_DEST_UPDATE_FAIL", d.name + ": " + r.error); return; }
     if (addA) addA("STORAGE_DEST_UPDATED", d.name + ": " + (d.enabled ? "disabled" : "enabled"));
     load();
@@ -1614,7 +1638,7 @@ export default function GlobalDashboard() {
   const [cvLoading, setCvLoading] = useState(false);
   const [cvError, setCvError] = useState(null);
   const [cvForm, setCvForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), notes, enabled}
-  const [cvNewToken, setCvNewToken] = useState(null); // one-time bearer token shown after create
+  const [cvNewToken, setCvNewToken] = useState(null); // {token, certPem, keyPem, caCertPem} -- shown once
   const [cvLog, setCvLog] = useState([]);
   const [cvLogTotal, setCvLogTotal] = useState(0);
   const [cvChain, setCvChain] = useState(null); // {intact, count, brokenAt?}
@@ -3347,15 +3371,18 @@ export default function GlobalDashboard() {
 
             {cvError&&<Card style={{background:C.d+"14",border:`1px solid ${C.d}40`}}><M style={{color:C.d}}>Error: {cvError}</M></Card>}
 
-            {cvNewToken&&(<Card style={{background:C.a+"10",border:`1px solid ${C.a}55`}}>
-              <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
-              <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer ..., or the X-Scan-Token header) when recording a scan via POST /api/cloud-vuln-access.</M>
-              <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{cvNewToken}</code>
-                <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(cvNewToken);}catch(e){}}}>Copy</Btn>
-                <Btn small onClick={()=>setCvNewToken(null)}>Dismiss</Btn>
-              </div>
-            </Card>)}
+            <OneTimeCredentials
+              creds={cvNewToken}
+              title="Scanner credentials - shown once"
+              note={'Copy all four into the scanner now. None can be retrieved again. The token alone authenticates NOTHING: the scanner must present this certificate on the TLS connection that carries the token, and must trust the Global Dashboard CA below.'}
+              items={[
+                {k:"token",l:"Scanner bearer token"},
+                {k:"certPem",l:"Client certificate (PEM)"},
+                {k:"keyPem",l:"Client private key (PEM)"},
+                {k:"caCertPem",l:"Global Dashboard CA certificate (PEM)"},
+              ]}
+              onDismiss={()=>setCvNewToken(null)}
+            />
 
             <Card>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
@@ -3378,9 +3405,9 @@ export default function GlobalDashboard() {
                     {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
                   </div>
                   <div style={{display:"flex",gap:6,flexShrink:0}}>
-                    <Btn small onClick={async()=>{const r=await api.put("/api/cloud-vuln/authorizations/"+a.id,{enabled:!a.enabled});if(r&&!r.error){showGdToast(a.enabled?"Scanner disabled":"Scanner enabled");reloadCloudVuln();}else setCvError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                    <Btn small onClick={async()=>{const r=await stepUp("/api/cloud-vuln/authorizations/"+a.id,{enabled:!a.enabled},"put");if(r&&!r.error){showGdToast(a.enabled?"Scanner disabled":"Scanner enabled");reloadCloudVuln();}else setCvError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
                     <Btn small onClick={()=>{setCvNewToken(null);setCvForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
-                    <Btn small style={{color:C.d,borderColor:C.d+"50"}} onClick={async()=>{if(!window.confirm("Revoke authorization \""+a.display_name+"\"? The scanner's token will stop working."))return;const r=await api.del("/api/cloud-vuln/authorizations/"+a.id);if(r&&!r.error){showGdToast("Authorization revoked");reloadCloudVuln();}else setCvError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                    <Btn small style={{color:C.d,borderColor:C.d+"50"}} onClick={async()=>{if(!window.confirm("Revoke authorization \""+a.display_name+"\"? The scanner's token will stop working."))return;const r=await stepUp("/api/cloud-vuln/authorizations/"+a.id,{},"del");if(r&&!r.error){showGdToast("Authorization revoked");reloadCloudVuln();}else setCvError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
                   </div>
                 </div>);
               })}
@@ -3423,11 +3450,11 @@ export default function GlobalDashboard() {
                     if(!cvForm.display_name.trim()){setCvError("Display name is required");return;}
                     if(cidrs.length===0){setCvError("At least one source IP / CIDR is required");return;}
                     if(cvForm.mode==="add"){
-                      const r=await api.post("/api/cloud-vuln/authorizations",{scanner_type:cvForm.scanner_type,display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null});
-                      if(r&&!r.error&&r.token){showGdToast("Scanner authorized");setCvForm(null);setCvError(null);setCvNewToken(r.token);reloadCloudVuln();}
+                      const r=await stepUp("/api/cloud-vuln/authorizations",{scanner_type:cvForm.scanner_type,display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null});
+                      if(r&&!r.error&&r.token){showGdToast("Scanner authorized");setCvForm(null);setCvError(null);setCvNewToken(r);reloadCloudVuln();}
                       else setCvError((r&&r.error)||"create failed");
                     }else{
-                      const r=await api.put("/api/cloud-vuln/authorizations/"+cvForm.id,{display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null,enabled:cvForm.enabled});
+                      const r=await stepUp("/api/cloud-vuln/authorizations/"+cvForm.id,{display_name:cvForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:cvForm.notes||null,enabled:cvForm.enabled});
                       if(r&&!r.error){showGdToast("Authorization updated");setCvForm(null);setCvError(null);reloadCloudVuln();}
                       else setCvError((r&&r.error)||"save failed");
                     }

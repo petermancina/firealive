@@ -52,7 +52,7 @@ const api = {
   async get(path) { try { const r = await fetch(API_BASE + path, { headers: await this.authHeaders('GET', path) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async put(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PUT', headers: await this.authHeaders('PUT', path), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   async patch(path, data) { try { const r = await fetch(API_BASE + path, { method: 'PATCH', headers: await this.authHeaders('PATCH', path), body: JSON.stringify(data) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
-  async del(path) { try { const r = await fetch(API_BASE + path, { method: 'DELETE', headers: await this.authHeaders('DELETE', path) }); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
+  async del(path, data) { try { const _init = { method: 'DELETE', headers: await this.authHeaders('DELETE', path) }; if (data !== undefined) _init.body = JSON.stringify(data); const r = await fetch(API_BASE + path, _init); if (r.ok) return await r.json(); let _b = {}; try { _b = await r.json(); } catch (_e) {} return { error: _b.error || r.statusText, code: _b.code, reason: _b.reason, _status: r.status }; } catch (e) { console.warn('[API]', path, e.message); return { error: e.message }; } },
   // download(path, filename, opts?) — fetches a binary response (CSV, PDF,
   // DOCX, etc.) and triggers a browser download via an anchor click. Use
   // for endpoints that return a blob rather than JSON; the get/post/put
@@ -282,6 +282,32 @@ const Btn = ({children,primary,danger,small,disabled,style,...p}) => <button dis
   color:disabled?C.td:danger?C.d:primary?C.a:C.tm,fontSize:small?10:12,fontWeight:500,
   cursor:disabled?"default":"pointer",...style}} {...p}>{children}</button>;
 const Badge = ({children,color=C.tm}) => <span style={{fontSize:9,padding:"2px 8px",background:`${color}18`,border:`1px solid ${color}40`,borderRadius:12,color,fontFamily:"'IBM Plex Mono',monospace"}}>{children}</span>;
+// O3 Half 2: one display for every machine credential handed out exactly once.
+// Four surfaces mint one now -- API keys, on-prem scanner authorizations, cloud
+// scanner authorizations, and threat-hunting consumers -- and a credential is no
+// longer a single string: it is a bearer secret PLUS the client certificate that
+// constrains it, its private key, and the CA to trust. Four copies of this
+// markup would drift, and the failure mode of drift here is an operator who
+// copies three of the four parts and cannot authenticate.
+//
+// `items` is [{k, l}] naming which fields of `creds` to render, in order.
+const OneTimeCredentials = ({ creds, title, note, items, onDismiss }) => !creds ? null : (
+  <Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
+    <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>{title}</M>
+    <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.5}}>{note}</M>
+    {items.map(c=>creds[c.k]?(
+      <div key={c.k} style={{marginBottom:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+          <M style={{color:C.t,fontWeight:500}}>{c.l}</M>
+          <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(String(creds[c.k]));}catch(e){}}}>Copy</Btn>
+        </div>
+        <code style={{display:"block",fontSize:10,whiteSpace:"pre-wrap",wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace",maxHeight:160,overflow:"auto"}}>{creds[c.k]}</code>
+      </div>
+    ):null)}
+    <Btn small onClick={onDismiss}>Dismiss</Btn>
+  </Card>
+);
+
 const Modal = ({children,onClose,title,width=480}) => (
   <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
     <div style={{width,maxWidth:"95vw",maxHeight:"90vh",overflow:"auto",padding:24,background:"#0D1117",border:`1px solid ${C.b}`,borderRadius:14}}>
@@ -466,6 +492,21 @@ const storageDestHint = (cfg) => {
 const emptyDestDraft = () => ({ id:null, name:"", adapter:"local", config:{}, creds:{}, immutability_mode:"unknown", retention_days:"", enabled:true });
 
 const StorageDestinations = ({ addA }) => {
+  // O3: a storage destination holds egress credentials, so creating, changing
+  // or removing one is a mint path and re-proves the hardware credential at the
+  // moment of the action. This component sits outside ManagementConsole and
+  // cannot reach its getStepUp, so it carries a local one in the same shape
+  // MigrationPanel already uses -- one idiom, not a third.
+  const getStepUp = async () => {
+    const opt = await api.post("/api/mfa/stepup/options", {});
+    if (!opt || opt.error || !opt.options || !opt.challengeToken) { return null; }
+    let cred;
+    try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
+    catch (_e) { return null; }
+    if (!cred) return null;
+    return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
+  };
+
   const [dests, setDests] = useState(null); // null = loading, [] = empty, [...] = loaded
   const [err, setErr] = useState(null);
   const [probe, setProbe] = useState({}); // id -> "running" | { ok, error, detail }
@@ -531,10 +572,12 @@ const StorageDestinations = ({ addA }) => {
   const save = async () => {
     if (!draft.name || String(draft.name).trim() === "") { setFormErr("Name is required."); return; }
     setSaving(true); setFormErr(null);
+    const stepup = await getStepUp();
+    if (!stepup) { setSaving(false); setFormErr("A hardware-key step-up is required to save a storage destination."); return; }
     const payload = buildPayload();
     const r = modal === "add"
-      ? await api.post("/api/storage-destinations", payload)
-      : await api.patch("/api/storage-destinations/" + draft.id, payload);
+      ? await api.post("/api/storage-destinations", { ...payload, stepup })
+      : await api.patch("/api/storage-destinations/" + draft.id, { ...payload, stepup });
     if (r && r.error) {
       setSaving(false);
       setFormErr(r.error + (r.field ? " (" + r.field + ")" : ""));
@@ -547,7 +590,9 @@ const StorageDestinations = ({ addA }) => {
 
   const remove = async () => {
     setSaving(true); setFormErr(null);
-    const r = await api.del("/api/storage-destinations/" + draft.id);
+    const stepup = await getStepUp();
+    if (!stepup) { setSaving(false); setFormErr("A hardware-key step-up is required to remove a storage destination."); return; }
+    const r = await api.del("/api/storage-destinations/" + draft.id, { stepup });
     if (r && r.deleted) {
       if (addA) addA("STORAGE_DEST_REMOVED", draft.name);
       closeModal();
@@ -561,7 +606,9 @@ const StorageDestinations = ({ addA }) => {
   };
 
   const toggleEnabled = async (d) => {
-    const r = await api.patch("/api/storage-destinations/" + d.id, { enabled: !d.enabled });
+    const stepup = await getStepUp();
+    if (!stepup) { if (addA) addA("STORAGE_DEST_UPDATE_FAIL", d.name + ": hardware-key step-up required"); return; }
+    const r = await api.patch("/api/storage-destinations/" + d.id, { enabled: !d.enabled, stepup });
     if (r && r.error) { if (addA) addA("STORAGE_DEST_UPDATE_FAIL", d.name + ": " + r.error); return; }
     if (addA) addA("STORAGE_DEST_UPDATED", d.name + ": " + (d.enabled ? "disabled" : "enabled"));
     load();
@@ -1234,6 +1281,23 @@ function MyMfaSecuritySection() {
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
+  // O3: enrolling or removing a credential is a mint path and requires a fresh
+  // user-verified assertion from an EXISTING credential. This component sits
+  // outside ManagementConsole, so it cannot reach that component's getStepUp;
+  // this mirrors the shape MigrationPanel already uses rather than inventing a
+  // third idiom. Every session holder has a passwordless passkey by
+  // construction -- login refuses is_passwordless != 1 -- so this can never be
+  // unsatisfiable.
+  const getStepUp = async () => {
+    const opt = await api.post("/api/mfa/stepup/options", {});
+    if (!opt || opt.error || !opt.options || !opt.challengeToken) { setErr("Could not start the hardware-key step-up: " + ((opt && opt.error) || "no challenge issued")); return null; }
+    let cred;
+    try { cred = await navigator.credentials.get({ publicKey: deserializeAuthOptions(opt.options) }); }
+    catch (_e) { return null; }
+    if (!cred) return null;
+    return { response: serializeAssertion(cred), challengeToken: opt.challengeToken };
+  };
+
   const loadPasskeys = async () => {
     const r = await api.get("/api/mfa/passkeys");
     setPasskeys(r && Array.isArray(r.passkeys) ? r.passkeys : []);
@@ -1259,11 +1323,17 @@ function MyMfaSecuritySection() {
       try { cred = await navigator.credentials.create({ publicKey: deserializeRegOptions(opt.options) }); }
       catch (_e) { setBusy(false); setErr("Passkey enrollment was cancelled or failed."); return; }
       if (!cred) { setBusy(false); setErr("No passkey was created."); return; }
+      // O3: prove an existing credential before a new one is persisted. Two
+      // touches in sequence is the control working, not a fault: the new key
+      // above, the enrolled key here.
+      const stepup = await getStepUp();
+      if (!stepup) { setBusy(false); setErr("A hardware-key step-up is required to enroll a new passkey."); return; }
       const r = await api.post("/api/mfa/passkey/register-verify", {
         response: serializeAttestation(cred),
         challengeToken: opt.challengeToken,
         passwordless: true,
         label: label.trim() || undefined,
+        stepup,
       });
       setBusy(false);
       if (!r || r.error) {
@@ -1286,7 +1356,9 @@ function MyMfaSecuritySection() {
   const removePasskey = async (id) => {
     if (!window.confirm("Remove this passkey?")) return;
     setErr(""); setMsg("");
-    const r = await api.del("/api/mfa/passkeys/" + id);
+    const stepup = await getStepUp();
+    if (!stepup) { setErr("A hardware-key step-up is required to remove a passkey."); return; }
+    const r = await api.del("/api/mfa/passkeys/" + id, { stepup });
     if (r && r.removed) { setMsg("Passkey removed."); loadPasskeys().catch(()=>{}); }
     else { setErr(r && r.error ? String(r.error) : "Could not remove passkey."); }
   };
@@ -3147,6 +3219,21 @@ function ManagementConsole() {
   const [hirLoading, setHirLoading] = useState(false);
   const [edrCfg, setEdrCfg] = useState({enabled:false,provider:null,scanOnUpload:true,scanOnRestore:true,scanOnPolicyImport:true,blockOnThreat:true,quarantineOnSuspicious:true});
   // ── Phase F4c: Multi-provider malware scanner integration ──
+  // O3 sub-phase 3: adding a scanner. The backend has always supported it;
+  // the console offered only test / toggle / delete, so on a fresh deployment
+  // the panel was unreachable -- nothing to toggle because nothing could be
+  // created.
+  const SCANNER_TYPES = [
+    "clamav", "virustotal",
+    "crowdstrike_falcon", "microsoft_defender", "sentinelone", "cisco_amp",
+    "fortinet_fortisandbox", "palo_alto_wildfire",
+    "trellix_atd", "sophos_intelix",
+    "joe_sandbox", "hybrid_analysis",
+    "blackberry_cylance", "trend_micro_ddan", "kaspersky_sandbox",
+  ];
+  const [scannerAdd, setScannerAdd] = useState(null); // {provider_type, display_name, credentialsText, priority}
+  const [scannerAddBusy, setScannerAddBusy] = useState(false);
+  const [scannerAddError, setScannerAddError] = useState(null);
   const [scannerList, setScannerList] = useState([]);
   const [scanMode, setScanMode] = useState("single_with_fallback");
   const [scannerForm, setScannerForm] = useState(null); // {mode:'add'|'edit', id?, provider_type, display_name, priority, enabled, credentials:{}}
@@ -3183,7 +3270,6 @@ function ManagementConsole() {
     setScannerListLoading(false);
   };
   useEffect(() => { reloadScanners(); }, []);
-  const [kmsCfg, setKmsCfg] = useState({enabled:false,provider:null,endpoint:"",keyId:"",rotationPolicy:"annual",envelopeEncryption:true,hsmBacked:false,keyUsage:{tier3Encryption:true,tier1Encryption:true,e2eeKeyWrapping:true,backupEncryption:true,auditLogSigning:true}});
   const [wifiPolicy, setWifiPolicy] = useState({minimumProtocol:"wpa2_enterprise",wpa3Preferred:true,blockWpa2Personal:true,requireDot1x:true,warnOnInsecure:true,disconnectOnInsecure:false});
   // ── v1.0.0 NEW STATE ──────────────────────────────────────────────────
   // MFA wizard
@@ -3851,7 +3937,6 @@ function ManagementConsole() {
   // B5d2: hydrate the team_config-backed tabs from their persistence endpoints on mount
   useEffect(()=>{
     api.get("/api/edr/config").then(c=>{if(c&&!c.error)setEdrCfg(pr=>({...pr,...c}));}).catch(()=>{});
-    api.get("/api/kms/config").then(c=>{if(c&&!c.error)setKmsCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/network/wifi-policy").then(c=>{if(c&&!c.error)setWifiPolicy(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/notifications/client-config").then(c=>{if(c&&!c.error)setClientNotifCfg(pr=>({...pr,...c}));}).catch(()=>{});
     api.get("/api/recert/status").then(st=>{if(st&&!st.error)setRecertCfg(pr=>({intervalDays:st.intervalDays||pr.intervalDays,enabled:st.reason!=="Recertification disabled"}));}).catch(()=>{});
@@ -3942,12 +4027,80 @@ function ManagementConsole() {
   const [vulnScanLoading, setVulnScanLoading] = useState(false);
   const [vulnScanError, setVulnScanError] = useState(null);
   const [vulnScanForm, setVulnScanForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), notes, enabled}
-  const [vulnScanNewToken, setVulnScanNewToken] = useState(null); // one-time bearer token shown after create
+  const [vulnScanNewToken, setVulnScanNewToken] = useState(null); // {token, certPem, keyPem, caCertPem} -- shown once
   const [vulnScanLog, setVulnScanLog] = useState([]);
   const [vulnScanLogTotal, setVulnScanLogTotal] = useState(0);
   const [vulnScanChain, setVulnScanChain] = useState(null); // {intact, count, brokenAt?}
   const [vulnScanConfig, setVulnScanConfig] = useState({enabled:false, allowedScanners:[], schedule:"weekly"});
   const [vulnScanConfigSaving, setVulnScanConfigSaving] = useState(false);
+
+  // ── O3 sub-phase 3: API keys. Backed by /api/apikeys, which has existed and
+  // been complete since R2. The previous console was decorative: a hardcoded
+  // list, a Revoke that only wrote a local activity line, and a Generate that
+  // minted a fake key in the browser and never called the server.
+  const API_KEY_SCOPES = [
+    "health:read", "siem:read", "siem:write",
+    "reports:generate", "routing:read", "routing:write", "routing:events",
+    "audit:read", "backup:trigger", "assessments:read",
+    "integrations:read", "integrations:write", "ticketing:events",
+    "cicd:webhook",
+  ];
+  const [apiKeyList, setApiKeyList] = useState([]);
+  const [apiKeyLoading, setApiKeyLoading] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState(null);
+  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+  const [apiKeyNewKey, setApiKeyNewKey] = useState(null); // {rawKey, certPem, keyPem, caCertPem, certFingerprint} -- shown once
+  const [apiKeyForm, setApiKeyForm] = useState({name:"", scopes:[], expiresIn:"90d"});
+  // ── O3 sub-phase 3: KMS providers. Backed by /api/kms-providers, the
+  // canonical multi-provider system with encrypted credentials, probe and
+  // atomic default election. The previous console PUT a flat blob to
+  // /api/kms/config, which stores a preference nothing consumes.
+  const KMS_TYPES = [
+    {id:"env-var", l:"Environment variable (development only)"},
+    {id:"aws-kms", l:"AWS KMS"},
+    {id:"azure-keyvault", l:"Azure Key Vault"},
+    {id:"gcp-kms", l:"Google Cloud KMS"},
+    {id:"hashicorp-vault", l:"HashiCorp Vault"},
+  ];
+  const [kmsList, setKmsList] = useState([]);
+  const [kmsLoading, setKmsLoading] = useState(false);
+  const [kmsError, setKmsError] = useState(null);
+  const [kmsBusy, setKmsBusy] = useState(false);
+  const [kmsForm, setKmsForm] = useState(null); // {mode:'add'|'edit', id?, name, provider_type, configText, credentialsText}
+  const reloadKmsProviders = async () => {
+    setKmsLoading(true); setKmsError(null);
+    try {
+      const r = await api.get("/api/kms-providers");
+      if (r && Array.isArray(r.items)) setKmsList(r.items);
+      else if (r && r.error) setKmsError(r.error);
+    } catch (e) { setKmsError(e.message); }
+    setKmsLoading(false);
+  };
+  useEffect(() => { if (tab === "kms") reloadKmsProviders(); }, [tab]);
+  // One helper for all six mutating KMS paths: each re-proves the hardware
+  // credential, and each assertion is single-use since sub-phase 0.
+  const kmsAct = async (fn, activity) => {
+    setKmsBusy(true); setKmsError(null);
+    try {
+      const stepup = await getStepUp();
+      if (!stepup) { setKmsError("A hardware-key step-up is required for this change."); return; }
+      const r = await fn(stepup);
+      if (r && r.error) { setKmsError(r.error); return; }
+      if (activity) addA("KMS_PROVIDER_" + activity.k, activity.v);
+      await reloadKmsProviders();
+      return r;
+    } finally { setKmsBusy(false); }
+  };
+  const reloadApiKeys = async () => {
+    setApiKeyLoading(true); setApiKeyError(null);
+    try {
+      const r = await api.get("/api/apikeys");
+      if (r && Array.isArray(r.keys)) setApiKeyList(r.keys);
+      else if (r && r.error) setApiKeyError(r.error);
+    } catch (e) { setApiKeyError(e.message); }
+    setApiKeyLoading(false);
+  };
+  useEffect(() => { if (tab === "apikeys") reloadApiKeys(); }, [tab]);
   const reloadVulnScan = async () => {
     setVulnScanLoading(true); setVulnScanError(null);
     try {
@@ -5513,17 +5666,45 @@ function ManagementConsole() {
                 // clicked "Change Secret" (server preserves existing on omission).
                 const soarConfig = {platform:soarPlatform, apiEndpoint:soarUrl, serviceAccount:soarServiceAccount, autoEscalate:soarAutoEscalate};
                 if (!soarApiKeyPresent || soarApiKeyChanging) soarConfig.apiKey = soarApiKey;
-                const soarRes = await api.put("/api/integrations/soar", {config:soarConfig});
+                const soarStepup = await getStepUp();
+      if (!soarStepup) { setSoarSaveError("A hardware-key step-up is required to save the SOAR configuration."); return; }
+      const soarRes = await api.put("/api/integrations/soar", {config:soarConfig, stepup:soarStepup});
                 if (soarRes?.error) { setSoarSaveError("SOAR save failed: "+soarRes.error); return; }
                 const ticketingConfig = {platform:soarTicketingPlatform, apiEndpoint:soarTicketingEndpoint};
                 if (!soarTicketingApiKeyPresent || soarTicketingApiKeyChanging) ticketingConfig.apiKey = soarTicketingApiKey;
-                const tkRes = await api.put("/api/integrations/ticketing", {config:ticketingConfig});
+                const tkStepup = await getStepUp();
+      if (!tkStepup) { setSoarSaveError("A hardware-key step-up is required to save the Ticketing configuration."); return; }
+      const tkRes = await api.put("/api/integrations/ticketing", {config:ticketingConfig, stepup:tkStepup});
                 if (tkRes?.error) { setSoarSaveError("Ticketing save failed: "+tkRes.error); return; }
                 addA("SOAR_CONFIG_SAVED","SOAR + Ticketing integrations saved");
                 // Re-hydrate from server so the form reflects post-save state
                 setSoarHydrated(false);
               } finally { setSoarSaveBusy(false); }
             }}>{soarSaveBusy?"Saving...":"Save SOAR Config"}</Btn>
+              <Btn danger disabled={soarSaveBusy} onClick={async()=>{
+                if(!window.confirm("Remove the SOAR integration? Its stored endpoint and API key are deleted. Escalations will stop being forwarded."))return;
+                setSoarSaveError(null); setSoarSaveBusy(true);
+                try {
+                  const stepup = await getStepUp();
+                  if (!stepup) { setSoarSaveError("A hardware-key step-up is required to remove an integration."); return; }
+                  const r = await api.del("/api/integrations/soar", {stepup});
+                  if (r?.error) { setSoarSaveError("SOAR removal failed: "+r.error); return; }
+                  addA("INTEGRATION_REMOVED","SOAR");
+                  setSoarHydrated(false);
+                } finally { setSoarSaveBusy(false); }
+              }}>Remove SOAR</Btn>
+              <Btn danger disabled={soarSaveBusy} onClick={async()=>{
+                if(!window.confirm("Remove the Ticketing integration? Its stored endpoint and API key are deleted. Tickets will stop being created."))return;
+                setSoarSaveError(null); setSoarSaveBusy(true);
+                try {
+                  const stepup = await getStepUp();
+                  if (!stepup) { setSoarSaveError("A hardware-key step-up is required to remove an integration."); return; }
+                  const r = await api.del("/api/integrations/ticketing", {stepup});
+                  if (r?.error) { setSoarSaveError("Ticketing removal failed: "+r.error); return; }
+                  addA("INTEGRATION_REMOVED","Ticketing");
+                  setSoarHydrated(false);
+                } finally { setSoarSaveBusy(false); }
+              }}>Remove Ticketing</Btn>
             <Btn disabled={soarTestBusy} onClick={async()=>{
               setSoarTestResult(null);
               setSoarTestBusy(true);
@@ -5801,24 +5982,89 @@ function ManagementConsole() {
         {/* API KEY MANAGEMENT — NEW v0.0.9 */}
         {tab==="apikeys"&&(<div>
           <L>API Key Management</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Role-scoped API keys for programmatic access. Keys follow least-privilege: each key has explicit scope (read-only team health, CEF stream, report generation, etc.).</M>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Role-scoped API keys for programmatic access. Each key carries explicit scopes and is stored only as a bcrypt hash — the raw key is shown once, at creation, and cannot be recovered afterwards. Creating or revoking a key re-proves your hardware credential.</M>
+
+          {apiKeyError&&(<Card style={{marginBottom:16,borderColor:C.d+"55"}}><M style={{color:C.d}}>{apiKeyError}</M></Card>)}
+
+          <OneTimeCredentials
+            creds={apiKeyNewKey}
+            title="API key and its client certificate - shown once"
+            note={'Copy all four into your integration now. None can be retrieved again. The key alone authenticates NOTHING: the client must present this certificate on the TLS connection that carries the key, and must trust the FireAlive CA below.'}
+            items={[
+              {k:"rawKey",l:"API key (X-API-Key header)"},
+              {k:"certPem",l:"Client certificate (PEM)"},
+              {k:"keyPem",l:"Client private key (PEM)"},
+              {k:"caCertPem",l:"FireAlive CA certificate (PEM)"},
+            ]}
+            onDismiss={()=>setApiKeyNewKey(null)}
+          />
+
           <Card style={{marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Active Keys</div>
-            {[{name:"SIEM Feed Consumer",scope:"siem:read",created:"2026-03-15",last:"2s ago",status:"active"},{name:"Report Automation",scope:"reports:generate,reports:read",created:"2026-03-20",last:"8h ago",status:"active"},{name:"Dashboard Widget",scope:"health:read",created:"2026-03-22",last:"5m ago",status:"active"}].map((k,i)=>(
-              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"10px 0",borderBottom:`1px solid ${C.b}`,alignItems:"center"}}>
-                <div><div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{k.name}</div><M style={{color:C.tm}}>Scope: {k.scope} · Created: {k.created} · Last used: {k.last}</M></div>
-                <div style={{display:"flex",gap:6}}><Badge color={C.a}>{k.status}</Badge><Btn small danger onClick={()=>addA("API_KEY_REVOKED",k.name)}>Revoke</Btn></div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Active Keys</div>
+              <Btn small onClick={reloadApiKeys} disabled={apiKeyLoading}>{apiKeyLoading?"Loading...":"Refresh"}</Btn>
+            </div>
+            {apiKeyLoading&&apiKeyList.length===0&&(<M style={{color:C.tm}}>Loading keys...</M>)}
+            {!apiKeyLoading&&apiKeyList.length===0&&(<M style={{color:C.tm}}>No API keys have been issued.</M>)}
+            {apiKeyList.map(k=>(
+              <div key={k.id} style={{display:"flex",justifyContent:"space-between",padding:"10px 0",borderBottom:`1px solid ${C.b}`,alignItems:"center",gap:12}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{k.name} <code style={{fontSize:10,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.key_prefix}...</code></div>
+                  <M style={{color:C.tm,wordBreak:"break-word"}}>Scopes: {k.scopes||"none"} · Created: {(k.created_at||"").slice(0,10)}{k.created_by_name?" by "+k.created_by_name:""} · Last used: {k.last_used_at?k.last_used_at.slice(0,16).replace("T"," "):"never"}{k.expires_at?" · Expires: "+k.expires_at.slice(0,10):" · No expiry"}</M>
+                </div>
+                <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
+                  <Badge color={k.revoked?C.d:(k.expires_at&&new Date(k.expires_at)<new Date()?C.w:C.a)}>{k.revoked?"revoked":(k.expires_at&&new Date(k.expires_at)<new Date()?"expired":"active")}</Badge>
+                  {!k.revoked&&(<Btn small danger disabled={apiKeyBusy} onClick={async()=>{
+                    if(!window.confirm(`Revoke "${k.name}"? Any integration using this key will stop working immediately.`))return;
+                    setApiKeyBusy(true); setApiKeyError(null);
+                    try{
+                      const stepup=await getStepUp();
+                      if(!stepup){setApiKeyError("A hardware-key step-up is required to revoke an API key.");return;}
+                      const r=await api.del("/api/apikeys/"+k.id,{stepup});
+                      if(r&&r.error)setApiKeyError(r.error);
+                      else{addA("API_KEY_REVOKED",k.name);await reloadApiKeys();}
+                    }finally{setApiKeyBusy(false);}
+                  }}>Revoke</Btn>)}
+                </div>
               </div>
             ))}
           </Card>
+
           <Card style={{padding:16}}>
             <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>Generate New Key</div>
-            <Input label="Key name" placeholder="e.g., Splunk Integration" maxLength={100}/>
-            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:6,display:"block"}}>Scopes:</M>
-              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{["health:read","siem:read","reports:read","reports:generate","routing:read","audit:read"].map(s=><label key={s} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:C.t}}><input type="checkbox" style={{accentColor:C.a}}/>{s}</label>)}</div>
+            <Input label="Key name" placeholder="e.g., Splunk Integration" maxLength={100} value={apiKeyForm.name} onChange={e=>setApiKeyForm({...apiKeyForm,name:e.target.value})}/>
+            <div style={{marginBottom:14}}><M style={{color:C.tm,marginBottom:6,display:"block"}}>Scopes (least privilege — grant only what the integration needs):</M>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{API_KEY_SCOPES.map(s=>(
+                <label key={s} style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:C.tm,cursor:"pointer"}}>
+                  <input type="checkbox" checked={apiKeyForm.scopes.includes(s)} onChange={()=>setApiKeyForm({...apiKeyForm,scopes:apiKeyForm.scopes.includes(s)?apiKeyForm.scopes.filter(x=>x!==s):[...apiKeyForm.scopes,s]})}/>
+                  <code style={{fontFamily:"'IBM Plex Mono',monospace"}}>{s}</code>
+                </label>
+              ))}</div>
             </div>
-            <Sel label="Expiry"><option value="30d">30 days</option><option value="90d">90 days</option><option value="1y">1 year</option><option value="none">No expiry (not recommended)</option></Sel>
-            <Btn primary onClick={()=>{const key="scr-"+Array.from(crypto.getRandomValues(new Uint8Array(24)),b=>b.toString(16).padStart(2,"0")).join("").slice(0,32);navigator.clipboard.writeText(key).catch(()=>{});addA("API_KEY_GENERATED","New API key generated: "+key.slice(0,12)+"…");alert("API Key generated and copied to clipboard:\\n\\n"+key+"\\n\\nStore this securely — it will not be shown again.");}}>Generate Key</Btn>
+            <Sel label="Expiry" value={apiKeyForm.expiresIn} onChange={e=>setApiKeyForm({...apiKeyForm,expiresIn:e.target.value})}>
+              <option value="30d">30 days</option>
+              <option value="90d">90 days</option>
+              <option value="180d">180 days</option>
+              <option value="365d">365 days</option>
+              <option value="">No expiry (not recommended)</option>
+            </Sel>
+            <Btn primary disabled={apiKeyBusy||!apiKeyForm.name.trim()||apiKeyForm.scopes.length===0} onClick={async()=>{
+              setApiKeyBusy(true); setApiKeyError(null);
+              try{
+                const stepup=await getStepUp();
+                if(!stepup){setApiKeyError("A hardware-key step-up is required to issue an API key.");return;}
+                const r=await api.post("/api/apikeys",{name:apiKeyForm.name.trim(),scopes:apiKeyForm.scopes,expiresIn:apiKeyForm.expiresIn||undefined,stepup});
+                if(r&&r.error){setApiKeyError(r.error);return;}
+                if(r&&r.rawKey){
+                  // Keep the whole bundle: the key is useless without its certificate.
+                  setApiKeyNewKey(r);
+                  setApiKeyForm({name:"",scopes:[],expiresIn:"90d"});
+                  addA("API_KEY_CREATED",apiKeyForm.name.trim()+" ("+apiKeyForm.scopes.join(", ")+")");
+                  await reloadApiKeys();
+                } else setApiKeyError("The server did not return a key.");
+              }finally{setApiKeyBusy(false);}
+            }}>{apiKeyBusy?"Working...":"Generate Key"}</Btn>
+            {apiKeyForm.scopes.length===0&&(<M style={{color:C.tm,display:"block",marginTop:8}}>Select at least one scope.</M>)}
           </Card>
         </div>)}
 
@@ -6554,15 +6800,18 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
           {cloudVulnError&&<Card style={{marginBottom:16,borderColor:C.d+"40",background:C.dd}}><M style={{color:C.d}}>Error: {cloudVulnError}</M></Card>}
 
-          {cloudVulnNewToken&&(<Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
-            <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
-            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner's configuration now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer …, or the X-Scan-Token header) when it records a scan via POST /api/cloud-vuln-access.</M>
-            <div style={{display:"flex",gap:8,alignItems:"center"}}>
-              <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{cloudVulnNewToken}</code>
-              <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(cloudVulnNewToken);}catch(e){}}}>Copy</Btn>
-              <Btn small onClick={()=>setCloudVulnNewToken(null)}>Dismiss</Btn>
-            </div>
-          </Card>)}
+          <OneTimeCredentials
+            creds={cloudVulnNewToken}
+            title="Scanner credentials - shown once"
+            note={'Copy all four into the scanner now. None can be retrieved again. The token alone authenticates NOTHING: the scanner must present this certificate on the TLS connection that carries the token, and must trust the FireAlive CA below.'}
+            items={[
+              {k:"token",l:"Scanner bearer token"},
+              {k:"certPem",l:"Client certificate (PEM)"},
+              {k:"keyPem",l:"Client private key (PEM)"},
+              {k:"caCertPem",l:"FireAlive CA certificate (PEM)"},
+            ]}
+            onDismiss={()=>setCloudVulnNewToken(null)}
+          />
 
           {/* ── AUTHORIZED SCANNERS LIST ── */}
           <Card style={{marginBottom:16}}>
@@ -6587,9 +6836,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
                 </div>
                 <div style={{display:"flex",gap:6,flexShrink:0}}>
-                  <Btn small onClick={async()=>{const r=await api.put(`/api/cloud-vuln/authorizations/${a.id}`,{enabled:!a.enabled});if(r&&!r.error)reloadCloudVuln();else setCloudVulnError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={async()=>{const stepup=await getStepUp();if(!stepup)return;const r=await api.put(`/api/cloud-vuln/authorizations/${a.id}`,{enabled:!a.enabled,stepup});if(r&&!r.error)reloadCloudVuln();else setCloudVulnError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
                   <Btn small onClick={()=>{setCloudVulnNewToken(null);setCloudVulnForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),scope_components:a.scope_components||[],notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
-                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const r=await api.del(`/api/cloud-vuln/authorizations/${a.id}`);if(r&&!r.error){addA("CLOUD_VULN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadCloudVuln();}else setCloudVulnError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const stepup=await getStepUp();if(!stepup)return;const r=await api.del(`/api/cloud-vuln/authorizations/${a.id}`,{stepup});if(r&&!r.error){addA("CLOUD_VULN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadCloudVuln();}else setCloudVulnError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
                 </div>
               </div>);
             })}
@@ -6645,11 +6894,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   if(cidrs.length===0){setCloudVulnError("At least one source IP / CIDR is required");return;}
                   if(cloudVulnForm.scope_components.length===0){setCloudVulnError("Select at least one component in scope");return;}
                   if(cloudVulnForm.mode==="add"){
-                    const r=await api.post("/api/cloud-vuln/authorizations",{scanner_type:cloudVulnForm.scanner_type,display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null});
-                    if(r&&!r.error&&r.token){addA("CLOUD_VULN_AUTH_CREATED",cloudVulnForm.display_name.trim()+" ("+cloudVulnForm.scanner_type+")");setCloudVulnForm(null);setCloudVulnError(null);setCloudVulnNewToken(r.token);reloadCloudVuln();}
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.post("/api/cloud-vuln/authorizations",{stepup,scanner_type:cloudVulnForm.scanner_type,display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null});
+                    if(r&&!r.error&&r.token){addA("CLOUD_VULN_AUTH_CREATED",cloudVulnForm.display_name.trim()+" ("+cloudVulnForm.scanner_type+")");setCloudVulnForm(null);setCloudVulnError(null);setCloudVulnNewToken(r);reloadCloudVuln();}
                     else setCloudVulnError((r&&r.error)||"create failed");
                   }else{
-                    const r=await api.put(`/api/cloud-vuln/authorizations/${cloudVulnForm.id}`,{display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null,enabled:cloudVulnForm.enabled});
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.put(`/api/cloud-vuln/authorizations/${cloudVulnForm.id}`,{stepup,display_name:cloudVulnForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:cloudVulnForm.scope_components,notes:cloudVulnForm.notes||null,enabled:cloudVulnForm.enabled});
                     if(r&&!r.error){addA("CLOUD_VULN_AUTH_UPDATED",cloudVulnForm.display_name.trim());setCloudVulnForm(null);setCloudVulnError(null);reloadCloudVuln();}
                     else setCloudVulnError((r&&r.error)||"save failed");
                   }
@@ -7973,22 +8222,25 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
             <M style={{color:C.td,display:"block",marginBottom:12,lineHeight:1.5}}>Removing a scanner type from the policy (or disabling scanning) immediately stops authorizing and rate-limit-exempting it — existing tokens for that type are rejected until it is permitted again.</M>
             <Btn primary disabled={vulnScanConfigSaving} onClick={async()=>{
               setVulnScanConfigSaving(true);
-              const r=await api.put("/api/vuln-scan/config",{enabled:vulnScanConfig.enabled,allowedScanners:vulnScanConfig.allowedScanners,schedule:vulnScanConfig.schedule});
+              const stepup=await getStepUp();if(!stepup)return;const r=await api.put("/api/vuln-scan/config",{stepup,enabled:vulnScanConfig.enabled,allowedScanners:vulnScanConfig.allowedScanners,schedule:vulnScanConfig.schedule});
               setVulnScanConfigSaving(false);
               if(r&&!r.error){addA("VULN_SCAN_CONFIG_UPDATED","enabled="+vulnScanConfig.enabled+" scanners="+vulnScanConfig.allowedScanners.join(",")+" schedule="+vulnScanConfig.schedule);setVulnScanError(null);if(r.config)setVulnScanConfig({enabled:!!r.config.enabled,allowedScanners:r.config.allowedScanners||[],schedule:r.config.schedule||"weekly"});}
               else setVulnScanError((r&&r.error)||"save policy failed");
             }}>{vulnScanConfigSaving?"Saving...":"Save policy"}</Btn>
           </Card>
 
-          {vulnScanNewToken&&(<Card style={{marginBottom:16,borderColor:C.a+"55",background:C.sh}}>
-            <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>Scanner token — shown once</M>
-            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.5}}>Copy this token into your scanner's configuration now. It is stored only as a salted hash and cannot be retrieved again. The scanner presents it (Authorization: Bearer …, or the X-Scan-Token header) when it records a scan via POST /api/vuln-scan-access.</M>
-            <div style={{display:"flex",gap:8,alignItems:"center"}}>
-              <code style={{flex:1,fontSize:11,wordBreak:"break-all",background:C.bg,padding:"8px 10px",borderRadius:8,border:`1px solid ${C.b}`,color:C.t,fontFamily:"'IBM Plex Mono',monospace"}}>{vulnScanNewToken}</code>
-              <Btn small onClick={()=>{try{if(navigator.clipboard)navigator.clipboard.writeText(vulnScanNewToken);}catch(e){}}}>Copy</Btn>
-              <Btn small onClick={()=>setVulnScanNewToken(null)}>Dismiss</Btn>
-            </div>
-          </Card>)}
+          <OneTimeCredentials
+            creds={vulnScanNewToken}
+            title="Scanner credentials - shown once"
+            note={'Copy all four into the scanner now. None can be retrieved again. The token alone authenticates NOTHING: the scanner must present this certificate on the TLS connection that carries the token, and must trust the FireAlive CA below.'}
+            items={[
+              {k:"token",l:"Scanner bearer token"},
+              {k:"certPem",l:"Client certificate (PEM)"},
+              {k:"keyPem",l:"Client private key (PEM)"},
+              {k:"caCertPem",l:"FireAlive CA certificate (PEM)"},
+            ]}
+            onDismiss={()=>setVulnScanNewToken(null)}
+          />
 
           {/* ── AUTHORIZED SCANNERS LIST ── */}
           <Card style={{marginBottom:16}}>
@@ -8014,9 +8266,9 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
                 </div>
                 <div style={{display:"flex",gap:6,flexShrink:0}}>
-                  <Btn small onClick={async()=>{const r=await api.put(`/api/vuln-scan/authorizations/${a.id}`,{enabled:!a.enabled});if(r&&!r.error)reloadVulnScan();else setVulnScanError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                  <Btn small onClick={async()=>{const stepup=await getStepUp();if(!stepup)return;const r=await api.put(`/api/vuln-scan/authorizations/${a.id}`,{enabled:!a.enabled,stepup});if(r&&!r.error)reloadVulnScan();else setVulnScanError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
                   <Btn small onClick={()=>{setVulnScanNewToken(null);setVulnScanForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
-                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const r=await api.del(`/api/vuln-scan/authorizations/${a.id}`);if(r&&!r.error){addA("VULN_SCAN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadVulnScan();}else setVulnScanError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                  <Btn small danger onClick={async()=>{if(!window.confirm(`Revoke authorization "${a.display_name}"? The scanner's token will stop working.`))return;const stepup=await getStepUp();if(!stepup)return;const r=await api.del(`/api/vuln-scan/authorizations/${a.id}`,{stepup});if(r&&!r.error){addA("VULN_SCAN_AUTH_REVOKED",a.display_name+" ("+a.scanner_type+")");reloadVulnScan();}else setVulnScanError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
                 </div>
               </div>);
             })}
@@ -8065,11 +8317,11 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                   if(!vulnScanForm.display_name.trim()){setVulnScanError("Display name is required");return;}
                   if(cidrs.length===0){setVulnScanError("At least one source IP / CIDR is required");return;}
                   if(vulnScanForm.mode==="add"){
-                    const r=await api.post("/api/vuln-scan/authorizations",{scanner_type:vulnScanForm.scanner_type,display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null});
-                    if(r&&!r.error&&r.token){addA("VULN_SCAN_AUTH_CREATED",vulnScanForm.display_name.trim()+" ("+vulnScanForm.scanner_type+")");setVulnScanForm(null);setVulnScanError(null);setVulnScanNewToken(r.token);reloadVulnScan();}
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.post("/api/vuln-scan/authorizations",{stepup,scanner_type:vulnScanForm.scanner_type,display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null});
+                    if(r&&!r.error&&r.token){addA("VULN_SCAN_AUTH_CREATED",vulnScanForm.display_name.trim()+" ("+vulnScanForm.scanner_type+")");setVulnScanForm(null);setVulnScanError(null);setVulnScanNewToken(r);reloadVulnScan();}
                     else setVulnScanError((r&&r.error)||"create failed");
                   }else{
-                    const r=await api.put(`/api/vuln-scan/authorizations/${vulnScanForm.id}`,{display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null,enabled:vulnScanForm.enabled});
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.put(`/api/vuln-scan/authorizations/${vulnScanForm.id}`,{stepup,display_name:vulnScanForm.display_name.trim(),allowed_cidrs:cidrs,notes:vulnScanForm.notes||null,enabled:vulnScanForm.enabled});
                     if(r&&!r.error){addA("VULN_SCAN_AUTH_UPDATED",vulnScanForm.display_name.trim());setVulnScanForm(null);setVulnScanError(null);reloadVulnScan();}
                     else setVulnScanError((r&&r.error)||"save failed");
                   }
@@ -8226,7 +8478,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
               </div>
             </label>
             <Btn primary small style={{marginTop:10}} onClick={async()=>{
-              const r=await api.post("/api/v1/malware-scanners/scan-mode",{mode:scanMode});
+              const stepup=await getStepUp();if(!stepup)return;const r=await api.post("/api/v1/malware-scanners/scan-mode",{mode:scanMode,stepup});
               if(r&&!r.error){addA("MALWARE_SCAN_MODE_SAVED","Scan mode set to "+scanMode);}
               else{setScannerError((r&&r.error)||"failed to save scan mode");}
             }}>Save scan mode</Btn>
@@ -8236,8 +8488,37 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Configured scanners ({scannerList.length})</div>
+              <Btn small primary disabled={scannerAddBusy} onClick={()=>{setScannerAddError(null);setScannerAdd({provider_type:"clamav",display_name:"",credentialsText:"{}",priority:10});}}>Add Scanner</Btn>
               <Btn primary small onClick={()=>setScannerForm({mode:"add",provider_type:"",display_name:"",priority:100,enabled:true,credentials:{}})}>+ Add Scanner</Btn>
             </div>
+            {scannerAddError&&(<Card style={{marginBottom:12,borderColor:C.d+"55"}}><M style={{color:C.d}}>{scannerAddError}</M></Card>)}
+            {scannerAdd&&(<Card style={{padding:14,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginBottom:10}}>Add malware scanner</div>
+              <Sel label="Provider" value={scannerAdd.provider_type} onChange={e=>setScannerAdd({...scannerAdd,provider_type:e.target.value})}>
+                {SCANNER_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+              </Sel>
+              <Input label="Display name" placeholder="e.g., Primary ClamAV" maxLength={128} value={scannerAdd.display_name} onChange={e=>setScannerAdd({...scannerAdd,display_name:e.target.value})}/>
+              <Input label="Priority (lower runs first)" type="number" value={scannerAdd.priority} onChange={e=>setScannerAdd({...scannerAdd,priority:Number(e.target.value)})}/>
+              <M style={{color:C.tm,marginBottom:4,display:"block"}}>Credentials (JSON — stored encrypted and never returned). ClamAV typically needs {"{"}"host":"...","port":3310{"}"}; cloud scanners need an API key.</M>
+              <textarea value={scannerAdd.credentialsText} onChange={e=>setScannerAdd({...scannerAdd,credentialsText:e.target.value})} rows={4} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",marginBottom:12}}/>
+              <div style={{display:"flex",gap:8}}>
+                <Btn primary disabled={scannerAddBusy||!scannerAdd.display_name.trim()} onClick={async()=>{
+                  let creds;
+                  try { creds = JSON.parse(scannerAdd.credentialsText||"{}"); } catch(e){ setScannerAddError("Credentials are not valid JSON."); return; }
+                  setScannerAddBusy(true); setScannerAddError(null);
+                  try {
+                    const stepup = await getStepUp();
+                    if (!stepup) { setScannerAddError("A hardware-key step-up is required to add a scanner."); return; }
+                    const r = await api.post("/api/v1/malware-scanners", {provider_type:scannerAdd.provider_type,display_name:scannerAdd.display_name.trim(),credentials:creds,priority:scannerAdd.priority,enabled:true,stepup});
+                    if (r?.error) { setScannerAddError(r.error); return; }
+                    addA("MALWARE_SCANNER_ADDED", scannerAdd.display_name.trim()+" ("+scannerAdd.provider_type+")");
+                    setScannerAdd(null);
+                    await reloadScanners();
+                  } finally { setScannerAddBusy(false); }
+                }}>{scannerAddBusy?"Adding...":"Add Scanner"}</Btn>
+                <Btn onClick={()=>{setScannerAdd(null);setScannerAddError(null);}}>Cancel</Btn>
+              </div>
+            </Card>)}
             {scannerListLoading&&<M style={{color:C.tm}}>Loading...</M>}
             {!scannerListLoading&&scannerList.length===0&&(
               <div style={{padding:"24px 0",textAlign:"center"}}>
@@ -8275,13 +8556,13 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
                     reloadScanners();
                   }}>Test</Btn>
                   <Btn small onClick={async()=>{
-                    const r=await api.post(`/api/v1/malware-scanners/${s.id}`,{enabled:!s.enabled});
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.post(`/api/v1/malware-scanners/${s.id}`,{enabled:!s.enabled,stepup});
                     if(r&&!r.error)reloadScanners();
                   }}>{s.enabled?"Disable":"Enable"}</Btn>
                   <Btn small onClick={()=>setScannerForm({mode:"edit",id:s.id,provider_type:s.provider_type,display_name:s.display_name,priority:s.priority,enabled:s.enabled,credentials:{}})}>Edit</Btn>
                   <Btn small danger onClick={async()=>{
                     if(!window.confirm(`Delete scanner "${s.display_name}"? This cannot be undone.`))return;
-                    const r=await api.del(`/api/v1/malware-scanners/${s.id}`);
+                    const stepup=await getStepUp();if(!stepup)return;const r=await api.del(`/api/v1/malware-scanners/${s.id}`,{stepup});
                     if(r&&!r.error){addA("MALWARE_SCANNER_DELETED",s.display_name+" ("+s.provider_type+")");reloadScanners();}
                     else{setScannerError((r&&r.error)||"delete failed");}
                   }}>Del</Btn>
@@ -8362,28 +8643,78 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
 
         {/* ══════════ ENTERPRISE KMS ══════════ */}
         {tab==="kms"&&(<div>
-          <L>Enterprise Key Management</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Integrate with your enterprise key management system for centralized key lifecycle management, HSM-backed key storage, and automated rotation. All encryption tiers (Tier-3 analyst data, Tier-1 team data, E2EE peer chat, backups, audit log signing) can be managed through your KMS.</M>
+          <L>Key Management Service</L>
+          <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>External KMS providers that wrap FireAlive's key-encryption key. Credentials are stored encrypted and never returned by the API. Exactly one enabled provider is the default; changing it re-wraps the KEK atomically. Every change here re-proves your hardware credential.</M>
+
+          {kmsError&&(<Card style={{marginBottom:16,borderColor:C.d+"55"}}><M style={{color:C.d}}>{kmsError}</M></Card>)}
+
           <Card style={{marginBottom:16}}>
-            <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.t,marginBottom:14}}><input type="checkbox" checked={kmsCfg.enabled} onChange={e=>setKmsCfg(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/>Enable enterprise KMS</label>
-            <Sel label="KMS Provider" value={kmsCfg.provider||""} onChange={e=>setKmsCfg(prev=>({...prev,provider:e.target.value}))}>
-              <option value="">Select...</option><option value="aws_kms">AWS KMS</option><option value="azure_keyvault">Azure Key Vault</option><option value="gcp_cloudkms">GCP Cloud KMS</option><option value="hashicorp_vault">HashiCorp Vault</option><option value="thales_ciphertrust">Thales CipherTrust Manager</option><option value="entrust_nshield">Entrust nShield</option>
-            </Sel>
-            <Input label="KMS endpoint / ARN" value={kmsCfg.endpoint} onChange={e=>setKmsCfg(prev=>({...prev,endpoint:e.target.value}))} placeholder="arn:aws:kms:us-east-1:123456789:key/..." maxLength={512}/>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Input label="Key ID / alias" value={kmsCfg.keyId} onChange={e=>setKmsCfg(prev=>({...prev,keyId:e.target.value}))} maxLength={256}/>
-              <Sel label="Rotation policy" value={kmsCfg.rotationPolicy} onChange={e=>setKmsCfg(prev=>({...prev,rotationPolicy:e.target.value}))}><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="annual">Annual</option><option value="manual">Manual</option></Sel>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5"}}>Configured Providers</div>
+              <div style={{display:"flex",gap:6}}>
+                <Btn small onClick={reloadKmsProviders} disabled={kmsLoading}>{kmsLoading?"Loading...":"Refresh"}</Btn>
+                <Btn small primary disabled={kmsBusy} onClick={()=>setKmsForm({mode:"add",name:"",provider_type:"aws-kms",configText:"{}",credentialsText:""})}>Add Provider</Btn>
+              </div>
             </div>
-            <label style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",cursor:"pointer"}}><input type="checkbox" checked={kmsCfg.hsmBacked} onChange={e=>setKmsCfg(prev=>({...prev,hsmBacked:e.target.checked}))}/><M style={{color:C.t}}>HSM-backed keys (FIPS 140-2 Level 3+)</M></label>
-            <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5",marginTop:8,marginBottom:8}}>Key Usage Scope</div>
-            {[{k:"tier3Encryption",l:"Tier-3: Analyst private data encryption"},{k:"tier1Encryption",l:"Tier-1: Team aggregate data encryption"},{k:"e2eeKeyWrapping",l:"E2EE: Peer chat key wrapping"},{k:"backupEncryption",l:"Backup encryption"},{k:"auditLogSigning",l:"Audit log signing"}].map(u=>(
-              <label key={u.k} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0",cursor:"pointer"}}><input type="checkbox" checked={kmsCfg.keyUsage[u.k]} onChange={e=>setKmsCfg(prev=>({...prev,keyUsage:{...prev.keyUsage,[u.k]:e.target.checked}}))}/><M style={{color:C.t}}>{u.l}</M></label>
+            {kmsLoading&&kmsList.length===0&&(<M style={{color:C.tm}}>Loading providers...</M>)}
+            {!kmsLoading&&kmsList.length===0&&(<M style={{color:C.tm}}>No KMS provider is configured. FireAlive is using its built-in key wrapping.</M>)}
+            {kmsList.map(k=>(
+              <div key={k.id} style={{padding:"10px 0",borderBottom:`1px solid ${C.b}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>{k.name} <code style={{fontSize:10,color:C.tm,fontFamily:"'IBM Plex Mono',monospace"}}>{k.provider_type}</code></div>
+                    <M style={{color:C.tm,wordBreak:"break-word"}}>{k.has_credentials?"Credentials stored":"No credentials"} · Probe: {k.last_probe_status?(k.last_probe_status+(k.last_probe_at?" at "+k.last_probe_at.slice(0,16).replace("T"," "):"")):"never"}{k.last_probe_error?" — "+k.last_probe_error:""}</M>
+                  </div>
+                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",flexShrink:0}}>
+                    {k.is_default&&(<Badge color={C.a}>default</Badge>)}
+                    <Badge color={k.enabled?C.a:C.tm}>{k.enabled?"enabled":"disabled"}</Badge>
+                    <Btn small disabled={kmsBusy} onClick={()=>kmsAct(stepup=>api.post("/api/kms-providers/"+k.id+"/probe",{stepup}),null)}>Probe</Btn>
+                    <Btn small disabled={kmsBusy} onClick={()=>setKmsForm({mode:"edit",id:k.id,name:k.name,provider_type:k.provider_type,configText:JSON.stringify(k.config||{},null,2),credentialsText:""})}>Edit</Btn>
+                    {!k.is_default&&k.enabled&&(<Btn small disabled={kmsBusy} onClick={()=>kmsAct(stepup=>api.post("/api/kms-providers/"+k.id+"/set-default",{stepup}),{k:"SET_DEFAULT",v:k.name})}>Make Default</Btn>)}
+                    <Btn small disabled={kmsBusy} onClick={()=>kmsAct(stepup=>k.enabled
+                      ? api.post(`/api/kms-providers/${k.id}/disable`,{stepup})
+                      : api.post(`/api/kms-providers/${k.id}/enable`,{stepup}),
+                      {k:k.enabled?"DISABLED":"ENABLED",v:k.name})}>{k.enabled?"Disable":"Enable"}</Btn>
+                    <Btn small danger disabled={kmsBusy} onClick={()=>{if(!window.confirm(`Delete "${k.name}"? Key material wrapped by this provider must already be re-wrapped elsewhere.`))return;kmsAct(stepup=>api.del("/api/kms-providers/"+k.id,{stepup}),{k:"DELETED",v:k.name});}}>Delete</Btn>
+                  </div>
+                </div>
+              </div>
             ))}
           </Card>
-          <Btn primary onClick={()=>api.put("/api/kms/config",kmsCfg).then(r=>saved(r,"KMS_CONFIG_SAVED","Enterprise KMS configuration saved"))}>Save KMS Config</Btn>
+
+          {kmsForm&&(<Card style={{padding:16,marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:12}}>{kmsForm.mode==="add"?"Add KMS Provider":"Edit "+kmsForm.name}</div>
+            <Input label="Name" placeholder="e.g., prod-aws-kms" maxLength={128} value={kmsForm.name} onChange={e=>setKmsForm({...kmsForm,name:e.target.value})}/>
+            {kmsForm.mode==="add"?(
+              <Sel label="Provider type" value={kmsForm.provider_type} onChange={e=>setKmsForm({...kmsForm,provider_type:e.target.value})}>
+                {KMS_TYPES.map(t=><option key={t.id} value={t.id}>{t.l}</option>)}
+              </Sel>
+            ):(<M style={{color:C.tm,display:"block",marginBottom:14}}>Provider type is <code style={{fontFamily:"'IBM Plex Mono',monospace"}}>{kmsForm.provider_type}</code> and cannot be changed. Create a new provider and delete this one to switch.</M>)}
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Configuration (JSON — endpoint, key id, region, and any provider-specific fields):</M>
+            <textarea value={kmsForm.configText} onChange={e=>setKmsForm({...kmsForm,configText:e.target.value})} rows={6} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",marginBottom:14}}/>
+            <M style={{color:C.tm,marginBottom:4,display:"block"}}>Credentials (JSON — stored encrypted, never returned).{kmsForm.mode==="edit"?" Leave blank to keep the existing credentials unchanged.":""}</M>
+            <textarea value={kmsForm.credentialsText} onChange={e=>setKmsForm({...kmsForm,credentialsText:e.target.value})} rows={4} placeholder={kmsForm.mode==="edit"?"(unchanged)":'{"accessKeyId":"...","secretAccessKey":"..."}'} style={{width:"100%",padding:10,background:"rgba(255,255,255,0.03)",border:`1px solid ${C.b}`,borderRadius:8,color:C.t,fontSize:11,fontFamily:"'IBM Plex Mono',monospace",marginBottom:14}}/>
+            <div style={{display:"flex",gap:8}}>
+              <Btn primary disabled={kmsBusy||!kmsForm.name.trim()} onClick={async()=>{
+                let cfg, creds;
+                try { cfg = JSON.parse(kmsForm.configText||"{}"); } catch(e){ setKmsError("Configuration is not valid JSON."); return; }
+                if (kmsForm.credentialsText.trim()) { try { creds = JSON.parse(kmsForm.credentialsText); } catch(e){ setKmsError("Credentials are not valid JSON."); return; } }
+                const r = await kmsAct(stepup=>kmsForm.mode==="add"
+                  ? api.post("/api/kms-providers",{name:kmsForm.name.trim(),provider_type:kmsForm.provider_type,config:cfg,credentials:creds===undefined?null:creds,stepup})
+                  : api.patch("/api/kms-providers/"+kmsForm.id,{name:kmsForm.name.trim(),config:cfg,...(creds===undefined?{}:{credentials:creds}),stepup}),
+                  {k:kmsForm.mode==="add"?"CREATED":"UPDATED",v:kmsForm.name.trim()});
+                if (r && !r.error) setKmsForm(null);
+              }}>{kmsBusy?"Working...":(kmsForm.mode==="add"?"Create Provider":"Save Changes")}</Btn>
+              <Btn onClick={()=>{setKmsForm(null);setKmsError(null);}}>Cancel</Btn>
+            </div>
+          </Card>)}
+
+          <Card style={{padding:16}}>
+            <div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Key rotation and usage scope</div>
+            <M style={{color:C.tm,display:"block",lineHeight:1.6}}>Rotation schedule and per-tier KMS usage scope are not yet implemented. FireAlive rotates its key-encryption key through the key-operation workflow under Key Operations, which requires two-person approval. This panel will gain a rotation policy and usage scope once those are built against the provider model above.</M>
+          </Card>
         </div>)}
 
-        {/* ══════════ WIFI SECURITY POLICY ══════════ */}
         {tab==="wifi"&&(<div>
           <L>WiFi Security Policy</L>
           <M style={{color:C.tm,display:"block",marginBottom:16,lineHeight:1.6}}>Set minimum WiFi security requirements for analyst clients. WPA2-Enterprise with 802.1X/EAP is the recommended minimum (per-user authentication, not shared PSK). WPA2-Personal (PSK) is vulnerable to brute force attacks that expose traffic to interception — an attacker could modify packets affecting incident response routing.</M>

@@ -402,7 +402,7 @@ const REMEDIATIONS = {
       'For zero volume in 24h: check that auditMiddleware is loaded and applied to /api/',
       'Verify audit_log INSERTs are not silently failing (check application logs)',
       'For unusually high volume: check for runaway event loops or denial-of-service conditions',
-      'Examine event_type distribution: SELECT event_type, COUNT(*) FROM audit_log WHERE timestamp > datetime("now", "-1 hour") GROUP BY event_type',
+      "Examine event_type distribution: SELECT event_type, COUNT(*) FROM audit_log WHERE timestamp > datetime('now', '-1 hour') GROUP BY event_type",
     ],
     uiPath: 'mc:admin/audit-log',
   },
