@@ -39,7 +39,7 @@ router.put('/:id/review', (req, res) => {
 
   if (!existing) { db.close(); return res.status(404).json({ error: 'Delegation not found' }); }
 
-  db.prepare('UPDATE delegations SET status = ?, reviewed_by = ?, resolved_at = datetime("now") WHERE id = ?')
+  db.prepare("UPDATE delegations SET status = ?, reviewed_by = ?, resolved_at = datetime('now') WHERE id = ?")
     .run(status, req.user.id, req.params.id);
   db.close();
 
