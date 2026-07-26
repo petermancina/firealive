@@ -115,7 +115,7 @@ module.exports = (checks) => ({
       id: 'Art.20 [Access]',
       name: 'Security Control Measures -- Access Control',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; MC-trust api_keys for inbound MC push authentication. PPC Guidelines on security control measures expressly identify access management as a required security measure.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; per-MC Ed25519 request signing for inbound MC push authentication (signing_keys registry; management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it, verified against an out-of-band CISO-approved public key). PPC Guidelines on security control measures expressly identify access management as a required security measure.',
     },
     {
       id: 'Art.22',
