@@ -88,13 +88,13 @@ module.exports = (checks) => ({
       id: 'AC-2',
       name: 'Account Management',
       check: checks.checkUniqueUsers,
-      mapping: 'Unique username constraint at database layer (UNIQUE on users.username); MC-trust api_keys (management_consoles.api_key) for programmatic identities authenticating inbound pushes. Account lifecycle (creation, modification, deactivation via users.active=0) audit-logged via the request-logging middleware. Analyst-identity continuity (pseudonym_uuid) is enforced at the MC layer.',
+      mapping: 'Unique username constraint at database layer (UNIQUE on users.username); programmatic identities for inbound pushes via per-MC Ed25519 request signing (signing_keys registry): management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it against an out-of-band CISO-approved public key. Account lifecycle (creation, modification, deactivation via users.active=0) audit-logged via the request-logging middleware. Analyst-identity continuity (pseudonym_uuid) is enforced at the MC layer.',
     },
     {
       id: 'AC-3',
       name: 'Access Enforcement',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware enforces access decisions with role-array gating on every /api route; MC-trust api_keys provide programmatic access scoping for inbound MC pushes.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware enforces access decisions with role-array gating on every /api route; management_consoles.api_key provides per-MC scoping for inbound MC pushes; authentication is per-request Ed25519 signature verification against the signing_keys registry.',
     },
     {
       id: 'AC-6',
@@ -232,7 +232,7 @@ module.exports = (checks) => ({
       id: 'SC-12',
       name: 'Cryptographic Key Establishment and Management',
       check: checks.checkKeyRotation,
-      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC-trust api_keys rotate per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration awaits future GD KMS phase.',
+      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration awaits future GD KMS phase.',
     },
     {
       id: 'SC-13',

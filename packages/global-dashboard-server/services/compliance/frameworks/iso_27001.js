@@ -83,7 +83,7 @@ module.exports = (checks) => ({
       id: 'A.5.15',
       name: 'Access Control',
       check: checks.checkAccessControl,
-      mapping: 'Rules to control physical and logical access to information and other associated assets. RBAC via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating; MC-trust api_keys for inbound MC push authentication. Access decisions audit-logged via the request-logging middleware.',
+      mapping: 'Rules to control physical and logical access to information and other associated assets. RBAC via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating; per-MC Ed25519 request signing for inbound MC push authentication (signing_keys registry; management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it, verified against an out-of-band CISO-approved public key). Access decisions audit-logged via the request-logging middleware.',
     },
     {
       id: 'A.5.16',
@@ -193,7 +193,7 @@ module.exports = (checks) => ({
       id: 'A.8.24',
       name: 'Use of Cryptography',
       check: checks.checkKeyRotation,
-      mapping: 'Rules for effective use of cryptography, including cryptographic key management, defined and implemented. GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC-trust api_keys rotate per 90-day cadence. TLS 1.2+ at reverse proxy in transit. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification.',
+      mapping: 'Rules for effective use of cryptography, including cryptographic key management, defined and implemented. GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. TLS 1.2+ at reverse proxy in transit. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification.',
     },
     {
       id: 'A.8.25',

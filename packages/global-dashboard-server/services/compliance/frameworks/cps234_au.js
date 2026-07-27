@@ -77,7 +77,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [13]',
       name: 'Information Security Capability',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; MC-trust api_keys for inbound MC push authentication. CPS 234 para 13 requires entity to maintain information security capability commensurate with vulnerabilities and threats; the GD layer contributes its governance-tier technical-control capability.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; per-MC Ed25519 request signing for inbound MC push authentication (signing_keys registry; management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it, verified against an out-of-band CISO-approved public key). CPS 234 para 13 requires entity to maintain information security capability commensurate with vulnerabilities and threats; the GD layer contributes its governance-tier technical-control capability.',
     },
     {
       id: 'CPS 234 [19]',
@@ -113,7 +113,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [25]',
       name: 'Identity and Access Management',
       check: checks.checkUniqueUsers,
-      mapping: 'Unique username constraint enforced at the database layer (UNIQUE on users.username); MC-trust api_keys (management_consoles.api_key) for programmatic identity authenticating inbound MC pushes. Analyst-identity continuity (pseudonym_uuid) is enforced upstream at the MC layer (architectural boundary — the GD does not store analyst identities). CPS 234 para 25 explicitly addresses identity and access management.',
+      mapping: 'Unique username constraint enforced at the database layer (UNIQUE on users.username); programmatic identity for inbound MC pushes via per-MC Ed25519 request signing (signing_keys registry): management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it against an out-of-band CISO-approved public key. Analyst-identity continuity (pseudonym_uuid) is enforced upstream at the MC layer (architectural boundary — the GD does not store analyst identities). CPS 234 para 25 explicitly addresses identity and access management.',
     },
     {
       id: 'CPS 234 [26]',

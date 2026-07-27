@@ -69,7 +69,7 @@ module.exports = (checks) => ({
       id: 'CC6.1',
       name: 'Logical Access Software',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware gates with role-array checks on every /api route; MC-trust api_keys (management_consoles.api_key) for inbound MC push authentication. Each authenticated request recorded in audit_log via the request-logging middleware.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware gates with role-array checks on every /api route; inbound MC push authentication via per-MC Ed25519 request signing (signing_keys registry): management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it against an out-of-band CISO-approved public key. Each authenticated request recorded in audit_log via the request-logging middleware.',
     },
     {
       id: 'CC6.2',
@@ -81,7 +81,7 @@ module.exports = (checks) => ({
       id: 'CC6.3',
       name: 'Access Modification and Removal',
       check: checks.checkApiKeyRotation,
-      mapping: 'MC-trust api_key 90-day rotation cadence (management_consoles.api_key re-registered via PATCH /api/management-consoles/:id); user role and active-status changes audit-logged via CONFIG_UPDATED events; offboarding workflow (users.active=0) preserves audit trail. R3g PR3 introduces signing_keys registry supplementing api_key shared-secret authentication.',
+      mapping: 'MC-trust api_key 90-day rotation cadence (management_consoles.api_key re-registered via PATCH /api/management-consoles/:id); user role and active-status changes audit-logged via CONFIG_UPDATED events; offboarding workflow (users.active=0) preserves audit trail. The signing_keys registry (SHIPPED in R3g PR3) rotates the per-MC Ed25519 signing key that authenticates inbound pushes: a new key is submitted pending_approval, its fingerprint is verified out of band by a CISO, and approval atomically demotes the prior key with a grace window for in-flight pushes.',
     },
     {
       id: 'CC6.6',

@@ -89,7 +89,7 @@ module.exports = (checks) => ({
       id: 'PR.AA-01',
       name: 'Identities and Credentials are Managed',
       check: checks.checkUniqueUsers,
-      mapping: 'Unique username constraint enforced at the database layer (UNIQUE on users.username); MC-trust api_keys (management_consoles.api_key) for inbound MC push authentication with 90-day rotation recommended. R3g PR3 adds signing_keys registry for cryptographically signed MC pushes.',
+      mapping: 'Unique username constraint enforced at the database layer (UNIQUE on users.username); inbound MC push authentication via per-MC Ed25519 request signing (signing_keys registry, SHIPPED in R3g PR3): management_consoles.api_key identifies the calling MC and carries a 90-day rotation recommendation, while the X-FA-Signature over timestamp+body authenticates it against an out-of-band CISO-approved public key.',
     },
     {
       id: 'PR.AA-03',

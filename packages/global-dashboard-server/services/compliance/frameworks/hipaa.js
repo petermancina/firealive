@@ -172,7 +172,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(4)(ii)(C)',
       name: 'Access Establishment and Modification (Addressable)',
       check: checks.checkApiKeyRotation,
-      mapping: 'The GD\'s API key surface is the MC-trust api_keys in management_consoles.api_key (each registered MC has a key for inbound push authentication). 90-day SOC-grade rotation cadence; re-register via PATCH /api/management-consoles/:id. R3g PR3 introduces a signing_keys registry that supplements the api_key shared secret with cryptographic signature verification on each push.',
+      mapping: 'The GD\'s API key surface is management_consoles.api_key, which IDENTIFIES each registered MC on inbound push; authentication is per-MC Ed25519 request signing (signing_keys registry): management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it against an out-of-band CISO-approved public key. 90-day SOC-grade rotation cadence; re-register via PATCH /api/management-consoles/:id. R3g PR3 introduces a signing_keys registry that supplements the api_key shared secret with cryptographic signature verification on each push.',
     },
     {
       id: '164.308(a)(5)(ii)(D)',

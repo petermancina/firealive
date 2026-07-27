@@ -169,13 +169,13 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(h) [Keys]',
       name: 'Cryptography -- Key Management',
       check: checks.checkKeyRotation,
-      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC-trust api_keys rotate per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration awaits future GD KMS phase.',
+      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration awaits future GD KMS phase.',
     },
     {
       id: 'Art.21(2)(i)',
       name: 'Human Resources Security, Access Control, Asset Management',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; MC-trust api_keys for inbound MC push authentication. HR security (background checks, training, termination procedures) and asset management (inventory) are operator-side.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; per-MC Ed25519 request signing for inbound MC push authentication (signing_keys registry; management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it, verified against an out-of-band CISO-approved public key). HR security (background checks, training, termination procedures) and asset management (inventory) are operator-side.',
     },
     {
       id: 'Art.21(2)(j) [MFA]',

@@ -542,15 +542,16 @@ Target directory: the server model root (default `~/.firealive/models`, override
 
 ### API Keys
 
-**What it’s for:** Programmatic access to FireAlive for SOAR/SIEM integrations. Each key is role-scoped — least privilege. A key for “team health metrics streaming to SIEM” doesn’t get access to anything else.
+**What it’s for:** Programmatic access to FireAlive for SOAR/SIEM integrations. Each key is role-scoped — least privilege — and **sender-constrained**: the key is issued alongside a client certificate, and a request presenting the key without that certificate is refused. A key copied out of a config file or a log authenticates nothing.
 
 **Workflow:**
 
 1. Lead opens API Keys
-1. Clicks “+ New Key”
-1. Names it (“splunk-cef-stream”), picks scope (“read team health”), sets expiry
-1. Receives the key, copies it into the SOAR/SIEM config
-1. Periodically reviews key usage (last used timestamps), revokes any that are unused or compromised
+1. Clicks “Generate Key”
+1. Names it (“splunk-cef-stream”), ticks the scopes it needs from the 14 available, sets expiry
+1. Confirms with a hardware-key touch — issuing a credential re-proves the hardware key at the moment of the action
+1. Receives **four** items, shown once and never retrievable again: the key, a client certificate, its private key, and the FireAlive CA certificate. All four go into the integration’s configuration; the key alone will not authenticate
+1. Periodically reviews key usage (last used timestamps) and revokes any that are unused or compromised — revoking a key also revokes its certificate
 
 ### Access Control
 
@@ -580,15 +581,17 @@ This feature also handles concurrent session limits, session timeouts, and per-a
 
 ### KMS (Enterprise Key Management)
 
-**What it’s for:** Centralize FireAlive’s encryption key lifecycle in the org’s enterprise KMS — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust. All encryption tiers (Tier-3 analyst data, Tier-1 team data, peer chat E2EE, backups, audit log signing) get their keys managed through KMS with HSM backing and automated rotation.
+**What it’s for:** Wrap FireAlive’s key-encryption key in the org’s enterprise KMS. Five provider types are supported: **AWS KMS, Azure Key Vault, Google Cloud KMS, HashiCorp Vault**, and an **environment-variable** provider for development. Multiple providers can be configured at once; exactly one enabled provider is the default, and changing which one re-wraps the KEK atomically. Credentials are stored encrypted and are never returned by the API.
 
 **Workflow:**
 
-1. Lead opens KMS tab on initial setup or when migrating from default keys
-1. Picks KMS provider, enters endpoint/ARN, key ID/alias
-1. Configures rotation policy
-1. FireAlive switches from default-key mode to KMS-backed mode
-1. From now on, every encryption operation uses keys from KMS
+1. Lead opens KMS on initial setup or when migrating from default keys
+1. Clicks “Add Provider”, picks the type, and supplies its configuration and credentials as JSON
+1. Confirms with a hardware-key touch — every change here re-proves the hardware key
+1. Uses **Probe** to round-trip the provider before relying on it; the result and any error are shown against the row
+1. Clicks **Make Default** to promote it. Enable, disable and delete are available per row, each requiring the same hardware confirmation
+
+**Not yet implemented:** rotation schedule and per-tier usage scope. FireAlive rotates its key-encryption key through the Key Operations workflow, which requires two-person approval. The KMS panel says so rather than presenting controls that do nothing.
 
 ### WiFi Policy
 
@@ -1390,7 +1393,7 @@ Health checks follow the feature: every integration is probed by a check that sh
 
 A scan policy sets the master on/off switch, the subset of the six scanner types you permit, and an informational schedule. The permitted-scanner policy is live: it is enforced when an authorization is created, again when a scan is announced, and again at the rate-limit exemption — so removing a scanner type (or disabling the feature) stops authorizing it and stops exempting its traffic within one refresh window, without touching individual authorizations.
 
-Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization whose type is currently permitted. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization whose type is currently permitted. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time.
 
 FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled, permitted authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
@@ -1407,7 +1410,7 @@ FireAlive performs application-layer authorization and logging. Network-layer bl
 
 **What it’s for:** Authorize your organization’s cloud-posture and IaC scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) to scan your FireAlive cloud deployment, and keep a tamper-evident record of every scan that reaches it. FireAlive does not run scans or store findings itself — scan results live in the scanner’s own console, the same way EDR and threat-hunting integrations let approved tooling inspect FireAlive without FireAlive duplicating the tool. This is the cloud-posture companion to the endpoint-focused EDR/Threat Hunting integrations: FireAlive opens itself to authorized scanning by the org’s security tooling and logs that access.
 
-Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with two controls: a bearer token (shown once at creation, then stored only as a salted hash) and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when both the token and the source IP match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
 
 FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 

@@ -99,7 +99,7 @@ module.exports = (checks) => ({
       id: '§1798.100(e) [Access Control]',
       name: 'Reasonable Security -- Access Control',
       check: checks.checkAccessControl,
-      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; MC-trust api_keys for inbound MC push authentication. Reasonable security includes limiting access to personal information to those with a need.',
+      mapping: 'Role-based access control via users.role (ciso / vp / readonly); route-level authMiddleware with role-array gating on every /api route; per-MC Ed25519 request signing for inbound MC push authentication (signing_keys registry; management_consoles.api_key identifies the calling MC, the X-FA-Signature over timestamp+body authenticates it, verified against an out-of-band CISO-approved public key). Reasonable security includes limiting access to personal information to those with a need.',
     },
     {
       id: '§1798.105',
@@ -147,7 +147,7 @@ module.exports = (checks) => ({
       id: '§1798.150 [Key Management]',
       name: 'Encryption Defense -- Key Management',
       check: checks.checkKeyRotation,
-      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended). MC-trust api_keys rotate per 90-day cadence. Hardware-backed KMS integration awaits future GD KMS phase. The encryption defense under §1798.150 only holds if the encryption keys themselves were not also breached -- key custody and rotation are material, and operator-managed disk-encryption key custody (cloud-provider KMS for managed-disk encryption, secrets-manager for application keys) is the current source of cryptographic isolation.',
+      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. Hardware-backed KMS integration awaits future GD KMS phase. The encryption defense under §1798.150 only holds if the encryption keys themselves were not also breached -- key custody and rotation are material, and operator-managed disk-encryption key custody (cloud-provider KMS for managed-disk encryption, secrets-manager for application keys) is the current source of cryptographic isolation.',
     },
   ],
   customerResponsibility: [
