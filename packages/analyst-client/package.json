@@ -19,7 +19,7 @@
     "pdfkit": "^0.19.1"
   },
   "devDependencies": {
-    "react": "19.2.7",
+    "react": "19.2.8",
     "react-dom": "19.2.7",
     "esbuild": "0.28.1",
     "electron": "^43.1.1",
