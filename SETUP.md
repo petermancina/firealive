@@ -117,6 +117,22 @@ anti-rollback fuse advances with releases: once a newer build has run, an older
 build below the sealed fuse floor **refuses to start** rather than open a
 downgrade window.
 
+**Upgrading to v1.0.89 or later stops existing API keys and scanner tokens from
+working.** From this release every machine credential is bound to a client
+certificate issued alongside it, and a request presenting the secret without that
+certificate is refused. Credentials created before the upgrade have no bound
+certificate, so they do not authenticate — deliberately, and the migration logs
+which tables are affected. Human logins, enrolled passkeys and client certificates
+are unaffected.
+
+Plan for this before you upgrade, not after: any SIEM feed, SOAR integration,
+vulnerability scanner or other headless caller stops working until you re-issue
+its credential. Re-issuing is done from the same console that created it — API
+Keys, or the scanner's authorization panel — and now hands back four items shown
+once: the secret, a client certificate, its private key, and the FireAlive CA
+certificate. All four go into the integration's configuration; the secret alone
+authenticates nothing. See `docs/machine-credentials.md`.
+
 **Take a restore point before you update.** This is the step that makes a
 rollback possible at all, and it can only be taken from the build you are about
 to replace:

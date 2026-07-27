@@ -47,6 +47,18 @@ jobs:
         run: node scripts/check-fuse-high-water.js
       - name: Verify rollback containment
         run: node scripts/check-rollback-containment.js
+      - name: Step-up coverage guard self-test
+        run: node scripts/check-stepup-coverage.js --selftest
+      - name: Verify step-up coverage on credential-minting paths
+        run: node scripts/check-stepup-coverage.js
+      - name: SQL quoting guard self-test
+        run: node scripts/check-sql-quoting.js --selftest
+      - name: Verify SQL string-literal quoting
+        run: node scripts/check-sql-quoting.js
+      - name: Machine-credential binding guard self-test
+        run: node scripts/check-machine-cert-binding.js --selftest
+      - name: Verify machine credentials are certificate-bound
+        run: node scripts/check-machine-cert-binding.js
       - name: Verify manifest consistency
         run: node scripts/check-manifest-consistency.js
       - name: Verify deployment-mode seal

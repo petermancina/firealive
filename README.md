@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.88 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 81 (anti-rollback) | **Build:** 20260724.1
+**Version:** v1.0.89 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 82 (anti-rollback) | **Build:** 20260727.1
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.88) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.89) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -76,6 +76,7 @@ FireAlive treats a running deployment as something that must continuously prove 
 - **Virtualized deployments.** Bare-metal installs bind to the physical TPM; virtualized installs additionally run a VM-attestation and clock-integrity gate, so a paused, rolled-back, snapshotted, or migrated VM is caught fail-closed rather than serving forked or stale state. See [`docs/anti-cloning-and-virtualization.md`](docs/anti-cloning-and-virtualization.md).
 - **Sender-constrained sessions.** Session tokens are bound to a per-device key — the token carries that key’s thumbprint — and every authenticated request carries a short-lived, replay-protected proof-of-possession signed by the device’s private key. A stolen session token is therefore useless on its own: without the device’s hardware-held key it cannot be replayed. See [`docs/iam-and-authentication.md`](docs/iam-and-authentication.md).
 - **Verified code integrity.** The packaged server ships with a code-integrity manifest generated at build time; at boot it recomputes the hashes of its own code and pinned trust anchors (including the bundled FIDO attestation roots) and, in production, refuses to start if any shipped file was modified on disk — a tampered install is caught fail-closed rather than served.
+- **Sender-constrained machine credentials.** Headless callers — API keys, on-prem and cloud vulnerability scanners, threat-hunting consumers — are bound the same way, without a hardware key to bind to. Each secret is issued alongside a client certificate this deployment's CA minted, carrying a role organizational unit scoped to the surface it may call, and the request must arrive over a mutual-TLS connection presenting that certificate before the secret is ever compared. A key copied out of a config file or a log authenticates nothing. Management Console → Global Dashboard pushes reach the same property by a different mechanism — per-request Ed25519 signatures over the body, against an out-of-band-approved public key — because that path crosses between two deployments with separate certificate authorities. See [`docs/machine-credentials.md`](docs/machine-credentials.md).
 - **Per-client recovery.** A lost or compromised Analyst Client can be torn down and re-provisioned individually — rate-limited and fully audited — without re-keying the whole deployment. See [`docs/client-recovery.md`](docs/client-recovery.md).
 - **Key continuity across upgrades.** A normal in-place upgrade preserves every key and sealed record: the new release resolves the same hardware root of trust (or KMS/env-var KEK), and the sealed data at rest is never rewritten — so an update costs nothing, with no re-keying, no re-encryption, and no data loss. The seal format is versioned with anti-rollback, so a downgrade onto newer-format data is halted and quarantined rather than risking a mismatched read. That protection is one-way by design, which is why an upgrade is preceded by a **pre-upgrade restore point** — a full-suite backup taken at the old fuse and schema, stored outside the data root so it survives an uninstall, and the only artifact that can put the previous build back in front of its data. Applying one is an offline operation on the host, with the server stopped, consuming a single-use authorization the running server granted beforehand and refusing anything further than one version back. See [`docs/pre-upgrade-restore-point.md`](docs/pre-upgrade-restore-point.md). Moving to a *different* KEK (a genuine hardware move) is the one case that re-seals the data, and the recovery code is the sole factor for it — there is no KMS escrow or back-door substitute, because that absence is the anti-clone guarantee. See [`docs/key-continuity-and-upgrades.md`](docs/key-continuity-and-upgrades.md).
 - **Two-person authorization for key operations.** Destructive key operations — re-keying a node, importing a migration bundle onto a new key, and a deployment reset — require an anchor-signed, single-use, two-person authorization with a fresh hardware-passkey step-up (a second admin approves, or delayed-self on a single-admin deployment), verified offline against the instance anchor before any key material is touched.
@@ -188,9 +189,9 @@ Both servers can run as an **active/passive** pair for automated failover. In ea
 
 |Module             |Protections                                                                                          |
 |-------------------|-----------------------------------------------------------------------------------------------------|
-|auth               |JWT + RBAC; sessions bound to a hardware device key via per-request proof-of-possession              |
+|auth               |JWT + RBAC; sessions bound to a hardware device key via per-request proof-of-possession; API keys bound to a CA-issued client certificate and refused without it |
 |auth-hardening     |Constant-time comparison, CSPRNG, account lockout, JWT rotation, suspicious input detection          |
-|mfa-stepup         |Fresh WebAuthn step-up assertion gate for sensitive and config actions                               |
+|mfa-stepup         |Fresh single-use WebAuthn step-up assertion gate for sensitive, config and credential-minting actions |
 |security-hardening |Headers, input sanitization, CSRF, anti-replay, rate limiting, SSRF, TLS                             |
 |body-validation    |Request-body shape validation (type-confusion / CWE-843 defense) on config writes                    |
 |pentest-hardening  |Token storage (memory only), safe errors, request correlation, content-type enforcement, idle timeout|
