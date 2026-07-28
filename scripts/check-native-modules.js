@@ -63,6 +63,11 @@ const REPO = path.resolve(__dirname, '..');
 
 // manifests that DECLARE node-llama-cpp (its consumers)
 const LLAMA_MANIFESTS = ['package.json', 'server/package.json', 'packages/analyst-client/package.json'];
+// better-sqlite3 is pinned in three manifests too, and until B6e's dependency
+// pass nothing enforced that they agree. Each server opens its own database
+// with its own copy of the driver; two majors of a native SQLite driver in one
+// monorepo is the same hazard the llama check above exists for.
+const SQLITE_MANIFESTS = ['package.json', 'server/package.json', 'packages/global-dashboard-server/package.json'];
 // manifests that DECLARE @mongodb-js/zstd (root + the embedded Regional Server, which runs backup-archive.js)
 const ZSTD_MANIFESTS = ['package.json', 'server/package.json'];
 // app packages whose electron-builder output SHIPS node-llama-cpp (MC via embedded server; AC directly)
@@ -140,6 +145,28 @@ function checkNativeModules(manifests, lock, appBuildConfigs) {
     problems.push('lockfile: node-llama-cpp is not resolved (node_modules/node-llama-cpp missing)');
   }
 
+  // ── A2. better-sqlite3 version consistency across its manifests
+  const sqliteSpecs = {};
+  for (const m of SQLITE_MANIFESTS) {
+    const pkg = manifests[m];
+    if (!pkg) { problems.push('manifest missing: ' + m); continue; }
+    const spec = depSpec(pkg, 'better-sqlite3');
+    if (!spec) { problems.push(m + ': does not declare better-sqlite3 (its consumer must pin it)'); continue; }
+    sqliteSpecs[m] = spec;
+  }
+  const distinctSqlite = [...new Set(Object.values(sqliteSpecs))];
+  if (distinctSqlite.length > 1) {
+    problems.push('better-sqlite3 version skew across manifests: '
+      + Object.entries(sqliteSpecs).map(([m, sp]) => m + '=' + sp).join(', ')
+      + ' -- each server opens its own database with its own copy of the driver; they must ship one major');
+  }
+
+  // resolved better-sqlite3 version from the lockfile
+  const sqliteLock = lp['node_modules/better-sqlite3'];
+  if (!sqliteLock || !sqliteLock.version) {
+    problems.push('lockfile: better-sqlite3 is not resolved (node_modules/better-sqlite3 missing)');
+  }
+
   // ── B. per-platform prebuilt presence, derived from the shipping apps' targets
   const required = requiredLlamaTargets(appBuildConfigs);
   if (required.length === 0) {
@@ -191,9 +218,10 @@ function checkNativeModules(manifests, lock, appBuildConfigs) {
 function selfTest() {
   const V = '3.19.0';
   const goodManifests = () => ({
-    'package.json': { dependencies: { 'node-llama-cpp': '^' + V, '@mongodb-js/zstd': '^7.0.0' } },
-    'server/package.json': { dependencies: { 'node-llama-cpp': '^' + V, '@mongodb-js/zstd': '^7.0.0' } },
+    'package.json': { dependencies: { 'node-llama-cpp': '^' + V, '@mongodb-js/zstd': '^7.0.0', 'better-sqlite3': '^12.11.1' } },
+    'server/package.json': { dependencies: { 'node-llama-cpp': '^' + V, '@mongodb-js/zstd': '^7.0.0', 'better-sqlite3': '^12.11.1' } },
     'packages/analyst-client/package.json': { dependencies: { 'node-llama-cpp': '^' + V } },
+    'packages/global-dashboard-server/package.json': { dependencies: { 'better-sqlite3': '^12.11.1' } },
   });
   const goodLock = () => ({
     packages: {
@@ -203,7 +231,8 @@ function selfTest() {
       'node_modules/@node-llama-cpp/win-x64': { version: V },
       'node_modules/@node-llama-cpp/linux-x64': { version: V },
       'node_modules/@node-llama-cpp/linux-arm64': { version: V },
-      'node_modules/@mongodb-js/zstd': { version: '7.0.0', dependencies: { 'prebuild-install': '^7.1.3', 'node-addon-api': '^8.5.0' } },
+      'node_modules/better-sqlite3': { version: '12.11.1' },
+        'node_modules/@mongodb-js/zstd': { version: '7.0.0', dependencies: { 'prebuild-install': '^7.1.3', 'node-addon-api': '^8.5.0' } },
     },
   });
   // frontend: mac[arm64,x64] win[x64] linux[x64]; AC: adds linux[arm64]
@@ -226,6 +255,9 @@ function selfTest() {
   add('prebuilt version != loader version', (m, l) => { l.packages['node_modules/@node-llama-cpp/win-x64'].version = '3.18.0'; }, 'must match');
   add('zstd not declared in server', (m) => { delete m['server/package.json'].dependencies['@mongodb-js/zstd']; }, 'does not declare @mongodb-js/zstd');
   add('zstd lost prebuild-install', (m, l) => { delete l.packages['node_modules/@mongodb-js/zstd'].dependencies['prebuild-install']; }, 'prebuild-install');
+  add('better-sqlite3 version skew across manifests', (m) => { m['packages/global-dashboard-server/package.json'].dependencies['better-sqlite3'] = '^13.0.1'; }, 'better-sqlite3 version skew');
+  add('better-sqlite3 not declared in a server', (m) => { delete m['server/package.json'].dependencies['better-sqlite3']; }, 'does not declare better-sqlite3');
+  add('better-sqlite3 unresolved in lockfile', (m, l) => { delete l.packages['node_modules/better-sqlite3']; }, 'better-sqlite3 is not resolved');
   add('node-llama-cpp unresolved in lockfile', (m, l) => { delete l.packages['node_modules/node-llama-cpp']; }, 'not resolved');
 
   let bad = 0;
@@ -250,7 +282,11 @@ if (process.argv.includes('--self-test')) {
 } else {
   const readJson = (rel) => { try { return JSON.parse(fs.readFileSync(path.join(REPO, rel), 'utf8')); } catch (e) { return null; } };
   const manifests = {};
-  for (const m of new Set([].concat(LLAMA_MANIFESTS, ZSTD_MANIFESTS))) manifests[m] = readJson(m);
+  // SQLITE_MANIFESTS is in this union too: it brings in the GD-server manifest,
+  // which neither of the other two lists names. Omitting it made the real run
+  // report that manifest missing while the self-test passed -- the detector was
+  // right and the LOADER never handed it the file.
+  for (const m of new Set([].concat(LLAMA_MANIFESTS, ZSTD_MANIFESTS, SQLITE_MANIFESTS))) manifests[m] = readJson(m);
   const lock = readJson('package-lock.json');
   const appBuildConfigs = {};
   for (const dir of LLAMA_SHIPPING_APPS) { const p = readJson(path.join(dir, 'package.json')); appBuildConfigs[dir] = p && p.build; }
