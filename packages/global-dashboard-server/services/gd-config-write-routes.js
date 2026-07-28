@@ -52,6 +52,7 @@ const CONFIG_WRITE_MOUNTS = [
   // step-up and stays available for incident response; B6j-4 handles its posture.
   '/api/iam',                   // FIDO trust-anchor admin (add/remove attestation roots + AAGUIDs); all-config. THE SHARP GAP: a locked-config ciso must not add a root then enroll a software passkey (defeats B5n3).
   '/api/cloud-vuln',            // scanner-authorization registry (mint/update/revoke). The scanner ANNOUNCE (/api/cloud-vuln-access, a separate mount) is deliberately never gated -- a scanner must announce while locked.
+  '/api/vuln-scan',            // scanner-authorization registry (mint/update/revoke). The scanner ANNOUNCE (/api/vuln-scan-access, a separate mount) is deliberately never gated -- a scanner must announce while locked.
   '/api/migration',             // FA-MIG1 deployment migration export + import (MC parity freezes export too).
   '/api/storage-destinations',  // destination CRUD (SFTP/S3/GCS/Azure credentials); freezes /:id/probe while locked (a config-time connectivity test).
   '/api/external-restore',      // external restore-source CRUD (credentials); freezes /test, /preview, /restore-request, /restore-execute -- pulling an off-box archive is a config-time trust action, frozen while locked.
