@@ -1,0 +1,629 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIREALIVE — Cloud Vulnerability Scan: Authorization + Access-Logging Integration
+//
+// This is an INTEGRATION (same family as EDR File Inspection and the non-cloud
+// Vulnerability Scan tab), NOT a scanner. FireAlive does not run scans and does
+// not ingest, parse, or store findings — scan results live in the cloud
+// scanner's own application. This route lets an admin AUTHORIZE external
+// cloud-posture / IaC scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov)
+// to scan FireAlive's cloud deployment, and records EVERY scan access in an
+// append-only, hash-chained log so the SOC has a tamper-evident record of when
+// FireAlive was scanned. Network-layer blocking remains the operator's firewall
+// responsibility; this is the application-layer authorization + audit trail.
+//
+// TWO routers (mounted separately in server/index.js):
+//   module.exports        — admin management router  → /api/cloud-vuln  (admin JWT)
+//     GET    /authorizations            — list (token material never returned)
+//     POST   /authorizations            — create; returns the bearer token ONCE
+//     PUT    /authorizations/:id         — update (name/cidrs/scope/enabled/notes)
+//     DELETE /authorizations/:id         — revoke
+//     GET    /access-log                 — paginated scan-access log
+//     GET    /access-log/verify          — recompute + verify the hash chain
+//   module.exports.accessRouter — scan-access recorder → /api/cloud-vuln-access
+//     POST   /                           — gated by per-authorization bearer
+//                                          token + source-IP/CIDR allow-list;
+//                                          logs authorized/rejected access.
+//                                          NOT behind admin JWT (a scanner /
+//                                          scan harness presents the token).
+//
+// Token model mirrors apikeys.js: a high-entropy token is generated, returned
+// in plaintext ONCE on creation, and only a salted SHA-256 hash is stored.
+// Verification is constant-time. Hash chain mirrors forensic_export_chain:
+// this_hash = SHA-256(prev_hash || canonical(entry) || accessed_at).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const router = require('express').Router();
+const accessRouter = require('express').Router();
+const crypto = require('crypto');
+const { getDb } = require('../db/init');
+const { readScanPolicy } = require('../services/scan-policy');
+const ca = require('../services/ca');
+const { verifyMachineCert } = require('../services/machine-cert-auth');
+const { auditLog } = require('../middleware/audit');
+const { logger } = require('../services/logger');
+const { mfaStepUp } = require('../middleware/mfa-stepup');
+
+const VALID_SCANNERS = ['scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov'];
+const VALID_SCHEDULES = ['daily', 'weekly', 'monthly', 'manual'];
+const VALID_COMPONENTS = ['mc', 'ac', 'arc', 'main_server', 'gd_server'];
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function hashToken(token, salt) {
+  return crypto.createHash('sha256').update(salt + ':' + token).digest('hex');
+}
+
+// Constant-time compare of two hex strings of equal length.
+function safeEqualHex(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Normalize an IPv4-mapped IPv6 address ("::ffff:1.2.3.4") to plain IPv4.
+function normalizeIp(ip) {
+  if (typeof ip !== 'string') return '';
+  const m = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  return m ? m[1] : ip;
+}
+
+function ipv4ToInt(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const o = Number(p);
+    if (!Number.isInteger(o) || o < 0 || o > 255) return null;
+    n = (n * 256) + o;
+  }
+  return n >>> 0;
+}
+
+// Match a source IP against one allow-list entry. IPv4 supports exact and CIDR
+// (a.b.c.d/nn). IPv6 supports exact match (full IPv6 CIDR math is intentionally
+// out of scope — operators list explicit IPv6 sources or rely on the firewall).
+function ipMatchesEntry(ip, entry) {
+  ip = normalizeIp(ip).trim();
+  entry = String(entry || '').trim();
+  if (!ip || !entry) return false;
+  if (entry.indexOf('/') === -1) return ip === normalizeIp(entry);
+  const [net, bitsRaw] = entry.split('/');
+  const bits = Number(bitsRaw);
+  const ipInt = ipv4ToInt(ip);
+  const netInt = ipv4ToInt(normalizeIp(net));
+  if (ipInt === null || netInt === null || !Number.isInteger(bits) || bits < 0 || bits > 32) {
+    return false; // non-IPv4 CIDR: no match (use exact entries for IPv6)
+  }
+  if (bits === 0) return true;
+  const mask = bits === 32 ? 0xffffffff : (~(0xffffffff >>> bits)) >>> 0;
+  return (ipInt & mask) === (netInt & mask);
+}
+
+function ipAllowed(ip, cidrs) {
+  if (!Array.isArray(cidrs)) return false;
+  return cidrs.some((c) => ipMatchesEntry(ip, c));
+}
+
+function parseJsonArray(val) {
+  try {
+    const a = JSON.parse(val);
+    return Array.isArray(a) ? a : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+// Validate an allow-list array: non-empty strings, each a plausible IP or CIDR.
+function sanitizeCidrs(input) {
+  if (!Array.isArray(input)) return null;
+  const out = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') return null;
+    const s = raw.trim();
+    if (!s || s.length > 64) return null;
+    if (!/^[0-9a-fA-F:.\/]+$/.test(s)) return null;
+    out.push(s);
+  }
+  return out;
+}
+
+function sanitizeComponents(input) {
+  if (!Array.isArray(input)) return null;
+  const out = [];
+  for (const c of input) {
+    if (!VALID_COMPONENTS.includes(c)) return null;
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+function publicAuthorization(row) {
+  return {
+    id: row.id,
+    scanner_type: row.scanner_type,
+    display_name: row.display_name,
+    allowed_cidrs: parseJsonArray(row.allowed_cidrs),
+    scope_components: parseJsonArray(row.scope_components),
+    enabled: row.enabled === 1,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_scan_at: row.last_scan_at,
+    last_scan_source_ip: row.last_scan_source_ip,
+    notes: row.notes,
+  };
+}
+
+// Canonical serialization of an access-log entry for the hash chain. Fixed
+// field order, NUL-separated; any field change breaks the chain.
+function canonicalAccessEntry(e) {
+  return [
+    e.prev_hash || '',
+    e.authorization_id || '',
+    e.scanner_type || '',
+    e.source_ip || '',
+    e.component || '',
+    e.outcome || '',
+    e.request_path || '',
+    e.user_agent || '',
+    e.detail || '',
+    e.accessed_at || '',
+  ].join('\u0000');
+}
+
+// Append one entry to the hash-chained scan-access log. Reads the prior
+// this_hash, computes this_hash = SHA-256(prev_hash || canonical || accessed_at),
+// and inserts — all inside a transaction so prev_hash linkage is consistent.
+function appendAccessLog(db, fields) {
+  const tx = db.transaction((f) => {
+    const accessedAt = db.prepare("SELECT datetime('now') AS t").get().t;
+    const prevRow = db
+      .prepare('SELECT this_hash FROM cloud_vuln_scan_access_log ORDER BY id DESC LIMIT 1')
+      .get();
+    const prevHash = prevRow ? prevRow.this_hash : null;
+    const entry = {
+      prev_hash: prevHash,
+      authorization_id: f.authorization_id || null,
+      scanner_type: f.scanner_type || null,
+      source_ip: f.source_ip,
+      component: f.component,
+      outcome: f.outcome,
+      request_path: f.request_path || null,
+      user_agent: f.user_agent || null,
+      detail: f.detail || null,
+      accessed_at: accessedAt,
+    };
+    const thisHash = crypto
+      .createHash('sha256')
+      .update(canonicalAccessEntry(entry))
+      .digest('hex');
+    db.prepare(
+      'INSERT INTO cloud_vuln_scan_access_log ' +
+        '(prev_hash, this_hash, authorization_id, scanner_type, source_ip, component, outcome, request_path, user_agent, detail, accessed_at) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      entry.prev_hash, thisHash, entry.authorization_id, entry.scanner_type,
+      entry.source_ip, entry.component, entry.outcome, entry.request_path,
+      entry.user_agent, entry.detail, entry.accessed_at
+    );
+    return { ...entry, this_hash: thisHash };
+  });
+  return tx(fields);
+}
+
+// ════════════════════════════ ADMIN MANAGEMENT ROUTER ═══════════════════════
+// All endpoints below assume an admin JWT (enforced at mount in server/index.js).
+
+// ── List authorizations ──────────────────────────────────────────────────────
+// ── B6e: scan policy ───────────────────────────────────────────────────────
+// The master switch and permitted-scanner list for the CLOUD surface. This
+// surface had neither until B6e: v022-features.js:513-521 records the earlier
+// config-only stub being deliberately removed when B1 built the real
+// authorization model, and B5p then built a policy layer for on-prem that cloud
+// never received. One policed surface beside two unpoliced ones.
+//
+// A SEPARATE ROW from the on-prem policy, not a merged one. The two scanner
+// vocabularies are completely disjoint -- nessus/openvas/... versus
+// scoutsuite/prowler/... -- so a single allowedScanners list would be ambiguous
+// about which surface a name governs. Shared SHAPE, shared reader, shared
+// fail-safe; separate vocabulary.
+router.get('/config', (req, res) => {
+  const db = getDb();
+  try {
+    res.json({ config: readScanPolicy(db, 'cloud'), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
+  } catch (err) {
+    logger.error('cloud-vuln config get error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to read cloud-vuln config' });
+  } finally {
+    db.close();
+  }
+});
+
+// Writing policy is a configuration change on a security control, so it carries
+// the same step-up as minting a credential: disabling the permitted-scanner
+// list is as consequential as issuing a new authorization.
+router.put('/config', mfaStepUp(), (req, res) => {
+  const { enabled, allowedScanners, schedule } = req.body || {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  if (!Array.isArray(allowedScanners)) {
+    return res.status(400).json({ error: 'allowedScanners must be an array' });
+  }
+  for (const sc of allowedScanners) {
+    if (!VALID_SCANNERS.includes(sc)) {
+      return res.status(400).json({ error: 'Invalid scanner in allowedScanners', validScanners: VALID_SCANNERS });
+    }
+  }
+  if (schedule !== undefined && !VALID_SCHEDULES.includes(schedule)) {
+    return res.status(400).json({ error: 'Invalid schedule', validSchedules: VALID_SCHEDULES });
+  }
+  const uniqScanners = Array.from(new Set(allowedScanners));
+  const config = {
+    enabled,
+    allowedScanners: uniqScanners,
+    schedule: VALID_SCHEDULES.includes(schedule) ? schedule : 'weekly',
+    updatedAt: new Date().toISOString(),
+  };
+  const db = getDb();
+  try {
+    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('cloud_vuln_config', ?, ?)")
+      .run(JSON.stringify(config), req.user.id);
+    auditLog(req.user.id, 'CLOUD_VULN_CONFIG_UPDATED', `enabled=${enabled} scanners=${uniqScanners.join(',')} schedule=${config.schedule}`, req.ip);
+    res.json({ config: readScanPolicy(db, 'cloud') });
+  } catch (err) {
+    logger.error('cloud-vuln config put error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to write cloud-vuln config' });
+  } finally {
+    db.close();
+  }
+});
+
+router.get('/authorizations', (req, res) => {
+  const db = getDb();
+  try {
+    const rows = db
+      .prepare('SELECT * FROM cloud_vuln_scanner_authorizations ORDER BY created_at DESC')
+      .all();
+    res.json({ authorizations: rows.map(publicAuthorization), validScanners: VALID_SCANNERS, validComponents: VALID_COMPONENTS });
+  } catch (err) {
+    logger.error('cloud-vuln list authorizations error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to list scanner authorizations' });
+  } finally {
+    db.close();
+  }
+});
+
+// ── Create authorization (returns the bearer token ONCE) ──────────────────────
+router.post('/authorizations', mfaStepUp(), (req, res) => {
+  const { scanner_type, display_name, allowed_cidrs, scope_components, notes } = req.body || {};
+  if (!VALID_SCANNERS.includes(scanner_type)) {
+    return res.status(400).json({ error: 'Invalid scanner_type', validScanners: VALID_SCANNERS });
+  }
+  if (typeof display_name !== 'string' || !display_name.trim() || display_name.length > 128) {
+    return res.status(400).json({ error: 'display_name required (1-128 chars)' });
+  }
+  const cidrs = sanitizeCidrs(allowed_cidrs);
+  if (cidrs === null || cidrs.length === 0) {
+    return res.status(400).json({ error: 'allowed_cidrs must be a non-empty array of IP / CIDR strings' });
+  }
+  const scope = sanitizeComponents(scope_components);
+  if (scope === null || scope.length === 0) {
+    return res.status(400).json({ error: 'scope_components must be a non-empty subset of: ' + VALID_COMPONENTS.join(', ') });
+  }
+  if (notes != null && (typeof notes !== 'string' || notes.length > 1000)) {
+    return res.status(400).json({ error: 'notes must be a string up to 1000 chars' });
+  }
+
+  const db = getDb();
+  // B6e: the live policy governs what may be MINTED, not just what may
+  // announce. Issuing an authorization for a scanner the policy does not
+  // permit would create a credential that can never be used -- and would
+  // survive a later policy change, quietly becoming usable again.
+  const policy = readScanPolicy(db, 'cloud');
+  if (!policy.allowedScanners.includes(scanner_type)) {
+    db.close();
+    return res.status(403).json({
+      error: 'scanner_type is not permitted by the current cloud scan policy',
+      allowedScanners: policy.allowedScanners,
+    });
+  }
+
+  try {
+    const id = crypto.randomBytes(16).toString('hex');
+    const token = `cvs-${crypto.randomBytes(32).toString('hex')}`;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const tokenHash = hashToken(token, salt);
+    // O3 Half 2: mint the certificate that constrains this token, in the
+    // SAME transaction as the row. Either half without the other is a
+    // defect: an orphaned certificate, or a row that cannot authenticate.
+    const cert = db.transaction(() => {
+      const c = ca.issueMachineConsumerCert(db, { displayName: display_name.trim(), ou: ca.SCANNER_CONSUMER_OU });
+      db.prepare(
+        'INSERT INTO cloud_vuln_scanner_authorizations ' +
+          '(id, scanner_type, display_name, allowed_cidrs, scope_components, cert_fingerprint, cert_serial, token_hash, token_salt, enabled, created_by, notes) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
+      ).run(
+        id, scanner_type, display_name.trim(), JSON.stringify(cidrs), JSON.stringify(scope),
+        c.fingerprint, c.serial, tokenHash, salt, req.user.id, notes != null ? notes : null
+      );
+      return c;
+    })();
+    auditLog(req.user.id, 'CLOUD_VULN_AUTH_CREATED', `scanner=${scanner_type} name="${display_name.trim()}" cidrs=${cidrs.length} scope=${scope.join('+')}`, req.ip);
+    const row = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(id);
+    // token returned ONCE — never retrievable again
+    res.status(201).json({
+      authorization: publicAuthorization(row),
+      // Returned exactly once and never retrievable again. The token alone
+      // authenticates nothing: the scanner must present this certificate on
+      // the TLS connection that carries it.
+      token,
+      certPem: cert.certPem,
+      keyPem: cert.keyPem,
+      caCertPem: cert.caCertPem,
+      certFingerprint: cert.fingerprint,
+      certSerial: cert.serial,
+    });
+  } catch (err) {
+    logger.error('cloud-vuln create authorization error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to create scanner authorization' });
+  } finally {
+    db.close();
+  }
+});
+
+// ── Update authorization ──────────────────────────────────────────────────────
+router.put('/authorizations/:id', mfaStepUp(), (req, res) => {
+  const { display_name, allowed_cidrs, scope_components, enabled, notes } = req.body || {};
+  const db = getDb();
+  try {
+    const row = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Authorization not found' });
+
+    const next = {
+      display_name: row.display_name,
+      allowed_cidrs: row.allowed_cidrs,
+      scope_components: row.scope_components,
+      enabled: row.enabled,
+      notes: row.notes,
+    };
+    if (display_name !== undefined) {
+      if (typeof display_name !== 'string' || !display_name.trim() || display_name.length > 128) {
+        return res.status(400).json({ error: 'display_name must be 1-128 chars' });
+      }
+      next.display_name = display_name.trim();
+    }
+    if (allowed_cidrs !== undefined) {
+      const cidrs = sanitizeCidrs(allowed_cidrs);
+      if (cidrs === null || cidrs.length === 0) return res.status(400).json({ error: 'allowed_cidrs must be a non-empty array of IP / CIDR strings' });
+      next.allowed_cidrs = JSON.stringify(cidrs);
+    }
+    if (scope_components !== undefined) {
+      const scope = sanitizeComponents(scope_components);
+      if (scope === null || scope.length === 0) return res.status(400).json({ error: 'scope_components must be a non-empty subset of: ' + VALID_COMPONENTS.join(', ') });
+      next.scope_components = JSON.stringify(scope);
+    }
+    if (enabled !== undefined) next.enabled = enabled ? 1 : 0;
+    if (notes !== undefined) {
+      if (notes != null && (typeof notes !== 'string' || notes.length > 1000)) return res.status(400).json({ error: 'notes must be a string up to 1000 chars' });
+      next.notes = notes != null ? notes : null;
+    }
+
+    db.prepare(
+      "UPDATE cloud_vuln_scanner_authorizations SET display_name = ?, allowed_cidrs = ?, scope_components = ?, enabled = ?, notes = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(next.display_name, next.allowed_cidrs, next.scope_components, next.enabled, next.notes, req.params.id);
+    auditLog(req.user.id, 'CLOUD_VULN_AUTH_UPDATED', `id=${req.params.id} enabled=${next.enabled}`, req.ip);
+    const updated = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    res.json({ authorization: publicAuthorization(updated) });
+  } catch (err) {
+    logger.error('cloud-vuln update authorization error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to update scanner authorization' });
+  } finally {
+    db.close();
+  }
+});
+
+// ── Revoke authorization ──────────────────────────────────────────────────────
+router.delete('/authorizations/:id', mfaStepUp(), (req, res) => {
+  const db = getDb();
+  try {
+    const row = db.prepare('SELECT id, scanner_type, display_name FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Authorization not found' });
+    // O3 Half 2: revoke the bound certificate too. Removing the row alone
+    // leaves a certificate this CA still vouches for -- a credential the
+    // operator believes destroyed and which is not.
+    const bound = db.prepare('SELECT cert_serial FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    db.transaction(() => {
+      db.prepare('DELETE FROM cloud_vuln_scanner_authorizations WHERE id = ?').run(req.params.id);
+      if (bound && bound.cert_serial) {
+        ca.revokeCert(db, { serial: bound.cert_serial, reason: 'scanner_authorization_revoked' });
+      }
+    })();
+    auditLog(req.user.id, 'CLOUD_VULN_AUTH_REVOKED', `id=${req.params.id} scanner=${row.scanner_type} name="${row.display_name}"`, req.ip);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('cloud-vuln revoke authorization error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to revoke scanner authorization' });
+  } finally {
+    db.close();
+  }
+});
+
+// ── Scan-access log (paginated) ───────────────────────────────────────────────
+router.get('/access-log', (req, res) => {
+  const db = getDb();
+  try {
+    let limit = parseInt(req.query.limit, 10);
+    if (!Number.isInteger(limit) || limit < 1) limit = 50;
+    if (limit > 200) limit = 200;
+    let offset = parseInt(req.query.offset, 10);
+    if (!Number.isInteger(offset) || offset < 0) offset = 0;
+
+    const where = [];
+    const args = [];
+    if (req.query.outcome) { where.push('outcome = ?'); args.push(req.query.outcome); }
+    if (req.query.scanner_type) { where.push('scanner_type = ?'); args.push(req.query.scanner_type); }
+    if (req.query.component) { where.push('component = ?'); args.push(req.query.component); }
+    const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
+
+    const total = db.prepare('SELECT COUNT(*) AS c FROM cloud_vuln_scan_access_log' + whereSql).get(...args).c;
+    const rows = db
+      .prepare('SELECT * FROM cloud_vuln_scan_access_log' + whereSql + ' ORDER BY id DESC LIMIT ? OFFSET ?')
+      .all(...args, limit, offset);
+    res.json({ entries: rows, total, limit, offset });
+  } catch (err) {
+    logger.error('cloud-vuln access-log error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to read scan-access log' });
+  } finally {
+    db.close();
+  }
+});
+
+// ── Verify the hash chain ─────────────────────────────────────────────────────
+router.get('/access-log/verify', (req, res) => {
+  const db = getDb();
+  try {
+    const rows = db
+      .prepare('SELECT id, prev_hash, this_hash, authorization_id, scanner_type, source_ip, component, outcome, request_path, user_agent, detail, accessed_at FROM cloud_vuln_scan_access_log ORDER BY id ASC')
+      .all();
+    let prevHash = null;
+    for (const row of rows) {
+      if ((row.prev_hash || null) !== (prevHash || null)) {
+        auditLog(req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
+        return res.json({ intact: false, count: rows.length, brokenAt: row.id, reason: 'prev_hash linkage mismatch' });
+      }
+      const recomputed = crypto.createHash('sha256').update(canonicalAccessEntry(row)).digest('hex');
+      if (recomputed !== row.this_hash) {
+        auditLog(req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
+        return res.json({ intact: false, count: rows.length, brokenAt: row.id, reason: 'this_hash mismatch' });
+      }
+      prevHash = row.this_hash;
+    }
+    auditLog(req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=true count=${rows.length}`, req.ip);
+    res.json({ intact: true, count: rows.length });
+  } catch (err) {
+    logger.error('cloud-vuln verify chain error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to verify scan-access log' });
+  } finally {
+    db.close();
+  }
+});
+
+// ════════════════════════════ SCAN-ACCESS RECORDER ══════════════════════════
+// Mounted at /api/cloud-vuln-access WITHOUT an admin JWT — a registered scanner
+// (or the operator's scan harness) presents its bearer token. Every call is
+// logged (authorized or rejected) to the hash-chained access log.
+accessRouter.post('/', (req, res) => {
+  const sourceIp = normalizeIp(req.ip || '');
+  const userAgent = (req.get && req.get('user-agent')) ? String(req.get('user-agent')).slice(0, 256) : null;
+  const body = req.body || {};
+  const component = VALID_COMPONENTS.includes(body.component) ? body.component : 'main_server';
+  const requestPath = typeof body.request_path === 'string' ? body.request_path.slice(0, 256) : null;
+
+  // Extract bearer token: Authorization: Bearer <token> or X-Scan-Token header.
+  let token = null;
+  const authz = req.get && req.get('authorization');
+  if (authz && /^Bearer\s+/i.test(authz)) token = authz.replace(/^Bearer\s+/i, '').trim();
+  if (!token && req.get && req.get('x-scan-token')) token = String(req.get('x-scan-token')).trim();
+
+  const db = getDb();
+  try {
+    const log = (outcome, fields) => {
+      // A logging failure must never change what the caller sees. Before
+      // this, a throw here escaped into the handler's catch and turned a
+      // 401 refusal into a 500 -- an ORACLE, because a certless caller got
+      // a different status than one with a valid cert and a bad token.
+      // Every rejection must answer identically.
+      //
+      // It must not be silent either: a dropped audit record is itself a
+      // security event. Caught, response unchanged, reported loudly.
+      try {
+        return appendAccessLog(db, {
+          authorization_id: fields.authorization_id || null,
+          scanner_type: fields.scanner_type || null,
+          source_ip: sourceIp,
+          component,
+          outcome,
+          request_path: requestPath,
+          user_agent: userAgent,
+          detail: fields.detail || null,
+        });
+      } catch (err) {
+        logger.error('cloud-vuln access log write FAILED', { outcome, error: err.message });
+        return null;
+      }
+    };
+
+    // ── Factor 1: mutual-TLS client certificate, CA-verified and scoped to
+    // this surface by OU=scanner-consumer. Checked BEFORE the token, so a
+    // caller with no certificate never reaches a token comparison and cannot
+    // probe which tokens exist. Every rejection answers the same 401; the
+    // reason goes to the hash-chained access log only.
+    const certCheck = verifyMachineCert(db, req, ca.SCANNER_CONSUMER_OU);
+    if (!certCheck.ok) {
+      log('rejected_cert', { detail: certCheck.reason });
+      return res.status(401).json({ error: 'Scan authorization token required' });
+    }
+    const certFp = certCheck.fingerprint;
+
+    if (!token || !/^cvs-[0-9a-f]{64}$/.test(token)) {
+      log('rejected_token', { detail: 'missing or malformed token' });
+      return res.status(401).json({ error: 'Scan authorization token required' });
+    }
+
+    // Find the matching authorization by constant-time token-hash comparison
+    // across enabled rows. (Disabled rows are excluded from the match set.)
+    // Narrowed to rows BOUND to this certificate; a NULL cert_fingerprint
+      // never matches, so an unbound row cannot authenticate.
+      const candidates = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE cert_fingerprint = ?').all(certFp);
+    let matched = null;
+    for (const row of candidates) {
+      if (safeEqualHex(hashToken(token, row.token_salt), row.token_hash)) { matched = row; break; }
+    }
+    if (!matched) {
+      log('rejected_unknown', { detail: 'token did not match any authorization' });
+      return res.status(401).json({ error: 'Scan authorization token not recognized' });
+    }
+    if (matched.enabled !== 1) {
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'authorization disabled' });
+      return res.status(403).json({ error: 'Scan authorization is disabled' });
+    }
+    // B6e: the live policy, checked AFTER the certificate and token factors.
+    // Order matters: a caller who fails authentication must not learn from the
+    // response whether the feature is enabled. Policy is an authorization
+    // decision about an AUTHENTICATED caller, so it belongs after identity is
+    // established -- same order as the on-prem router.
+    const policy = readScanPolicy(db, 'cloud');
+    if (!policy.enabled) {
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'cloud vulnerability scanning is disabled by policy' });
+      return res.status(403).json({ error: 'Cloud vulnerability scanning is disabled' });
+    }
+    if (!policy.allowedScanners.includes(matched.scanner_type)) {
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: `scanner_type ${matched.scanner_type} is not permitted by the current policy` });
+      return res.status(403).json({ error: 'Scanner type is not permitted by the current policy' });
+    }
+
+    const cidrs = parseJsonArray(matched.allowed_cidrs);
+    if (!ipAllowed(sourceIp, cidrs)) {
+      log('rejected_ip', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: `source ${sourceIp} not in allow-list` });
+      return res.status(403).json({ error: 'Source IP not in this authorization\'s allow-list' });
+    }
+
+    // Authorized.
+    log('authorized', { authorization_id: matched.id, scanner_type: matched.scanner_type });
+    db.prepare("UPDATE cloud_vuln_scanner_authorizations SET last_scan_at = datetime('now'), last_scan_source_ip = ? WHERE id = ?")
+      .run(sourceIp, matched.id);
+    res.json({ ok: true, authorized: true, scanner_type: matched.scanner_type, component });
+  } catch (err) {
+    logger.error('cloud-vuln access recorder error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to record scan access' });
+  } finally {
+    db.close();
+  }
+});
+
+router.accessRouter = accessRouter;
+module.exports = router;
