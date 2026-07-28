@@ -167,6 +167,30 @@ function checkNativeModules(manifests, lock, appBuildConfigs) {
     problems.push('lockfile: better-sqlite3 is not resolved (node_modules/better-sqlite3 missing)');
   }
 
+  // The lockfile must also SATISFY what the manifests declare. Resolving the
+  // module is not enough: main briefly carried '^13.0.1' in all three
+  // manifests while the committed lockfile still resolved 12.11.1, and the
+  // first version of this check passed it. CI did not catch it either,
+  // because build.yml uses `npm install` -- which treats the lockfile as
+  // advisory, resolves 13 from the manifests, and discards the update. So
+  // the binaries that shipped were built from a version the lockfile did not
+  // record, which is exactly the property a lockfile exists to provide.
+  if (sqliteLock && sqliteLock.version) {
+    const locked = sqliteLock.version;
+    const lockedMajor = String(locked).split('.')[0];
+    for (const [m, spec] of Object.entries(sqliteSpecs)) {
+      // Caret on a non-zero major permits anything inside that major, so a
+      // major mismatch is the decisive one: it means the lockfile was never
+      // regenerated after the manifest moved.
+      const specMajor = String(spec).replace(/^[^0-9]*/, '').split('.')[0];
+      if (specMajor && specMajor !== lockedMajor) {
+        problems.push('better-sqlite3 lockfile/manifest mismatch: ' + m + ' declares ' + spec
+          + ' but package-lock.json resolves ' + locked
+          + ' -- the lockfile was not regenerated, so it does not record what ships');
+      }
+    }
+  }
+
   // ── B. per-platform prebuilt presence, derived from the shipping apps' targets
   const required = requiredLlamaTargets(appBuildConfigs);
   if (required.length === 0) {
@@ -257,6 +281,8 @@ function selfTest() {
   add('zstd lost prebuild-install', (m, l) => { delete l.packages['node_modules/@mongodb-js/zstd'].dependencies['prebuild-install']; }, 'prebuild-install');
   add('better-sqlite3 version skew across manifests', (m) => { m['packages/global-dashboard-server/package.json'].dependencies['better-sqlite3'] = '^13.0.1'; }, 'better-sqlite3 version skew');
   add('better-sqlite3 not declared in a server', (m) => { delete m['server/package.json'].dependencies['better-sqlite3']; }, 'does not declare better-sqlite3');
+  add('better-sqlite3 lockfile behind the manifests', (m, l) => { for (const k of Object.keys(m)) if (m[k].dependencies && m[k].dependencies['better-sqlite3']) m[k].dependencies['better-sqlite3'] = '^13.0.1'; }, 'lockfile was not regenerated');
+  add('better-sqlite3 lockfile AHEAD of the manifests', (m, l) => { l.packages['node_modules/better-sqlite3'].version = '13.0.1'; }, 'lockfile was not regenerated');
   add('better-sqlite3 unresolved in lockfile', (m, l) => { delete l.packages['node_modules/better-sqlite3']; }, 'better-sqlite3 is not resolved');
   add('node-llama-cpp unresolved in lockfile', (m, l) => { delete l.packages['node_modules/node-llama-cpp']; }, 'not resolved');
 
