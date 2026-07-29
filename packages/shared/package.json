@@ -24,7 +24,7 @@
     "./package.json": "./package.json"
   },
   "dependencies": {
-    "@signalapp/libsignal-client": "^0.97.2",
+    "@signalapp/libsignal-client": "^0.99.1",
     "pdfkit": "^0.19.1"
   }
 }
