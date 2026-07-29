@@ -36,6 +36,7 @@ const router = require('express').Router();
 const accessRouter = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
+const { readScanPolicy } = require('../services/scan-policy');
 const ca = require('../services/ca');
 const { verifyMachineCert } = require('../services/machine-cert-auth');
 const { auditLog } = require('../middleware/audit');
@@ -43,6 +44,7 @@ const { logger } = require('../services/logger');
 const { mfaStepUp } = require('../middleware/mfa-stepup');
 
 const VALID_SCANNERS = ['scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov'];
+const VALID_SCHEDULES = ['daily', 'weekly', 'monthly', 'manual'];
 const VALID_COMPONENTS = ['mc', 'ac', 'arc', 'main_server', 'gd_server'];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -216,6 +218,70 @@ function appendAccessLog(db, fields) {
 // All endpoints below assume an admin JWT (enforced at mount in server/index.js).
 
 // ── List authorizations ──────────────────────────────────────────────────────
+// ── B6e: scan policy ───────────────────────────────────────────────────────
+// The master switch and permitted-scanner list for the CLOUD surface. This
+// surface had neither until B6e: v022-features.js:513-521 records the earlier
+// config-only stub being deliberately removed when B1 built the real
+// authorization model, and B5p then built a policy layer for on-prem that cloud
+// never received. One policed surface beside two unpoliced ones.
+//
+// A SEPARATE ROW from the on-prem policy, not a merged one. The two scanner
+// vocabularies are completely disjoint -- nessus/openvas/... versus
+// scoutsuite/prowler/... -- so a single allowedScanners list would be ambiguous
+// about which surface a name governs. Shared SHAPE, shared reader, shared
+// fail-safe; separate vocabulary.
+router.get('/config', (req, res) => {
+  const db = getDb();
+  try {
+    res.json({ config: readScanPolicy(db, 'cloud'), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
+  } catch (err) {
+    logger.error('cloud-vuln config get error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to read cloud-vuln config' });
+  } finally {
+    db.close();
+  }
+});
+
+// Writing policy is a configuration change on a security control, so it carries
+// the same step-up as minting a credential: disabling the permitted-scanner
+// list is as consequential as issuing a new authorization.
+router.put('/config', mfaStepUp(), (req, res) => {
+  const { enabled, allowedScanners, schedule } = req.body || {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  if (!Array.isArray(allowedScanners)) {
+    return res.status(400).json({ error: 'allowedScanners must be an array' });
+  }
+  for (const sc of allowedScanners) {
+    if (!VALID_SCANNERS.includes(sc)) {
+      return res.status(400).json({ error: 'Invalid scanner in allowedScanners', validScanners: VALID_SCANNERS });
+    }
+  }
+  if (schedule !== undefined && !VALID_SCHEDULES.includes(schedule)) {
+    return res.status(400).json({ error: 'Invalid schedule', validSchedules: VALID_SCHEDULES });
+  }
+  const uniqScanners = Array.from(new Set(allowedScanners));
+  const config = {
+    enabled,
+    allowedScanners: uniqScanners,
+    schedule: VALID_SCHEDULES.includes(schedule) ? schedule : 'weekly',
+    updatedAt: new Date().toISOString(),
+  };
+  const db = getDb();
+  try {
+    db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('cloud_vuln_config', ?, ?)")
+      .run(JSON.stringify(config), req.user.id);
+    auditLog(req.user.id, 'CLOUD_VULN_CONFIG_UPDATED', `enabled=${enabled} scanners=${uniqScanners.join(',')} schedule=${config.schedule}`, req.ip);
+    res.json({ config: readScanPolicy(db, 'cloud') });
+  } catch (err) {
+    logger.error('cloud-vuln config put error', { error: err.message, stack: err.stack });
+    res.status(500).json({ error: 'Failed to write cloud-vuln config' });
+  } finally {
+    db.close();
+  }
+});
+
 router.get('/authorizations', (req, res) => {
   const db = getDb();
   try {
@@ -253,6 +319,19 @@ router.post('/authorizations', mfaStepUp(), (req, res) => {
   }
 
   const db = getDb();
+  // B6e: the live policy governs what may be MINTED, not just what may
+  // announce. Issuing an authorization for a scanner the policy does not
+  // permit would create a credential that can never be used -- and would
+  // survive a later policy change, quietly becoming usable again.
+  const policy = readScanPolicy(db, 'cloud');
+  if (!policy.allowedScanners.includes(scanner_type)) {
+    db.close();
+    return res.status(403).json({
+      error: 'scanner_type is not permitted by the current cloud scan policy',
+      allowedScanners: policy.allowedScanners,
+    });
+  }
+
   try {
     const id = crypto.randomBytes(16).toString('hex');
     const token = `cvs-${crypto.randomBytes(32).toString('hex')}`;
@@ -452,16 +531,31 @@ accessRouter.post('/', (req, res) => {
 
   const db = getDb();
   try {
-    const log = (outcome, fields) => appendAccessLog(db, {
-      authorization_id: fields.authorization_id || null,
-      scanner_type: fields.scanner_type || null,
-      source_ip: sourceIp,
-      component,
-      outcome,
-      request_path: requestPath,
-      user_agent: userAgent,
-      detail: fields.detail || null,
-    });
+    const log = (outcome, fields) => {
+      // A logging failure must never change what the caller sees. Before
+      // this, a throw here escaped into the handler's catch and turned a
+      // 401 refusal into a 500 -- an ORACLE, because a certless caller got
+      // a different status than one with a valid cert and a bad token.
+      // Every rejection must answer identically.
+      //
+      // It must not be silent either: a dropped audit record is itself a
+      // security event. Caught, response unchanged, reported loudly.
+      try {
+        return appendAccessLog(db, {
+          authorization_id: fields.authorization_id || null,
+          scanner_type: fields.scanner_type || null,
+          source_ip: sourceIp,
+          component,
+          outcome,
+          request_path: requestPath,
+          user_agent: userAgent,
+          detail: fields.detail || null,
+        });
+      } catch (err) {
+        logger.error('cloud-vuln access log write FAILED', { outcome, error: err.message });
+        return null;
+      }
+    };
 
     // ── Factor 1: mutual-TLS client certificate, CA-verified and scoped to
     // this surface by OU=scanner-consumer. Checked BEFORE the token, so a
@@ -497,6 +591,21 @@ accessRouter.post('/', (req, res) => {
       log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'authorization disabled' });
       return res.status(403).json({ error: 'Scan authorization is disabled' });
     }
+    // B6e: the live policy, checked AFTER the certificate and token factors.
+    // Order matters: a caller who fails authentication must not learn from the
+    // response whether the feature is enabled. Policy is an authorization
+    // decision about an AUTHENTICATED caller, so it belongs after identity is
+    // established -- same order as the on-prem router.
+    const policy = readScanPolicy(db, 'cloud');
+    if (!policy.enabled) {
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'cloud vulnerability scanning is disabled by policy' });
+      return res.status(403).json({ error: 'Cloud vulnerability scanning is disabled' });
+    }
+    if (!policy.allowedScanners.includes(matched.scanner_type)) {
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: `scanner_type ${matched.scanner_type} is not permitted by the current policy` });
+      return res.status(403).json({ error: 'Scanner type is not permitted by the current policy' });
+    }
+
     const cidrs = parseJsonArray(matched.allowed_cidrs);
     if (!ipAllowed(sourceIp, cidrs)) {
       log('rejected_ip', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: `source ${sourceIp} not in allow-list` });

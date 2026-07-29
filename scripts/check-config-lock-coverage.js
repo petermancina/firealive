@@ -166,6 +166,7 @@ const GD_OPERATIONAL_ALLOWLIST = new Map([
   ['POST /api/backup/:id/verify', 'operational: verifies a stored backup'],
   ['POST /api/backup/chain/verify', 'operational: verifies the backup chain'],
   ['POST /api/cloud-vuln-access', 'inbound announce sub-router (no auth mw); not a config write'],
+  ['POST /api/vuln-scan-access', 'inbound announce sub-router (no auth mw); not a config write. A scanner runs on a timer and must be able to announce while the config lock is closed -- which is most of the time, by design. Machine-authenticated: cert, then token, then source IP.'],
   ['POST /api/cloud/package', 'operational: builds a cloud deployment package'],
   ['POST /api/config/lock', 'lock control: must work while locked (CONFIG_LOCK_EXEMPT)'],
   ['POST /api/config/lock/unlock-options', 'lock control: unlock recovery path'],

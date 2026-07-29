@@ -3983,6 +3983,12 @@ function ManagementConsole() {
   const THREAT_HUNT_FORMATS = [
     {id:"json",l:"Native JSON"},{id:"cef",l:"CEF (ArcSight / syslog)"},{id:"ocsf",l:"OCSF 1.1.0"},{id:"stix",l:"STIX 2.1 / TAXII"},
   ];
+  // B6e: the cloud scan policy -- master switch + permitted scanners. This
+  // surface had no policy at all until B6e: an operator could revoke
+  // authorizations one at a time but could not turn cloud scanning off.
+  const [cloudVulnPolicy, setCloudVulnPolicy] = useState(null);
+  const [cloudVulnPolicySaving, setCloudVulnPolicySaving] = useState(false);
+  const [cloudVulnPolicyMsg, setCloudVulnPolicyMsg] = useState(null);
   const [cloudVulnList, setCloudVulnList] = useState([]);
   const [cloudVulnLoading, setCloudVulnLoading] = useState(false);
   const [cloudVulnError, setCloudVulnError] = useState(null);
@@ -4000,6 +4006,12 @@ function ManagementConsole() {
   const [thAuthLogCount, setThAuthLogCount] = useState(0);
   const [thAuthChain, setThAuthChain] = useState(null); // {intact, count, brokenAt?}
   const reloadCloudVuln = async () => {
+  // The policy is loaded with the authorizations: an operator looking at the
+  // list needs to know whether the surface is even enabled.
+  try {
+    const pc = await api.get("/api/cloud-vuln/config");
+    if (pc && !pc.error) setCloudVulnPolicy({ enabled: !!pc.config.enabled, allowedScanners: pc.config.allowedScanners || [], schedule: pc.config.schedule || "weekly", valid: pc.validScanners || [] });
+  } catch (_e) { /* the list still renders; the panel shows its own error */ }
     setCloudVulnLoading(true); setCloudVulnError(null);
     try {
       const r = await api.get("/api/cloud-vuln/authorizations");
@@ -6816,6 +6828,37 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           {/* ── AUTHORIZED SCANNERS LIST ── */}
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              {cloudVulnPolicy&&(<Card style={{marginBottom:12}}>
+                <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:6}}>Cloud scan policy</M>
+                <M style={{color:C.td,display:"block",marginBottom:10,lineHeight:1.5}}>The master switch and the permitted-scanner list. Turning scanning off stops every announce on this surface and withdraws the rate-limit exemption from its scanners, whether or not their authorizations are still enabled.</M>
+                {cloudVulnPolicyMsg&&<M style={{color:C.p,display:"block",marginBottom:8}}>{cloudVulnPolicyMsg}</M>}
+                <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,cursor:"pointer"}}>
+                  <input type="checkbox" checked={cloudVulnPolicy.enabled} onChange={e=>setCloudVulnPolicy(p=>({...p,enabled:e.target.checked}))}/>
+                  <M style={{color:C.t}}>Cloud vulnerability scanning enabled</M>
+                </label>
+                <M style={{color:C.td,display:"block",marginBottom:6}}>Permitted scanners</M>
+                <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12}}>
+                  {(cloudVulnPolicy.valid||[]).map(sc=>(
+                    <label key={sc} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",padding:"4px 8px",border:`1px solid ${C.b}`,borderRadius:6}}>
+                      <input type="checkbox" checked={cloudVulnPolicy.allowedScanners.includes(sc)} onChange={()=>setCloudVulnPolicy(p=>({...p,allowedScanners:p.allowedScanners.includes(sc)?p.allowedScanners.filter(x=>x!==sc):[...p.allowedScanners,sc]}))}/>
+                      <M style={{color:C.t}}>{sc}</M>
+                    </label>
+                  ))}
+                </div>
+                <Btn primary disabled={cloudVulnPolicySaving} onClick={async()=>{
+                  setCloudVulnPolicySaving(true);setCloudVulnPolicyMsg(null);
+                  try{
+                    const stepup=await getStepUp();
+                    // Cancelling the hardware prompt must not leave the button stuck
+                    // disabled -- the existing on-prem button at :8223 returns here with
+                    // its busy flag still true.
+                    if(!stepup){setCloudVulnError("Hardware confirmation cancelled; policy unchanged.");return;}
+                    const r=await api.put("/api/cloud-vuln/config",{stepup,enabled:cloudVulnPolicy.enabled,allowedScanners:cloudVulnPolicy.allowedScanners,schedule:cloudVulnPolicy.schedule});
+                    if(r&&!r.error){addA("CLOUD_VULN_CONFIG_UPDATED","enabled="+cloudVulnPolicy.enabled+" scanners="+cloudVulnPolicy.allowedScanners.join(","));setCloudVulnPolicyMsg("Scan policy saved.");reloadCloudVuln();}
+                    else setCloudVulnError((r&&r.error)||"save policy failed");
+                  } finally { setCloudVulnPolicySaving(false); }
+                }}>{cloudVulnPolicySaving?"Saving...":"Save policy"}</Btn>
+              </Card>)}
               <div style={{fontSize:12,fontWeight:500,color:"#E8EDF5"}}>Authorized scanners ({cloudVulnList.length})</div>
               <Btn primary small onClick={()=>{setCloudVulnNewToken(null);setCloudVulnForm({mode:"add",scanner_type:"",display_name:"",allowed_cidrs:"",scope_components:[],notes:"",enabled:true});}}>+ Authorize Scanner</Btn>
             </div>

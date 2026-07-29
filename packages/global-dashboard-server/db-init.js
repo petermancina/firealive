@@ -883,6 +883,85 @@ CREATE TRIGGER IF NOT EXISTS report_verifications_no_delete
 -- holds its OWN authorizations (independent of the MC); this is NOT a vulnerability
 -- aggregate/dashboard — it is the same EDR-style authorization + audit integration
 -- as on the main server, scoped to the GD-server.
+-- ── B6e: on-prem vulnerability-scan authorizations (GD) ──────────────────
+-- The GD's own on-prem scan surface, twinning the Regional Server's rather than
+-- the GD's cloud one. Two deliberate differences from the cloud table beside it:
+--
+--   * NO scope_components. A cloud scan targets FireAlive COMPONENTS; an
+--     on-prem scan targets HOSTS, and allowed_cidrs already says which. An
+--     unused security-shaped column invites a future reader to enforce
+--     something that was never designed.
+--   * the on-prem scanner vocabulary, which is disjoint from cloud's.
+--
+-- cert_fingerprint / cert_serial are NOT NULL from the first line: this table
+-- has never existed, so there is no upgrade path that would need a nullable
+-- column, and a fresh install cannot write an unbound credential at all.
+CREATE TABLE IF NOT EXISTS vuln_scan_scanner_authorizations (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  scanner_type TEXT NOT NULL CHECK (scanner_type IN (
+    'nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei'
+  )),
+  display_name TEXT NOT NULL,
+  allowed_cidrs TEXT NOT NULL DEFAULT '[]',
+  -- Cert first, then token, then source IP -- the same three factors every
+  -- other machine-authenticated surface on this server carries.
+  cert_fingerprint TEXT NOT NULL,
+  cert_serial TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  token_salt TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_scan_at TEXT,
+  last_scan_source_ip TEXT,
+  notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gd_vuln_scan_auth_enabled
+  ON vuln_scan_scanner_authorizations(enabled, scanner_type);
+
+CREATE INDEX IF NOT EXISTS idx_gd_vuln_scan_auth_cert_fp
+  ON vuln_scan_scanner_authorizations(cert_fingerprint);
+
+-- Append-only, hash-chained. rejected_cert is present FROM THE START: O3 added
+-- a certificate factor to three shipped access routers without extending their
+-- outcome CHECKs, which turned a 401 refusal into a 500 and lost the audit
+-- record entirely. Sub-phase 1 rebuilt those three tables; there is no reason
+-- to repeat the mistake on a fourth.
+CREATE TABLE IF NOT EXISTS vuln_scan_access_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_hash TEXT,
+  this_hash TEXT NOT NULL,
+  authorization_id TEXT REFERENCES vuln_scan_scanner_authorizations(id) ON DELETE SET NULL,
+  scanner_type TEXT,
+  source_ip TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'authorized',
+    'rejected_cert',
+    'rejected_ip',
+    'rejected_token',
+    'rejected_disabled',
+    'rejected_unknown'
+  )),
+  request_path TEXT,
+  user_agent TEXT,
+  detail TEXT,
+  accessed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_gd_vuln_scan_access_accessed_at
+  ON vuln_scan_access_log(accessed_at DESC);
+
+-- The chain is only evidence if nobody can rewrite it.
+CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_update
+  BEFORE UPDATE ON vuln_scan_access_log
+  BEGIN SELECT RAISE(ABORT, 'vuln_scan_access_log is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_delete
+  BEFORE DELETE ON vuln_scan_access_log
+  BEGIN SELECT RAISE(ABORT, 'vuln_scan_access_log is append-only'); END;
+
 CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   scanner_type TEXT NOT NULL CHECK (scanner_type IN (
@@ -923,7 +1002,11 @@ CREATE TABLE IF NOT EXISTS cloud_vuln_scan_access_log (
     'mc', 'ac', 'arc', 'main_server', 'gd_server'
   )),
   outcome TEXT NOT NULL CHECK (outcome IN (
-    'authorized', 'rejected_ip', 'rejected_token', 'rejected_disabled', 'rejected_unknown'
+    'authorized',
+    -- O3 made this router certificate-first: the cert check runs BEFORE
+    -- the token, so its rejection is the first thing a probing scanner
+    -- produces. It must be recordable.
+    'rejected_cert', 'rejected_ip', 'rejected_token', 'rejected_disabled', 'rejected_unknown'
   )),
   request_path TEXT,
   user_agent TEXT,
@@ -1630,6 +1713,56 @@ function initDb() {
   } catch (e) {
     console.error('O3 Half 2 GD certificate-binding migration failed:', e.message);
   }
+
+    // ── B6e: let the GD scanner access log record rejected_cert ───────────────
+    //
+    // O3 made all three scanner access routers (this server carries one of them) certificate-first and added
+    // log('rejected_cert', ...) as the FIRST rejection -- before the token is
+    // ever compared. None of the access-log tables permitted that value: the
+    // outcome CHECK carried five entries and the sixth code was added without
+    // extending it. The request still failed closed (the 401 returned), but the
+    // rejection was never written to the hash-chained log -- which is exactly
+    // the record that answers "is something probing our scan endpoint?".
+    //
+    // SQLite cannot alter a CHECK in place, and re-running CREATE TABLE IF NOT
+    // EXISTS with a wider CHECK is a no-op on an existing database. So the
+    // constraint has to be rebuilt. Guarded on the CONSTRAINT TEXT rather than a
+    // version number: this runs only where the old five-value CHECK is present.
+    try {
+      for (const tbl of ['cloud_vuln_scan_access_log']) {
+        const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tbl);
+        if (!row || !row.sql) continue;                       // table not on this deployment
+        if (row.sql.includes("'rejected_cert'")) continue;     // already rebuilt
+        const rebuilt = row.sql
+          .replace('CREATE TABLE IF NOT EXISTS ' + tbl, 'CREATE TABLE ' + tbl + '_b6e_new')
+          .replace('CREATE TABLE ' + tbl, 'CREATE TABLE ' + tbl + '_b6e_new')
+          .replace("'authorized',", "'authorized',\n            'rejected_cert',");
+        if (!rebuilt.includes("'rejected_cert'")) {
+          throw new Error('could not widen the CHECK for ' + tbl + '; refusing to rebuild');
+        }
+        const cols = db.prepare(`PRAGMA table_info(${tbl})`).all().map((c) => c.name).join(', ');
+        // One transaction: a failure mid-rebuild leaves the original intact
+        // rather than a half-copied audit log.
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.exec(`DROP TRIGGER IF EXISTS ${tbl}_no_update`);
+          db.exec(`DROP TRIGGER IF EXISTS ${tbl}_no_delete`);
+          db.exec(rebuilt);
+          db.exec(`INSERT INTO ${tbl}_b6e_new (${cols}) SELECT ${cols} FROM ${tbl}`);
+          db.exec(`DROP TABLE ${tbl}`);
+          db.exec(`ALTER TABLE ${tbl}_b6e_new RENAME TO ${tbl}`);
+          db.exec(`CREATE TRIGGER IF NOT EXISTS ${tbl}_no_update BEFORE UPDATE ON ${tbl} BEGIN SELECT RAISE(ABORT, '${tbl} is append-only'); END`);
+          db.exec(`CREATE TRIGGER IF NOT EXISTS ${tbl}_no_delete BEFORE DELETE ON ${tbl} BEGIN SELECT RAISE(ABORT, '${tbl} is append-only'); END`);
+          db.exec('COMMIT');
+          console.log(`${tbl} migration (B6e): outcome CHECK widened to record rejected_cert; ${db.prepare(`SELECT COUNT(*) c FROM ${tbl}`).get().c} rows preserved`);
+        } catch (inner) {
+          db.exec('ROLLBACK');
+          throw inner;
+        }
+      }
+    } catch (e) {
+      console.error('B6e access-log CHECK migration failed:', e.message);
+    }
 
   // v2 encrypted-backup + WAL/chain columns on `backups` (MC-grade parity).
   // Existing GD installs created `backups` without them; add via guarded ALTER

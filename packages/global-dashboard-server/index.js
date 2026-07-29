@@ -53,6 +53,8 @@ const gdDeviceKey = require('./services/gd-device-key');
 const gdPop = require('./services/gd-pop');
 const { verifyPushSignature } = require('./services/mc-signature-verifier');
 const signingKeysSvc = require('./services/signing-keys');
+const { isAuthorizedCloudScannerIp } = require('./services/gd-cloud-vuln-allowlist');
+const { isAuthorizedOnPremScannerIp } = require('./services/gd-vuln-scan-allowlist');
 const cicdBundle = require('./services/cicd-bundle');
 const forensicExport = require('./services/forensic-export');
 const { canonicalSerialize, sliceSha256 } = require('./services/audit-export-shared');
@@ -191,7 +193,38 @@ const apiLimiter = rateLimit({
   // chokepoint and the device-PoP gate already follow, or the skip never fires and
   // the load balancer's health probes are rate-limited -- which can make the LB
   // declare a perfectly healthy active down and trigger a needless failover.
-  skip: (req) => ((req.originalUrl || req.url || '').split('?')[0]) === '/api/health',
+  skip: (req) => {
+    // The health probe stays first and unchanged: comparing originalUrl
+    // rather than req.path matters because this limiter is mounted at
+    // '/api/', so Express strips the mount and req.path is '/health'.
+    // Getting that wrong makes the skip silently never fire and the load
+    // balancer's probes get rate-limited, which can make it declare a
+    // healthy active down and trigger a needless failover.
+    if (((req.originalUrl || req.url || '').split('?')[0]) === '/api/health') return true;
+    // B6e: a sanctioned scan generates far more requests in a short window
+    // than any human session. Without this the limiter throttles the scan
+    // and it reports a false clean -- the security control defeating the
+    // security test. The Regional Server has had this since B5p; the GD had
+    // NO exemption at all, so its own cloud scans have been throttled as
+    // attacks since B1.
+    //
+    // This is the ONLY defence relaxed. The mutual-TLS certificate factor,
+    // the bearer token, the source-IP allow-list, the live scan policy, the
+    // append-only hash-chained access log and the lockout all stay active.
+    // An exempted IP gets more REQUESTS, never more ACCESS.
+    //
+    // Wrapped: a throw here would propagate into every request through the
+    // limiter. On error, no exemption -- the failure direction is toward
+    // MORE rate limiting, never less.
+    try {
+      // Both GD scan surfaces. Checked separately rather than merged: each
+      // reads its own policy row and its own authorization table, so a
+      // disabled cloud policy cannot exempt an on-prem scanner or vice versa.
+      return isAuthorizedCloudScannerIp(req.ip) || isAuthorizedOnPremScannerIp(req.ip);
+    } catch (_) {
+      return false;
+    }
+  },
   keyGenerator: rateLimitKeyGenerator,
   validate: true,
 });
@@ -484,6 +517,18 @@ const authMiddleware = (roles, options) => (req, res, next) => {
 app.use('/api/instance', authMiddleware(null), require('./routes/instance-identity'));
 app.use('/api/cloud-vuln', authMiddleware(['ciso', 'vp']), require('./routes/cloud-vuln-scan'));
 app.use('/api/cloud-vuln-access', require('./routes/cloud-vuln-scan').accessRouter);
+// B6e: the GD's own ON-PREM scan surface, twinning the Regional Server's rather
+// than the cloud router beside it. Same shape as the cloud mounts above:
+//
+//   * the admin router is ciso/vp-gated -- minting a scanner credential is a
+//     CISO-level act
+//   * the access router carries NO authMiddleware, deliberately. It is
+//     machine-authenticated: mutual-TLS client certificate first, then bearer
+//     token, then source IP. A JWT here would be meaningless -- a scanner has
+//     no operator session -- and adding one would break the surface while
+//     appearing to harden it.
+app.use('/api/vuln-scan', authMiddleware(['ciso', 'vp']), require('./routes/vuln-scan'));
+app.use('/api/vuln-scan-access', require('./routes/vuln-scan').accessRouter);
 // B5n3: CISO-only management of FIDO attestation trust anchors + AAGUID allow-list
 // (trust-anchor management is ciso-gated; the config-lock chokepoint mounted above
 // now also covers the MC-trust mutation endpoints).
@@ -5929,6 +5974,110 @@ function runGdRegression(db) {
     const anon = call(null);
     if (anon.nexted || anon.code !== 403) throw new Error('missing-user was not rejected');
     return 'requireCiso rejects vp + missing-user (403), admits ciso; writes stay ciso-only';
+  });
+
+  // -- B6e: on-prem vulnerability scan (8) --------------------------------
+  // The GD gained its own on-prem scan surface in B6e. It had none, and the
+  // Regional Server's nine equivalents had no GD counterpart -- a surface with
+  // no regression coverage is one where a refactor can silently remove a
+  // control and nothing notices until an audit.
+  //
+  // These assert the EFFECT, in the convention this runner already follows: they
+  // execute SQL against the live schema rather than grepping for a function name
+  // that a refactor could move without breaking.
+  record('vuln_scan', 'schema present: tables, indexes, append-only triggers', () => {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('vuln_scan_scanner_authorizations','vuln_scan_access_log')").all().map(r => r.name);
+    if (t.length !== 2) throw new Error('missing table(s): have ' + JSON.stringify(t));
+    const tr = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'vuln_scan_access_log_no_%'").all();
+    if (tr.length !== 2) throw new Error('append-only triggers missing: ' + tr.length + '/2');
+    return 'both tables + 2 append-only triggers';
+  });
+
+  record('vuln_scan', 'a credential cannot be written without a bound certificate', () => {
+    // cert_fingerprint NOT NULL is the structural guarantee. If a future
+    // migration relaxes it, an unbound credential becomes writable and the
+    // whole certificate-first model is decorative.
+    const cols = db.prepare('PRAGMA table_info(vuln_scan_scanner_authorizations)').all();
+    const fp = cols.find((c) => c.name === 'cert_fingerprint');
+    const sn = cols.find((c) => c.name === 'cert_serial');
+    if (!fp || !sn) throw new Error('cert columns missing');
+    if (!fp.notnull || !sn.notnull) throw new Error('cert columns are nullable -- an unbound credential can be written');
+    return 'cert_fingerprint + cert_serial NOT NULL';
+  });
+
+  record('vuln_scan', 'scanner_type is a closed enum, disjoint from the cloud surface', () => {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='vuln_scan_scanner_authorizations'").get();
+    if (!sql) throw new Error('table missing');
+    for (const want of ['nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei']) {
+      if (!sql.sql.includes("'" + want + "'")) throw new Error('missing scanner ' + want);
+    }
+    for (const cloud of ['scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov']) {
+      if (sql.sql.includes("'" + cloud + "'")) throw new Error('CLOUD scanner ' + cloud + ' is accepted on the on-prem surface');
+    }
+    return '6 on-prem scanners, no cloud scanner accepted';
+  });
+
+  record('vuln_scan', 'the access log can record every outcome its router emits', () => {
+    // O3 added a certificate factor to three shipped access routers without
+    // extending their outcome CHECKs. The INSERT threw, which turned a 401
+    // refusal into a 500 -- an oracle -- and lost the audit record. This asserts
+    // the fourth table never acquires that gap.
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='vuln_scan_access_log'").get();
+    if (!sql) throw new Error('access log missing');
+    for (const o of ['authorized', 'rejected_cert', 'rejected_ip', 'rejected_token', 'rejected_disabled', 'rejected_unknown']) {
+      if (!sql.sql.includes("'" + o + "'")) throw new Error('outcome not recordable: ' + o);
+    }
+    return 'all 6 outcomes recordable, including rejected_cert';
+  });
+
+  record('vuln_scan', 'the access log is append-only in fact, not only by convention', () => {
+    const before = db.prepare('SELECT COUNT(*) c FROM vuln_scan_access_log').get().c;
+    let blocked = 0;
+    try { db.prepare("UPDATE vuln_scan_access_log SET source_ip = 'x' WHERE id = (SELECT MIN(id) FROM vuln_scan_access_log)").run(); }
+    catch (e) { if (/append-only/.test(String(e.message))) blocked++; }
+    try { db.prepare('DELETE FROM vuln_scan_access_log WHERE id = (SELECT MIN(id) FROM vuln_scan_access_log)').run(); }
+    catch (e) { if (/append-only/.test(String(e.message))) blocked++; }
+    const after = db.prepare('SELECT COUNT(*) c FROM vuln_scan_access_log').get().c;
+    if (before !== after) throw new Error('a row was removed: ' + before + ' -> ' + after);
+    if (before > 0 && blocked !== 2) throw new Error('mutation was not refused (' + blocked + '/2 blocked)');
+    return before > 0 ? 'UPDATE and DELETE both refused' : SKIP('log is empty; nothing to attempt a mutation against');
+  });
+
+  record('vuln_scan', 'the live policy fails closed when absent or corrupt', () => {
+    // The direction matters: a reader that failed OPEN would turn a corrupted
+    // config row into a silently unrestricted scan surface.
+    const { readScanPolicy } = require('./services/gd-scan-policy');
+    const off = readScanPolicy(null, 'on_prem');
+    if (off.enabled || off.allowedScanners.length) throw new Error('no db handle did not fail closed');
+    const bogus = readScanPolicy(db, 'not_a_surface');
+    if (bogus.enabled || bogus.allowedScanners.length) throw new Error('an unknown surface did not fail closed');
+    return 'absent handle and unknown surface both yield disabled/empty';
+  });
+
+  record('vuln_scan', 'the rate-limit exemption is withdrawn when the policy is off', () => {
+    // Without this the exemption outlives the policy that authorized it:
+    // disabling scanning would stop announces while the source IPs stayed
+    // exempt, so a scanner revoked BY POLICY keeps a privilege it should lose.
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'services', 'gd-vuln-scan-allowlist.js'), 'utf8');
+    if (!/readScanPolicy\(db, 'on_prem'\)/.test(src)) throw new Error('the allow-list does not read the live policy');
+    if (!/policy\.enabled && policy\.allowedScanners\.length/.test(src)) throw new Error('the allow-list does not gate on the policy');
+    return 'the allow-list refresh is gated on enabled + permitted scanners';
+  });
+
+  record('vuln_scan', 'the announce path is reachable while the config lock is closed', () => {
+    // A scanner runs on a timer. If announcing required an unlocked config,
+    // scans would fail whenever the lock is closed -- which is most of the time,
+    // by design.
+    const w = require('./services/gd-config-write-routes');
+    const mounts = (w && (w.CONFIG_WRITE_MOUNTS || w.MOUNTS)) || [];
+    const list = Array.isArray(mounts) ? mounts : [];
+    if (list.length && list.some((m) => String(m).indexOf('/api/vuln-scan-access') === 0)) {
+      throw new Error('the announce path is config-lock gated; scans would fail while locked');
+    }
+    if (list.length && !list.some((m) => String(m) === '/api/vuln-scan')) {
+      throw new Error('the admin mount is NOT config-lock gated');
+    }
+    return list.length ? 'admin mount gated, announce path exempt' : SKIP('mount registry not exported for inspection');
   });
 
   const passed = tests.filter(t => t.status === 'pass').length;

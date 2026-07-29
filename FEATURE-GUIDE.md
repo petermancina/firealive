@@ -1393,7 +1393,7 @@ Health checks follow the feature: every integration is probed by a check that sh
 
 A scan policy sets the master on/off switch, the subset of the six scanner types you permit, and an informational schedule. The permitted-scanner policy is live: it is enforced when an authorization is created, again when a scan is announced, and again at the rate-limit exemption — so removing a scanner type (or disabling the feature) stops authorizing it and stops exempting its traffic within one refresh window, without touching individual authorizations.
 
-Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization whose type is currently permitted. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization whose type is currently permitted. The scan policy — a master switch and the permitted-scanner list — is changed with a hardware-key touch, and narrowing it takes effect at the next announce and at the next rate-limit refresh without touching any authorization row. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time.
 
 FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled, permitted authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
@@ -1410,7 +1410,7 @@ FireAlive performs application-layer authorization and logging. Network-layer bl
 
 **What it’s for:** Authorize your organization’s cloud-posture and IaC scanners (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) to scan your FireAlive cloud deployment, and keep a tamper-evident record of every scan that reaches it. FireAlive does not run scans or store findings itself — scan results live in the scanner’s own console, the same way EDR and threat-hunting integrations let approved tooling inspect FireAlive without FireAlive duplicating the tool. This is the cloud-posture companion to the endpoint-focused EDR/Threat Hunting integrations: FireAlive opens itself to authorized scanning by the org’s security tooling and logs that access.
 
-Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, and the main server); the Global Dashboard server keeps its own separate authorization config and its own scan-access log.
+Each authorization is a registered scanner identity, not an open door. Access is granted per scanner with three controls, checked in order and failing closed on each: a mutual-TLS client certificate issued by this deployment’s CA and scoped to the scanner role, a bearer token (shown once at creation, then stored only as a salted hash), and a source-IP allow-list (individual IPs or CIDR ranges). A scan is accepted only when the certificate, the token and the source IP all match an enabled authorization. Every scan attempt — accepted or rejected — is written to an append-only, hash-chained scan-access log whose integrity can be verified from the console at any time. Authorization covers all deployed components (Management Console, Analyst Client, and the main server); the Global Dashboard server keeps its own separate authorization config, its own scan-access log, and its own certificate authority — a certificate issued by one server does not verify on the other. Each surface also has its own scan policy: a master switch and a permitted-scanner list, changed with a hardware-key touch, which stops announces and withdraws the rate-limit exemption without revoking any authorization.
 
 FireAlive performs application-layer authorization and logging. Network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility — FireAlive records and attributes the scans that reach it rather than acting as a network firewall. Source IPs belonging to an enabled authorization are exempt from FireAlive’s API rate limiting so a sanctioned high-volume scan is not throttled; all other defenses stay active.
 
@@ -1428,6 +1428,24 @@ On the Global Dashboard server the same feature appears in its own console and a
 -----
 
 ## Audit group
+
+### On-Prem Vulnerability Scan (Global Dashboard)
+
+**What it's for:** The Global Dashboard is a deployed asset in its own right, on its own host. This authorizes your organization's own on-prem scanners — Nessus, OpenVAS, Qualys, Rapid7, Tenable.io, Nuclei — to scan it, on the same terms the Management Console has offered since B5p.
+
+It is a **separate surface**, not a view onto the Regional Server's. The Global Dashboard runs its own certificate authority, its own authorization table, its own scan-access log and its own scan policy. A certificate or token issued by the Regional Server grants nothing here.
+
+**Workflow:**
+
+1. CISO opens On-Prem Vuln Scan on the Global Dashboard
+1. Sets the scan policy first — the master switch and which of the six scanner types are permitted. Confirms with a hardware-key touch. **Nothing can be authorized for a scanner type the policy does not permit**, so the policy comes before the authorization rather than after
+1. Clicks "Authorize scanner", names it, picks the type, and enters the CIDR ranges its scans originate from
+1. Confirms with a hardware-key touch
+1. Receives **four** items, shown once and never retrievable: the bearer token, a client certificate, its private key, and the Global Dashboard CA certificate. All four go into the scanner's configuration; the token alone authenticates nothing
+1. Runs the scan. The scanner announces to `/api/vuln-scan-access` before scanning; its source IP is exempted from rate limiting for the duration, so the scan is not throttled into a false clean
+1. Reviews the scan-access log, and verifies its hash chain from the console
+
+**Turning it off:** flip the master switch. Every announce stops and every rate-limit exemption is withdrawn within one refresh window, without revoking a single authorization — and turning it back on restores exactly what was there before.
 
 ### Audit Log
 

@@ -17,6 +17,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { getDb } = require('../db/init');
+const { readScanPolicy } = require('./scan-policy');
 
 const TTL_MS = 30 * 1000;
 let cache = { cidrs: [], loadedAt: 0 };
@@ -68,17 +69,30 @@ function refresh() {
   let db;
   try {
     db = getDb();
-    const rows = db
-      .prepare('SELECT allowed_cidrs FROM cloud_vuln_scanner_authorizations WHERE enabled = 1')
-      .all();
+    // B6e: honour the live policy, as the on-prem twin has since B5p.
+    // Without this the rate-limit exemption outlives the policy that
+    // authorized it: disabling cloud scanning would stop announces while
+    // these source IPs stayed exempt, so a scanner revoked BY POLICY keeps
+    // a privilege it should have lost. An operator toggling the switch
+    // would reasonably believe the surface was closed.
+    const policy = readScanPolicy(db, 'cloud');
     const cidrs = [];
-    for (const r of rows) {
-      try {
-        const arr = JSON.parse(r.allowed_cidrs);
-        if (Array.isArray(arr)) {
-          for (const c of arr) if (typeof c === 'string' && c.trim()) cidrs.push(c.trim());
-        }
-      } catch (_) { /* skip malformed row */ }
+    if (policy.enabled && policy.allowedScanners.length) {
+      const allowed = new Set(policy.allowedScanners);
+      const rows = db
+        .prepare('SELECT allowed_cidrs, scanner_type FROM cloud_vuln_scanner_authorizations WHERE enabled = 1')
+        .all();
+      for (const r of rows) {
+        // A scanner type the policy no longer permits is not exempt, even
+        // though its authorization row is still enabled.
+        if (!allowed.has(r.scanner_type)) continue;
+        try {
+          const arr = JSON.parse(r.allowed_cidrs);
+          if (Array.isArray(arr)) {
+            for (const c of arr) if (typeof c === 'string' && c.trim()) cidrs.push(c.trim());
+          }
+        } catch (_) { /* skip malformed row */ }
+      }
     }
     cache = { cidrs, loadedAt: Date.now() };
   } catch (_) {

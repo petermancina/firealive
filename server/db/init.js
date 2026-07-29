@@ -3390,6 +3390,56 @@ function initDb() {
       console.error('O3 Half 2 certificate-binding migration failed:', e.message);
   }
 
+    // ── B6e: let the scanner access logs record rejected_cert ───────────────
+    //
+    // O3 made all three scanner access routers certificate-first and added
+    // log('rejected_cert', ...) as the FIRST rejection -- before the token is
+    // ever compared. None of the access-log tables permitted that value: the
+    // outcome CHECK carried five entries and the sixth code was added without
+    // extending it. The request still failed closed (the 401 returned), but the
+    // rejection was never written to the hash-chained log -- which is exactly
+    // the record that answers "is something probing our scan endpoint?".
+    //
+    // SQLite cannot alter a CHECK in place, and re-running CREATE TABLE IF NOT
+    // EXISTS with a wider CHECK is a no-op on an existing database. So the
+    // constraint has to be rebuilt. Guarded on the CONSTRAINT TEXT rather than a
+    // version number: this runs only where the old five-value CHECK is present.
+    try {
+      for (const tbl of ['vuln_scan_access_log', 'cloud_vuln_scan_access_log']) {
+        const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tbl);
+        if (!row || !row.sql) continue;                       // table not on this deployment
+        if (row.sql.includes("'rejected_cert'")) continue;     // already rebuilt
+        const rebuilt = row.sql
+          .replace('CREATE TABLE IF NOT EXISTS ' + tbl, 'CREATE TABLE ' + tbl + '_b6e_new')
+          .replace('CREATE TABLE ' + tbl, 'CREATE TABLE ' + tbl + '_b6e_new')
+          .replace("'authorized',", "'authorized',\n            'rejected_cert',");
+        if (!rebuilt.includes("'rejected_cert'")) {
+          throw new Error('could not widen the CHECK for ' + tbl + '; refusing to rebuild');
+        }
+        const cols = db.prepare(`PRAGMA table_info(${tbl})`).all().map((c) => c.name).join(', ');
+        // One transaction: a failure mid-rebuild leaves the original intact
+        // rather than a half-copied audit log.
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.exec(`DROP TRIGGER IF EXISTS ${tbl}_no_update`);
+          db.exec(`DROP TRIGGER IF EXISTS ${tbl}_no_delete`);
+          db.exec(rebuilt);
+          db.exec(`INSERT INTO ${tbl}_b6e_new (${cols}) SELECT ${cols} FROM ${tbl}`);
+          db.exec(`DROP TABLE ${tbl}`);
+          db.exec(`ALTER TABLE ${tbl}_b6e_new RENAME TO ${tbl}`);
+          db.exec(`CREATE TRIGGER IF NOT EXISTS ${tbl}_no_update BEFORE UPDATE ON ${tbl} BEGIN SELECT RAISE(ABORT, '${tbl} is append-only'); END`);
+          db.exec(`CREATE TRIGGER IF NOT EXISTS ${tbl}_no_delete BEFORE DELETE ON ${tbl} BEGIN SELECT RAISE(ABORT, '${tbl} is append-only'); END`);
+          db.exec('COMMIT');
+          console.log(`${tbl} migration (B6e): outcome CHECK widened to record rejected_cert; ${db.prepare(`SELECT COUNT(*) c FROM ${tbl}`).get().c} rows preserved`);
+        } catch (inner) {
+          db.exec('ROLLBACK');
+          throw inner;
+        }
+      }
+    } catch (e) {
+      console.error('B6e access-log CHECK migration failed:', e.message);
+    }
+
   // ── Migration: peer board KV → peer_board_messages (U2) ──────────────────
   // The prototype board (retired v022-features route) stored each post as a
   // JSON blob in team_config under keys "peer_board_<id>". U2 introduces the
@@ -7827,6 +7877,10 @@ function initDb() {
         )),
         outcome TEXT NOT NULL CHECK (outcome IN (
           'authorized',
+          -- O3 made this router certificate-first: the cert check runs BEFORE
+          -- the token, so its rejection is the first thing a probing scanner
+          -- produces. It must be recordable.
+          'rejected_cert',
           'rejected_ip',
           'rejected_token',
           'rejected_disabled',
@@ -7924,6 +7978,10 @@ function initDb() {
         source_ip TEXT NOT NULL,
         outcome TEXT NOT NULL CHECK (outcome IN (
           'authorized',
+          -- O3 made this router certificate-first: the cert check runs BEFORE
+          -- the token, so its rejection is the first thing a probing scanner
+          -- produces. It must be recordable.
+          'rejected_cert',
           'rejected_ip',
           'rejected_token',
           'rejected_disabled',

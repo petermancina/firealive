@@ -133,6 +133,29 @@ once: the secret, a client certificate, its private key, and the FireAlive CA
 certificate. All four go into the integration's configuration; the secret alone
 authenticates nothing. See `docs/machine-credentials.md`.
 
+**Upgrading to v1.0.90 or later turns cloud vulnerability scanning off until you
+switch it on.** From this release every scan surface carries a master switch and a
+list of permitted scanner types. The on-prem surface already had one and keeps
+whatever you set; the cloud surfaces did not have one at all, so there is no saved
+setting to carry forward and they start disabled.
+
+That is deliberate — a security control that arrived already switched on would be
+one nobody chose — but it means an existing cloud scanner stops being accepted at
+the moment you upgrade. Its authorization is untouched and its credentials still
+work; the announce is refused by policy, and the refusal is recorded in the
+scan-access log as `rejected_disabled`.
+
+To restore it: open Cloud Vuln Scan in the console that owns the surface — the
+Management Console for the Regional Server, the Global Dashboard for its own — turn
+scanning on, tick the scanner types you use, and confirm with your hardware key.
+The permitted-scanner list is per surface and the two vocabularies are different,
+so set each one you actually use. Nothing needs re-issuing.
+
+The same switch is the supported way to stop scanning later: turning it off halts
+every announce on that surface and withdraws its rate-limit exemption within a
+minute, without revoking a single authorization, and turning it back on restores
+exactly what was there before. See `docs/vulnerability-scanning.md`.
+
 **Take a restore point before you update.** This is the step that makes a
 rollback possible at all, and it can only be taken from the build you are about
 to replace:

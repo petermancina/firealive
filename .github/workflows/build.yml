@@ -59,6 +59,10 @@ jobs:
         run: node scripts/check-machine-cert-binding.js --selftest
       - name: Verify machine credentials are certificate-bound
         run: node scripts/check-machine-cert-binding.js
+      - name: Access-log outcome guard self-test
+        run: node scripts/check-access-log-outcomes.js --selftest
+      - name: Verify every logged outcome is recordable
+        run: node scripts/check-access-log-outcomes.js
       - name: Verify manifest consistency
         run: node scripts/check-manifest-consistency.js
       - name: Verify deployment-mode seal

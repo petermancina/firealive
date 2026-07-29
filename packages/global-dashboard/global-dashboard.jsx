@@ -18,6 +18,76 @@ const Btn=({children,primary,small,style,...p})=><button style={{padding:small?"
 // trust. Twin of the MC component; separate because the two frontends are
 // separate bundles, not because the markup should differ. Uses the GD palette
 // (which has no C.sh) and the GD's own accent-tint idiom.
+// B6e: the scan-policy panel, used by BOTH GD scan tabs.
+//
+// Every scan surface has a master switch and a permitted-scanner list, enforced
+// at mint, at announce, and at the rate-limit exemption. Until B6e none of them
+// had a console: an operator could revoke authorizations one at a time but
+// could not turn a surface off. A policy an operator cannot set is a control
+// that does not exist.
+//
+// ONE component, two uses. Three copies of a form that toggles a master security
+// switch is how one surface ends up with a stale scanner list while the others
+// are current, with nothing to tell the operator which.
+//
+// The save routes through stepUp(), which returns { error } when the operator
+// cancels the hardware prompt -- so a cancel leaves the policy untouched and
+// says so, rather than failing silently.
+const ScanPolicyPanel=({configPath,label,onSave,onSaved})=>{
+  const [cfg,setCfg]=useState(null);
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState(null);
+  const [msg,setMsg]=useState(null);
+  const load=async()=>{
+    try{
+      const r=await api.get(configPath);
+      if(r&&!r.error) setCfg({enabled:!!r.config.enabled,allowedScanners:r.config.allowedScanners||[],schedule:r.config.schedule||"weekly",valid:r.validScanners||validScanners||[]});
+      else setErr((r&&r.error)||"Failed to load policy");
+    }catch(e){ setErr(String(e&&e.message||e)); }
+  };
+  useEffect(()=>{load();},[configPath]);
+  if(!cfg) return (<Card><M style={{color:C.tm}}>Loading scan policy...</M></Card>);
+  const toggle=(sc)=>setCfg(p=>({...p,allowedScanners:p.allowedScanners.includes(sc)?p.allowedScanners.filter(x=>x!==sc):[...p.allowedScanners,sc]}));
+  const save=async()=>{
+    setBusy(true); setErr(null); setMsg(null);
+    try{
+      // The caller performs the write with a LITERAL path, so a reviewer -- and
+      // the step-up coverage gate -- can see which endpoint each panel targets.
+      // Assembling it from a prop here made the call site unattributable.
+      const r=await onSave({enabled:cfg.enabled,allowedScanners:cfg.allowedScanners,schedule:cfg.schedule});
+      if(r&&r.error){ setErr(r.error); }
+      else { setMsg("Scan policy saved."); if(onSaved) onSaved(); await load(); }
+    }catch(e){ setErr(String(e&&e.message||e)); }
+    finally{ setBusy(false); }
+  };
+  return (
+    <Card style={{marginBottom:12}}>
+      <M style={{color:C.t,fontWeight:600,display:"block",marginBottom:6}}>{label} scan policy</M>
+      <M style={{color:C.tm,display:"block",marginBottom:10,lineHeight:1.6}}>
+        The master switch and the permitted-scanner list. Turning scanning off stops every
+        announce on this surface and withdraws the rate-limit exemption from its scanners,
+        whether or not their authorizations are still enabled.
+      </M>
+      {err&&<M style={{color:C.d,display:"block",marginBottom:8}}>{err}</M>}
+      {msg&&<M style={{color:C.p,display:"block",marginBottom:8}}>{msg}</M>}
+      <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,cursor:"pointer"}}>
+        <input type="checkbox" checked={cfg.enabled} onChange={e=>setCfg(p=>({...p,enabled:e.target.checked}))}/>
+        <M style={{color:C.t}}>Scanning enabled</M>
+      </label>
+      <M style={{color:C.tm,display:"block",marginBottom:6}}>Permitted scanners</M>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12}}>
+        {(cfg.valid||[]).map(sc=>(
+          <label key={sc} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",padding:"4px 8px",border:`1px solid ${C.b}`,borderRadius:6}}>
+            <input type="checkbox" checked={cfg.allowedScanners.includes(sc)} onChange={()=>toggle(sc)}/>
+            <M style={{color:C.t}}>{sc}</M>
+          </label>
+        ))}
+      </div>
+      <Btn primary disabled={busy} onClick={save}>{busy?"Saving...":"Save policy"}</Btn>
+    </Card>
+  );
+};
+
 const OneTimeCredentials=({creds,title,note,items,onDismiss})=>!creds?null:(
   <Card style={{background:C.a+"10",border:`1px solid ${C.a}55`}}>
     <M style={{color:C.a,fontWeight:600,display:"block",marginBottom:6}}>{title}</M>
@@ -1654,6 +1724,29 @@ export default function GlobalDashboard() {
     setCvLoading(false);
   };
   useEffect(() => { reloadCloudVuln(); }, []);
+  // B6e: the GD's on-prem scan surface. Mirrors the cloud state above; the two
+  // are kept separate rather than merged because each reads its own policy row,
+  // its own authorization table and its own access log.
+  const [vsList, setVsList] = useState([]);
+  const [vsLoading, setVsLoading] = useState(false);
+  const [vsError, setVsError] = useState(null);
+  const [vsForm, setVsForm] = useState(null); // {mode:'add'|'edit', id?, scanner_type, display_name, allowed_cidrs(text), notes, enabled}
+  const [vsNewToken, setVsNewToken] = useState(null); // {token, certPem, keyPem, caCertPem} -- shown once
+  const [vsLog, setVsLog] = useState([]);
+  const [vsLogTotal, setVsLogTotal] = useState(0);
+  const [vsChain, setVsChain] = useState(null); // {intact, count, brokenAt?}
+  const reloadVulnScan = async () => {
+    setVsLoading(true); setVsError(null);
+    try {
+      const r = await api.get("/api/vuln-scan/authorizations");
+      if (r && Array.isArray(r.authorizations)) setVsList(r.authorizations);
+      else if (r && r.error) setVsError(r.error);
+      const lg = await api.get("/api/vuln-scan/access-log?limit=100");
+      if (lg && Array.isArray(lg.entries)) { setVsLog(lg.entries); setVsLogTotal(lg.total||lg.entries.length); }
+    } catch (e) { setVsError(e.message); }
+    setVsLoading(false);
+  };
+  useEffect(() => { reloadVulnScan(); }, []);
   const [gdCicdPlatform, setGdCicdPlatform] = useState("github-actions");
   const [gdCicdPurpose, setGdCicdPurpose] = useState("custom-build");
   const [gdCicdResult, setGdCicdResult] = useState(null);
@@ -2611,7 +2704,7 @@ export default function GlobalDashboard() {
     {id:"connections",label:"MC Connections"},{id:"mc_offboard",label:"MC Offboarding"},{id:"notifications",label:"Notifications"},
     {id:"query",label:"Query Tool"},{id:"sys_health",label:"System Health"},{id:"monitoring",label:"Monitoring Integrations"},
     {id:"iam",label:"IAM & Access"},{id:"mfa",label:"MFA"},{id:"posture",label:"Posture Assessment"},{id:"wifi",label:"WiFi Policy"},
-    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"vuln_scan",label:"Cloud Vuln Scan"},
+    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},{id:"vuln_scan",label:"On-Prem Vuln Scan"},
     {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha",label:"High Availability"},
     {id:"backup",label:"Backup & Restore"},{id:"restore",label:"Restore"},{id:"restore_approvals",label:"Restore Approvals"},{id:"backup_schedules",label:"Backup Schedules"},{id:"migration",label:"Deployment Migration"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
@@ -3361,7 +3454,7 @@ export default function GlobalDashboard() {
           </div>)}
 
           {/* ══════════ VULNERABILITY SCAN ══════════ */}
-          {tab==="vuln_scan"&&(<div>
+          {tab==="cloud_vuln"&&(<div>
             <L>Cloud Vulnerability Scan</L>
             <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan this Global Dashboard server. The GD-server does not run scans or store findings — results appear in the scanner's own console. This authorizes scanners (bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches the GD-server. These authorizations are the GD-server's own, independent of any Management Console.</M>
             <Card style={{background:C.w+"14",border:`1px solid ${C.w}40`}}>
@@ -3384,6 +3477,9 @@ export default function GlobalDashboard() {
               onDismiss={()=>setCvNewToken(null)}
             />
 
+            <ScanPolicyPanel configPath="/api/cloud-vuln/config" label="Cloud vulnerability"
+              onSave={(body)=>stepUp("/api/cloud-vuln/config",body,"put")}
+              onSaved={reloadCloudVuln}/>
             <Card>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
                 <M style={{color:C.t,fontWeight:600}}>Authorized scanners ({cvList.length})</M>
@@ -3459,6 +3555,111 @@ export default function GlobalDashboard() {
                       else setCvError((r&&r.error)||"save failed");
                     }
                   }}>{cvForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
+                </div>
+              </div>
+            </div>)}
+          </div>)}
+          {tab==="vuln_scan"&&(<div>
+            <L>On-Prem Vulnerability Scan</L>
+            <M style={{color:C.tm,display:"block",marginBottom:8,lineHeight:1.6}}>Authorize your organization's cloud-posture and IaC scanners to scan this Global Dashboard server. The GD-server does not run scans or store findings — results appear in the scanner's own console. This authorizes scanners (bearer token + source-IP allow-list) and keeps a tamper-evident log of every scan that reaches the GD-server. These authorizations are the GD-server's own, independent of any Management Console.</M>
+            <Card style={{background:C.w+"14",border:`1px solid ${C.w}40`}}>
+              <M style={{color:C.w,fontWeight:600,letterSpacing:1.2,textTransform:"uppercase",fontSize:10,display:"block",marginBottom:6}}>Application-layer authorization</M>
+              <M style={{color:C.t,display:"block",lineHeight:1.6}}>The GD-server authorizes and logs scans that reach it; network-layer blocking of unauthorized scanners remains your firewall / security-group responsibility. Authorized scanner source IPs are exempt from the GD-server's API rate limiting so a sanctioned scan is not throttled — all other defenses stay active.</M>
+            </Card>
+
+            {vsError&&<Card style={{background:C.d+"14",border:`1px solid ${C.d}40`}}><M style={{color:C.d}}>Error: {vsError}</M></Card>}
+
+            <OneTimeCredentials
+              creds={vsNewToken}
+              title="Scanner credentials - shown once"
+              note={'Copy all four into the scanner now. None can be retrieved again. The token alone authenticates NOTHING: the scanner must present this certificate on the TLS connection that carries the token, and must trust the Global Dashboard CA below.'}
+              items={[
+                {k:"token",l:"Scanner bearer token"},
+                {k:"certPem",l:"Client certificate (PEM)"},
+                {k:"keyPem",l:"Client private key (PEM)"},
+                {k:"caCertPem",l:"Global Dashboard CA certificate (PEM)"},
+              ]}
+              onDismiss={()=>setVsNewToken(null)}
+            />
+
+            <ScanPolicyPanel configPath="/api/vuln-scan/config" label="On-prem vulnerability"
+              onSave={(body)=>stepUp("/api/vuln-scan/config",body,"put")}
+              onSaved={reloadVulnScan}/>
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                <M style={{color:C.t,fontWeight:600}}>Authorized scanners ({vsList.length})</M>
+                <Btn primary small onClick={()=>{setVsNewToken(null);setVsForm({mode:"add",scanner_type:"",display_name:"",allowed_cidrs:"",notes:"",enabled:true});}}>+ Authorize Scanner</Btn>
+              </div>
+              {vsLoading&&<M style={{color:C.tm}}>Loading...</M>}
+              {!vsLoading&&vsList.length===0&&<M style={{color:C.tm,display:"block",padding:"12px 0"}}>No scanners authorized. No external scanner can record a scan of the GD-server until one is added and enabled.</M>}
+              {vsList.map(a=>{
+                const sc=CLOUD_VULN_SCANNERS.find(s=>s.id===a.scanner_type);
+                return(<div key={a.id} style={{padding:"12px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:12,opacity:a.enabled?1:0.55}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                      <M style={{color:C.t,fontWeight:600}}>{a.display_name}</M>
+                      <Badge color={C.i}>{sc?sc.l:a.scanner_type}</Badge>
+                      {!a.enabled&&<Badge color={C.td}>DISABLED</Badge>}
+                    </div>
+                    <M style={{color:C.tm,display:"block"}}>Allow-list: {(a.allowed_cidrs||[]).join(", ")||"—"}</M>
+                    <M style={{color:C.td,display:"block",marginTop:4}}>Last scan: {a.last_scan_at?(a.last_scan_at+(a.last_scan_source_ip?(" from "+a.last_scan_source_ip):"")):"never"}</M>
+                    {a.notes&&<M style={{color:C.td,display:"block",marginTop:2}}>{a.notes}</M>}
+                  </div>
+                  <div style={{display:"flex",gap:6,flexShrink:0}}>
+                    <Btn small onClick={async()=>{const r=await stepUp("/api/vuln-scan/authorizations/"+a.id,{enabled:!a.enabled},"put");if(r&&!r.error){showGdToast(a.enabled?"Scanner disabled":"Scanner enabled");reloadVulnScan();}else setVsError((r&&r.error)||"update failed");}}>{a.enabled?"Disable":"Enable"}</Btn>
+                    <Btn small onClick={()=>{setVsNewToken(null);setVsForm({mode:"edit",id:a.id,scanner_type:a.scanner_type,display_name:a.display_name,allowed_cidrs:(a.allowed_cidrs||[]).join(", "),notes:a.notes||"",enabled:a.enabled});}}>Edit</Btn>
+                    <Btn small style={{color:C.d,borderColor:C.d+"50"}} onClick={async()=>{if(!window.confirm("Revoke authorization \""+a.display_name+"\"? The scanner's token will stop working."))return;const r=await stepUp("/api/vuln-scan/authorizations/"+a.id,{},"del");if(r&&!r.error){showGdToast("Authorization revoked");reloadVulnScan();}else setVsError((r&&r.error)||"revoke failed");}}>Revoke</Btn>
+                  </div>
+                </div>);
+              })}
+            </Card>
+
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+                <M style={{color:C.t,fontWeight:600}}>Scan-access log ({vsLogTotal})</M>
+                <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                  {vsChain&&<Badge color={vsChain.intact?C.a:C.d}>{vsChain.intact?("CHAIN OK ("+vsChain.count+")"):("CHAIN BROKEN @"+vsChain.brokenAt)}</Badge>}
+                  <Btn small onClick={async()=>{const r=await api.get("/api/vuln-scan/access-log/verify");if(r&&!r.error)setVsChain(r);else setVsError((r&&r.error)||"verify failed");}}>Verify chain</Btn>
+                  <Btn small onClick={reloadVulnScan}>Refresh</Btn>
+                </div>
+              </div>
+              {vsLog.length===0&&<M style={{color:C.tm}}>No scan access recorded yet.</M>}
+              {vsLog.map(e=>(<div key={e.id} style={{padding:"8px 0",borderTop:`1px solid ${C.b}`,display:"flex",alignItems:"center",gap:10}}>
+                <Badge color={e.outcome==="authorized"?C.a:C.d}>{e.outcome}</Badge>
+                <M style={{color:C.t,flex:1,minWidth:0}}>{(e.scanner_type||"unknown")+" · "+e.component+" · "+e.source_ip}</M>
+                <M style={{color:C.td,flexShrink:0}}>{e.accessed_at}</M>
+              </div>))}
+            </Card>
+
+            {vsForm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setVsForm(null)}>
+              <div onClick={e=>e.stopPropagation()} style={{background:C.bg,border:`1px solid ${C.b}`,borderRadius:14,padding:28,maxWidth:540,width:"90%",maxHeight:"85vh",overflowY:"auto"}}>
+                <L>{vsForm.mode==="add"?"Authorize Scanner":"Edit Authorization"}</L>
+                <Sel label="Scanner" value={vsForm.scanner_type} onChange={e=>setVsForm(prev=>({...prev,scanner_type:e.target.value}))} disabled={vsForm.mode==="edit"}>
+                  <option value="">Select a scanner...</option>
+                  {CLOUD_VULN_SCANNERS.map(s=>(<option key={s.id} value={s.id}>{s.l}</option>))}
+                </Sel>
+                <Input label="Display name" value={vsForm.display_name} onChange={e=>setVsForm(prev=>({...prev,display_name:e.target.value}))} placeholder="e.g. Prod Prowler (us-east-1)" maxLength={128}/>
+                <Input label="Source IP allow-list (comma-separated IPs or CIDRs)" value={vsForm.allowed_cidrs} onChange={e=>setVsForm(prev=>({...prev,allowed_cidrs:e.target.value}))} placeholder="e.g. 10.0.0.0/24, 203.0.113.7" maxLength={512}/>
+                <M style={{color:C.td,display:"block",marginBottom:14}}>Scope: Global Dashboard server</M>
+                <Input label="Notes (optional)" value={vsForm.notes} onChange={e=>setVsForm(prev=>({...prev,notes:e.target.value}))} maxLength={1000}/>
+                {vsForm.mode==="edit"&&(<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:8}}><input type="checkbox" checked={vsForm.enabled} onChange={e=>setVsForm(prev=>({...prev,enabled:e.target.checked}))} style={{accentColor:C.a}}/><M style={{color:C.t}}>Enabled</M></label>)}
+                <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+                  <Btn onClick={()=>setVsForm(null)}>Cancel</Btn>
+                  <Btn primary onClick={async()=>{
+                    const cidrs=vsForm.allowed_cidrs.split(",").map(x=>x.trim()).filter(Boolean);
+                    if(!vsForm.scanner_type){setVsError("Scanner is required");return;}
+                    if(!vsForm.display_name.trim()){setVsError("Display name is required");return;}
+                    if(cidrs.length===0){setVsError("At least one source IP / CIDR is required");return;}
+                    if(vsForm.mode==="add"){
+                      const r=await stepUp("/api/vuln-scan/authorizations",{scanner_type:vsForm.scanner_type,display_name:vsForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:vsForm.notes||null});
+                      if(r&&!r.error&&r.token){showGdToast("Scanner authorized");setVsForm(null);setVsError(null);setVsNewToken(r);reloadVulnScan();}
+                      else setVsError((r&&r.error)||"create failed");
+                    }else{
+                      const r=await stepUp("/api/vuln-scan/authorizations/"+vsForm.id,{display_name:vsForm.display_name.trim(),allowed_cidrs:cidrs,scope_components:["gd_server"],notes:vsForm.notes||null,enabled:vsForm.enabled});
+                      if(r&&!r.error){showGdToast("Authorization updated");setVsForm(null);setVsError(null);reloadVulnScan();}
+                      else setVsError((r&&r.error)||"save failed");
+                    }
+                  }}>{vsForm.mode==="add"?"Authorize":"Save Changes"}</Btn>
                 </div>
               </div>
             </div>)}

@@ -51,6 +51,7 @@ const router = require('express').Router();
 const accessRouter = require('express').Router();
 const crypto = require('crypto');
 const { getDb } = require('../db/init');
+const { readScanPolicy } = require('../services/scan-policy');
 const ca = require('../services/ca');
 const { verifyMachineCert } = require('../services/machine-cert-auth');
 const { auditLog } = require('../middleware/audit');
@@ -165,22 +166,6 @@ function publicAuthorization(row) {
 
 // Read the live policy (enabled / allowedScanners / schedule) from team_config.
 // Fail-safe: any error or missing/garbled config yields a disabled, empty policy.
-function readConfig(db) {
-  try {
-    const r = db.prepare("SELECT value FROM team_config WHERE key = 'vuln_scan_config'").get();
-    if (!r) return { enabled: false, allowedScanners: [], schedule: 'weekly' };
-    const cfg = JSON.parse(r.value);
-    return {
-      enabled: !!(cfg && cfg.enabled === true),
-      allowedScanners: (cfg && Array.isArray(cfg.allowedScanners))
-        ? cfg.allowedScanners.filter((s) => VALID_SCANNERS.includes(s))
-        : [],
-      schedule: (cfg && VALID_SCHEDULES.includes(cfg.schedule)) ? cfg.schedule : 'weekly',
-    };
-  } catch (_) {
-    return { enabled: false, allowedScanners: [], schedule: 'weekly' };
-  }
-}
 
 // Canonical serialization of an access-log entry for the hash chain. Fixed
 // field order, NUL-separated; any field change breaks the chain.
@@ -244,7 +229,7 @@ function appendAccessLog(db, fields) {
 router.get('/config', (req, res) => {
   const db = getDb();
   try {
-    res.json({ config: readConfig(db), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
+    res.json({ config: readScanPolicy(db, 'on_prem'), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
   } catch (err) {
     logger.error('vuln-scan config get error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to read vuln-scan config' });
@@ -281,7 +266,7 @@ router.put('/config', mfaStepUp(), (req, res) => {
     db.prepare("INSERT OR REPLACE INTO team_config (key, value, updated_by) VALUES ('vuln_scan_config', ?, ?)")
       .run(JSON.stringify(config), req.user.id);
     auditLog(req.user.id, 'VULN_SCAN_CONFIG_UPDATED', `enabled=${enabled} scanners=${uniqScanners.join(',')} schedule=${config.schedule}`, req.ip);
-    res.json({ config: readConfig(db) });
+    res.json({ config: readScanPolicy(db, 'on_prem') });
   } catch (err) {
     logger.error('vuln-scan config put error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to save vuln-scan config' });
@@ -327,7 +312,7 @@ router.post('/authorizations', mfaStepUp(), (req, res) => {
   try {
     // Live policy (mint-time): an authorization may be created only for a
     // scanner type the current policy permits.
-    const cfg = readConfig(db);
+    const cfg = readScanPolicy(db, 'on_prem');
     if (!cfg.allowedScanners.includes(scanner_type)) {
       return res.status(409).json({
         error: 'scanner_type is not in the current allowedScanners policy; add it under Config first',
@@ -526,15 +511,30 @@ accessRouter.post('/', (req, res) => {
 
   const db = getDb();
   try {
-    const log = (outcome, fields) => appendAccessLog(db, {
-      authorization_id: fields.authorization_id || null,
-      scanner_type: fields.scanner_type || null,
-      source_ip: sourceIp,
-      outcome,
-      request_path: requestPath,
-      user_agent: userAgent,
-      detail: fields.detail || null,
-    });
+    const log = (outcome, fields) => {
+      // A logging failure must never change what the caller sees. Before
+      // this, a throw here escaped into the handler's catch and turned a
+      // 401 refusal into a 500 -- an ORACLE, because a certless caller got
+      // a different status than one with a valid cert and a bad token.
+      // Every rejection must answer identically.
+      //
+      // It must not be silent either: a dropped audit record is itself a
+      // security event. Caught, response unchanged, reported loudly.
+      try {
+        return appendAccessLog(db, {
+          authorization_id: fields.authorization_id || null,
+          scanner_type: fields.scanner_type || null,
+          source_ip: sourceIp,
+          outcome,
+          request_path: requestPath,
+          user_agent: userAgent,
+          detail: fields.detail || null,
+        });
+      } catch (err) {
+        logger.error('vuln-scan access log write FAILED', { outcome, error: err.message });
+        return null;
+      }
+    };
 
     // ── Factor 1: mutual-TLS client certificate, CA-verified and scoped to
     // this surface by OU=scanner-consumer. Checked BEFORE the token, so a
@@ -573,7 +573,7 @@ accessRouter.post('/', (req, res) => {
 
     // Live policy + master gate: the feature must be enabled and the matched
     // scanner_type must still be permitted by the current policy.
-    const cfg = readConfig(db);
+    const cfg = readScanPolicy(db, 'on_prem');
     if (!cfg.enabled) {
       log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'vulnerability scan feature disabled' });
       return res.status(403).json({ error: 'Vulnerability scanning is disabled' });

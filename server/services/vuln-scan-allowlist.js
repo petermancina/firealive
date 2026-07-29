@@ -24,6 +24,7 @@
 // ===========================================================================
 
 const { getDb } = require('../db/init');
+const { readScanPolicy } = require('./scan-policy');
 
 const TTL_MS = 30 * 1000;
 let cache = { cidrs: [], loadedAt: 0 };
@@ -71,22 +72,6 @@ function ipMatchesEntry(ip, entry) {
 // Read the live policy (enabled + allowedScanners) from team_config. Fail-safe:
 // any error or missing/garbled config yields a disabled, empty policy so nothing
 // is exempted.
-function readPolicy(db) {
-  try {
-    const row = db
-      .prepare("SELECT value FROM team_config WHERE key = 'vuln_scan_config'")
-      .get();
-    if (!row) return { enabled: false, allowedScanners: [] };
-    const cfg = JSON.parse(row.value);
-    const enabled = !!(cfg && cfg.enabled === true);
-    const allowedScanners = (cfg && Array.isArray(cfg.allowedScanners))
-      ? cfg.allowedScanners.filter((s) => typeof s === 'string')
-      : [];
-    return { enabled, allowedScanners };
-  } catch (_) {
-    return { enabled: false, allowedScanners: [] };
-  }
-}
 
 // Reload the exempt CIDR set: the allowed_cidrs of ENABLED authorizations whose
 // scanner_type is permitted by the live policy, but only while the feature is
@@ -97,7 +82,7 @@ function refresh() {
   let db;
   try {
     db = getDb();
-    const policy = readPolicy(db);
+    const policy = readScanPolicy(db, 'on_prem');
     const cidrs = [];
     if (policy.enabled && policy.allowedScanners.length) {
       const allowed = new Set(policy.allowedScanners);

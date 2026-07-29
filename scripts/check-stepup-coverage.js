@@ -154,6 +154,12 @@ const STEPUP_REQUIRED = {
     'POST /api/v1/malware-scanners/scan-mode',
 
     'PUT /api/vuln-scan/config',
+  // B6e: the cloud surface gained the policy layer it never had. Writing
+  // policy is a configuration change on a security control -- disabling the
+  // permitted-scanner list is as consequential as issuing an authorization,
+  // and an intruder who can silently widen it can then mint freely inside the
+  // same unlock window. Same treatment as its on-prem twin above.
+  'PUT /api/cloud-vuln/config',
     'POST /api/vuln-scan/authorizations',
     'PUT /api/vuln-scan/authorizations/:id',
     'DELETE /api/vuln-scan/authorizations/:id',
@@ -171,6 +177,17 @@ const STEPUP_REQUIRED = {
     'DELETE /api/mfa/passkeys/:id',
   ],
   GD: [
+    // B6e: the GD's two scan surfaces gained a policy layer. Writing policy is a
+    // configuration change on a security control -- silently widening the
+    // permitted-scanner list re-opens a surface an operator believes is closed.
+    'PUT /api/cloud-vuln/config',
+    'PUT /api/vuln-scan/config',
+    // B6e: the GD's on-prem scan surface. The same three mint paths its cloud
+    // twin carries -- a scanner authorization IS a credential, and revoking one
+    // is how an intruder blinds a scan or covers a track.
+    'POST /api/vuln-scan/authorizations',
+    'PUT /api/vuln-scan/authorizations/:id',
+    'DELETE /api/vuln-scan/authorizations/:id',
     'POST /api/storage-destinations',
     'PATCH /api/storage-destinations/:id',
     'DELETE /api/storage-destinations/:id',

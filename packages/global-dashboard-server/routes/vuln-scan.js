@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE GLOBAL DASHBOARD — Cloud Vulnerability Scan: Authorization + Access-Logging
-// Integration (GD-server's own duplicated config; mirrors server/routes/cloud-vuln-scan.js)
+// FIREALIVE GLOBAL DASHBOARD — On-prem vulnerability scan: Authorization + Access-Logging
+// Integration (GD-server's own duplicated config; mirrors server/routes/vuln-scan-scan.js)
 //
 // This is an INTEGRATION (same family as EDR File Inspection and the non-cloud
 // Vulnerability Scan tab), NOT a scanner. FireAlive does not run scans and does
@@ -13,14 +13,14 @@
 // responsibility; this is the application-layer authorization + audit trail.
 //
 // TWO routers (mounted separately in server/index.js):
-//   module.exports        — admin management router  → /api/cloud-vuln  (ciso/vp JWT)
+//   module.exports        — admin management router  → /api/vuln-scan  (ciso/vp JWT)
 //     GET    /authorizations            — list (token material never returned)
 //     POST   /authorizations            — create; returns the bearer token ONCE
 //     PUT    /authorizations/:id         — update (name/cidrs/scope/enabled/notes)
 //     DELETE /authorizations/:id         — revoke
 //     GET    /access-log                 — paginated scan-access log
 //     GET    /access-log/verify          — recompute + verify the hash chain
-//   module.exports.accessRouter — scan-access recorder → /api/cloud-vuln-access
+//   module.exports.accessRouter — scan-access recorder → /api/vuln-scan-access
 //     POST   /                           — gated by per-authorization bearer
 //                                          token + source-IP/CIDR allow-list;
 //                                          logs authorized/rejected access.
@@ -51,10 +51,9 @@ function audit(db, userId, eventType, detail, ip) {
       .run(userId || null, eventType, detail || null, ip || null, 'info');
   } catch (_) { /* never let audit failure break the request */ }
 }
-function logErr(msg, obj) { console.error('[gd-cloud-vuln]', msg, obj && obj.error ? obj.error : ''); }
+function logErr(msg, obj) { console.error('[gd-vuln-scan]', msg, obj && obj.error ? obj.error : ''); }
 
-const VALID_SCANNERS = ['scoutsuite', 'prowler', 'pacu', 'cloudbrute', 'checkov'];
-const VALID_COMPONENTS = ['mc', 'ac', 'arc', 'main_server', 'gd_server'];
+const VALID_SCANNERS = ['nessus', 'openvas', 'qualys', 'rapid7', 'tenable_io', 'nuclei'];
 const VALID_SCHEDULES = ['daily', 'weekly', 'monthly', 'manual'];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -140,15 +139,6 @@ function sanitizeCidrs(input) {
   return out;
 }
 
-function sanitizeComponents(input) {
-  if (!Array.isArray(input)) return null;
-  const out = [];
-  for (const c of input) {
-    if (!VALID_COMPONENTS.includes(c)) return null;
-    if (!out.includes(c)) out.push(c);
-  }
-  return out;
-}
 
 function publicAuthorization(row) {
   return {
@@ -156,8 +146,7 @@ function publicAuthorization(row) {
     scanner_type: row.scanner_type,
     display_name: row.display_name,
     allowed_cidrs: parseJsonArray(row.allowed_cidrs),
-    scope_components: parseJsonArray(row.scope_components),
-    enabled: row.enabled === 1,
+      enabled: row.enabled === 1,
     created_by: row.created_by,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -175,8 +164,7 @@ function canonicalAccessEntry(e) {
     e.authorization_id || '',
     e.scanner_type || '',
     e.source_ip || '',
-    e.component || '',
-    e.outcome || '',
+      e.outcome || '',
     e.request_path || '',
     e.user_agent || '',
     e.detail || '',
@@ -191,7 +179,7 @@ function appendAccessLog(db, fields) {
   const tx = db.transaction((f) => {
     const accessedAt = db.prepare("SELECT datetime('now') AS t").get().t;
     const prevRow = db
-      .prepare('SELECT this_hash FROM cloud_vuln_scan_access_log ORDER BY id DESC LIMIT 1')
+      .prepare('SELECT this_hash FROM vuln_scan_access_log ORDER BY id DESC LIMIT 1')
       .get();
     const prevHash = prevRow ? prevRow.this_hash : null;
     const entry = {
@@ -199,7 +187,6 @@ function appendAccessLog(db, fields) {
       authorization_id: f.authorization_id || null,
       scanner_type: f.scanner_type || null,
       source_ip: f.source_ip,
-      component: f.component,
       outcome: f.outcome,
       request_path: f.request_path || null,
       user_agent: f.user_agent || null,
@@ -211,12 +198,12 @@ function appendAccessLog(db, fields) {
       .update(canonicalAccessEntry(entry))
       .digest('hex');
     db.prepare(
-      'INSERT INTO cloud_vuln_scan_access_log ' +
-        '(prev_hash, this_hash, authorization_id, scanner_type, source_ip, component, outcome, request_path, user_agent, detail, accessed_at) ' +
+      'INSERT INTO vuln_scan_access_log ' +
+        '(prev_hash, this_hash, authorization_id, scanner_type, source_ip, outcome, request_path, user_agent, detail, accessed_at) ' +
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
       entry.prev_hash, thisHash, entry.authorization_id, entry.scanner_type,
-      entry.source_ip, entry.component, entry.outcome, entry.request_path,
+      entry.source_ip, entry.outcome, entry.request_path,
       entry.user_agent, entry.detail, entry.accessed_at
     );
     return { ...entry, this_hash: thisHash };
@@ -239,10 +226,10 @@ function appendAccessLog(db, fields) {
 router.get('/config', (req, res) => {
   const db = getDb();
   try {
-    res.json({ config: readScanPolicy(db, 'cloud'), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
+    res.json({ config: readScanPolicy(db, 'on_prem'), validScanners: VALID_SCANNERS, validSchedules: VALID_SCHEDULES });
   } catch (err) {
     logErr('config get error', { error: err.message });
-    res.status(500).json({ error: 'Failed to read cloud-vuln config' });
+    res.status(500).json({ error: 'Failed to read vuln-scan config' });
   } finally {
     db.close();
   }
@@ -276,13 +263,13 @@ router.put('/config', gdMfaStepUp(), (req, res) => {
   };
   const db = getDb();
   try {
-    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('cloud_vuln_config', ?)")
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('vuln_scan_config', ?)")
       .run(JSON.stringify(config));
-    audit(db, req.user && req.user.id, 'CLOUD_VULN_CONFIG_UPDATED', `enabled=${enabled} scanners=${uniqScanners.join(',')} schedule=${config.schedule}`, req.ip);
-    res.json({ config: readScanPolicy(db, 'cloud') });
+    audit(db, req.user && req.user.id, 'VULN_SCAN_CONFIG_UPDATED', `enabled=${enabled} scanners=${uniqScanners.join(',')} schedule=${config.schedule}`, req.ip);
+    res.json({ config: readScanPolicy(db, 'on_prem') });
   } catch (err) {
     logErr('config put error', { error: err.message });
-    res.status(500).json({ error: 'Failed to write cloud-vuln config' });
+    res.status(500).json({ error: 'Failed to write vuln-scan config' });
   } finally {
     db.close();
   }
@@ -292,11 +279,11 @@ router.get('/authorizations', (req, res) => {
   const db = getDb();
   try {
     const rows = db
-      .prepare('SELECT * FROM cloud_vuln_scanner_authorizations ORDER BY created_at DESC')
+      .prepare('SELECT * FROM vuln_scan_scanner_authorizations ORDER BY created_at DESC')
       .all();
-    res.json({ authorizations: rows.map(publicAuthorization), validScanners: VALID_SCANNERS, validComponents: VALID_COMPONENTS });
+    res.json({ authorizations: rows.map(publicAuthorization), validScanners: VALID_SCANNERS });
   } catch (err) {
-    logErr('cloud-vuln list authorizations error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan list authorizations error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to list scanner authorizations' });
   } finally {
     db.close();
@@ -305,7 +292,7 @@ router.get('/authorizations', (req, res) => {
 
 // ── Create authorization (returns the bearer token ONCE) ──────────────────────
 router.post('/authorizations', gdMfaStepUp(), (req, res) => {
-  const { scanner_type, display_name, allowed_cidrs, scope_components, notes } = req.body || {};
+  const { scanner_type, display_name, allowed_cidrs, notes } = req.body || {};
   if (!VALID_SCANNERS.includes(scanner_type)) {
     return res.status(400).json({ error: 'Invalid scanner_type', validScanners: VALID_SCANNERS });
   }
@@ -316,10 +303,6 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
   if (cidrs === null || cidrs.length === 0) {
     return res.status(400).json({ error: 'allowed_cidrs must be a non-empty array of IP / CIDR strings' });
   }
-  const scope = sanitizeComponents(scope_components);
-  if (scope === null || scope.length === 0) {
-    return res.status(400).json({ error: 'scope_components must be a non-empty subset of: ' + VALID_COMPONENTS.join(', ') });
-  }
   if (notes != null && (typeof notes !== 'string' || notes.length > 1000)) {
     return res.status(400).json({ error: 'notes must be a string up to 1000 chars' });
   }
@@ -329,7 +312,7 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
   // announce. An authorization for a scanner the policy does not permit
   // would be unusable now and would silently become usable again after a
   // later policy change nobody connected to it.
-  const policy = readScanPolicy(db, 'cloud');
+  const policy = readScanPolicy(db, 'on_prem');
   if (!policy.allowedScanners.includes(scanner_type)) {
     db.close();
     return res.status(403).json({
@@ -340,7 +323,7 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
 
   try {
     const id = crypto.randomBytes(16).toString('hex');
-    const token = `cvs-${crypto.randomBytes(32).toString('hex')}`;
+    const token = `vss-${crypto.randomBytes(32).toString('hex')}`;
     const salt = crypto.randomBytes(16).toString('hex');
     const tokenHash = hashToken(token, salt);
     // O3 Half 2: mint the certificate that constrains this token, in the
@@ -349,17 +332,17 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
     const cert = db.transaction(() => {
       const c = gdCa.issueMachineConsumerCert(db, { displayName: display_name.trim(), ou: gdCa.SCANNER_CONSUMER_OU });
       db.prepare(
-        'INSERT INTO cloud_vuln_scanner_authorizations ' +
-          '(id, scanner_type, display_name, allowed_cidrs, scope_components, cert_fingerprint, cert_serial, token_hash, token_salt, enabled, created_by, notes) ' +
-          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
+        'INSERT INTO vuln_scan_scanner_authorizations ' +
+          '(id, scanner_type, display_name, allowed_cidrs, cert_fingerprint, cert_serial, token_hash, token_salt, enabled, created_by, notes) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
       ).run(
-        id, scanner_type, display_name.trim(), JSON.stringify(cidrs), JSON.stringify(scope),
+        id, scanner_type, display_name.trim(), JSON.stringify(cidrs),
         c.fingerprint, c.serial, tokenHash, salt, req.user.id, notes != null ? notes : null
       );
       return c;
     })();
-    audit(db, req.user.id, 'CLOUD_VULN_AUTH_CREATED', `scanner=${scanner_type} name="${display_name.trim()}" cidrs=${cidrs.length} scope=${scope.join('+')}`, req.ip);
-    const row = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(id);
+    audit(db, req.user.id, 'VULN_SCAN_AUTH_CREATED', `scanner=${scanner_type} name="${display_name.trim()}" cidrs=${cidrs.length} scope=${scope.join('+')}`, req.ip);
+    const row = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE id = ?').get(id);
     // token returned ONCE — never retrievable again
     res.status(201).json({
       authorization: publicAuthorization(row),
@@ -374,7 +357,7 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
       certSerial: cert.serial,
     });
   } catch (err) {
-    logErr('cloud-vuln create authorization error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan create authorization error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to create scanner authorization' });
   } finally {
     db.close();
@@ -383,16 +366,15 @@ router.post('/authorizations', gdMfaStepUp(), (req, res) => {
 
 // ── Update authorization ──────────────────────────────────────────────────────
 router.put('/authorizations/:id', gdMfaStepUp(), (req, res) => {
-  const { display_name, allowed_cidrs, scope_components, enabled, notes } = req.body || {};
+  const { display_name, allowed_cidrs, enabled, notes } = req.body || {};
   const db = getDb();
   try {
-    const row = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    const row = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Authorization not found' });
 
     const next = {
       display_name: row.display_name,
       allowed_cidrs: row.allowed_cidrs,
-      scope_components: row.scope_components,
       enabled: row.enabled,
       notes: row.notes,
     };
@@ -407,11 +389,6 @@ router.put('/authorizations/:id', gdMfaStepUp(), (req, res) => {
       if (cidrs === null || cidrs.length === 0) return res.status(400).json({ error: 'allowed_cidrs must be a non-empty array of IP / CIDR strings' });
       next.allowed_cidrs = JSON.stringify(cidrs);
     }
-    if (scope_components !== undefined) {
-      const scope = sanitizeComponents(scope_components);
-      if (scope === null || scope.length === 0) return res.status(400).json({ error: 'scope_components must be a non-empty subset of: ' + VALID_COMPONENTS.join(', ') });
-      next.scope_components = JSON.stringify(scope);
-    }
     if (enabled !== undefined) next.enabled = enabled ? 1 : 0;
     if (notes !== undefined) {
       if (notes != null && (typeof notes !== 'string' || notes.length > 1000)) return res.status(400).json({ error: 'notes must be a string up to 1000 chars' });
@@ -419,13 +396,13 @@ router.put('/authorizations/:id', gdMfaStepUp(), (req, res) => {
     }
 
     db.prepare(
-      "UPDATE cloud_vuln_scanner_authorizations SET display_name = ?, allowed_cidrs = ?, scope_components = ?, enabled = ?, notes = ?, updated_at = datetime('now') WHERE id = ?"
-    ).run(next.display_name, next.allowed_cidrs, next.scope_components, next.enabled, next.notes, req.params.id);
-    audit(db, req.user.id, 'CLOUD_VULN_AUTH_UPDATED', `id=${req.params.id} enabled=${next.enabled}`, req.ip);
-    const updated = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+      "UPDATE vuln_scan_scanner_authorizations SET display_name = ?, allowed_cidrs = ?, enabled = ?, notes = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(next.display_name, next.allowed_cidrs, next.enabled, next.notes, req.params.id);
+    audit(db, req.user.id, 'VULN_SCAN_AUTH_UPDATED', `id=${req.params.id} enabled=${next.enabled}`, req.ip);
+    const updated = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
     res.json({ authorization: publicAuthorization(updated) });
   } catch (err) {
-    logErr('cloud-vuln update authorization error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan update authorization error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to update scanner authorization' });
   } finally {
     db.close();
@@ -436,22 +413,22 @@ router.put('/authorizations/:id', gdMfaStepUp(), (req, res) => {
 router.delete('/authorizations/:id', gdMfaStepUp(), (req, res) => {
   const db = getDb();
   try {
-    const row = db.prepare('SELECT id, scanner_type, display_name FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    const row = db.prepare('SELECT id, scanner_type, display_name FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Authorization not found' });
     // O3 Half 2: revoke the bound certificate too. Removing the row alone
     // leaves a certificate this CA still vouches for -- a credential the
     // operator believes destroyed and which is not.
-    const bound = db.prepare('SELECT cert_serial FROM cloud_vuln_scanner_authorizations WHERE id = ?').get(req.params.id);
+    const bound = db.prepare('SELECT cert_serial FROM vuln_scan_scanner_authorizations WHERE id = ?').get(req.params.id);
     db.transaction(() => {
-      db.prepare('DELETE FROM cloud_vuln_scanner_authorizations WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM vuln_scan_scanner_authorizations WHERE id = ?').run(req.params.id);
       if (bound && bound.cert_serial) {
         gdCa.revokeCert(db, { serial: bound.cert_serial, reason: 'scanner_authorization_revoked' });
       }
     })();
-    audit(db, req.user.id, 'CLOUD_VULN_AUTH_REVOKED', `id=${req.params.id} scanner=${row.scanner_type} name="${row.display_name}"`, req.ip);
+    audit(db, req.user.id, 'VULN_SCAN_AUTH_REVOKED', `id=${req.params.id} scanner=${row.scanner_type} name="${row.display_name}"`, req.ip);
     res.json({ ok: true });
   } catch (err) {
-    logErr('cloud-vuln revoke authorization error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan revoke authorization error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to revoke scanner authorization' });
   } finally {
     db.close();
@@ -472,16 +449,15 @@ router.get('/access-log', (req, res) => {
     const args = [];
     if (req.query.outcome) { where.push('outcome = ?'); args.push(req.query.outcome); }
     if (req.query.scanner_type) { where.push('scanner_type = ?'); args.push(req.query.scanner_type); }
-    if (req.query.component) { where.push('component = ?'); args.push(req.query.component); }
     const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
 
-    const total = db.prepare('SELECT COUNT(*) AS c FROM cloud_vuln_scan_access_log' + whereSql).get(...args).c;
+    const total = db.prepare('SELECT COUNT(*) AS c FROM vuln_scan_access_log' + whereSql).get(...args).c;
     const rows = db
-      .prepare('SELECT * FROM cloud_vuln_scan_access_log' + whereSql + ' ORDER BY id DESC LIMIT ? OFFSET ?')
+      .prepare('SELECT * FROM vuln_scan_access_log' + whereSql + ' ORDER BY id DESC LIMIT ? OFFSET ?')
       .all(...args, limit, offset);
     res.json({ entries: rows, total, limit, offset });
   } catch (err) {
-    logErr('cloud-vuln access-log error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan access-log error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to read scan-access log' });
   } finally {
     db.close();
@@ -493,25 +469,25 @@ router.get('/access-log/verify', (req, res) => {
   const db = getDb();
   try {
     const rows = db
-      .prepare('SELECT id, prev_hash, this_hash, authorization_id, scanner_type, source_ip, component, outcome, request_path, user_agent, detail, accessed_at FROM cloud_vuln_scan_access_log ORDER BY id ASC')
+      .prepare('SELECT id, prev_hash, this_hash, authorization_id, scanner_type, source_ip, outcome, request_path, user_agent, detail, accessed_at FROM vuln_scan_access_log ORDER BY id ASC')
       .all();
     let prevHash = null;
     for (const row of rows) {
       if ((row.prev_hash || null) !== (prevHash || null)) {
-        audit(db, req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
+        audit(db, req.user.id, 'VULN_SCAN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
         return res.json({ intact: false, count: rows.length, brokenAt: row.id, reason: 'prev_hash linkage mismatch' });
       }
       const recomputed = crypto.createHash('sha256').update(canonicalAccessEntry(row)).digest('hex');
       if (recomputed !== row.this_hash) {
-        audit(db, req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
+        audit(db, req.user.id, 'VULN_SCAN_ACCESS_LOG_VERIFIED', `intact=false brokenAt=${row.id}`, req.ip);
         return res.json({ intact: false, count: rows.length, brokenAt: row.id, reason: 'this_hash mismatch' });
       }
       prevHash = row.this_hash;
     }
-    audit(db, req.user.id, 'CLOUD_VULN_ACCESS_LOG_VERIFIED', `intact=true count=${rows.length}`, req.ip);
+    audit(db, req.user.id, 'VULN_SCAN_ACCESS_LOG_VERIFIED', `intact=true count=${rows.length}`, req.ip);
     res.json({ intact: true, count: rows.length });
   } catch (err) {
-    logErr('cloud-vuln verify chain error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan verify chain error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to verify scan-access log' });
   } finally {
     db.close();
@@ -519,14 +495,13 @@ router.get('/access-log/verify', (req, res) => {
 });
 
 // ════════════════════════════ SCAN-ACCESS RECORDER ══════════════════════════
-// Mounted at /api/cloud-vuln-access WITHOUT an admin JWT — a registered scanner
+// Mounted at /api/vuln-scan-access WITHOUT an admin JWT — a registered scanner
 // (or the operator's scan harness) presents its bearer token. Every call is
 // logged (authorized or rejected) to the hash-chained access log.
 accessRouter.post('/', (req, res) => {
   const sourceIp = normalizeIp(req.ip || '');
   const userAgent = (req.get && req.get('user-agent')) ? String(req.get('user-agent')).slice(0, 256) : null;
   const body = req.body || {};
-  const component = VALID_COMPONENTS.includes(body.component) ? body.component : 'gd_server';
   const requestPath = typeof body.request_path === 'string' ? body.request_path.slice(0, 256) : null;
 
   // Extract bearer token: Authorization: Bearer <token> or X-Scan-Token header.
@@ -551,7 +526,6 @@ accessRouter.post('/', (req, res) => {
           authorization_id: fields.authorization_id || null,
           scanner_type: fields.scanner_type || null,
           source_ip: sourceIp,
-          component,
           outcome,
           request_path: requestPath,
           user_agent: userAgent,
@@ -575,7 +549,7 @@ accessRouter.post('/', (req, res) => {
     }
     const certFp = certCheck.fingerprint;
 
-    if (!token || !/^cvs-[0-9a-f]{64}$/.test(token)) {
+    if (!token || !/^vss-[0-9a-f]{64}$/.test(token)) {
       log('rejected_token', { detail: 'missing or malformed token' });
       return res.status(401).json({ error: 'Scan authorization token required' });
     }
@@ -584,7 +558,7 @@ accessRouter.post('/', (req, res) => {
     // across enabled rows. (Disabled rows are excluded from the match set.)
     // Narrowed to rows BOUND to this certificate; a NULL cert_fingerprint
       // never matches, so an unbound row cannot authenticate.
-      const candidates = db.prepare('SELECT * FROM cloud_vuln_scanner_authorizations WHERE cert_fingerprint = ?').all(certFp);
+      const candidates = db.prepare('SELECT * FROM vuln_scan_scanner_authorizations WHERE cert_fingerprint = ?').all(certFp);
     let matched = null;
     for (const row of candidates) {
       if (safeEqualHex(hashToken(token, row.token_salt), row.token_hash)) { matched = row; break; }
@@ -601,10 +575,10 @@ accessRouter.post('/', (req, res) => {
     // Order matters: a caller who fails authentication must not learn from the
     // response whether the feature is enabled. Policy is an authorization
     // decision about an AUTHENTICATED caller.
-    const policy = readScanPolicy(db, 'cloud');
+    const policy = readScanPolicy(db, 'on_prem');
     if (!policy.enabled) {
-      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'cloud vulnerability scanning is disabled by policy' });
-      return res.status(403).json({ error: 'Cloud vulnerability scanning is disabled' });
+      log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: 'on-prem vulnerability scanning is disabled by policy' });
+      return res.status(403).json({ error: 'On-prem vulnerability scanning is disabled' });
     }
     if (!policy.allowedScanners.includes(matched.scanner_type)) {
       log('rejected_disabled', { authorization_id: matched.id, scanner_type: matched.scanner_type, detail: `scanner_type ${matched.scanner_type} is not permitted by the current policy` });
@@ -619,11 +593,11 @@ accessRouter.post('/', (req, res) => {
 
     // Authorized.
     log('authorized', { authorization_id: matched.id, scanner_type: matched.scanner_type });
-    db.prepare("UPDATE cloud_vuln_scanner_authorizations SET last_scan_at = datetime('now'), last_scan_source_ip = ? WHERE id = ?")
+    db.prepare("UPDATE vuln_scan_scanner_authorizations SET last_scan_at = datetime('now'), last_scan_source_ip = ? WHERE id = ?")
       .run(sourceIp, matched.id);
-    res.json({ ok: true, authorized: true, scanner_type: matched.scanner_type, component });
+    res.json({ ok: true, authorized: true, scanner_type: matched.scanner_type });
   } catch (err) {
-    logErr('cloud-vuln access recorder error', { error: err.message, stack: err.stack });
+    logErr('vuln-scan access recorder error', { error: err.message, stack: err.stack });
     res.status(500).json({ error: 'Failed to record scan access' });
   } finally {
     db.close();
