@@ -41,6 +41,7 @@ credential FireAlive issues.
 | Cloud vulnerability scanners | bearer / `X-Scan-Token` | `scanner-consumer` | Regional |
 | Cloud vulnerability scanners | bearer / `X-Scan-Token` | `scanner-consumer` | Global Dashboard |
 | Threat-hunting consumers | bearer | `threat-hunting-consumer` | Regional |
+| On-prem vulnerability scanners | bearer / `X-Scan-Token` | `scanner-consumer` | Global Dashboard |
 
 A **fifth** machine path — Management Console → Global Dashboard pushes — is
 authenticated by per-request Ed25519 signatures rather than a bound certificate.
