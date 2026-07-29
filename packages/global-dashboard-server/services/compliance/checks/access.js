@@ -310,12 +310,12 @@ function checkIamIntegrationHealth(db) {
   if (nonLocal.length === 0) {
     return {
       status: 'pass',
-      detail: `All users use local FIDO2 passkey auth (${methods[0].c} users). Per-user auth_method distribution: ${summary}.${recentSummary} Real SAML/OIDC/LDAP IdP integration planned for B5b (v1.0.51); integration_config table not yet present. Until then, auth_method is set per-user without per-integration health tracking.`,
+      detail: `All users use local FIDO2 passkey auth (${methods[0].c} users). Per-user auth_method distribution: ${summary}.${recentSummary} B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely: a FIDO2 hardware passkey is the only authentication method, so there is no password to phish and no shared secret to replay. auth_method records which method a user holds.`,
     };
   }
   return {
     status: 'pass',
-    detail: `Auth method distribution: ${summary}.${recentSummary} Real SAML/OIDC/LDAP IdP integration planned for B5b (v1.0.51); when shipped, per-integration health will surface here automatically.`,
+    detail: `Auth method distribution: ${summary}.${recentSummary} B5b evaluated SAML / OIDC / LDAP SSO and rejected it in favour of FIDO2 hardware passkeys only; there is no external IdP whose health would surface here.`,
   };
 }
 

@@ -124,7 +124,7 @@ module.exports = (checks) => ({
       id: 'Art.18(IV)',
       name: 'Right to Anonymization, Blocking, or Elimination',
       check: checks.checkDataSubjectRights,
-      mapping: 'Account-level blocking via users.active=0 soft delete (CISO-only) for the narrow GD-account surface. No dedicated DELETE /api/users/:id endpoint as of v0.0.31; full elimination currently operator-managed via direct DB operations preserving audit trail. Analyst-data anonymization/blocking/elimination is enforced at the MC layer (architectural — the GD does not store analyst-level data, only aggregate metrics). Art.18(IV) right covers unnecessary, excessive, or unlawfully processed data.',
+      mapping: 'Account-level blocking via users.active=0 soft delete (CISO-only) for the narrow GD-account surface. No dedicated DELETE /api/users/:id endpoint; full elimination currently operator-managed via direct DB operations preserving audit trail. Analyst-data anonymization/blocking/elimination is enforced at the MC layer (architectural — the GD does not store analyst-level data, only aggregate metrics). Art.18(IV) right covers unnecessary, excessive, or unlawfully processed data.',
     },
     {
       id: 'Art.18(V)',

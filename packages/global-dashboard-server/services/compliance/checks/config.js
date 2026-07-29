@@ -189,7 +189,7 @@ function checkAntiRollback(db) {
 // not exist on the GD. Unlike MC, GD has no NODE_ENV-gated middleware
 // (no enforceMinTls, no production-mode error handling, no mTLS on
 // internal routes — the GD has no /api/internal/ routes). NODE_ENV
-// is purely a label on the GD as of v0.0.31, included for parity with
+// is purely a label on the GD, included for parity with
 // industry convention but without runtime effect.
 //
 // Maps to controls including: SOC 2 CC8.1, NIST CSF PR.PS-01,
@@ -200,7 +200,7 @@ function checkSecureBaseline() {
   if (env === 'production') {
     return {
       status: 'warning',
-      detail: 'NODE_ENV=production set on the GD, but the GD has no NODE_ENV-gated middleware as of v0.0.31 (no enforceMinTls, no production-mode error handling, no mTLS enforcement, no /api/internal/ routes). NODE_ENV is a label without runtime effect on the GD. HTTPS enforcement and hardened error handling are entirely reverse-proxy responsibility and customer-managed; the proxy must terminate TLS, sanitize error responses if needed, and segregate the GD\'s management port from public networks.',
+      detail: 'NODE_ENV=production set on the GD, but the GD has no NODE_ENV-gated middleware (no enforceMinTls, no production-mode error handling, no mTLS enforcement, no /api/internal/ routes). NODE_ENV is a label without runtime effect on the GD. HTTPS enforcement and hardened error handling are entirely reverse-proxy responsibility and customer-managed; the proxy must terminate TLS, sanitize error responses if needed, and segregate the GD\'s management port from public networks.',
     };
   }
   if (!env || env === 'development' || env === 'test') {

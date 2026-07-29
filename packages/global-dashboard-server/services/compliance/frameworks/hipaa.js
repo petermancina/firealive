@@ -111,7 +111,7 @@ module.exports = (checks) => ({
       id: '164.312(a)(2)(iv)',
       name: 'Encryption and Decryption (Addressable)',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key for JWTs) is required at-rest cryptographic foundation. Data-at-rest protection is filesystem-level on the SQLite database file (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Addressable specification, implemented at the OS/volume layer. A future GD KMS integration phase would add application-layer at-rest encryption.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key for JWTs) is required at-rest cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Addressable specification, implemented at the OS/volume layer. A future GD KMS integration phase would add application-layer at-rest encryption.',
     },
     {
       id: '164.312(b)',
@@ -123,7 +123,7 @@ module.exports = (checks) => ({
       id: '164.312(c)(1)',
       name: 'Integrity Controls (Standard)',
       check: checks.checkAuditIntegrity,
-      mapping: 'audit_log is append-only by API contract (no UPDATE or DELETE routes expose modification of audit_log). Cryptographic hash chain (SHA-256 hash + prev_hash columns) lands in B5a (v1.0.50); when shipped, the check verifies chain integrity by walking it linearly. Required Standard.',
+      mapping: 'audit_log is append-only by API contract (no UPDATE or DELETE routes expose modification of audit_log). Cryptographic hash chain (SHA-256 hash + prev_hash columns) shipped in B5a; services/gd-audit-chain.js verifies chain integrity by walking it linearly, and signed checkpoints anchor the chain so a truncation is detectable. Required Standard.',
     },
     {
       id: '164.312(c)(2)',
@@ -135,7 +135,7 @@ module.exports = (checks) => ({
       id: '164.312(d)',
       name: 'Person or Entity Authentication (Standard)',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP is planned for B5b (v1.0.51) with integration_config-based IdP wiring; until then, users.auth_method is informational only and authentication is a FIDO2 hardware passkey. Required Standard.',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. Authentication is a FIDO2 hardware passkey, and only that: B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely rather than offering them alongside. There is no password to phish and no shared secret to replay. users.auth_method records which method a user holds. Required Standard.',
     },
     {
       id: '164.312(d) [MFA]',
@@ -147,7 +147,7 @@ module.exports = (checks) => ({
       id: '164.312(e)(1)',
       name: 'Transmission Security (Standard)',
       check: checks.checkTransmission,
-      mapping: 'GD has no application-layer HTTPS enforcement as of v0.0.31; TLS termination happens at the reverse proxy (nginx / Caddy / cloud load balancer) under operator management. Reject plaintext HTTP at the proxy before requests reach the GD application port. Required Standard. NODE_ENV=production is set for industry convention but has no in-platform gated behavior on the GD.',
+      mapping: 'The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS will refuse plaintext thereafter. The GD does not itself terminate TLS or reject a plaintext request arriving at its port; that stays with the reverse proxy — TLS termination happens at the reverse proxy (nginx / Caddy / cloud load balancer) under operator management. Reject plaintext HTTP at the proxy before requests reach the GD application port. Required Standard. NODE_ENV=production gates two boot-time protections on the GD: SKIP_INTEGRITY_CHECK is honoured ONLY outside production, and an anti-rollback violation halts the process rather than warning.',
     },
     {
       id: '164.312(e)(2)(i)',
@@ -196,7 +196,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(7)(ii)(D)',
       name: 'Testing and Revision Procedures (Addressable)',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. Addressable specification; in-platform automation lands when a future restore-workflow phase ships.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. A full DR drill against production-representative data remains operator-managed, since only the operator can supply that data: provision a side-by-side GD instance, restore from backup, verify recovery. Addressable specification.',
     },
   ],
   customerResponsibility: [
@@ -301,7 +301,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(6)(i)',
       name: 'Security Incident Procedures (Standard)',
       category: 'procedural',
-      detail: 'Implement policies and procedures to address security incidents. Document the incident response process; the GD has no application-layer IR policy registry (no ir_policies table) as of v0.0.31, so IR procedures are operator-authored and stored off-platform.',
+      detail: 'Implement policies and procedures to address security incidents. Document the incident response process; the GD has no application-layer IR policy registry (no ir_policies table), so IR procedures are operator-authored and stored off-platform.',
     },
     {
       id: '164.308(a)(6)(ii)',
@@ -313,7 +313,7 @@ module.exports = (checks) => ({
       id: '164.308(a)(7)(i)',
       name: 'Contingency Plan (Standard)',
       category: 'procedural',
-      detail: 'Establish (and implement as needed) policies and procedures for responding to an emergency or other occurrence that damages systems containing ePHI. Operator authors the contingency plan; platform provides backup/restore infrastructure (at the MC; GD backup is implemented but no restore workflow as of v0.0.31).',
+      detail: 'Establish (and implement as needed) policies and procedures for responding to an emergency or other occurrence that damages systems containing ePHI. Operator authors the contingency plan; platform provides backup/restore infrastructure (at the MC; GD backup is implemented but no restore workflow).',
     },
     {
       id: '164.308(a)(7)(ii)(C)',

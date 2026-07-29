@@ -80,7 +80,7 @@ module.exports = (checks) => ({
       id: 'Art.5(1)(f)',
       name: 'Integrity and Confidentiality',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) provides the application-layer cryptographic foundation for session integrity. Data-at-rest protection is filesystem-level on the SQLite database file (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) provides the application-layer cryptographic foundation for session integrity. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption.',
     },
     {
       id: 'Art.5(2)',
@@ -131,13 +131,13 @@ module.exports = (checks) => ({
       id: 'Art.32(1)(c)',
       name: 'Restoration of Availability and Access',
       check: checks.checkBackupFrequency,
-      mapping: 'backup_schedules drive automated periodic backups; backups table records completed backups with SHA-256 integrity hash. POST /api/backups/trigger executes a manual backup. Note: GD has no restore workflow as of v0.0.31 — Art.32(1)(c) requires the ability to RESTORE availability, which is currently off-platform discipline (provision side-by-side instance, restore from backup, verify).',
+      mapping: 'backup_schedules drive automated periodic backups; backups table records completed backups with SHA-256 integrity hash. POST /api/backups/trigger executes a manual backup. Note: GD has no restore workflow — Art.32(1)(c) requires the ability to RESTORE availability, which is currently off-platform discipline (provision side-by-side instance, restore from backup, verify).',
     },
     {
       id: 'Art.32(1)(d)',
       name: 'Regular Testing of Technical and Organisational Measures',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.32(1)(d) explicitly requires regular testing; quarterly is SOC-grade industry norm. Off-platform discipline applies until a future restore-workflow phase ships.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. Art.32(1)(d) explicitly requires regular testing; quarterly is SOC-grade industry norm. A full drill against production-representative data remains operator-managed, since only the operator can supply that data.',
     },
     {
       id: 'Art.32(2)',
@@ -157,7 +157,7 @@ module.exports = (checks) => ({
       id: 'Art.17',
       name: 'Right to Erasure (Right to be Forgotten)',
       check: checks.checkDataSubjectRights,
-      mapping: 'GD\'s data-subject surface is narrow: only GD users (CISO / VP / readonly accounts) are direct data subjects on the GD. Account-level erasure via users.active=0 soft delete (CISO-only). No dedicated DELETE /api/users/:id endpoint as of v0.0.31; full erasure currently operator-managed via direct DB operations preserving audit trail required for Art.5(2) accountability. Right to erasure under Art.17 is subject to exceptions (Art.17(3)) including legal obligations and public-interest archiving.',
+      mapping: 'GD\'s data-subject surface is narrow: only GD users (CISO / VP / readonly accounts) are direct data subjects on the GD. Account-level erasure via users.active=0 soft delete (CISO-only). No dedicated DELETE /api/users/:id endpoint; full erasure currently operator-managed via direct DB operations preserving audit trail required for Art.5(2) accountability. Right to erasure under Art.17 is subject to exceptions (Art.17(3)) including legal obligations and public-interest archiving.',
     },
     // ── Art.20 Right to Data Portability ─────────────────────────────────────
     {

@@ -28,7 +28,7 @@
 //     integration-test suite that is not a backup-restore drill)
 //     and /api/compromise-scan (which DOES log a
 //     COMPROMISE_SCAN audit event). Neither is a true backup-restore
-//     drill; the GD has no backup-restore DR-drill infrastructure as of v0.0.31.
+//     drill; the GD has no backup-restore DR-drill infrastructure.
 //   - GD has no ir_policies table. checkIrPlanExists returns warning;
 //     IR planning for the GD is operator-managed off-platform.
 //   - GD has no sla_config table. Notification thresholds live in
@@ -112,12 +112,12 @@ function checkBackupMultiDestination(db) {
 
 // ── checkDrTestRecency ───────────────────────────────────────────────────────
 // Verifies disaster recovery test recency. The GD has no backup-restore
-// DR-drill infrastructure as of v0.0.31:
+// DR-drill infrastructure:
 //   - /api/regression-test runs a real integration-test suite (and writes
 //     a REGRESSION_RUN audit entry) but does not exercise backup-restore.
 //   - /api/compromise-scan does log a COMPROMISE_SCAN audit event but
 //     is a self-scan, not a recovery drill.
-//   - There is no restore workflow on the GD (no restore_approvals
+//   - The GD has a restore workflow (restore_approvals
 //     table; no PUT/POST /api/backups/:id/restore endpoint).
 // Honest gap: DR testing on the GD is operator-managed off-platform
 // (operator restores a backup to a side-by-side GD instance manually).
@@ -132,12 +132,12 @@ function checkDrTestRecency(db) {
   if (compromiseScans.c > 0) {
     return {
       status: 'warning',
-      detail: `GD has no application-layer DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). ${compromiseScans.c} compromise-scan event(s) in last 90 days provide partial self-integrity signal but are not a true backup-restore drill. SOC-grade DR testing on the GD is currently operator-managed off-platform.`,
+      detail: `The GD carries an in-platform restore workflow: pre-upgrade restore points, restore_approvals with second-person CISO approval, an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. /api/regression-test runs a real integration-test suite, which is not a backup-restore drill. ${compromiseScans.c} compromise-scan event(s) in last 90 days provide partial self-integrity signal but are not a true backup-restore drill. SOC-grade DR testing on the GD is currently operator-managed off-platform.`,
     };
   }
   return {
     status: 'warning',
-    detail: 'GD has no application-layer DR test infrastructure as of v0.0.31. SOC-grade DR testing is operator-managed off-platform (restore a backup to a side-by-side GD instance on a documented cadence — quarterly per SOC 2 A1.3 norm).',
+    detail: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, restore_approvals with second-person CISO approval, an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. A full DR drill against production-representative data remains operator-managed, since only the operator can supply that data: restore a backup to a side-by-side GD instance on a documented cadence -- quarterly per SOC 2 A1.3 norm.',
   };
 }
 
@@ -159,7 +159,7 @@ function checkDrTestRecency(db) {
 function checkIrPlanExists() {
   return {
     status: 'warning',
-    detail: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO/governance-tier incident response planning is operator-managed off-platform. Document scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC.',
+    detail: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO/governance-tier incident response planning is operator-managed off-platform. Document scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC.',
   };
 }
 

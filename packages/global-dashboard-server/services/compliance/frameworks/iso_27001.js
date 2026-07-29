@@ -95,7 +95,7 @@ module.exports = (checks) => ({
       id: 'A.5.17',
       name: 'Authentication Information',
       check: checks.checkAuthentication,
-      mapping: 'Allocation and management of authentication information controlled. JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is a FIDO2 hardware passkey.',
+      mapping: 'Allocation and management of authentication information controlled. JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely rather than offering them alongside: a FIDO2 hardware passkey is the only authentication method, so there is no password to phish and no shared secret to replay.',
     },
     {
       id: 'A.5.18',
@@ -119,13 +119,13 @@ module.exports = (checks) => ({
       id: 'A.5.23',
       name: 'Information Security for Use of Cloud Services',
       check: checks.checkKmsProvider,
-      mapping: 'Processes for acquisition, use, management and exit from cloud services. GD has not yet integrated with an external KMS (kms_providers table not present as of v0.0.31); data-at-rest protection is filesystem-level on the SQLite database file (operator-managed disk encryption). A future GD KMS integration phase will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault).',
+      mapping: 'Processes for acquisition, use, management and exit from cloud services. GD has not yet integrated with an external KMS (kms_providers table not present); The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption). A future GD KMS integration phase will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault).',
     },
     {
       id: 'A.5.30',
       name: 'ICT Readiness for Business Continuity',
       check: checks.checkBackupMultiDestination,
-      mapping: 'ICT readiness planned, implemented, maintained and tested based on business continuity objectives and ICT continuity requirements. Multi-destination resilience via active backup_schedules pointing to different destination values; single-destination configurations cannot survive a destination failure. Note: GD has no in-platform restore workflow as of v0.0.31; testing is off-platform discipline.',
+      mapping: 'ICT readiness planned, implemented, maintained and tested based on business continuity objectives and ICT continuity requirements. Multi-destination resilience via active backup_schedules pointing to different destination values; single-destination configurations cannot survive a destination failure. Note: GD has no in-platform restore workflow; testing is off-platform discipline.',
     },
     // ── A.6 People Controls (technical aspect) ──────────────────────────────
     {
@@ -175,7 +175,7 @@ module.exports = (checks) => ({
       id: 'A.8.15',
       name: 'Logging',
       check: checks.checkAuditControls,
-      mapping: 'Logs that record activities, exceptions, faults and other relevant events produced, stored, protected and analysed. Request-logging middleware records every /api request (except /api/health) to audit_log with user_id, event_type, detail, ip, severity, timestamp. SIEM streaming for external retention lands when integration_config + B3 SIEM/SOAR wiring (v1.0.48) ship. Cryptographic hash chain awaits B5a (v1.0.50).',
+      mapping: 'Logs that record activities, exceptions, faults and other relevant events produced, stored, protected and analysed. Request-logging middleware records every /api request (except /api/health) to audit_log with user_id, event_type, detail, ip, severity, timestamp. Alerts reach the operator\'s SIEM as CEF events over tcp / tls / udp; continuous streaming of the full audit log for external retention is a separate capability and has not shipped. The cryptographic hash chain shipped in B5a: services/gd-audit-chain.js walks it linearly and signed checkpoints anchor it, so a truncation is detectable.',
     },
     {
       id: 'A.8.16',

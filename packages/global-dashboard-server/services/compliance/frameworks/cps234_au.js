@@ -107,7 +107,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [23b]',
       name: 'Information Security Controls -- Authentication',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); login is a FIDO2 hardware passkey. The hardware-passkey MFA is enrolled in webauthn_credentials and enforced at login.',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET; no passwords stored (passwordless FIDO2 hardware-passkey login). B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely rather than offering them alongside: a FIDO2 hardware passkey is the only authentication method, so there is no password to phish and no shared secret to replay. The hardware-passkey MFA is enrolled in webauthn_credentials and enforced at login.',
     },
     {
       id: 'CPS 234 [25]',
@@ -131,13 +131,13 @@ module.exports = (checks) => ({
       id: 'CPS 234 [32]',
       name: 'Systematic Testing of Controls',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). CPS 234 para 32 requirement for systematic testing (including vulnerability testing, penetration testing, response exercises) is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; APRA-grade norm is quarterly.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. CPS 234 para 32 systematic testing against production-representative data remains operator-managed, since only the operator can supply that data: provision a side-by-side GD instance, restore from backup, verify recovery; APRA-grade norm is quarterly.',
     },
     {
       id: 'CPS 234 [35]',
       name: 'Incident Response Plans',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides multi-channel alert delivery (email, sms, recipients) for threshold-based alerts. CPS 234 para 35 requires incident response plans for material information security incidents.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides multi-channel alert delivery (email, sms, recipients) for threshold-based alerts. CPS 234 para 35 requires incident response plans for material information security incidents.',
     },
     {
       id: 'CPS 234 [36]',

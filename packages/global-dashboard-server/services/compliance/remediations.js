@@ -110,7 +110,7 @@ const REMEDIATIONS = {
       'Set GD_JWT_SECRET in the GD server deployment environment (32 bytes / 64 hex chars minimum)',
       'Restart the GD server to pick up the env var',
       'Without GD_JWT_SECRET, the server generates an ephemeral key per-restart and all existing JWTs are invalidated on each restart',
-      'For data-at-rest encryption: configure operator-managed disk encryption (LUKS / FileVault / BitLocker / AWS EBS encryption) on the underlying volume — the GD has no application-layer at-rest encryption',
+      'For data-at-rest encryption: the GD already seals its secrets at the application layer -- every signing-key private key, the GD CA key and integration credentials are AES-256-GCM encrypted under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk cannot unseal them. General table data is not application-layer encrypted; configure operator-managed disk encryption (LUKS / FileVault / BitLocker / AWS EBS encryption) on the underlying volume for that remainder',
     ],
     uiPath: null,
   },
@@ -151,11 +151,11 @@ const REMEDIATIONS = {
   checkTransmission: {
     summary: 'Configure TLS at the reverse proxy in front of the GD',
     steps: [
-      'GD has no application-layer HTTPS enforcement; TLS terminates at the reverse proxy',
+      'The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS will refuse plaintext thereafter. The GD does not itself terminate TLS or reject a plaintext request arriving at its port; that stays with the reverse proxy, which is the correct boundary for a self-hosted deployment',
       'Configure your reverse proxy (nginx / Caddy / cloud load balancer) with TLS 1.2 minimum (TLS 1.3 preferred)',
       'Use a CA-issued certificate (not self-signed) for production deployments',
       'Reject plaintext HTTP requests at the proxy before they reach the GD application port',
-      'Set NODE_ENV=production in the GD deployment for industry convention (note: GD has no NODE_ENV-gated middleware as of v0.0.31)',
+      'Set NODE_ENV=production in the GD deployment for industry convention (note: GD has no NODE_ENV-gated middleware)',
     ],
     uiPath: null,
   },
@@ -298,7 +298,7 @@ const REMEDIATIONS = {
   checkRoleSeparation: {
     summary: 'Wait for GD Config Lock server-side persistence',
     steps: [
-      'GD has no config_lock_state table or /api/config/lock route handler as of v0.0.31',
+      'GD has no config_lock_state table or /api/config/lock route handler',
       'The Config Lock toggle in the GD frontend is server-side stubbed — clicks have no persistent effect',
       'A future BUILD-PLAN-v16 phase will land Config Lock server-side persistence on the GD (mirroring MC\'s R3e v1.0.32 pattern)',
       'Until then, role-based authority is enforced at route-middleware only (CISO-only routes via authMiddleware([\'ciso\']))',
@@ -333,7 +333,7 @@ const REMEDIATIONS = {
   checkTlsMinVersion: {
     summary: 'Enforce TLS 1.2 minimum at the reverse proxy',
     steps: [
-      'GD has no application-layer HTTPS enforcement — TLS configuration is reverse-proxy responsibility',
+      'The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS will refuse plaintext thereafter. The GD does not itself terminate TLS or reject a plaintext request arriving at its port; that stays with the reverse proxy — TLS configuration is reverse-proxy responsibility',
       'Configure your reverse proxy with ssl_protocols TLSv1.2 TLSv1.3 (nginx syntax) or equivalent',
       'Reject TLS 1.0 / TLS 1.1 / SSL connections at the proxy',
       'Test with `nmap --script ssl-enum-ciphers -p 443 <gd-host>` to confirm acceptable cipher suite negotiation',
@@ -344,7 +344,7 @@ const REMEDIATIONS = {
   checkKmsProvider: {
     summary: 'Configure external KMS when the GD KMS integration phase ships',
     steps: [
-      'CURRENT STATE: GD has no kms_providers table; data-at-rest protection is filesystem-level on the SQLite database file',
+      'CURRENT STATE: GD has no kms_providers table. Secrets -- signing-key private keys, the GD CA key, integration credentials -- are already AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave; general table data rests on filesystem-level protection of the SQLite database file',
       'Operator-managed alternative: enable disk encryption (LUKS / FileVault / BitLocker / AWS EBS encryption / similar) on the volume containing GD_DB_PATH',
       'FUTURE STATE: a GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce kms_providers — at that point, configure your provider (AWS KMS / GCP KMS / Azure Key Vault / HashiCorp Vault) via GD -> Integrations -> KMS',
     ],
@@ -459,8 +459,8 @@ const REMEDIATIONS = {
     steps: [
       'GD\'s data-subject surface is narrow: only GD users (CISO / VP / readonly accounts) are direct data subjects on the GD',
       'Access: queryable via /api/audit-logs and exportable via /api/audit-logs/export/:format',
-      'Erasure: no dedicated /api/users/:id DELETE endpoint as of v0.0.31 — operator-managed via direct DB operations',
-      'Rectification: no dedicated /api/users/:id PATCH endpoint as of v0.0.31 — operator-managed via direct DB operations',
+      'Erasure: no dedicated /api/users/:id DELETE endpoint — operator-managed via direct DB operations',
+      'Rectification: no dedicated /api/users/:id PATCH endpoint — operator-managed via direct DB operations',
       'Document SOPs for handling subject-rights requests until application-layer endpoints ship',
     ],
     uiPath: null,
@@ -527,7 +527,7 @@ const REMEDIATIONS = {
   checkDrTestRecency: {
     summary: 'Perform off-platform DR drill until in-platform DR test infrastructure ships',
     steps: [
-      'CURRENT STATE: GD has no application-layer DR test infrastructure (/api/regression-test runs a real integration-test suite but is not a backup-restore drill; no restore workflow)',
+      'CURRENT STATE: the GD has an in-platform restore workflow (restore points, restore_approvals with second-person CISO approval, external-restore allow-list, sanctioned rollback over a hash-chained restore chain). /api/regression-test runs a real integration-test suite, which is not a backup-restore drill',
       'Off-platform DR drill (SOC-grade norm: quarterly): provision a side-by-side GD instance; restore from backup; verify users/MCs/metrics are correctly recovered; document the drill in your operator runbook',
       'FUTURE STATE: B2 (v1.0.47) builds the regression test runner with real integration tests; B4 (v1.0.49) builds compromise scan orchestration; a future restore-workflow phase would close the DR-drill gap entirely',
       'Until then, schedule and document off-platform drills',
@@ -538,7 +538,7 @@ const REMEDIATIONS = {
   checkIrPlanExists: {
     summary: 'Document GD-layer IR procedures off-platform',
     steps: [
-      'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31)',
+      'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint)',
       'Document CISO/governance-tier IR procedures off-platform — in your wiki, DMS, or runbook system',
       'Cover scenarios specific to the GD layer: GD compromise, GD database corruption, suspicious aggregate metrics from an MC, MC api_key compromise, signing-key registry compromise (signing_keys table present)',
       'Reference NIST 800-61 and ISO 27035 for IR program structure',
@@ -607,7 +607,7 @@ const REMEDIATIONS = {
   checkIntegrityVerification: {
     summary: 'Operator-managed deployment-artifact integrity until in-platform verifier ships',
     steps: [
-      'CURRENT STATE: GD has no startup integrity verifier (no SKIP_INTEGRITY_CHECK env var consumption; no release-manifest.json comparison at boot)',
+      'CURRENT STATE: the GD verifies its own integrity at boot via services/gd-integrity.js, and SKIP_INTEGRITY_CHECK is honoured only outside production so no environment variable can disable the gate on a shipped install',
       'Operator-managed alternatives: use signed installers, verify sha256sum of the GD distribution against published hashes, sign container images with Cosign or Notary if deployed via container',
       'FUTURE STATE: a future GD buildout phase will add a manifest-based verifier (release-manifest.json shipping with each release; boot-time SHA-256 comparison against index.js / db-init.js / package.json)',
       'When the verifier ships: set NODE_ENV=production and do NOT set SKIP_INTEGRITY_CHECK in production',

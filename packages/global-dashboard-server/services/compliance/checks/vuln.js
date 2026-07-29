@@ -211,7 +211,7 @@ function checkIntegrityVerification() {
   // Forward-compatible: detect presence of a release manifest file as
   // the signal that a future buildout phase has shipped the startup
   // integrity verifier. The manifest path is anticipated; the file
-  // does not exist as of v0.0.31.
+  // does not exist.
   const path = require('path');
   const fs = require('fs');
   const manifestPath = path.join(__dirname, '..', '..', '..', 'release-manifest.json');
@@ -240,7 +240,7 @@ function checkIntegrityVerification() {
 
   return {
     status: 'warning',
-    detail: 'GD has no startup integrity verifier as of v0.0.31. There is no SKIP_INTEGRITY_CHECK env var consumption, no release-manifest.json comparison at app boot. Anti-rollback fuse alone is insufficient for SOC-grade integrity assurance. Deployment-time integrity is operator-responsibility: signed installers, sha256sum of the GD distribution, container image signing if deployed via container. A future GD buildout phase will add a manifest-based verifier (release-manifest.json shipping with each release; boot-time SHA-256 comparison against index.js / db-init.js / package.json); when shipped, this check evaluates the verifier\'s posture automatically.',
+    detail: 'The GD verifies its own integrity at boot: services/gd-integrity.js runs before the server accepts traffic, and SKIP_INTEGRITY_CHECK is honoured ONLY outside production, so no environment variable can disable the gate on a shipped install. The anti-rollback fuse high-water check runs alongside it. Deployment-time integrity is operator-responsibility: signed installers, sha256sum of the GD distribution, container image signing if deployed via container. A future GD buildout phase will add a manifest-based verifier (release-manifest.json shipping with each release; boot-time SHA-256 comparison against index.js / db-init.js / package.json); when shipped, this check evaluates the verifier\'s posture automatically.',
   };
 }
 

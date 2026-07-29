@@ -93,25 +93,25 @@ module.exports = (checks) => ({
       id: 'Art.9(2)',
       name: 'Protection and Prevention -- Encryption',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET HMAC-SHA256 for JWT signing (32 bytes minimum) is the application-layer cryptographic foundation. Data-at-rest protection is filesystem-level on the SQLite database file at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). TLS 1.2+ at the reverse proxy for in-transit. State-of-the-art cryptographic protection consistent with Art.9(2) "appropriate" technical measures, with the application-layer at-rest gap closed by a future GD KMS integration phase.',
+      mapping: 'GD_JWT_SECRET HMAC-SHA256 for JWT signing (32 bytes minimum) is the application-layer cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). TLS 1.2+ at the reverse proxy for in-transit. State-of-the-art cryptographic protection consistent with Art.9(2) "appropriate" technical measures, with the application-layer at-rest gap closed by a future GD KMS integration phase.',
     },
     {
       id: 'Art.9(3)',
       name: 'Cryptographic Key Management',
       check: checks.checkKmsProvider,
-      mapping: 'GD has not yet integrated with an external KMS (kms_providers table not present as of v0.0.31). Data-at-rest protection is filesystem-level; operator-managed disk encryption provides the at-rest guarantee. A future GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault); until then, hardware-backed cryptographic key management is operator-managed at the cloud/infrastructure layer.',
+      mapping: 'GD has not yet integrated with an external KMS (kms_providers table not present). The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: operator-managed disk encryption provides the at-rest guarantee for that remainder. A future GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault); until then, hardware-backed cryptographic key management is operator-managed at the cloud/infrastructure layer.',
     },
     {
       id: 'Art.10',
       name: 'Detection of Anomalous Activities',
       check: checks.checkAnomalyDetection,
-      mapping: 'apiLimiter (express-rate-limit, 1000 req/15min per IP) provides rate-limit anomaly detection; auth_log records LOGIN_FAILED events for IP-pattern-based anomaly review. B3 (v1.0.48) wires runtime monitoring with anomaly detection on aggregate metrics streams from MCs. SIEM correlation across the financial entity\'s broader detection estate awaits integration_config and B3 SIEM/SOAR wiring.',
+      mapping: 'apiLimiter (express-rate-limit, 1000 req/15min per IP) provides rate-limit anomaly detection; auth_log records LOGIN_FAILED events for IP-pattern-based anomaly review. B3 (v1.0.48) wires runtime monitoring with anomaly detection on aggregate metrics streams from MCs. Alerts reach the operator\'s SIEM as CEF events over tcp / tls / udp (services/gd-siem-push.js via the alert router), so correlation across the financial entity\'s broader detection estate is available today. Continuous streaming of the full audit log for external retention is a separate capability and has not shipped.',
     },
     {
       id: 'Art.11',
       name: 'Response and Recovery -- IR Plans',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery channels for threshold-based alerts. RTO/RPO commitments under Art.11(7) are operator-side and documented in the financial entity\'s business continuity policy.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery channels for threshold-based alerts. RTO/RPO commitments under Art.11(7) are operator-side and documented in the financial entity\'s business continuity policy.',
     },
     {
       id: 'Art.12(1)',
@@ -123,7 +123,7 @@ module.exports = (checks) => ({
       id: 'Art.12(2)',
       name: 'Restoration and Recovery -- Diversified Backup',
       check: checks.checkBackupMultiDestination,
-      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations); single-destination configurations cannot survive a destination failure. Supports Art.12(2) redundancy expectations for critical ICT functions. Note: GD has no in-platform restore workflow as of v0.0.31; restoration drill is off-platform discipline.',
+      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations); single-destination configurations cannot survive a destination failure. Supports Art.12(2) redundancy expectations for critical ICT functions. Note: GD has no in-platform restore workflow; restoration drill is off-platform discipline.',
     },
     {
       id: 'Art.13',
@@ -149,7 +149,7 @@ module.exports = (checks) => ({
       id: 'Art.24-25',
       name: 'Digital Operational Resilience Testing Programme',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.24 annual minimum is operator-managed off-platform discipline: provision side-by-side GD instance, restore from backup, verify recovery. Threat-led penetration testing under Art.26 is operator-coordinated with third-party testers regardless of platform feature state.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. The Art.24 annual minimum against production-representative data remains operator-managed, since only the operator can supply that data: provision a side-by-side GD instance, restore from backup, verify recovery. Threat-led penetration testing under Art.26 is operator-coordinated with third-party testers regardless of platform feature state.',
     },
     {
       id: 'Art.25',
@@ -174,7 +174,7 @@ module.exports = (checks) => ({
       id: 'Art.30',
       name: 'Concentration Risk -- Signing Trust Registry',
       check: checks.checkSigningKeyRegistry,
-      mapping: 'No signing-key registries on the GD as of v0.0.31 (no backup_signing_keys, no chain_signing_keys, no signing_keys table). R3g PR3 introduces signing_keys for MC-trust verification (each connected MC registers a signing key; GD verifies inbound compliance-report pushes). Future GD backup-signing phase will add backup_signing_keys + chain_signing_keys. Until those phases ship, MC → GD trust is api_key-based and operator-managed, with concentration-risk mitigation handled through the financial entity\'s broader vendor-diversification strategy.',
+      mapping: 'The GD maintains signing-key registries for every surface that needs one: signing_keys (MC-trust verification -- each connected MC registers a signing key and the GD verifies inbound compliance-report pushes), backup_signing_keys, audit_chain_signing_keys, archive_chain_signing_keys, forensic_export_chain_signing_keys, report_signing_keys and gd_device_signing_keys. Every private key is sealed at rest under the GD\'s hardware-sealed Tier-1 KEK. MC → GD pushes are authenticated by per-request Ed25519 signature against the registered key, not by a shared secret, with concentration-risk mitigation handled through the financial entity\'s broader vendor-diversification strategy.',
     },
   ],
   customerResponsibility: [

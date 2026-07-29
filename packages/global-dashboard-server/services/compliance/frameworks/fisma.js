@@ -118,7 +118,7 @@ module.exports = (checks) => ({
       id: 'AC-17',
       name: 'Remote Access',
       check: checks.checkTransmission,
-      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. The GD has no application-layer HTTPS enforcement as of v0.0.31. Remote-access protection through encrypted transport is reverse-proxy responsibility.',
+      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS will refuse plaintext thereafter. The GD does not itself terminate TLS or reject a plaintext request arriving at its port; that stays with the reverse proxy. Remote-access protection through encrypted transport is reverse-proxy responsibility.',
     },
     // ── AU Audit and Accountability ─────────────────────────────────────────
     {
@@ -137,7 +137,7 @@ module.exports = (checks) => ({
       id: 'AU-9',
       name: 'Protection of Audit Information',
       check: checks.checkAuditIntegrity,
-      mapping: 'audit_log append-only by API contract (no UPDATE or DELETE routes expose modification). Cryptographic hash chain (SHA-256 hash + prev_hash columns) lands in B5a (v1.0.50); when shipped, the check verifies chain integrity by walking it linearly. External tamper-evident copy via SIEM streaming awaits integration_config + B3.',
+      mapping: 'audit_log append-only by API contract (no UPDATE or DELETE routes expose modification). Cryptographic hash chain (SHA-256 hash + prev_hash columns) shipped in B5a; services/gd-audit-chain.js verifies chain integrity by walking it linearly, and signed checkpoints anchor it. External tamper-evident copy via SIEM streaming awaits integration_config + B3.',
     },
     {
       id: 'AU-11',
@@ -168,7 +168,7 @@ module.exports = (checks) => ({
       id: 'CM-7',
       name: 'Least Functionality',
       check: checks.checkSecureBaseline,
-      mapping: 'NODE_ENV=production is set for industry convention but has no in-platform gated behavior on the GD as of v0.0.31 (no enforceMinTls, no production-mode error handling, no mTLS on /api/internal/ routes, no /api/internal/ routes at all). Secure-baseline elements (HTTPS, error sanitization, network isolation) are entirely operator-managed at the reverse-proxy / deployment layer.',
+      mapping: 'NODE_ENV=production gates two boot-time protections on the GD: SKIP_INTEGRITY_CHECK is honoured ONLY outside production, so no environment variable can disable the startup integrity gate on a shipped install, and an anti-rollback violation halts the process rather than warning. There is no enforceMinTls and no /api/internal/ routes; transport security (HTTPS termination, error sanitization, network isolation) remains operator-managed at the reverse-proxy / deployment layer, which is the correct boundary for a self-hosted deployment.',
     },
     // ── CP Contingency Planning ─────────────────────────────────────────────
     {
@@ -181,14 +181,14 @@ module.exports = (checks) => ({
       id: 'CP-10',
       name: 'System Recovery and Reconstitution',
       check: checks.checkBackupMultiDestination,
-      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values supports CP-10 recovery from single-destination failure. Note: GD has no in-platform restore workflow as of v0.0.31; second-person approval and recovery testing are off-platform discipline until a future restore-workflow phase ships.',
+      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values supports CP-10 recovery from single-destination failure. The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. Recovery TESTING against a production-representative dataset remains operator-managed, since only the operator can supply that data.',
     },
     // ── IA Identification and Authentication ────────────────────────────────
     {
       id: 'IA-2',
       name: 'Identification and Authentication (Organizational Users)',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET. SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, authentication is a FIDO2 hardware passkey. IA-2(1) MFA for privileged accounts requires checkMfaEnforcement (see below).',
+      mapping: 'Authentication is a FIDO2 hardware passkey, and only that: B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely rather than offering them alongside. There is no password to phish and no shared secret to replay. Session tokens are JWTs signed with an operator-configured GD_JWT_SECRET. IA-2(1) MFA for privileged accounts requires checkMfaEnforcement (see below).',
     },
     {
       id: 'IA-2(1)',
@@ -207,7 +207,7 @@ module.exports = (checks) => ({
       id: 'IR-4',
       name: 'Incident Handling',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery channels for threshold-based alerts.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery channels for threshold-based alerts.',
     },
     {
       id: 'IR-6',
@@ -226,7 +226,7 @@ module.exports = (checks) => ({
       id: 'SC-8',
       name: 'Transmission Confidentiality and Integrity',
       check: checks.checkTransmission,
-      mapping: 'TLS termination at the reverse proxy (operator-managed); TLS 1.2+ minimum. GD has no application-layer HTTPS enforcement and no mTLS on /api/internal/ (no /api/internal/ routes exist on the GD). TLS provides both confidentiality (encryption) and integrity (MAC) per SC-8(1) at the reverse-proxy layer.',
+      mapping: 'TLS termination at the reverse proxy (operator-managed); TLS 1.2+ minimum. The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS refuses plaintext thereafter; the GD does not itself terminate TLS, and there is no mTLS on /api/internal/ (no /api/internal/ routes exist on the GD). TLS provides both confidentiality (encryption) and integrity (MAC) per SC-8(1) at the reverse-proxy layer.',
     },
     {
       id: 'SC-12',
@@ -244,14 +244,14 @@ module.exports = (checks) => ({
       id: 'SC-28',
       name: 'Protection of Information at Rest',
       check: checks.checkEncryption,
-      mapping: 'GD has no application-layer at-rest encryption as of v0.0.31. Data-at-rest protection is filesystem-level on the SQLite database file at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). SC-28(1) cryptographic protection of information at rest is satisfied at the OS/volume layer; application-layer encryption awaits a future GD KMS integration phase.',
+      mapping: 'The GD\'s secrets are encrypted at the application layer: every signing-key private key, the GD CA key and integration credentials are sealed with AES-256-GCM under a Tier-1 KEK that is itself hardware-sealed to the host\'s TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted; that rests on filesystem-level protection at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS). SC-28(1) is therefore satisfied cryptographically for secret material and at the OS/volume layer for the remainder; extending application-layer encryption to general table data under an external KMS awaits a future GD KMS integration phase.',
     },
     // ── SI System and Information Integrity ─────────────────────────────────
     {
       id: 'SI-2',
       name: 'Flaw Remediation',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter tracks platform version. package.json now carries a fuseCounter field (added in B6a); there is still no startup integrity check comparing the manifest fuse to system_meta.fuse_counter (planned for a future GD startup-verifier phase). Host OS / Node.js runtime / dependency patching is operator-managed via the customer\'s patch-management program; npm audit / Snyk / Dependabot in CI is the SOC-grade norm.',
+      mapping: 'The GD enforces anti-rollback at boot: services/gd-fuse-high-water.js reads the manifest fuseCounter and compares it against the highest value this deployment has ever recorded in node_state.fuse_high_water. A lower fuse marks the instance quarantined and, in production, halts the process rather than starting on a downgraded build. Host OS / Node.js runtime / dependency patching is operator-managed via the customer\'s patch-management program; npm audit / Snyk / Dependabot in CI is the SOC-grade norm.',
     },
     {
       id: 'SI-3',
@@ -269,7 +269,7 @@ module.exports = (checks) => ({
       id: 'SI-7',
       name: 'Software, Firmware, Information Integrity',
       check: checks.checkIntegrityVerification,
-      mapping: 'GD has no startup integrity verifier as of v0.0.31 (no SKIP_INTEGRITY_CHECK env var consumption; no release-manifest.json comparison at boot). A future GD buildout phase will add a manifest-based verifier (release-manifest.json shipping with each release; boot-time SHA-256 comparison against index.js / db-init.js / package.json). Until then, deployment-time integrity is operator-managed.',
+      mapping: 'The GD verifies its own integrity at boot: services/gd-integrity.js runs before the server accepts traffic, and SKIP_INTEGRITY_CHECK is honoured ONLY outside production, so no environment variable can disable the gate on a shipped install. Deployment-time integrity of the surrounding host remains operator-managed.',
     },
     // ── SR Supply Chain Risk Management ─────────────────────────────────────
     {

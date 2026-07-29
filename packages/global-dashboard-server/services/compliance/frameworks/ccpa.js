@@ -105,7 +105,7 @@ module.exports = (checks) => ({
       id: '§1798.105',
       name: 'Right to Delete',
       check: checks.checkDataSubjectRights,
-      mapping: 'GD\'s data-subject surface is narrow: only GD users (CISO / VP / readonly accounts) are direct data subjects on the GD. Account-level erasure via users.active=0 soft delete (CISO-only). No dedicated DELETE /api/users/:id endpoint as of v0.0.31; full erasure currently operator-managed via direct DB operations preserving audit trail. Analyst-data erasure is enforced at the MC layer (architectural — the GD does not store analyst-level data).',
+      mapping: 'GD\'s data-subject surface is narrow: only GD users (CISO / VP / readonly accounts) are direct data subjects on the GD. Account-level erasure via users.active=0 soft delete (CISO-only). No dedicated DELETE /api/users/:id endpoint; full erasure currently operator-managed via direct DB operations preserving audit trail. Analyst-data erasure is enforced at the MC layer (architectural — the GD does not store analyst-level data).',
     },
     {
       id: '§1798.106',
@@ -141,7 +141,7 @@ module.exports = (checks) => ({
       id: '§1798.150 [Encryption Defense]',
       name: 'Private Right of Action Encryption Defense',
       check: checks.checkEncryption,
-      mapping: 'GD has no application-layer at-rest encryption as of v0.0.31. Data-at-rest protection is filesystem-level on the SQLite database file (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). §1798.150(a)(1) limits statutory damages under the private right of action to breaches of nonencrypted and nonredacted personal information. Filesystem-level encryption substantially reduces private-right-of-action exposure even before the future GD KMS phase ships application-layer encryption.',
+      mapping: 'The GD\'s secrets are encrypted at the application layer: every signing-key private key, the GD CA key and integration credentials are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted and rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). §1798.150(a)(1) limits statutory damages under the private right of action to breaches of nonencrypted and nonredacted personal information. Filesystem-level encryption substantially reduces private-right-of-action exposure even before the future GD KMS phase ships application-layer encryption.',
     },
     {
       id: '§1798.150 [Key Management]',

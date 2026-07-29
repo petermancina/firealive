@@ -189,7 +189,7 @@ function checkAlgorithmStrength() {
 function checkTlsMinVersion() {
   return {
     status: 'warning',
-    detail: 'GD has no application-layer HTTPS enforcement middleware (no equivalent of MC\'s enforceMinTls). TLS termination and version negotiation are entirely reverse-proxy responsibility. SOC-grade deployments configure the proxy with TLSv1.2 minimum (TLSv1.3 preferred) and reject plaintext HTTP requests at the proxy layer before they reach the GD application port. This is enumerated as customer-responsibility in framework definitions.',
+    detail: 'The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS will refuse plaintext thereafter. The GD does not itself terminate TLS or reject a plaintext request arriving at its port; that stays with the reverse proxy. There is no equivalent of the MC\'s enforceMinTls). TLS termination and version negotiation are entirely reverse-proxy responsibility. SOC-grade deployments configure the proxy with TLSv1.2 minimum (TLSv1.3 preferred) and reject plaintext HTTP requests at the proxy layer before they reach the GD application port. This is enumerated as customer-responsibility in framework definitions.',
   };
 }
 
@@ -246,7 +246,7 @@ function checkKmsProvider(db) {
   }
   return {
     status: 'warning',
-    detail: 'GD has not yet integrated with an external KMS (kms_providers table not present). Data-at-rest protection is filesystem-level on the SQLite database file at the directory configured via GD_DB_PATH (default packages/global-dashboard-server/data/global-dashboard.db). SOC-grade deployments use operator-managed disk encryption (LUKS, FileVault, BitLocker, AWS EBS encryption, etc.) on the underlying volume. A GD KMS integration phase is planned for the broader GD buildout (B-phase track in BUILD-PLAN-v16); when it ships, this check will report per-provider trust automatically.',
+    detail: 'GD has not yet integrated with an external KMS (kms_providers table not present). The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection at the directory configured via GD_DB_PATH (default packages/global-dashboard-server/data/global-dashboard.db). SOC-grade deployments use operator-managed disk encryption (LUKS, FileVault, BitLocker, AWS EBS encryption, etc.) on the underlying volume. A GD KMS integration phase is planned for the broader GD buildout (B-phase track in BUILD-PLAN-v16); when it ships, this check will report per-provider trust automatically.',
   };
 }
 

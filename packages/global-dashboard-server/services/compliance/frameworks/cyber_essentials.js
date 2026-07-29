@@ -102,7 +102,7 @@ module.exports = (checks) => ({
       id: 'CE-2.1',
       name: 'Secure Configuration -- Production Hardening',
       check: checks.checkSecureBaseline,
-      mapping: 'NODE_ENV=production is set for industry convention but has no in-platform gated behavior on the GD as of v0.0.31 (no enforceMinTls, no production-mode error handling, no mTLS on /api/internal/ routes). Secure-baseline elements (HTTPS, error sanitization, network isolation) are entirely operator-managed at the reverse-proxy / deployment layer.',
+      mapping: 'NODE_ENV=production gates two boot-time protections on the GD: SKIP_INTEGRITY_CHECK is honoured ONLY outside production, so no environment variable can disable the startup integrity gate on a shipped install, and an anti-rollback violation halts the process rather than warning. There is no enforceMinTls and no /api/internal/ routes; transport security (HTTPS termination, error sanitization, network isolation) remains operator-managed at the reverse-proxy / deployment layer.',
     },
     {
       id: 'CE-2.2',
@@ -159,7 +159,7 @@ module.exports = (checks) => ({
       id: 'CE-5.1',
       name: 'Security Update Management',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter tracks platform version (seeded by db-init.js). The GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing it against system_meta.fuse_counter (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. AGPL-3.0 source transparency for software-update auditing. Host OS / Node.js runtime / dependency patching is operator-managed; Cyber Essentials v3.2 requires high/critical patches within 14 days.',
+      mapping: 'system_meta.fuse_counter tracks platform version (seeded by db-init.js). The GD enforces anti-rollback at boot: services/gd-fuse-high-water.js reads the manifest fuseCounter and compares it against the highest value this deployment has ever recorded in node_state.fuse_high_water. A lower fuse marks the instance quarantined and, in production, halts the process rather than starting on a downgraded build. AGPL-3.0 source transparency for software-update auditing. Host OS / Node.js runtime / dependency patching is operator-managed; Cyber Essentials v3.2 requires high/critical patches within 14 days.',
     },
   ],
   customerResponsibility: [

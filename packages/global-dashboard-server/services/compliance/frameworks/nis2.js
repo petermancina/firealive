@@ -109,7 +109,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(b)',
       name: 'Incident Handling',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident handling is operator-managed off-platform. notification_config provides multi-channel alert delivery (email, sms, recipients) for threshold-based alerts.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident handling is operator-managed off-platform. notification_config provides multi-channel alert delivery (email, sms, recipients) for threshold-based alerts.',
     },
     {
       id: 'Art.21(2)(c) [Backup]',
@@ -121,7 +121,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(c) [DR]',
       name: 'Business Continuity -- Disaster Recovery',
       check: checks.checkBackupMultiDestination,
-      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations) prevents single-destination failure from defeating recovery. Note: GD has no in-platform restore workflow as of v0.0.31; recovery testing is off-platform discipline until a future restore-workflow phase ships.',
+      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations) prevents single-destination failure from defeating recovery. Note: GD has no in-platform restore workflow; recovery testing is off-platform discipline until a future restore-workflow phase ships.',
     },
     {
       id: 'Art.21(2)(d) [Supply Chain]',
@@ -145,13 +145,13 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(e) [Patch]',
       name: 'Security in Acquisition, Development, Maintenance -- Patch Management',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter tracks platform version. The GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing it against system_meta.fuse_counter (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. Patch management at the operator infrastructure layer is operator-managed using their patch-management procedure; npm audit / Snyk / Dependabot in CI is the SOC-grade norm for dependency tracking.',
+      mapping: 'The GD enforces anti-rollback at boot: services/gd-fuse-high-water.js reads the manifest fuseCounter and compares it against the highest value this deployment has ever recorded in node_state.fuse_high_water. A lower fuse marks the instance quarantined and, in production, halts the process rather than starting on a downgraded build. Patch management at the operator infrastructure layer is operator-managed using their patch-management procedure; npm audit / Snyk / Dependabot in CI is the SOC-grade norm for dependency tracking.',
     },
     {
       id: 'Art.21(2)(f)',
       name: 'Effectiveness Assessment of Cybersecurity Risk Management Measures',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 (no restore workflow; /api/regression-test runs a real integration-test suite but is not a backup-restore drill). Art.21(2)(f) requirement for assessment of measures effectiveness is operator-managed off-platform: provision side-by-side GD instance, restore from backup, verify recovery; SOC-grade norm is quarterly.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. Art.21(2)(f) assessment against production-representative data remains operator-managed, since only the operator can supply that data: provision a side-by-side GD instance, restore from backup, verify recovery; SOC-grade norm is quarterly.',
     },
     {
       id: 'Art.21(2)(g)',
@@ -187,7 +187,7 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(j) [Comms]',
       name: 'Secured Communications',
       check: checks.checkTransmission,
-      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. GD has no application-layer HTTPS enforcement and no mTLS on /api/internal/ (no /api/internal/ routes exist on the GD). Secure voice/video communications and emergency communication systems are operator-side.',
+      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS refuses plaintext thereafter; the GD does not itself terminate TLS, and there is no mTLS on /api/internal/ (no /api/internal/ routes exist on the GD). Secure voice/video communications and emergency communication systems are operator-side.',
     },
     // ── Art.23 Reporting Obligations ─────────────────────────────────────────
     {

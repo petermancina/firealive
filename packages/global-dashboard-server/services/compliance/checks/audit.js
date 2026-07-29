@@ -15,7 +15,7 @@
 //   - GD has no SIEM streaming infrastructure (no SIEM_ENABLED env
 //     var consumption, no config.siem_config key, no
 //     integration_config table at all). External tamper-evidence is
-//     therefore unavailable on the GD side as of v0.0.31. SIEM
+//     therefore unavailable on the GD side. SIEM
 //     integration is a future enhancement; checkAuditIntegrity and
 //     checkSyslogExport surface this honestly.
 //   - GD has no integration_config table. The GD's "third parties"

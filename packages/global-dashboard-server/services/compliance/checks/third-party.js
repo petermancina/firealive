@@ -249,7 +249,7 @@ function checkKmsProviderTrust(db) {
   if (!tableExists(db, 'kms_providers')) {
     return {
       status: 'warning',
-      detail: 'GD has no external KMS integration as of v0.0.31 (kms_providers table not present). A future GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce per-provider trust probing; until then, KMS trust evaluation is operator-managed off-platform. When the table lands, this check reports per-provider probe status with 7-day recency expectation.',
+      detail: 'GD has no external KMS integration (kms_providers table not present). A future GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce per-provider trust probing; until then, KMS trust evaluation is operator-managed off-platform. When the table lands, this check reports per-provider probe status with 7-day recency expectation.',
     };
   }
   const enabled = db.prepare(
@@ -419,7 +419,7 @@ function checkSigningKeyRegistry(db) {
   if (allBackupMissing && signingKeysMissing) {
     return {
       status: 'warning',
-      detail: `No signing-key registries present on the GD. Each future phase introduces one: ${[...backupRegistries, { table: 'signing_keys', label: 'MC-trust verification', phaseNote: 'R3g PR3 (MC-push verification registry)' }].map(r => `${r.table} (${r.phaseNote})`).join('; ')}. Until those phases ship, MC → GD trust is api_key-based and operator-managed; GD backup integrity is hash-only (no cryptographic signature).`,
+      detail: `Signing-key registry status on the GD: ${[...backupRegistries, { table: 'signing_keys', label: 'MC-trust verification', phaseNote: 'R3g PR3 (MC-push verification registry)' }].map(r => `${r.table} (${r.phaseNote})`).join('; ')}. Until those phases ship, MC → GD trust is api_key-based and operator-managed; GD backup integrity is hash-only (no cryptographic signature).`,
     };
   }
 

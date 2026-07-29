@@ -95,7 +95,7 @@ module.exports = (checks) => ({
       id: 'PR.AA-03',
       name: 'Users, Services, Hardware are Authenticated',
       check: checks.checkAuthentication,
-      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET (HMAC-SHA256). SSO via SAML / OIDC / LDAP planned for B5b (v1.0.51); until then, users.auth_method is informational and authentication is a FIDO2 hardware passkey. MC-to-GD service authentication via management_consoles.api_key shared secret.',
+      mapping: 'JWT-based authentication with operator-configured GD_JWT_SECRET (HMAC-SHA256). Authentication is a FIDO2 hardware passkey, and only that: B5b evaluated SAML / OIDC / LDAP SSO and rejected it, removing password and LDAP login entirely rather than offering them alongside. There is no password to phish and no shared secret to replay. users.auth_method records which method a user holds. MC-to-GD service authentication via management_consoles.api_key shared secret.',
     },
     {
       id: 'PR.AA-03 [MFA]',
@@ -113,25 +113,25 @@ module.exports = (checks) => ({
       id: 'PR.DS-01',
       name: 'Data-at-Rest is Protected',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key) is the application-layer cryptographic foundation. Data-at-rest protection is filesystem-level on the SQLite database file at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption parallel to MC\'s TIER1/TIER3 pattern.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key) is the application-layer cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption parallel to MC\'s TIER1/TIER3 pattern.',
     },
     {
       id: 'PR.DS-02',
       name: 'Data-in-Transit is Protected',
       check: checks.checkTransmission,
-      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. GD has no application-layer HTTPS enforcement as of v0.0.31. Backup destinations support encrypted=true via backup_schedules; destination-side encryption (S3 SSE / GCS CMEK / Azure SE) is operator-managed.',
+      mapping: 'TLS termination at the reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at the proxy. The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS refuses plaintext thereafter; the GD does not itself terminate TLS. Backup destinations support encrypted=true via backup_schedules; destination-side encryption (S3 SSE / GCS CMEK / Azure SE) is operator-managed.',
     },
     {
       id: 'PR.DS-10',
       name: 'Data-in-Use is Protected (Integrity)',
       check: checks.checkAuditIntegrity,
-      mapping: 'audit_log is append-only by API contract (no UPDATE or DELETE routes expose modification). Cryptographic hash chain (SHA-256 hash + prev_hash columns) lands in B5a (v1.0.50); when shipped, the check verifies chain integrity by walking it linearly.',
+      mapping: 'audit_log is append-only by API contract (no UPDATE or DELETE routes expose modification). Cryptographic hash chain (SHA-256 hash + prev_hash columns) shipped in B5a; services/gd-audit-chain.js verifies chain integrity by walking it linearly, and signed checkpoints anchor the chain so a truncation is detectable.',
     },
     {
       id: 'PR.DS-11',
       name: 'Backups of Data are Created, Protected, Maintained, Tested',
       check: checks.checkBackupFrequency,
-      mapping: 'backup_schedules table holds active=1 schedules; backups table records completed backups with SHA-256 integrity hash. POST /api/backups/trigger bootstraps a manual backup. Note: GD has no restore workflow as of v0.0.31, so backup TESTING is off-platform discipline (provision side-by-side instance, restore, verify).',
+      mapping: 'backup_schedules table holds active=1 schedules; backups table records completed backups with SHA-256 integrity hash. POST /api/backups/trigger bootstraps a manual backup. Note: GD has no restore workflow, so backup TESTING is off-platform discipline (provision side-by-side instance, restore, verify).',
     },
     {
       id: 'PR.IR-01',
@@ -149,7 +149,7 @@ module.exports = (checks) => ({
       id: 'PR.PS-02',
       name: 'Software is Maintained, Replaced, Removed Commensurate with Risk',
       check: checks.checkPatchManagement,
-      mapping: 'system_meta.fuse_counter is seeded by db-init.js and the GD manifest now carries a package.json fuseCounter (72); the boot-time check comparing the two (and so enforcing anti-rollback) still awaits the GD startup-verifier phase, so the fuse is reported but not yet enforcing. AGPL-3.0 license provides transparency for software-maintenance auditing. Host OS / Node.js runtime / dependency patching is operator-managed.',
+      mapping: 'The GD enforces anti-rollback at boot: services/gd-fuse-high-water.js reads the manifest fuseCounter and compares it against the highest value this deployment has ever recorded in node_state.fuse_high_water. A lower fuse marks the instance quarantined and, in production, halts the process rather than starting on a downgraded build. AGPL-3.0 license provides transparency for software-maintenance auditing. Host OS / Node.js runtime / dependency patching is operator-managed.',
     },
     {
       id: 'PR.PS-05',
@@ -168,7 +168,7 @@ module.exports = (checks) => ({
       id: 'DE.CM-09',
       name: 'Computing Hardware and Software is Monitored for Adverse Events',
       check: checks.checkIntegrityVerification,
-      mapping: 'GD has no startup integrity verifier as of v0.0.31 (no SKIP_INTEGRITY_CHECK env var consumption; no release-manifest.json comparison at boot). A future GD buildout phase will add a manifest-based verifier (release-manifest.json shipping with each release; boot-time SHA-256 comparison against index.js / db-init.js / package.json); when shipped, this check evaluates the verifier\'s posture automatically.',
+      mapping: 'The GD verifies its own integrity at boot: services/gd-integrity.js runs before the server accepts traffic, and SKIP_INTEGRITY_CHECK is honoured ONLY outside production, so no environment variable can disable the gate on a shipped install.',
     },
     {
       id: 'DE.AE-02',
@@ -181,14 +181,14 @@ module.exports = (checks) => ({
       id: 'RS.MA-02',
       name: 'Incident Reports are Triaged and Validated',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery-channel configuration for threshold-based alerts.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery-channel configuration for threshold-based alerts.',
     },
     // ── RECOVER ──────────────────────────────────────────────────────────────
     {
       id: 'RC.RP-01',
       name: 'Incident Recovery Plan is Executed',
       check: checks.checkBackupMultiDestination,
-      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations); SHA-256 verification on each backup. Note: GD has no restore workflow as of v0.0.31; recovery plan execution is off-platform until a future restore-workflow phase ships.',
+      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations); SHA-256 verification on each backup. Note: GD has no restore workflow; recovery plan execution is off-platform until a future restore-workflow phase ships.',
     },
   ],
   customerResponsibility: [

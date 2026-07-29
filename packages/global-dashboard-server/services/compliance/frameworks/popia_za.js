@@ -145,7 +145,7 @@ module.exports = (checks) => ({
       id: '§24',
       name: 'Right to Correct or Delete',
       check: checks.checkDataSubjectRights,
-      mapping: 'PATCH /api/users/:id permits correction of GD user account information per §24(1)(a) (CISO-only) for the narrow GD-account data-subject surface. Account-level deletion via users.active=0 soft delete per §24(1)(b) where information is inaccurate, irrelevant, excessive, out of date, incomplete, misleading, or obtained unlawfully. No dedicated DELETE /api/users/:id endpoint as of v0.0.31; full deletion currently operator-managed via direct DB operations preserving audit trail. Analyst-level correction/deletion is enforced at the MC layer.',
+      mapping: 'PATCH /api/users/:id permits correction of GD user account information per §24(1)(a) (CISO-only) for the narrow GD-account data-subject surface. Account-level deletion via users.active=0 soft delete per §24(1)(b) where information is inaccurate, irrelevant, excessive, out of date, incomplete, misleading, or obtained unlawfully. No dedicated DELETE /api/users/:id endpoint; full deletion currently operator-managed via direct DB operations preserving audit trail. Analyst-level correction/deletion is enforced at the MC layer.',
     },
     {
       id: '§72',

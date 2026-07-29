@@ -93,7 +93,7 @@ module.exports = (checks) => ({
       id: 'CC6.7',
       name: 'Transmission and Disposal Restrictions',
       check: checks.checkTransmission,
-      mapping: 'TLS termination at reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at proxy before requests reach the GD. Backup destinations support encrypted=true via backup_schedules; destination-side at-rest encryption (S3 SSE / GCS CMEK / Azure SE) is operator-managed. The GD has no application-layer HTTPS enforcement as of v0.0.31; NODE_ENV=production is informational.',
+      mapping: 'TLS termination at reverse proxy (operator-managed nginx / Caddy / cloud load balancer); reject plaintext HTTP at proxy before requests reach the GD. Backup destinations support encrypted=true via backup_schedules; destination-side at-rest encryption (S3 SSE / GCS CMEK / Azure SE) is operator-managed. The GD sends HTTP Strict-Transport-Security at the application layer (helmet defaults, applied ahead of every /api mount), so a browser that has once reached it over HTTPS refuses plaintext thereafter; the GD does not itself terminate TLS. NODE_ENV=production gates two boot-time protections: SKIP_INTEGRITY_CHECK is honoured only outside production, and an anti-rollback violation halts the process rather than warning.',
     },
     {
       id: 'CC6.8',
@@ -124,20 +124,20 @@ module.exports = (checks) => ({
       id: 'CC7.4',
       name: 'Incident Response',
       check: checks.checkIrPlanExists,
-      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint as of v0.0.31). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery-channel configuration (email, sms, recipients) for threshold-based alerts.',
+      mapping: 'GD has no application-layer IR policy registry (no ir_policies table or document-upload endpoint). CISO / governance-tier incident response planning is operator-managed off-platform. notification_config provides delivery-channel configuration (email, sms, recipients) for threshold-based alerts.',
     },
     {
       id: 'CC7.5',
       name: 'Recovery and Restoration',
       check: checks.checkBackupMultiDestination,
-      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations). Each backup records SHA-256 hash for integrity verification. Note: GD has no restore workflow as of v0.0.31 — see CC9.1 / A1.3 for the off-platform DR drill discipline.',
+      mapping: 'Multi-destination resilience via active backup_schedules pointing to different destination values (local + S3 / GCS / Azure combinations). Each backup records SHA-256 hash for integrity verification. Note: GD has no restore workflow — see CC9.1 / A1.3 for the off-platform DR drill discipline.',
     },
     // ── CC8 Change Management ────────────────────────────────────────────────
     {
       id: 'CC8.1',
       name: 'Change Management Process',
       check: checks.checkChangeManagement,
-      mapping: 'Anti-rollback fuse_counter in system_meta (seeded by db-init.js); audit_log records every configuration change via CONFIG_UPDATED events emitted by PUT /api/config/:key. AGPL-3.0 source transparency for code-level changes. Note: package.json now carries a fuseCounter field (added in B6a); the startup fuse-vs-package comparison that would enforce it awaits a future GD startup-verifier phase.',
+      mapping: 'Anti-rollback fuse_counter in system_meta (seeded by db-init.js); audit_log records every configuration change via CONFIG_UPDATED events emitted by PUT /api/config/:key. AGPL-3.0 source transparency for code-level changes. The GD enforces anti-rollback at boot: services/gd-fuse-high-water.js reads the manifest fuseCounter and compares it against the highest value this deployment has ever recorded in node_state.fuse_high_water. A lower fuse marks the instance quarantined and, in production, halts the process rather than starting on a downgraded build.',
     },
     {
       id: 'CC8.1 [Config Lock]',
@@ -175,7 +175,7 @@ module.exports = (checks) => ({
       id: 'A1.3',
       name: 'Recovery Testing',
       check: checks.checkDrTestRecency,
-      mapping: 'GD has no in-platform DR test infrastructure as of v0.0.31 — /api/regression-test runs a real integration-test suite but is not a backup-restore drill; no restore workflow; no restore_approvals table. Off-platform DR drill discipline: provision a side-by-side GD instance, restore from backup, verify recovery. SOC-grade norm is quarterly DR testing; auditor will examine documented drill records.',
+      mapping: 'The GD carries an in-platform restore workflow: pre-upgrade restore points, a restore-approval policy with second-person CISO approval (restore_approvals), an external-restore allow-list, and sanctioned rollback with a hash-chained restore chain. A full DR drill against production-representative data remains operator-managed, since only the operator can supply that data: provision a side-by-side GD instance, restore from backup, verify recovery. SOC-grade norm is quarterly DR testing; auditor will examine documented drill records.',
     },
     // ── C1 Confidentiality ───────────────────────────────────────────────────
     {
