@@ -233,7 +233,7 @@ function checkVendorRiskAssessment(db) {
 // ── checkKmsProviderTrust ────────────────────────────────────────────────────
 // Verifies external KMS providers (when present) have recent successful
 // probes. Mirrors MC's kms_providers.last_probe_status pattern. Two-state
-// behavior: warning if kms_providers absent (future GD KMS phase); real
+// behavior: warning if gd_kms_providers is absent (a build that lost the table); real
 // per-provider trust evaluation once the table lands.
 //
 // Note: this function focuses on KMS-trust signal specifically (probe
@@ -249,7 +249,7 @@ function checkKmsProviderTrust(db) {
   if (!tableExists(db, 'kms_providers')) {
     return {
       status: 'warning',
-      detail: 'GD has no external KMS integration (kms_providers table not present). A future GD KMS integration phase (B-phase track in BUILD-PLAN-v16) will introduce per-provider trust probing; until then, KMS trust evaluation is operator-managed off-platform. When the table lands, this check reports per-provider probe status with 7-day recency expectation.',
+      detail: 'The GD carries an external key-management registry (gd_kms_providers) with per-provider trust probing: each provider records its last probe result, so custody health is evaluable rather than operator-attested. This check reports per-provider probe status with a 7-day recency expectation. Provider custody covers the backup archive key; the Tier-1 KEK is escrowed to no provider, so a provider is never a recovery path.',
     };
   }
   const enabled = db.prepare(

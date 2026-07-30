@@ -1,102 +1,39 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Key Wrapping Provider Base
+// =============================================================================
+// FIREALIVE GD -- key-wrapping provider registry base  [B6g]
+// Copyright (C) 2026 Peter Mancina
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// =============================================================================
 //
-// Common interface, registry, and helpers for KEK (key encryption key)
-// providers. Each provider (env-var, AWS KMS, Azure Key Vault, GCP KMS,
-// HashiCorp Vault) implements the interface contract documented below
-// and registers itself via registerProvider() at module-load time.
+// The GD twin of server/services/key-wrapping-providers/base.js. Derived from it
+// rather than hand-written: same contract, same validation helpers, same
+// registry semantics, and 341 lines meant to be identical are how two
+// implementations drift apart.
 //
-// THE KEY WRAPPING DISPATCHER (services/backup-key-wrapping.js, refactored
-// in commits 20-21 of this phase) routes wrap/unwrap calls through this
-// registry based on the configured kms_providers.provider_type.
+// The GD server is fully self-contained -- no local package dependency, never
+// requires from server/, and 86 of its services are twins of a server/services
+// file. A shared module is not available here, so the twin is the mechanism.
 //
-// PROVIDER INTERFACE (each provider module exports ONE object with these
-// fields, then calls registerProvider at end of module):
+// TWO THINGS DIFFER FROM THE REGIONAL SERVER'S COPY, both deliberate:
 //
-//   name: string
-//     Lowercase identifier matching kms_providers.provider_type:
-//     'env-var' | 'aws-kms' | 'azure-keyvault' | 'gcp-kms' |
-//     'hashicorp-vault'
+//   'gd-tier1' replaces 'env-var' as the local scheme. Not a rename. The MC's
+//   env-var KEK is a hex string in the process environment; the GD's Tier-1 KEK
+//   is hardware-sealed to this host's TPM 2.0 / Secure Enclave and a copied disk
+//   cannot unseal it.
 //
-//   description: string
-//     Short human-readable description shown in admin UI.
+//   FA_BACKUP_KEK_DOMAIN is unchanged, and that matters for compatibility rather
+//   than symmetry: the domain separator only ever appears inside a fingerprint,
+//   and the GD's EXISTING gd-tier1 manifests do not use it at all -- they record
+//   gdTier1Kek.ownKekFingerprint() directly. The gd-tier1 provider must keep
+//   doing that, or every manifest already written fails its fingerprint check.
+//   The domain is used only by the four cloud providers, which are new here.
 //
-//   securityTier: number
-//     1 (HSM-backed, never-extractable, e.g. PKCS#11 future)
-//     2 (cloud KMS / Vault transit -- KEK never leaves provider HSM)
-//     3 (KEK in process memory, e.g. env-var)
-//     For SOC operator decision-making in the admin UI picker.
-//
-//   validateConfig(config) -> { ok, error?, field? }
-//     Synchronous validation of the config JSON object. Return
-//     { ok: true } if valid, { ok: false, error, field } otherwise.
-//     Field optional but helps admin UI highlight the offending input.
-//
-//   validateCredentials(credentials) -> { ok, error?, field? }
-//     Synchronous validation of the credentials object. May return
-//     { ok: true } if the provider supports a no-credentials mode
-//     (e.g., env-var; cloud SDKs falling back to instance metadata).
-//
-//   async probe(config, credentials) -> { ok, error?, detail? }
-//     Round-trip test: wrap a known plaintext, unwrap it, verify
-//     bytes match. Surfaces config errors before the first real
-//     wrap operation. Should be FAST (ideally <5s); cloud KMS
-//     providers should set per-call timeouts.
-//
-//   async wrap(plaintextDek, config, credentials, options) -> Buffer
-//     The core wrap operation. Inputs:
-//       plaintextDek: Buffer of raw DEK bytes (typically 32 for AES-256)
-//       config: parsed JSON config object
-//       credentials: decrypted credentials object or null
-//       options: { logger, signal, timeoutMs }
-//     Returns: Buffer in provider-specific format. Format details:
-//       env-var:        iv(12) + tag(16) + ciphertext  (AES-GCM)
-//       aws-kms:        AWS KMS ciphertext blob (opaque to us)
-//       azure-keyvault: Azure Key Vault ciphertext blob (opaque)
-//       gcp-kms:        GCP KMS ciphertext blob (opaque)
-//       hashicorp-vault Vault transit response with key version prefix
-//     Adapters never interpret each other's formats. The manifest's
-//     key_wrapping.scheme field tells unwrap-time which provider to
-//     dispatch to.
-//     Throws KeyWrappingError on failure. The error's retryable flag
-//     tells callers whether to retry (transient) or give up (permanent).
-//
-//   async unwrap(wrappedDek, config, credentials, options) -> Buffer
-//     The inverse of wrap. Inputs:
-//       wrappedDek: Buffer in the same format produced by wrap
-//       config + credentials: same shape as wrap
-//       options: same shape as wrap
-//     Returns: plaintext DEK Buffer (raw bytes).
-//     Throws KeyWrappingError on failure. UnwrapAuth failures are
-//     ALWAYS permanent (key not found, wrong KMS key, etc.) -- no
-//     amount of retrying makes a wrong key correct.
-//
-// REGISTRY
-//
-// Provider modules call registerProvider(provider) at end of module
-// load. The dispatcher looks up providers via getProvider(name).
-// listProviders() returns metadata for the admin UI picker.
-//
-// SECURITY-TIER CRITERIA (for the admin UI to display warnings)
-//
-// Tier 1 (HSM): KEK in dedicated tamper-evident hardware that physically
-//   cannot extract the key (PKCS#11 with appropriate token). Reserved
-//   for future R3d-5+ providers; no R3d-4 provider declares Tier 1.
-//
-// Tier 2 (cloud KMS / Vault): KEK in cloud provider's HSM (FIPS 140-2
-//   Level 3 in eligible regions) or self-hosted Vault transit engine.
-//   The KEK never leaves the provider's HSM/vault; only ciphertext
-//   crosses the network. Includes aws-kms, azure-keyvault, gcp-kms,
-//   hashicorp-vault.
-//
-// Tier 3 (env-var): KEK exists in the FireAlive process's environment
-//   variable, readable by any process running as the same user.
-//   Operator's responsibility to inject from a secrets manager. Last-
-//   resort fallback; default for backward compatibility.
-// ═══════════════════════════════════════════════════════════════════════════════
 
 const VALID_PROVIDER_NAMES = new Set([
-  'env-var',
+  // The GD's local scheme. The Regional Server's equivalent is 'env-var', whose
+  // KEK is a hex string in the process environment; the GD's is the Tier-1 KEK,
+  // hardware-sealed to this host's TPM 2.0 / Secure Enclave. Not a rename -- a
+  // different and stronger thing, which is why the name differs.
+  'gd-tier1',
   'aws-kms',
   'azure-keyvault',
   'gcp-kms',
@@ -142,14 +79,14 @@ const providerRegistry = new Map();
 // in the manifest is non-correlatable across backups.
 //
 //   kekFingerprint(config, credentials) -> lowercase-hex string   (NEW provider method)
-//     A stable, one-way fingerprint of the KEK this provider wraps under. env-var fingerprints
+//     A stable, one-way fingerprint of the KEK this provider wraps under. gd-tier1 fingerprints
 //     the raw material; cloud KMS fingerprints the stable key reference (the material never
 //     leaves the HSM). It lets a restore confirm the target's KEK matches the backup's WITHOUT
 //     unwrapping anything. (Enforced in registerProvider only once every provider implements it.)
 const cryptoMod = require('crypto');
 const FA_BACKUP_KEK_DOMAIN = 'fa-backup-kek:v1';
 
-// Fingerprint of raw KEK MATERIAL (env-var scheme: the 32-byte KEK itself). The material never
+// Fingerprint of raw KEK MATERIAL (raw KEK material). The material never
 // appears in the manifest -- only this domain-separated SHA-256, hex.
 function kekFpFromMaterial(materialBuffer) {
   if (!Buffer.isBuffer(materialBuffer) || materialBuffer.length === 0) {

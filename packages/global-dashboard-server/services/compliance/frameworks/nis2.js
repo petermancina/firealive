@@ -163,13 +163,13 @@ module.exports = (checks) => ({
       id: 'Art.21(2)(h) [Crypto]',
       name: 'Cryptography -- Algorithm Strength',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption).',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). The GD-layer cryptographic surface is narrower than the MC (which encrypts analyst-data tiers with AES-256-GCM). Application-layer at-rest encryption the GD backup data key may be wrapped by an external key-management provider (AWS KMS, Azure Key Vault, GCP KMS or HashiCorp Vault) registered in gd_kms_providers, giving FIPS-validated custody, provider-side rotation and provider-side audit for the archive key. The Tier-1 KEK itself is escrowed to no provider: recovering a deployment means re-establishing it from the offline recovery code, so a provider is custody and never a recovery path; until then, at-rest protection is filesystem-level (operator-managed disk encryption).',
     },
     {
       id: 'Art.21(2)(h) [Keys]',
       name: 'Cryptography -- Key Management',
       check: checks.checkKeyRotation,
-      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration awaits future GD KMS phase.',
+      mapping: 'GD_JWT_SECRET rotation is operator-managed (quarterly cadence recommended; restart invalidates all existing JWTs). MC signing keys rotate through the signing_keys registry with an atomic demote-and-promote and an operator-configured grace window; the management_consoles.api_key identifier rotates per 90-day cadence. Backup-signing-key registries (backup_signing_keys, chain_signing_keys) await future GD backup-signing phase; R3g PR3 adds signing_keys for MC-push verification. Hardware-backed KMS integration the GD backup data key may be wrapped by an external key-management provider (AWS KMS, Azure Key Vault, GCP KMS or HashiCorp Vault) registered in gd_kms_providers, giving FIPS-validated custody, provider-side rotation and provider-side audit for the archive key. The Tier-1 KEK itself is escrowed to no provider: recovering a deployment means re-establishing it from the offline recovery code, so a provider is custody and never a recovery path.',
     },
     {
       id: 'Art.21(2)(i)',

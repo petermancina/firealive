@@ -150,7 +150,7 @@ module.exports = (checks) => ({
       id: 'CC9.1',
       name: 'Risk Mitigation Activities',
       check: checks.checkBackups,
-      mapping: 'Defense-in-depth on the GD\'s current surface: multi-destination backups, encrypted backup option, rate limiting, MFA enrollment, role-based access, audit logging, Config Lock (server-side, hardware-passkey unlock). Several SOC-grade defenses (hash chain, anti-replay, signing keys, KMS) await specific BUILD-PLAN-v16 phases (B5a, R3g PR3 signing keys, future GD KMS phase).',
+      mapping: 'Defense-in-depth on the GD\'s current surface: multi-destination backups, encrypted backup option, rate limiting, MFA enrollment, role-based access, audit logging, Config Lock (server-side, hardware-passkey unlock). External key-management custody for the backup archive key is available via gd_kms_providers. Application-layer encryption of general table data remains future work.',
     },
     {
       id: 'CC9.2',

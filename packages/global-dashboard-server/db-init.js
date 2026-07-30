@@ -506,7 +506,22 @@ CREATE TABLE IF NOT EXISTS backups (
   wal_end_position TEXT,                            -- serialized WAL frame ref (next backup's start)
   page_count INTEGER,                               -- integrity verification anchor
   kind TEXT NOT NULL DEFAULT 'single-db'
-    CHECK (kind IN ('single-db', 'full-suite'))
+    CHECK (kind IN ('single-db', 'full-suite')),
+  -- B6g: which key-wrapping provider sealed this backup's data key.
+  -- Restore dispatches on the manifest's recorded {scheme, ref}, never on
+  -- current config, so these are a RECORD of what happened rather than an
+  -- instruction. They are what makes "is this provider still needed?"
+  -- answerable, and therefore what makes a delete guard possible at all.
+  -- NULL means gd-tier1: before B6g that was the only value SUPPORTED_SCHEMES
+  -- allowed, so no backfill is needed and none is performed.
+  wrap_scheme TEXT,
+  wrap_ref TEXT,
+  -- ON DELETE RESTRICT is ENFORCED: getDb() sets foreign_keys = ON (B6g 4a).
+  -- The database refuses to delete a provider a backup depends on even when the
+  -- caller bypasses the service layer entirely. Before 4a this clause would have
+  -- read as protection and provided none, which is what backups.signing_key_id
+  -- had been doing since it shipped.
+  wrap_provider_id TEXT REFERENCES gd_kms_providers(id) ON DELETE RESTRICT
 );
 
 -- Backup manifest signing keys (dedicated GD backup Ed25519 family; separate
@@ -961,6 +976,60 @@ CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_update
 CREATE TRIGGER IF NOT EXISTS vuln_scan_access_log_no_delete
   BEFORE DELETE ON vuln_scan_access_log
   BEGIN SELECT RAISE(ABORT, 'vuln_scan_access_log is append-only'); END;
+
+-- == B6g: GD backup key-wrapping provider registry =========================
+-- CUSTODY, NEVER RECOVERY. A provider here wraps the PER-BACKUP EPHEMERAL DATA
+-- KEY that gd-backup-archive produced. It does not wrap the GD Tier-1 KEK, and
+-- the Tier-1 KEK is escrowed to no provider anywhere. Recovering a deployment
+-- always means re-establishing the KEK from the offline recovery code, because
+-- a v2 archive is the database file and the secret columns inside it stay
+-- sealed to hardware that is gone. Nothing in this table is a recovery path.
+--
+-- A separate table in a separate trust realm: the GD never reads the Regional
+-- Server's kms_providers rows and vice versa.
+CREATE TABLE IF NOT EXISTS gd_kms_providers (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  name TEXT NOT NULL UNIQUE,
+  provider_type TEXT NOT NULL CHECK (provider_type IN
+    ('gd-tier1', 'aws-kms', 'azure-keyvault', 'gcp-kms', 'hashicorp-vault')),
+  config TEXT NOT NULL,
+  -- Sealed under the GD Tier-1 KEK via gd-tier1-seal. The column is registered
+  -- in gd-tier1-columns.js, which is GENERATED from this schema -- sealing an
+  -- unregistered column throws at runtime, so the registry regeneration is part
+  -- of this change and not a follow-up.
+  credentials_encrypted TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1
+    CHECK (enabled IN (0, 1)),
+  -- Distinct from enabled=0. enabled=0 means do not use for NEW backups;
+  -- retired=1 means keep this row only so existing manifests can still
+  -- restore. One flag for both is how an operator deletes a provider that a
+  -- manifest still references.
+  retired INTEGER NOT NULL DEFAULT 0
+    CHECK (retired IN (0, 1)),
+  is_default INTEGER NOT NULL DEFAULT 0
+    CHECK (is_default IN (0, 1)),
+  -- Resolved at configuration time and recorded, so the cross-border transfer
+  -- register can cite the key-custody jurisdiction rather than re-deriving it.
+  residency_country TEXT,
+  residency_provider_domicile TEXT,
+  residency_verdict TEXT
+    CHECK (residency_verdict IS NULL OR residency_verdict IN
+      ('compliant', 'violation-region', 'undeclared', 'category-open',
+       'declare-only', 'disabled', 'denied-unset')),
+  last_probe_at TEXT,
+  last_probe_status TEXT
+    CHECK (last_probe_status IS NULL OR last_probe_status IN ('ok', 'failed')),
+  last_probe_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gd_kms_providers_default
+  ON gd_kms_providers(is_default) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS idx_gd_kms_providers_enabled
+  ON gd_kms_providers(enabled) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_gd_kms_providers_type
+  ON gd_kms_providers(provider_type);
 
 CREATE TABLE IF NOT EXISTS cloud_vuln_scanner_authorizations (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -1627,7 +1696,25 @@ CREATE TABLE IF NOT EXISTS external_restore_sources (
 function getDb() {
   // Creates 0700 and refuses an already group- or world-accessible directory.
   gdDataRoot.ensureDir(path.dirname(DB_PATH));
-  return new Database(DB_PATH);
+  const db = new Database(DB_PATH);
+
+  // B6g: ENFORCE referential integrity. better-sqlite3 defaults foreign_keys to
+  // OFF, so before this line every REFERENCES ... ON DELETE clause in the GD
+  // schema -- 57 across 15 parent tables -- was decorative. A DELETE of a row
+  // that a child RESTRICTs succeeded and left the child pointing at an id that
+  // no longer existed.
+  //
+  // The table-rebuild migrations below still turn it off around the 12-step
+  // rebuild and restore it in a finally, which is correct and required: dropping
+  // a parent table with constraints enforced would fail. Each one sets the
+  // pragma BEFORE opening its transaction, which matters because the pragma is a
+  // NO-OP inside a transaction -- with the old OFF default that no-op was
+  // harmless, and with this ON default it would not be.
+  //
+  // No opt-out. A switch that disables referential integrity is a switch someone
+  // eventually uses to silence an error, and the error is the control working.
+  db.pragma('foreign_keys = ON');
+  return db;
 }
 
 function initDb() {
@@ -1784,6 +1871,20 @@ function initDb() {
       db.exec(`ALTER TABLE backups ADD COLUMN wal_end_position TEXT;`);
       db.exec(`ALTER TABLE backups ADD COLUMN page_count INTEGER;`);
       console.log('Migrated backups: added v2 encrypted-backup + WAL/chain columns');
+    }
+    // B6g: the wrap-provenance columns. A SEPARATE guard from the v2 block
+    // above -- that one is gated on `format_version`, which any install
+    // reaching this release already has, so adding these there would never run.
+    if (!bCols.some(c => c.name === 'wrap_scheme')) {
+      db.exec(`ALTER TABLE backups ADD COLUMN wrap_scheme TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN wrap_ref TEXT;`);
+      db.exec(`ALTER TABLE backups ADD COLUMN wrap_provider_id TEXT REFERENCES gd_kms_providers(id) ON DELETE RESTRICT;`);
+      // Deliberately NOT backfilled. NULL means gd-tier1, which is provable:
+      // before B6g that was the only value SUPPORTED_SCHEMES allowed. Writing
+      // 'gd-tier1' into every historical row would assert an inference as a
+      // fact, and would afterwards be indistinguishable from a row the new
+      // code wrote.
+      console.log('Migrated backups: added B6g wrap-provenance columns (NULL = gd-tier1)');
     }
   } catch (gdBackupV2ColsErr) {
     console.error('GD v2 backup columns migration failed:', gdBackupV2ColsErr.message);

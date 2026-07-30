@@ -113,7 +113,7 @@ module.exports = (checks) => ({
       id: 'PR.DS-01',
       name: 'Data-at-Rest is Protected',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key) is the application-layer cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption parallel to MC\'s TIER1/TIER3 pattern.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key) is the application-layer cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection at GD_DB_PATH (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Extending application-layer encryption to general table data remains future work, and is separate from the key-wrapping registry: that covers the backup archive key, not the database contents, parallel to the MC\'s TIER1/TIER3 pattern.',
     },
     {
       id: 'PR.DS-02',

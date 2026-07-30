@@ -42,6 +42,12 @@ const CONFIG_KEY = 'data_residency_config';
 // enforceable. snapshot inherits backup's route.
 const CATEGORIES = [
   'live_deployment', 'backup', 'audit_log', 'forensic_export', 'snapshot', 'cef_archive',
+  // B6g. Key custody is not a data-location category: an external KMS holds the
+  // key that opens a backup and can be COMPELLED to use it. Listed here so
+  // loadResidencyConfig will READ a policy for it -- that loop drops unknown
+  // categories -- but evaluated by gd-key-custody-residency.js, NOT by decide(),
+  // because decide() treats an unset policy as open and this one denies.
+  'key_custody',
 ];
 const MODES = ['enforce', 'warn', 'declare-only'];
 
@@ -64,6 +70,9 @@ function defaultConfig() {
       forensic_export: { permittedRegions: [], mode: 'warn' },
       snapshot: { permittedRegions: [], mode: 'warn' },
       cef_archive: { permittedRegions: [], mode: 'warn' },
+      // B6g. enforce by default: the fail-open default that suits a data-location
+      // category is the wrong default for who may be ordered to unwrap a backup.
+      key_custody: { permittedRegions: [], mode: 'enforce' },
     },
   };
 }

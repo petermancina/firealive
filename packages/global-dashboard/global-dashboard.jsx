@@ -1735,6 +1735,23 @@ export default function GlobalDashboard() {
   const [vsLog, setVsLog] = useState([]);
   const [vsLogTotal, setVsLogTotal] = useState(0);
   const [vsChain, setVsChain] = useState(null); // {intact, count, brokenAt?}
+  // B6g -- Backup Key Custody. kp* is deliberately distinct from cv* and vs*:
+  // B6e shipped a defect where the on-prem tab read and wrote the cloud tab's
+  // state in fourteen places because a list-based rename missed one symbol.
+  const [kpList, setKpList] = useState([]);
+  const [kpError, setKpError] = useState("");
+  const [kpBusy, setKpBusy] = useState(false);
+  const [kpShowRetired, setKpShowRetired] = useState(false);
+  const [kpForm, setKpForm] = useState({name:"",provider_type:"aws-kms",config:"{}",credentials:"",residency_country:""});
+  // B6g. include_retired is a query flag rather than a separate screen: a
+  // retired provider is still the reason an old archive opens, so an operator
+  // must be able to see it without hunting.
+  const reloadKmsProviders = async (showRetired) => {
+    const r = await api.get("/api/kms-providers" + (showRetired ? "?include_retired=true" : ""));
+    if (r && !r.error) { setKpList(r.providers||[]); setKpError(""); }
+    else setKpError((r&&r.error)||"Could not load key-custody providers");
+  };
+
   const reloadVulnScan = async () => {
     setVsLoading(true); setVsError(null);
     try {
@@ -2704,7 +2721,7 @@ export default function GlobalDashboard() {
     {id:"connections",label:"MC Connections"},{id:"mc_offboard",label:"MC Offboarding"},{id:"notifications",label:"Notifications"},
     {id:"query",label:"Query Tool"},{id:"sys_health",label:"System Health"},{id:"monitoring",label:"Monitoring Integrations"},
     {id:"iam",label:"IAM & Access"},{id:"mfa",label:"MFA"},{id:"posture",label:"Posture Assessment"},{id:"wifi",label:"WiFi Policy"},
-    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},{id:"vuln_scan",label:"On-Prem Vuln Scan"},
+    {id:"compromise",label:"Compromise Scan"},{id:"regression",label:"Regression Test"},{id:"cloud_vuln",label:"Cloud Vuln Scan"},{id:"vuln_scan",label:"On-Prem Vuln Scan"},{id:"kms_providers",label:"Backup Key Custody"},
     {id:"cloud_iac",label:"Cloud & IaC"},{id:"sdn_sase",label:"SDN / SASE"},{id:"ha",label:"High Availability"},
     {id:"backup",label:"Backup & Restore"},{id:"restore",label:"Restore"},{id:"restore_approvals",label:"Restore Approvals"},{id:"backup_schedules",label:"Backup Schedules"},{id:"migration",label:"Deployment Migration"},{id:"data_sov",label:"Data Sovereignty"},{id:"recert",label:"Recertification"},
     {id:"compliance_posture",label:"Compliance Posture"},{id:"compliance_xregion",label:"Cross-Region Compliance"},
@@ -3664,6 +3681,74 @@ export default function GlobalDashboard() {
               </div>
             </div>)}
           </div>)}
+          {tab==="kms_providers"&&(<div>
+            <h2>Backup Key Custody</h2>
+            <p className="muted">
+              Which key wraps this Global Dashboard's backup archives. A provider here holds the key that
+              opens a backup, and can be compelled by the law of its own jurisdiction to use it.
+              <strong> This is custody, not recovery.</strong> No provider holds the Tier-1 KEK, and
+              recovering this deployment on replacement hardware always means re-establishing that key from
+              your offline recovery code.
+            </p>
+            {kpError&&<div className="err">{kpError}</div>}
+            <div className="row">
+              <label><input type="checkbox" checked={kpShowRetired}
+                onChange={async(e)=>{setKpShowRetired(e.target.checked);await reloadKmsProviders(e.target.checked);}}/>
+                Show retired</label>
+              <Btn small onClick={()=>reloadKmsProviders(kpShowRetired)}>Refresh</Btn>
+            </div>
+            <table><thead><tr><th>Name</th><th>Type</th><th>Key custody</th><th>State</th><th>Backups</th><th/></tr></thead>
+              <tbody>{kpList.map(p=>(<tr key={p.id}>
+                <td>{p.name}{p.is_default?" (default)":""}</td>
+                <td>{p.provider_type}</td>
+                <td>{p.residency.country||"undeclared"}{p.residency.provider_domicile?" / "+p.residency.provider_domicile+"-domiciled":""}</td>
+                <td>{p.retired?"retired":(p.enabled?"enabled":"disabled")}</td>
+                <td>{p.backups_using!==undefined?p.backups_using:""}</td>
+                <td>
+                  <Btn small disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id+"/test",{},"post");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Test</Btn>
+                  {!p.is_default&&!p.retired&&p.enabled&&<Btn small disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id+"/default",{},"post");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Make default</Btn>}
+                  {p.enabled?<Btn small disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id+"/disable",{},"post");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Disable</Btn>
+                  :<Btn small disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id+"/enable",{},"post");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Enable</Btn>}
+                  {!p.retired&&<Btn small disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id+"/retire",{},"post");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Retire</Btn>}
+                  <Btn small danger disabled={kpBusy} onClick={async()=>{setKpBusy(true);
+                    const r=await stepUp("/api/kms-providers/"+p.id,{},"delete");
+                    setKpBusy(false); if(r&&r.error)setKpError(r.error); else await reloadKmsProviders(kpShowRetired);}}>Delete</Btn>
+                </td></tr>))}</tbody></table>
+            <h3>Add a provider</h3>
+            <p className="muted">Credentials are sealed under this host's Tier-1 KEK and are never shown again.</p>
+            <div className="row">
+              <input placeholder="name" value={kpForm.name} onChange={e=>setKpForm({...kpForm,name:e.target.value})}/>
+              <select value={kpForm.provider_type} onChange={e=>setKpForm({...kpForm,provider_type:e.target.value})}>
+                <option value="aws-kms">aws-kms</option><option value="azure-keyvault">azure-keyvault</option>
+                <option value="gcp-kms">gcp-kms</option><option value="hashicorp-vault">hashicorp-vault</option>
+                <option value="gd-tier1">gd-tier1 (local)</option>
+              </select>
+              <input placeholder='config JSON' value={kpForm.config} onChange={e=>setKpForm({...kpForm,config:e.target.value})}/>
+              <input placeholder='credentials JSON (optional)' value={kpForm.credentials} onChange={e=>setKpForm({...kpForm,credentials:e.target.value})}/>
+              <input placeholder='key-custody country (e.g. DE)' value={kpForm.residency_country} onChange={e=>setKpForm({...kpForm,residency_country:e.target.value})}/>
+              <Btn disabled={kpBusy} onClick={async()=>{
+                let cfg,creds=null;
+                try{cfg=JSON.parse(kpForm.config||"{}");}catch(_e){setKpError("config must be valid JSON");return;}
+                if(kpForm.credentials.trim()){try{creds=JSON.parse(kpForm.credentials);}catch(_e){setKpError("credentials must be valid JSON");return;}}
+                setKpBusy(true);
+                const r=await stepUp("/api/kms-providers",{name:kpForm.name,provider_type:kpForm.provider_type,config:cfg,credentials:creds,residency_country:kpForm.residency_country||undefined},"post");
+                setKpBusy(false);
+                if(r&&r.error)setKpError(r.error);
+                else{setKpForm({name:"",provider_type:"aws-kms",config:"{}",credentials:"",residency_country:""});await reloadKmsProviders(kpShowRetired);}
+              }}>Add</Btn>
+            </div>
+          </div>)}
+
 
           {tab==="cloud_iac"&&(<div>
             <L>Cloud Mode (Confidential VM)</L>

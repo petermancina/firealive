@@ -309,6 +309,13 @@ const ENCODING = {
   },
 
   gd: {
+    // B6g -- gd_kms_providers.credentials_encrypted, sealed via gd-tier1-seal.
+    // ENVELOPE, matching every other class-tier1 column on this server.
+    // gd-tier1-seal is envelope-only for tier1; the two base64 entries
+    // (gd_ha_node) are class tier1-derived, which is a different path. The MC's
+    // kms_providers uses hex and its other credential columns use base64, but
+    // neither convention governs here.
+    'gd_kms_providers.credentials_encrypted': { shape: 'json', storage: 'envelope' },
     // GD signing keys + ca + integration credentials go through gd-encryption,
     // whose encryptConfig returns a self-describing JSON envelope STRING.
     'archive_chain_signing_keys.private_key_encrypted': { shape: 'json', storage: 'envelope' },
@@ -377,7 +384,7 @@ const MANUAL_CLASSIFICATION = {
 // ---------------------------------------------------------------------------
 const EXPECTED = {
   mc: { tier1: 19, 'tier1-derived': 2, tier3: 1, 'client-sealed': 4, unused: 0 },
-  gd: { tier1: 10, 'tier1-derived': 2, tier3: 0, 'client-sealed': 0, unused: 0 },
+  gd: { tier1: 11, 'tier1-derived': 2, tier3: 0, 'client-sealed': 0, unused: 0 }, // B6g: +gd_kms_providers.credentials_encrypted
 };
 const NODE_LOCAL_EXPECTED = { mc: 9, gd: 6 };
 

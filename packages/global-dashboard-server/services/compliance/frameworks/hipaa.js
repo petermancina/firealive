@@ -111,7 +111,7 @@ module.exports = (checks) => ({
       id: '164.312(a)(2)(iv)',
       name: 'Encryption and Decryption (Addressable)',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key for JWTs) is required at-rest cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Addressable specification, implemented at the OS/volume layer. A future GD KMS integration phase would add application-layer at-rest encryption.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256 signing key for JWTs) is required at-rest cryptographic foundation. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Addressable specification, implemented at the OS/volume layer. Extending application-layer encryption to general table data remains future work, and is separate from the key-wrapping registry: that covers the backup archive key, not the database contents.',
     },
     {
       id: '164.312(b)',

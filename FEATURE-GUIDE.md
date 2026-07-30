@@ -1457,6 +1457,29 @@ It is a **separate surface**, not a view onto the Regional Server's. The Global 
 1. Open Audit Log, filter by user / action type / time range / event type
 1. Find the entry, verify chain integrity, export
 
+### Backup Key Custody (Global Dashboard)
+
+**What it's for:** Deciding where the key that opens a Global Dashboard backup lives, and therefore whose law can compel someone to use it.
+
+Every v2 backup generates a fresh data key, encrypts the archive with it, and wraps that key. By default the wrap uses the Global Dashboard's own Tier-1 KEK — sealed to this host's TPM 2.0 or Secure Enclave, so a copied disk or cloned VM cannot open the archive. A CISO can instead register an external custodian: **AWS KMS, Azure Key Vault, GCP KMS or HashiCorp Vault**, for FIPS-validated custody, provider-side rotation and provider-side audit.
+
+**A provider is custody, never recovery.** It wraps the per-backup data key and nothing else. The Tier-1 KEK is escrowed to no provider anywhere — because a key an IAM principal can unwrap over the network is a key a compromised deployment can unwrap over the network, which would reduce the anti-clone guarantee from what your TPM is worth to what your cloud IAM policy is worth. Recovering on replacement hardware still means your offline recovery code.
+
+**Key custody is a residency question.** A KMS key sits in a region and the company operating it has a domicile, and those are different facts: an EU region operated by a US company is still reachable under US law. If you have declared a data-residency policy, the Key custody category governs which jurisdictions may hold the wrapping key — and unlike the data-location categories, **leaving it unset denies rather than permits**, because a key custodian can be compelled to unwrap.
+
+**Workflow:**
+
+1. CISO sets `GD_KMS_ALLOWED_HOSTS` at the deployment layer if they intend to use HashiCorp Vault or Azure Key Vault, which are the two provider types that take an operator-supplied URL. Unset means no endpoint is authorised — the check fails closed.
+1. Opens Backup Key Custody on the Global Dashboard. `gd-tier1` is present by default and needs no configuration.
+1. Adds a provider: name, type, config, optional credentials, and — for Vault and Key Vault, whose configuration carries a hostname rather than a region — the key-custody country, which cannot be inferred from a hostname.
+1. Confirms with a hardware passkey. The residency gate evaluates the arrangement **before** the provider is stored, so a refused provider is never left sitting configured and unusable.
+1. Clicks Test. The probe reads key metadata; it never performs a wrap or an unwrap, so an IAM policy granting `describe` but not `encrypt` is enough to prove reachability.
+1. Makes it the default. New backups wrap through it; existing archives are untouched.
+1. Later, to stop using it: **Retire**, not Delete. Retiring stops new backups using it and keeps the row so archives already wrapped with it still open. A provider that backups depend on cannot be deleted — the console shows the count, the API refuses with an explanation, and the database refuses independently.
+
+**What an operator should expect when something is wrong:** if the configured provider is unreachable at backup time, the backup **fails**. It never falls back to the local KEK, because an operator who believes the data key is in an HSM must never quietly have it in process memory instead.
+
+
 -----
 
 ## Other MC tabs

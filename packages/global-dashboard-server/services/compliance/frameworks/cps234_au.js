@@ -101,7 +101,7 @@ module.exports = (checks) => ({
       id: 'CPS 234 [23a]',
       name: 'Information Security Controls -- Encryption',
       check: checks.checkEncryption,
-      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption awaits a future GD KMS integration phase; until then, at-rest protection is filesystem-level (operator-managed disk encryption). CPS 234 para 23 requires controls including encryption for sensitive data.',
+      mapping: 'HMAC-SHA256 for JWT signing via GD_JWT_SECRET (32 bytes minimum); no passwords stored (passwordless FIDO2 hardware-passkey login). TLS 1.2+ at the reverse proxy in transit (operator-managed). Application-layer at-rest encryption the GD backup data key may be wrapped by an external key-management provider (AWS KMS, Azure Key Vault, GCP KMS or HashiCorp Vault) registered in gd_kms_providers, giving FIPS-validated custody, provider-side rotation and provider-side audit for the archive key. The Tier-1 KEK itself is escrowed to no provider: recovering a deployment means re-establishing it from the offline recovery code, so a provider is custody and never a recovery path; until then, at-rest protection is filesystem-level (operator-managed disk encryption). CPS 234 para 23 requires controls including encryption for sensitive data.',
     },
     {
       id: 'CPS 234 [23b]',

@@ -1,141 +1,25 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — HashiCorp Vault Key Wrapping Provider
+// =============================================================================
+// FIREALIVE GD -- hashicorp-vault key-wrapping provider  [B6g]
+// Copyright (C) 2026 Peter Mancina
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// =============================================================================
 //
-// Wraps and unwraps DEKs via HashiCorp Vault's transit secrets engine,
-// using raw HTTPS calls -- NO SDK dependency. The KEK lives inside the
-// Vault transit backend and never leaves Vault. We POST plaintext DEK
-// (base64-encoded) to /v1/transit/encrypt/<key>, get back a
-// "vault:v1:<base64>" ciphertext string; for unwrap, POST that string
-// to /v1/transit/decrypt/<key>, get back base64 plaintext.
+// The GD twin of server/services/key-wrapping-providers/hashicorp-vault.js.
+// Derived from it, every substitution asserted -- the contract, the SDK calls
+// and the error taxonomy are identical, and four 400-line files meant to be the
+// same are how two implementations drift.
 //
-// Tier 2 security: KEK in Vault's HSM-backed storage (Vault Enterprise +
-// HSM auto-unseal) or in software-encrypted storage (Vault OSS).
-// Same security tier as aws-kms, azure-keyvault, gcp-kms.
+// ONE FUNCTIONAL DIFFERENCE: the endpoint allow-list reads GD_KMS_ALLOWED_HOSTS,
+// not KMS_ALLOWED_HOSTS. Separate trust realms get separate allow-lists, and the
+// Regional Server's list authorises nothing here -- asserted by test.
 //
-// CRITICAL FOR EU PRIVACY-FIRST AND ON-PREM
+// WHAT THIS PROVIDER WRAPS: the per-backup ephemeral data key, and only that.
+// It does not wrap the GD Tier-1 KEK, and the Tier-1 KEK is escrowed to no
+// provider anywhere. A key an IAM principal can unwrap over the network is a key
+// a compromised deployment can unwrap over the network, which would reduce the
+// anti-clone guarantee from what the TPM is worth to what the cloud IAM policy is
+// worth. This is custody of the archive key. It is not disaster recovery.
 //
-// Self-hosted Vault is the on-prem KEK provider for SOCs that:
-//   - Cannot use US cloud KMS for data sovereignty reasons
-//   - Run on EU privacy-first clouds (Hetzner, OVHcloud, Scaleway)
-//     where managed KMS isn't available or doesn't meet compliance
-//   - Are air-gapped or highly network-restricted
-//   - Want a unified secrets/PKI/transit infrastructure they control
-//
-// CONFIG SCHEMA (kms_providers.config JSON for hashicorp-vault rows)
-//
-//   {
-//     "vault_addr":   "https://vault.example.com:8200",     (required)
-//     "transit_path": "transit",                             (optional;
-//                                                            default
-//                                                            'transit')
-//     "key_name":     "firealive-backup-kek",               (required)
-//     "key_version":  3,                                     (optional integer)
-//     "namespace":    "ops/team-blue",                       (optional;
-//                                                            Enterprise)
-//     "ca_cert_pem":  "-----BEGIN CERTIFICATE-----...",      (optional;
-//                                                            for
-//                                                            self-signed)
-//     "context_b64":  "<base64>"                              (optional;
-//                                                            convergent
-//                                                            encryption)
-//   }
-//
-// vault_addr:    Full Vault URL with scheme + port. https only;
-//                http rejected. Operators with a private VPN tunnel
-//                can use a private hostname; the URL just needs to
-//                resolve from FireAlive's network.
-//
-// transit_path: Mount path of the transit engine. Vault's default is
-//                'transit'; operators sometimes mount it elsewhere
-//                (e.g., 'transit/firealive') for namespace
-//                organization. Validated as alphanumeric with
-//                slashes; no leading/trailing slash.
-//
-// key_name:      Name of the encryption key inside the transit
-//                engine. Pattern: 1-128 alphanumeric/-/_ chars.
-//                Vault rejects malformed names at first call.
-//
-// key_version:   Optional integer pinning to specific key version.
-//                Vault transit supports automatic rotation; if
-//                omitted, encrypt uses the current primary version.
-//                The "vault:v<N>:..." prefix in the ciphertext
-//                already records the version, so decrypt works
-//                regardless of this field.
-//
-// namespace:     Vault Enterprise namespace. Sent via X-Vault-Namespace
-//                header. Required if FireAlive's role+token are
-//                scoped to a namespace; omit for OSS or root namespace.
-//
-// ca_cert_pem:   PEM-encoded CA certificate for self-signed Vault
-//                deployments. If provided, the TLS connection only
-//                trusts this CA (overrides system trust store).
-//                If omitted, Node's default system CA store is used.
-//                NO tls_skip_verify option -- there is no escape
-//                hatch for unverified TLS. Operators must either
-//                use a publicly-trusted cert or supply the CA PEM.
-//
-// context_b64:   Optional base64-encoded context for Vault's
-//                convergent/derived-key features (transit
-//                "derived" keys). Most operators don't use this;
-//                it's exposed for parity with Vault's API.
-//
-// CREDENTIALS SCHEMA (kms_providers.credentials_encrypted)
-//
-//   {
-//     "token": "hvs.CAESI..."                                (required)
-//   }
-//
-// token:         Vault token. Typically issued via AppRole login
-//                with policies like:
-//                   path "transit/encrypt/firealive-backup-kek" {
-//                     capabilities = ["update"]
-//                   }
-//                   path "transit/decrypt/firealive-backup-kek" {
-//                     capabilities = ["update"]
-//                   }
-//
-//                Token renewal is the operator's concern -- typically
-//                a Vault Agent sidecar refreshes the token in the env
-//                or in the credentials_encrypted row. R3d-4 doesn't
-//                implement token renewal; we use the token as-is and
-//                let permission-denied errors surface to the operator.
-//
-// WIRE FORMAT
-//
-// Vault transit returns ciphertext as a UTF-8 string with a
-// "vault:v<N>:<base64>" format. wrap() returns Buffer.from(string, 'utf8')
-// for downstream embedding in the wrapped-key.bin envelope:
-//
-//   { "v": 1, "scheme": "hashicorp-vault",
-//     "ref": "vault.example.com:8200/transit/keys/firealive-backup-kek",
-//     "wrapped": "<base64 of UTF-8 'vault:v3:abc...'>" }
-//
-// The dispatcher base64-encodes the Buffer (which contains the
-// UTF-8 bytes of the vault: string). On unwrap, dispatcher decodes
-// and provides the same Buffer; provider converts to UTF-8 string
-// to send to Vault decrypt.
-//
-// REQUEST/RESPONSE FORMAT
-//
-// POST /v1/<transit_path>/encrypt/<key_name>
-//   Body: { "plaintext": "<base64>", "key_version": N?,
-//           "context": "<base64>"? }
-//   Response: { "data": { "ciphertext": "vault:v3:<base64>",
-//                          "key_version": 3 } }
-//
-// POST /v1/<transit_path>/decrypt/<key_name>
-//   Body: { "ciphertext": "vault:v3:<base64>",
-//           "context": "<base64>"? }
-//   Response: { "data": { "plaintext": "<base64>" } }
-//
-// Headers: X-Vault-Token: <token>
-//          X-Vault-Namespace: <namespace>?    (Enterprise)
-//          Content-Type: application/json
-//
-// All HTTP requests have a 15s timeout; operators with very high
-// Vault latency can adjust via VAULT_REQUEST_TIMEOUT_MS env (read
-// at provider load time; defaults to 15000).
-// ═══════════════════════════════════════════════════════════════════════════════
 
 const https = require('https');
 const { URL } = require('url');
@@ -145,7 +29,7 @@ const base = require('./base');
 // Regional Server reads KMS_ALLOWED_HOSTS; the GD twin of this provider reads
 // GD_KMS_ALLOWED_HOSTS. Naming it here rather than inside the allow-list module
 // keeps one module serving both servers.
-const ALLOW_LIST_ENV = 'KMS_ALLOWED_HOSTS';
+const ALLOW_LIST_ENV = 'GD_KMS_ALLOWED_HOSTS';
 
 const PROVIDER_NAME = 'hashicorp-vault';
 const SECURITY_TIER = 2;
@@ -311,7 +195,7 @@ function isRetryableError(err, statusCode) {
 
 function buildEndpoint(config, action) {
   // B6g: re-check the host on the CRYPTO path, not only at config-write.
-  // Every kms_providers row written before this allow-list existed carries a
+  // Every gd_kms_providers row written before this allow-list existed carries a
   // vault_addr that validateConfig never examined against it, and a check that
   // runs only on write cannot constrain what was already written. wrap() and
   // unwrap() both route through here, so one call point covers both.

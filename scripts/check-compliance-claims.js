@@ -105,6 +105,24 @@ const CAPABILITIES = [
     ],
   },
   {
+    name: 'GD external key-wrapping provider registry',
+    // A `table` probe, not `service`: the registry is only real once an operator
+    // can persist a provider, and the table is what makes that true. The five
+    // provider modules exist either way.
+    probe: { type: 'table', tables: ['gd_kms_providers'] },
+    absence: [
+      /awaits (?:a )?future GD KMS/i,
+      /not yet integrated with an external KMS/i,
+      /kms_providers table not present/i,
+      /no external KMS integration/i,
+      /GD has no key-wrapping-providers registry/i,
+    ],
+    // What is STILL true after B6g and must not be flipped: the Tier-1 KEK is
+    // escrowed to no provider. A claim that the GD cannot RECOVER from a
+    // provider is correct and stays.
+    unless: [/Tier-1 KEK/i, /recovery code/i],
+  },
+  {
     name: 'SIEM/SOAR alert push',
     probe: { type: 'service', file: GD + '/services/gd-siem-push.js', wired: 'gd-alert-router' },
     absence: [

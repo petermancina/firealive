@@ -119,7 +119,7 @@ module.exports = (checks) => ({
       id: 'A.5.23',
       name: 'Information Security for Use of Cloud Services',
       check: checks.checkKmsProvider,
-      mapping: 'Processes for acquisition, use, management and exit from cloud services. GD has not yet integrated with an external KMS (kms_providers table not present); The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption). A future GD KMS integration phase will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault).',
+      mapping: 'Processes for acquisition, use, management and exit from cloud services. The GD can wrap the backup data key through an external key-management provider registered in gd_kms_providers. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption). Provider custody covers the archive key only; the Tier-1 KEK is escrowed to no provider. Earlier GD KMS integration phase will introduce hardware-backed key custody (AWS KMS / Azure Key Vault / GCP KMS / HashiCorp Vault).',
     },
     {
       id: 'A.5.30',

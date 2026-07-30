@@ -1,99 +1,25 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// FIREALIVE — Azure Key Vault Key Wrapping Provider
+// =============================================================================
+// FIREALIVE GD -- azure-keyvault key-wrapping provider  [B6g]
+// Copyright (C) 2026 Peter Mancina
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// =============================================================================
 //
-// Wraps and unwraps DEKs via Azure Key Vault using the @azure/keyvault-keys
-// SDK with @azure/identity for authentication. The KEK lives inside Azure
-// Key Vault (FIPS 140-2 Level 2 in Standard SKU; Level 3 in Premium /
-// Managed HSM) and never leaves Azure -- FireAlive sends plaintext DEK to
-// CryptographyClient.wrapKey, gets back wrapped bytes; for unwrap, sends
-// wrapped bytes to CryptographyClient.unwrapKey, gets back plaintext DEK.
+// The GD twin of server/services/key-wrapping-providers/azure-keyvault.js.
+// Derived from it, every substitution asserted -- the contract, the SDK calls
+// and the error taxonomy are identical, and four 400-line files meant to be the
+// same are how two implementations drift.
 //
-// Tier 2 security: KEK in cloud HSM. Same security tier as aws-kms,
-// gcp-kms, hashicorp-vault.
+// ONE FUNCTIONAL DIFFERENCE: the endpoint allow-list reads GD_KMS_ALLOWED_HOSTS,
+// not KMS_ALLOWED_HOSTS. Separate trust realms get separate allow-lists, and the
+// Regional Server's list authorises nothing here -- asserted by test.
 //
-// CONFIG SCHEMA (kms_providers.config JSON for azure-keyvault rows)
+// WHAT THIS PROVIDER WRAPS: the per-backup ephemeral data key, and only that.
+// It does not wrap the GD Tier-1 KEK, and the Tier-1 KEK is escrowed to no
+// provider anywhere. A key an IAM principal can unwrap over the network is a key
+// a compromised deployment can unwrap over the network, which would reduce the
+// anti-clone guarantee from what the TPM is worth to what the cloud IAM policy is
+// worth. This is custody of the archive key. It is not disaster recovery.
 //
-//   {
-//     "vault_url":   "https://my-vault.vault.azure.net",
-//     "key_name":    "firealive-backup-kek",
-//     "key_version": "abc123def456...",       (optional; omit for latest)
-//     "algorithm":   "RSA-OAEP-256"           (optional; see below)
-//   }
-//
-// vault_url:    Full Azure Key Vault URL. Validated as https URL.
-//               Standard form: https://<vault-name>.vault.azure.net.
-//               Managed HSM form: https://<hsm-name>.managedhsm.azure.net.
-//               Sovereign clouds: .vault.azure.cn (China),
-//               .vault.azure.us (Government), .vault.usgovcloudapi.net,
-//               etc. We accept any https URL; Azure will reject
-//               unreachable hosts at first call.
-//
-// key_name:     Name of the KEK in the vault. Pattern enforced by Azure:
-//               1-127 chars, alphanumeric + dashes. We validate length
-//               and a loose pattern; Azure rejects malformed at first call.
-//
-// key_version:  Optional specific version (32-char hex). Omit to use
-//               latest version (recommended; supports automatic rotation).
-//               Pinning to a version is useful for compliance audits
-//               where the exact key material must be reproducible.
-//
-// algorithm:    Wrap algorithm. Allowlist below. Default RSA-OAEP-256
-//               since it works in Standard SKU (RSA keys are universal).
-//               A256KW / A256GCM require symmetric keys (Premium SKU
-//               or Managed HSM only).
-//
-//               ALLOWED:
-//                 RSA-OAEP-256   (recommended; SHA-256 padding)
-//                 RSA-OAEP       (SHA-1 padding; legacy but supported)
-//                 A256KW         (AES Key Wrap; Premium/Managed HSM)
-//                 A256GCM        (AES-GCM; Premium/Managed HSM)
-//
-//               REJECTED:
-//                 RSA1_5         (deprecated PKCS#1 v1.5 padding;
-//                                 vulnerable to Bleichenbacher attacks)
-//                 anything else
-//
-// CREDENTIALS SCHEMA (kms_providers.credentials_encrypted)
-//
-// Either explicit service principal:
-//
-//   {
-//     "tenant_id":     "00000000-0000-0000-0000-000000000000",
-//     "client_id":     "00000000-0000-0000-0000-000000000000",
-//     "client_secret": "..."
-//   }
-//
-// Or null/empty -> SDK uses DefaultAzureCredential, which tries (in
-// order): managed identity (recommended for Azure-hosted FireAlive),
-// EnvironmentCredential (AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET env
-// vars), AzureCliCredential. Recommended for FireAlive-on-Azure
-// deployments -- no Azure secrets in FireAlive database.
-//
-// WIRE FORMAT
-//
-// wrap() returns Buffer of the algorithm-specific wrapped output:
-//   RSA-OAEP*: 256 bytes (RSA 2048) or 384 bytes (RSA 3072) etc.
-//   A256KW:    plaintext_length + 8 bytes (AES Key Wrap overhead)
-//   A256GCM:   nonce(12) + tag(16) + ciphertext bytes
-// All opaque to us; embedded in the wrapped-key.bin envelope by the
-// dispatcher (commits 20-21):
-//
-//   { "v": 1, "scheme": "azure-keyvault",
-//     "ref": "https://my-vault.vault.azure.net/keys/key-name/version",
-//     "wrapped": "<base64>" }
-//
-// Algorithm is part of the EnvelopeContext so unwrap-time uses the
-// same algorithm. (Stored in dispatcher's envelope, not here.)
-//
-// SDK NOT YET INSTALLED
-//
-// @azure/keyvault-keys + @azure/identity are added to package.json in
-// commit 23. Until then, this module loads cleanly (require is lazy
-// inside _getSdks()). Any wrap/unwrap call before then throws
-// KeyWrappingError(operation='sdk-load') with a clear "npm install"
-// message naming both packages. Existing env-var/aws-kms rows
-// continue working independently.
-// ═══════════════════════════════════════════════════════════════════════════════
 
 const base = require('./base');
 
@@ -101,7 +27,7 @@ const base = require('./base');
 // Regional Server reads KMS_ALLOWED_HOSTS; the GD twin of this provider reads
 // GD_KMS_ALLOWED_HOSTS. Naming it here rather than inside the allow-list module
 // keeps one module serving both servers.
-const ALLOW_LIST_ENV = 'KMS_ALLOWED_HOSTS';
+const ALLOW_LIST_ENV = 'GD_KMS_ALLOWED_HOSTS';
 
 const PROVIDER_NAME = 'azure-keyvault';
 const SECURITY_TIER = 2;

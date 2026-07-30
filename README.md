@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.91 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 84 (anti-rollback) | **Build:** 20260729.1
+**Version:** v1.0.92 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 85 (anti-rollback) | **Build:** 20260729.2
 
 -----
 
@@ -21,7 +21,7 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.91) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.92) under Tags.
 
 See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
 
@@ -80,6 +80,7 @@ FireAlive treats a running deployment as something that must continuously prove 
 - **Authorized vulnerability scanning, on four surfaces.** Your own scanners — on-prem (Nessus, OpenVAS, Qualys, Rapid7, Tenable.io, Nuclei) and cloud (ScoutSuite, Prowler, Pacu, CloudBrute, Checkov) — can be authorized to scan FireAlive itself, on the Regional Server and on the Global Dashboard independently. Each surface carries its own master switch and permitted-scanner list, changed with a hardware-key touch: turning one off stops every announce and withdraws the rate-limit exemption within one refresh window, without revoking a single authorization. Every scan attempt, accepted or rejected, lands in an append-only hash-chained log you can verify from the console. See [`docs/vulnerability-scanning.md`](docs/vulnerability-scanning.md).
 - **Per-client recovery.** A lost or compromised Analyst Client can be torn down and re-provisioned individually — rate-limited and fully audited — without re-keying the whole deployment. See [`docs/client-recovery.md`](docs/client-recovery.md).
 - **Key continuity across upgrades.** A normal in-place upgrade preserves every key and sealed record: the new release resolves the same hardware root of trust (or KMS/env-var KEK), and the sealed data at rest is never rewritten — so an update costs nothing, with no re-keying, no re-encryption, and no data loss. The seal format is versioned with anti-rollback, so a downgrade onto newer-format data is halted and quarantined rather than risking a mismatched read. That protection is one-way by design, which is why an upgrade is preceded by a **pre-upgrade restore point** — a full-suite backup taken at the old fuse and schema, stored outside the data root so it survives an uninstall, and the only artifact that can put the previous build back in front of its data. Applying one is an offline operation on the host, with the server stopped, consuming a single-use authorization the running server granted beforehand and refusing anything further than one version back. See [`docs/pre-upgrade-restore-point.md`](docs/pre-upgrade-restore-point.md). Moving to a *different* KEK (a genuine hardware move) is the one case that re-seals the data, and the recovery code is the sole factor for it — there is no KMS escrow or back-door substitute, because that absence is the anti-clone guarantee. See [`docs/key-continuity-and-upgrades.md`](docs/key-continuity-and-upgrades.md).
+- **Backup key custody you choose, on both servers.** The key that opens a backup archive can be wrapped by the host's own hardware-sealed KEK, or by an external custodian you register — AWS KMS, Azure Key Vault, GCP KMS or HashiCorp Vault — for FIPS-validated custody, provider-side rotation and provider-side audit. A KMS key has a region and its operator has a domicile, so key custody is treated as a **residency** question in its own right: an EU region run by a US company is still reachable under US law, and if you have declared a residency policy an unlisted jurisdiction is refused rather than permitted by default. **A provider is custody, never recovery** — it wraps the per-backup data key and never the Tier-1 KEK, which is escrowed nowhere, so recovering on replacement hardware still means your offline recovery code. A provider cannot be deleted while a backup still needs it: retire it instead, and archives already wrapped with it keep opening. [`docs/gd-key-wrapping-providers.md`](docs/gd-key-wrapping-providers.md)
 - **Two-person authorization for key operations.** Destructive key operations — re-keying a node, importing a migration bundle onto a new key, and a deployment reset — require an anchor-signed, single-use, two-person authorization with a fresh hardware-passkey step-up (a second admin approves, or delayed-self on a single-admin deployment), verified offline against the instance anchor before any key material is touched.
 
 ### Locking Configuration (Required Hardening)

@@ -450,7 +450,15 @@ async function performV2Backup(db, options = {}) {
           archive_path = ?,
           manifest_sig_path = ?,
           wrapped_key_path = ?,
-          wal_end_position = ?
+          wal_end_position = ?,
+          -- B6g: what actually wrapped this backup's data key. Set here rather
+          -- than in the INSERT above because the wrap happens after the row is
+          -- created. NULL provider_id for gd-tier1: the local KEK has no
+          -- gd_kms_providers row, and with foreign keys enforced a non-NULL id
+          -- there would fail the statement rather than dangle.
+          wrap_scheme = ?,
+          wrap_ref = ?,
+          wrap_provider_id = ?
       WHERE id = ?
     `).run(
       totalSize,
@@ -460,6 +468,9 @@ async function performV2Backup(db, options = {}) {
       manifestSigPath,
       wrappedKeyPath,
       walEndPosition,
+      keyWrappingScheme,
+      kekReference,
+      options.kmsProviderId || null,
       backupId,
     );
 

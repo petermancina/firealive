@@ -268,6 +268,16 @@
       "ciphertext": "{\"v\":1,\"iv\":\"w01QM8vbiSuYSCA1\",\"tag\":\"1t7zztIijkT4+gcFEUPZeQ==\",\"ciphertext\":\"clnFzzY1g7IEkAnPAdPbOtB0MV335BM6vRI87bGa8Pc6B8XQnOjMIr6BxTD6s54nAig8VljREvXvdPLy82C9lfjb4yehoglwCZ+T1N7sjHAVJShJOjKX15FI\"}"
     },
     {
+      "colRef": "gd_kms_providers.credentials_encrypted",
+      "shape": "json",
+      "storage": "envelope",
+      "plaintext": {
+        "golden": "gd_kms_providers.credentials_encrypted",
+        "marker": "tier1-golden-vector"
+      },
+      "ciphertext": "{\"v\":2,\"kek_fp\":\"np9ZjCm3Nug=\",\"iv\":\"bwyI9853fs2OLdK2\",\"tag\":\"hmTF607DbODXrZjhn1kOTQ==\",\"ciphertext\":\"Qf3T3wn8KOsBHDHRrvfFVzVweNKCApAN4Bhr8n80KhdLAf/8MVQTDmPKtsiroPZ+PKbTkaWPeTw5JtEWgpUdpPeZu+DgdtcAif7xtitkGL2uRg==\"}"
+    },
+    {
       "colRef": "malware_scanner_integrations.credentials_encrypted",
       "shape": "json",
       "storage": "envelope",

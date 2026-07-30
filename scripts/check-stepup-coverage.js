@@ -198,6 +198,19 @@ const STEPUP_REQUIRED = {
 
     'POST /api/mfa/passkey/register-verify',
     'DELETE /api/mfa/passkeys/:id',
+    // B6g: the key-wrapping provider registry. Every mutating endpoint, because
+    // configuring a key custodian decides who can be COMPELLED to open this
+    // deployment's backups -- the same weight as minting a credential. /test is
+    // included: it reads provider metadata using stored credentials, and an
+    // unauthenticated caller must not be able to probe whether they still work.
+    'POST /api/kms-providers',
+    'PUT /api/kms-providers/:id',
+    'POST /api/kms-providers/:id/enable',
+    'POST /api/kms-providers/:id/disable',
+    'POST /api/kms-providers/:id/retire',
+    'POST /api/kms-providers/:id/default',
+    'DELETE /api/kms-providers/:id',
+    'POST /api/kms-providers/:id/test',
   ],
 };
 

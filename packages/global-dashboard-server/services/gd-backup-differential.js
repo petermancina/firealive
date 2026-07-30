@@ -307,14 +307,21 @@ async function performDifferentialBackup(db, options = {}) {
                            format_version, manifest_path, archive_path,
                            manifest_sig_path, wrapped_key_path, signing_key_id,
                            parent_backup_id, parent_full_backup_id,
-                           wal_start_position, wal_end_position, page_count)
+                           wal_start_position, wal_end_position, page_count,
+                           -- B6g: what wrapped this backup's data key. NULL
+                           -- provider_id for gd-tier1 -- the local KEK has no
+                           -- gd_kms_providers row, and with foreign keys
+                           -- enforced a non-NULL id there would fail the INSERT.
+                           wrap_scheme, wrap_ref, wrap_provider_id)
       VALUES (?, ?, 'differential', 'single-db', ?, ?, 'verified', datetime('now'),
               2, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?)
+              ?, ?, ?, ?, ?,
+              ?, ?, ?)
     `).run(
       backupId, triggerType, totalSize, manifestSha256,
       manifestPath, archivePath, manifestSigPath, wrappedKeyPath, signingKey.id,
       anchor.id, anchor.id, anchor.wal_end_position, walEndPosition, collectedFrames.length,
+      keyWrappingScheme, kekReference, options.kmsProviderId || null,
     );
 
     console.log(`gd-backup-differential: differential ${backupId} verified (anchor ${anchor.id}, ${collectedFrames.length} pages)`);

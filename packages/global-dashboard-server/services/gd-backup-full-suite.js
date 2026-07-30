@@ -219,11 +219,19 @@ async function performFullSuiteBackup(db, options = {}) {
           manifest_path = ?,
           archive_path = ?,
           manifest_sig_path = ?,
-          wrapped_key_path = ?
+          wrapped_key_path = ?,
+          -- B6g: what wrapped this backup's data key. NULL provider_id for
+          -- gd-tier1 -- the local KEK has no gd_kms_providers row, and with
+          -- foreign keys enforced a non-NULL id there would fail the statement.
+          wrap_scheme = ?,
+          wrap_ref = ?,
+          wrap_provider_id = ?
       WHERE id = ?
     `).run(
       totalSize, manifestSha256, manifestPath, archivePath, manifestSigPath,
-      wrappedKeyPath, backupId,
+      wrappedKeyPath,
+      keyWrappingScheme, kekReference, options.kmsProviderId || null,
+      backupId,
     );
 
     console.log(`gd-backup-full-suite: backup ${backupId} verified (${totalSize} bytes, manifest ${manifestSha256.slice(0, 16)})`);

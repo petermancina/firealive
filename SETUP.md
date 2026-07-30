@@ -156,6 +156,30 @@ every announce on that surface and withdraws its rate-limit exemption within a
 minute, without revoking a single authorization, and turning it back on restores
 exactly what was there before. See `docs/vulnerability-scanning.md`.
 
+**Upgrading to v1.0.92 or later makes the Global Dashboard enforce its database
+constraints.** Until this release the GD ran with SQLite foreign keys switched off,
+so the referential rules in its schema were declared but not applied. They are now
+applied.
+
+Nothing blocks your upgrade and nothing is rewritten. SQLite does not re-check
+existing rows when enforcement is turned on, so a database with historical
+inconsistencies still opens and serves normally. Two things change from the moment
+you upgrade:
+
+- **Deleting a record now removes what depended on it.** Removing a registered
+  Management Console, for example, now also removes its rolled-up data, where
+  before that data was left behind unreferenced. This is what the schema always
+  said should happen.
+- **Some deletions are now refused.** The Global Dashboard will not let you delete a
+  backup key-custody provider while backups still need it to open. Retire it
+  instead — retiring stops new backups using it and keeps those archives readable.
+
+If you want to see whether your existing database carries any historical
+inconsistencies, open it read-only with `sqlite3` and run `PRAGMA
+foreign_key_check;`. An empty result means there are none. Anything it reports is
+pre-existing and harmless to leave; it was created before this release and is not
+affected by the upgrade.
+
 **Take a restore point before you update.** This is the step that makes a
 rollback possible at all, and it can only be taken from the build you are about
 to replace:
@@ -321,7 +345,28 @@ JWT_SECRET=<generate-a-separate-key>
 JWT_REFRESH_SECRET=<generate-another-key>
 NODE_ENV=production
 PORT=3000
+
+# Only needed if you register a key-wrapping provider addressed by URL
+# (HashiCorp Vault, or Azure Key Vault). Comma-separated exact hostnames.
+# KMS_ALLOWED_HOSTS is read by the Regional Server, GD_KMS_ALLOWED_HOSTS by the
+# Global Dashboard; the two lists are independent.
+KMS_ALLOWED_HOSTS=vault.example.com
+GD_KMS_ALLOWED_HOSTS=vault.example.com
 ```
+
+**The KMS host lists are fail-closed.** Leave them unset and no provider addressed
+by a URL can be configured at all — the attempt is refused with a message naming
+the variable. That is deliberate: an operator who has not decided which hosts are
+legitimate has not authorised any, and a key-management endpoint is not a setting
+where "unconfigured" should mean "anywhere".
+
+Matching is exact and hostname-only. `vault.example.com` does **not** authorise
+`evil.vault.example.com`, and there are no wildcards — a wildcard is satisfied by
+any subdomain an attacker controls. The port and path are not matched, so
+`https://vault.example.com:8200/v1/...` is covered by the host alone.
+
+AWS KMS and GCP KMS need no entry: they are addressed by region and key id rather
+than a URL you supply.
 
 ### Provision the Tier-1 KEK (hardware-sealed)
 

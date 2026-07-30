@@ -80,7 +80,7 @@ module.exports = (checks) => ({
       id: 'Art.5(1)(f)',
       name: 'Integrity and Confidentiality',
       check: checks.checkEncryption,
-      mapping: 'GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) provides the application-layer cryptographic foundation for session integrity. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). A future GD KMS integration phase would add application-layer at-rest encryption.',
+      mapping: 'GD_JWT_SECRET (HMAC-SHA256, 32 bytes minimum) provides the application-layer cryptographic foundation for session integrity. The GD\'s secrets -- every signing-key private key, the GD CA key and integration credentials -- are AES-256-GCM sealed under a Tier-1 KEK hardware-sealed to the host TPM 2.0 / Secure Enclave, so a copied disk or cloned VM cannot unseal them. General table data is not application-layer encrypted: that rests on filesystem-level protection (operator-managed disk encryption: LUKS / FileVault / BitLocker / AWS EBS encryption). Extending application-layer encryption to general table data remains future work, and is separate from the key-wrapping registry: that covers the backup archive key, not the database contents.',
     },
     {
       id: 'Art.5(2)',
@@ -125,7 +125,7 @@ module.exports = (checks) => ({
       id: 'Art.32(1)(b)',
       name: 'Ongoing Confidentiality, Integrity, Availability, Resilience',
       check: checks.checkSystemBoundaries,
-      mapping: 'Boundary enforcement via management_consoles status tracking (the GD\'s third-party data sources). Layer 2 integrations (SOAR / SIEM / cloud / IAM via integration_config) land in B5b (v1.0.51) and onward. Resilience via multi-destination backup_schedules; apiLimiter rate limiting. Several SOC-grade defenses (hash chain B5a, anti-replay, signing keys R3g PR3, KMS) await specific BUILD-PLAN-v16 phases.',
+      mapping: 'Boundary enforcement via management_consoles status tracking (the GD\'s third-party data sources). Alerts reach the operator\'s SIEM as CEF events over tcp / tls / udp. Resilience via multi-destination backup_schedules; apiLimiter rate limiting. The audit-log hash chain, the signing-key registries and external key-management custody for the backup archive key have all shipped; application-layer encryption of general table data remains future work.',
     },
     {
       id: 'Art.32(1)(c)',

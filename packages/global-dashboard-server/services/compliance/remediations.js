@@ -725,7 +725,7 @@ const REMEDIATIONS = {
   checkKmsProviderTrust: {
     summary: 'Probe and refresh KMS providers when the table ships',
     steps: [
-      'CURRENT STATE: kms_providers table not present on the GD; no per-provider probe history to evaluate',
+      'CURRENT STATE: the GD carries gd_kms_providers, so the backup data key can be placed in an external HSM or cloud KMS with provider-side rotation and audit. Each provider records its last probe result, so custody health is evaluable. The Tier-1 KEK remains escrowed to no provider: a provider is custody of the archive key and never a recovery path',
       'FUTURE STATE: a future GD KMS integration phase introduces kms_providers; navigate to GD -> Integrations -> KMS to configure',
       'Once configured: the platform should probe each enabled provider every few hours; investigate any providers with failed or stale probes (>7 days)',
       'Refresh stale providers by re-testing connectivity from the GD -> Integrations -> KMS detail view',

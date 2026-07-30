@@ -50,8 +50,27 @@ const SERVERS = [
   },
 ];
 
-function mockKek() {
-  return { ownKek: function () { return OWN_KEK; }, sharedKek: function () { return SHARED_KEK; } };
+function mockKek(realKekPath) {
+  // B6g: the seal modules fingerprint BY DOMAIN, so the stub must answer four
+  // calls, not two. Supplying only ownKek/sharedKek left kekFpForDomain calling
+  // an undefined function, and this generator has been failing ever since --
+  // unnoticed, because it only runs when a sealed column is added and B6g is the
+  // first phase to add one since.
+  //
+  // The fingerprint uses the same SHA-256 truncation the real module uses, so the
+  // vectors stay deterministic: same input KEKs, same output, on any machine.
+  // DELEGATES to the real kekFingerprint rather than reimplementing it. It is a
+  // pure function of the key and loads without hardware, and reimplementing a
+  // security primitive in a test double is how a golden vector ends up certifying
+  // something the product does not do. `real` is resolved through the ORIGINAL
+  // loader so the stub does not recurse into itself.
+  const real = originalLoad(realKekPath, null, false);
+  return {
+    ownKek: function () { return OWN_KEK; },
+    sharedKek: function () { return SHARED_KEK; },
+    ownKekFingerprint: function () { return real.kekFingerprint(OWN_KEK); },
+    sharedKekFingerprint: function () { return real.kekFingerprint(SHARED_KEK); },
+  };
 }
 
 const originalLoad = Module._load;
@@ -60,7 +79,12 @@ Module._load = function (request, parent, isMain) {
   if (parent && parent.filename) {
     for (let i = 0; i < SERVERS.length; i++) {
       const s = SERVERS[i];
-      if (request === s.kekRequest && parent.filename.endsWith(s.sealBasename)) return mockKek();
+      if (request === s.kekRequest && parent.filename.endsWith(s.sealBasename)) {
+        // Resolve the real KEK module the way the seal module itself would, so the
+        // stub can delegate its fingerprint to the real implementation instead of
+        // reimplementing it.
+        return mockKek(path.resolve(path.dirname(parent.filename), s.kekRequest));
+      }
     }
   }
   return originalLoad.apply(this, arguments);

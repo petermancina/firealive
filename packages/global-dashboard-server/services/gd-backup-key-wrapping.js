@@ -35,11 +35,39 @@
 const { encryptConfigWithKey, decryptConfigWithKey, deriveKek } = require('./gd-encryption');
 const gdTier1Kek = require('./gd-tier1-kek');
 
+// B6g: the provider registry. Requiring the provider modules is what registers
+// them -- each calls base.registerProvider at load. A provider whose SDK is not
+// installed stays unregistered rather than crashing the server, which is why the
+// requires are individually guarded.
+const providerBase = require('./gd-key-wrapping-providers/base');
+for (const mod of [
+  './gd-key-wrapping-providers/gd-tier1',
+  './gd-key-wrapping-providers/aws-kms',
+  './gd-key-wrapping-providers/azure-keyvault',
+  './gd-key-wrapping-providers/gcp-kms',
+  './gd-key-wrapping-providers/hashicorp-vault',
+]) {
+  try { require(mod); } catch (_e) { /* SDK absent: that provider is simply unavailable */ }
+}
+
 const ENVELOPE_VERSION = 1;
 const KEY_LENGTH_BYTES = 32;                 // AES-256 data key
 const DEFAULT_SCHEME = 'gd-tier1';
 const DEFAULT_KEK_REFERENCE = 'GD_ENCRYPTION_KEY';
-const SUPPORTED_SCHEMES = ['gd-tier1'];
+// B6g: the registry's view rather than a literal. gd-tier1 is asserted present
+// rather than assumed: it is the scheme every existing manifest records, and a
+// build that failed to register it would turn every historical backup
+// unreadable with a message about an unknown scheme.
+function supportedSchemes() {
+  const names = providerBase.listProviders().map((p) => (typeof p === 'string' ? p : p.name));
+  if (names.indexOf(DEFAULT_SCHEME) === -1) {
+    throw new Error(
+      "gd-backup-key-wrapping: the '" + DEFAULT_SCHEME + "' provider is not registered. "
+      + 'Every GD backup ever taken records that scheme, so this build cannot read any of them.',
+    );
+  }
+  return names;
+}
 
 /**
  * Serialize an outer wrapping envelope object to the wrapped-key.bin bytes
@@ -97,21 +125,26 @@ async function wrapKey(ephemeralKey, options = {}) {
   const scheme = typeof options.scheme === 'string' && options.scheme ? options.scheme : DEFAULT_SCHEME;
   const ref = typeof options.kekReference === 'string' && options.kekReference ? options.kekReference : DEFAULT_KEK_REFERENCE;
 
-  if (!SUPPORTED_SCHEMES.includes(scheme)) {
-    throw new Error(`gd-backup-key-wrapping: unknown scheme '${scheme}' (supported: ${SUPPORTED_SCHEMES.join(', ')})`);
+  const schemes = supportedSchemes();
+  if (!schemes.includes(scheme)) {
+    throw new Error(`gd-backup-key-wrapping: unknown scheme '${scheme}' (supported: ${schemes.join(', ')})`);
   }
 
-  // Wrap the raw key through the GD Tier-1 KEK. gd-encryption serializes the
-  // object, AES-256-GCM-encrypts it under the KEK, and returns a self-describing
-  // envelope string. We carry that string, base64-encoded, in the outer
-  // envelope's `wrapped` field.
-  const gdEnvelope = encryptConfigWithKey({ k: ephemeralKey.toString('base64') }, deriveKek());
+  // B6g: delegate to the registered provider. The gd-tier1 provider reproduces
+  // the pre-registry calls byte-for-byte -- encryptConfigWithKey({ k: <base64> },
+  // deriveKek()) then utf-8 -> base64 -- so an archive written before this change
+  // and one written after are indistinguishable.
+  const impl = providerBase.getProvider(scheme);
+  if (!impl) {
+    throw new Error(`gd-backup-key-wrapping: scheme '${scheme}' is not registered on this server`);
+  }
+  const wrapped = await impl.wrap(ephemeralKey, options.config || {}, options.credentials || null, options);
 
   const envelope = {
     v: ENVELOPE_VERSION,
     scheme,
     ref,
-    wrapped: Buffer.from(gdEnvelope, 'utf-8').toString('base64'),
+    wrapped,
   };
   return serializeEnvelope(envelope);
 }
@@ -138,8 +171,9 @@ async function unwrapKey(envelopeBytes, expectedScheme, expectedRef, options = {
   if (typeof expectedRef !== 'string' || !expectedRef) {
     throw new Error('gd-backup-key-wrapping: expectedRef required for unwrap');
   }
-  if (!SUPPORTED_SCHEMES.includes(expectedScheme)) {
-    throw new Error(`gd-backup-key-wrapping: unknown scheme '${expectedScheme}' (supported: ${SUPPORTED_SCHEMES.join(', ')})`);
+  const schemes = supportedSchemes();
+  if (!schemes.includes(expectedScheme)) {
+    throw new Error(`gd-backup-key-wrapping: unknown scheme '${expectedScheme}' (supported: ${schemes.join(', ')})`);
   }
 
   const envelope = parseEnvelope(envelopeBytes);
@@ -157,19 +191,33 @@ async function unwrapKey(envelopeBytes, expectedScheme, expectedRef, options = {
     );
   }
 
-  const gdEnvelope = Buffer.from(envelope.wrapped, 'base64').toString('utf-8');
-  let obj;
+  // B6g: delegate to the provider the MANIFEST names, not the one currently
+  // configured. A backup wrapped under a provider that has since been retired
+  // still restores, which is the whole reason retirement exists as a state
+  // distinct from deletion.
+  const impl = providerBase.getProvider(expectedScheme);
+  if (!impl) {
+    throw new Error(
+      `gd-backup-key-wrapping: this backup was wrapped with scheme '${expectedScheme}', `
+      + 'which is not registered on this server. The archive is intact; the provider module '
+      + 'that opens it is missing.',
+    );
+  }
+  let key;
   try {
-    obj = decryptConfigWithKey(gdEnvelope, deriveKek());
+    key = await impl.unwrap(envelope.wrapped, options.config || {}, options.credentials || null, options);
   } catch (err) {
     // Unwrap failures (wrong KEK, tampered wrapped bytes) are permanent; no
     // retry helps.
     throw new Error(`gd-backup-key-wrapping: unwrap failed (wrong KEK or tampered wrapped key): ${err.message}`);
   }
-  if (!obj || typeof obj.k !== 'string') {
-    throw new Error('gd-backup-key-wrapping: unwrapped envelope missing key material');
+  // The length check stays HERE as well as in the provider. A provider is a
+  // registered module and a future one could return the wrong thing; this is the
+  // chokepoint every restore passes through, so it is where the invariant that
+  // matters to the caller belongs.
+  if (!Buffer.isBuffer(key)) {
+    throw new Error('gd-backup-key-wrapping: provider returned a non-Buffer key');
   }
-  const key = Buffer.from(obj.k, 'base64');
   if (key.length !== KEY_LENGTH_BYTES) {
     throw new Error(`gd-backup-key-wrapping: unwrapped key is ${key.length} bytes, expected ${KEY_LENGTH_BYTES}`);
   }
@@ -222,5 +270,8 @@ module.exports = {
   KEY_LENGTH_BYTES,
   DEFAULT_SCHEME,
   DEFAULT_KEK_REFERENCE,
-  SUPPORTED_SCHEMES,
+  // B6g: a function now, not a frozen literal. Callers that read it get the
+  // registry's live view; the name is kept so existing call sites keep working.
+  supportedSchemes,
+  get SUPPORTED_SCHEMES() { return supportedSchemes(); },
 };

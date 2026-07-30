@@ -544,6 +544,9 @@ app.use('/api/config', authMiddleware(), require('./routes/config-lock'));
 // are never gated.
 app.use('/api/self-protection', authMiddleware(['ciso', 'vp']), require('./routes/self-protection'));
 app.use('/api/malware-scanners', authMiddleware(['ciso']), require('./routes/gd-malware-scanners'));
+// B6g: the key-wrapping provider registry. CISO-only, because configuring a key
+// custodian decides who can be compelled to open this deployment's backups.
+app.use('/api/kms-providers', authMiddleware(['ciso']), require('./routes/gd-kms-providers'));
 app.use('/api/config-baseline', authMiddleware(['ciso']), require('./routes/gd-config-baseline'));
 
 // B6d: HA operator control plane (config/status/pair/pairing-token). ciso-gated +
@@ -6079,6 +6082,123 @@ function runGdRegression(db) {
     }
     return list.length ? 'admin mount gated, announce path exempt' : SKIP('mount registry not exported for inspection');
   });
+
+  // ── B6g: backup key custody ────────────────────────────────────────────
+  // A provider here wraps the PER-BACKUP EPHEMERAL DATA KEY. It never wraps the
+  // Tier-1 KEK, and the Tier-1 KEK is escrowed to no provider. These assert
+  // custody, and one of them asserts that this is NOT a recovery path.
+
+  record('gd_kms', 'provider registry schema present with the retired state', () => {
+    const t = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'gd_kms_providers'").all();
+    if (t.length !== 1) throw new Error('gd_kms_providers table missing');
+    const cols = db.prepare("PRAGMA table_info(gd_kms_providers)").all().map(c => c.name);
+    for (const need of ['retired', 'residency_country', 'residency_provider_domicile', 'residency_verdict']) {
+      if (cols.indexOf(need) === -1) throw new Error('column missing: ' + need);
+    }
+    return 'table + retired + residency columns';
+  });
+
+  record('gd_kms', 'a backup records which provider wrapped it', () => {
+    const cols = db.prepare("PRAGMA table_info(backups)").all().map(c => c.name);
+    for (const need of ['wrap_scheme', 'wrap_ref', 'wrap_provider_id']) {
+      if (cols.indexOf(need) === -1) throw new Error('backups.' + need + ' missing');
+    }
+    // NULL is meaningful, not missing: before B6g gd-tier1 was the only
+    // supported scheme, so a NULL wrap_scheme IS a gd-tier1 backup.
+    return 'wrap provenance recorded (NULL = gd-tier1)';
+  });
+
+  record('gd_kms', 'FOREIGN KEYS ARE ENFORCED on this connection', () => {
+    const row = db.prepare('PRAGMA foreign_keys').get();
+    const on = row && (row.foreign_keys === 1 || row.foreign_keys === true);
+    if (!on) {
+      throw new Error('foreign_keys is OFF: every REFERENCES ... ON DELETE clause in this '
+        + 'schema is decorative, including the guard that stops a KMS provider being deleted '
+        + 'while backups still need it to restore');
+    }
+    return 'foreign_keys = ON';
+  });
+
+  record('gd_kms', 'deleting a provider a backup depends on is refused by the database', () => {
+    // Written to FAIL on a broken system. It creates a real dependency and
+    // asserts the DELETE is refused, rather than checking that a guard function
+    // is mentioned somewhere.
+    const pid = 'regr-' + Date.now().toString(36);
+    const bid = 'regrb-' + Date.now().toString(36);
+    db.prepare("INSERT INTO gd_kms_providers (id,name,provider_type,config) VALUES (?,?,'aws-kms','{}')").run(pid, pid);
+    db.prepare("INSERT INTO backups (id,type,wrap_scheme,wrap_ref,wrap_provider_id) VALUES (?,'on-demand','aws-kms','regr',?)").run(bid, pid);
+    let refused = false;
+    try { db.prepare('DELETE FROM gd_kms_providers WHERE id = ?').run(pid); }
+    catch (e) { refused = /FOREIGN KEY/i.test(e.message); }
+    // clean up in the opposite order regardless of the outcome
+    try { db.prepare('DELETE FROM backups WHERE id = ?').run(bid); } catch (_e) {}
+    try { db.prepare('DELETE FROM gd_kms_providers WHERE id = ?').run(pid); } catch (_e) {}
+    if (!refused) throw new Error('the DELETE succeeded: a referenced provider can be removed, '
+      + 'which would leave that backup unrecoverable');
+    return 'referenced provider cannot be deleted';
+  });
+
+  record('gd_kms', 'key custody denies by default under a declared residency policy', () => {
+    // The distinction from the data-location categories: decide() treats an
+    // unset policy as OPEN, and this one must DENY, because a KMS key holder can
+    // be compelled to unwrap.
+    const kc = require('./services/gd-key-custody-residency');
+    const before = db.prepare("SELECT value FROM config WHERE key = 'data_residency_config'").get();
+    try {
+      db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('data_residency_config', ?)")
+        .run(JSON.stringify({ enabled: true, categories: { backup: { permittedRegions: ['EU'], mode: 'enforce' } } }));
+      const v = kc.evaluateKeyCustody(db, 'aws-kms', { region: 'eu-central-1' });
+      if (v.permitted) throw new Error('an unset key_custody policy PERMITTED an external KMS');
+      if (v.action !== 'denied-unset') throw new Error('unexpected action: ' + v.action);
+    } finally {
+      if (before) db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('data_residency_config', ?)").run(before.value);
+      else db.prepare("DELETE FROM config WHERE key = 'data_residency_config'").run();
+    }
+    return 'unset key_custody policy denies';
+  });
+
+  record('gd_kms', 'an EU-region cloud key still reports a US provider domicile', () => {
+    // Location is not jurisdiction. An EU region operated by a US company is
+    // reachable under US law, which is the reason domicile is tracked separately.
+    const kc = require('./services/gd-key-custody-residency');
+    const j = kc.resolveProviderJurisdiction('aws-kms', { region: 'eu-central-1' }, null);
+    if (j.country !== 'DE') throw new Error('expected country DE, got ' + j.country);
+    if (j.providerDomicile !== 'US') throw new Error('expected domicile US, got ' + j.providerDomicile);
+    return 'DE location, US domicile';
+  });
+
+  record('gd_kms', 'a KMS endpoint host outside the allow-list is refused', () => {
+    // The SSRF guard, asserted by effect. Instance metadata is the case that
+    // matters: an operator-supplied URL reaching 169.254.169.254 would have the
+    // server fetch cloud credentials.
+    const allow = require('./services/gd-key-wrapping-providers/endpoint-allow-list');
+    const denied = allow.checkEndpoint('https://169.254.169.254/latest/meta-data/', 'GD_KMS_ALLOWED_HOSTS', { GD_KMS_ALLOWED_HOSTS: 'vault.example.com' });
+    if (denied.ok) throw new Error('instance metadata was accepted as a KMS endpoint');
+    const sub = allow.checkEndpoint('https://evil.vault.example.com/', 'GD_KMS_ALLOWED_HOSTS', { GD_KMS_ALLOWED_HOSTS: 'vault.example.com' });
+    if (sub.ok) throw new Error('a subdomain was implied by the allow-list');
+    const unset = allow.checkEndpoint('https://vault.example.com/', 'GD_KMS_ALLOWED_HOSTS', {});
+    if (unset.ok) throw new Error('an unset allow-list permitted an endpoint');
+    return 'metadata, subdomain and unset all refused';
+  });
+
+  record('gd_kms', 'a provider is custody, never a recovery path', () => {
+    // The invariant this whole phase is built around. If a future change lets a
+    // provider hold the Tier-1 KEK, the anti-clone guarantee drops from what the
+    // TPM is worth to what a cloud IAM policy is worth.
+    const kw = require('./services/gd-backup-key-wrapping');
+    const schemes = kw.supportedSchemes();
+    if (schemes.indexOf('gd-tier1') === -1) {
+      throw new Error("the 'gd-tier1' provider is not registered: every existing GD backup "
+        + 'records that scheme and would be unreadable');
+    }
+    const local = require('./services/gd-key-wrapping-providers/gd-tier1');
+    if (local.securityTier !== 1) throw new Error('gd-tier1 must be security tier 1');
+    const cred = local.validateCredentials({ token: 'x' });
+    if (cred && cred.ok !== false) throw new Error('gd-tier1 accepted operator credentials: '
+      + 'its KEK is sealed to this host and is never operator-supplied');
+    return 'gd-tier1 registered, tier 1, credential-free';
+  });
+
 
   const passed = tests.filter(t => t.status === 'pass').length;
   const failed = tests.filter(t => t.status === 'fail').length;

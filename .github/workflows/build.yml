@@ -67,6 +67,10 @@ jobs:
         run: node scripts/check-compliance-claims.js --selftest
       - name: Verify no compliance claim contradicts the shipped tree
         run: node scripts/check-compliance-claims.js
+      - name: Foreign-key enforcement self-test
+        run: node scripts/check-foreign-keys-enforced.js --selftest
+      - name: Verify foreign keys are enforced at connection open
+        run: node scripts/check-foreign-keys-enforced.js
       - name: Verify manifest consistency
         run: node scripts/check-manifest-consistency.js
       - name: Verify deployment-mode seal
