@@ -54,6 +54,7 @@ const CONFIG_WRITE_MOUNTS = [
   '/api/cloud-vuln',            // scanner-authorization registry (mint/update/revoke). The scanner ANNOUNCE (/api/cloud-vuln-access, a separate mount) is deliberately never gated -- a scanner must announce while locked.
   '/api/vuln-scan',            // scanner-authorization registry (mint/update/revoke). The scanner ANNOUNCE (/api/vuln-scan-access, a separate mount) is deliberately never gated -- a scanner must announce while locked.
   '/api/migration',             // FA-MIG1 deployment migration export + import (MC parity freezes export too).
+  '/api/kms-providers',        // key-wrapping provider registry. Configuring a key custodian decides who can be compelled to open this deployment's backups, so it freezes with the rest of configuration.
   '/api/storage-destinations',  // destination CRUD (SFTP/S3/GCS/Azure credentials); freezes /:id/probe while locked (a config-time connectivity test).
   '/api/external-restore',      // external restore-source CRUD (credentials); freezes /test, /preview, /restore-request, /restore-execute -- pulling an off-box archive is a config-time trust action, frozen while locked.
   '/api/storage-routing',       // per-data-type routing; freezes /:type/test while locked (config-time).
