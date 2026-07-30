@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+'use strict';
+
+/*
+ * gen-tier1-golden-vectors.js
+ *
+ * Regenerates scripts/tier1-golden-vectors.json: one known-correct ciphertext per
+ * Tier-1 column, on each server, sealed through the REAL chokepoint under the fixed
+ * mock keys the round-trip regression uses (OWN 0x11 for node-local, SHARED 0x22 for
+ * replicated). The regression opens each vector and asserts the recovered plaintext,
+ * which verifies the column's declared encoding by demonstration on real ciphertext
+ * (a wrong storage decodes the vector wrong and the GCM tag fails; a wrong shape
+ * recovers the wrong value).
+ *
+ * These are frozen fixtures: DO NOT edit the JSON by hand, and only regenerate when a
+ * column's encoding legitimately changes (which is a data-migration event, not a
+ * routine change). Regenerate with:
+ *
+ *   node scripts/gen-tier1-golden-vectors.js
+ *
+ * The keys are the same fixed mock values the regression injects, so the vectors are
+ * reproducible and need no hardware. A buffer-storage ciphertext (a raw Buffer) is
+ * stored base64-encoded for JSON transport and decoded back to a Buffer by the
+ * regression; base64/hex/envelope ciphertexts are strings stored verbatim.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const Module = require('module');
+
+const OWN_KEK = Buffer.alloc(32, 0x11);
+const SHARED_KEK = Buffer.alloc(32, 0x22);
+
+const SERVERS = [
+  {
+    name: 'mc',
+    sealModule: '../server/services/tier1-seal.js',
+    registryModule: '../server/services/tier1-columns.js',
+    registryExport: 'TIER1_COLUMNS',
+    kekRequest: './tier1-kek',
+    sealBasename: 'tier1-seal.js',
+  },
+  {
+    name: 'gd',
+    sealModule: '../packages/global-dashboard-server/services/gd-tier1-seal.js',
+    registryModule: '../packages/global-dashboard-server/services/gd-tier1-columns.js',
+    registryExport: 'GD_TIER1_COLUMNS',
+    kekRequest: './gd-tier1-kek',
+    sealBasename: 'gd-tier1-seal.js',
+  },
+];
+
+function mockKek(realKekPath) {
+  // B6g: the seal modules fingerprint BY DOMAIN, so the stub must answer four
+  // calls, not two. Supplying only ownKek/sharedKek left kekFpForDomain calling
+  // an undefined function, and this generator has been failing ever since --
+  // unnoticed, because it only runs when a sealed column is added and B6g is the
+  // first phase to add one since.
+  //
+  // The fingerprint uses the same SHA-256 truncation the real module uses, so the
+  // vectors stay deterministic: same input KEKs, same output, on any machine.
+  // DELEGATES to the real kekFingerprint rather than reimplementing it. It is a
+  // pure function of the key and loads without hardware, and reimplementing a
+  // security primitive in a test double is how a golden vector ends up certifying
+  // something the product does not do. `real` is resolved through the ORIGINAL
+  // loader so the stub does not recurse into itself.
+  const real = originalLoad(realKekPath, null, false);
+  return {
+    ownKek: function () { return OWN_KEK; },
+    sharedKek: function () { return SHARED_KEK; },
+    ownKekFingerprint: function () { return real.kekFingerprint(OWN_KEK); },
+    sharedKekFingerprint: function () { return real.kekFingerprint(SHARED_KEK); },
+  };
+}
+
+const originalLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === 'tweetnacl' || request === 'tweetnacl-util') return {};
+  if (parent && parent.filename) {
+    for (let i = 0; i < SERVERS.length; i++) {
+      const s = SERVERS[i];
+      if (request === s.kekRequest && parent.filename.endsWith(s.sealBasename)) {
+        // Resolve the real KEK module the way the seal module itself would, so the
+        // stub can delegate its fingerprint to the real implementation instead of
+        // reimplementing it.
+        return mockKek(path.resolve(path.dirname(parent.filename), s.kekRequest));
+      }
+    }
+  }
+  return originalLoad.apply(this, arguments);
+};
+
+// A deterministic, column-specific plaintext so a mis-assignment to another column's
+// encoding cannot silently pass.
+function plaintextFor(colRef, shape) {
+  if (shape === 'json') return { golden: colRef, marker: 'tier1-golden-vector' };
+  if (shape === 'utf8') return 'tier1-golden-vector::' + colRef;
+  throw new Error('gen: unexpected shape ' + shape + ' for ' + colRef);
+}
+
+function buildServer(s) {
+  const seal = require(path.resolve(__dirname, s.sealModule));
+  const registry = require(path.resolve(__dirname, s.registryModule))[s.registryExport];
+  const out = [];
+  const tier1 = registry.filter(function (c) { return c.class === 'tier1'; });
+  for (let i = 0; i < tier1.length; i++) {
+    const c = tier1[i];
+    const colRef = c.table + '.' + c.column;
+    const plaintext = plaintextFor(colRef, c.shape);
+    const stored = seal.sealTier1(colRef, plaintext);
+    const ciphertext = Buffer.isBuffer(stored) ? stored.toString('base64') : stored;
+    out.push({ colRef: colRef, shape: c.shape, storage: c.storage, plaintext: plaintext, ciphertext: ciphertext });
+  }
+  return out;
+}
+
+function main() {
+  const result = {};
+  for (let i = 0; i < SERVERS.length; i++) {
+    const s = SERVERS[i];
+    result[s.name] = buildServer(s);
+  }
+  const banner = {
+    _README: 'GENERATED by scripts/gen-tier1-golden-vectors.js -- DO NOT EDIT BY HAND. ' +
+      'Frozen known-correct ciphertexts sealed under fixed mock keys (OWN 0x11 node-local, ' +
+      'SHARED 0x22 replicated). check-tier1-seal-roundtrip.js opens each and asserts the ' +
+      'plaintext, verifying the column encoding. A buffer ciphertext is base64 for transport.',
+  };
+  const payload = Object.assign(banner, result);
+  const dest = path.resolve(__dirname, 'tier1-golden-vectors.json');
+  fs.writeFileSync(dest, JSON.stringify(payload, null, 2) + '\n');
+  let count = 0;
+  for (let i = 0; i < SERVERS.length; i++) count += result[SERVERS[i].name].length;
+  console.log('wrote ' + dest + ' (' + count + ' vectors: ' +
+    SERVERS.map(function (s) { return s.name + ' ' + result[s.name].length; }).join(', ') + ')');
+}
+
+if (require.main === module) main();
