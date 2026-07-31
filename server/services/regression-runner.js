@@ -3832,6 +3832,83 @@ class RegressionRunner {
       return 'ratchet=max(pre,restored); force-lock on; MFA cleared; pre-B6h mark seeded';
     });
 
+      // ── H1: in-app Help ──────────────────────────────────────────────────
+      // The Help tab renders FEATURE-GUIDE.md at runtime. Before H1, 50 of the
+      // MC's 95 nav tabs had no help entry at all, and the guide shipped inside
+      // nothing. These assert the wiring holds, and one asserts the property
+      // that made the design safe rather than merely sanitized.
+
+      await check('help', 'Every MC nav tab resolves to a real guide section', () => {
+        const fsx = require('fs');
+        const pathx = require('path');
+        const root = pathx.resolve(__dirname, '..', '..');
+        const guideSrc = fsx.readFileSync(pathx.join(root, 'FEATURE-GUIDE.md'), 'utf8');
+        const sections = new Set();
+        for (const line of guideSrc.split('\n')) {
+          if (/^###\s+/.test(line) && !/^####/.test(line)) sections.add(line.replace(/^###\s+/, '').trim());
+        }
+        if (sections.size < 100) throw new Error('guide has only ' + sections.size + ' sections; expected 100+');
+        const map = require(pathx.join(root, 'frontend', 'help-sections.js'));
+        const jsx = fsx.readFileSync(pathx.join(root, 'frontend', 'firealive-mc.jsx'), 'utf8');
+        const at = jsx.indexOf('{cat:"');
+        if (at === -1) throw new Error('cannot find the MC nav array');
+        let st = jsx.lastIndexOf('[', at); let d = 0; let en = -1;
+        for (let i2 = st; i2 < jsx.length; i2 += 1) {
+          if (jsx[i2] === '[') d += 1;
+          else if (jsx[i2] === ']') { d -= 1; if (d === 0) { en = i2; break; } }
+        }
+        const nav = jsx.slice(st, en + 1);
+        const re2 = /\{id:"([a-z0-9_]+)",label:"([^"]+)"/g;
+        let m2; let count = 0; const bad = [];
+        while ((m2 = re2.exec(nav)) !== null) {
+          count += 1;
+          const heading = map.sectionForTab(m2[1], m2[2]);
+          if (map.NOT_FOR_MC[heading]) { bad.push(m2[1] + ' -> forbidden'); continue; }
+          if (!sections.has(heading)) bad.push(m2[1] + ' -> "' + heading + '" missing');
+        }
+        if (count < 50) throw new Error('only ' + count + ' nav tabs parsed; the nav shape changed');
+        if (bad.length) throw new Error(bad.length + ' tab(s) without help: ' + bad.slice(0, 4).join('; '));
+        return count + ' tabs resolve to ' + sections.size + ' guide sections';
+      });
+
+      await check('help', 'The guide is shipped inside the packaged application', () => {
+        const fsx = require('fs');
+        const pathx = require('path');
+        const root = pathx.resolve(__dirname, '..', '..');
+        const pkg = JSON.parse(fsx.readFileSync(pathx.join(root, 'frontend', 'package.json'), 'utf8'));
+        const files = ((pkg.build || {}).files) || [];
+        let ships = false;
+        for (const e of files) {
+          if (typeof e === 'string' && e.indexOf('FEATURE-GUIDE.md') !== -1) ships = true;
+          if (e && typeof e === 'object') {
+            for (const f of [].concat(e.filter || [])) {
+              if (String(f).indexOf('FEATURE-GUIDE.md') !== -1) ships = true;
+            }
+          }
+        }
+        // Drop it from build.files and Help is empty in the installer while
+        // working perfectly in development. That is the state this phase began in.
+        if (!ships) throw new Error('FEATURE-GUIDE.md is not in frontend build.files');
+        return 'guide is in build.files';
+      });
+
+      await check('help', 'The guide renders to inert nodes, never HTML', () => {
+        const pathx = require('path');
+        const root = pathx.resolve(__dirname, '..', '..');
+        const md = require(pathx.join(root, 'packages', 'shared', 'help-markdown.js'));
+        // A script tag must come back as ONE text node. If a future change
+        // introduced an HTML path, this is where it shows.
+        const blocks = md.parseMarkdown('<script>alert(1)</script>');
+        if (JSON.stringify(blocks).indexOf('"html"') !== -1) throw new Error('parser produced an html node');
+        if (blocks[0].children[0].t !== 'text') throw new Error('a script tag did not become a text node');
+        const link = md.parseInline('[x](javascript:alert(1))');
+        if (link[0].t === 'link') throw new Error('a javascript: URL became a live link');
+        // Trojan Source: a bidi override could make a security instruction display
+        // differently from what it says.
+        if (md.normalise('never\u202Ereven').indexOf('\u202E') !== -1) throw new Error('bidi override survived');
+        return 'script inert; javascript: refused; bidi stripped';
+      });
+
     // ── Aggregate ──────────────────────────────────────────────────
     const passed = results.filter(r => r.status === 'pass').length;
     const skipped = results.filter(r => r.status === 'skip').length;

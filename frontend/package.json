@@ -1,6 +1,6 @@
 {
   "name": "firealive-management-console",
-  "version": "1.0.92",
+  "version": "1.0.93",
   "description": "FireAlive \u2014 Management Console",
   "main": "main.js",
   "author": "Peter Mancina",
@@ -22,7 +22,6 @@
     "esbuild": "0.28.1",
     "electron": "^43.1.1",
     "electron-builder": "^26.15.3"
-
   },
   "build": {
     "appId": "com.firealive.management-console",
@@ -35,7 +34,14 @@
       "preload.js",
       "index.html",
       "app.js",
-      "assets/**/*"
+      "assets/**/*",
+      {
+        "from": "../",
+        "to": ".",
+        "filter": [
+          "FEATURE-GUIDE.md"
+        ]
+      }
     ],
     "extraResources": [
       {

@@ -16,6 +16,9 @@ const ALLOWED_CHANNELS = [
   'device:getPublicKey', 'device:signAction', 'device:signPopProof',
   // B5e (D9): deployment-mode first-run selection
   'deployment:getLocalMode', 'deployment:setLocalMode',
+  // H1: in-app Help. Read-only, and no path crosses this boundary -- the renderer
+  // sends a section name or a search term and receives a parsed node tree.
+  'help:forTab', 'help:search', 'help:index',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

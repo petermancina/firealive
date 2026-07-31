@@ -1,7 +1,7 @@
 # FireAlive — SOC Analyst Burnout Prevention Platform
 
-**Version:** v1.0.92 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
-**E-fuse counter:** 85 (anti-rollback) | **Build:** 20260729.2
+**Version:** v1.0.93 | **License:** AGPL-3.0-or-later | **Author:** Peter Mancina  
+**E-fuse counter:** 86 (anti-rollback) | **Build:** 20260730.1
 
 -----
 
@@ -13,7 +13,7 @@ FireAlive is grounded in peer-reviewed research on burnout — both SOC-analyst-
 
 The name plays on the notion of burnout — FireAlive keeps the fire burning long.
 
-> **📘 See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do, and is bundled with every distribution. It’s also the reference behind the in-app Help articles in the MC, AC, and GD.
+> **📘 See [FEATURE-GUIDE.md](FEATURE-GUIDE.md)** for plain-language descriptions of every feature in the FireAlive suite — what each feature is for, who uses it, when, and the workflow to use it. The Feature Guide is the source of truth for what each feature is supposed to do. **In the Management Console it is built in:** it ships inside the application, and opening the Help tab renders this same file rather than a summary of it that can fall behind. The Analyst Client and Global Dashboard still carry their own separate help text and are not yet wired to this guide.
 
 -----
 
@@ -21,9 +21,9 @@ The name plays on the notion of burnout — FireAlive keeps the fire burning lon
 
 > **⚠️ Pre-Release Notice:** FireAlive is in pre-release. It should be evaluated in a lab or sandbox environment before any production deployment. SOC teams should thoroughly test all integrations, routing logic, and security controls in a non-production setting before relying on FireAlive for operational use. Community testing, feedback, and contributions are welcome.
 
-**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.92) under Tags.
+**Download installers:** Pre-built installers for Mac (.dmg), Windows (.exe), and Linux (.AppImage) are available on the [Releases page](https://github.com/petermancina/firealive/releases/tag/v1.0.93) under Tags.
 
-See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it.
+See **SETUP.md** for detailed setup instructions, and **FEATURE-GUIDE.md** for what each feature does and how to use it — or, in the Management Console, just open the Help tab, which renders that same file.
 
 ### Quick Start (Development)
 

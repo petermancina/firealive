@@ -2000,7 +2000,121 @@ function MigrationPanel() {
   );
 }
 
+// ── H1: the Help tab ────────────────────────────────────────────────────────
+//
+// Renders FEATURE-GUIDE.md, not a copy of it. Before H1 this tab held 45
+// hand-written one-line descriptions against 95 nav tabs -- 50 tabs had no help
+// at all, and only 33 of the 45 still matched a section in the guide they were
+// originally written from. Three apps drifted the same way for one reason:
+// nothing failed when a tab shipped without help.
+//
+// NODES BECOME REACT ELEMENTS. Never an HTML string, at any stage.
+// dangerouslySetInnerHTML appears zero times across all three Electron apps and
+// this feature does not spend that. React escapes string children, so a <script>
+// tag in the guide renders as the literal characters an operator should see --
+// there is no sink to sanitize because none is constructed.
+const HelpInline = ({nodes}) => (nodes||[]).map((n,i)=>{
+  // A bare string child, keyed for the map. The shorthand fragment avoids a
+  // React.Fragment reference: this file imports hooks as NAMED imports and has
+  // no default React binding in scope.
+  if(n.t==="text") return <span key={i}>{n.v}</span>;
+  if(n.t==="code") return <code key={i} style={{fontFamily:"'IBM Plex Mono',monospace",fontSize:11,background:C.s,padding:"1px 4px",borderRadius:3,color:C.a}}>{n.v}</code>;
+  if(n.t==="b") return <strong key={i} style={{color:C.t}}><HelpInline nodes={n.children}/></strong>;
+  if(n.t==="i") return <em key={i}><HelpInline nodes={n.children}/></em>;
+  if(n.t==="link") return <a key={i} href={n.href} target="_blank" rel="noreferrer noopener" style={{color:C.a}}><HelpInline nodes={n.children}/></a>;
+  return null;
+});
+
+const HelpBlocks = ({blocks}) => (blocks||[]).map((b,i)=>{
+  if(b.t==="p") return <M key={i} style={{display:"block",marginBottom:10,lineHeight:1.7,color:C.tm,fontSize:11}}><HelpInline nodes={b.children}/></M>;
+  if(b.t==="h") return <div key={i} style={{fontSize:12,fontWeight:600,color:C.t,marginTop:14,marginBottom:6}}><HelpInline nodes={b.children}/></div>;
+  if(b.t==="ul") return <ul key={i} style={{margin:"0 0 10px 18px",padding:0}}>{b.items.map((it,k)=><li key={k} style={{marginBottom:4}}><M style={{lineHeight:1.7,color:C.tm,fontSize:11}}><HelpInline nodes={it}/></M></li>)}</ul>;
+  if(b.t==="ol") return <ol key={i} style={{margin:"0 0 10px 18px",padding:0}}>{b.items.map((it,k)=><li key={k} style={{marginBottom:4}}><M style={{lineHeight:1.7,color:C.tm,fontSize:11}}><HelpInline nodes={it}/></M></li>)}</ol>;
+  if(b.t==="hr") return <div key={i} style={{borderTop:`1px solid ${C.b}`,margin:"12px 0"}}/>;
+  if(b.t==="table") return (<table key={i} style={{borderCollapse:"collapse",marginBottom:10,width:"100%"}}><thead><tr>{b.head.map((h,k)=><th key={k} style={{textAlign:"left",padding:"4px 8px",borderBottom:`1px solid ${C.b}`,fontSize:10,color:C.td}}><HelpInline nodes={h}/></th>)}</tr></thead><tbody>{b.rows.map((r,k)=><tr key={k}>{r.map((c,q)=><td key={q} style={{padding:"4px 8px",borderBottom:`1px solid ${C.b}`,fontSize:11,color:C.tm}}><HelpInline nodes={c}/></td>)}</tr>)}</tbody></table>);
+  return null;
+});
+
+const HelpTab = ({tab,navLabel,onOpen}) => {
+  const [doc,setDoc] = useState(null);
+  const [idx,setIdx] = useState(null);
+  const [q,setQ] = useState("");
+  const [hits,setHits] = useState(null);
+
+  // The renderer cannot read the guide itself -- nodeIntegration is false and the
+  // CSP is default-src 'self'. It asks the main process by SECTION NAME and gets
+  // a parsed node tree back. No path crosses this boundary in either direction.
+  useEffect(()=>{
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if(!bridge || !bridge.invoke){ setDoc({ok:false,reason:"no-bridge"}); return; }
+    bridge.invoke("help:forTab",{tabId:tab,navLabel:navLabel||""})
+      .then(r=>setDoc(r||{ok:false,reason:"empty"}))
+      .catch(()=>setDoc({ok:false,reason:"error"}));
+    bridge.invoke("help:index").then(r=>setIdx(r&&r.ok?r.groups:null)).catch(()=>{});
+  },[tab,navLabel]);
+
+  const search = (term)=>{
+    setQ(term);
+    if(term.trim().length<2){ setHits(null); return; }
+    const bridge = (typeof window !== "undefined") ? window.firealive : null;
+    if(!bridge || !bridge.invoke) return;
+    // Matched as a literal substring in the main process, never as a pattern.
+    bridge.invoke("help:search",{term,limit:25})
+      .then(r=>setHits(r&&r.ok?r.results:[])).catch(()=>setHits([]));
+  };
+
+  return (<div>
+    <L>Help</L>
+    <M style={{color:C.tm,display:"block",marginBottom:12,lineHeight:1.6}}>
+      This is the FireAlive feature guide as it ships in this build. It is the same
+      document the team maintains, not a summary of it, so it cannot fall behind
+      what the console actually does.
+    </M>
+    <input value={q} onChange={e=>search(e.target.value)} placeholder="Search the guide"
+      style={{width:"100%",padding:"8px 10px",marginBottom:12,background:C.s,border:`1px solid ${C.b}`,borderRadius:4,color:C.t,fontFamily:"'IBM Plex Mono',monospace",fontSize:11}}/>
+
+    {hits!==null && (<Card style={{marginBottom:12}}>
+      <L>{hits.length} result{hits.length===1?"":"s"}</L>
+      {hits.length===0 && <M style={{color:C.tm,display:"block",marginTop:6}}>Nothing in the guide matches that.</M>}
+      {hits.map((h,i)=>(<div key={i} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`,cursor:"pointer"}} onClick={()=>{setHits(null);setQ("");onOpen&&onOpen(h.title,h.title);}}>
+        <div style={{fontSize:11,color:C.a}}>{h.title}</div>
+        <M style={{color:C.td,display:"block",fontSize:10}}>{h.snippet}</M>
+      </div>))}
+    </Card>)}
+
+    {doc && doc.ok && (<Card style={{marginBottom:12}}>
+      <L>{doc.group}</L>
+      <div style={{fontSize:14,fontWeight:600,color:C.t,margin:"4px 0 10px"}}>{doc.title}</div>
+      <HelpBlocks blocks={doc.blocks}/>
+    </Card>)}
+
+    {/* A missing section is reported as missing, and an unreadable guide as
+        unreadable. Those need different responses from an operator, and a blank
+        panel looks identical to both. */}
+    {doc && !doc.ok && (<Card style={{marginBottom:12}}>
+      <M style={{color:C.tm,display:"block",lineHeight:1.7}}>
+        {doc.reason==="unreadable" ? doc.error
+         : doc.reason==="no-bridge" ? "In-app help is available in the desktop application."
+         : "No guide section is mapped to this tab yet."}
+      </M>
+    </Card>)}
+
+    {idx && (<Card>
+      <L>Everything in the guide</L>
+      {Object.keys(idx).map(g=>(<div key={g} style={{marginTop:10}}>
+        <div style={{fontSize:11,color:C.td,marginBottom:4}}>{g}</div>
+        {idx[g].map(tt=>(<div key={tt} onClick={()=>onOpen&&onOpen(tt,tt)}
+          style={{fontSize:11,color:C.a,cursor:"pointer",padding:"2px 0"}}>{tt}</div>))}
+      </div>))}
+    </Card>)}
+  </div>);
+};
+
 function ManagementConsole() {
+  // H1: which guide section the Help tab is showing. Defaults to the tab the
+  // operator was last on, so opening Help answers "what is this screen".
+  const [helpTopic, setHelpTopic] = useState(null);
+  const [helpLabel, setHelpLabel] = useState("");
   const [tab, setTab] = useState("actions");
   const [notifTest, setNotifTest] = useState(null);
   const [gDepth, setGD] = useState(null);
@@ -10393,32 +10507,7 @@ Analyst Clients (Tier-3) ── NO SIEM flow`}</pre></Card>
           </Card>
         </div>)}
 
-        {tab==="help_mc"&&(<div>
-          <L>Management Console Help</L>
-          <M style={{color:C.tm,display:"block",marginBottom:16}}>Complete guide to every feature in the Management Console.</M>
-          {[
-            {cat:"Operations",items:[{n:"Actions",d:"Priority prompts generated from team health signals. Each prompt has severity, recommendation, and supporting research. Use depth controls to adjust detail level."},{n:"Team Overview",d:"Aggregate team health metrics — score, utilization, capacity. No individual burnout data. Shows shift roster with tier, utilization, and complexity caps."},{n:"Routing",d:"Configure burnout-aware ticket distribution. Set per-analyst complexity caps. Routing adjusts automatically based on team health signals."},{n:"Shift Handoff",d:"Structured shift transition notes. Maintains context continuity between shifts."},{n:"SLA",d:"Service Level Agreement targets for MTTA (mean time to acknowledge) and MTTR (mean time to resolve) by priority level."},{n:"Automation",d:"Track automated systems (EDR, SOAR, SIEM) and their alert volumes. Add new automation integrations."},{n:"Fail-Open Routing",d:"Like IPS fail-open: if burnout routing fails, tickets flow unfiltered so the SOC keeps running."},{n:"Auto-Disable Routing",d:"Automatically turn off burnout routing when critical incidents require all hands. Triggers: P1 tickets, SIEM alerts, SOAR escalations."},{n:"Recovery Runbook",d:"Generate step-by-step recovery instructions for 10+ failure scenarios (server crash, ransomware, insider threat, etc.)."}]},
-            {cat:"Analysts & Wellbeing",items:[{n:"Skills Matrix",d:"Team skill coverage across 16 categories. Identifies gaps for training planning."},{n:"Assessments",d:"Create and assign skills assessments. Track results with progress bars."},{n:"Certifications",d:"Upload and track industry certs (CompTIA, ISACA, ISC², GIAC, etc.)."},{n:"CISM Retro",d:"Post-incident retrospective protocol following Mitchell's CISM model. 24hr/48-72hr/7-day check-ins."},{n:"Peer Config",d:"Configure peer skill-share scheduling windows, session limits, and helper leaderboard."},{n:"Pseudonyms",d:"Decouple analyst identity from burnout data. All data stored under pseudonyms. Mapping exportable for offline storage."},{n:"Proactive Breaks",d:"Sonnentag research-based: suggest breaks after prolonged high-severity work. Requires your approval before notification sent to analyst."},{n:"Upskilling Hour",d:"Dedicate one hour per shift to professional development. Routing pauses automatically. Research shows this reduces turnover by 20-30%."},{n:"Offboarding",d:"Securely deprovision analysts. Revokes keys, archives data, cancels peer sessions, notifies SOAR."}]},
-            {cat:"Integrations",items:[{n:"SOAR",d:"Configure SOAR platform connection (Splunk SOAR, Cortex XSOAR, etc.)."},{n:"SIEM",d:"Configure SIEM feed for team health data and audit events."},{n:"EDR",d:"Integrate EDR for file inspection — scans uploads, restores, policy imports, app updates."},{n:"Threat Hunting",d:"XDR, ATP, Next-Gen AV, MSP scanner integrations for behavioral monitoring and consumption metrics."}]},
-            {cat:"Security",items:[{n:"IAM",d:"Configure SAML, OIDC, Active Directory, or cloud IdP for enterprise authentication."},{n:"MFA",d:"TOTP/WebAuthn setup for deployments without IAM. Includes NIST 800-63B password policy."},{n:"API Keys",d:"Manage API keys for SOAR/SIEM integrations."},{n:"Access Control",d:"Role-based access control configuration."},{n:"Auth Logs",d:"Track all login attempts. Brute-force detection, out-of-cycle alerts, log tampering detection."},{n:"KMS",d:"Enterprise key management — AWS KMS, Azure Key Vault, HashiCorp Vault, Thales, Entrust."},{n:"WiFi Policy",d:"Minimum WiFi security requirements. Block WPA2-Personal/WEP."},{n:"Posture Assessment",d:"802.1X-style client health checks before connection."},{n:"Tripwire",d:"Detect mass reduced-routing requests that may indicate coordinated attack."},{n:"Compromise Scan",d:"10-point diagnostic on all or individual clients."},{n:"TTX Generator",d:"Generate tabletop exercise scenarios for FireAlive compromise."}]},
-            {cat:"Infrastructure",items:[{n:"Cloud & IaC",d:"Cloud migration tools and Infrastructure-as-Code generation (Terraform, CloudFormation, Pulumi)."},{n:"High Availability",d:"Active/passive failover with automated promotion, manual failover, and a measured self-test."}]},
-            {cat:"Data & Backup",items:[{n:"Backup",d:"Database backup management."},{n:"Backup Schedules",d:"Multiple concurrent backup schedules with regulatory presets (HIPAA, SOX, PCI-DSS)."},{n:"Restore",d:"Restore from backups with integrity verification."},{n:"Data Sovereignty",d:"Assign each analyst a home country and geo-fence logins against the country observed from their source IP, with trusted-network allow-listing and time-boxed exceptions."}]},
-            {cat:"Reports & Compliance",items:[{n:"Report Engine",d:"Scheduled and on-demand reports — team health, utilization, automation, trends."},{n:"Compliance",d:"Framework scanning — NIST CSF, ISO 27001, SOC 2, GDPR, HIPAA."},{n:"Knowledge Base",d:"50 research-backed entries on burnout prevention. AI synthesis engine generates contextual prompts."},{n:"Risk Register Asset",d:"Generate quantitative (AV/EF/SLE/ARO/ALE) and qualitative risk assessment for the app."},{n:"Human Impact Report",d:"Link incident types to burnout metrics, quantified for enterprise risk registers."},{n:"Query Tool",d:"SQL-like queries against audit logs, team data, and metrics."}]},
-          ].map(cat=>(
-            <Card key={cat.cat} style={{marginBottom:12}}>
-              <div style={{fontSize:13,fontWeight:600,color:C.a,marginBottom:10}}>{cat.cat}</div>
-              {cat.items.map(item=>(
-                <div key={item.n} style={{padding:"6px 0",borderBottom:`1px solid ${C.b}`}}>
-                  <M style={{color:C.t,fontWeight:500}}>{item.n}</M>
-                  <M style={{color:C.tm,display:"block"}}>{item.d}</M>
-                </div>
-              ))}
-            </Card>
-          ))}
-          <L style={{marginTop:24}}>Common Issues</L>
-          <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Routing</div><M style={{color:C.tm,display:"block",lineHeight:1.6}}>Requires SOAR + ticketing. If panic, restore first.</M></Card>
-          <Card style={{marginBottom:10}}><div style={{fontSize:13,fontWeight:500,color:"#E8EDF5",marginBottom:8}}>Config</div><M style={{color:C.tm,display:"block",lineHeight:1.6}}>Unlock config lock (sidebar, MFA).</M></Card>
-        </div>)}
+        {tab==="help_mc"&&(<HelpTab tab={helpTopic||tab} navLabel={helpLabel} onOpen={(t,l)=>{setHelpTopic(t);setHelpLabel(l);}}/>)}
 
         {/* INBOX — in-app notifications from server */}
         {tab==="inbox"&&(<div>

@@ -223,6 +223,14 @@ ipcMain.handle('device:signPopProof', async (_e, { method, path } = {}) => {
 });
 
 // D9: report / set this installation's deployment-mode selection (first-run).
+// Lazily required so a failure to load the Help reader cannot prevent the window
+// from opening. Help is important; it is not more important than the app starting.
+let _helpReader = null;
+function helpReader() {
+  if (!_helpReader) _helpReader = require('./help-reader');
+  return _helpReader;
+}
+
 ipcMain.handle('deployment:getLocalMode', async () => {
   try {
     const lm = localMode();
@@ -239,6 +247,43 @@ ipcMain.handle('deployment:setLocalMode', async (_e, { mode, substrate } = {}) =
     return { ok: true, mode: lm.getMode(), substrate: lm.getSubstrate() };
   } catch (e) {
     return { error: e.message };
+  }
+});
+
+// ── H1: in-app Help ─────────────────────────────────────────────────────────
+//
+// The renderer cannot read FEATURE-GUIDE.md itself -- nodeIntegration is false,
+// contextIsolation is true, and the CSP is default-src 'self'. So it asks for a
+// tab's help by NAME and receives a parsed node tree back.
+//
+// Nothing here accepts a path. `tabId` and `navLabel` are looked up in a map
+// built from the guide's own headings; anything that is not a key returns a
+// reason code, not a file. That is why there is no traversal check to get wrong.
+//
+// The reader caches the file, which ships inside the asar archive and cannot
+// change while the app runs.
+ipcMain.handle('help:forTab', async (_e, { tabId, navLabel } = {}) => {
+  try {
+    return helpReader().helpForTab(String(tabId || ''), String(navLabel || ''));
+  } catch (e) {
+    return { ok: false, reason: 'error', error: e.message };
+  }
+});
+
+ipcMain.handle('help:search', async (_e, { term, limit } = {}) => {
+  try {
+    // The term is a literal substring, never a pattern. See help-reader.js.
+    return { ok: true, results: helpReader().searchGuide(String(term || ''), limit) };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('help:index', async () => {
+  try {
+    return helpReader().guideIndex();
+  } catch (e) {
+    return { ok: false, error: e.message };
   }
 });
 

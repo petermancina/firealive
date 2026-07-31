@@ -2,7 +2,7 @@
 
 A plain-language reference to every feature in the FireAlive suite. For each feature: what it’s for, who uses it, when, and the workflow to use it.
 
-This guide is bundled with every FireAlive distribution and is also accessible via the Help tab in each application (Management Console, Analyst Client, Global Dashboard).
+This guide ships inside the Management Console and is what its Help tab renders: open Help on any tab and you are reading this file, not a summary of it that can drift out of date. The Analyst Client and Global Dashboard still carry their own separate help text and are not yet wired to this guide.
 
 If you’re new to FireAlive, start with **The Big Picture** below.
 
@@ -443,6 +443,18 @@ Flagged ratings still grant points at rating time (the helper sees their balance
 1. Scanner returns clean → upload proceeds
 1. Scanner returns malicious → upload rejected, lead notified, audit log entry
 
+### Malware Scanners
+
+**What it's for:** Scanning files before FireAlive trusts them, through whichever malware engines the SOC already pays for.
+
+FireAlive ships integrations for fifteen providers — ClamAV, Microsoft Defender, CrowdStrike Falcon, SentinelOne, Palo Alto WildFire, Trellix ATD, Trend Micro DDAN, Fortinet FortiSandbox, Cisco AMP, Sophos Intelix, Kaspersky Sandbox, BlackBerry Cylance, Joe Sandbox, Hybrid Analysis, and VirusTotal. Each is configured independently, and credentials are encrypted at rest under the Tier-1 KEK.
+
+**Why more than one:** the scanners disagree, and that is the point. A file that one engine clears and another flags is a file worth a second look, so the lead sees each engine's verdict rather than a single merged answer.
+
+**Where scanning actually runs.** This tab configures the integrations; the enforcement lives where files enter. The most important consumer is the local AI model-load gate, which will not load a weights file until it has cleared every applicable layer — a backdoored-but-well-formed weights file is not something a format check can catch, which is why a real scanner is required there rather than optional.
+
+**What an operator should expect when something is wrong:** an unreachable scanner is reported as unreachable, not as a clean result. A scan that could not run is never recorded as a pass.
+
 ### Threat Hunting Integrations
 
 **What it’s for:** Authorize your organization’s threat-hunting tools — XDR, ATP, Next-Gen AV, and MSP scanners — to pull FireAlive’s own operational security telemetry as a read-only feed they can correlate in their own consoles. This is the inbound counterpart to the SIEM/SOAR integrations (which push events out): here approved tooling connects in and pulls a curated slice — authentication events, sessions, the audit trail, and client-integrity findings — plus an actor-free summary of activity counts and compromise indicators. FireAlive is the monitored asset and never dials out; it serves only what a consumer is authorized to pull, and logs every pull. The per-category policy in this tab governs which consumer classes are allowed; each individual consumer is then authorized below.
@@ -539,6 +551,20 @@ Target directory: the server model root (default `~/.firealive/models`, override
 1. Add a passkey (the authenticator creates it; it is verified server-side) or review your issued certificates
 1. Remove a passkey you no longer use, or revoke a certificate that may be compromised
 1. If you are ever locked out with no working credential, recovery is the audited one-time break-glass credential
+
+### MFA & Step-Up Authentication
+
+**What it's for:** Proving who is at the keyboard, both at login and again at the moment a dangerous action is taken.
+
+**Login is passwordless.** FireAlive authenticates operators with WebAuthn passkeys — a hardware security key, or a platform authenticator backed by the device's secure element. There is no password to phish, reuse, or leak, because password login was removed rather than left as a fallback. The login path requires user verification, so a passkey login is MFA-complete on its own: the key proves possession and its PIN or biometric proves the second factor.
+
+**Step-up is separate from login, and that separation is deliberate.** Being logged in answers "did someone authenticate hours ago"; a step-up answers "is the CISO at the keyboard right now". Forty-six routes across the Management Console require a fresh hardware-key assertion at the moment of use — minting an API key, changing the config lock, authorising a client recovery, registering a key-management provider. A stolen session is not enough to reach any of them.
+
+**Replay is prevented structurally.** Each challenge carries a signed, self-expiring token, and every consumed challenge is recorded so the same assertion cannot be presented twice. Attestation is requested directly from the authenticator, and the accepted algorithms are pinned to ES256 and RS256 — the pair every mainstream authenticator supports.
+
+**Enrolment.** Operators register their own credentials under My Security. The first credential is enrolled through a one-time token issued by an administrator; after that, an operator adds and removes their own keys with an existing key. Registering a second key is strongly advised, because a passwordless system with one credential is a system with one point of failure.
+
+**What an operator should expect when something is wrong:** a step-up that fails leaves the underlying action untouched. Nothing is half-applied while waiting for a key tap.
 
 ### API Keys
 
@@ -1447,6 +1473,18 @@ It is a **separate surface**, not a view onto the Regional Server's. The Global 
 
 **Turning it off:** flip the master switch. Every announce stops and every rate-limit exemption is withdrawn within one refresh window, without revoking a single authorization — and turning it back on restores exactly what was there before.
 
+### Forensic Exports
+
+**What it's for:** Handing evidence to someone outside FireAlive — an incident responder, an auditor, a regulator, or a court — in a form their tools already read and in a form they can prove was not altered.
+
+**Eight formats, chosen for who receives them:** STIX 2.1 for threat-intelligence exchange, CEF for SIEM ingest, DFXML and Sleuth Kit bodyfile for digital-forensics tooling, Plaso L2T CSV for timeline analysis, EVTX-XML for Windows event pipelines, plus JSON Lines and CSV for everything else. The same evidence is expressed in each; the format is a delivery choice, not a different extract.
+
+**Every export is signed, and the signatures form a chain.** Each export records a hash of its own contents and links to the export before it, so a recipient can verify not only that a single export is intact but that no export was removed from the sequence. The signing keys live in their own registry with their own rotation history, so a key can be retired without invalidating what it already signed.
+
+**Exports are recorded as events, not just produced as files.** Who exported, when, over what date range, in which format, and where it was pushed are all written to the audit log. An export is a disclosure of SOC data, and a disclosure nobody can account for afterwards is the problem this tab exists to avoid.
+
+**What an operator should expect when something is wrong:** a failed export leaves no partial file and no chain entry. The chain is only extended once the export is complete and signed, so a broken chain always means tampering rather than an interrupted job.
+
 ### Audit Log
 
 **What it’s for:** Aggregated audit trail across MC + AC. Every meaningful action — logins, config changes, ticket assignments, peer flag resolutions, redemption approvals — is appended through a single chained-write path, so each entry joins a per-row SHA-256 hash chain that Ed25519-signed checkpoints periodically notarize (see Log Integrity). The table is append-only at the database level (UPDATE/DELETE rejected by trigger). Searchable, paginated, exportable for forensics, and verifiable on demand via `GET /api/audit/integrity`.
@@ -1517,7 +1555,11 @@ Every v2 backup generates a fresh data key, encrypts the archive with it, and wr
 
 ### Help (MC)
 
-**What it’s for:** In-app help — this Feature Guide accessible by tab. Each tab in the MC has a corresponding mini-article in this Help menu.
+**What it’s for:** In-app help. The Help tab renders this Feature Guide itself — the same file the team maintains, shipped inside the application — so what you read here cannot fall behind what the console does.
+
+Opening Help from any tab shows that tab’s section. There is also a search box over the whole guide, and an index of every section grouped the way this document is.
+
+A build in which a tab has no section fails CI rather than shipping, which is the difference between this and the hand-written summaries it replaced: those drifted for several releases before anyone noticed, because nothing failed when a new tab arrived undocumented.
 
 -----
 
@@ -1550,7 +1592,7 @@ The “Request Reduced Tickets” button is two-state: when reduced routing is O
 1. Clicks the signal — gets context on what this typically means and research-backed responses
 1. Optionally requests reduced queue (anonymous) or messages lead (pseudonymous, E2EE)
 
-### Inbox
+### Inbox (Analyst Client)
 
 **What it’s for:** Same as MC inbox — optional storage of notifications for users who chose inbox as a delivery channel.
 
@@ -1719,7 +1761,7 @@ Tier-3 PRIVATE — the lead literally cannot see whether the analyst accesses th
 
 **What it’s for:** Analyst’s data privacy controls and consent log. Shows what data is collected at Tier-1 (visible to lead, aggregate only) vs Tier-3 (private to analyst). Consent events log every privacy decision the analyst made.
 
-### Certifications
+### Certifications (AC-side)
 
 **What it’s for:** Where the analyst registers their professional industry certifications (CompTIA, ISACA, ISC², GIAC, etc.). Uploads cert file (PDF/image, encrypted), enters verification number. Lead verifies and the cert contributes to the analyst’s skill profile.
 
@@ -1819,11 +1861,11 @@ When a regional SOC is decommissioned, offboard its MC. Historical data retentio
 
 Threshold alerts when any region crosses critical lines (burnout health below threshold, SLA below %, turnover risk high).
 
-### Query Tool
+### Query Tool (Global Dashboard)
 
 Run cross-region queries: burnout trends, turnover risk, cert gaps, automation ROI.
 
-### System Health
+### System Health (Global Dashboard)
 
 **What it’s for:** Self-monitoring of the GD server itself. A subsystem-health rollup (built in B6a) draws from the GD metrics collector — fleet and ingest freshness, compliance coverage, signing-key status, audit-chain integrity, backup status, unacknowledged notifications, integration health, and live runtime metrics (CPU / memory / heap / DB-read rate / monitored file count) — behind `GET /api/system/health-metrics`. The runtime monitor underneath it runs continuous file-integrity monitoring over the GD server tree plus CPU / memory / DB-read anomaly detection with hysteresis, and routes any anomaly through the GD alert router. See `docs/runtime-monitoring-and-system-health.md`.
 
@@ -1831,7 +1873,7 @@ Run cross-region queries: burnout trends, turnover risk, cert gaps, automation R
 
 **What it’s for:** The GD’s self-protection console (built in B6a) — connect the GD server to the org’s monitoring stack so compromise of the GD *itself* is detected and routed, and never analyst data (the GD holds none). It configures SIEM (CEF over syslog TCP/UDP/TLS) and SOAR push, the operational alert-email recipients and webhook target, and an editable per-severity × channel alert-routing matrix (info / warning / high / critical fanned across audit / SOAR / SIEM+email / in-app notification / webhook, with audit always on). It runs opt-in, read-only dependency probes over the GD’s own KMS, backup storage, and MC-trust coverage (run-now plus cached results). It registers an optional external EDR provider (eleven supported, from CrowdStrike Falcon and Microsoft Defender for Endpoint to Wazuh and LimaCharlie) with AES-256-GCM-encrypted credentials — additive on top of the in-platform runtime-monitor baseline. And it shows live runtime-monitor metrics with editable sustained-load thresholds. The GD’s own security events — a rejected MC ingest signature, an audit-chain break, a rejected MC signing key — route through the same alert router so they fan out to SIEM / SOAR / notification / webhook on top of the always-on audit. See `docs/runtime-monitoring-and-system-health.md`.
 
-### High Availability
+### High Availability (Global Dashboard)
 
 **What it’s for:** A warm standby and automated failover for the Global Dashboard server. Losing the GD does not stop analysts working — the regional servers keep serving them — but it blinds cross-region visibility exactly when several regions are in trouble at once, which is when a CISO needs that view most. Two GD nodes pair over a mutually authenticated peer link: one runs **active** and holds the write lease, the other runs **passive**, replicating continuously and refusing every write. If the active is lost, the passive promotes itself. The feature is **opt-in** — a GD that has never been paired behaves exactly as it did before, and every gate described here fails open on a standalone node.
 
