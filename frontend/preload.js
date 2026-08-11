@@ -18,7 +18,7 @@ const ALLOWED_CHANNELS = [
   'deployment:getLocalMode', 'deployment:setLocalMode',
   // H1: in-app Help. Read-only, and no path crosses this boundary -- the renderer
   // sends a section name or a search term and receives a parsed node tree.
-  'help:forTab', 'help:search', 'help:index',
+  'help:forTab', 'help:search', 'help:index', 'help:common',
 ];
 
 contextBridge.exposeInMainWorld('firealive', {

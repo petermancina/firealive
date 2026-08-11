@@ -279,6 +279,14 @@ ipcMain.handle('help:search', async (_e, { term, limit } = {}) => {
   }
 });
 
+ipcMain.handle('help:common', async () => {
+  try {
+    return { ok: true, common: helpReader().commonIssues() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
 ipcMain.handle('help:index', async () => {
   try {
     return helpReader().guideIndex();

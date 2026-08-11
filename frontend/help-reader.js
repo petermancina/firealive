@@ -158,7 +158,27 @@ function searchGuide(term, limit) {
   return out;
 }
 
-/** Every section title, grouped, for the Help tab's index view. */
+/**
+ * The opening sentence of a section, for the index.
+ *
+ * Derived from the guide rather than written a second time. The old Help tab kept
+ * its own one-line description per screen, and those are exactly what drifted --
+ * fifty screens ended up with none and a third of the rest no longer matched the
+ * guide. A summary taken from the text it summarises cannot disagree with it.
+ */
+function summarise(body) {
+  if (!body) return '';
+  // Skip the bold lead-in ("What it's for:") and take the sentence after it.
+  let t = body.split('\n')[0] || '';
+  const colon = t.indexOf(':**');
+  if (colon !== -1) t = t.slice(colon + 3);
+  t = t.replace(/\*\*/g, '').trim();
+  const stop = t.search(/\.\s/);
+  if (stop !== -1 && stop < 240) t = t.slice(0, stop + 1);
+  return t.length > 240 ? t.slice(0, 237) + '...' : t;
+}
+
+/** Every section title, grouped and summarised, for the Help tab's index view. */
 function guideIndex() {
   const g = loadGuide();
   if (!g.ok) return { ok: false, error: g.error };
@@ -167,7 +187,7 @@ function guideIndex() {
     if (Object.prototype.hasOwnProperty.call(NOT_FOR_MC, title)) continue;
     const grp = g.sections[title].group || 'Other';
     if (!groups[grp]) groups[grp] = [];
-    groups[grp].push(title);
+    groups[grp].push({ title: title, summary: summarise(g.sections[title].body) });
   }
   return { ok: true, groups: groups };
 }
@@ -175,8 +195,27 @@ function guideIndex() {
 /** Test seam: drop the cache so a test can point at a different file. */
 function _resetCache() { cache = null; }
 
+/**
+ * The Common Issues section, rendered as its own card.
+ *
+ * The Help tab this replaced ended with a short troubleshooting block, and H1
+ * dropped it. A feature description answers "what is this screen"; it does not
+ * answer "why isn't it working", and the second question is the one an operator
+ * has when they open Help. Kept in the guide rather than hardcoded, so it is
+ * maintained alongside everything else.
+ */
+function commonIssues() {
+  const g = loadGuide();
+  if (!g.ok) return null;
+  const sec = g.sections['Common Issues'];
+  if (!sec) return null;
+  return { title: 'Common Issues', blocks: parseMarkdown(sec.body) };
+}
+
 module.exports = {
   GUIDE_FILENAME,
+  commonIssues,
+  summarise,
   guidePath,
   loadGuide,
   helpForTab,

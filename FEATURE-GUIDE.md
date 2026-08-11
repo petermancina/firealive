@@ -1553,11 +1553,73 @@ Every v2 backup generates a fresh data key, encrypts the archive with it, and wr
 
 **Locked toggle.** `peer_abuse_flagging` is a **locked** capability in Feature Toggles and cannot be turned off — disabling abuse reporting would lower the SOC’s safety floor.
 
+### Common Issues
+
+**What it's for:** The things that most often stop working, and what to check
+first. If a screen is doing nothing, start here before assuming a fault.
+
+**Every item below is also checked automatically.** The Troubleshooter tab
+inspects the live server -- configuration, integration state, recent activity --
+and reports what it finds rather than what should be true. Describe the problem
+there and it will run the relevant checks. This section is the same knowledge in
+a form you can read ahead of time.
+
+**Tickets are not being routed.** Burnout-aware routing needs somewhere to route
+*from* and *to*: a SOAR integration and a ticketing integration, both configured
+under Integrations. If those are present and tickets still flow unfiltered, check
+three things on the Routing tab in order -- whether panic mode is on (it disables
+routing deliberately, so the SOC keeps running during an incident), whether a
+reduced-load override is in force for the analysts concerned, and whether
+auto-disable has triggered on a P1. Fail-open is the designed behaviour: when
+routing cannot make a decision, tickets flow rather than stall.
+
+**A configuration change is refused.** The config lock is closed. Unlock it from
+the sidebar; it requires a hardware-key tap, and it re-locks on its own. This is
+deliberate -- it is what stops a compromised session from quietly re-pointing an
+integration.
+
+**An Analyst Client will not connect.** Three things must line up, and the client
+reports which one failed: the analyst has redeemed a provisioning token, the
+client trusts the Management Console's certificate authority, and the client
+holds a valid certificate of its own. Re-provisioning issues a fresh token; it
+does not require re-installing the client.
+
+**Backups are not running.** A schedule alone is not enough -- a backup needs a
+destination configured under Storage Destinations, and it needs a key-custody
+provider that is enabled and reachable. If the provider is retired, existing
+archives still restore but no new backup will be written. The Troubleshooter
+reports the age of the most recent backup, which is usually the fastest way to
+tell whether the problem is new.
+
+**The SIEM is configured but nothing is arriving.** Configuration and delivery are
+separate. Check the CEF stream activity on the SIEM tab: if the integration is
+present but no events have been sent recently, the transport is the problem
+(host, port, or TLS), not the mapping.
+
+**Peer sessions are not being scheduled.** Peer skill-share reads availability
+from the scheduling integration. If that integration has not synced recently, the
+board has no windows to offer and will appear empty rather than error.
+
+**Everyone is locked out.** A tripwire has fired. Tripwires lock the console on
+purpose when they detect a compromise indicator, and the way back in is the
+break-glass recovery path, not a password reset. The Auth Logs tab shows what
+tripped it.
+
+**The upskilling hour is not pausing routing.** Upskilling needs both a configured
+window and analysts assigned to it. With no assignment, the hour is recorded but
+nothing pauses.
+
+**Help itself is empty.** In-app help reads the feature guide bundled inside the
+application. If the Help tab reports that it cannot read the guide, the
+installation is incomplete -- reinstalling restores it. Nothing else is affected.
+
 ### Help (MC)
 
 **What it’s for:** In-app help. The Help tab renders this Feature Guide itself — the same file the team maintains, shipped inside the application — so what you read here cannot fall behind what the console does.
 
-Opening Help from any tab shows that tab’s section. There is also a search box over the whole guide, and an index of every section grouped the way this document is.
+Opening Help from any tab shows that tab’s section. Above it sits **Something not working?** — a collapsed troubleshooting card covering the failures that most often stop a screen doing anything, and what to check first for each. It is the same knowledge the Troubleshooter tab applies to your live server, in a form you can read ahead of time.
+
+There is also a search box over the whole guide, and an index of every section — grouped the way this document is, and showing each section’s opening line, so you can find a feature you cannot name.
 
 A build in which a tab has no section fails CI rather than shipping, which is the difference between this and the hand-written summaries it replaced: those drifted for several releases before anyone noticed, because nothing failed when a new tab arrived undocumented.
 
@@ -1594,7 +1656,22 @@ The “Request Reduced Tickets” button is two-state: when reduced routing is O
 
 ### Inbox (Analyst Client)
 
-**What it’s for:** Same as MC inbox — optional storage of notifications for users who chose inbox as a delivery channel.
+**What it’s for:** Somewhere for an analyst’s notifications to wait, if they would
+rather read them than be interrupted by them.
+
+Notifications reach an analyst through whichever channel they chose -- desktop
+notification, email, or this inbox. The inbox is the option for people who do not
+want a popup during focused work: nothing is pushed at them, and the messages are
+there when they look.
+
+**Workflow:**
+1. Analyst selects inbox as a delivery channel in their notification settings
+2. Break suggestions, peer-session invitations and shift-handoff notes arrive here
+3. Analyst reads them when they choose to
+4. Read messages stay until the analyst clears them
+
+Choosing the inbox does not suppress anything urgent: notifications the platform
+treats as time-critical still use the direct channels.
 
 ### Delegate
 
@@ -1755,6 +1832,20 @@ Tier-3 PRIVATE — the lead literally cannot see whether the analyst accesses th
 
 ### Audit (AC-side)
 
+**What it’s for:** The analyst’s own record of what their client did -- visible to
+them, not only to their lead.
+
+The client keeps a local log of its own events and mirrors it to the Management
+Console. The analyst can read it, which is the point: if a question is ever raised
+about what they were doing at a particular time, the record is not something held
+only by someone else. It is the same principle as the pseudonym design -- the
+analyst can see what is held about them.
+
+**Workflow:**
+1. Analyst opens Audit in the client
+2. Reviews sign-ins, sessions, and actions taken from this device
+3. Compares against the mirrored copy if there is ever a discrepancy
+
 **What it’s for:** Local audit log of events on this client. Auto-mirrored to MC. So if questions arise about what the analyst was doing at a specific time, they can see their own log.
 
 ### Privacy
@@ -1773,11 +1864,44 @@ The GD aggregates anonymized data from multiple regional MCs. The CISO sees regi
 
 ### Global Overview
 
-Cross-region aggregate health.
+**What it's for:** The CISO's first screen: one health picture across every
+Management Console reporting into this Global Dashboard, so a problem in one
+region is visible without opening that region.
+
+It aggregates what each MC pushes up -- team health score, utilization, SLA
+attainment, automation rate -- and shows the roll-up alongside the spread. The
+spread is the point: an average that looks fine can hide one region carrying the
+load for the others, and that is the situation this screen exists to surface.
+
+**Workflow:**
+1. CISO opens the Global Dashboard and lands here
+2. Reads the aggregate figures for the fleet
+3. Looks at the distribution rather than the average -- an outlier region shows as
+   a bar well away from the rest
+4. Clicks through to Regional Breakdown for the per-region detail
+
+Regions that have stopped reporting are shown as stale rather than dropped, so a
+console that has gone quiet is visible instead of silently improving the average.
 
 ### Regional Breakdown
 
-Per-region health bars, automation rates, cert coverage.
+**What it's for:** The same figures as Global Overview, one row per region, so a
+CISO can compare Management Consoles directly rather than through an average.
+
+Each region shows its team health score, utilization, automation rate and
+certification coverage. Comparing them is what makes the numbers actionable: a
+region with high utilization and low automation is carrying manual load its peers
+have engineered away, which is a staffing conversation rather than a wellbeing
+one.
+
+**Workflow:**
+1. CISO opens Regional Breakdown from the Global Dashboard
+2. Sorts or scans by the metric they are investigating
+3. Identifies regions that are outliers on that metric
+4. Uses Cross-Region Compliance or the Query Tool to test a hypothesis about why
+
+Regions appear here as soon as their MC is registered and has pushed at least one
+roll-up. A region present but blank has registered and not yet reported.
 
 ### Reports
 
@@ -1855,15 +1979,62 @@ The push payload is signed with the MC’s Ed25519 key and verified GD-side via 
 
 ### MC Offboarding
 
-When a regional SOC is decommissioned, offboard its MC. Historical data retention per policy.
+**What it's for:** Retiring a Management Console when a regional SOC closes,
+merges, or moves, without losing the history it reported.
+
+Offboarding is deliberately not deletion. The console stops reporting and stops
+counting toward fleet figures, but everything it already pushed stays queryable
+for as long as the retention policy says -- because the questions a CISO gets
+about a closed region usually arrive after it has closed.
+
+**Workflow:**
+1. CISO opens MC Offboarding and selects the console
+2. Confirms the retention period that applies to that region's data
+3. Offboards, which requires a hardware-key tap
+4. The console appears as offboarded rather than absent, with its history intact
+
+The console's own credentials are revoked at the same time, so an offboarded MC
+cannot resume pushing data if it is brought back online.
 
 ### CISO Notifications
 
-Threshold alerts when any region crosses critical lines (burnout health below threshold, SLA below %, turnover risk high).
+**What it's for:** Being told when a region crosses a line, instead of finding out
+at the next review.
+
+The CISO sets the thresholds -- team health below a floor, SLA attainment below a
+percentage, turnover risk above a level -- and the Global Dashboard raises an
+alert when a region crosses one. Thresholds are per-CISO rather than global, so
+two people watching the same fleet can watch it differently.
+
+**Workflow:**
+1. CISO opens Notifications and sets the thresholds that matter to them
+2. Chooses delivery -- inbox, email, or the configured channel
+3. Receives an alert naming the region, the metric, and the crossing
+4. Opens Regional Breakdown to see whether it is a trend or a single bad week
+
+An alert fires on the crossing, not on every subsequent reading, so a region that
+stays below a floor produces one alert rather than a daily reminder.
 
 ### Query Tool (Global Dashboard)
 
-Run cross-region queries: burnout trends, turnover risk, cert gaps, automation ROI.
+**What it's for:** Asking a question across every region at once, rather than
+opening each Management Console and comparing by hand.
+
+Typical questions: how burnout scores have moved fleet-wide over a quarter, which
+regions carry the highest turnover risk, where certification gaps cluster, and
+what automation has actually returned. The answers come from the roll-ups regions
+have pushed, so the tool reports what has been reported -- a region that has not
+sent data recently is excluded rather than counted as zero.
+
+**Workflow:**
+1. CISO opens the Query Tool on the Global Dashboard
+2. Chooses the question and the period
+3. Reviews the result with its coverage note -- which regions contributed
+4. Exports if the answer is going into a board pack or a risk register
+
+Filtering is a plain case-insensitive substring match, not a regular expression.
+That is deliberate: a pattern supplied by a caller is a denial-of-service surface,
+and there is no regular-expression engine safe enough to accept one.
 
 ### System Health (Global Dashboard)
 
@@ -1909,4 +2080,24 @@ Same purposes as MC equivalents but scoped to the GD server (which is independen
 
 ### Audit & Forensics
 
-Audit trail visibility for the GD layer — separate audit log from the regional MCs.
+**What it's for:** What happened on the Global Dashboard itself -- kept separately
+from the regional Management Consoles, and for a specific reason.
+
+A CISO investigating a regional incident needs the regional log. A CISO
+investigating whether someone tampered with the *oversight* layer needs a log that
+the regional consoles could not have written. Keeping the two apart is what makes
+the second question answerable.
+
+The GD's log records who signed in, what they read, every configuration change,
+every cross-region query, and every forensic export -- including exports that were
+refused. Entries are hash-chained, so a removed entry breaks the chain rather than
+disappearing quietly.
+
+**Workflow:**
+1. CISO opens Audit & Forensics on the Global Dashboard
+2. Filters by period, actor, or event type
+3. Verifies chain integrity for the range in question
+4. Exports the range in the format the recipient's tooling reads
+
+An export is itself an auditable event: who exported what, when, and where it went
+is recorded before the file is produced.

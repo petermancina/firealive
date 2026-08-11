@@ -2040,6 +2040,8 @@ const HelpTab = ({tab,navLabel,onOpen}) => {
   const [idx,setIdx] = useState(null);
   const [q,setQ] = useState("");
   const [hits,setHits] = useState(null);
+  const [common,setCommon] = useState(null);
+  const [showCommon,setShowCommon] = useState(false);
 
   // The renderer cannot read the guide itself -- nodeIntegration is false and the
   // CSP is default-src 'self'. It asks the main process by SECTION NAME and gets
@@ -2051,6 +2053,7 @@ const HelpTab = ({tab,navLabel,onOpen}) => {
       .then(r=>setDoc(r||{ok:false,reason:"empty"}))
       .catch(()=>setDoc({ok:false,reason:"error"}));
     bridge.invoke("help:index").then(r=>setIdx(r&&r.ok?r.groups:null)).catch(()=>{});
+    bridge.invoke("help:common").then(r=>setCommon(r&&r.ok?r.common:null)).catch(()=>{});
   },[tab,navLabel]);
 
   const search = (term)=>{
@@ -2082,6 +2085,19 @@ const HelpTab = ({tab,navLabel,onOpen}) => {
       </div>))}
     </Card>)}
 
+    {/* Restored in v1.0.94. The Help tab this replaced ended with a short
+        troubleshooting block and H1 dropped it. A feature description answers
+        "what is this screen"; it does not answer "why isn't it working", and the
+        second is the question an operator has when they open Help. Collapsed by
+        default so it does not push the current screen's help down the page. */}
+    {common && (<Card style={{marginBottom:12}}>
+      <div onClick={()=>setShowCommon(!showCommon)} style={{cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{fontSize:13,fontWeight:600,color:C.t}}>Something not working?</div>
+        <M style={{color:C.a}}>{showCommon?"hide":"common issues"}</M>
+      </div>
+      {showCommon && <div style={{marginTop:10}}><HelpBlocks blocks={common.blocks}/></div>}
+    </Card>)}
+
     {doc && doc.ok && (<Card style={{marginBottom:12}}>
       <L>{doc.group}</L>
       <div style={{fontSize:14,fontWeight:600,color:C.t,margin:"4px 0 10px"}}>{doc.title}</div>
@@ -2103,8 +2119,16 @@ const HelpTab = ({tab,navLabel,onOpen}) => {
       <L>Everything in the guide</L>
       {Object.keys(idx).map(g=>(<div key={g} style={{marginTop:10}}>
         <div style={{fontSize:11,color:C.td,marginBottom:4}}>{g}</div>
-        {idx[g].map(tt=>(<div key={tt} onClick={()=>onOpen&&onOpen(tt,tt)}
-          style={{fontSize:11,color:C.a,cursor:"pointer",padding:"2px 0"}}>{tt}</div>))}
+        {/* Titles AND their opening sentence. The tab this replaced listed every
+            screen with a one-line description on a single page, and that
+            at-a-glance view is how a lead finds a feature they cannot name. The
+            summary is derived from the guide rather than written again -- keeping
+            a second copy is exactly what drifted the first time. */}
+        {idx[g].map(e=>(<div key={e.title} onClick={()=>onOpen&&onOpen(e.title,e.title)}
+          style={{cursor:"pointer",padding:"5px 0",borderBottom:`1px solid ${C.b}`}}>
+          <div style={{fontSize:11,color:C.a}}>{e.title}</div>
+          {e.summary && <M style={{color:C.td,display:"block",fontSize:10,lineHeight:1.5}}>{e.summary}</M>}
+        </div>))}
       </div>))}
     </Card>)}
   </div>);
