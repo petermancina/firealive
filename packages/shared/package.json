@@ -26,6 +26,6 @@
   },
   "dependencies": {
     "@signalapp/libsignal-client": "^0.97.2",
-    "pdfkit": "^0.19.1"
+    "pdfkit": "^0.20.1"
   }
 }
