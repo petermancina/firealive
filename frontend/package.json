@@ -20,7 +20,7 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "esbuild": "0.28.1",
-    "electron": "^43.1.1",
+    "electron": "^44.2.0",
     "electron-builder": "^26.15.3"
   },
   "build": {
